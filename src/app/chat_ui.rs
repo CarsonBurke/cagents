@@ -2109,6 +2109,16 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
     })
 }
 
+/// The root a terminal replacing this chat names as its recovery origin: the
+/// one the chat's own terminal descended from, or the chat itself.
+fn succession_root(session: &chat::Session) -> TerminalId {
+    session
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.recovery_origin)
+        .unwrap_or(session.id)
+}
+
 fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
     session.launch.session_id.as_ref().ok_or_else(|| "Waiting for the provider's exact conversation identity. Return is unavailable until it is known.".to_owned())?;
     if session.launch.provider == Provider::Codex
@@ -2125,6 +2135,7 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
     let mut terminal = session.terminal.clone().unwrap_or_else(|| TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
+        predecessor: None,
         id,
         launch: recipe.clone(),
         continuity: TerminalContinuity::RelaunchAvailable {
@@ -3863,7 +3874,11 @@ impl Cagents {
                     .cards
                     .iter()
                     .position(|state| state.id == card)?;
-                Some((launch, (index, durable + 1)))
+                let succession = match &self.durable.cards[durable].kind {
+                    CardKind::Chat(session) => Some((succession_root(session), session.id)),
+                    _ => None,
+                };
+                Some((launch, (index, durable + 1), succession))
             }
             None => None,
         };
@@ -3876,9 +3891,13 @@ impl Cagents {
         &mut self,
         launch: LaunchRecipe,
         slot: (usize, usize),
+        succession: Option<(TerminalId, TerminalId)>,
     ) -> Task<Message> {
         let mut session = fresh_terminal_session(launch);
         session.resume_hint = crate::model::agent_recovery::hint_from_launch(&session.launch);
+        // The provider's CLI succeeds the chat it replaces.
+        session.recovery_origin = succession.map(|(root, _)| root);
+        session.predecessor = succession.map(|(_, chat)| chat);
         self.insert_terminal_card(session, Some(slot))
     }
 

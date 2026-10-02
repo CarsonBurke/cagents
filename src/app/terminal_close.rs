@@ -324,7 +324,11 @@ impl Cagents {
     pub(super) fn commit_card_removal(
         &mut self,
         id: CardId,
-        replacement: Option<(LaunchRecipe, (usize, usize))>,
+        replacement: Option<(
+            LaunchRecipe,
+            (usize, usize),
+            Option<(TerminalId, TerminalId)>,
+        )>,
     ) -> Option<Task<Message>> {
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
@@ -402,7 +406,7 @@ impl Cagents {
         // A chat returned to a terminal is replaced only now that it
         // is closed, so no state ever holds both.
         let replacement = replacement
-            .map(|(launch, slot)| self.open_chat_replacement(launch, slot))
+            .map(|(launch, slot, succession)| self.open_chat_replacement(launch, slot, succession))
             .unwrap_or_else(Task::none);
         // The replacement joins the chat's channel, which is then not
         // empty after all.

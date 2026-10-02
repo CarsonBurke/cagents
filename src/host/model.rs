@@ -27,8 +27,9 @@ use crate::{
 mod automations;
 pub(super) use automations::Claimed;
 mod execution;
+mod lineage;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -566,6 +567,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
+    }
+    if version < 4 {
+        lineage::migrate(db)?;
     }
     Ok(())
 }

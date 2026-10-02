@@ -1981,6 +1981,7 @@ mod tests {
             kind: CardKind::Terminal(TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),
                 transcript_path: Some(PathBuf::from("/state/transcript")),

@@ -32,7 +32,7 @@ use crate::{
 #[cfg(feature = "ui")]
 mod review_cache;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -2134,6 +2134,10 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                  CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
             )?;
         }
+        if current < 11 {
+            transaction
+                .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN predecessor TEXT;")?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -2494,8 +2498,8 @@ const INVALIDATE_CARD_HASH_BY_TERMINAL: &str = "UPDATE cards SET content_hash = 
 
 const UPSERT_TERMINAL_RECIPE: &str = "INSERT INTO terminal_recipes (
         terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
-        updated_at_unix_ms, recovery_origin, owned_codex_listener
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        updated_at_unix_ms, recovery_origin, owned_codex_listener, predecessor
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
      ON CONFLICT(terminal_id) DO UPDATE SET
         card_id = excluded.card_id,
         generation = excluded.generation,
@@ -2504,7 +2508,8 @@ const UPSERT_TERMINAL_RECIPE: &str = "INSERT INTO terminal_recipes (
         resume_hint = excluded.resume_hint,
         updated_at_unix_ms = excluded.updated_at_unix_ms,
         recovery_origin = excluded.recovery_origin,
-        owned_codex_listener = excluded.owned_codex_listener";
+        owned_codex_listener = excluded.owned_codex_listener,
+        predecessor = excluded.predecessor";
 
 const UPSERT_TRANSCRIPT_PATH: &str = "INSERT INTO transcript_metadata (
         terminal_id, generation, path_json, byte_len, durable_offset, updated_at_unix_ms
@@ -3097,6 +3102,7 @@ enum CardPayloadWrite<'card> {
     Terminal {
         terminal_id: String,
         recovery_origin: Option<String>,
+        predecessor: Option<String>,
         owned_codex_listener: Option<String>,
         recipe_json: String,
         continuity_json: String,
@@ -3150,6 +3156,7 @@ impl<'card> CardWrite<'card> {
             CardKind::Terminal(terminal) => CardPayloadWrite::Terminal {
                 terminal_id: terminal.id.to_string(),
                 recovery_origin: terminal.recovery_origin.map(|id| id.to_string()),
+                predecessor: terminal.predecessor.map(|id| id.to_string()),
                 owned_codex_listener: terminal
                     .owned_codex_listener
                     .as_ref()
@@ -3203,6 +3210,7 @@ impl<'card> CardWrite<'card> {
             CardPayloadWrite::Terminal {
                 terminal_id,
                 recovery_origin,
+                predecessor,
                 owned_codex_listener,
                 recipe_json,
                 continuity_json,
@@ -3213,6 +3221,7 @@ impl<'card> CardWrite<'card> {
                     .text("terminal")
                     .text(terminal_id)
                     .optional_text(recovery_origin.as_deref())
+                    .optional_text(predecessor.as_deref())
                     .optional_text(owned_codex_listener.as_deref())
                     .text(recipe_json)
                     .text(continuity_json)
@@ -3325,6 +3334,7 @@ fn save_card_payload(
         CardPayloadWrite::Terminal {
             terminal_id,
             recovery_origin,
+            predecessor,
             owned_codex_listener,
             recipe_json,
             continuity_json,
@@ -3349,6 +3359,7 @@ fn save_card_payload(
                     timestamp,
                     recovery_origin,
                     owned_codex_listener,
+                    predecessor,
                 ])?;
             if let Some(path_json) = transcript_path_json {
                 transaction
@@ -3585,6 +3596,7 @@ fn replace_terminal_identity_transaction(
                 .as_ref()
                 .map(to_json)
                 .transpose()?,
+            replacement.predecessor.map(|id| id.to_string()),
         ],
     )?;
     if let Some(path) = &replacement.transcript_path {
@@ -4014,7 +4026,7 @@ fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<Term
     // `QueryReturnedNoRows` that used to abort the whole workspace restore.
     let recipe = connection
         .query_row(
-            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin, owned_codex_listener
+            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin, owned_codex_listener, predecessor
              FROM terminal_recipes WHERE card_id = ?1",
             [card_id.to_string()],
             |row| {
@@ -4025,6 +4037,7 @@ fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<Term
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
@@ -4036,6 +4049,7 @@ fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<Term
         resume_hint,
         recovery_origin,
         owned_codex_listener,
+        predecessor,
     )) = recipe
     else {
         return Err(StoreError::corrupt_row(
@@ -4062,6 +4076,9 @@ fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<Term
             .transpose()?,
         recovery_origin: recovery_origin
             .map(|id| parse_id("terminal recovery origin", &id))
+            .transpose()?,
+        predecessor: predecessor
+            .map(|id| parse_id("terminal predecessor", &id))
             .transpose()?,
         id: terminal_id,
         launch,
@@ -4480,6 +4497,7 @@ mod tests {
                 kind: CardKind::Terminal(TerminalSession {
                     owned_codex_listener: None,
                     recovery_origin: None,
+                    predecessor: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
                     transcript_path: Some(PathBuf::from("/tmp/transcript")),
@@ -5364,6 +5382,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 ALTER TABLE terminal_recipes DROP COLUMN predecessor;
                  DROP TABLE review_cache_files;
                  DROP TABLE review_cache;
                  PRAGMA user_version = 7;",
@@ -5376,6 +5395,7 @@ mod tests {
             panic!("terminal")
         };
         assert!(legacy.owned_codex_listener.is_none());
+        assert!(legacy.predecessor.is_none());
         let CardKind::Terminal(original) = &workspace.cards[0].kind else {
             panic!("terminal")
         };
@@ -5490,6 +5510,7 @@ mod tests {
             let view = TerminalSession {
                 owned_codex_listener: native.owned_codex_listener.clone(),
                 recovery_origin: None,
+                predecessor: None,
                 id: native.id,
                 launch: native.launch.terminal_recipe().unwrap(),
                 transcript_path: None,
@@ -5646,7 +5667,8 @@ mod tests {
         transaction
             .execute_batch(
                 "ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;
-                 ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;",
+                 ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;
+                 ALTER TABLE terminal_recipes ADD COLUMN predecessor TEXT;",
             )
             .unwrap();
         let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
@@ -5676,7 +5698,8 @@ mod tests {
         transaction
             .execute_batch(
                 "ALTER TABLE terminal_recipes DROP COLUMN recovery_origin;
-                 ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;",
+                 ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 ALTER TABLE terminal_recipes DROP COLUMN predecessor;",
             )
             .unwrap();
         transaction.commit().unwrap();
@@ -5728,7 +5751,8 @@ mod tests {
         transaction
             .execute_batch(
                 "ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;
-                 ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;",
+                 ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;
+                 ALTER TABLE terminal_recipes ADD COLUMN predecessor TEXT;",
             )
             .unwrap();
         let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
@@ -5765,7 +5789,10 @@ mod tests {
         );
         transaction.pragma_update(None, "user_version", 5).unwrap();
         transaction
-            .execute_batch("ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;")
+            .execute_batch(
+                "ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 ALTER TABLE terminal_recipes DROP COLUMN predecessor;",
+            )
             .unwrap();
         transaction.commit().unwrap();
         drop(connection);
@@ -5899,6 +5926,7 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE projects DROP COLUMN kind_json;
                  ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 ALTER TABLE terminal_recipes DROP COLUMN predecessor;
                  DROP TABLE review_cache_files;
                  DROP TABLE review_cache;
                  PRAGMA user_version = 6;",
@@ -6428,6 +6456,7 @@ mod tests {
         let replacement = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: Some(original_id),
+            predecessor: Some(original_id),
             id: replacement_id,
             launch: launch.clone(),
             transcript_path: Some(PathBuf::from("/tmp/relaunched-transcript")),
@@ -6646,6 +6675,7 @@ mod tests {
         let replacement = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,

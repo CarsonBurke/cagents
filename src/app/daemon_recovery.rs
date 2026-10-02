@@ -323,6 +323,7 @@ mod tests {
         TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: LaunchRecipe::shell(path.to_owned()).unwrap(),
             transcript_path: None,
@@ -902,6 +903,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: crate::model::TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -921,6 +923,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: crate::model::TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,

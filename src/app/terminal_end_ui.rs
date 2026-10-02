@@ -509,6 +509,7 @@ mod tests {
         let mut session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,

@@ -921,7 +921,7 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     assert_eq!(
         child.agent.origin,
         Origin::Child {
-            parent: parent.session.as_ref().unwrap().id()
+            parent: crate::agent_execution::Lineage(parent.session.as_ref().unwrap().id())
         }
     );
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
@@ -1502,7 +1502,10 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     assert_eq!(me.project.as_deref(), Some(key.as_path()));
     assert_eq!(me.project_name.as_deref(), Some("Service fixture"));
     let delegation = me.delegation.unwrap();
-    assert_eq!(delegation.owner, Owner::Session(parent_session));
+    assert_eq!(
+        delegation.owner,
+        Owner::Session(crate::agent_execution::Lineage(parent_session))
+    );
     assert_eq!(delegation.run_state, Some(State::Succeeded));
     assert_eq!(
         directory
@@ -1771,4 +1774,149 @@ fn a_project_is_found_by_its_name() {
         read(Scope::Project(project.clone())).unwrap(),
         Scope::Project(project)
     );
+}
+
+#[test]
+fn a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own() {
+    use crate::agent_execution::{
+        Lineage,
+        directory::{Relation, Scope},
+    };
+    use crate::model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession};
+    if isolated("a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    host.lock().unwrap().register_client(1);
+    // Each shell runs until its marker file appears.
+    let spawn =
+        |id: TerminalId, recovery_origin: Option<TerminalId>, predecessor: Option<TerminalId>| {
+            let marker = root.join(format!("exit-{id}"));
+            let recipe = LaunchRecipe {
+                unset_environment: Default::default(),
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    format!("while [ ! -e '{}' ]; do sleep 0.02; done", marker.display()),
+                ],
+                working_directory: root.join("project"),
+                environment: Default::default(),
+            };
+            crate::host::state::spawn_terminal(
+                &host,
+                1,
+                TerminalSession {
+                    owned_codex_listener: None,
+                    recovery_origin,
+                    predecessor,
+                    id,
+                    launch: recipe.clone(),
+                    transcript_path: None,
+                    resume_hint: None,
+                    continuity: TerminalContinuity::RelaunchAvailable {
+                        recipe,
+                        last_exit: None,
+                    },
+                },
+                Default::default(),
+            )
+            .unwrap();
+            registry(&host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retained_agent_authority(id)
+                .unwrap()
+        };
+    let exit = |id: TerminalId| {
+        std::fs::write(root.join(format!("exit-{id}")), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.lock().unwrap().any_live(&[id]) {
+            assert!(Instant::now() < deadline, "the shell never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let list = |authority: &Authority| {
+        let Reply::Listed(listed) = process(&host, authority.clone(), Operation::List).unwrap()
+        else {
+            panic!("list reply")
+        };
+        listed
+            .into_iter()
+            .map(|summary| summary.agent.id)
+            .collect::<Vec<_>>()
+    };
+
+    let first = TerminalId::new();
+    let first_authority = spawn(first, None, None);
+    let mut rival_request = request.clone();
+    rival_request.idempotency_key = "rival child".into();
+    let mut child_request = request;
+    child_request.idempotency_key = "child".into();
+    let child = submit(&host, &first_authority, child_request).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+
+    // A relaunch while the original still runs starts a lineage of its own.
+    // This one was saved before predecessors were recorded, so it names only
+    // its root.
+    let rival = TerminalId::new();
+    let rival_authority = spawn(rival, Some(first), None);
+    assert!(list(&rival_authority).is_empty());
+    assert!(status(&host, &rival_authority, child.agent.id).is_err());
+
+    // Once it has exited, the next relaunch takes its agents over.
+    exit(first);
+    // The exited original can no longer act at all.
+    assert!(process(&host, first_authority.clone(), Operation::List).is_err());
+    let second = TerminalId::new();
+    let second_authority = spawn(second, Some(first), Some(first));
+    assert_eq!(list(&second_authority), vec![child.agent.id]);
+    assert!(status(&host, &second_authority, child.agent.id).is_ok());
+
+    let child_session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(child.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let child_authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(child_session)
+        .unwrap();
+    let Reply::Directory(directory) =
+        process(&host, child_authority, Operation::Directory(Scope::All)).unwrap()
+    else {
+        panic!("directory reply")
+    };
+    let relation = |id: TerminalId| {
+        directory
+            .sessions
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| (entry.relation, entry.lineage))
+    };
+    assert_eq!(relation(second), Some((Relation::Parent, Lineage(first))));
+    // The rival is a plain shell that owns nothing, so it is not listed.
+    assert_eq!(relation(rival), None);
+
+    // The rival's own lineage passes to its successor, though the chain's
+    // root is the original.
+    let rival_child = submit(&host, &rival_authority, rival_request).unwrap();
+    assert_eq!(settled(&host, rival_child.run.id).state, State::Succeeded);
+    exit(rival);
+    let rival_next = TerminalId::new();
+    let rival_next_authority = spawn(rival_next, Some(first), Some(rival));
+    assert_eq!(list(&rival_next_authority), vec![rival_child.agent.id]);
+    assert_eq!(list(&second_authority), vec![child.agent.id]);
+
+    close(&host, &second_authority, child.agent.id).unwrap();
+    close(&host, &rival_next_authority, rival_child.agent.id).unwrap();
+    exit(second);
+    exit(rival_next);
 }

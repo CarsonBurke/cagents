@@ -1495,6 +1495,7 @@ fn codex_terminal_view(
     let terminal = crate::model::TerminalSession {
         owned_codex_listener: session.owned_codex_listener.clone(),
         recovery_origin: None,
+        predecessor: None,
         id: chat_id,
         launch: recipe.clone(),
         continuity: crate::model::TerminalContinuity::RelaunchAvailable {
@@ -1760,6 +1761,28 @@ fn recover_account(
         }
     }
     let id = replacement.id;
+    // The checks above prove the candidate replaces the source, so it joins the
+    // source's lineage, unless another of its sessions runs, before its
+    // provider can delegate as anything else.
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .succeed(
+                id,
+                source.id,
+                source
+                    .terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.recovery_origin),
+                |members| {
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .any_other_live(members, source.id)
+                },
+            )
+            .map_err(unavailable)?;
+    }
     start(
         host,
         client,
@@ -1884,11 +1907,29 @@ fn process_inner(
                     "The old Codex owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
             }
+            let predecessor = source.id;
+            let root = source
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.recovery_origin);
             let mut session = source;
             session.reset_owned_codex_listener();
             session.id = TerminalId::new();
             session.proof = None;
             session.terminal = None;
+            // The old owner's close is proved, so the reopened conversation
+            // takes over its lineage, unless another of its sessions runs.
+            if let Ok(registry) = super::agent_execution::registry(host) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .succeed(session.id, predecessor, root, |members| {
+                        host.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .any_other_live(members, predecessor)
+                    })
+                    .map_err(unavailable)?;
+            }
             Ok(ServerResponse::ChatResumePrepared { session })
         }
         ClientRequest::ChatRecoverAccount {
@@ -2163,6 +2204,7 @@ fn process_inner(
             let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: terminal_id,
                 launch: recipe.clone(),
                 continuity: crate::model::TerminalContinuity::RelaunchAvailable {
@@ -2212,6 +2254,27 @@ fn process_inner(
                 recipe,
                 last_exit: None,
             };
+            // Teardown is proved, so the terminal takes over the chat's lineage
+            // and whatever agents it started, unless another of its sessions runs.
+            if let Ok(registry) = super::agent_execution::registry(host) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .succeed(
+                        terminal_id,
+                        chat_id,
+                        session
+                            .terminal
+                            .as_ref()
+                            .and_then(|terminal| terminal.recovery_origin),
+                        |members| {
+                            host.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .any_other_live(members, chat_id)
+                        },
+                    )
+                    .map_err(unavailable)?;
+            }
             let descriptor = super::state::spawn_terminal_with_environment(
                 host,
                 client,
@@ -3260,6 +3323,7 @@ for line in sys.stdin:
         let terminal = crate::model::TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: terminal_id,
             launch: recipe.clone(),
             continuity: crate::model::TerminalContinuity::RelaunchAvailable {
@@ -4280,6 +4344,10 @@ for line in sys.stdin:
         let mut client = crate::control::ControlClient::connect(&socket).unwrap();
         let started = Instant::now();
         if return_terminal {
+            host.lock().unwrap().install_model(
+                super::super::model::Registry::at(&directory.path().join("registry.sqlite3"))
+                    .unwrap(),
+            );
             host.lock().unwrap().register_client(1);
             let ServerResponse::ChatTerminal {
                 session: terminal, ..
@@ -4287,6 +4355,16 @@ for line in sys.stdin:
             else {
                 panic!("chat did not return to terminal")
             };
+            // The terminal takes over the chat's lineage and its agents.
+            assert_eq!(
+                super::super::agent_execution::registry(&host)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .session_lineage(terminal.id)
+                    .unwrap(),
+                Some(crate::agent_execution::Lineage(chat_id))
+            );
             assert!(
                 terminal
                     .launch

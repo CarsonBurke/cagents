@@ -107,6 +107,7 @@ impl RestoreFixture {
                     kind: CardKind::Terminal(TerminalSession {
                         owned_codex_listener: None,
                         recovery_origin: None,
+                        predecessor: None,
                         id: terminal_id,
                         launch: launch.clone(),
                         transcript_path: Some(PathBuf::from("/var/tmp/cagents/transcript.cast")),

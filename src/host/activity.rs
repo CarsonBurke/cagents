@@ -389,6 +389,7 @@ mod tests {
             TerminalSession {
                 id,
                 recovery_origin: None,
+                predecessor: None,
                 owned_codex_listener: None,
                 launch: launch.clone(),
                 transcript_path: None,

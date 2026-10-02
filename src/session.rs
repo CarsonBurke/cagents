@@ -2496,6 +2496,7 @@ mod tests {
                 kind: CardKind::Terminal(TerminalSession {
                     owned_codex_listener: None,
                     recovery_origin: None,
+                    predecessor: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
                     transcript_path: None,
@@ -2780,6 +2781,7 @@ mod tests {
         let terminal = |id| TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id,
             launch: launch.clone(),
             transcript_path: None,
@@ -3052,6 +3054,7 @@ mod tests {
         let replacement = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: new_id,
             launch: recipe.clone(),
             transcript_path: Some(PathBuf::from("/tmp/relaunched.log")),

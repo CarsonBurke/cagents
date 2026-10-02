@@ -222,6 +222,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 transcript_path: None,
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
             };
             let (descriptor, terminal_handle) = spawn_terminal_view_owned(
                 &successor,
@@ -548,6 +549,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
             transcript_path: None,
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
         };
         spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
         let mut pid = None;
@@ -610,6 +612,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
                 transcript_path: None,
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
             },
             previous_sources: Vec::new(),
             relaunches: Vec::new(),
@@ -821,6 +824,11 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         || !record.root.is_current(),
         "explicit Close did not reap provider",
     );
+    let registry_directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    rollback.lock().unwrap().install_model(
+        super::super::model::Registry::at(&registry_directory.path().join("registry.sqlite3"))
+            .unwrap(),
+    );
     // A normal close retains authenticated evidence for exact disk resume,
     // including descriptors issued before the replacement daemon attached.
     let crate::terminal::ipc::ServerResponse::ChatResumePrepared { session: reopened } =
@@ -849,6 +857,16 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
     assert_ne!(reopened.id, id);
     assert!(reopened.proof.is_none());
     assert!(reopened.terminal.is_none());
+    // The reopened conversation succeeds the closed one and what it owned.
+    assert_eq!(
+        super::super::agent_execution::registry(&rollback)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .session_lineage(reopened.id)
+            .unwrap(),
+        Some(crate::agent_execution::Lineage(id))
+    );
     for &(terminal, pid) in &terminals {
         let handle = rollback.lock().unwrap().terminals[&terminal].handle.clone();
         assert_eq!(

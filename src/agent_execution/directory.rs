@@ -51,7 +51,8 @@ pub enum Relation {
 pub enum Owner {
     /// A CLI caller outside any cagents session.
     User,
-    Session(TerminalId),
+    /// Every session of this lineage.
+    Session(super::Lineage),
     Automation(uuid::Uuid),
 }
 
@@ -76,7 +77,8 @@ pub struct Delegation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// The live session ID. It addresses this session until it exits; a
-    /// relaunched or recovered conversation is listed under a new ID.
+    /// relaunched or recovered session is listed under a new ID and the same
+    /// lineage.
     pub id: TerminalId,
     pub surface: Surface,
     /// Absent only for the caller's own plain shell.
@@ -91,6 +93,8 @@ pub struct Entry {
     pub project_name: Option<String>,
     pub delegation: Option<Delegation>,
     pub relation: Relation,
+    /// Stable across this session's relaunches and recoveries.
+    pub lineage: super::Lineage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +141,9 @@ impl Entry {
             line.push_str(&format!("  \"{title}\""));
         }
         line.push_str(relation);
+        if self.lineage.0 != self.id {
+            line.push_str(&format!("\n    lineage {}", self.lineage));
+        }
         if let Some(delegation) = &self.delegation {
             line.push_str(&format!("\n    agent {}", delegation.agent));
             if let Some(state) = delegation.run_state {

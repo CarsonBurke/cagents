@@ -102,7 +102,9 @@ use crate::{
 /// Snapshots require a matched set.
 /// Version 41 lets an agent's owner read its requests, answer and interrupt it.
 /// Version 42 adds native resume preparation, queue mutation and branching.
-pub const PROTOCOL_VERSION: u16 = 42;
+/// Version 43 keys delegated ownership to a session lineage and lists each
+/// session's lineage.
+pub const PROTOCOL_VERSION: u16 = 43;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -840,6 +842,7 @@ impl TerminalDescriptor {
             session: TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: terminal_id,
                 launch: recipe.clone(),
                 transcript_path,

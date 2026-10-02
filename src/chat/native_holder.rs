@@ -423,6 +423,7 @@ mod tests {
             resume_hint: None,
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
         });
         let holder = terminal_holder(&paired);
         assert!(
@@ -478,6 +479,7 @@ mod tests {
             transcript_path: None,
             owned_codex_listener: paired.owned_codex_listener.clone(),
             recovery_origin: None,
+            predecessor: None,
         });
         let holder = terminal_holder(&paired);
         assert!(
