@@ -1452,6 +1452,8 @@ impl Adapter for Codex {
                 self.history(&mut step, Some(cursor))?;
             }
             Command::Slash { .. } => return Err("Codex app-server has no TUI slash-command dispatcher; use the native model, compact, interrupt and prompt controls".into()),
+            Command::DismissPermissionDenial { tool_use_id } => step.events.push(Event::PermissionDenialDismissed { tool_use_id }),
+            Command::RefreshPermissions | Command::UpdatePermissionSettings { .. } => return Err("Permission rule settings are available for Claude sessions".into()),
         }
         Ok(step)
     }

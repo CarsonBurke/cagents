@@ -16,6 +16,7 @@ mod clipboard_image;
 mod completion;
 mod fold;
 mod images;
+mod permissions;
 mod prose;
 mod retained;
 mod scroll;
@@ -198,6 +199,13 @@ pub enum Action {
     Model(Target, String),
     Reasoning(Target, String, String),
     PermissionMode(Target, String),
+    PermissionRetry(Target, String),
+    PermissionDismiss(Target, String),
+    PermissionPage(Target, permissions::Page),
+    PermissionRuleText(Target, String),
+    PermissionBehavior(Target, chat::PermissionBehavior),
+    PermissionEnvironmentText(Target, String),
+    PermissionSetting(Target, chat::PermissionSettingsUpdate),
     Field(Target, String, String, String),
     Choice(Target, String, String, String),
     Answer(Target, String, String),
@@ -295,6 +303,13 @@ impl Action {
             | Self::Model(target, _)
             | Self::Reasoning(target, _, _)
             | Self::PermissionMode(target, _)
+            | Self::PermissionRetry(target, _)
+            | Self::PermissionDismiss(target, _)
+            | Self::PermissionPage(target, _)
+            | Self::PermissionRuleText(target, _)
+            | Self::PermissionBehavior(target, _)
+            | Self::PermissionEnvironmentText(target, _)
+            | Self::PermissionSetting(target, _)
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
@@ -1208,6 +1223,7 @@ pub(super) struct Runtime {
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
     permission_picker: bool,
+    permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
     /// Messages the provider accepted, oldest first, for Up and Down in the
@@ -1245,9 +1261,21 @@ pub(super) struct Runtime {
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
 pub(super) const COMPACT_COMMAND: &str = "compact";
+pub(super) const PERMISSIONS_COMMAND: &str = "permissions";
+
+fn permissions_available(snapshot: &Snapshot) -> bool {
+    !snapshot.capabilities.permission_modes.is_empty()
+        || !snapshot.permission_denials.is_empty()
+        || snapshot
+            .requests
+            .iter()
+            .any(|request| request.fields.is_empty())
+}
 
 /// What a draft beginning with `/` asks for, when it is not a message.
 enum SlashInvocation {
+    Permissions,
+    PermissionsArguments,
     /// One of the provider's own commands, sent through its dispatcher.
     Command(String),
     /// Compaction, offered as a command wherever the provider can do it.
@@ -1267,6 +1295,13 @@ fn slash_invocation(draft: &str, snapshot: &Snapshot) -> Option<SlashInvocation>
     let name = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
     if name.is_empty() {
         return None;
+    }
+    if name.eq_ignore_ascii_case(PERMISSIONS_COMMAND) && permissions_available(snapshot) {
+        return Some(if rest.eq_ignore_ascii_case(PERMISSIONS_COMMAND) {
+            SlashInvocation::Permissions
+        } else {
+            SlashInvocation::PermissionsArguments
+        });
     }
     if snapshot.commands.iter().any(|command| {
         command
@@ -1290,6 +1325,12 @@ fn submission(
     mode: PromptMode,
 ) -> Result<Command, &'static str> {
     match (mode, slash_invocation(text, snapshot)) {
+        (_, Some(SlashInvocation::Permissions)) => {
+            Err("Permissions are managed in the native permissions panel.")
+        }
+        (_, Some(SlashInvocation::PermissionsArguments)) => {
+            Err("Use /permissions without arguments to open the permissions panel.")
+        }
         (PromptMode::Send, Some(SlashInvocation::Command(_))) if !attachments.is_empty() => {
             Err("Send attachments with a message, not a slash command.")
         }
@@ -1534,6 +1575,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
+            permissions_form: permissions::Form::default(),
             account_picker: false,
             history: Vec::new(),
             history_cursor: None,
@@ -5638,6 +5680,29 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if matches!(
+                    slash_invocation(&runtime.composer.text(), &runtime.snapshot),
+                    Some(SlashInvocation::PermissionsArguments)
+                ) {
+                    runtime.error = Some(
+                        "Use /permissions without arguments to open the permissions panel.".into(),
+                    );
+                    return Task::none();
+                }
+                if matches!(
+                    slash_invocation(&runtime.composer.text(), &runtime.snapshot),
+                    Some(SlashInvocation::Permissions)
+                ) {
+                    if runtime.pastes_pending > 0 {
+                        runtime.error = Some(
+                            "Wait for the paste to finish, or use the permissions button.".into(),
+                        );
+                        return Task::none();
+                    }
+                    runtime.replace_draft(text_editor::Content::new());
+                    runtime.error = None;
+                    return self.handle_chat_ui(Action::PermissionPicker(target, true));
+                }
                 if runtime.pastes_pending > 0 {
                     runtime.submit_after_paste = Some(mode);
                     return Task::none();
@@ -5770,8 +5835,68 @@ impl Cagents {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
                         runtime.account_picker = false;
+                        runtime.permissions_form.page = permissions::Page::Blocked;
+                        if runtime.session.launch.provider == Provider::Claude
+                            && !runtime.is_draft()
+                        {
+                            return self.chat_send(target, Command::RefreshPermissions, false);
+                        }
                     }
                 }
+            }
+            Action::PermissionPage(target, page) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.permissions_form.page = page;
+                }
+            }
+            Action::PermissionRuleText(target, text) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.permissions_form.rule = text;
+                }
+            }
+            Action::PermissionBehavior(target, behavior) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.permissions_form.behavior = behavior;
+                }
+            }
+            Action::PermissionEnvironmentText(target, text) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.permissions_form.environment = text;
+                }
+            }
+            Action::PermissionSetting(target, update) => {
+                return self.chat_send(target, Command::UpdatePermissionSettings { update }, false);
+            }
+            Action::PermissionRetry(target, id) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if let Some(denial) = runtime
+                    .snapshot
+                    .permission_denials
+                    .iter()
+                    .find(|denial| denial.tool_use_id == id)
+                    && let Some(retry) = permissions::retry_draft(denial)
+                {
+                    let mut draft = runtime.composer.text();
+                    if !draft.trim().is_empty() {
+                        draft.push_str("\n\n");
+                    }
+                    draft.push_str(&retry);
+                    runtime.replace_draft(text_editor::Content::with_text(&draft));
+                    runtime.permission_picker = false;
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ));
+                }
+            }
+            Action::PermissionDismiss(target, tool_use_id) => {
+                return self.chat_send(
+                    target,
+                    Command::DismissPermissionDenial { tool_use_id },
+                    false,
+                );
             }
             Action::Files(target, directory, files) => {
                 self.chat_ui.files.insert(directory.clone(), files.clone());
@@ -6781,6 +6906,84 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_permissions_opens_locally_even_while_busy_and_preserves_attachments() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("permissions"));
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.permission_modes = vec!["manual".into(), "auto".into()];
+        snapshot.commands.push(chat::SlashCommand {
+            name: "permissions".into(),
+            description: "Provider dialog".into(),
+        });
+        runtime.replace_draft(text_editor::Content::with_text("/PERMISSIONS"));
+        runtime.attachments.push(Attachment {
+            path: "retained.png".into(),
+        });
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.permission_picker);
+        assert!(runtime.composer.text().trim().is_empty());
+        assert_eq!(runtime.attachments[0].path, PathBuf::from("retained.png"));
+        assert!(runtime.followup.is_none());
+        assert!(runtime.pending.is_none());
+        assert!(app.dismiss_chat_picker());
+        assert!(!chat_runtime(&app, card).permission_picker);
+        assert!(
+            submission(
+                "/permissions allow Bash(*)",
+                &chat_runtime(&app, card).snapshot,
+                &[],
+                PromptMode::Steer
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn permission_retry_preserves_the_draft_and_requires_a_current_exact_action() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("permissions"));
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        Arc::make_mut(&mut runtime.snapshot)
+            .permission_denials
+            .push(chat::PermissionDenial {
+                tool_use_id: "blocked".into(),
+                tool_name: "Bash".into(),
+                tool_input: Some("{\"command\":\"git push origin topic\"}".into()),
+                reason: "Auto denied".into(),
+                reason_type: Some("classifier".into()),
+                agent_id: None,
+            });
+        runtime.replace_draft(text_editor::Content::with_text("Keep this next task"));
+        runtime.attachments.push(Attachment {
+            path: "retained.png".into(),
+        });
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::PermissionRetry(target, "stale".into())));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "Keep this next task"
+        );
+        drop(app.handle_chat_ui(Action::PermissionRetry(target, "blocked".into())));
+        let runtime = chat_runtime(&app, card);
+        let draft = runtime.composer.text();
+        assert!(draft.starts_with("Keep this next task\n\nI authorize"));
+        assert!(draft.contains("git push origin topic"));
+        assert_eq!(runtime.attachments.len(), 1);
+        assert!(runtime.pending.is_none());
+        assert_eq!(runtime.snapshot.permission_denials.len(), 1);
+    }
+
     #[test]
     fn image_gallery_is_modal_and_reuses_the_transcript_handle() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

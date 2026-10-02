@@ -745,6 +745,10 @@ pub struct Snapshot {
     pub reasoning: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub permissions: Option<PermissionSettings>,
+    #[serde(default)]
+    pub permission_denials: Vec<PermissionDenial>,
     pub commands: Vec<SlashCommand>,
     pub skills: Vec<Skill>,
     pub usage: Usage,
@@ -800,6 +804,23 @@ pub struct QueuedMessage {
 pub struct BranchPoint {
     pub id: String,
     pub label: String,
+}
+
+/// A denied tool call is advisory evidence, never a pending approval to replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDenial {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    /// Exact JSON, represented as text for the postcard IPC codec.
+    pub tool_input: Option<String>,
+    pub reason: String,
+    pub reason_type: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+impl PermissionDenial {
+    pub const LIMIT: usize = 64;
+    pub const INPUT_LIMIT: usize = 64 * 1024;
 }
 
 impl QueuedMessage {
@@ -914,6 +935,13 @@ pub enum Command {
     SetPermissionMode {
         mode: String,
     },
+    RefreshPermissions,
+    UpdatePermissionSettings {
+        update: PermissionSettingsUpdate,
+    },
+    DismissPermissionDenial {
+        tool_use_id: String,
+    },
     Compact,
     Refresh,
     LoadEarlier,
@@ -944,6 +972,65 @@ pub enum Command {
 pub struct Answer {
     pub field: String,
     pub values: Vec<String>,
+}
+
+/// Permission metadata supplied by the provider, without unrelated settings
+/// such as environment variables, hooks, or account credentials.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSettings {
+    pub rules: Vec<PermissionRule>,
+    pub environment: Vec<PermissionEnvironment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionBehavior {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl PermissionBehavior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub behavior: PermissionBehavior,
+    pub rule: String,
+    /// Claude source identity. Only `flagSettings` is editable in this view.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionEnvironment {
+    pub text: String,
+    pub source: String,
+}
+
+/// Changes affect this running conversation's flag settings, never files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionSettingsUpdate {
+    AddRule {
+        behavior: PermissionBehavior,
+        rule: String,
+    },
+    RemoveRule {
+        behavior: PermissionBehavior,
+        rule: String,
+    },
+    AddEnvironment {
+        text: String,
+    },
+    RemoveEnvironment {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1409,6 +1496,11 @@ pub enum Event {
     },
     Capabilities(Capabilities),
     PermissionMode(Option<String>),
+    PermissionSettings(PermissionSettings),
+    PermissionDenied(PermissionDenial),
+    PermissionDenialDismissed {
+        tool_use_id: String,
+    },
     Models {
         models: Vec<Model>,
         selected: Option<String>,

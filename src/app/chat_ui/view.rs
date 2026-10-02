@@ -1,6 +1,6 @@
 use super::*;
 
-fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
+pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
         .size(design::TEXT_BODY)
         .width(Length::Fill)
@@ -769,7 +769,7 @@ struct Place {
 impl Runtime {
     // Provider descriptions can contain a whole prompt. Keep status controls
     // compact while the full transcript remains available on selection.
-    fn short_description(raw: &str, limit: usize) -> String {
+    pub(super) fn short_description(raw: &str, limit: usize) -> String {
         let mut chars = raw.chars();
         let text: String = chars.by_ref().take(limit).collect();
         if chars.next().is_some() {
@@ -1811,35 +1811,67 @@ impl Runtime {
             // and four decimals of a dollar is a number nobody reads.
             spend.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
         }
-        content.push(
-            widget::row::with_children(vec![
-                widget::scrollable(
-                    widget::row::with_children(status)
-                        .spacing(step::GAP_S)
-                        .align_y(Alignment::Center)
-                        // The thumb floats over the row it belongs to, so its
-                        // rail is reserved below the content the way every
-                        // other scrollable in the app reserves one.
-                        .padding(design::with_horizontal_rail(iced::Padding::ZERO)),
-                )
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    design::scrollbar(),
-                ))
-                .width(Length::Fill)
-                .into(),
-                widget::row::with_children(spend)
+        let mut footer = vec![
+            widget::scrollable(
+                widget::row::with_children(status)
                     .spacing(step::GAP_S)
                     .align_y(Alignment::Center)
-                    // The scrolling half reserves a rail under itself, so the
-                    // pinned half reserves the same strip and the two read as
-                    // one line rather than sitting half a rail apart.
-                    .padding(design::with_horizontal_rail(iced::Padding::ZERO))
-                    .into(),
-            ])
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
+                    // The thumb floats over the row it belongs to, so its
+                    // rail is reserved below the content the way every
+                    // other scrollable in the app reserves one.
+                    .padding(design::with_horizontal_rail(iced::Padding::ZERO)),
+            )
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill)
             .into(),
+        ];
+        if let Some(notice) = permissions::notice(snapshot) {
+            footer.push(
+                widget::button::custom(
+                    widget::row::with_children(vec![
+                        crate::ui_controls::passive_icon(
+                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic"),
+                            design::COMPACT_ICON_SIZE,
+                        ),
+                        design::caption(notice)
+                            .class(cosmic::theme::Text::Custom(design::warning_text))
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into(),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                )
+                .name("Resolve blocked permissions")
+                .class(crate::ui_controls::control_style(
+                    self.permission_picker,
+                    None,
+                ))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(
+                    target,
+                    !self.permission_picker,
+                )))
+                .into(),
+            );
+        }
+        footer.push(
+            widget::row::with_children(spend)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .padding(design::with_horizontal_rail(iced::Padding::ZERO))
+                .into(),
         );
+        content.push(crate::ui_controls::popover(
+            widget::row::with_children(footer)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            self.permission_picker
+                .then(|| self.permissions_view(available, content_width - 32.0)),
+            widget::popover::Position::Top,
+            action(Action::PermissionPicker(target, false)),
+        ));
         let pane = widget::container(
             widget::column::with_children(content)
                 .spacing(step::GAP_S)
@@ -2100,32 +2132,7 @@ impl Runtime {
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::PermissionPicker(target, !open)));
-                let choices = open.then(|| {
-                    widget::column::with_children(
-                        modes
-                            .iter()
-                            .enumerate()
-                            .map(|(index, mode)| {
-                                widget::button::custom(design::body(permission_mode_label(mode)))
-                                    .class(crate::ui_controls::control_style(
-                                        Some(index) == selected,
-                                        None,
-                                    ))
-                                    .width(Length::Fill)
-                                    .on_press(action(Action::PermissionMode(target, mode.clone())))
-                                    .into()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .width(200)
-                    .into()
-                });
-                controls.push(crate::ui_controls::popover(
-                    anchor,
-                    choices,
-                    widget::popover::Position::Top,
-                    action(Action::PermissionPicker(target, false)),
-                ));
+                controls.push(anchor.into());
             }
         }
         controls
@@ -3112,7 +3119,7 @@ impl Runtime {
     }
 }
 
-fn permission_mode_label(mode: &str) -> &str {
+pub(super) fn permission_mode_label(mode: &str) -> &str {
     match mode {
         "default" | "manual" => "Ask before edits",
         "readOnly" => "Read only",
@@ -3193,7 +3200,7 @@ pub(super) type Answers = HashMap<(String, String), Vec<String>>;
 /// blob of JSON, a stray text field and the decisions themselves all had
 /// the same weight, so the one thing the reader had to do was the hardest
 /// thing on it to find.
-fn request_view<'a>(
+pub(super) fn request_view<'a>(
     target: Target,
     request: &'a chat::Request,
     answers: &'a Answers,

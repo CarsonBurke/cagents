@@ -314,6 +314,10 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<String, Item>,
+    tool_inputs: HashMap<String, String>,
+    tool_input_order: VecDeque<String>,
+    dismissed_denials: VecDeque<String>,
+    permissions: Option<super::claude_permissions::Snapshot>,
     tool_order: VecDeque<String>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
@@ -362,6 +366,8 @@ impl Claude {
             .ok_or("Malformed native Claude control operation")?;
         wire.remove("_cagents_reasoning");
         wire.remove("_cagents_turn");
+        wire.remove("_cagents_permissions");
+        wire.remove("_cagents_permission_update");
         Ok(Step {
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
             events: vec![],
@@ -407,8 +413,24 @@ impl Claude {
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(id) = self.tool_order.pop_front() {
                 self.tools.remove(&id);
+                self.tool_inputs.remove(&id);
             }
         }
+    }
+    fn remember_tool_input(&mut self, id: &str, input: &Value) -> Result<(), String> {
+        if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
+            return Ok(());
+        }
+        if !self.tool_inputs.contains_key(id) {
+            self.tool_input_order.push_back(id.into());
+        }
+        self.tool_inputs.insert(id.into(), input.to_string());
+        while self.tool_input_order.len() > chat::PermissionDenial::LIMIT {
+            if let Some(expired) = self.tool_input_order.pop_front() {
+                self.tool_inputs.remove(&expired);
+            }
+        }
+        Ok(())
     }
     fn send_prompt(
         &mut self,
@@ -512,7 +534,7 @@ impl Claude {
         }
         let response = match action.as_str() {
             "deny" => json!({"behavior":"deny", "message":"The user denied this request"}),
-            "allow" => {
+            "allow" | "allow_session" => {
                 let mut input = request["input"].clone();
                 if string(request, "tool_name") == "AskUserQuestion" {
                     let fields = question_fields(&input)?;
@@ -542,7 +564,12 @@ impl Claude {
                 } else if !answers.is_empty() {
                     return Err("This Claude approval does not accept form answers".into());
                 }
-                json!({"behavior":"allow", "updatedInput":input})
+                let mut response = json!({"behavior":"allow", "updatedInput":input});
+                if action == "allow_session" {
+                    response["updatedPermissions"] = session_permission_suggestions(request)
+                        .ok_or("This request has no safe scoped session permission suggestion")?;
+                }
+                response
             }
             _ => return Err("Unsupported Claude decision; explicitly allow or deny".into()),
         };
@@ -555,6 +582,22 @@ impl Claude {
             ],
             events: vec![],
         };
+        if action == "deny"
+            && string(request, "tool_name") != "AskUserQuestion"
+            && let Some(tool_use_id) = request["tool_use_id"].as_str()
+        {
+            self.permission_denied(
+                &json!({
+                    "tool_use_id": tool_use_id,
+                    "tool_name": request["tool_name"],
+                    "tool_input": request["input"],
+                    "decision_reason_type": "userDenied",
+                    "decision_reason": "You denied this request",
+                    "agent_id": request["agent_id"],
+                }),
+                &mut step,
+            )?;
+        }
         self.retire(id, &mut step);
         Ok(step)
     }
@@ -618,13 +661,27 @@ impl Claude {
         } else {
             vec![]
         };
-        let description = format!("{}\n{}", string(request, "description"), request["input"]);
+        let description = format!(
+            "{}\n{}\n{}",
+            string(request, "description"),
+            clean_permission_text(string(request, "decision_reason")),
+            request["input"]
+        );
+        let mut actions = vec![choice("allow", "Allow once")];
+        if name != "AskUserQuestion"
+            && let Some(suggestions) = session_permission_suggestions(request)
+        {
+            let mut session = choice("allow_session", "Allow for session");
+            session.description = format!("Session only: {suggestions}");
+            actions.push(session);
+        }
+        actions.push(choice("deny", "Deny"));
         let event = Request {
             id: id.clone(),
             title: format!("Claude: {name}"),
             description,
             fields,
-            actions: vec![choice("allow", "Allow once"), choice("deny", "Deny")],
+            actions,
         };
         self.pending.insert(id, raw);
         Ok(Step {
@@ -904,6 +961,7 @@ impl Claude {
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
+                        self.remember_tool_input(&tool_id, &block["input"])?;
                         let item = Item {
                             id: tool_id.clone(),
                             role: Role::Assistant,
@@ -1374,6 +1432,49 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"set_permission_mode", "mode":mode}))
             }
+            Command::DismissPermissionDenial { tool_use_id } => {
+                if tool_use_id.is_empty() || tool_use_id.len() > 4096 {
+                    return Err("Invalid Claude denied tool identifier".into());
+                }
+                if !self.dismissed_denials.contains(&tool_use_id) {
+                    self.dismissed_denials.push_back(tool_use_id.clone());
+                    if self.dismissed_denials.len() > chat::PermissionDenial::LIMIT {
+                        self.dismissed_denials.pop_front();
+                    }
+                }
+                Ok(Step {
+                    events: vec![Event::PermissionDenialDismissed { tool_use_id }],
+                    ..Step::default()
+                })
+            }
+            Command::RefreshPermissions => {
+                if self.controls.values().any(|request| {
+                    string(request, "subtype") == "get_settings"
+                        || request["_cagents_permissions"].as_bool() == Some(true)
+                }) {
+                    return Err(
+                        "Claude permission settings are already being refreshed or updated".into(),
+                    );
+                }
+                self.permissions = None;
+                self.control(json!({"subtype":"get_settings"}))
+            }
+            Command::UpdatePermissionSettings { update } => {
+                if self.controls.values().any(|request| {
+                    string(request, "subtype") == "get_settings"
+                        || request["_cagents_permissions"].as_bool() == Some(true)
+                }) {
+                    return Err(
+                        "Wait for Claude to confirm the previous permission settings change".into(),
+                    );
+                }
+                let settings = self
+                    .permissions
+                    .as_ref()
+                    .ok_or("Refresh Claude permission settings before changing them")?
+                    .update(&update)?;
+                self.control(json!({"subtype":"apply_flag_settings", "settings":settings, "_cagents_permissions":true, "_cagents_permission_update":update}))
+            }
             Command::Compact => {
                 if !self.capabilities().compact {
                     return Err("This Claude session does not advertise /compact".into());
@@ -1480,6 +1581,10 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.tool_inputs.clear();
+                self.tool_input_order.clear();
+                self.dismissed_denials.clear();
+                self.permissions = None;
                 self.tool_order.clear();
                 self.tasks.clear();
                 self.agent_tasks.clear();
@@ -1572,6 +1677,35 @@ impl Adapter for Claude {
                             let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
                             step.writes.extend(next.writes);
                         }
+                        "get_settings" => {
+                            let snapshot =
+                                super::claude_permissions::Snapshot::parse(&response["response"])?;
+                            step.events
+                                .push(Event::PermissionSettings(snapshot.settings.clone()));
+                            if let Some(update) = request.get("_cagents_permission_update") {
+                                let update =
+                                    serde_json::from_value::<chat::PermissionSettingsUpdate>(
+                                        update.clone(),
+                                    )
+                                    .map_err(
+                                        |_| "Malformed pending Claude permission settings update",
+                                    )?;
+                                if let Err(message) = snapshot.confirm(&update) {
+                                    step.events.push(Event::Error {
+                                        message,
+                                        fatal: false,
+                                    });
+                                }
+                            }
+                            self.permissions = Some(snapshot);
+                        }
+                        "apply_flag_settings"
+                            if request["_cagents_permissions"].as_bool() == Some(true) =>
+                        {
+                            self.permissions = None;
+                            let next = self.control(json!({"subtype":"get_settings", "_cagents_permission_update":request["_cagents_permission_update"]}))?;
+                            step.writes.extend(next.writes);
+                        }
                         "apply_flag_settings" => {
                             self.reasoning = request["settings"]["effortLevel"]
                                 .as_str()
@@ -1631,6 +1765,14 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
+                for denial in frame["permission_denials"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(chat::PermissionDenial::LIMIT)
+                {
+                    self.permission_denied(denial, &mut step)?;
+                }
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
                 if had_turn || frame["uuid"].as_str().is_some() {
@@ -1842,6 +1984,75 @@ fn rate_limit_detail(info: &Value) -> String {
         Some("rejected") => format!("Claude's usage limit is reached{resets}"),
         Some(other) => format!("Claude usage limit {other}{resets}"),
     }
+}
+
+/// Only a provider-suggested allow rule scoped to this tool action can be
+/// remembered. Never accept mode changes, whole-tool rules or directory grants.
+fn session_permission_suggestions(request: &Value) -> Option<Value> {
+    if request["suppress_always_allow_rule"].as_bool() == Some(true) {
+        return None;
+    }
+    let suggestions = request["permission_suggestions"].as_array()?;
+    if suggestions.is_empty() || suggestions.len() > 16 {
+        return None;
+    }
+    let tool = request["tool_name"].as_str()?;
+    let mut scoped = Vec::new();
+    for suggestion in suggestions {
+        if string(suggestion, "type") != "addRules" || string(suggestion, "behavior") != "allow" {
+            return None;
+        }
+        let rules = suggestion["rules"].as_array()?;
+        if rules.is_empty() || rules.len() > 16 {
+            return None;
+        }
+        for rule in rules {
+            let content = rule["ruleContent"].as_str()?.trim();
+            if string(rule, "toolName") != tool
+                || content.is_empty()
+                || content.starts_with('*')
+                || matches!(content, "/**" | "/*" | "*:*" | ":*")
+                || content.len() > 4096
+                || content.chars().any(char::is_control)
+            {
+                return None;
+            }
+        }
+        scoped.push(
+            json!({"type":"addRules", "rules":rules, "behavior":"allow", "destination":"session"}),
+        );
+    }
+    Some(Value::Array(scoped))
+}
+
+/// SDK permission reasons can carry ANSI escapes. Keep them plain on every surface.
+fn clean_permission_text(value: &str) -> String {
+    let mut chars = value.chars().peekable();
+    let mut plain = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for code in chars.by_ref() {
+                        if ('@'..='~').contains(&code) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(code) = chars.next() {
+                        if code == '\u{7}' || (code == '\u{1b}' && chars.next() == Some('\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if !ch.is_control() || ch == '\n' || ch == '\t' {
+            plain.push(ch);
+        }
+    }
+    plain
 }
 
 fn choice(id: &str, label: &str) -> Choice {
@@ -2902,6 +3113,7 @@ impl Claude {
                         // accumulate as a plain tool call and the richer
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
+                        self.remember_tool_input(&item.id, &parsed)?;
                         if !matches!(content, ItemContent::Tool { .. }) {
                             item.content = content;
                             step.events.push(Event::Item(item.clone()));
@@ -2937,6 +3149,43 @@ impl Claude {
         self.blocks.retain(|(id, _), _| id != message);
     }
 
+    fn permission_denied(&self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        let id = required(frame, "tool_use_id")?;
+        if self
+            .dismissed_denials
+            .iter()
+            .any(|dismissed| dismissed == id)
+        {
+            return Ok(());
+        }
+        let name = required(frame, "tool_name")?;
+        let input = if frame["tool_input"].is_object() {
+            Some(frame["tool_input"].to_string())
+        } else {
+            self.tool_inputs.get(id).cloned()
+        }
+        .filter(|input| input.len() <= chat::PermissionDenial::INPUT_LIMIT);
+        let bounded = |value: &str| {
+            let mut text = clean_permission_text(value);
+            text.truncate(text.floor_char_boundary(4096));
+            text
+        };
+        step.events
+            .push(Event::PermissionDenied(chat::PermissionDenial {
+                tool_use_id: bounded(id),
+                tool_name: bounded(name),
+                tool_input: input,
+                reason: bounded(
+                    frame["decision_reason"]
+                        .as_str()
+                        .unwrap_or(string(frame, "message")),
+                ),
+                reason_type: frame["decision_reason_type"].as_str().map(bounded),
+                agent_id: frame["agent_id"].as_str().map(bounded),
+            }));
+        Ok(())
+    }
+
     fn system(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         // Both initial metadata and autonomous plan-mode transitions report
         // the effective permission mode, independent of our control replies.
@@ -2946,6 +3195,7 @@ impl Claude {
             )));
         }
         match string(frame, "subtype") {
+            "permission_denied" => self.permission_denied(frame, step)?,
             "init" | "commands_changed" => self.metadata(frame, step),
             "model_refusal_fallback" => {
                 self.retract(&frame["retracted_message_uuids"], step)?;
@@ -3891,6 +4141,169 @@ mod tests {
     use crate::agent::Provider;
     use std::io::Write as _;
 
+    #[test]
+    fn permission_settings_changes_wait_for_provider_confirmation_and_preserve_reasoning() {
+        let mut adapter = Claude {
+            reasoning: Some("high".into()),
+            ..Claude::default()
+        };
+        let update = Command::UpdatePermissionSettings {
+            update: chat::PermissionSettingsUpdate::AddEnvironment {
+                text: "This is a disposable checkout.".into(),
+            },
+        };
+        assert!(adapter.command(update.clone()).is_err());
+        let read = adapter.command(Command::RefreshPermissions).unwrap();
+        assert_eq!(read.writes[0]["request"]["subtype"], "get_settings");
+        assert!(adapter.command(update.clone()).is_err());
+        let confirmed = adapter
+            .receive(json!({"type":"control_response","response":{
+                "subtype":"success","request_id":read.writes[0]["request_id"],
+                "response":{"effective":{},"sources":[]}
+            }}))
+            .unwrap();
+        assert!(matches!(
+            confirmed.events.as_slice(),
+            [Event::PermissionSettings(_)]
+        ));
+        let apply = adapter.command(update.clone()).unwrap();
+        assert_eq!(
+            apply.writes[0]["request"],
+            json!({"subtype":"apply_flag_settings","settings":{
+                "autoMode":{"environment":["$defaults","This is a disposable checkout."]}
+            }})
+        );
+        assert!(apply.events.is_empty());
+        assert!(adapter.command(update.clone()).is_err());
+        let acknowledged = adapter
+            .receive(json!({"type":"control_response","response":{
+                "subtype":"success","request_id":apply.writes[0]["request_id"],"response":{}
+            }}))
+            .unwrap();
+        assert!(acknowledged.events.is_empty());
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+        assert_eq!(acknowledged.writes[0]["request"]["subtype"], "get_settings");
+        assert!(adapter.command(update).is_err());
+        let confirmed = adapter.receive(json!({"type":"control_response","response":{
+            "subtype":"success","request_id":acknowledged.writes[0]["request_id"],
+            "response":{"effective":{"autoMode":{"environment":["$defaults","This is a disposable checkout."]}},
+                "sources":[{"source":"flagSettings","settings":{"autoMode":{"environment":["$defaults","This is a disposable checkout."]}}}]}
+        }})).unwrap();
+        let Event::PermissionSettings(settings) = &confirmed.events[0] else {
+            panic!("settings metadata missing")
+        };
+        assert_eq!(
+            settings.environment,
+            vec![chat::PermissionEnvironment {
+                text: "This is a disposable checkout.".into(),
+                source: "flagSettings".into()
+            }]
+        );
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn rejected_permission_settings_update_keeps_last_provider_confirmed_metadata() {
+        let mut adapter = Claude::default();
+        adapter.permissions = Some(
+            super::super::claude_permissions::Snapshot::parse(
+                &json!({"effective":{},"sources":[]}),
+            )
+            .unwrap(),
+        );
+        let apply = adapter
+            .command(Command::UpdatePermissionSettings {
+                update: chat::PermissionSettingsUpdate::AddRule {
+                    behavior: chat::PermissionBehavior::Allow,
+                    rule: "Read(./docs/**)".into(),
+                },
+            })
+            .unwrap();
+        let failed = adapter.receive(json!({"type":"control_response","response":{
+            "subtype":"error","request_id":apply.writes[0]["request_id"],"error":"Policy rejected the change"
+        }})).unwrap();
+        assert!(matches!(
+            failed.events.as_slice(),
+            [Event::Error { fatal: false, .. }]
+        ));
+        assert!(failed.writes.is_empty());
+        assert!(adapter.permissions.unwrap().settings.rules.is_empty());
+    }
+
+    #[test]
+    fn silently_ignored_permission_edits_report_actual_metadata_and_actionable_errors() {
+        let rule = "Read(./docs/**)";
+        let context = "Disposable checkout";
+        for update in [
+            chat::PermissionSettingsUpdate::AddRule {
+                behavior: chat::PermissionBehavior::Allow,
+                rule: rule.into(),
+            },
+            chat::PermissionSettingsUpdate::RemoveRule {
+                behavior: chat::PermissionBehavior::Allow,
+                rule: rule.into(),
+            },
+            chat::PermissionSettingsUpdate::AddEnvironment {
+                text: context.into(),
+            },
+            chat::PermissionSettingsUpdate::RemoveEnvironment {
+                text: context.into(),
+            },
+        ] {
+            let removal = matches!(
+                &update,
+                chat::PermissionSettingsUpdate::RemoveRule { .. }
+                    | chat::PermissionSettingsUpdate::RemoveEnvironment { .. }
+            );
+            let sources = if removal {
+                json!([{"source":"flagSettings","settings":{"permissions":{"allow":[rule]},"autoMode":{"environment":[context]}}}])
+            } else {
+                // An inherited match does not prove the session edit applied.
+                json!([{"source":"userSettings","settings":{"permissions":{"allow":[rule]},"autoMode":{"environment":[context]}}}])
+            };
+            let returned = json!({"effective":{},"sources":sources});
+            let mut adapter = Claude::default();
+            adapter.permissions =
+                Some(super::super::claude_permissions::Snapshot::parse(&returned).unwrap());
+            let apply = adapter
+                .command(Command::UpdatePermissionSettings { update })
+                .unwrap();
+            assert!(
+                apply.writes[0]["request"]
+                    .get("_cagents_permission_update")
+                    .is_none()
+            );
+            let ack = adapter
+                .receive(json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":apply.writes[0]["request_id"],"response":{}
+                }}))
+                .unwrap();
+            assert_eq!(ack.writes[0]["request"], json!({"subtype":"get_settings"}));
+            let confirmed = adapter
+                .receive(json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":ack.writes[0]["request_id"],"response":returned
+                }}))
+                .unwrap();
+            assert!(matches!(
+                confirmed.events.as_slice(),
+                [
+                    Event::PermissionSettings(_),
+                    Event::Error { fatal: false, .. }
+                ]
+            ));
+            let Event::Error { message, .. } = &confirmed.events[1] else {
+                unreachable!()
+            };
+            assert!(message.contains(if removal {
+                "did not remove"
+            } else {
+                "did not apply"
+            }));
+            assert!(message.contains("actual settings"));
+            assert!(adapter.permissions.is_some());
+        }
+    }
+
     /// The status line is one row of prose a reader watches while a turn
     /// runs. A usage-limit frame has to reach it as a sentence, and has to
     /// stay off it entirely while the limit is not biting.
@@ -3987,6 +4400,64 @@ mod tests {
 
     fn approval(id: &str, tool: &str, input: Value) -> Value {
         json!({"type":"control_request", "request_id":id, "request":{"subtype":"can_use_tool", "tool_name":tool, "tool_use_id":"tool-1", "input":input}})
+    }
+    #[test]
+    fn permission_denials_preserve_exact_input_and_advisory_reason() {
+        let mut adapter = Claude::default();
+        let input = json!({"command":"git push origin feature", "timeout":120000});
+        adapter.receive(json!({"type":"assistant","uuid":"msg","message":{"role":"assistant","content":[{"type":"tool_use","id":"blocked","name":"Bash","input":input}]}})).unwrap();
+        let advisory = adapter.receive(json!({"type":"system","subtype":"permission_denied","tool_use_id":"blocked","tool_name":"Bash","decision_reason":"\u{1b}[31mPush needs approval\u{1b}[0m","decision_reason_type":"classifier","agent_id":"child"})).unwrap();
+        let Event::PermissionDenied(denial) = &advisory.events[0] else {
+            panic!("missing denial")
+        };
+        assert_eq!(denial.reason, "Push needs approval");
+        assert_eq!(denial.agent_id.as_deref(), Some("child"));
+        assert_eq!(
+            serde_json::from_str::<Value>(denial.tool_input.as_ref().unwrap()).unwrap(),
+            input
+        );
+        let result = adapter.receive(json!({"type":"result","permission_denials":[{"tool_use_id":"blocked","tool_name":"Bash","tool_input":input}]})).unwrap();
+        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_use_id == "blocked" && d.tool_input.is_some())));
+        adapter
+            .command(Command::DismissPermissionDenial {
+                tool_use_id: "blocked".into(),
+            })
+            .unwrap();
+        let duplicate = adapter.receive(json!({"type":"result","permission_denials":[{"tool_use_id":"blocked","tool_name":"Bash","tool_input":input}]})).unwrap();
+        assert!(
+            !duplicate
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PermissionDenied(_)))
+        );
+    }
+
+    #[test]
+    fn session_approval_only_uses_narrow_provider_rules_and_exact_input() {
+        let mut adapter = Claude::default();
+        let input = json!({"command":"git push origin feature"});
+        let mut request = approval("scoped", "Bash", input.clone());
+        request["request"]["permission_suggestions"] = json!([{"type":"addRules","behavior":"allow","destination":"userSettings","rules":[{"toolName":"Bash","ruleContent":"git push origin feature"}]}]);
+        let step = adapter.receive(request.clone()).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Request(r) if r.actions.iter().any(|a| a.id == "allow_session"))));
+        let answer = adapter
+            .answer("scoped".into(), "allow_session".into(), vec![])
+            .unwrap();
+        assert_eq!(
+            answer.writes[0]["response"]["response"]["updatedInput"],
+            input
+        );
+        assert_eq!(
+            answer.writes[0]["response"]["response"]["updatedPermissions"][0]["destination"],
+            "session"
+        );
+        request["request"]["suppress_always_allow_rule"] = json!(true);
+        assert!(session_permission_suggestions(&request["request"]).is_none());
+        request["request"]["suppress_always_allow_rule"] = json!(false);
+        request["request"]["permission_suggestions"][0]["rules"][0]["ruleContent"] = json!("*");
+        assert!(session_permission_suggestions(&request["request"]).is_none());
+        request["request"]["permission_suggestions"][0]["type"] = json!("setMode");
+        assert!(session_permission_suggestions(&request["request"]).is_none());
     }
     fn reply(id: &str, data: Value) -> Value {
         json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":data}})

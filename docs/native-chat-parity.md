@@ -19,7 +19,8 @@ app-server 0.159.3, and Oh My Pi 18.2.9.
 | Child approvals | Provider permission requests | Explicit, labeled child requests | Provider input dialogs |
 | Direct child messaging, stop and restart controls | No native controls | Remaining native UI gap | RPC unavailable |
 | Model, reasoning, attachments, skills, compaction | Supported where provider advertises them | Supported | Supported |
-| Runtime permission policy | Provider modes | Common policy presets | Launch/settings configuration |
+| Runtime permission policy | Provider modes; source-labelled rules and Auto context with live-session edits | Common policy presets | Launch/settings configuration |
+| Permission recovery | Footer notice, denied input/reason, explicit retry drafts, pending approvals | Pending approvals | Pending approvals |
 | Steering timing | Next delivery boundary | Active turn steering | Between tools or after the turn |
 
 Claude async steering and queueing are enabled for 2.1.286 and newer. Messages

@@ -689,6 +689,19 @@ Usage and cost come from provider reports.
 - Claude permission controls describe each available mode and follow changes
   reported by the provider. Finished reasoning collapses into a summary that
   can be expanded. Long user prompts also offer an expand control.
+- A permission block or pending approval shows a notice in the chat's bottom
+  bar. Click it, the permission mode, or enter `/permissions` to open the native
+  permissions panel. It shows blocked tools, their reasons and exact inputs,
+  pending approvals, and permission modes. **Review retry** appends an explicit
+  authorization to your draft for you to review and send; **Dismiss** clears
+  the notice without approving or running the action.
+- In Claude's panel, **Rules** shows allow, ask and deny rules with their source;
+  **Auto context** lets you describe trusted repositories or services. Additions
+  and removals apply to the running provider process and appear only after
+  Claude confirms them. Account, project and managed settings are shown as
+  read-only. These edits do not save settings files and do not survive a provider
+  process restart or a terminal handoff. Deny rules and hard safety checks still
+  apply to retries.
 - Relative file links resolve from the conversation's working directory.
   Links such as `src/main.rs:42:5` open the editor at that line and column.
 
