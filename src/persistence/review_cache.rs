@@ -174,9 +174,15 @@ mod tests {
         let path = dir.path().join("state.sqlite3");
         {
             let store = StateStore::open(&path, crate::model::BootId::new("boot")).unwrap();
-            store.lock_inner().unwrap().connection.execute_batch(
-                "DROP TABLE review_cache_files; DROP TABLE review_cache; PRAGMA user_version = 8;",
-            ).unwrap();
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch(
+                    "DROP TABLE review_cache_files; DROP TABLE review_cache;
+                 ALTER TABLE terminal_recipes DROP COLUMN predecessor; PRAGMA user_version = 8;",
+                )
+                .unwrap();
         }
         let store = StateStore::open(&path, crate::model::BootId::new("boot")).unwrap();
         assert_eq!(

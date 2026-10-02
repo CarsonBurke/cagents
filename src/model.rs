@@ -897,6 +897,11 @@ pub struct TerminalSession {
     /// current terminal ID, this remains unchanged through repeated recovery.
     #[serde(default)]
     pub recovery_origin: Option<TerminalId>,
+    /// The exact session this one replaces. The daemon offers this session
+    /// that one's lineage, and with it the agents it owns, when it first
+    /// starts; `recovery_origin` names only the root of the chain.
+    #[serde(default)]
+    pub predecessor: Option<TerminalId>,
     pub launch: LaunchRecipe,
     pub transcript_path: Option<PathBuf>,
     pub resume_hint: Option<String>,

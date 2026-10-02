@@ -1452,6 +1452,7 @@ pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
     TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
+        predecessor: None,
         id,
         transcript_path: transcript_path_for(&launch, id),
         launch: launch.clone(),
@@ -1519,6 +1520,7 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
     TerminalSession {
         owned_codex_listener: None,
         recovery_origin: Some(session.recovery_origin.unwrap_or(session.id)),
+        predecessor: Some(session.id),
         id,
         launch: recipe.clone(),
         transcript_path: transcript_path_for(&recipe, id),
@@ -5652,6 +5654,9 @@ impl Cagents {
                     session.launch = recipe;
                 }
                 session.id = TerminalId::new();
+                // A clone is a conversation of its own, not a successor.
+                session.recovery_origin = None;
+                session.predecessor = None;
                 session.continuity = TerminalContinuity::RelaunchAvailable {
                     recipe: session.launch.clone(),
                     last_exit: None,
@@ -19819,6 +19824,7 @@ mod tests {
         let mut session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -19993,6 +19999,7 @@ mod tests {
         let recovered = TerminalSession {
             id: TerminalId::new(),
             recovery_origin: Some(original.id),
+            predecessor: None,
             continuity: TerminalContinuity::Live {
                 host_session_id: HostSessionId::new("replacement-host"),
                 boot_id: boot.clone(),
@@ -20059,6 +20066,7 @@ mod tests {
         let mut session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -20087,6 +20095,8 @@ mod tests {
 
         let relaunched = fresh_terminal_relaunch(&session);
         assert_ne!(relaunched.id, exited_id);
+        // It succeeds exactly the session it replaces.
+        assert_eq!(relaunched.predecessor, Some(exited_id));
         assert_eq!(relaunched.launch, launch.clone());
         assert_eq!(relaunched.resume_hint, None);
         assert!(matches!(
@@ -20111,6 +20121,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -21036,6 +21047,7 @@ mod tests {
             kind: CardKind::Terminal(TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),
                 transcript_path: None,
@@ -21052,6 +21064,12 @@ mod tests {
     fn pane_clone_is_adjacent_and_never_shares_terminal_continuity() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
+        // The source is itself a relaunch, but its clone succeeds nothing.
+        let source = app.durable.cards[0].id;
+        if let CardKind::Terminal(session) = &mut app.card_state_mut(source).unwrap().kind {
+            session.recovery_origin = Some(TerminalId::new());
+            session.predecessor = Some(TerminalId::new());
+        }
         let source = app.durable.cards[0].clone();
         let _unpolled = app.clone_focused_pane();
         let cloned = app.workspace.focused().unwrap();
@@ -21072,6 +21090,7 @@ mod tests {
         assert_eq!(copy.launch, original.launch);
         assert!(copy.continuity.live_proof().is_none());
         assert!(copy.resume_hint.is_none());
+        assert_eq!((copy.recovery_origin, copy.predecessor), (None, None));
     }
 
     #[test]

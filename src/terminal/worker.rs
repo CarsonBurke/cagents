@@ -3719,6 +3719,7 @@ mod tests {
         TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4110,6 +4111,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4894,6 +4896,7 @@ mod tests {
             TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: crate::model::TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,
@@ -5664,6 +5667,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

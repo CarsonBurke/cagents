@@ -91,6 +91,7 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
             transcript_path: None,
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
         };
         spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
         let handle = host.lock().unwrap().terminals[&source.id].handle.clone();

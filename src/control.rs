@@ -2381,6 +2381,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
             let session = TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,
@@ -4080,6 +4081,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4479,6 +4481,7 @@ mod tests {
             launch: LaunchRecipe::shell("/".into()).unwrap(),
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             transcript_path: None,
             resume_hint: None,
             continuity: TerminalContinuity::Exited {

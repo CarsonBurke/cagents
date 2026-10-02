@@ -1235,6 +1235,7 @@ mod tests {
         TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             continuity: TerminalContinuity::RelaunchAvailable {
@@ -1502,6 +1503,7 @@ mod tests {
         let terminal = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             continuity: TerminalContinuity::RelaunchAvailable {
@@ -1606,6 +1608,7 @@ mod tests {
         let terminal = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
                 unset_environment: Default::default(),
@@ -1999,6 +2002,7 @@ mod tests {
         converted.terminal = Some(crate::model::TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: converted.id,
             launch: converted.launch.recipe.clone(),
             continuity: crate::model::TerminalContinuity::RelaunchAvailable {

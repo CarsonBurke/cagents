@@ -69,13 +69,32 @@ impl Authority {
     }
 }
 
+/// A session and its successors: each relaunch, crash recovery or account
+/// recovery of a session gets a new ID but stays in its lineage, named by the
+/// first session's ID. Ownership and addresses that must outlive one process
+/// use it; resuming a conversation in a new session starts a new lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Lineage(pub TerminalId);
+
+impl std::fmt::Display for Lineage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Assigned after caller authentication. A raw parent ID in a request grants
 /// no authority to address another session's children.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Origin {
     User,
-    Child { parent: TerminalId },
-    Automation { id: uuid::Uuid },
+    /// Started by a session; every session of its lineage owns it.
+    Child {
+        parent: Lineage,
+    },
+    Automation {
+        id: uuid::Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

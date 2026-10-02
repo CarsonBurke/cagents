@@ -2137,6 +2137,7 @@ mod tests {
                 launch: recipe,
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 transcript_path: None,
                 resume_hint: None,
                 continuity: crate::model::TerminalContinuity::DetachedSameBoot {

@@ -3,8 +3,9 @@
 use super::{Registry, repository_key, take_ordinal};
 use crate::{
     agent_execution::{
-        Accepted, Agent, Authority, Destination, HostedSession, MAX_CHILDREN, MAX_PARENT_DEPTH,
-        MAX_PARENT_RUNNING, MAX_RUNNING, Origin, ResultSummary, Run, State, Submit, Update,
+        Accepted, Agent, Authority, Destination, HostedSession, Lineage, MAX_CHILDREN,
+        MAX_PARENT_DEPTH, MAX_PARENT_RUNNING, MAX_RUNNING, Origin, ResultSummary, Run, State,
+        Submit, Update,
     },
     model::{AgentId, ChannelId, RunId},
 };
@@ -461,18 +462,23 @@ impl Registry {
         if token.len() != 36 || uuid::Uuid::parse_str(token).is_err() {
             return Err("Invalid agent session authority".into());
         }
-        let session: String = self
+        // A session owns what its whole lineage started.
+        let lineage: String = self
             .db
             .query_row(
-                "SELECT session_id FROM agent_authorities WHERE token = ?1",
+                "SELECT coalesce(l.lineage, a.session_id) FROM agent_authorities a
+                 LEFT JOIN session_lineages l ON l.session_id = a.session_id
+                 WHERE a.token = ?1",
                 [token],
                 |row| row.get(0),
             )
             .map_err(|_| "This agent session authority is no longer registered".to_owned())?;
         Ok(Origin::Child {
-            parent: session
-                .parse()
-                .map_err(|_| "Stored agent session identity is invalid")?,
+            parent: Lineage(
+                lineage
+                    .parse()
+                    .map_err(|_| "Stored agent session identity is invalid")?,
+            ),
         })
     }
 
@@ -607,6 +613,13 @@ impl Registry {
         tx.execute(
             "INSERT INTO agent_authorities(token, session_id, source) VALUES (?1, ?2, ?3)",
             params![token, id, encode(session)?],
+        )
+        .map_err(|error| error.to_string())?;
+        // A session not recorded as a successor starts its own lineage; one
+        // that was keeps it, through every later process under its ID.
+        tx.execute(
+            "INSERT OR IGNORE INTO session_lineages(session_id, lineage) VALUES (?1, ?1)",
+            [&id],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1290,9 +1303,11 @@ fn check_parent_depth(db: &Connection, origin: &Origin) -> Result<(), String> {
         if !seen.insert(parent) || seen.len() > MAX_PARENT_DEPTH {
             return Err("Agent parent depth limit reached".into());
         }
+        // The parent is an agent if any session of its lineage hosts one.
         let previous: Option<String> = db
             .query_row(
-                "SELECT origin FROM agents WHERE session_id = ?1",
+                "SELECT origin FROM agents WHERE session_id = ?1 OR session_id IN
+                 (SELECT session_id FROM session_lineages WHERE lineage = ?1) LIMIT 1",
                 [parent.to_string()],
                 |row| row.get(0),
             )
@@ -1334,11 +1349,11 @@ fn require_channel(
     Ok(())
 }
 
-fn encode<T: serde::Serialize>(value: &T) -> Result<String, String> {
+pub(super) fn encode<T: serde::Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|error| error.to_string())
 }
 
-fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
+pub(super) fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value)
         .map_err(|error| format!("Stored agent execution is unreadable: {error}"))
 }

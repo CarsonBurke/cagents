@@ -38,6 +38,15 @@ pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
 }
 
 pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin, String> {
+    caller(host, authority).map(|(origin, _)| origin)
+}
+
+/// The caller's origin, keyed by its lineage, and the exact live session its
+/// authority was issued to, if any.
+pub(super) fn caller(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<(Origin, Option<TerminalId>), String> {
     let registry = registry(host)?;
     let (origin, source) = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -46,6 +55,7 @@ pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin,
             registry.agent_authority_source(authority)?,
         )
     };
+    let session = source.as_ref().map(HostedSession::id);
     if let Some(source) = source {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let live = match source {
@@ -67,7 +77,7 @@ pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin,
             return Err("The issuing agent session is no longer live or proved adopted".into());
         }
     }
-    Ok(origin)
+    Ok((origin, session))
 }
 
 pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
@@ -1021,6 +1031,7 @@ fn create_console(
         resume_hint: None,
         owned_codex_listener: None,
         recovery_origin: None,
+        predecessor: None,
     };
     let (descriptor, console_handle) = super::state::spawn_terminal_view_owned(
         host,
@@ -1149,7 +1160,7 @@ fn console(
     command: crate::agent_execution::ConsoleCommand,
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{ConsoleCommand, ConsoleView, Reply};
-    let caller = origin(host, authority)?;
+    let (_, caller) = caller(host, authority)?;
     let registry = registry(host)?;
     let agent = registry
         .lock()
@@ -1159,12 +1170,8 @@ fn console(
         .console
         .as_ref()
         .ok_or("The console is not attached yet")?;
-    if agent.closed
-        || caller
-            != (Origin::Child {
-                parent: terminal.id,
-            })
-    {
+    // Only the console session itself, not its lineage, drives the agent.
+    if agent.closed || caller != Some(terminal.id) {
         return Err("This session does not own the requested agent console".into());
     }
     let handle = {

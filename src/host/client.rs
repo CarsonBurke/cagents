@@ -1252,6 +1252,7 @@ mod tests {
             launch: recipe.clone(),
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             transcript_path: None,
             resume_hint: None,
             continuity: crate::model::TerminalContinuity::RelaunchAvailable {
@@ -1371,6 +1372,7 @@ mod tests {
             launch: recipe.clone(),
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             transcript_path: None,
             resume_hint: None,
             continuity: TerminalContinuity::Exited {
@@ -1771,6 +1773,7 @@ mod tests {
         let session = crate::model::TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: terminal_id,
             launch: launch.clone(),
             transcript_path: None,
@@ -2056,6 +2059,7 @@ mod tests {
         let session = crate::model::TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

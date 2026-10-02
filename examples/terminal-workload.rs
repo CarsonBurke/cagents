@@ -244,6 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let session = TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,

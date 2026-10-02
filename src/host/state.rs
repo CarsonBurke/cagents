@@ -1001,6 +1001,35 @@ impl HostState {
         Ok(())
     }
 
+    /// Whether any of `sessions` runs, or is starting or handing off, here.
+    /// A successor joins a lineage only when none of its members does. A
+    /// terminal counts until its teardown completes, as long as its authority
+    /// can still act.
+    pub(super) fn any_live(&self, sessions: &[TerminalId]) -> bool {
+        sessions.iter().any(|id| self.is_live(id))
+    }
+
+    /// Whether any of `sessions` other than `predecessor` is live, for a
+    /// successor whose start has itself proved `predecessor` stopped.
+    pub(super) fn any_other_live(&self, sessions: &[TerminalId], predecessor: TerminalId) -> bool {
+        sessions
+            .iter()
+            .any(|id| *id != predecessor && self.is_live(id))
+    }
+
+    fn is_live(&self, id: &TerminalId) -> bool {
+        self.terminals
+            .get(id)
+            .is_some_and(|record| record.running || !record.handle.is_completed())
+            || self.spawning.contains(id)
+            || self
+                .chats
+                .get(id)
+                .is_some_and(|record| !record.handle.is_completed())
+            || self.chat_spawning.contains_key(id)
+            || self.chat_handoffs.contains_key(id)
+    }
+
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
         self.browser_logins_spawning.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
@@ -2486,6 +2515,7 @@ fn restore_upgrade_from(
         let terminal = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: chat.source.id,
             launch: chat
                 .launch
@@ -3202,11 +3232,35 @@ fn start_terminal_view_owned(
                 };
                 source.resume_hint =
                     crate::model::agent_recovery::observed_hint_from_launch(&source.launch);
-                match registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .fresh_agent_authority(&crate::agent_execution::HostedSession::Terminal(source))
-                {
+                let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                // A relaunch or recovery names the session it replaces; it
+                // inherits what that lineage owns once nothing else of it runs.
+                // A session saved before predecessors were recorded names only
+                // its root.
+                let succeeded = session
+                    .predecessor
+                    .or(session.recovery_origin)
+                    .filter(|predecessor| *predecessor != terminal_id)
+                    .map_or(Ok(()), |predecessor| {
+                        registry
+                            .succeed(
+                                terminal_id,
+                                predecessor,
+                                session.recovery_origin,
+                                |members| {
+                                    shared
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .any_live(members)
+                                },
+                            )
+                            .map(drop)
+                    });
+                match succeeded.and_then(|()| {
+                    registry.fresh_agent_authority(
+                        &crate::agent_execution::HostedSession::Terminal(source),
+                    )
+                }) {
                     Ok(authority) => authority,
                     Err(error) => {
                         shared
@@ -3738,6 +3792,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -3776,6 +3831,7 @@ mod tests {
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -3980,6 +4036,7 @@ mod tests {
             resume_hint: None,
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             continuity: TerminalContinuity::RelaunchAvailable {
                 recipe,
                 last_exit: None,
@@ -4055,6 +4112,7 @@ mod tests {
         let source = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4276,6 +4334,7 @@ for line in sys.stdin:
         changed.terminal = Some(TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: source.id,
             launch: source.launch.recipe.clone(),
             transcript_path: None,
@@ -4483,6 +4542,7 @@ for line in sys.stdin:
         let replacement = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4552,6 +4612,7 @@ for line in sys.stdin:
         let source = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4614,6 +4675,7 @@ for line in sys.stdin:
             source: TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,
@@ -4697,6 +4759,7 @@ for line in sys.stdin:
         let source = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap(),
             transcript_path: None,
@@ -4752,6 +4815,7 @@ for line in sys.stdin:
         let source = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: Some(directory.path().join("shell.log")),
@@ -4859,6 +4923,7 @@ for line in sys.stdin:
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -4955,6 +5020,7 @@ for line in sys.stdin:
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -5073,6 +5139,7 @@ for line in sys.stdin:
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -5204,6 +5271,7 @@ for line in sys.stdin:
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -5287,6 +5355,7 @@ for line in sys.stdin:
         };
         let session = TerminalSession {
             recovery_origin: None,
+            predecessor: None,
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -5359,6 +5428,7 @@ for line in sys.stdin:
         };
         let session = TerminalSession {
             recovery_origin: None,
+            predecessor: None,
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -5431,6 +5501,7 @@ for line in sys.stdin:
         let session = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -5549,6 +5620,7 @@ for line in sys.stdin:
             let session = TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
+                predecessor: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,
@@ -5573,6 +5645,7 @@ for line in sys.stdin:
         let pending = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

@@ -416,6 +416,7 @@ mod tests {
         TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
+            predecessor: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
                 unset_environment: Default::default(),

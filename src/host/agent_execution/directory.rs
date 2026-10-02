@@ -1,11 +1,11 @@
 //! Answers directory reads from the live hosted sessions and the durable
 //! delegation records. Reading confers no authority over any listed session.
 
-use super::{SharedHost, origin, registry};
+use super::{SharedHost, caller, registry};
 use crate::{
     agent::{ActivityState, Provider},
     agent_execution::{
-        Authority, Origin,
+        Authority, Lineage, Origin,
         directory::{Delegation, Directory, Entry, Owner, Relation, Scope, Surface},
     },
     model::TerminalId,
@@ -33,16 +33,13 @@ pub(super) fn read(
 ) -> Result<Directory, String> {
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
-    let caller_origin = origin(host, authority).unwrap_or(Origin::User);
-    let caller = match caller_origin {
-        Origin::Child { parent } => Some(parent),
-        Origin::User | Origin::Automation { .. } => None,
-    };
+    let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
     let mut live = live_sessions(host);
-    let (model, delegations) = {
+    let (model, delegations, lineages) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
+        let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
         let mut delegations = BTreeMap::new();
         // Only a live session's delegation is listed, so only its latest run
         // is read.
@@ -67,8 +64,9 @@ pub(super) fn read(
                 ),
             );
         }
-        (model, delegations)
+        (model, delegations, lineages)
     };
+    let lineage = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
     // A plain shell is listed only where it matters: as the caller, or as the
     // session that owns a listed agent.
     live.retain(|entry| {
@@ -76,7 +74,7 @@ pub(super) fn read(
             || Some(entry.id) == caller
             || delegations
                 .values()
-                .any(|(delegation, _)| delegation.owner == Owner::Session(entry.id))
+                .any(|(delegation, _)| delegation.owner == Owner::Session(lineage(entry.id)))
     });
     let caller_owner = Owner::from(&caller_origin);
     let parent = caller
@@ -120,7 +118,7 @@ pub(super) fn read(
         let (delegation, channel) = delegations.get(&live.id).cloned().unzip();
         let relation = if Some(live.id) == caller {
             Relation::Myself
-        } else if Some(live.id) == parent {
+        } else if Some(lineage(live.id)) == parent {
             Relation::Parent
         } else if delegation
             .as_ref()
@@ -154,6 +152,7 @@ pub(super) fn read(
             project,
             delegation,
             relation,
+            lineage: lineage(live.id),
         };
         if relation == Relation::Myself {
             me = Some(entry);
