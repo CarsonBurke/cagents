@@ -1326,6 +1326,7 @@ impl Cagents {
             !self.context_inspector_open,
         );
         widget::column::with_children(vec![
+            crate::design::horizontal_rule().into(),
             header,
             crate::design::horizontal_rule().into(),
             content,
