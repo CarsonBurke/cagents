@@ -3740,6 +3740,7 @@ fn view_inner<'a>(
             widget::container(utilities(compact, modal_open, shortcuts))
                 .padding([0, spacing.space_xxxs]),
         )
+        .push(design::horizontal_rule())
         .push(
             widget::container(header(model, state, compact, header_loading, modal_open))
                 .padding([0, spacing.space_xxxs]),
@@ -15346,11 +15347,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn worktree_and_tab_headers_share_the_same_separator_baseline() {
+    fn sidebar_worktree_and_tab_headers_share_the_same_separator_baseline() {
         use cosmic::iced::Point;
         let renderer = headless_renderer();
         let model = panel_model();
         let state = panel_state(&model);
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
         let width = 380.0;
         let tabs = widget::column::with_children(vec![
             crate::tab_strip::horizontal(
@@ -15363,6 +15365,15 @@ pub(crate) mod tests {
         ])
         .into();
         let surfaces = [
+            view_inner(
+                &model,
+                &state,
+                SidebarMode::Expanded,
+                width,
+                false,
+                None,
+                &shortcuts,
+            ),
             file_panel(&model, &state, width, false),
             git_panel(&model, &state, width, false),
             tabs,
