@@ -10,7 +10,7 @@ use crate::chat::{Skill, SkillReach, Snapshot};
 use cosmic::widget::text_editor::{self, Cursor, Position};
 use std::borrow::Cow;
 
-use super::{COMPACT_COMMAND, PERMISSIONS_COMMAND, permissions_available};
+use super::{COMPACT_COMMAND, PERMISSIONS_COMMAND, RESUME_COMMAND, permissions_available};
 
 /// The sigil every provider's commands are named with, and the one the
 /// composer accepts for skills whatever the provider spells them with.
@@ -285,22 +285,23 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
     // A command is only a command at the head of a message; offered anywhere
     // else it would be sent as words the provider does not act on.
     if token.sigil == COMMAND_SIGIL && token.leading {
+        // The composer answers `/resume` itself, so a provider's command of
+        // that name is never the one sent.
         let commands = snapshot
             .commands
             .iter()
-            .filter(|command| {
-                !permissions_available(snapshot)
-                    || !command
-                        .name
-                        .trim_start_matches(COMMAND_SIGIL)
-                        .eq_ignore_ascii_case(PERMISSIONS_COMMAND)
-            })
             .map(|command| {
                 (
                     command.name.trim_start_matches(COMMAND_SIGIL),
                     command.description.as_str(),
                 )
-            });
+            })
+            .filter(|(name, _)| {
+                !name.eq_ignore_ascii_case(RESUME_COMMAND)
+                    && !(permissions_available(snapshot)
+                        && name.eq_ignore_ascii_case(PERMISSIONS_COMMAND))
+            })
+            .chain([(RESUME_COMMAND, "Return to a saved conversation")]);
         // Compaction is a capability rather than an advertised command for
         // some providers; the composer answers to it either way, so the list
         // says so too.
@@ -923,7 +924,7 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(
             insertions(&snapshot, "/|"),
-            ["/clear", "/review", "/commits", "/pr-review"]
+            ["/clear", "/review", "/resume", "/commits", "/pr-review"]
         );
         // Mid-message a command would be sent as words; a skill still works.
         assert_eq!(insertions(&snapshot, "then /|"), ["/commits", "/pr-review"]);
@@ -987,6 +988,25 @@ mod tests {
         // The slash names a skill in the provider's own spelling, and offers
         // compaction where it is a capability rather than a listed command.
         assert_eq!(insertions(&snapshot, "/c|"), ["/compact", "$commits"]);
+    }
+
+    /// `/resume` is offered for every provider, once, as the composer's own:
+    /// a provider's command of that name is never the one sent.
+    #[test]
+    fn resume_is_the_composers_own_command() {
+        let mut snapshot = snapshot();
+        assert_eq!(insertions(&snapshot, "/resu|"), ["/resume"]);
+        snapshot.commands.push(SlashCommand {
+            name: "/Resume".into(),
+            description: "The provider's picker".into(),
+        });
+        let (draft, caret) = marked("/resu|");
+        let token = token_in(&draft, caret, &sigils(&snapshot)).expect("a token");
+        let offered = candidates(&snapshot, &token);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].description, "Return to a saved conversation");
+        // Only at the head of a message, where a command is a command.
+        assert!(insertions(&snapshot, "then /resu|").is_empty());
     }
 
     /// Two Codex skills sharing a name are each invoked by their path, and

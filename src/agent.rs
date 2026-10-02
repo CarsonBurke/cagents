@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 mod claude;
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(feature = "host")]
 pub(crate) use claude::transcript as claude_transcript;
 mod codex;
 mod omp;

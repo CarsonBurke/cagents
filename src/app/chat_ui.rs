@@ -1272,6 +1272,20 @@ fn permissions_available(snapshot: &Snapshot) -> bool {
             .any(|request| request.fields.is_empty())
 }
 
+/// The name the composer answers itself, by opening the conversation picker,
+/// whatever command of that name the provider lists.
+pub(super) const RESUME_COMMAND: &str = "resume";
+
+/// What a draft reading `/resume [query]` searches for, or `None` for any
+/// other draft.
+fn resume_invocation(draft: &str) -> Option<String> {
+    let rest = draft.trim().strip_prefix(completion::COMMAND_SIGIL)?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    rest[..end]
+        .eq_ignore_ascii_case(RESUME_COMMAND)
+        .then(|| rest[end..].trim().to_owned())
+}
+
 /// What a draft beginning with `/` asks for, when it is not a message.
 enum SlashInvocation {
     Permissions,
@@ -3133,7 +3147,7 @@ impl Cagents {
         self.add_default_pane(directory, pane)
     }
 
-    fn default_chat_is_unused(&self, card: CardId) -> bool {
+    pub(super) fn chat_is_unused(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
             if runtime.session.is_unstarted()
                 && runtime.choosing()
@@ -3151,7 +3165,7 @@ impl Cagents {
             .default_chats
             .iter()
             .copied()
-            .filter(|card| !self.default_chat_is_unused(*card))
+            .filter(|card| !self.chat_is_unused(*card))
             .collect::<Vec<_>>();
         for card in used {
             self.chat_ui.default_chats.remove(&card);
@@ -3226,7 +3240,7 @@ impl Cagents {
         let mut removed = false;
         for card in defaults {
             self.chat_ui.default_chats.remove(&card);
-            let unused = self.default_chat_is_unused(card);
+            let unused = self.chat_is_unused(card);
             if !unused {
                 removed = true;
                 continue;
@@ -5709,6 +5723,13 @@ impl Cagents {
                 }
                 if runtime.composer.text().trim().is_empty() && runtime.attachments.is_empty() {
                     return Task::none();
+                }
+                // Resuming is the composer's own command, answered here in
+                // every state the conversation can be in.
+                if let Some(query) = resume_invocation(&runtime.composer.text()) {
+                    runtime.replace_draft(text_editor::Content::new());
+                    runtime.error = None;
+                    return self.open_resume_from(target.card, query);
                 }
                 if runtime.is_draft() {
                     return self.start_chat_draft(target);
@@ -9985,6 +10006,96 @@ mod tests {
             ));
             assert!(app.chat_switch_ready(card), "it can be tried again");
             assert!(!app.chat_ui.transition_pending());
+        }
+    }
+
+    #[test]
+    fn resume_is_read_from_a_draft_naming_it() {
+        assert_eq!(resume_invocation("/resume").as_deref(), Some(""));
+        assert_eq!(
+            resume_invocation("  /Resume  flaky tests \n").as_deref(),
+            Some("flaky tests")
+        );
+        assert_eq!(resume_invocation("/resumes"), None);
+        assert_eq!(resume_invocation("resume"), None);
+        assert_eq!(resume_invocation("please /resume"), None);
+    }
+
+    /// `/resume` sends nothing: it opens the picker on the conversation's
+    /// provider and project, searching for what follows it, and an untouched
+    /// draft gives its place to the conversation chosen there.
+    #[test]
+    fn resume_command_opens_the_picker_for_this_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let card = draft_in(&mut app, project.path());
+        write(&mut app, card, "/resume flaky tests");
+        submit(&mut app, card);
+        assert!(app.resume_ui.open);
+        assert_eq!(app.resume_ui.query, "flaky tests");
+        let scope = app.resume_ui.scope.as_ref().expect("a narrowed search");
+        assert_eq!(scope.provider, Provider::Codex);
+        assert!(
+            scope
+                .roots
+                .iter()
+                .any(|root| project.path().starts_with(root))
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.composer.is_empty());
+        assert!(runtime.is_draft() && !app.chat_start_pending(card));
+        assert_eq!(app.resume_ui.replace, Some(card));
+
+        let _ = app.resume_saved_conversation(earlier(&app, card));
+        let resumed = app.workspace.focused().unwrap();
+        assert_ne!(resumed, card);
+        assert_eq!(app.card_state(resumed).unwrap().title, "Earlier");
+        assert!(!app.resume_ui.open);
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|handoff| handoff.unmounting),
+            Some(card),
+            "the draft gives its place to the conversation"
+        );
+    }
+
+    /// A draft is replaced only while the picker it asked for is open.
+    #[test]
+    fn a_draft_outlives_a_cancelled_resume() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let card = draft_in(&mut app, project.path());
+        write(&mut app, card, "/resume");
+        submit(&mut app, card);
+        assert_eq!(app.resume_ui.replace, Some(card));
+        let _ = app.update_resume(super::resume_ui::Action::Close);
+        assert_eq!(app.resume_ui.replace, None);
+        let _ = app.resume_saved_conversation(earlier(&app, card));
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.workspace.order().any(|id| id == card));
+    }
+
+    /// A new conversation's draft in `directory`, a folder that exists.
+    fn draft_in(app: &mut Cagents, directory: &Path) -> CardId {
+        let _ = app.new_native_chat(Provider::Codex, Some(directory.into()));
+        let card = app.workspace.focused().unwrap();
+        assert!(chat_runtime(app, card).is_draft());
+        card
+    }
+
+    /// Another conversation in the project of `card`'s, as resume lists it.
+    fn earlier(app: &Cagents, card: CardId) -> crate::persistence::SavedConversation {
+        let mut session = chat_runtime(app, card).session.clone();
+        session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        // Resumed directly, without a daemon to prepare it.
+        session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        crate::persistence::SavedConversation {
+            card: CardId::new(),
+            title: "Earlier".into(),
+            session,
+            open: false,
+            updated_at_unix_ms: 1,
         }
     }
 

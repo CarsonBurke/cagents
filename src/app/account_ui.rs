@@ -3378,6 +3378,33 @@ impl Cagents {
             })
     }
 
+    /// The name of the project holding `directory`, and the roots its work
+    /// runs in: its repository and every worktree it has.
+    pub(super) fn project_roots(&self, directory: &Path) -> Option<(String, Vec<PathBuf>)> {
+        let (id, name, _) = self.project_for_directory(directory)?;
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == id)?;
+        let roots = std::iter::once(project.repository.clone())
+            .chain(
+                project
+                    .repository
+                    .parent()
+                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                    .map(Path::to_path_buf),
+            )
+            .chain(
+                project
+                    .worktrees
+                    .iter()
+                    .map(|worktree| worktree.path.clone()),
+            )
+            .collect();
+        Some((name.to_owned(), roots))
+    }
+
     /// A channel owns its project even when its displayed workspace path is
     /// unavailable or has changed. The Accounts pane uses the selected scope,
     /// then falls back to the worktree path when no channel is selected.

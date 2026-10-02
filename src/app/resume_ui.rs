@@ -2,19 +2,128 @@ use super::*;
 use crate::agent::Provider;
 use crate::chat;
 use crate::persistence::SavedConversation;
-use std::io::{Read, Seek};
+use cosmic::iced::futures::StreamExt;
 mod catalog;
+
+/// Conversations read before the first found ones are listed, so the newest
+/// appear at once, and between later listings.
+const FIRST_BATCH: usize = 64;
+const BATCH: usize = 512;
+/// Rows listed at a time; more are listed on request.
+const PAGE: usize = 100;
 
 #[derive(Default)]
 pub(super) struct State {
     pub open: bool,
     generation: u64,
-    query: String,
-    entries: Vec<SavedConversation>,
+    pub(super) query: String,
+    rows: Vec<Row>,
+    /// Indices of the rows the query and scope admit, in listed order.
+    visible: Vec<usize>,
+    /// The sessions found conversations resume with, and their accounts' names.
+    seeds: Arc<[chat::Session]>,
+    seed_accounts: Vec<String>,
+    /// The provider and project `/resume` was asked for in, until the reader
+    /// widens the search.
+    pub(super) scope: Option<Scope>,
+    /// The untouched draft `/resume` was asked from, which the resumed
+    /// conversation takes the place of.
+    pub(super) replace: Option<CardId>,
+    /// Transcripts read so far and transcripts to read, while indexing.
+    indexing: Option<(usize, usize)>,
+    /// Whether a chosen conversation is being prepared to resume.
     pub(super) loading: bool,
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
+    /// What earlier openings read, so reopening reads only what changed.
+    cache: Arc<catalog::Cache>,
+    indexer: Option<iced::task::Handle>,
+}
+
+/// A conversation as the picker lists it.
+struct Row {
+    card: CardId,
+    title: String,
+    provider: Provider,
+    directory: PathBuf,
+    account: String,
+    updated_at_unix_ms: i64,
+    open: bool,
+    /// What the query is matched against, lowercased once.
+    haystack: String,
+    source: Source,
+}
+
+enum Source {
+    /// A conversation cagents saved, with the launch it was saved with.
+    Saved(Box<SavedConversation>),
+    /// A conversation found in a provider's history.
+    Found(catalog::Found),
+}
+
+impl Row {
+    fn saved(entry: SavedConversation, account: String) -> Self {
+        let launch = &entry.session.launch;
+        let mut row = Self {
+            card: entry.card,
+            title: entry.title.clone(),
+            provider: launch.provider,
+            directory: launch.recipe.working_directory.clone(),
+            account,
+            updated_at_unix_ms: entry.updated_at_unix_ms,
+            open: entry.open,
+            haystack: String::new(),
+            source: Source::Saved(Box::new(entry)),
+        };
+        row.index();
+        row
+    }
+
+    fn found(found: catalog::Found, provider: Provider, account: String) -> Self {
+        let mut row = Self {
+            card: CardId::new(),
+            title: found.title.clone(),
+            provider,
+            directory: found.directory.clone(),
+            account,
+            updated_at_unix_ms: found.updated_at_unix_ms,
+            open: false,
+            haystack: String::new(),
+            source: Source::Found(found),
+        };
+        row.index();
+        row
+    }
+
+    fn index(&mut self) {
+        self.haystack = format!(
+            "{} {} {} {}",
+            self.title,
+            self.provider.label(),
+            self.directory.display(),
+            self.account
+        )
+        .to_lowercase();
+    }
+}
+
+/// The provider and project a search is narrowed to.
+#[derive(Debug, Clone)]
+pub(super) struct Scope {
+    pub(super) provider: Provider,
+    pub(super) roots: Vec<PathBuf>,
+    label: String,
+}
+
+impl Scope {
+    fn admits(&self, row: &Row) -> bool {
+        row.provider == self.provider
+            && self
+                .roots
+                .iter()
+                .any(|root| row.directory.starts_with(root))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -22,11 +131,35 @@ pub enum Action {
     Open,
     Close,
     Query(String),
-    Loaded(u64, Result<Vec<SavedConversation>, String>),
+    /// Widens a search narrowed to one provider and project to every one.
+    Unscope,
+    Indexed(u64, Progress),
     Resume(CardId),
     More,
     Submit,
     Prepared(u64, SavedConversation, Result<chat::Session, String>),
+}
+
+/// What indexing has found so far, in the order it is found.
+#[derive(Debug, Clone)]
+pub enum Progress {
+    /// Conversations cagents saved, and the sessions found ones resume with.
+    Saved {
+        entries: Vec<SavedConversation>,
+        seeds: Arc<[chat::Session]>,
+        error: Option<String>,
+    },
+    /// How many transcripts the providers' histories hold.
+    Counted(usize),
+    /// Nothing more is coming.
+    Finished,
+    /// Conversations found among the next transcripts, and better titles for
+    /// saved conversations found among them.
+    Found {
+        conversations: Vec<catalog::Found>,
+        titles: Vec<(CardId, String)>,
+        read: usize,
+    },
 }
 
 pub(super) fn focus_id() -> widget::Id {
@@ -42,86 +175,114 @@ fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
         })
 }
 
-/// Read bounded transcript metadata, never the complete conversation body.
-fn claude_title(session: &chat::Session) -> Option<String> {
-    if session.launch.provider != Provider::Claude {
-        return None;
-    }
-    let recipe = &session.launch.recipe;
-    let home = recipe
-        .environment
-        .get("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            recipe
-                .environment
-                .get("HOME")
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })?;
-    let home = if home.is_absolute() {
-        home
-    } else {
-        recipe.working_directory.join(home)
-    };
-    let path = crate::agent::claude_transcript(
-        &home,
-        &recipe
-            .working_directory
-            .canonicalize()
-            .unwrap_or_else(|_| recipe.working_directory.clone()),
-        session.launch.session_id.as_deref()?,
+/// What makes two listings the same conversation: its provider, its ID, and
+/// the account home its history is kept in.
+type Identity = (Provider, Option<String>, Option<PathBuf>);
+
+fn identity(provider: Provider, id: Option<&str>, recipe: &LaunchRecipe) -> Identity {
+    (
+        provider,
+        id.map(str::to_owned),
+        crate::account::home_variable(provider)
+            .and_then(|variable| recipe.environment.get(variable))
+            .map(|home| {
+                let path = PathBuf::from(home);
+                path.canonicalize().unwrap_or(path)
+            }),
     )
-    .ok()?;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut title = None;
-    let mut summary = None;
-    let mut first_prompt = None;
-    let mut read_part = |bytes: Vec<u8>| {
-        for line in bytes.split(|byte| *byte == b'\n') {
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-                continue;
-            };
-            if matches!(
-                value.get("type").and_then(|v| v.as_str()),
-                Some("custom-title" | "summary")
-            ) {
-                if let Some(text) = value
-                    .get("customTitle")
-                    .or_else(|| value.get("summary"))
-                    .and_then(|v| v.as_str())
-                {
-                    if value["type"] == "custom-title" {
-                        title = crate::account::clean_label(text);
-                    } else {
-                        summary = crate::account::clean_label(text);
+}
+
+/// Lists saved conversations, then every conversation the seeds' providers
+/// keep, newest first, until `send` reports that nobody is listening.
+fn index(
+    saved: Result<Vec<SavedConversation>, String>,
+    seeds: Vec<chat::Session>,
+    cache: &catalog::Cache,
+    mut send: impl FnMut(Progress) -> bool,
+) {
+    let (mut entries, error) = match saved {
+        Ok(entries) => (entries, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    entries.sort_by_key(|entry| {
+        (
+            std::cmp::Reverse(entry.open),
+            std::cmp::Reverse(entry.updated_at_unix_ms),
+        )
+    });
+    // Persisted descriptors retain their launch configuration and ownership
+    // evidence even when a log file is newer, so they win over a found copy.
+    let mut seen = HashMap::new();
+    entries.retain(|entry| {
+        let launch = &entry.session.launch;
+        let key = identity(
+            launch.provider,
+            launch.session_id.as_deref(),
+            &launch.recipe,
+        );
+        seen.insert(key, Some(entry.card)).is_none()
+    });
+    let seeds: Arc<[chat::Session]> = seeds.into();
+    if !send(Progress::Saved {
+        entries,
+        seeds: seeds.clone(),
+        error,
+    }) {
+        return;
+    }
+    let candidates = catalog::candidates(&seeds);
+    if !send(Progress::Counted(candidates.len())) {
+        return;
+    }
+    let names = catalog::names(&seeds);
+    // Each seed's account home, resolved once rather than per conversation.
+    let homes = seeds
+        .iter()
+        .map(|seed| identity(seed.launch.provider, None, &seed.launch.recipe).2)
+        .collect::<Vec<_>>();
+    // Transcripts are many small reads, which a cold disk answers faster
+    // side by side.
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZero::get)
+        .min(8);
+    let mut read = 0;
+    while read < candidates.len() {
+        let batch = &candidates[read..candidates
+            .len()
+            .min(read + if read == 0 { FIRST_BATCH } else { BATCH })];
+        read += batch.len();
+        let mut conversations = Vec::new();
+        let mut titles = Vec::new();
+        for mut found in catalog::find_all(cache, &seeds, batch, workers) {
+            if let Some(name) = names.get(&found.id) {
+                found.title = name.clone();
+                found.titled = true;
+            }
+            let provider = seeds[found.seed].launch.provider;
+            match seen.entry((provider, Some(found.id.clone()), homes[found.seed].clone())) {
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(None);
+                    conversations.push(found);
+                }
+                // A saved conversation goes by the title its provider gives
+                // it, unless the reader renamed it here.
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    if let Some(card) = occupied.get_mut().take()
+                        && found.titled
+                    {
+                        titles.push((card, found.title));
                     }
                 }
-            } else if first_prompt.is_none()
-                && value.get("type").and_then(|v| v.as_str()) == Some("user")
-                && value.get("isMeta").and_then(|v| v.as_bool()) != Some(true)
-                && value.get("isSidechain").and_then(|v| v.as_bool()) != Some(true)
-            {
-                let content = &value["message"]["content"];
-                let text = content.as_str().or_else(|| {
-                    content
-                        .as_array()?
-                        .iter()
-                        .find_map(|part| part.get("text")?.as_str())
-                });
-                first_prompt = text.and_then(crate::account::clean_label);
             }
         }
-    };
-    let mut head = Vec::new();
-    (&mut file).take(128 * 1024).read_to_end(&mut head).ok()?;
-    read_part(head);
-    if file.metadata().ok()?.len() > 128 * 1024 {
-        file.seek(std::io::SeekFrom::End(-64 * 1024)).ok()?;
-        let mut tail = Vec::new();
-        (&mut file).take(64 * 1024).read_to_end(&mut tail).ok()?;
-        read_part(tail);
+        if !send(Progress::Found {
+            conversations,
+            titles,
+            read,
+        }) {
+            return;
+        }
     }
-    title.or(summary).or(first_prompt)
 }
 
 impl Cagents {
@@ -137,7 +298,7 @@ impl Cagents {
         }
         match key {
             keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                let count = self.resume_entries().len().min(self.resume_ui.limit);
+                let count = self.resume_ui.visible.len().min(self.resume_ui.limit);
                 self.resume_ui.selected =
                     (self.resume_ui.selected + 1).min(count.saturating_sub(1));
                 Some(self.reveal_resume_selection())
@@ -151,7 +312,7 @@ impl Cagents {
     }
 
     fn reveal_resume_selection(&self) -> Task<Message> {
-        let count = self.resume_entries().len().min(self.resume_ui.limit);
+        let count = self.resume_ui.visible.len().min(self.resume_ui.limit);
         let content_height = count as f32 * 104.0;
         let y = (self.resume_ui.selected as f32 * 104.0 - 180.0)
             .max(0.0)
@@ -165,113 +326,137 @@ impl Cagents {
         )
         .map(cosmic::Action::App)
     }
+
+    /// Opens the picker from `card`'s composer: narrowed to its provider and
+    /// project, searching for `query`, and in place of `card` when it is a
+    /// draft nothing was written in.
+    pub(super) fn open_resume_from(&mut self, card: CardId, query: String) -> Task<Message> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let provider = runtime.session.launch.provider;
+        let directory = runtime.session.launch.recipe.working_directory.clone();
+        let (project, roots) = self.project_roots(&directory).unwrap_or_else(|| {
+            let name = directory.file_name().map_or_else(
+                || directory.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            (name, vec![directory.clone()])
+        });
+        let task = self.open_resume(Some(Scope {
+            provider,
+            roots,
+            label: format!("{} · {project}", provider.label()),
+        }));
+        if !self.resume_ui.open {
+            return task;
+        }
+        self.resume_ui.replace = self.chat_is_unused(card).then_some(card);
+        Task::batch([task, self.update_resume(Action::Query(query))])
+    }
+
+    fn open_resume(&mut self, scope: Option<Scope>) -> Task<Message> {
+        if self.modal_is_open() {
+            return Task::none();
+        }
+        self.chrome_ui.close();
+        let state = &mut self.resume_ui;
+        if let Some(indexer) = state.indexer.take() {
+            indexer.abort();
+        }
+        state.open = true;
+        state.generation = state.generation.wrapping_add(1);
+        state.query.clear();
+        state.rows.clear();
+        state.visible.clear();
+        state.seeds = Arc::from([]);
+        state.seed_accounts.clear();
+        state.scope = scope;
+        state.replace = None;
+        state.error = None;
+        state.loading = false;
+        state.indexing = Some((0, 0));
+        state.limit = PAGE;
+        state.selected = 0;
+        let generation = state.generation;
+        let cache = state.cache.clone();
+        let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        let current = self.durable.cards.clone();
+        let accounts = self.resume_catalog_accounts();
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let (sender, receiver) = async_channel::bounded(2);
+        let spawned = std::thread::Builder::new()
+            .name("resume-index".into())
+            .spawn(move || {
+                let mut saved = store
+                    .map_or(Ok(Vec::new()), |store| store.saved_conversations())
+                    .map_err(|error| error.to_string());
+                if let Ok(entries) = &mut saved {
+                    for card in current {
+                        if let CardKind::Chat(session) = card.kind
+                            && session.launch.session_id.is_some()
+                        {
+                            let updated_at_unix_ms = entries
+                                .iter()
+                                .find(|entry| entry.card == card.id)
+                                .map_or_else(
+                                    || chat::now_ms().unwrap_or(0) as i64,
+                                    |entry| entry.updated_at_unix_ms,
+                                );
+                            entries.retain(|entry| entry.card != card.id);
+                            entries.push(SavedConversation {
+                                card: card.id,
+                                title: card.title,
+                                session,
+                                open: card.existence.is_open(),
+                                updated_at_unix_ms,
+                            });
+                        }
+                    }
+                }
+                let seeds = accounts
+                    .into_iter()
+                    .filter_map(|account| {
+                        chat::fresh_session(
+                            account.provider,
+                            TerminalId::new(),
+                            directory.clone(),
+                            &account,
+                        )
+                        .ok()
+                    })
+                    .collect();
+                index(saved, seeds, &cache, |progress| {
+                    sender.send_blocking(progress).is_ok()
+                });
+            });
+        if let Err(error) = spawned {
+            self.resume_ui.error = Some(format!("Could not look for conversations: {error}"));
+        }
+        // The end is marked whatever ends it, so a listing never waits on
+        // an indexer that is gone.
+        let progress = receiver.chain(cosmic::iced::futures::stream::once(async {
+            Progress::Finished
+        }));
+        let (indexer, handle) = Task::stream(progress.map(move |progress| {
+            cosmic::Action::App(Message::ResumeConversation(Action::Indexed(
+                generation, progress,
+            )))
+        }))
+        .abortable();
+        self.resume_ui.indexer = Some(handle);
+        Task::batch([
+            iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
+            indexer,
+        ])
+    }
+
     pub(super) fn update_resume(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Open => {
-                if self.modal_is_open() {
-                    return Task::none();
-                }
-                self.chrome_ui.close();
-                self.resume_ui.open = true;
-                self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
-                self.resume_ui.query.clear();
-                self.resume_ui.entries.clear();
-                self.resume_ui.error = None;
-                self.resume_ui.loading = true;
-                self.resume_ui.limit = 100;
-                self.resume_ui.selected = 0;
-                let generation = self.resume_ui.generation;
-                let store = self.session.as_ref().map(SessionRuntime::operation_store);
-                let current = self.durable.cards.clone();
-                let accounts = self.resume_catalog_accounts();
-                let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-                Task::batch([
-                    iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
-                    cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            let mut entries = store
-                                .map_or(Ok(Vec::new()), |store| store.saved_conversations())
-                                .map_err(|error| error.to_string())?;
-                            for card in current {
-                                if let CardKind::Chat(session) = card.kind
-                                    && session.launch.session_id.is_some()
-                                {
-                                    let updated_at_unix_ms = entries
-                                        .iter()
-                                        .find(|entry| entry.card == card.id)
-                                        .map_or_else(
-                                            || chat::now_ms().unwrap_or(0) as i64,
-                                            |entry| entry.updated_at_unix_ms,
-                                        );
-                                    entries.retain(|entry| entry.card != card.id);
-                                    entries.insert(
-                                        0,
-                                        SavedConversation {
-                                            card: card.id,
-                                            title: card.title,
-                                            session,
-                                            open: card.existence.is_open(),
-                                            updated_at_unix_ms,
-                                        },
-                                    );
-                                }
-                            }
-                            let mut seeds = Vec::new();
-                            for account in accounts {
-                                if let Ok(session) = chat::fresh_session(
-                                    account.provider,
-                                    TerminalId::new(),
-                                    directory.clone(),
-                                    &account,
-                                ) {
-                                    seeds.push(session);
-                                }
-                            }
-                            entries.sort_by_key(|entry| {
-                                (
-                                    std::cmp::Reverse(entry.open),
-                                    std::cmp::Reverse(entry.updated_at_unix_ms),
-                                )
-                            });
-                            // Persisted descriptors retain their launch configuration and
-                            // ownership evidence even when a log file is newer.
-                            entries.extend(catalog::discover(&seeds));
-                            let mut seen = HashSet::new();
-                            entries.retain(|entry| {
-                                let launch = &entry.session.launch;
-                                seen.insert((
-                                    launch.provider,
-                                    launch.session_id.clone(),
-                                    crate::account::home_variable(launch.provider)
-                                        .and_then(|variable| {
-                                            launch.recipe.environment.get(variable)
-                                        })
-                                        .map(|home| {
-                                            let path = PathBuf::from(home);
-                                            path.canonicalize().unwrap_or(path)
-                                        }),
-                                ))
-                            });
-                            entries
-                                .sort_by_key(|entry| std::cmp::Reverse(entry.updated_at_unix_ms));
-                            for entry in &mut entries {
-                                if entry.title
-                                    == chat_ui::chat_card_title(entry.session.launch.provider)
-                                    && let Some(title) = claude_title(&entry.session)
-                                {
-                                    entry.title = title;
-                                }
-                            }
-                            Ok(entries)
-                        })
-                        .await
-                        .unwrap_or_else(|error| Err(error.to_string()));
-                        Message::ResumeConversation(Action::Loaded(generation, result))
-                    }),
-                ])
-            }
+            Action::Open => self.open_resume(None),
             Action::Close => {
-                self.resume_ui.open = false;
+                self.close_resume();
+                // Whatever was being prepared is abandoned with the picker.
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
                 self.workspace.focused().map_or_else(Task::none, |card| {
@@ -281,45 +466,62 @@ impl Cagents {
             }
             Action::Query(query) => {
                 self.resume_ui.query = query;
-                self.resume_ui.limit = 100;
-                self.resume_ui.selected = 0;
+                self.refilter_resume();
                 self.reveal_resume_selection()
             }
+            Action::Unscope => {
+                self.resume_ui.scope = None;
+                self.refilter_resume();
+                Task::batch([
+                    self.reveal_resume_selection(),
+                    iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
+                ])
+            }
             Action::More => {
-                self.resume_ui.limit += 100;
+                self.resume_ui.limit += PAGE;
                 Task::none()
             }
-            Action::Loaded(generation, result) => {
+            Action::Indexed(generation, progress) => {
                 if !self.resume_ui.open || generation != self.resume_ui.generation {
                     return Task::none();
                 }
-                self.resume_ui.loading = false;
-                match result {
-                    Ok(entries) => self.resume_ui.entries = entries,
-                    Err(error) => self.resume_ui.error = Some(error),
-                }
+                self.resume_indexed(progress);
                 Task::none()
             }
             Action::Resume(card) => {
                 if !self.resume_ui.open || self.resume_ui.loading {
                     return Task::none();
                 }
-                let Some(entry) = self
-                    .resume_ui
-                    .entries
-                    .iter()
-                    .find(|entry| entry.card == card)
-                    .cloned()
-                else {
+                let Some(row) = self.resume_ui.rows.iter().find(|row| row.card == card) else {
+                    return Task::none();
+                };
+                let entry = match &row.source {
+                    Source::Saved(entry) => Some(SavedConversation::clone(entry)),
+                    Source::Found(found) => self
+                        .resume_ui
+                        .seeds
+                        .get(found.seed)
+                        .and_then(|seed| catalog::session(seed, found))
+                        .map(|session| SavedConversation {
+                            card,
+                            title: row.title.clone(),
+                            session,
+                            open: false,
+                            updated_at_unix_ms: row.updated_at_unix_ms,
+                        }),
+                };
+                let Some(entry) = entry else {
+                    self.resume_error("This conversation can no longer be resumed.");
                     return Task::none();
                 };
                 self.resume_saved_conversation(entry)
             }
             Action::Submit => {
                 let card = self
-                    .resume_entries()
+                    .resume_ui
+                    .visible
                     .get(self.resume_ui.selected)
-                    .map(|entry| entry.card);
+                    .map(|&index| self.resume_ui.rows[index].card);
                 card.map_or_else(Task::none, |card| self.update_resume(Action::Resume(card)))
             }
             Action::Prepared(generation, mut entry, result) => {
@@ -342,6 +544,98 @@ impl Cagents {
                 }
             }
         }
+    }
+
+    fn resume_indexed(&mut self, progress: Progress) {
+        match progress {
+            Progress::Saved {
+                entries,
+                seeds,
+                error,
+            } => {
+                let accounts = seeds
+                    .iter()
+                    .map(|seed| self.resume_account_label(seed))
+                    .collect();
+                let rows = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let account = self.resume_account_label(&entry.session);
+                        Row::saved(entry, account)
+                    })
+                    .collect::<Vec<_>>();
+                let state = &mut self.resume_ui;
+                state.seeds = seeds;
+                state.seed_accounts = accounts;
+                state.error = error;
+                state.rows.extend(rows);
+            }
+            Progress::Finished => self.resume_ui.indexing = None,
+            Progress::Counted(total) => {
+                let state = &mut self.resume_ui;
+                state.indexing = (total > 0).then_some((0, total));
+            }
+            Progress::Found {
+                conversations,
+                titles,
+                read,
+            } => {
+                let state = &mut self.resume_ui;
+                for (card, title) in titles
+                    .into_iter()
+                    .filter(|(card, _)| !self.chrome_ui.user_titles.contains_key(card))
+                {
+                    if let Some(row) = state.rows.iter_mut().find(|row| row.card == card) {
+                        row.title = title;
+                        row.index();
+                    }
+                }
+                for found in conversations {
+                    let Some(seed) = state.seeds.get(found.seed) else {
+                        continue;
+                    };
+                    let (provider, account) = (
+                        seed.launch.provider,
+                        state.seed_accounts[found.seed].clone(),
+                    );
+                    state.rows.push(Row::found(found, provider, account));
+                }
+                state.indexing = state
+                    .indexing
+                    .map(|(_, total)| (read, total))
+                    .filter(|(read, total)| read < total);
+            }
+        }
+        let state = &mut self.resume_ui;
+        // A row the reader moved to stays selected wherever more rows land;
+        // otherwise the newest stays first.
+        let selected = state
+            .visible
+            .get(state.selected)
+            .filter(|_| state.selected > 0)
+            .and_then(|&index| state.rows.get(index))
+            .map(|row| row.card);
+        // Stable, so rows already listed keep their order among equals.
+        state
+            .rows
+            .sort_by_key(|row| std::cmp::Reverse(row.updated_at_unix_ms));
+        state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
+        state.selected = selected
+            .and_then(|card| {
+                state
+                    .visible
+                    .iter()
+                    .position(|&index| state.rows[index].card == card)
+            })
+            .unwrap_or(0);
+    }
+
+    /// Lists the rows the query and scope admit, from the first.
+    fn refilter_resume(&mut self) {
+        let state = &mut self.resume_ui;
+        state.limit = PAGE;
+        state.selected = 0;
+        state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
     }
 
     fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
@@ -367,7 +661,7 @@ impl Cagents {
         self.resume_ui.error = None;
         let existing = self.existing_conversation_card(&entry.session);
         if let Some(card) = existing {
-            self.resume_ui.open = false;
+            self.close_resume();
             let scope = if let Some(channel) = self
                 .durable
                 .channels
@@ -430,15 +724,40 @@ impl Cagents {
             session.proof = None;
             session.terminal = None;
         }
-        self.resume_ui.open = false;
+        let replace = self.resume_ui.replace;
+        self.close_resume();
         self.recently_closed
             .retain(|(card, _)| card.id != entry.card);
         let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
-        let insert = self.insert_chat_card(session, None, None);
+        // The draft `/resume` was asked from gives its place to the
+        // conversation, where both belong to the same strip.
+        let replace = replace.filter(|card| {
+            self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
+        });
+        let insert = self.insert_chat_card(session, replace, None);
         if let Some(card) = self.workspace.focused() {
             self.apply_reported_title(card, entry.title);
         }
-        Task::batch([scope, insert])
+        let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
+        Task::batch([scope, insert, discard])
+    }
+
+    /// Closes the picker and stops indexing. Focus is left to whatever the
+    /// caller shows next.
+    fn close_resume(&mut self) {
+        let state = &mut self.resume_ui;
+        state.open = false;
+        state.indexing = None;
+        state.replace = None;
+        if let Some(indexer) = state.indexer.take() {
+            indexer.abort();
+        }
+        // Rows hold sessions, which are not small; the cache keeps what
+        // reopening needs.
+        state.rows = Vec::new();
+        state.visible = Vec::new();
+        state.seeds = Arc::from([]);
+        state.seed_accounts = Vec::new();
     }
 
     fn resume_error(&mut self, error: &str) {
@@ -453,16 +772,21 @@ impl Cagents {
             return None;
         }
         let state = &self.resume_ui;
-        let entries = self.resume_entries();
         let mut rows: Vec<Element<'_, Message>> = Vec::new();
-        for (index, entry) in entries.iter().take(state.limit).enumerate() {
+        for (index, row) in state
+            .visible
+            .iter()
+            .take(state.limit)
+            .map(|&index| &state.rows[index])
+            .enumerate()
+        {
             let label = format!(
                 "{} · {}{}",
-                entry.session.launch.provider.label(),
-                self.resume_account_label(&entry.session),
-                if entry.open { " · Open" } else { "" }
+                row.provider.label(),
+                row.account,
+                if row.open { " · Open" } else { "" }
             );
-            let date = chat::local_time(entry.updated_at_unix_ms / 1000)
+            let date = chat::local_time(row.updated_at_unix_ms / 1000)
                 .map(|time| {
                     format!(
                         "{:04}-{:02}-{:02} {}",
@@ -473,13 +797,9 @@ impl Cagents {
                     )
                 })
                 .unwrap_or_default();
-            let detail = format!(
-                "{} · {}",
-                entry.session.launch.recipe.working_directory.display(),
-                date
-            );
+            let detail = format!("{} · {}", row.directory.display(), date);
             let contents = widget::column::with_children(vec![
-                design::body(&entry.title)
+                design::body(&row.title)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
                         EllipsizeHeightLimit::Lines(1),
@@ -504,19 +824,19 @@ impl Cagents {
             .spacing(4);
             rows.push(
                 widget::button::custom(contents)
-                    .name(format!("Resume {}", entry.title))
+                    .name(format!("Resume {}", row.title))
                     .width(Length::Fill)
                     .height(Length::Fixed(96.0))
                     .class(cosmic::theme::Button::ListItem([8.0; 4]))
                     .selected(index == state.selected)
                     .on_press_maybe(
                         (!state.loading)
-                            .then_some(Message::ResumeConversation(Action::Resume(entry.card))),
+                            .then_some(Message::ResumeConversation(Action::Resume(row.card))),
                     )
                     .into(),
             );
         }
-        if entries.len() > state.limit {
+        if state.visible.len() > state.limit {
             rows.push(
                 widget::button::standard("Show more conversations")
                     .on_press(Message::ResumeConversation(Action::More))
@@ -525,16 +845,38 @@ impl Cagents {
         }
         if rows.is_empty() {
             rows.push(
-                design::caption(if state.loading {
-                    "Loading saved conversations…"
-                } else if state.entries.is_empty() {
+                design::caption(if state.indexing.is_some() {
+                    "Looking for saved conversations…"
+                } else if state.rows.is_empty() {
                     "No saved conversations yet."
+                } else if state.scope.is_some() && state.query.is_empty() {
+                    "No conversations in this project yet."
                 } else {
                     "No matching conversations."
                 })
                 .into(),
             );
         }
+        let progress = match state.indexing {
+            Some((_, 0)) => "Looking for conversations…".to_owned(),
+            Some((read, total)) => format!("Reading {read} of {total} conversations…"),
+            None => match state.visible.len() {
+                1 => "1 conversation".to_owned(),
+                count => format!("{count} conversations"),
+            },
+        };
+        let mut filters: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(scope) = &state.scope {
+            filters.push(
+                widget::button::standard(scope.label.clone())
+                    .trailing_icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
+                    .name("Search every provider and project")
+                    .on_press(Message::ResumeConversation(Action::Unscope))
+                    .into(),
+            );
+        }
+        filters.push(iced::widget::Space::new().width(Length::Fill).into());
+        filters.push(design::caption(progress).into());
         let mut content = widget::column::with_children(vec![
             widget::text::title3("Resume conversation").into(),
             design::caption(
@@ -545,6 +887,13 @@ impl Cagents {
                 .id(focus_id())
                 .on_input(|query| Message::ResumeConversation(Action::Query(query)))
                 .on_submit(|_| Message::ResumeConversation(Action::Submit))
+                .into(),
+            widget::row::with_children(filters)
+                .align_y(Alignment::Center)
+                .spacing(8)
+                // As tall as the scope it may hold, so widening the search
+                // does not move the list.
+                .height(Length::Fixed(32.0))
                 .into(),
             widget::scrollable(widget::column::with_children(rows).spacing(8))
                 .id(widget::Id::new("conversation-resume.results"))
@@ -564,26 +913,20 @@ impl Cagents {
             1.0,
         ))
     }
+}
 
-    fn resume_entries(&self) -> Vec<&SavedConversation> {
-        let query = self.resume_ui.query.to_lowercase();
-        self.resume_ui
-            .entries
-            .iter()
-            .filter(|entry| {
-                let recipe = &entry.session.launch.recipe;
-                format!(
-                    "{} {} {} {}",
-                    entry.title,
-                    entry.session.launch.provider.label(),
-                    recipe.working_directory.display(),
-                    self.resume_account_label(&entry.session)
-                )
-                .to_lowercase()
-                .contains(&query)
-            })
-            .collect()
-    }
+/// Indices of the rows matching `query` within `scope`.
+fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    // Every word is looked for on its own, so "rust review" finds "Review
+    // peripheral Rust modules".
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| scope.is_none_or(|scope| scope.admits(row)))
+        .filter(|(_, row)| words.iter().all(|word| row.haystack.contains(word)))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 #[cfg(test)]
@@ -606,6 +949,19 @@ mod tests {
             open: false,
             updated_at_unix_ms: 1,
         }
+    }
+
+    /// Delivers `entries` to an open picker as indexing would.
+    fn list(app: &mut Cagents, generation: u64, entries: Vec<SavedConversation>) {
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::Saved {
+                entries,
+                seeds: Arc::from([]),
+                error: None,
+            },
+        ));
+        let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
     }
 
     #[test]
@@ -684,50 +1040,214 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.resume_ui.open = true;
         app.resume_ui.generation = 2;
-        app.resume_ui.limit = 100;
-        let _ = app.update_resume(Action::Loaded(1, Ok(vec![saved(directory.path())])));
-        assert!(app.resume_ui.entries.is_empty());
-        let _ = app.update_resume(Action::Loaded(2, Ok(vec![saved(directory.path())])));
+        app.resume_ui.limit = PAGE;
+        list(&mut app, 1, vec![saved(directory.path())]);
+        assert!(app.resume_ui.rows.is_empty());
+        list(&mut app, 2, vec![saved(directory.path())]);
+        assert!(app.resume_ui.indexing.is_none());
         let _ = app.update_resume(Action::Query("PERIPHERAL".into()));
-        assert_eq!(app.resume_entries().len(), 1);
+        assert_eq!(app.resume_ui.visible.len(), 1);
+        let _ = app.update_resume(Action::Query("rust review".into()));
+        assert_eq!(app.resume_ui.visible.len(), 1);
         let _ = app.update_resume(Action::Query("not this conversation".into()));
-        assert!(app.resume_entries().is_empty());
+        assert!(app.resume_ui.visible.is_empty());
         let _ = app.update_resume(Action::Submit);
         assert!(app.durable.cards.is_empty());
         let _ = app.update_resume(Action::Close);
-        let _ = app.update_resume(Action::Loaded(2, Ok(vec![saved(directory.path())])));
+        list(&mut app, 2, vec![saved(directory.path())]);
         assert!(!app.resume_ui.open);
         assert!(app.durable.cards.is_empty());
     }
 
+    /// Newer conversations found while the picker is open land above the
+    /// selection, which stays on the newest until the reader moves it, and
+    /// then stays with the row they moved to.
     #[test]
-    fn transcript_title_keeps_custom_name_and_ignores_sidechains() {
+    fn the_selection_follows_the_reader_not_the_arrivals() {
         let directory = tempfile::tempdir().unwrap();
-        let mut entry = saved(directory.path());
-        let home = directory.path().join("claude");
-        entry
-            .session
-            .launch
-            .recipe
-            .environment
-            .insert("CLAUDE_CONFIG_DIR".into(), home.display().to_string());
-        let encoded: String = directory
-            .path()
-            .to_str()
-            .unwrap()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        let project = home.join("projects").join(encoded);
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{}.jsonl", entry.session.launch.session_id.as_ref().unwrap())),
-            concat!("{\"type\":\"user\",\"isSidechain\":true,\"message\":{\"content\":\"Wrong subagent\"}}\n",
-                "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Review Rust\"}]}}\n",
-                "{\"type\":\"custom-title\",\"customTitle\":\"My saved review\"}\n",
-                "{\"type\":\"summary\",\"summary\":\"Generated summary\"}\n")).unwrap();
-        assert_eq!(
-            claude_title(&entry.session).as_deref(),
-            Some("My saved review")
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        let older = saved(directory.path());
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::Saved {
+                entries: vec![older.clone()],
+                seeds: Arc::from([older.session.clone()]),
+                error: None,
+            },
+        ));
+        let found = |updated_at_unix_ms| catalog::Found {
+            seed: 0,
+            path: directory.path().join("transcript.jsonl"),
+            id: uuid::Uuid::new_v4().to_string(),
+            directory: directory.path().into(),
+            title: "Newer".into(),
+            titled: true,
+            updated_at_unix_ms,
+        };
+        let arrive = |app: &mut Cagents, updated_at_unix_ms| {
+            let _ = app.update_resume(Action::Indexed(
+                generation,
+                Progress::Found {
+                    conversations: vec![found(updated_at_unix_ms)],
+                    titles: Vec::new(),
+                    read: 1,
+                },
+            ));
+        };
+        let selected = |app: &Cagents| {
+            let state = &app.resume_ui;
+            state.rows[state.visible[state.selected]].card
+        };
+        arrive(&mut app, 2);
+        assert_ne!(selected(&app), older.card, "the newest is first");
+        let _ = app.resume_key_event(&keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        assert_eq!(selected(&app), older.card);
+        arrive(&mut app, 3);
+        assert_eq!(selected(&app), older.card, "the reader's choice holds");
+    }
+
+    /// A search narrowed to one provider and project lists only its
+    /// conversations until the reader widens it.
+    #[test]
+    fn a_scoped_search_lists_its_project_until_widened() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.scope = Some(Scope {
+            provider: Provider::Claude,
+            roots: vec![project.path().into()],
+            label: "Claude · project".into(),
+        });
+        let inside = saved(&project.path().join("src"));
+        let mut outside = saved(elsewhere.path());
+        outside.card = CardId::new();
+        outside.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let generation = app.resume_ui.generation;
+        list(&mut app, generation, vec![inside.clone(), outside]);
+        let listed = |app: &Cagents| {
+            app.resume_ui
+                .visible
+                .iter()
+                .map(|&index| app.resume_ui.rows[index].card)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&app), [inside.card]);
+        let _ = app.update_resume(Action::Unscope);
+        assert_eq!(listed(&app).len(), 2);
+    }
+
+    /// Saved conversations are listed before any history is read; a found
+    /// copy of one only lends it the provider's title; and the newest found
+    /// arrive first and alone.
+    #[test]
+    fn indexing_lists_saved_conversations_first_and_found_ones_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("claude");
+        let account = crate::account::Account {
+            provider: Provider::Claude,
+            home: crate::account::AccountHome::Linked {
+                key: uuid::Uuid::new_v4(),
+                path: home.clone(),
+            },
+        };
+        let seed = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            root.path().into(),
+            &account,
+        )
+        .unwrap();
+        let projects = provider_root(&seed).join("projects/project");
+        std::fs::create_dir_all(&projects).unwrap();
+        let ids = (0..FIRST_BATCH + 2)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        for (age, id) in ids.iter().enumerate() {
+            let path = projects.join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Prompt {age}")}})
+                ),
+            )
+            .unwrap();
+            let modified = std::time::SystemTime::now() - Duration::from_secs(age as u64 * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        let mut entry = saved(root.path());
+        entry.session = seed.clone();
+        entry.session.launch.session_id = Some(ids[1].clone());
+        entry.title = chat_ui::chat_card_title(Provider::Claude).into();
+        let mut progress = Vec::new();
+        index(
+            Ok(vec![entry.clone()]),
+            vec![seed],
+            &catalog::Cache::default(),
+            |step| {
+                progress.push(step);
+                true
+            },
         );
+        let Progress::Saved { entries, .. } = &progress[0] else {
+            panic!("saved conversations come first")
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(progress[1], Progress::Counted(count) if count == ids.len()));
+        let Progress::Found {
+            conversations,
+            titles,
+            read,
+        } = &progress[2]
+        else {
+            panic!("the newest conversations come next")
+        };
+        assert_eq!(*read, FIRST_BATCH);
+        assert_eq!(conversations.len(), FIRST_BATCH - 1);
+        assert_eq!(conversations[0].id, ids[0]);
+        assert_eq!(conversations[1].id, ids[2]);
+        assert_eq!(titles, &[(entry.card, "Prompt 1".to_owned())]);
+        let Progress::Found { read, .. } = &progress[3] else {
+            panic!("the rest follow")
+        };
+        assert_eq!(*read, ids.len());
+        // Nobody listening stops indexing at once.
+        let mut steps = 0;
+        index(
+            Ok(Vec::new()),
+            Vec::new(),
+            &catalog::Cache::default(),
+            |_| {
+                steps += 1;
+                false
+            },
+        );
+        assert_eq!(steps, 1);
+    }
+
+    fn provider_root(seed: &chat::Session) -> PathBuf {
+        seed.launch
+            .provider
+            .session_root(&seed.launch.recipe)
+            .unwrap()
     }
 }
