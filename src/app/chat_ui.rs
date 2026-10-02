@@ -6800,12 +6800,15 @@ mod tests {
             vec![0, 0, 0, 255],
         ));
         runtime.cache.insert("image".into(), cached);
-        Arc::make_mut(&mut runtime.snapshot).items = vec![chat::Item {
-            id: "image".into(),
-            role: chat::Role::Assistant,
-            content,
-            at: None,
-        }];
+        Arc::make_mut(&mut runtime.snapshot).items = vec![
+            chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content,
+                at: None,
+            }
+            .into(),
+        ];
         let target = runtime.target;
         drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
         assert!(app.chat_ui.image_viewer.is_some());
@@ -7130,12 +7133,15 @@ mod tests {
     fn resumed_and_cli_paired_snapshots_supply_channel_names() {
         let mut snapshot = Snapshot::default();
         assert_eq!(snapshot_channel_name(&snapshot), None);
-        snapshot.items.push(chat::Item {
-            id: "prompt".into(),
-            role: chat::Role::User,
-            content: text("Implement the requested feature"),
-            at: None,
-        });
+        snapshot.items.push(
+            chat::Item {
+                id: "prompt".into(),
+                role: chat::Role::User,
+                content: text("Implement the requested feature"),
+                at: None,
+            }
+            .into(),
+        );
         assert_eq!(
             snapshot_channel_name(&snapshot),
             Some((
@@ -9272,12 +9278,15 @@ mod tests {
         let card = live_chat(&mut app, Some("thread"));
         let target = match app.cards.get_mut(&card) {
             Some(CardRuntime::Chat(runtime)) => {
-                Arc::make_mut(&mut runtime.snapshot).items.push(chat::Item {
-                    id: "prompt".into(),
-                    role: chat::Role::User,
-                    content: text("hello"),
-                    at: None,
-                });
+                Arc::make_mut(&mut runtime.snapshot).items.push(
+                    chat::Item {
+                        id: "prompt".into(),
+                        role: chat::Role::User,
+                        content: text("hello"),
+                        at: None,
+                    }
+                    .into(),
+                );
                 runtime.target
             }
             _ => unreachable!(),
@@ -10346,12 +10355,15 @@ mod tests {
         answer_start(&mut app, target, Ok(handle.clone()));
         handle.replace_snapshot_for_test(Snapshot {
             ready: true,
-            items: vec![chat::Item {
-                id: "prompt".into(),
-                role: chat::Role::User,
-                content: text("hello"),
-                at: None,
-            }],
+            items: vec![
+                chat::Item {
+                    id: "prompt".into(),
+                    role: chat::Role::User,
+                    content: text("hello"),
+                    at: None,
+                }
+                .into(),
+            ],
             ..Snapshot::default()
         });
         settle(

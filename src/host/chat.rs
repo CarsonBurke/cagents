@@ -2168,10 +2168,26 @@ fn process_inner(
                     "Hidden chat has no presentation stream; make it visible before reading",
                 ));
             }
-            Ok(ServerResponse::ChatSnapshot {
-                chat_id,
-                snapshot: record.handle.snapshot(after_generation),
-            })
+            let handle = record.handle.clone();
+            drop(state);
+            let response = handle.presentation(chat_id, after_generation).unwrap_or(
+                ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: None,
+                },
+            );
+            // A close, detach, replacement actor, or visibility change during
+            // hydration must not publish data under the old attachment.
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let current = attached(&state, client, chat_id)?;
+            if !current.handle.same_actor(&handle)
+                || !current.subscribers.get(&client).copied().unwrap_or(false)
+            {
+                return Err(error(
+                    "Chat attachment changed while preparing its transcript",
+                ));
+            }
+            Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
             let (handle, mut session) = {

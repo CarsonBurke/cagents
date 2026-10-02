@@ -348,6 +348,7 @@ impl Handle {
                     wake: reader,
                     notify,
                     output: Vec::new(),
+                    scanned: 0,
                     pending: VecDeque::new(),
                     offset: 0,
                     queued: 0,
@@ -694,8 +695,10 @@ impl Handle {
         if after.is_some_and(|generation| generation >= state.generation) && !store.dirty {
             return None;
         }
+        let refresh_publication =
+            store.presented_generation != Some(state.generation) || store.dirty;
         if store.dirty {
-            match store.window() {
+            match store.window_reusing(&mut state.items) {
                 Ok(window) => {
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
@@ -706,7 +709,123 @@ impl Handle {
                 }
             }
         }
+        if refresh_publication {
+            store.presented_generation = Some(state.generation);
+            store.presentation = None;
+            store.presented_children = state
+                .subagents
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.items.clone()))
+                .collect();
+        }
         Some(state.clone())
+    }
+    /// The last publication is retained for other readers of the same revision.
+    /// Readers that missed it receive the authoritative full snapshot instead.
+    pub(crate) fn presentation(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Option<crate::terminal_ipc::ServerResponse> {
+        let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if after == Some(state.generation) && !store.dirty {
+            return None;
+        }
+        if store.presented_generation != Some(state.generation) || store.dirty {
+            let baseline = store.presented_generation;
+            let changes = if store.dirty {
+                match store.window_reusing(&mut state.items) {
+                    Ok(window) => {
+                        state.items = window.items;
+                        state.has_earlier = window.has_earlier;
+                        state.has_later = window.has_later;
+                        window.changes
+                    }
+                    Err(error) => {
+                        state.error = Some(format!("Cannot page owned transcript cache: {error}"));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            store.presentation = baseline
+                .filter(|generation| *generation < state.generation)
+                .map(|base_generation| {
+                    let children = state
+                        .subagents
+                        .iter()
+                        .map(|agent| {
+                            let previous: BTreeMap<_, _> = store
+                                .presented_children
+                                .get(&agent.id)
+                                .into_iter()
+                                .flatten()
+                                .map(|item| (item.id.as_str(), item))
+                                .collect();
+                            crate::chat::presentation::ChildUpdate {
+                                id: agent.id.clone(),
+                                order: agent.items.iter().map(|item| item.id.clone()).collect(),
+                                changes: agent
+                                    .items
+                                    .iter()
+                                    .filter(|item| {
+                                        previous
+                                            .get(item.id.as_str())
+                                            .is_none_or(|old| !Arc::ptr_eq(old, item))
+                                    })
+                                    .map(|item| {
+                                        crate::chat::presentation::ItemChange::between(
+                                            previous.get(item.id.as_str()).map(|old| old.as_ref()),
+                                            item,
+                                        )
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect();
+                    let items = std::mem::take(&mut state.items);
+                    let child_items: Vec<_> = state
+                        .subagents
+                        .iter_mut()
+                        .map(|agent| std::mem::take(&mut agent.items))
+                        .collect();
+                    let metadata = state.clone();
+                    state.items = items;
+                    for (agent, items) in state.subagents.iter_mut().zip(child_items) {
+                        agent.items = items;
+                    }
+                    crate::chat::presentation::Presentation {
+                        base_generation,
+                        metadata,
+                        order: state.items.iter().map(|item| item.id.clone()).collect(),
+                        changes,
+                        children,
+                    }
+                });
+            store.presented_generation = Some(state.generation);
+            store.presented_children = state
+                .subagents
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.items.clone()))
+                .collect();
+        }
+        if let Some(presentation) = store
+            .presentation
+            .as_ref()
+            .filter(|update| after == Some(update.base_generation))
+        {
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate {
+                chat_id,
+                update: presentation.clone(),
+            })
+        } else {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                chat_id,
+                snapshot: Some(state.clone()),
+            })
+        }
     }
     pub fn session_id(&self) -> Option<String> {
         self.0
@@ -1150,6 +1269,17 @@ impl Drop for ChildGuard {
         self.terminate();
     }
 }
+fn next_newline(bytes: &[u8], scanned: &mut usize) -> Option<usize> {
+    let start = *scanned;
+    match bytes[start..].iter().position(|byte| *byte == b'\n') {
+        Some(offset) => Some(start + offset),
+        None => {
+            *scanned = bytes.len();
+            None
+        }
+    }
+}
+
 fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     let raw = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
@@ -1178,6 +1308,8 @@ struct Actor {
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
+    /// Prefix already checked for a delimiter in the incomplete stdio frame.
+    scanned: usize,
     pending: VecDeque<Vec<u8>>,
     offset: usize,
     queued: usize,
@@ -1302,11 +1434,12 @@ impl Actor {
             let mut frames_ready = false;
             let mut parsed = 0usize;
             loop {
-                let Some(newline) = self.output.iter().position(|byte| *byte == b'\n') else {
+                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
                     break;
                 };
                 if newline == 0 {
                     self.output.drain(..1);
+                    self.scanned = 0;
                     continue;
                 }
                 if parsed == FRAMES_PER_POLL {
@@ -1317,6 +1450,7 @@ impl Actor {
                     format!("Unsupported provider stdout (expected JSON-lines): {error}")
                 })?;
                 self.output.drain(..=newline);
+                self.scanned = 0;
                 partial_started = None;
                 parsed += 1;
                 self.first_frame = true;
@@ -1955,6 +2089,21 @@ fn recover_history_error(
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     match event {
+        Event::OutputDelta { id, offset, delta } => {
+            if let Some(&index) = indices.get(&id) {
+                let item = Arc::make_mut(&mut state.items[index]);
+                let body = match &mut item.content {
+                    ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => {
+                        Some(output)
+                    }
+                    _ => None,
+                };
+                if let Some(body) = body.filter(|body| body.len() == offset) {
+                    body.push_str(&delta);
+                    item.at = observed_at();
+                }
+            }
+        }
         Event::TurnStarted
         | Event::TurnSettled
         | Event::TurnFinished { .. }
@@ -2049,10 +2198,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         input.clone_from(old_input);
                     }
                 }
-                state.items[index] = item;
+                state.items[index] = Arc::new(item);
             } else {
                 indices.insert(item.id.clone(), state.items.len());
-                state.items.push(item);
+                state.items.push(Arc::new(item));
             }
         }
         Event::Subagent {
@@ -2076,9 +2225,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             item.at = observed_at();
             let agent = subagent(state, &id);
             if let Some(old) = agent.items.iter_mut().find(|old| old.id == item.id) {
-                *old = item;
+                *old = Arc::new(item);
             } else {
-                agent.items.push(item);
+                agent.items.push(Arc::new(item));
             }
             trim_subagent(agent);
         }
@@ -2091,12 +2240,13 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         } => {
             let agent = subagent(state, &id);
             if let Some(item) = agent.items.iter_mut().find(|item| item.id == item_id) {
+                let item = Arc::make_mut(item);
                 if let ItemContent::Text { text, .. } = &mut item.content {
                     text.push_str(&delta);
                     item.at = observed_at();
                 }
             } else {
-                agent.items.push(Item {
+                agent.items.push(Arc::new(Item {
                     id: item_id,
                     role,
                     content: ItemContent::Text {
@@ -2105,7 +2255,26 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         phase: Phase::Final,
                     },
                     at: observed_at(),
-                });
+                }));
+            }
+            trim_subagent(agent);
+        }
+        Event::SubagentOutputDelta {
+            id,
+            item_id,
+            offset,
+            delta,
+        } => {
+            let agent = subagent(state, &id);
+            if let Some(item) = agent.items.iter_mut().find(|item| item.id == item_id) {
+                let item = Arc::make_mut(item);
+                if let ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } =
+                    &mut item.content
+                    && output.len() == offset
+                {
+                    output.push_str(&delta);
+                    item.at = observed_at();
+                }
             }
             trim_subagent(agent);
         }
@@ -2124,7 +2293,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                     continue;
                 }
                 if let Some(index) = state.items.iter().position(|cached| cached.id == item.id) {
-                    state.items.splice(index..index, run.drain(..));
+                    state
+                        .items
+                        .splice(index..index, run.drain(..).map(Arc::new));
                     after = Some(item.id);
                 } else {
                     run.push(item);
@@ -2139,7 +2310,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         .map(|index| index + 1)
                 })
                 .unwrap_or(if latest_history { state.items.len() } else { 0 });
-            state.items.splice(insertion..insertion, run);
+            state
+                .items
+                .splice(insertion..insertion, run.into_iter().map(Arc::new));
             indices.clear();
             indices.extend(
                 state
@@ -2158,9 +2331,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         } => {
             let at = observed_at();
             if let Some(&index) = indices.get(&id) {
-                if let ItemContent::Text { text, .. } = &mut state.items[index].content {
+                let item = Arc::make_mut(&mut state.items[index]);
+                if let ItemContent::Text { text, .. } = &mut item.content {
                     text.push_str(&delta);
-                    state.items[index].at = at;
+                    item.at = at;
                 } else {
                     state.error = Some(format!(
                         "Provider reused non-text item ID {id} for a text delta"
@@ -2168,7 +2342,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 }
             } else {
                 indices.insert(id.clone(), state.items.len());
-                state.items.push(Item {
+                state.items.push(Arc::new(Item {
                     id,
                     role,
                     // The delta stream carries no phase, so the item created to
@@ -2180,7 +2354,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         phase: Phase::Final,
                     },
                     at,
-                });
+                }));
             }
         }
         Event::Request(request) => {
@@ -2261,7 +2435,7 @@ fn trim_subagent(agent: &mut Subagent) {
     if let Some(last) = agent.items.last_mut()
         && last.content.byte_len() > MAX_BYTES
     {
-        last.content = ItemContent::Text {
+        Arc::make_mut(last).content = ItemContent::Text {
             text: "[This large item is available in the provider transcript.]".into(),
             thinking: false,
             phase: Phase::Commentary,
@@ -2280,6 +2454,27 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incomplete_stdio_frames_only_scan_the_new_suffix() {
+        let mut bytes = Vec::new();
+        let mut scanned = 0;
+        for _ in 0..1024 {
+            let before = bytes.len();
+            bytes.extend_from_slice(&[b'x'; 8192]);
+            assert_eq!(scanned, before);
+            assert_eq!(super::next_newline(&bytes, &mut scanned), None);
+            assert_eq!(scanned, bytes.len());
+        }
+        bytes.extend_from_slice(b"\n{}\n");
+        assert_eq!(
+            super::next_newline(&bytes, &mut scanned),
+            Some(8 * 1024 * 1024)
+        );
+        bytes.drain(..=scanned);
+        scanned = 0;
+        assert_eq!(super::next_newline(&bytes, &mut scanned), Some(2));
+    }
+
     #[test]
     fn update_readiness_fences_a_prompt_whose_caller_stopped_waiting() {
         struct GatedPrompt {
@@ -2487,11 +2682,11 @@ mod tests {
     }
     /// Stamps are wall-clock readings, so structural comparisons drop them and
     /// leave the timing contract to the test that is actually about timing.
-    fn unstamped(items: &[Item]) -> Vec<Item> {
+    fn unstamped(items: &[Arc<Item>]) -> Vec<Item> {
         items
             .iter()
-            .cloned()
-            .map(|mut item| {
+            .map(|item| {
+                let mut item = (**item).clone();
                 item.at = None;
                 item
             })
@@ -2903,6 +3098,92 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn presentation_serves_multiple_readers_and_resyncs_missed_revisions() {
+        struct Updates;
+        impl Adapter for Updates {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Item(text("fixed", &"x".repeat(128 * 1024))),
+                        Event::Item(text("live", "hello")),
+                        Event::Ready(true),
+                    ],
+                    ..Step::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::TextDelta {
+                        id: "live".into(),
+                        role: Role::Assistant,
+                        thinking: false,
+                        delta: " world".into(),
+                    }],
+                    ..Step::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Updates);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let baseline = until(&handle, |snapshot| snapshot.ready);
+        let fixed = baseline.items[0].clone();
+        let id = crate::model::TerminalId::new();
+        handle.command(Command::Refresh).unwrap();
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) =
+            handle.presentation(id, Some(baseline.generation))
+        else {
+            panic!("expected incremental update");
+        };
+        assert!(postcard::to_stdvec(&update).unwrap().len() < 4096);
+        let mut first = baseline.clone();
+        update.clone().apply(&mut first).unwrap();
+        assert!(
+            Arc::ptr_eq(&fixed, &first.items[0]),
+            "unchanged payload is shared across snapshots"
+        );
+        // A console/full-snapshot reader at the same revision must not
+        // erase the incremental patch another subscriber is about to read.
+        assert_eq!(handle.snapshot(None).unwrap().generation, first.generation);
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update: second, .. }) =
+            handle.presentation(id, Some(baseline.generation))
+        else {
+            panic!("second reader lost its update");
+        };
+        assert_eq!(update, second);
+        handle.command(Command::Refresh).unwrap();
+        assert!(matches!(
+            handle.presentation(id, Some(baseline.generation)),
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            handle.presentation(id, None),
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(_),
+                ..
+            })
+        ));
+        handle.close().unwrap();
     }
 
     #[test]

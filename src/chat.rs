@@ -3,6 +3,7 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod presentation;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -734,7 +735,9 @@ pub struct BindingCandidate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub generation: u64,
-    pub items: Vec<Item>,
+    /// Immutable payloads are shared by daemon, client and retained UI snapshots.
+    /// Updating one answer must not copy the finished transcript around it.
+    pub items: Vec<std::sync::Arc<Item>>,
     pub requests: Vec<Request>,
     pub capabilities: Capabilities,
     pub models: Vec<Model>,
@@ -823,7 +826,7 @@ pub struct Subagent {
     pub kind: String,
     pub description: String,
     pub status: ToolStatus,
-    pub items: Vec<Item>,
+    pub items: Vec<std::sync::Arc<Item>>,
 }
 
 /// Route transcript content without letting child status, identity or usage
@@ -847,6 +850,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
                 item_id,
                 role,
                 thinking,
+                delta,
+            }],
+            Event::OutputDelta {
+                id: item_id,
+                offset,
+                delta,
+            } => vec![Event::SubagentOutputDelta {
+                id: id.into(),
+                item_id,
+                offset,
                 delta,
             }],
             Event::ItemsRemoved { ids } => vec![Event::SubagentItemsRemoved { id: id.into(), ids }],
@@ -1405,6 +1418,12 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// An append to a tracked command/tool output, never an authoritative rewrite.
+    OutputDelta {
+        id: String,
+        offset: usize,
+        delta: String,
+    },
     Subagent {
         id: String,
         kind: String,
@@ -1414,6 +1433,12 @@ pub enum Event {
     SubagentItem {
         id: String,
         item: Item,
+    },
+    SubagentOutputDelta {
+        id: String,
+        item_id: String,
+        offset: usize,
+        delta: String,
     },
     SubagentTextDelta {
         id: String,

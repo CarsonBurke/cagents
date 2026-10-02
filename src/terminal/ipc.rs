@@ -108,7 +108,7 @@ use crate::{
 /// for the caller.
 /// Version 45 lets a connection act for an agent session, which may then
 /// change only the terminals it controls.
-pub const PROTOCOL_VERSION: u16 = 45;
+pub const PROTOCOL_VERSION: u16 = 46;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -712,6 +712,10 @@ pub enum ServerResponse {
     },
     ChatResumePrepared {
         session: crate::chat::Session,
+    },
+    ChatUpdate {
+        chat_id: TerminalId,
+        update: crate::chat::presentation::Presentation,
     },
 }
 
