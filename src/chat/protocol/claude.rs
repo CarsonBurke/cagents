@@ -1303,7 +1303,7 @@ impl Adapter for Claude {
                 }
             }
             step.events.push(Event::History {
-                items,
+                items: settled(items),
                 has_earlier: history.offset > 0,
             });
             step.events.extend(children);
@@ -1416,7 +1416,10 @@ impl Adapter for Claude {
                     })
                     .collect();
                 Ok(Step {
-                    events: vec![Event::History { items, has_earlier }],
+                    events: vec![Event::History {
+                        items: settled(items),
+                        has_earlier,
+                    }],
                     ..Step::default()
                 })
             }
@@ -2520,6 +2523,22 @@ fn command_content(
 }
 /// Attach a tool result to whichever variant the call was mapped to, so that a
 /// richer mapping never costs the result the provider reported.
+/// A history page's items, each once: where it first appeared, as it last
+/// stood. Replaying a tool reports its call and then its result as the same
+/// item, and a page keeps an item's first copy.
+fn settled(items: Vec<Item>) -> Vec<Item> {
+    let mut positions = HashMap::new();
+    let mut page: Vec<Item> = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(&position) = positions.get(&item.id) {
+            page[position] = item;
+        } else {
+            positions.insert(item.id.clone(), page.len());
+            page.push(item);
+        }
+    }
+    page
+}
 fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
     let result = if failed {
         ToolStatus::Failed
@@ -4980,6 +4999,38 @@ mod tests {
         assert!(returned.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Running), .. } if id == "tool-agent")));
         let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task-one","tool_use_id":"tool-agent","patch":{"status":"completed"}})).unwrap();
         assert!(done.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn a_replayed_tool_reads_as_its_result() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"assistant","uuid":"call","parentUuid":null,"sessionId":session,"message":{"id":"call-message","content":[{"type":"tool_use","id":"tool-read","name":"Read","input":{"file_path":"/a"}}]}}),
+            json!({"type":"user","uuid":"result","parentUuid":"call","sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-read","content":"text"}]}}),
+            json!({"type":"assistant","uuid":"answer","parentUuid":"result","sessionId":session,"message":{"id":"answer-message","content":[{"type":"text","text":"Read it"}]}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut adapter = Claude {
+            history: Some(History::index(file, session).unwrap()),
+            ..Claude::default()
+        };
+        let replayed = adapter.initialize().unwrap();
+        let Some(Event::History { items, .. }) = replayed
+            .events
+            .iter()
+            .find(|event| matches!(event, Event::History { .. }))
+        else {
+            panic!("history was not replayed");
+        };
+        let ids = items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["tool-read", "answer-message:0"]);
+        assert_eq!(items[0].content.status(), Some(ToolStatus::Succeeded));
     }
 
     #[test]
