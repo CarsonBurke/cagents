@@ -62,6 +62,129 @@ pub struct Diagnostic {
     pub end: Position,
     pub severity: crate::lsp::LspSeverity,
 }
+
+/// Immutable native lines, addressable without a renderer or font-system lock.
+/// The ranges exclude terminators, while `text` preserves exactly the bytes
+/// [`Content::text`] would save, including mixed and bare-CR line endings.
+#[derive(Debug)]
+pub(crate) struct SearchSnapshot {
+    text: String,
+    lines: Vec<std::ops::Range<usize>>,
+}
+
+impl SearchSnapshot {
+    pub(crate) fn find_matches(
+        &self,
+        query: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Vec<(Position, Position)>> {
+        find_in_lines(
+            self.lines.iter().map(|range| &self.text[range.clone()]),
+            query,
+            cancelled,
+        )
+    }
+
+    /// Build a replacement in source order: each match and source byte is
+    /// visited once, irrespective of the number of lines or length changes.
+    pub(crate) fn replace_matches(
+        &self,
+        matches: &[(Position, Position)],
+        replacement: &str,
+    ) -> Option<String> {
+        let mut result = String::with_capacity(self.text.len());
+        let mut copied = 0;
+        for &(start, end) in matches {
+            let start_line = self.lines.get(start.line)?;
+            let end_line = self.lines.get(end.line)?;
+            if start.column > start_line.len() || end.column > end_line.len() {
+                return None;
+            }
+            let start = start_line.start + start.column;
+            let end = end_line.start + end.column;
+            if end < start || start < copied || !self.text.is_char_boundary(end) {
+                return None;
+            }
+            result.push_str(self.text.get(copied..start)?);
+            result.push_str(replacement);
+            copied = end;
+        }
+        result.push_str(self.text.get(copied..)?);
+        Some(result)
+    }
+}
+
+fn find_in_lines<T: AsRef<str>>(
+    lines: impl Iterator<Item = T>,
+    query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Option<Vec<(Position, Position)>> {
+    use unicode_casefold::UnicodeCaseFold;
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let query: String = query.case_fold().collect();
+    let mut matches = Vec::new();
+    // Reuse scratch space rather than allocating two buffers per source line.
+    let mut folded = String::new();
+    let mut boundaries = Vec::new();
+    for (line, text) in lines.enumerate() {
+        let text = text.as_ref();
+        if cancelled() {
+            return None;
+        }
+        folded.clear();
+        boundaries.clear();
+        if text.is_ascii() {
+            // ASCII case folding preserves every byte boundary. Most source
+            // lines take this path and need no boundary map at all.
+            folded.push_str(text);
+            folded.make_ascii_lowercase();
+            for (index, (offset, _)) in folded.match_indices(&query).enumerate() {
+                if index % 1024 == 0 && cancelled() {
+                    return None;
+                }
+                matches.push((
+                    Position {
+                        line,
+                        column: offset,
+                    },
+                    Position {
+                        line,
+                        column: offset + query.len(),
+                    },
+                ));
+            }
+            continue;
+        }
+        for (index, (offset, character)) in text.char_indices().enumerate() {
+            if index % 1024 == 0 && cancelled() {
+                return None;
+            }
+            let start = folded.len();
+            folded.extend(std::iter::once(character).case_fold());
+            boundaries.resize(folded.len(), None);
+            boundaries[start] = Some(offset);
+        }
+        boundaries.push(Some(text.len()));
+        for (index, (offset, _)) in folded.match_indices(&query).enumerate() {
+            if index % 1024 == 0 && cancelled() {
+                return None;
+            }
+            if let (Some(start), Some(end)) = (boundaries[offset], boundaries[offset + query.len()])
+            {
+                matches.push((
+                    Position {
+                        line,
+                        column: start,
+                    },
+                    Position { line, column: end },
+                ));
+            }
+        }
+    }
+    Some(matches)
+}
 type NativeEditor = <cosmic::Renderer as text::Renderer>::Editor;
 pub struct TextEditor<'a, Highlighter, Message, Theme = cosmic::Theme, Renderer = cosmic::Renderer>
 where
@@ -829,39 +952,29 @@ where
 
     /// Search Unicode text a line at a time, retaining source byte positions.
     pub fn find_matches(&self, query: &str) -> Vec<(Position, Position)> {
-        use unicode_casefold::UnicodeCaseFold;
-        if query.is_empty() {
-            return Vec::new();
+        let internal = self.0.borrow();
+        // NativeEditor borrows these lines in place; no whole-buffer snapshot
+        // is needed for the synchronous, bounded small-file search.
+        let lines =
+            (0..internal.editor.line_count()).filter_map(|index| internal.editor.line(index));
+        find_in_lines(lines.map(|line| line.text), query, || false).unwrap_or_default()
+    }
+
+    pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut text = String::new();
+        let mut lines = Vec::with_capacity(count);
+        for index in 0..count {
+            let Some(line) = internal.editor.line(index) else {
+                break;
+            };
+            let start = text.len();
+            text.push_str(&line.text);
+            lines.push(start..text.len());
+            text.push_str(terminator(line.ending, index + 1 == count));
         }
-        let query: String = query.case_fold().collect();
-        let mut matches = Vec::new();
-        for line in 0..self.line_count() {
-            self.with_line(line, |text, _| {
-                let mut folded = String::with_capacity(text.len());
-                let mut boundaries = Vec::with_capacity(text.len() + 1);
-                for (offset, character) in text.char_indices() {
-                    let start = folded.len();
-                    folded.extend(std::iter::once(character).case_fold());
-                    boundaries.resize(folded.len(), None);
-                    boundaries[start] = Some(offset);
-                }
-                boundaries.push(Some(text.len()));
-                for (offset, _) in folded.match_indices(&query) {
-                    if let (Some(start), Some(end)) =
-                        (boundaries[offset], boundaries[offset + query.len()])
-                    {
-                        matches.push((
-                            Position {
-                                line,
-                                column: start,
-                            },
-                            Position { line, column: end },
-                        ));
-                    }
-                }
-            });
-        }
-        matches
+        SearchSnapshot { text, lines }
     }
 
     /// Byte length of the text [`Content::text`] would produce, without
@@ -2843,6 +2956,74 @@ impl ScrollGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_snapshot_preserves_native_positions_unicode_and_mixed_endings() {
+        let source = "Straße\rSTRASSE\r\ncafé CAFÉ\n\rtail";
+        let content: Content = Content::with_text(source);
+        let snapshot = content.search_snapshot();
+        assert_eq!(snapshot.text, content.text());
+        for query in ["strasse", "café", " ", "tail", "s", ""] {
+            assert_eq!(
+                snapshot.find_matches(query, || false).unwrap(),
+                content.find_matches(query)
+            );
+        }
+        let matches = snapshot.find_matches("strasse", || false).unwrap();
+        assert_eq!(
+            snapshot.replace_matches(&matches, "road\nnext").unwrap(),
+            "road\nnext\rroad\nnext\r\ncafé CAFÉ\n\rtail"
+        );
+    }
+
+    #[test]
+    fn replace_all_builds_a_large_changed_length_document_in_source_order() {
+        let text = "token\n".repeat(100_000);
+        let content: Content = Content::with_text(&text);
+        let snapshot = content.search_snapshot();
+        let matches = snapshot.find_matches("token", || false).unwrap();
+        assert_eq!(matches.len(), 100_000);
+        assert_eq!(
+            snapshot
+                .replace_matches(&matches, "longer replacement")
+                .unwrap(),
+            "longer replacement\n".repeat(100_000)
+        );
+        assert_eq!(
+            snapshot.replace_matches(&matches, "").unwrap(),
+            "\n".repeat(100_000)
+        );
+    }
+
+    #[test]
+    fn snapshot_search_cancels_inside_a_single_long_line() {
+        let content: Content = Content::with_text(&"Straße ".repeat(100_000));
+        let snapshot = content.search_snapshot();
+        let checks = std::cell::Cell::new(0);
+        assert!(
+            snapshot
+                .find_matches("strasse", || {
+                    checks.set(checks.get() + 1);
+                    checks.get() == 3
+                })
+                .is_none()
+        );
+        assert_eq!(checks.get(), 3);
+    }
+
+    #[test]
+    fn replace_matches_rejects_overlapping_or_invalid_unicode_ranges() {
+        let content: Content = Content::with_text("café");
+        let snapshot = content.search_snapshot();
+        let at = |column| Position { line: 0, column };
+        for matches in [
+            vec![(at(0), at(3)), (at(2), at(5))],
+            vec![(at(0), at(4))],
+            vec![(at(9), at(9))],
+        ] {
+            assert!(snapshot.replace_matches(&matches, "x").is_none());
+        }
+    }
 
     #[test]
     fn find_casefolds_unicode_preserves_whitespace_and_source_offsets() {

@@ -626,6 +626,11 @@ pub enum RepositoryAction {
         card: CardId,
         focused: bool,
     },
+    FindLoaded {
+        card: CardId,
+        ticket: uuid::Uuid,
+        result: Result<Option<Vec<(text_editor::Position, text_editor::Position)>>, String>,
+    },
     ReplaceQueryChanged {
         card: CardId,
         query: String,
@@ -701,6 +706,7 @@ impl RepositoryAction {
             | Self::FindNext { card }
             | Self::FindPrevious { card }
             | Self::FindInputFocus { card, .. }
+            | Self::FindLoaded { card, .. }
             | Self::ReplaceQueryChanged { card, .. }
             | Self::ToggleReplace { card }
             | Self::ReplaceMatch { card, .. }
@@ -1342,35 +1348,6 @@ fn caret_for_offset(
     caret
 }
 
-/// The byte offset into [`text_editor::Content::text`] of an editor caret,
-/// and the length of the buffer for a caret beyond its last line.
-///
-/// The inverse of [`caret_for_offset`], walking the lines in place for the
-/// same reason: find asks for this on every open, and a conversion that
-/// allocated per line would charge the whole document for one keystroke.
-fn caret_byte_offset(
-    content: &text_editor::Content<cosmic::Renderer>,
-    caret: text_editor::Position,
-) -> usize {
-    let lines = content.line_count();
-    let mut offset = 0;
-    for index in 0..lines {
-        let Some(advance) = content.with_line(index, |text, ending| {
-            if index == caret.line {
-                return char_boundary(text, caret.column);
-            }
-            text.len() + terminator_str(ending, index + 1 == lines).len()
-        }) else {
-            break;
-        };
-        offset += advance;
-        if index == caret.line {
-            break;
-        }
-    }
-    offset
-}
-
 /// Index of the editor line whose bare `\r` terminator is the buffer's very
 /// last byte, if there is one.
 ///
@@ -1829,6 +1806,25 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct FindKey {
+    generation: u64,
+    revision: u64,
+    query: String,
+}
+
+struct FindJob {
+    key: FindKey,
+    ticket: uuid::Uuid,
+    cancellation: CancellationToken,
+}
+
+impl Drop for FindJob {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     directory_only: bool,
@@ -1899,6 +1895,11 @@ pub struct RepositoryRuntime {
     replace_query: String,
     toolbar_overflow_open: bool,
     find_matches: Vec<(text_editor::Position, text_editor::Position)>,
+    find_cache: Option<FindKey>,
+    find_snapshot: Option<(u64, u64, Arc<text_editor::SearchSnapshot>)>,
+    find_active: Option<FindJob>,
+    find_origin: Option<(usize, usize)>,
+    find_error: Option<String>,
     /// One entry per comparison this selection has been asked for.
     ///
     /// A list rather than a map: at most six bases are live at once, and
@@ -2060,6 +2061,11 @@ impl RepositoryRuntime {
             replace_query: String::new(),
             toolbar_overflow_open: false,
             find_matches: Vec::new(),
+            find_cache: None,
+            find_snapshot: None,
+            find_active: None,
+            find_origin: None,
+            find_error: None,
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
@@ -2916,17 +2922,26 @@ impl RepositoryRuntime {
     /// Selects one case-insensitive occurrence in the open buffer and returns
     /// the total number of occurrences.
     pub fn select_text_match(&mut self, query: &str, occurrence: usize) -> Option<usize> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        let key = FindKey {
+            generation: self.generation,
+            revision: document.revision,
+            query: query.to_owned(),
+        };
+        if self.find_cache.as_ref() != Some(&key) {
+            self.find_matches = document.content.find_matches(query);
+            self.find_cache = Some(key);
+        }
+        self.select_cached_match(occurrence)
+    }
+
+    fn select_cached_match(&mut self, occurrence: usize) -> Option<usize> {
         let DocumentState::Editable(document) = &mut self.document else {
             return None;
         };
         document.history.seal();
-        self.find_matches = document.content.find_matches(query);
-        if query.is_empty() {
-            document
-                .content
-                .perform(text_editor::Action::ClearSelection);
-            return None;
-        }
         let total = self.find_matches.len();
         if total == 0 {
             document
@@ -3013,8 +3028,23 @@ impl RepositoryRuntime {
         }
         self.find_open = true;
         self.set_search_mode(true);
+        if let DocumentState::Editable(document) = &self.document {
+            let cursor = document.content.cursor();
+            let origin = cursor.selection.map_or(cursor.position, |anchor| {
+                if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) {
+                    anchor
+                } else {
+                    cursor.position
+                }
+            });
+            self.find_origin = Some((origin.line, origin.column));
+        }
+        self.prepare_find_matches();
         let occurrence = self.occurrence_from_caret();
         self.select_find_match(occurrence);
+        if self.find_cache.as_ref() == self.wanted_find().as_ref() {
+            self.find_origin = None;
+        }
         iced::widget::operation::focus(find_focus_id(card))
     }
 
@@ -3037,17 +3067,27 @@ impl RepositoryRuntime {
         self.find_total = 0;
         self.find_input_focused = false;
         self.find_matches.clear();
+        self.find_cache = None;
+        self.find_snapshot = None;
+        self.find_origin = None;
+        self.find_error = None;
+        if let Some(active) = &self.find_active {
+            active.cancellation.cancel();
+        }
         self.set_search_mode(false);
     }
 
     /// Selects one occurrence and records the count that search reported,
     /// which is the only place the count is ever computed.
     fn select_find_match(&mut self, occurrence: usize) {
-        // Taken rather than cloned: the search needs `&mut self` and the
-        // query goes straight back.
-        let query = std::mem::take(&mut self.find_query);
-        let total = self.select_text_match(&query, occurrence);
-        self.find_query = query;
+        self.prepare_find_matches();
+        if self.find_cache.as_ref() != self.wanted_find().as_ref() {
+            // Keep the requested occurrence while a revision is re-searched;
+            // an empty pending result is not a completed zero-match search.
+            self.find_index = occurrence;
+            return;
+        }
+        let total = self.select_cached_match(occurrence);
         match total {
             Some(total) => {
                 self.find_index = occurrence % total;
@@ -3060,6 +3100,129 @@ impl RepositoryRuntime {
                 self.find_total = 0;
             }
         }
+    }
+
+    fn wanted_find(&self) -> Option<FindKey> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        self.find_open.then(|| FindKey {
+            generation: self.generation,
+            revision: document.revision,
+            query: self.find_query.clone(),
+        })
+    }
+
+    /// Small files search immediately. Larger files clear stale highlights and
+    /// let `find_task` scan a reusable immutable snapshot off the update thread.
+    fn prepare_find_matches(&mut self) {
+        let Some(wanted) = self.wanted_find() else {
+            return;
+        };
+        if let Some(active) = &self.find_active
+            && active.key != wanted
+        {
+            active.cancellation.cancel();
+        }
+        if self.find_cache.as_ref() == Some(&wanted) {
+            return;
+        }
+        self.find_matches.clear();
+        self.find_total = 0;
+        self.find_error = None;
+        let DocumentState::Editable(document) = &mut self.document else {
+            return;
+        };
+        document
+            .content
+            .perform(text_editor::Action::ClearSelection);
+        if wanted.query.is_empty()
+            || (document.content.line_count() <= 2048 && document.content.text_len() <= 64 * 1024)
+        {
+            self.find_matches = document.content.find_matches(&wanted.query);
+            self.find_cache = Some(wanted);
+        }
+    }
+
+    /// Only one CPU worker is outstanding, including after cancellation. A
+    /// completed superseded query releases that slot before the latest starts.
+    fn find_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.prepare_find_matches();
+        let Some(key) = self.wanted_find() else {
+            return Task::none();
+        };
+        if self.find_cache.as_ref() == Some(&key) || self.find_active.is_some() {
+            return Task::none();
+        }
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
+        if self
+            .find_snapshot
+            .as_ref()
+            .is_none_or(|(generation, revision, _)| {
+                *generation != key.generation || *revision != key.revision
+            })
+        {
+            self.find_snapshot = Some((
+                key.generation,
+                key.revision,
+                Arc::new(document.content.search_snapshot()),
+            ));
+        }
+        let snapshot = Arc::clone(&self.find_snapshot.as_ref().unwrap().2);
+        // A card can replace its runtime while an already-completed task is
+        // waiting for delivery. A fresh identity fences that old callback too.
+        let ticket = uuid::Uuid::new_v4();
+        let cancellation = CancellationToken::new();
+        self.find_active = Some(FindJob {
+            key: key.clone(),
+            ticket,
+            cancellation: cancellation.clone(),
+        });
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                snapshot.find_matches(&key.query, || cancellation.is_cancelled())
+            })
+            .await
+            .map_err(|error| format!("Find worker failed: {error}"));
+            RepositoryAction::FindLoaded {
+                card,
+                ticket,
+                result,
+            }
+        })
+    }
+
+    fn finish_find(
+        &mut self,
+        ticket: uuid::Uuid,
+        result: Result<Option<Vec<(text_editor::Position, text_editor::Position)>>, String>,
+    ) {
+        if self
+            .find_active
+            .as_ref()
+            .is_none_or(|active| active.ticket != ticket)
+        {
+            return;
+        }
+        let active = self.find_active.take().unwrap();
+        if active.cancellation.is_cancelled() || self.wanted_find().as_ref() != Some(&active.key) {
+            return;
+        }
+        match result {
+            Ok(Some(matches)) => self.find_matches = matches,
+            Ok(None) => return,
+            Err(error) => self.find_error = Some(error),
+        }
+        self.find_cache = Some(active.key.clone());
+        let occurrence = if self.find_origin.is_some() {
+            self.occurrence_from_caret()
+        } else {
+            self.find_index
+        };
+        self.find_origin = None;
+        self.select_find_match(occurrence);
     }
 
     /// Renews the cached count after something changed the buffer under an
@@ -3114,9 +3277,8 @@ impl RepositoryRuntime {
         if let Some(anchor) = cursor.selection {
             origin = origin.min((anchor.line, anchor.column));
         }
-        document
-            .content
-            .find_matches(query)
+        origin = self.find_origin.unwrap_or(origin);
+        self.find_matches
             .iter()
             .take_while(|(start, _)| (start.line, start.column) < origin)
             .count()
@@ -4368,6 +4530,12 @@ impl RepositoryRuntime {
     }
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        let card = action.card();
+        let task = self.update_inner(action);
+        Task::batch([task, self.find_task(card)])
+    }
+
+    fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         if matches!(
             &action,
             RepositoryAction::Save { .. }
@@ -5438,6 +5606,7 @@ impl RepositoryRuntime {
             RepositoryAction::CloseFind { card } => self.close_find(card),
             RepositoryAction::FindQueryChanged { query, .. } => {
                 self.find_query = query;
+                self.find_origin = None;
                 // A new query knows nothing of where the last one had got
                 // to, so it starts at its own first occurrence.
                 self.find_index = 0;
@@ -5454,6 +5623,10 @@ impl RepositoryRuntime {
             }
             RepositoryAction::FindInputFocus { focused, .. } => {
                 self.find_input_focused = focused;
+                Task::none()
+            }
+            RepositoryAction::FindLoaded { ticket, result, .. } => {
+                self.finish_find(ticket, result);
                 Task::none()
             }
             RepositoryAction::ReplaceQueryChanged { query, .. } => {
@@ -5475,12 +5648,12 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 if all {
-                    let mut text = document.content.text();
-                    for (start, end) in self.find_matches.iter().rev() {
-                        let start = caret_byte_offset(&document.content, *start);
-                        let end = caret_byte_offset(&document.content, *end);
-                        text.replace_range(start..end, &self.replace_query);
-                    }
+                    let snapshot = document.content.search_snapshot();
+                    let Some(text) =
+                        snapshot.replace_matches(&self.find_matches, &self.replace_query)
+                    else {
+                        return Task::none();
+                    };
                     document.content.perform(text_editor::Action::SelectAll);
                     document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
                         Arc::new(text),
@@ -7485,7 +7658,11 @@ fn find_strip<'a>(
     // not searched for anything and says nothing rather than "No results".
     if !runtime.find_query.is_empty() {
         row.push(
-            crate::design::caption(if matched {
+            crate::design::caption(if let Some(error) = &runtime.find_error {
+                error.clone()
+            } else if runtime.find_cache.as_ref() != runtime.wanted_find().as_ref() {
+                "Searching…".to_owned()
+            } else if matched {
                 format!("{} of {}", runtime.find_index + 1, runtime.find_total)
             } else {
                 "No results".to_owned()
@@ -17074,6 +17251,181 @@ mod tests {
         assert_eq!(document.content.text(), "road road\n");
         assert!(runtime.is_dirty());
         assert_eq!(runtime.find_total, 0);
+        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "Straße STRASSE\n");
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "road road\n");
+        assert_eq!(runtime.find_total, 0);
+    }
+
+    #[test]
+    fn find_navigation_reuses_cached_match_storage_and_open_starts_from_selection() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "alpha alpha alpha\n");
+        assert_eq!(runtime.select_text_match("alpha", 1), Some(3));
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        assert_eq!(runtime.find_index, 1);
+        let cached = runtime.find_matches.as_ptr();
+        for _ in 0..100 {
+            drop(runtime.update(RepositoryAction::FindNext { card }));
+            assert_eq!(runtime.find_matches.as_ptr(), cached);
+            drop(runtime.update(RepositoryAction::FindPrevious { card }));
+            assert_eq!(runtime.find_matches.as_ptr(), cached);
+            assert_eq!(runtime.find_index, 1);
+        }
+    }
+
+    fn find_output(task: Task<RepositoryAction>) -> RepositoryAction {
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("find worker");
+        let output = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(stream.next())
+            .unwrap();
+        let iced::runtime::Action::Output(action) = output else {
+            panic!("find output");
+        };
+        action
+    }
+
+    #[test]
+    fn large_find_fences_superseded_queries_reuses_snapshot_and_rejects_closed_results() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", &"alpha beta\r\n".repeat(3000));
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        let first = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        });
+        assert_eq!(
+            runtime.find_total, 0,
+            "large queries must leave the UI thread"
+        );
+        let snapshot = Arc::clone(&runtime.find_snapshot.as_ref().unwrap().2);
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "beta".into(),
+        }));
+        assert!(
+            runtime
+                .find_active
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .is_cancelled()
+        );
+        // Retire the only outstanding worker before the latest query gets one.
+        let latest = runtime.update(find_output(first));
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &runtime.find_snapshot.as_ref().unwrap().2
+        ));
+        assert_eq!(runtime.find_total, 0);
+        drop(runtime.update(find_output(latest)));
+        assert_eq!(runtime.find_total, 3000);
+        let cached = runtime.find_matches.as_ptr();
+        drop(runtime.update(RepositoryAction::FindNext { card }));
+        assert_eq!(runtime.find_matches.as_ptr(), cached);
+        assert!(runtime.find_active.is_none());
+
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 0 },
+            selection: None,
+        });
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        runtime.push_lsp_change(None);
+        let revised = runtime.find_task(card);
+        assert_eq!(
+            runtime.find_index, 1,
+            "pending searches preserve the selected occurrence"
+        );
+        drop(runtime.update(find_output(revised)));
+        assert_eq!(runtime.find_total, 3000);
+        assert_eq!(runtime.find_index, 1);
+
+        let closed = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        });
+        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        drop(runtime.update(find_output(closed)));
+        assert_eq!(runtime.find_total, 0);
+        assert!(runtime.find_matches.is_empty());
+        assert!(runtime.find_snapshot.is_none());
+        assert!(runtime.find_active.is_none());
+    }
+
+    #[test]
+    fn large_find_rejects_a_result_for_the_previous_document_revision() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", &"alpha beta\n".repeat(3000));
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        let old = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        });
+        let snapshot = Arc::clone(&runtime.find_snapshot.as_ref().unwrap().2);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        // A buffer edit delivered outside the find bar (such as completion or
+        // discard) must invalidate a worker as well as its displayed matches.
+        document.content.perform(text_editor::Action::SelectAll);
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+            Arc::new("beta gamma\n".repeat(3000)),
+        )));
+        let current = runtime.update(find_output(old));
+        assert!(!Arc::ptr_eq(
+            &snapshot,
+            &runtime.find_snapshot.as_ref().unwrap().2
+        ));
+        assert_eq!(runtime.find_total, 0);
+        drop(runtime.update(find_output(current)));
+        assert_eq!(runtime.find_total, 0);
+        assert!(runtime.find_matches.is_empty());
+        assert!(runtime.find_active.is_none());
+    }
+
+    #[test]
+    fn large_find_rejects_a_completed_result_from_a_replaced_card_runtime() {
+        let card = CardId::new();
+        let (mut old, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", &"alpha\n".repeat(3000));
+        drop(old.update(RepositoryAction::OpenFind { card }));
+        let old_task = old.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        });
+        // Completion can already be in the application's event queue when
+        // Retry replaces a clean repository runtime under the same card ID.
+        let old_output = find_output(old_task);
+        drop(old);
+
+        let (mut replacement, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", &"alpha beta\n".repeat(3000));
+        drop(replacement.update(RepositoryAction::OpenFind { card }));
+        let current = replacement.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "beta".into(),
+        });
+        let ticket = replacement.find_active.as_ref().unwrap().ticket;
+        drop(replacement.update(old_output));
+        assert_eq!(replacement.find_active.as_ref().unwrap().ticket, ticket);
+        assert!(replacement.find_matches.is_empty());
+        assert_eq!(replacement.find_total, 0);
+
+        drop(replacement.update(find_output(current)));
+        assert_eq!(replacement.find_total, 3000);
+        assert_eq!(replacement.find_matches[0].0.column, 6);
+        assert!(replacement.find_active.is_none());
     }
 
     #[test]
