@@ -917,6 +917,14 @@ impl Adapter for Omp {
                         message: text(&frame, "error").into(),
                         fatal,
                     });
+                    // A refused prompt started no turn, so the conversation is
+                    // idle again rather than waiting for one.
+                    if text(&frame, "command") == "prompt" && !self.busy {
+                        step.events.push(Event::Status {
+                            busy: false,
+                            detail: "Ready".into(),
+                        });
+                    }
                     self.finish_execution(
                         text(&frame, "id"),
                         crate::notifications::Kind::Failed,
@@ -2269,6 +2277,10 @@ mod tests {
         assert!(
             matches!(&failure.events[0],Event::Error {message,fatal:false} if message=="Extension failed")
         );
+        assert!(failure.events.contains(&Event::Status {
+            busy: false,
+            detail: "Ready".into()
+        }));
     }
 
     /// A reply the conversation needs before it takes commands that fails
