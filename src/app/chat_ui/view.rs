@@ -3729,18 +3729,23 @@ mod tests {
             detail: "Working".into(),
             ..Snapshot::default()
         };
-        snapshot.items.push(chat::Item {
-            id: "thought".into(),
-            role: chat::Role::Assistant,
-            at: None,
-            content: ItemContent::Text {
-                text: "Planning".into(),
-                thinking: true,
-                phase: chat::Phase::Commentary,
-            },
-        });
+        snapshot.items.push(
+            chat::Item {
+                id: "thought".into(),
+                role: chat::Role::Assistant,
+                at: None,
+                content: ItemContent::Text {
+                    text: "Planning".into(),
+                    thinking: true,
+                    phase: chat::Phase::Commentary,
+                },
+            }
+            .into(),
+        );
         assert_eq!(activity_label(&snapshot), "Thinking");
-        if let ItemContent::Text { thinking, .. } = &mut snapshot.items[0].content {
+        if let ItemContent::Text { thinking, .. } =
+            &mut Arc::make_mut(&mut snapshot.items[0]).content
+        {
             *thinking = false;
         }
         assert_eq!(activity_label(&snapshot), "Responding");
@@ -3765,7 +3770,7 @@ mod tests {
         handle.publish_snapshot_for_test(Snapshot {
             generation,
             ready: true,
-            items: items.to_vec(),
+            items: items.iter().cloned().map(Arc::new).collect(),
             ..Snapshot::default()
         });
         runtime.refresh();

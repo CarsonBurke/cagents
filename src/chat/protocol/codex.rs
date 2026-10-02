@@ -2252,8 +2252,19 @@ impl Adapter for Codex {
                         };
                         let limit =
                             MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+                        let offset = output.len();
+                        let preserves_prefix = offset.saturating_add(delta.len()) <= limit
+                            || offset <= limit.saturating_sub(OUTPUT_TRUNCATED.len());
                         if append_display_output(output, delta, limit) {
-                            step.events.push(Event::Item(item.clone()));
+                            if preserves_prefix {
+                                step.events.push(Event::OutputDelta {
+                                    id,
+                                    offset,
+                                    delta: output[offset..].to_owned(),
+                                });
+                            } else {
+                                step.events.push(Event::Item(item.clone()));
+                            }
                         }
                     }
                 }
@@ -4308,7 +4319,7 @@ mod tests {
         adapter.page(&json!({"data":[{"id":"turn-a","status":"inProgress","items":[item]}],"nextCursor":"older"}),&mut page, false).unwrap();
         let delta = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":"lo"}})).unwrap();
         assert!(
-            matches!(&delta.events[0],Event::Item(Item { id,content:ItemContent::Command { output,.. },.. }) if id == "turn-a/0" && output == "hello")
+            matches!(&delta.events[0],Event::OutputDelta { id, offset: 3, delta } if id == "turn-a/0" && delta == "lo")
         );
         let completed = json!({"id":"0","type":"agentMessage","text":"answer"});
         let one = parse_item(&completed, true, "turn-a").unwrap();
@@ -4355,7 +4366,7 @@ mod tests {
         );
         let delta = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"long","itemId":"running","delta":" tail"}})).unwrap();
         assert!(
-            matches!(&delta.events[0], Event::Item(Item { content: ItemContent::Command { output, .. }, .. }) if output == "start tail")
+            matches!(&delta.events[0], Event::OutputDelta { offset: 5, delta, .. } if delta == " tail")
         );
         let completed = json!({"id":"running","type":"commandExecution","command":"echo live","cwd":"/repo","status":"completed","aggregatedOutput":"start tail"});
         adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"long","item":completed}})).unwrap();
@@ -4370,13 +4381,17 @@ mod tests {
         adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
         let delta = "🦀".repeat(MAX_ITEM_BYTES);
         let streamed = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"large","delta":delta}})).unwrap();
-        let Event::Item(streamed) = &streamed.events[0] else {
-            panic!("missing streamed item")
+        let Event::OutputDelta {
+            offset,
+            delta: suffix,
+            ..
+        } = &streamed.events[0]
+        else {
+            panic!("missing streamed append")
         };
-        assert!(streamed.content.byte_len() <= MAX_ITEM_BYTES);
-        assert!(
-            matches!(&streamed.content, ItemContent::Command { output, .. } if output.ends_with(OUTPUT_TRUNCATED))
-        );
+        assert_eq!(*offset, 0);
+        assert!(suffix.len() <= MAX_ITEM_BYTES);
+        assert!(suffix.ends_with(OUTPUT_TRUNCATED));
         item["status"] = json!("completed");
         item["aggregatedOutput"] = json!(delta);
         let completed = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();

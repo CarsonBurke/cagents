@@ -39,7 +39,8 @@ enum LatestBoundary {
     After(i64),
 }
 pub(super) struct Window {
-    pub items: Vec<Item>,
+    pub items: Vec<std::sync::Arc<Item>>,
+    pub changes: Vec<crate::chat::presentation::ItemChange>,
     pub has_earlier: bool,
     pub has_later: bool,
 }
@@ -53,6 +54,11 @@ pub(crate) struct Store {
     pending_earlier: Option<Cursor>,
     latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
+    /// Dirty identities are bounded even while the conversation is hidden.
+    changed: Option<std::collections::HashSet<String>>,
+    pub presented_generation: Option<u64>,
+    pub presentation: Option<crate::chat::presentation::Presentation>,
+    pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
@@ -132,6 +138,10 @@ impl Store {
                 latest_boundary: None,
                 messages: None,
                 dirty: true,
+                changed: Some(Default::default()),
+                presented_generation: None,
+                presentation: None,
+                presented_children: Default::default(),
                 pending_text: None,
             })
         })();
@@ -281,6 +291,7 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        self.changed(&item.id);
         self.dirty = true;
         Ok(warning)
     }
@@ -543,6 +554,52 @@ impl Store {
             out.push(nonfatal(warning));
         }
         match event {
+            Event::OutputDelta { id, offset, delta } => {
+                let cached: Option<(Vec<u8>, usize, usize)> = self
+                    .db
+                    .query_row(
+                        "SELECT metadata,len0,len1 FROM items WHERE id=?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let Some((metadata, len0, len1)) = cached else {
+                    // Oversized identities are deliberately refused by put_at
+                    // without terminating the provider. Their later appends
+                    // must preserve that same nonfatal cache boundary.
+                    out.push(nonfatal(format!(
+                        "Output for uncached provider item {} was not cached",
+                        brief(&id)
+                    )));
+                    return Ok(out);
+                };
+                let mut item: Item =
+                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+                let (field, length) = match item.content {
+                    ItemContent::Command { .. } => (0, len0),
+                    ItemContent::Tool { .. } => (1, len1),
+                    _ => return Err("Output delta names a non-tool item".into()),
+                };
+                if length != offset {
+                    return Err("Output delta does not follow the cached output".into());
+                }
+                item.at = observed_at();
+                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
+                let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+                insert_body(&transaction, &id, field, offset as i64, &delta)?;
+                let update = if field == 0 {
+                    "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
+                } else {
+                    "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
+                };
+                transaction
+                    .execute(update, params![id, delta.len(), metadata])
+                    .map_err(|error| error.to_string())?;
+                transaction.commit().map_err(|error| error.to_string())?;
+                self.changed(&id);
+                self.dirty = true;
+            }
             Event::Item(item) => {
                 if let Some(warning) = self.put(item, false)? {
                     out.push(nonfatal(warning));
@@ -741,6 +798,7 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
+            self.changed(id);
         }
         Ok(warning)
     }
@@ -799,8 +857,28 @@ impl Store {
             .map_or(target, |index| start + index)
             .min(target))
     }
+    fn changed(&mut self, id: &str) {
+        if let Some(changed) = &mut self.changed {
+            changed.insert(id.into());
+            if changed.len() > WINDOW_ITEMS * 2 {
+                self.changed = None;
+            }
+        }
+    }
+    #[cfg(test)]
     pub(super) fn window(&mut self) -> Result<Window, String> {
+        self.window_reusing(&mut Vec::new())
+    }
+    pub(super) fn window_reusing(
+        &mut self,
+        previous: &mut Vec<std::sync::Arc<Item>>,
+    ) -> Result<Window, String> {
         let _ = self.flush_text()?;
+        let old: std::collections::HashMap<_, _> = previous
+            .iter()
+            .map(|item| (item.id.as_str(), item))
+            .collect();
+        let mut reused = std::collections::HashSet::new();
         let records = {
             let mut statement = self.db.prepare("SELECT id,ordinal,metadata,len0,len1,len2 FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129").map_err(|e| e.to_string())?;
             let rows = statement
@@ -855,6 +933,30 @@ impl Store {
                     // stays expanded across frames.
                     item.id =
                         format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
+                }
+                let attached =
+                    if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
+                        len2
+                    } else {
+                        0
+                    };
+                let size = metadata.len() + end - start + 128 + attached;
+                if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
+                {
+                    break 'records;
+                }
+                if self
+                    .changed
+                    .as_ref()
+                    .is_some_and(|changed| !changed.contains(&id))
+                    && old.contains_key(item.id.as_str())
+                {
+                    reused.insert(item.id.clone());
+                    newest.get_or_insert((ordinal, part));
+                    first = Some((ordinal, part));
+                    bytes += size;
+                    items.push(std::sync::Arc::new(item));
+                    continue;
                 }
                 let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
                     .map_err(|e| e.to_string())?;
@@ -939,7 +1041,7 @@ impl Store {
                 }
                 bytes += size;
                 first = Some((ordinal, part));
-                items.push(item);
+                items.push(std::sync::Arc::new(item));
             }
         }
         items.reverse();
@@ -958,7 +1060,6 @@ impl Store {
             None => false,
         };
         self.first = first;
-        self.dirty = false;
         let has_later = if self.end.is_none() {
             false
         } else if let Some((ordinal, part)) = newest {
@@ -970,8 +1071,31 @@ impl Store {
                 })
                 .map_err(|e| e.to_string())?
         };
+        let changes = items
+            .iter()
+            .filter(|item| !reused.contains(&item.id))
+            .map(|item| {
+                crate::chat::presentation::ItemChange::between(
+                    old.get(item.id.as_str()).map(|item| item.as_ref()),
+                    item,
+                )
+            })
+            .collect();
+        drop(old);
+        let mut old: std::collections::HashMap<_, _> = std::mem::take(previous)
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect();
+        for item in &mut items {
+            if reused.contains(&item.id) {
+                *item = old.remove(&item.id).expect("reused resident item");
+            }
+        }
+        self.dirty = false;
+        self.changed = Some(Default::default());
         Ok(Window {
             items,
+            changes,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
         })
@@ -1140,6 +1264,159 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn output_for_an_uncacheable_identity_remains_nonfatal() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let id = "x".repeat(METADATA_LIMIT + 1);
+        let item = Item {
+            id: id.clone(),
+            role: Role::Assistant,
+            at: None,
+            content: ItemContent::Tool {
+                name: "tool".into(),
+                input: String::new(),
+                output: "begin".into(),
+                status: crate::chat::ToolStatus::Running,
+            },
+        };
+        assert!(!store.apply(Event::Item(item)).unwrap().is_empty());
+        assert!(
+            !store
+                .apply(Event::OutputDelta {
+                    id,
+                    offset: 5,
+                    delta: " tail".into()
+                })
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .apply(Event::Item(history_item("later", "provider still alive")))
+            .unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "later");
+    }
+
+    #[test]
+    fn output_appends_preserve_existing_chunks_and_final_rewrites() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let item = Item {
+            id: "tool".into(),
+            role: Role::Assistant,
+            at: None,
+            content: ItemContent::Tool {
+                name: "shell".into(),
+                input: "args".into(),
+                output: "α".into(),
+                status: crate::chat::ToolStatus::Running,
+            },
+        };
+        store.apply(Event::Item(item.clone())).unwrap();
+        for offset in [2, 4, 6] {
+            store
+                .apply(Event::OutputDelta {
+                    id: "tool".into(),
+                    offset,
+                    delta: "β".into(),
+                })
+                .unwrap();
+        }
+        assert!(
+            store
+                .apply(Event::OutputDelta {
+                    id: "tool".into(),
+                    offset: 1,
+                    delta: "bad".into()
+                })
+                .is_err()
+        );
+        let chunks: usize = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE id='tool' AND field=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunks, 4, "the original chunk survives each append");
+        let window = store.window().unwrap();
+        assert!(
+            matches!(&window.items[0].content, ItemContent::Tool { input, output, .. } if input == "args" && output == "αβββ")
+        );
+        let mut rewritten = item;
+        if let ItemContent::Tool { output, status, .. } = &mut rewritten.content {
+            *output = "final replacement".into();
+            *status = crate::chat::ToolStatus::Succeeded;
+        }
+        store.apply(Event::Item(rewritten)).unwrap();
+        assert!(
+            matches!(&store.window().unwrap().items[0].content, ItemContent::Tool { output, .. } if output == "final replacement")
+        );
+    }
+
+    #[test]
+    fn resident_window_reuses_unchanged_bodies_and_pages_resynchronize() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(history_item(
+                "fixed",
+                &"x".repeat(PART_BYTES / 2),
+            )))
+            .unwrap();
+        store
+            .apply(Event::Item(history_item("live", "begin")))
+            .unwrap();
+        let mut previous = store.window().unwrap().items;
+        let fixed = previous[0].clone();
+        store
+            .apply(Event::TextDelta {
+                id: "live".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " tail".into(),
+            })
+            .unwrap();
+        let window = store.window_reusing(&mut previous).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&fixed, &window.items[0]));
+        assert_eq!(window.changes.len(), 1);
+        assert!(
+            matches!(&window.changes[0], crate::chat::presentation::ItemChange::Append { offset: 5, suffix, .. } if suffix == " tail")
+        );
+        previous = window.items;
+        store
+            .apply(Event::Item(history_item(
+                "huge",
+                &"λ".repeat(PART_BYTES * 16),
+            )))
+            .unwrap();
+        let mut latest = store.window_reusing(&mut previous).unwrap();
+        assert!(
+            latest
+                .items
+                .iter()
+                .any(|item| item.id.contains(":native-part:"))
+        );
+        let baseline = crate::chat::Snapshot {
+            generation: 1,
+            items: latest.items.clone(),
+            ..Default::default()
+        };
+        store.earlier().unwrap();
+        let earlier = store.window_reusing(&mut latest.items).unwrap();
+        let mut replayed = baseline;
+        crate::chat::presentation::Presentation {
+            children: Vec::new(),
+            base_generation: 1,
+            metadata: crate::chat::Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: earlier.items.iter().map(|item| item.id.clone()).collect(),
+            changes: earlier.changes,
+        }
+        .apply(&mut replayed)
+        .unwrap();
+        assert_eq!(replayed.items, earlier.items);
+    }
     fn history_item(id: &str, body: &str) -> Item {
         Item {
             id: id.into(),
@@ -1158,7 +1435,7 @@ mod tests {
             .unwrap()
             .items
             .into_iter()
-            .map(|item| item.id)
+            .map(|item| item.id.clone())
             .collect()
     }
 
@@ -1463,7 +1740,7 @@ mod tests {
             let value = page
                 .items
                 .into_iter()
-                .map(|item| match item.content {
+                .map(|item| match item.content.clone() {
                     ItemContent::Text { text, .. } => text,
                     _ => panic!("unexpected content"),
                 })
@@ -1737,7 +2014,7 @@ mod tests {
             window
                 .items
                 .into_iter()
-                .map(|item| item.id)
+                .map(|item| item.id.clone())
                 .filter(|id| id.contains(":native-part:"))
                 .collect::<Vec<_>>()
         };

@@ -1582,6 +1582,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
+        ServerResponse::ChatUpdate { .. } => "chat_update",
     }
 }
 

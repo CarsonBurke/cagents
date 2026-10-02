@@ -2031,17 +2031,18 @@ fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_asker
     // A delegated agent without a title of its own goes by its channel's.
     assert!(sent.message.from.title.is_some());
     assert_eq!(delivered(&sent.message).to.session, Some(parent_session));
-    let shown = transcript(parent_session)
-        .into_iter()
-        .find_map(|item| match item.content {
-            chat::ItemContent::Delivery {
-                kind: chat::DeliveryKind::Message,
-                sender,
-                body,
-                ..
-            } => Some((item.role, sender, body)),
-            _ => None,
-        });
+    let shown =
+        transcript(parent_session)
+            .into_iter()
+            .find_map(|item| match item.content.clone() {
+                chat::ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Message,
+                    sender,
+                    body,
+                    ..
+                } => Some((item.role, sender, body)),
+                _ => None,
+            });
     assert_eq!(
         shown,
         Some((

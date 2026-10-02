@@ -16,7 +16,7 @@
 //! work that follows belongs to the next group.
 
 use crate::chat::{self, Item, ItemContent, Phase, Role, ToolStatus};
-use std::collections::HashSet;
+use std::{borrow::Borrow, collections::HashSet};
 
 /// Where an item belongs inside its group.
 ///
@@ -91,8 +91,8 @@ pub(super) struct Turn {
 impl Turn {
     /// Opens a group whose first item is `index`, taken as its prompt when
     /// `prompt` is set and as its first activity otherwise.
-    fn opened(items: &[Item], index: usize, prompt: bool) -> Self {
-        let item = items.get(index);
+    fn opened<T: Borrow<Item>>(items: &[T], index: usize, prompt: bool) -> Self {
+        let item = items.get(index).map(Borrow::borrow);
         Self {
             prompt: if prompt { vec![index] } else { Vec::new() },
             steps: Vec::new(),
@@ -137,7 +137,7 @@ impl Turn {
     }
 
     /// Fills in the summary once the group's membership is final.
-    fn describe(&mut self, items: &[Item]) {
+    fn describe<T: Borrow<Item>>(&mut self, items: &[T]) {
         // A single step names itself, because "1 step" tells the reader
         // nothing they could not see from the row's absence. Several steps are
         // counted, with a failure called out, because that is the one thing a
@@ -145,7 +145,7 @@ impl Turn {
         self.summary = match self.steps.as_slice() {
             // A group that did no work draws no strip, so it needs no line.
             [] => return,
-            [only] => match items.get(only.index) {
+            [only] => match items.get(only.index).map(Borrow::borrow) {
                 Some(item) => {
                     let verb = step_verb(&item.content);
                     let label = step_label(&item.content);
@@ -267,10 +267,10 @@ enum Open {
 /// "attachment" bubble as though the reader had sent it alone. Two messages
 /// the reader genuinely sent back to back land in one group as well, which is
 /// right for the same reason: there is no activity between them to attribute.
-pub(super) fn group(items: &[Item], asked_after: &HashSet<String>) -> Vec<Turn> {
+pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
-    for (index, item) in items.iter().enumerate() {
+    for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
         if !renders(&item.content) {
             continue;
         }
@@ -438,12 +438,12 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
 /// first because it is what a reader scrolling back is looking for; a kind
 /// that did not happen is left out. `None` when nothing in the group is a
 /// kind this can name, which is when a bare count is the honest summary.
-fn summarize_steps(steps: &[Placed], items: &[Item]) -> Option<String> {
+fn summarize_steps<T: Borrow<Item>>(steps: &[Placed], items: &[T]) -> Option<String> {
     let mut edited = std::collections::BTreeSet::new();
     let (mut ran, mut read, mut searched, mut listed, mut web, mut called, mut viewed) =
         (0, 0, 0, 0, 0, 0, 0);
     for placed in steps {
-        match &items.get(placed.index)?.content {
+        match &items.get(placed.index)?.borrow().content {
             ItemContent::Changes { changes, .. } => {
                 edited.extend(changes.iter().map(|change| change.path.as_str()));
             }
@@ -902,7 +902,7 @@ mod tests {
             at: None,
         };
         assert_eq!(group(std::slice::from_ref(&empty), &unasked()).len(), 0);
-        assert_eq!(group(&[], &unasked()).len(), 0);
+        assert_eq!(group::<Item>(&[], &unasked()).len(), 0);
         // A message that has not streamed its first bytes yet is the same
         // shape, and must come back once it has them.
         let items = vec![

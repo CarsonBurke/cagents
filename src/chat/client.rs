@@ -836,6 +836,7 @@ impl ClientHandle {
         let worker = thread::Builder::new().name(format!("chat-client-{id}")).spawn(move || {
             let mut read_pending = false;
             let mut read_again = false;
+            let mut resync = false;
             let failure = loop {
                 let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
                     Ok(Some(value)) => value,
@@ -906,9 +907,20 @@ impl ClientHandle {
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
                         if let Some(update) = update {
+                            resync = false;
                             *snapshot.lock().unwrap_or_else(|p| p.into_inner()) = Arc::new(update);
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
                         }
+                    },
+                    ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
+                        read_pending = false;
+                        let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                        let applied = update.apply(Arc::make_mut(&mut state));
+                        drop(state);
+                        if applied.is_err() {
+                            resync = true;
+                            read_again = true;
+                        } else if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
                     },
                     ServerMessage::Error(error) => {
                         read_pending = false;
@@ -923,7 +935,7 @@ impl ClientHandle {
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
                     read_again = false;
                     let generation = snapshot.lock().unwrap_or_else(|p| p.into_inner()).generation;
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: Some(generation) }) { break error; }
+                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) }) { break error; }
                     read_pending = true;
                 }
             };
@@ -2290,5 +2302,195 @@ mod tests {
             handle.session().launch.session_id.as_deref(),
             Some(CONVERSATION)
         );
+    }
+    #[test]
+    fn wire_updates_share_retained_items_and_request_full_resync_on_invalid_patch() {
+        use crate::chat::{
+            Item, ItemContent, Role,
+            presentation::{ItemChange, Presentation},
+        };
+        let text = |id: &str, body: &str| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            at: None,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+        };
+        let initial = Snapshot {
+            generation: 1,
+            items: vec![
+                Arc::new(text("fixed", &"x".repeat(128 * 1024))),
+                Arc::new(text("live", "hello")),
+            ],
+            ..Default::default()
+        };
+        let update = Presentation {
+            base_generation: 1,
+            metadata: Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec!["fixed".into(), "live".into()],
+            changes: vec![ItemChange::between(
+                Some(&initial.items[1]),
+                &text("live", "hello tail"),
+            )],
+            children: vec![],
+        };
+        let full = Snapshot {
+            generation: 4,
+            items: vec![Arc::new(text("live", "resynchronized"))],
+            ..Default::default()
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("live");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("expected new chat")
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                },
+            );
+            let visible: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                visible.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate { chat_id, update },
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let malformed = Presentation {
+                base_generation: 0,
+                metadata: Snapshot {
+                    generation: 3,
+                    ..Default::default()
+                },
+                order: vec![],
+                changes: vec![],
+                children: vec![],
+            };
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate {
+                        chat_id,
+                        update: malformed,
+                    },
+                },
+            );
+            let resync: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    resync.request,
+                    ClientRequest::ChatRead {
+                        after_generation: None,
+                        ..
+                    }
+                ),
+                "invalid patch must request an unconditional snapshot"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(resync.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(full),
+                    },
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let retained = handle.snapshot();
+        handle.set_visible(true).unwrap();
+        while handle.snapshot().generation != 2 {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let updated = handle.snapshot();
+        assert!(Arc::ptr_eq(&retained.items[0], &updated.items[0]));
+        assert!(
+            matches!(&retained.items[1].content, ItemContent::Text { text, .. } if text == "hello")
+        );
+        assert!(
+            matches!(&updated.items[1].content, ItemContent::Text { text, .. } if text == "hello tail")
+        );
+        advance_tx.send(()).unwrap();
+        while handle.snapshot().generation != 4 {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(
+            matches!(&handle.snapshot().items[0].content, ItemContent::Text { text, .. } if text == "resynchronized")
+        );
+        advance_tx.send(()).unwrap();
+        worker.join().unwrap();
     }
 }

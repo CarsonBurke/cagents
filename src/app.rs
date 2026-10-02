@@ -19452,7 +19452,8 @@ mod tests {
                         phase: Phase::Final,
                     },
                     at: None,
-                },
+                }
+                .into(),
                 Item {
                     id: "tool-1".into(),
                     role: Role::Assistant,
@@ -19463,7 +19464,8 @@ mod tests {
                         status: ToolStatus::Running,
                     },
                     at: None,
-                },
+                }
+                .into(),
                 Item {
                     id: "assistant-1".into(),
                     role: Role::Assistant,
@@ -19473,7 +19475,8 @@ mod tests {
                         phase: Phase::Commentary,
                     },
                     at: None,
-                },
+                }
+                .into(),
             ],
             requests: vec![Request {
                 id: "request-1".into(),

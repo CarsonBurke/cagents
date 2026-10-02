@@ -166,7 +166,7 @@ pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>)
     .expect("a session");
     let base = Snapshot {
         ready: true,
-        items: items.to_vec(),
+        items: items.iter().cloned().map(Arc::new).collect(),
         ..Snapshot::default()
     };
     let handle = Arc::new(ClientHandle::fixture(session.clone(), base));
@@ -210,7 +210,7 @@ fn measure(turns: usize) {
         handle.publish_snapshot_for_test(Snapshot {
             generation,
             ready: true,
-            items: items.clone(),
+            items: items.iter().cloned().map(Arc::new).collect(),
             ..Snapshot::default()
         });
         let warm = frame >= 8;
