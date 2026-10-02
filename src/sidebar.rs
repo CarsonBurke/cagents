@@ -3628,16 +3628,76 @@ pub fn view<'a>(
 }
 
 #[derive(Default)]
-pub struct NavigationCache(std::cell::RefCell<(SidebarModel, SidebarState, u64)>);
+pub struct NavigationCache(std::cell::RefCell<(Option<NavigationSnapshot>, u64)>);
+
+/// Exactly the inputs to `project_list`. File trees, history and commit
+/// composers belong to the source-control panel, which is rendered separately.
+/// Keeping them out of this snapshot bounds comparisons and copies by the
+/// number of navigation entities, even in a very large repository.
+struct NavigationSnapshot {
+    projects: Vec<SidebarProject>,
+    editors: Vec<SidebarEditor>,
+    rows: selection::Selection,
+    query: String,
+    filter: SidebarFilter,
+    controls_expanded: bool,
+    collapsed_projects: BTreeSet<ProjectId>,
+    selection: Option<SidebarSelection>,
+    active_worktree: Option<ActiveWorktreeKey>,
+    worktree_sort: crate::settings::WorktreeSort,
+    agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    agent_activity: BTreeMap<CardId, PaneActivity>,
+    worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
+}
+
+impl NavigationSnapshot {
+    fn matches(&self, model: &SidebarModel, state: &SidebarState) -> bool {
+        self.projects == model.projects
+            && self.editors == model.external_editors
+            && self.rows == state.rows
+            && self.query == state.query
+            && self.filter == state.filter
+            && self.controls_expanded == state.controls_expanded
+            && self.collapsed_projects == state.collapsed_projects
+            && self.selection == state.selection
+            && self.active_worktree == state.active_worktree
+            && self.worktree_sort == state.worktree_sort
+            && self.agent_updates == state.agent_updates
+            && self.agent_activity == state.agent_activity
+            && self.worktrees_with_panes == state.worktrees_with_panes
+    }
+
+    fn capture(model: &SidebarModel, state: &SidebarState) -> Self {
+        Self {
+            projects: model.projects.clone(),
+            editors: model.external_editors.clone(),
+            rows: state.rows.clone(),
+            query: state.query.clone(),
+            filter: state.filter,
+            controls_expanded: state.controls_expanded,
+            collapsed_projects: state.collapsed_projects.clone(),
+            selection: state.selection,
+            active_worktree: state.active_worktree.clone(),
+            worktree_sort: state.worktree_sort,
+            agent_updates: state.agent_updates.clone(),
+            agent_activity: state.agent_activity.clone(),
+            worktrees_with_panes: state.worktrees_with_panes.clone(),
+        }
+    }
+}
+
 impl NavigationCache {
     fn generation(&self, model: &SidebarModel, state: &SidebarState) -> u64 {
         let mut snapshot = self.0.borrow_mut();
-        if &snapshot.0 != model || &snapshot.1 != state {
-            snapshot.0 = model.clone();
-            snapshot.1 = state.clone();
-            snapshot.2 = snapshot.2.wrapping_add(1);
+        if snapshot
+            .0
+            .as_ref()
+            .is_none_or(|previous| !previous.matches(model, state))
+        {
+            snapshot.0 = Some(NavigationSnapshot::capture(model, state));
+            snapshot.1 = snapshot.1.wrapping_add(1);
         }
-        snapshot.2
+        snapshot.1
     }
 }
 
@@ -10639,6 +10699,65 @@ pub(crate) mod tests {
         let attention = cache.generation(&model, &state);
         assert_ne!(searched, attention);
         assert_eq!(attention, cache.generation(&model, &state));
+    }
+
+    #[test]
+    fn navigation_cache_ignores_large_source_control_and_file_panel_interactions() {
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let initial = cache.generation(&model, &state);
+        let paths: Vec<_> = (0..10_000)
+            .map(|index| RepoPath::parse(format!("src/file_{index}.rs")).unwrap())
+            .collect();
+        let mut source = SourceControlModel::loading(main_key());
+        source.files = file_rows(&paths);
+        model.source_control = Some(source);
+        assert_eq!(initial, cache.generation(&model, &state));
+
+        state.files_query = "file".into();
+        state
+            .expanded_directories
+            .insert(RepoPath::parse("src").unwrap());
+        state.commit_message = "message".into();
+        state
+            .commit_composer
+            .0
+            .perform(cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Insert('x'),
+            ));
+        state.changes_tab = ChangesTab::History;
+        assert_eq!(initial, cache.generation(&model, &state));
+        model.source_control.as_mut().unwrap().files.clear();
+        assert_eq!(initial, cache.generation(&model, &state));
+    }
+
+    #[test]
+    fn navigation_cache_tracks_active_worktree_open_panes_editors_and_project_changes() {
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let mut previous = cache.generation(&model, &state);
+        state.active_worktree = Some(main_key());
+        let next = cache.generation(&model, &state);
+        assert_ne!(previous, next);
+        previous = next;
+        state
+            .worktrees_with_panes
+            .insert((main_key().project_id, main_key().worktree_id));
+        let next = cache.generation(&model, &state);
+        assert_ne!(previous, next);
+        previous = next;
+        model.external_editors.push(SidebarEditor {
+            id: "test".into(),
+            name: "Test editor".into(),
+            icon: "editor".into(),
+        });
+        let next = cache.generation(&model, &state);
+        assert_ne!(previous, next);
+        previous = next;
+        model.projects[0].reloading = true;
+        assert_ne!(previous, cache.generation(&model, &state));
     }
 
     #[test]

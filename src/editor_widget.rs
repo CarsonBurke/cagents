@@ -62,7 +62,181 @@ pub struct Diagnostic {
     pub end: Position,
     pub severity: crate::lsp::LspSeverity,
 }
+
+/// Immutable native lines, addressable without a renderer or font-system lock.
+/// The ranges exclude terminators, while `text` preserves exactly the bytes
+/// [`Content::text`] would save, including mixed and bare-CR line endings.
+#[derive(Debug)]
+pub(crate) struct SearchSnapshot {
+    text: String,
+    lines: Vec<std::ops::Range<usize>>,
+}
+
+impl SearchSnapshot {
+    pub(crate) fn find_matches(
+        &self,
+        query: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Vec<(Position, Position)>> {
+        find_in_lines(
+            self.lines.iter().map(|range| &self.text[range.clone()]),
+            query,
+            cancelled,
+        )
+    }
+
+    /// Build a replacement in source order: each match and source byte is
+    /// visited once, irrespective of the number of lines or length changes.
+    pub(crate) fn replace_matches(
+        &self,
+        matches: &[(Position, Position)],
+        replacement: &str,
+    ) -> Option<String> {
+        let mut result = String::with_capacity(self.text.len());
+        let mut copied = 0;
+        for &(start, end) in matches {
+            let start_line = self.lines.get(start.line)?;
+            let end_line = self.lines.get(end.line)?;
+            if start.column > start_line.len() || end.column > end_line.len() {
+                return None;
+            }
+            let start = start_line.start + start.column;
+            let end = end_line.start + end.column;
+            if end < start || start < copied || !self.text.is_char_boundary(end) {
+                return None;
+            }
+            result.push_str(self.text.get(copied..start)?);
+            result.push_str(replacement);
+            copied = end;
+        }
+        result.push_str(self.text.get(copied..)?);
+        Some(result)
+    }
+}
+
+fn find_in_lines<T: AsRef<str>>(
+    lines: impl Iterator<Item = T>,
+    query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Option<Vec<(Position, Position)>> {
+    use unicode_casefold::UnicodeCaseFold;
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let query: String = query.case_fold().collect();
+    let mut matches = Vec::new();
+    // Reuse scratch space rather than allocating two buffers per source line.
+    let mut folded = String::new();
+    let mut boundaries = Vec::new();
+    for (line, text) in lines.enumerate() {
+        let text = text.as_ref();
+        if cancelled() {
+            return None;
+        }
+        folded.clear();
+        boundaries.clear();
+        if text.is_ascii() {
+            // ASCII case folding preserves every byte boundary. Most source
+            // lines take this path and need no boundary map at all.
+            folded.push_str(text);
+            folded.make_ascii_lowercase();
+            for (index, (offset, _)) in folded.match_indices(&query).enumerate() {
+                if index % 1024 == 0 && cancelled() {
+                    return None;
+                }
+                matches.push((
+                    Position {
+                        line,
+                        column: offset,
+                    },
+                    Position {
+                        line,
+                        column: offset + query.len(),
+                    },
+                ));
+            }
+            continue;
+        }
+        for (index, (offset, character)) in text.char_indices().enumerate() {
+            if index % 1024 == 0 && cancelled() {
+                return None;
+            }
+            let start = folded.len();
+            folded.extend(std::iter::once(character).case_fold());
+            boundaries.resize(folded.len(), None);
+            boundaries[start] = Some(offset);
+        }
+        boundaries.push(Some(text.len()));
+        for (index, (offset, _)) in folded.match_indices(&query).enumerate() {
+            if index % 1024 == 0 && cancelled() {
+                return None;
+            }
+            if let (Some(start), Some(end)) = (boundaries[offset], boundaries[offset + query.len()])
+            {
+                matches.push((
+                    Position {
+                        line,
+                        column: start,
+                    },
+                    Position { line, column: end },
+                ));
+            }
+        }
+    }
+    Some(matches)
+}
 type NativeEditor = <cosmic::Renderer as text::Renderer>::Editor;
+
+/// Each fragment ends at one native line boundary. Recorded boundaries can
+/// intentionally separate CR and LF that a fresh parser would pair together.
+fn paste_fragments<'a>(
+    text: &'a str,
+    breaks: Option<&'a [usize]>,
+) -> impl Iterator<Item = &'a str> {
+    use cosmic::iced::advanced::graphics::text::cosmic_text;
+    let mut parsed = cosmic_text::LineIter::new(text);
+    let mut recorded = breaks
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .chain([text.len()]);
+    let mut previous = 0;
+    std::iter::from_fn(move || {
+        if breaks.is_none() {
+            return parsed
+                .next()
+                .map(|(range, ending)| &text[range.start..range.end + ending.as_str().len()]);
+        }
+        loop {
+            let end = recorded.next()?;
+            if end > previous {
+                let fragment = &text[previous..end];
+                previous = end;
+                return Some(fragment);
+            }
+        }
+    })
+}
+
+fn append_fragment(editor: &mut NativeEditor, text: &str, ending: &str) {
+    if text.is_empty() && ending.is_empty() {
+        return;
+    }
+    let mut fragment = String::with_capacity(text.len() + ending.len());
+    fragment.push_str(text);
+    fragment.push_str(ending);
+    editor.perform(Action::Edit(Edit::Paste(Arc::new(fragment))));
+}
+
+fn mark_changed_from(editor: &mut NativeEditor, position: Position) {
+    let cursor = editor.cursor();
+    editor.move_to(Cursor {
+        position,
+        selection: None,
+    });
+    editor.perform(Action::Edit(Edit::Paste(Arc::new(String::new()))));
+    editor.move_to(cursor);
+}
 pub struct TextEditor<'a, Highlighter, Message, Theme = cosmic::Theme, Renderer = cosmic::Renderer>
 where
     Highlighter: text::Highlighter,
@@ -625,6 +799,83 @@ fn seek_scroll(
     }
 }
 
+/// Give a fresh buffer real bounds and the prior viewport before native
+/// hit-testing or caret reveal. The final caret remains pending, just as after
+/// native Paste; queued Scroll/Click/Drag therefore retain native ordering.
+fn seed_splice_viewport(
+    editor: &mut NativeEditor,
+    previous: ScrollPosition,
+    wrapping: Wrapping,
+    mut shape: impl FnMut(&mut NativeEditor),
+) {
+    let cursor = editor.cursor();
+    editor.move_to(Cursor {
+        position: Position {
+            line: previous.line.min(editor.line_count().saturating_sub(1)),
+            column: 0,
+        },
+        selection: None,
+    });
+    shape(editor);
+    seek_scroll(
+        editor,
+        ScrollTarget::Position(previous),
+        wrapping,
+        &mut shape,
+    );
+    // None preserves the native selection mode and anchor. Restoring the
+    // reported Some(anchor) would turn a Word/Line selection into Normal.
+    editor.move_to(Cursor {
+        position: cursor.position,
+        selection: None,
+    });
+}
+
+fn shape_after_splice(
+    editor: &mut NativeEditor,
+    previous: Option<ScrollPosition>,
+    scroll_lines: i32,
+    wrapping: Wrapping,
+    mut shape: impl FnMut(&mut NativeEditor),
+) {
+    if let Some(previous) = previous {
+        seed_splice_viewport(editor, previous, wrapping, &mut shape);
+        if scroll_lines != 0 {
+            editor.perform(Action::Scroll {
+                lines: scroll_lines,
+            });
+        }
+    }
+    shape(editor);
+}
+
+#[derive(Clone, Copy)]
+struct EditorLayout {
+    bounds: Size,
+    font: cosmic::iced::Font,
+    size: Pixels,
+    line_height: LineHeight,
+    wrapping: Wrapping,
+}
+
+impl EditorLayout {
+    fn prepare(&self, editor: &mut NativeEditor, previous: ScrollPosition) {
+        seed_splice_viewport(editor, previous, self.wrapping, |editor| {
+            editor.update(
+                self.bounds,
+                self.font,
+                self.size,
+                self.line_height,
+                self.wrapping,
+                &mut highlighter::PlainText::new(&()),
+            );
+        });
+        // PlainText consumed native's changed-line notification. The actual
+        // widget highlighter must still invalidate its full prior document.
+        mark_changed_from(editor, Position { line: 0, column: 0 });
+    }
+}
+
 /// The content of a [`TextEditor`].
 pub struct Content<R = cosmic::Renderer>(RefCell<Internal<R>>)
 where
@@ -635,7 +886,13 @@ where
     R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     editor: R::Editor,
+    layout: Option<EditorLayout>,
+    reset_highlighter: bool,
     pending_scroll: Option<ScrollPosition>,
+    // A rebuilt buffer first needs the old viewport, then ordinary caret
+    // reveal. Seeding this after real metrics are known avoids eager shaping.
+    pending_edit_scroll: Option<ScrollPosition>,
+    pending_edit_scroll_lines: i32,
     // Native glyphs/hit tests use document X, but its scroll setter is private.
     // Own the viewport over a real unwrapped canvas so renderer damage bounds
     // cover visible glyphs even when the viewport is far along a long line.
@@ -649,6 +906,14 @@ impl<R> Internal<R>
 where
     R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
+    fn finish_layout(&mut self, highlighter: &mut impl Highlighter) {
+        // Native edits overwrite their changed-line marker. A queued small
+        // edit must not hide the full invalidation of a rebuilt document.
+        if std::mem::take(&mut self.reset_highlighter) {
+            highlighter.change_line(0);
+        }
+    }
+
     fn horizontal_translation(&self) -> f32 {
         let displayed = if self.wrapping == Wrapping::None {
             self.horizontal
@@ -696,9 +961,31 @@ where
 
     /// Creates a [`Content`] with the given text.
     pub fn with_text(text: &str) -> Self {
+        // The native constructor shapes all text before it has a viewport.
+        // Insert native line fragments instead: Paste does not shape, and
+        // appending one fragment avoids its quadratic interior Vec insertions
+        // for a large multiline paste. Use the same parser as Buffer::set_text
+        // so mixed and paired line endings retain their exact native identity.
+        let mut editor = R::Editor::with_text("");
+        for fragment in paste_fragments(text, None) {
+            append_fragment(&mut editor, fragment, "");
+        }
+        editor.perform(Action::ClearSelection);
+        editor.move_to(Cursor {
+            position: Position { line: 0, column: 0 },
+            selection: None,
+        });
+        // Native edits remember the latest changed line for highlighting.
+        // Renew that marker at the start after the append-only load, without
+        // changing text, so the first viewport highlights from line zero.
+        mark_changed_from(&mut editor, Position { line: 0, column: 0 });
         Self(RefCell::new(Internal {
-            editor: R::Editor::with_text(text),
+            editor,
+            layout: None,
+            reset_highlighter: true,
             pending_scroll: None,
+            pending_edit_scroll: None,
+            pending_edit_scroll_lines: 0,
             horizontal: 0.0,
             reveal_horizontal: true,
             canvas_width: 0.0,
@@ -708,8 +995,24 @@ where
 
     /// Performs an [`Action`] on the [`Content`].
     pub fn perform(&mut self, mut action: Action) {
+        match &action {
+            Action::Edit(Edit::Paste(text)) if self.try_splice(text, None) => return,
+            Action::Edit(Edit::Delete | Edit::Backspace)
+                if self.cursor().selection.is_some() && self.try_splice("", None) =>
+            {
+                return;
+            }
+            _ => {}
+        }
         let internal = self.0.get_mut();
         internal.pending_scroll = None;
+        if let Action::Scroll { lines } = action
+            && internal.pending_edit_scroll.is_some()
+        {
+            internal.pending_edit_scroll_lines =
+                internal.pending_edit_scroll_lines.saturating_add(lines);
+            return;
+        }
         match &mut action {
             Action::Click(position) | Action::Drag(position) => {
                 position.x -= internal.horizontal_translation();
@@ -726,6 +1029,105 @@ where
         internal.editor.perform(action);
     }
 
+    /// Native multiline insertion and removal shift row vectors repeatedly.
+    /// Bound those operations; large splices rebuild from native fragments in
+    /// one pass, while an append near EOF can keep its existing styled prefix.
+    fn try_splice(&mut self, replacement: &str, breaks: Option<&[usize]>) -> bool {
+        const MAX_NATIVE_ROWS: usize = 128;
+        const MAX_STREAMED_TAIL: usize = 32;
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let inserted_rows = paste_fragments(replacement, breaks)
+            .filter(|fragment| {
+                fragment
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+            })
+            .count();
+        if inserted_rows <= MAX_NATIVE_ROWS
+            && cursor.position.line.abs_diff(anchor.line) <= MAX_NATIVE_ROWS
+        {
+            return false;
+        }
+        let count = self.line_count();
+        let selection = if cursor.selection.is_some() {
+            let first = cursor.position.line.min(anchor.line).saturating_sub(1);
+            let last = (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1));
+            self.selected_span(&self.excerpt(first, last), cursor)
+        } else {
+            cursor
+        };
+        let anchor = selection.selection.unwrap_or(selection.position);
+        let (start, end) = if (anchor.line, anchor.column)
+            <= (selection.position.line, selection.position.column)
+        {
+            (anchor, selection.position)
+        } else {
+            (selection.position, anchor)
+        };
+        let internal = self.0.get_mut();
+        internal.pending_scroll = None;
+        internal.reveal_horizontal = true;
+        if end.line - start.line <= MAX_NATIVE_ROWS
+            && count.saturating_sub(end.line + 1) <= MAX_STREAMED_TAIL
+            && end.column == internal.editor.buffer().lines[end.line].text().len()
+        {
+            let mut fragments = paste_fragments(replacement, breaks).peekable();
+            if fragments.peek().is_none() {
+                internal
+                    .editor
+                    .perform(Action::Edit(Edit::Paste(Arc::new(String::new()))));
+            } else {
+                for fragment in fragments {
+                    append_fragment(&mut internal.editor, fragment, "");
+                }
+            }
+            mark_changed_from(&mut internal.editor, start);
+            return true;
+        }
+
+        let scroll = internal.editor.buffer().scroll();
+        let previous_view = ScrollPosition {
+            line: scroll.line,
+            vertical: scroll.vertical,
+            horizontal: internal.horizontal,
+        };
+        let mut editor = NativeEditor::with_text("");
+        let lines = &internal.editor.buffer().lines;
+        for line in &lines[..start.line] {
+            append_fragment(&mut editor, line.text(), line.ending().as_str());
+        }
+        append_fragment(&mut editor, &lines[start.line].text()[..start.column], "");
+        for fragment in paste_fragments(replacement, breaks) {
+            append_fragment(&mut editor, fragment, "");
+        }
+        let caret = editor.cursor();
+        let suffix = &lines[end.line];
+        append_fragment(
+            &mut editor,
+            &suffix.text()[end.column..],
+            suffix.ending().as_str(),
+        );
+        for line in &lines[end.line + 1..] {
+            append_fragment(&mut editor, line.text(), line.ending().as_str());
+        }
+        editor.move_to(caret);
+        mark_changed_from(&mut editor, Position { line: 0, column: 0 });
+        if let Some(layout) = internal.layout {
+            layout.prepare(
+                &mut editor,
+                internal.pending_edit_scroll.unwrap_or(previous_view),
+            );
+            internal.pending_edit_scroll = None;
+        } else {
+            internal.pending_edit_scroll.get_or_insert(previous_view);
+        }
+        internal.editor = editor;
+        internal.reset_highlighter = true;
+        true
+    }
+
     /// Moves the current cursor to reflect the given one.
     pub fn move_to(&mut self, cursor: Cursor) {
         let internal = self.0.get_mut();
@@ -738,24 +1140,28 @@ where
     /// Reads the native viewport without copying or shaping document text.
     pub fn scroll_position(&self) -> ScrollPosition {
         let internal = self.0.borrow();
-        internal.pending_scroll.unwrap_or_else(|| {
-            let scroll = internal.editor.buffer().scroll();
-            let line_height = internal.editor.buffer().metrics().line_height;
-            canonical_scroll(
-                ScrollPosition {
-                    line: scroll.line,
-                    vertical: scroll.vertical,
-                    horizontal: internal.horizontal,
-                },
-                line_height,
-                internal.wrapping == Wrapping::None,
-            )
-        })
+        internal
+            .pending_scroll
+            .or(internal.pending_edit_scroll)
+            .unwrap_or_else(|| {
+                let scroll = internal.editor.buffer().scroll();
+                let line_height = internal.editor.buffer().metrics().line_height;
+                canonical_scroll(
+                    ScrollPosition {
+                        line: scroll.line,
+                        vertical: scroll.vertical,
+                        horizontal: internal.horizontal,
+                    },
+                    line_height,
+                    internal.wrapping == Wrapping::None,
+                )
+            })
     }
 
     /// Restores after layout knows the current font, wrapping, and viewport.
     /// A subsequent explicit edit/caret move takes precedence over restoration.
     pub fn restore_scroll_position(&mut self, position: ScrollPosition) {
+        self.0.get_mut().pending_edit_scroll_lines = 0;
         self.0.get_mut().pending_scroll = Some(ScrollPosition {
             line: position.line,
             vertical: if position.vertical.is_finite() {
@@ -829,39 +1235,29 @@ where
 
     /// Search Unicode text a line at a time, retaining source byte positions.
     pub fn find_matches(&self, query: &str) -> Vec<(Position, Position)> {
-        use unicode_casefold::UnicodeCaseFold;
-        if query.is_empty() {
-            return Vec::new();
+        let internal = self.0.borrow();
+        // NativeEditor borrows these lines in place; no whole-buffer snapshot
+        // is needed for the synchronous, bounded small-file search.
+        let lines =
+            (0..internal.editor.line_count()).filter_map(|index| internal.editor.line(index));
+        find_in_lines(lines.map(|line| line.text), query, || false).unwrap_or_default()
+    }
+
+    pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut text = String::new();
+        let mut lines = Vec::with_capacity(count);
+        for index in 0..count {
+            let Some(line) = internal.editor.line(index) else {
+                break;
+            };
+            let start = text.len();
+            text.push_str(&line.text);
+            lines.push(start..text.len());
+            text.push_str(terminator(line.ending, index + 1 == count));
         }
-        let query: String = query.case_fold().collect();
-        let mut matches = Vec::new();
-        for line in 0..self.line_count() {
-            self.with_line(line, |text, _| {
-                let mut folded = String::with_capacity(text.len());
-                let mut boundaries = Vec::with_capacity(text.len() + 1);
-                for (offset, character) in text.char_indices() {
-                    let start = folded.len();
-                    folded.extend(std::iter::once(character).case_fold());
-                    boundaries.resize(folded.len(), None);
-                    boundaries[start] = Some(offset);
-                }
-                boundaries.push(Some(text.len()));
-                for (offset, _) in folded.match_indices(&query) {
-                    if let (Some(start), Some(end)) =
-                        (boundaries[offset], boundaries[offset + query.len()])
-                    {
-                        matches.push((
-                            Position {
-                                line,
-                                column: start,
-                            },
-                            Position { line, column: end },
-                        ));
-                    }
-                }
-            });
-        }
-        matches
+        SearchSnapshot { text, lines }
     }
 
     /// Byte length of the text [`Content::text`] would produce, without
@@ -982,51 +1378,74 @@ where
         let Some(selected) = self.selection().filter(|selected| !selected.is_empty()) else {
             return caret;
         };
-        let (Some(caret_at), Some(anchor_at)) =
-            (excerpt.offset(cursor.position), excerpt.offset(anchor))
-        else {
-            return cursor;
+        // Native copy_selection joins native lines with LF, even when their
+        // stored endings are CRLF, LFCR, or bare CR. Locate the same native
+        // positions in that normalized view when the exact excerpt differs.
+        let locate = |excerpt: &Excerpt| -> Option<Cursor> {
+            let (Some(caret_at), Some(anchor_at)) =
+                (excerpt.offset(cursor.position), excerpt.offset(anchor))
+            else {
+                return None;
+            };
+            let text = excerpt.text();
+            let (low, high) = (caret_at.min(anchor_at), caret_at.max(anchor_at));
+            // Only starts whose end covers both reported points can match.
+            // Earlier candidates make repeated-character selections quadratic.
+            let mut search = high.saturating_sub(selected.len());
+            if search > low {
+                return None;
+            }
+            while !text.is_char_boundary(search) {
+                search -= 1;
+            }
+            let mut limit = (high + selected.len()).min(text.len());
+            while !text.is_char_boundary(limit) {
+                limit += 1;
+            }
+            let mut span = None;
+            while let Some(found) = text
+                .get(search..limit)
+                .and_then(|rest| rest.find(&selected))
+            {
+                let start = search + found;
+                if start > low {
+                    break;
+                }
+                if start + selected.len() >= high {
+                    span = Some(start..start + selected.len());
+                    break;
+                }
+                search = start + text[start..].chars().next().map_or(1, char::len_utf8);
+            }
+            let Some(span) = span else {
+                return None;
+            };
+            let (start, end) = (excerpt.position(span.start), excerpt.position(span.end));
+            Some(if caret_at < anchor_at {
+                Cursor {
+                    position: start,
+                    selection: Some(end),
+                }
+            } else {
+                Cursor {
+                    position: end,
+                    selection: Some(start),
+                }
+            })
         };
-        let text = excerpt.text();
-        let (low, high) = (caret_at.min(anchor_at), caret_at.max(anchor_at));
-        let mut search = low.saturating_sub(selected.len());
-        while !text.is_char_boundary(search) {
-            search -= 1;
+        if let Some(span) = locate(excerpt) {
+            return span;
         }
-        let mut limit = (high + selected.len()).min(text.len());
-        while !text.is_char_boundary(limit) {
-            limit += 1;
+        let first = excerpt.position(0).line;
+        let last =
+            (cursor.position.line.max(anchor.line) + 1).min(self.line_count().saturating_sub(1));
+        let internal = self.0.borrow();
+        let lines = &internal.editor.buffer().lines;
+        let mut normalized = Excerpt::new(first);
+        for (index, line) in lines.iter().enumerate().take(last + 1).skip(first) {
+            normalized.push_line(line.text(), if index + 1 < lines.len() { "\n" } else { "" });
         }
-        let mut span = None;
-        while let Some(found) = text
-            .get(search..limit)
-            .and_then(|rest| rest.find(&selected))
-        {
-            let start = search + found;
-            if start > low {
-                break;
-            }
-            if start + selected.len() >= high {
-                span = Some(start..start + selected.len());
-                break;
-            }
-            search = start + text[start..].chars().next().map_or(1, char::len_utf8);
-        }
-        let Some(span) = span else {
-            return cursor;
-        };
-        let (start, end) = (excerpt.position(span.start), excerpt.position(span.end));
-        if caret_at < anchor_at {
-            Cursor {
-                position: start,
-                selection: Some(end),
-            }
-        } else {
-            Cursor {
-                position: end,
-                selection: Some(start),
-            }
-        }
+        locate(&normalized).unwrap_or(cursor)
     }
 
     /// Serializes lines `first..=last` exactly as [`Content::text`] would.
@@ -1126,6 +1545,9 @@ where
         if !replacement.is_empty() {
             if history::canonical_breaks(replacement, breaks) {
                 self.perform(Action::Edit(Edit::Paste(Arc::new(replacement.to_owned()))));
+                return;
+            }
+            if self.try_splice(replacement, Some(breaks)) {
                 return;
             }
             let mut previous = 0;
@@ -1430,6 +1852,13 @@ where
                 .canvas_width
                 .max((viewport.width + internal.horizontal).min(f32::MAX));
         }
+        internal.layout = Some(EditorLayout {
+            bounds: canvas,
+            font: self.font.unwrap_or_else(|| renderer.default_font()),
+            size: self.text_size.unwrap_or_else(|| renderer.default_size()),
+            line_height: self.line_height,
+            wrapping: self.wrapping,
+        });
         let shape = |editor: &mut NativeEditor, bounds| {
             editor.update(
                 bounds,
@@ -1440,7 +1869,15 @@ where
                 state.highlighter.borrow_mut().deref_mut(),
             );
         };
-        shape(&mut internal.editor, canvas);
+        let pending_edit_scroll = internal.pending_edit_scroll.take();
+        let pending_lines = std::mem::take(&mut internal.pending_edit_scroll_lines);
+        shape_after_splice(
+            &mut internal.editor,
+            pending_edit_scroll,
+            pending_lines,
+            self.wrapping,
+            |editor| shape(editor, canvas),
+        );
         if let Some(target) = target {
             seek_scroll(&mut internal.editor, target, self.wrapping, |editor| {
                 shape(editor, canvas)
@@ -1459,6 +1896,9 @@ where
                 canvas.width = width;
                 shape(&mut internal.editor, canvas);
             }
+            if let Some(layout) = &mut internal.layout {
+                layout.bounds = canvas;
+            }
             internal.canvas_width = canvas.width;
             if internal.reveal_horizontal
                 && let Some(caret) = internal.caret_position()
@@ -1473,6 +1913,7 @@ where
             internal.horizontal = 0.0;
         }
         internal.reveal_horizontal = false;
+        internal.finish_layout(state.highlighter.borrow_mut().deref_mut());
 
         match self.height {
             Length::Fill | Length::FillPortion(_) | Length::Fixed(_) => {
@@ -2844,6 +3285,700 @@ impl ScrollGeometry {
 mod tests {
     use super::*;
 
+    fn native_state(editor: &NativeEditor) -> Vec<(String, String)> {
+        editor
+            .buffer()
+            .lines
+            .iter()
+            .map(|line| (line.text().to_owned(), format!("{:?}", line.ending())))
+            .collect()
+    }
+
+    #[test]
+    fn large_splices_preserve_native_lines_endings_and_caret() {
+        let source = "α token\r\nβ token\n\rγ token\rδ token\n".repeat(100) + "EOF";
+        let replacement = "é inserted\r\n漢\n\r".repeat(100);
+        for (first, last) in [(0, 400), (20, 300), (250, 400), (400, 400), (100, 100)] {
+            for reverse in [false, true] {
+                for edit in [
+                    Edit::Paste(Arc::new(replacement.clone())),
+                    Edit::Paste(Arc::new(String::new())),
+                    Edit::Delete,
+                    Edit::Backspace,
+                ] {
+                    if first == last && !matches!(edit, Edit::Paste(_)) {
+                        continue;
+                    }
+                    let mut content: Content = Content::with_text(&source);
+                    let mut native = NativeEditor::with_text(&source);
+                    let start = Position {
+                        line: first,
+                        column: if first == 400 { 3 } else { 2 },
+                    };
+                    let end = Position {
+                        line: last,
+                        column: if last == 400 { 3 } else { 3 },
+                    };
+                    let cursor = Cursor {
+                        position: if reverse { start } else { end },
+                        selection: (start != end).then_some(if reverse { end } else { start }),
+                    };
+                    content.set_cursor(cursor);
+                    native.move_to(cursor);
+                    native.perform(Action::Edit(edit.clone()));
+                    content.perform(Action::Edit(edit.clone()));
+                    assert_eq!(
+                        native_state(&content.0.borrow().editor),
+                        native_state(&native),
+                        "{first}..{last}, reverse={reverse}, {edit:?}"
+                    );
+                    assert_eq!(content.cursor(), native.cursor());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_splices_normalize_word_and_line_selection_over_mixed_endings() {
+        let source = "α token\r\nβ token\n\rγ token\rδ token\n".repeat(100);
+        for selection in [Action::SelectWord, Action::SelectLine] {
+            let mut content: Content = Content::with_text(&source);
+            let mut native = NativeEditor::with_text(&source);
+            let anchor = Cursor {
+                position: Position {
+                    line: 10,
+                    column: 3,
+                },
+                selection: None,
+            };
+            content.move_to(anchor);
+            native.move_to(anchor);
+            content.perform(selection.clone());
+            native.perform(selection);
+            let caret = Cursor {
+                position: Position {
+                    line: 300,
+                    column: 3,
+                },
+                selection: None,
+            };
+            content.move_to(caret);
+            native.move_to(caret);
+            let edit = Edit::Paste(Arc::new("new\r\n".repeat(200)));
+            native.perform(Action::Edit(edit.clone()));
+            content.perform_edit(edit);
+            assert_eq!(
+                native_state(&content.0.borrow().editor),
+                native_state(&native)
+            );
+            assert_eq!(content.cursor(), native.cursor());
+        }
+    }
+
+    #[test]
+    fn large_recorded_fragment_replay_keeps_separate_lf_cr_boundaries() {
+        let mut content: Content = Content::with_text(&"suffix\n".repeat(400));
+        let mut native = NativeEditor::with_text(&"suffix\n".repeat(400));
+        let fragments = ["x\n", "\r", "y\r\n"].repeat(100);
+        let text = fragments.concat();
+        let mut length = 0;
+        let breaks: Vec<_> = fragments
+            .iter()
+            .map(|fragment| {
+                length += fragment.len();
+                length
+            })
+            .collect();
+        content.replace_range_with_breaks(
+            Position {
+                line: 100,
+                column: 2,
+            },
+            Position {
+                line: 110,
+                column: 3,
+            },
+            &text,
+            &breaks,
+        );
+        native.move_to(Cursor {
+            position: Position {
+                line: 110,
+                column: 3,
+            },
+            selection: Some(Position {
+                line: 100,
+                column: 2,
+            }),
+        });
+        for fragment in fragments {
+            native.perform(Action::Edit(Edit::Paste(Arc::new(fragment.to_owned()))));
+        }
+        assert_eq!(
+            native_state(&content.0.borrow().editor),
+            native_state(&native)
+        );
+        assert_eq!(content.cursor(), native.cursor());
+    }
+
+    #[test]
+    fn rebuilt_buffer_retains_first_viewport_through_queued_edits() {
+        let source = "row\n".repeat(600);
+        let mut content: Content = Content::with_text(&source);
+        layout_content(&mut content, 500.0, 240.0);
+        seek_content(
+            &mut content,
+            ScrollTarget::Position(ScrollPosition {
+                line: 90,
+                vertical: 0.0,
+                horizontal: 0.0,
+            }),
+            500.0,
+            240.0,
+        );
+        let before = content.scroll_position();
+        content.0.get_mut().layout = None; // exercise edits queued before a first configured layout
+        for end in [400, 300] {
+            content.set_cursor(Cursor {
+                position: Position {
+                    line: end,
+                    column: 0,
+                },
+                selection: Some(Position {
+                    line: 100,
+                    column: 0,
+                }),
+            });
+            content.perform(Action::Edit(Edit::Paste(Arc::new("new\n".repeat(200)))));
+            assert_eq!(content.0.borrow().pending_edit_scroll, Some(before));
+        }
+        content.move_to(Cursor {
+            position: Position {
+                line: 100,
+                column: 0,
+            },
+            selection: None,
+        });
+        layout_content(&mut content, 500.0, 240.0);
+        assert_eq!(content.scroll_position(), before);
+        assert!(content.0.borrow().pending_edit_scroll.is_none());
+        let shaped = content
+            .0
+            .borrow()
+            .editor
+            .buffer()
+            .lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        assert!(
+            shaped < 40,
+            "viewport seeding must not shape the intervening document: {shaped}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_buffer_queued_scroll_matches_native_before_and_after_layout() {
+        let source = "row\n".repeat(600);
+        for queued in [false, true] {
+            let mut content: Content = Content::with_text(&source);
+            let mut reference: Content = Content::with_text(&source);
+            for document in [&mut content, &mut reference] {
+                layout_content(document, 500.0, 240.0);
+                seek_content(
+                    document,
+                    ScrollTarget::Position(ScrollPosition {
+                        line: 90,
+                        vertical: 0.0,
+                        horizontal: 0.0,
+                    }),
+                    500.0,
+                    240.0,
+                );
+                document.set_cursor(Cursor {
+                    position: Position {
+                        line: 400,
+                        column: 0,
+                    },
+                    selection: Some(Position {
+                        line: 100,
+                        column: 0,
+                    }),
+                });
+            }
+            let paste = Action::Edit(Edit::Paste(Arc::new("new\n".repeat(200))));
+            content.perform(paste.clone());
+            reference.0.get_mut().editor.perform(paste);
+            if !queued {
+                layout_content(&mut content, 500.0, 240.0);
+                layout_content(&mut reference, 500.0, 240.0);
+            }
+            content.perform(Action::Scroll { lines: -50 });
+            reference
+                .0
+                .get_mut()
+                .editor
+                .perform(Action::Scroll { lines: -50 });
+            layout_content(&mut content, 500.0, 240.0);
+            layout_content(&mut reference, 500.0, 240.0);
+            assert_eq!(
+                content.scroll_position(),
+                reference.scroll_position(),
+                "queued={queued}"
+            );
+            assert_eq!(content.cursor(), reference.cursor());
+            if !queued {
+                assert!(content.scroll_position().line + 12 < content.cursor().position.line);
+            }
+        }
+    }
+
+    #[test]
+    fn rebuilt_buffer_explicit_restore_wins_over_queued_scroll() {
+        let mut content: Content = Content::with_text(&"row\n".repeat(600));
+        layout_content(&mut content, 500.0, 240.0);
+        content.set_cursor(Cursor {
+            position: Position {
+                line: 400,
+                column: 0,
+            },
+            selection: Some(Position {
+                line: 100,
+                column: 0,
+            }),
+        });
+        content.perform(Action::Edit(Edit::Paste(Arc::new("new\n".repeat(200)))));
+        content.perform(Action::Scroll { lines: 50 });
+        let restored = ScrollPosition {
+            line: 20,
+            vertical: 0.0,
+            horizontal: 0.0,
+        };
+        content.restore_scroll_position(restored);
+        assert_eq!(content.0.borrow().pending_edit_scroll_lines, 0);
+        // Production applies an explicit restore after ordinary caret reveal.
+        layout_content(&mut content, 500.0, 240.0);
+        let target = content.0.get_mut().pending_scroll.take().unwrap();
+        seek_content(&mut content, ScrollTarget::Position(target), 500.0, 240.0);
+        assert_eq!(content.scroll_position(), restored);
+    }
+
+    #[test]
+    fn large_paste_before_a_long_eof_suffix_rebuilds_once() {
+        let source = "é".repeat(50_000);
+        let mut content: Content = Content::with_text(&source);
+        let mut native = NativeEditor::with_text(&source);
+        let cursor = Cursor {
+            position: Position { line: 0, column: 2 },
+            selection: None,
+        };
+        content.move_to(cursor);
+        native.move_to(cursor);
+        let edit = Edit::Paste(Arc::new("new\n".repeat(200)));
+        content.perform(Action::Edit(edit.clone()));
+        native.perform(Action::Edit(edit));
+        assert!(
+            content.0.borrow().pending_edit_scroll.is_some(),
+            "a long carried suffix must use the one-pass rebuild"
+        );
+        assert_eq!(
+            native_state(&content.0.borrow().editor),
+            native_state(&native)
+        );
+        assert_eq!(content.cursor(), native.cursor());
+    }
+
+    #[test]
+    fn rebuilt_editor_queued_pointer_and_page_actions_match_native() {
+        for action in [
+            Action::Click(Point::new(24.0, 40.0)),
+            Action::Drag(Point::new(40.0, 80.0)),
+            Action::Move(Motion::PageDown),
+            Action::Move(Motion::PageUp),
+        ] {
+            let source = "α token row\n".repeat(600);
+            let mut content: Content = Content::with_text(&source);
+            let mut reference: Content = Content::with_text(&source);
+            for document in [&mut content, &mut reference] {
+                layout_content(document, 500.0, 240.0);
+                seek_content(
+                    document,
+                    ScrollTarget::Position(ScrollPosition {
+                        line: 90,
+                        vertical: 0.0,
+                        horizontal: 0.0,
+                    }),
+                    500.0,
+                    240.0,
+                );
+                document.set_cursor(Cursor {
+                    position: Position {
+                        line: 400,
+                        column: 0,
+                    },
+                    selection: Some(Position {
+                        line: 100,
+                        column: 0,
+                    }),
+                });
+            }
+            let paste = Action::Edit(Edit::Paste(Arc::new("new row\n".repeat(200))));
+            content.perform(paste.clone());
+            reference.0.get_mut().editor.perform(paste);
+            assert!(content.0.borrow().pending_edit_scroll.is_none());
+            content.perform(action.clone());
+            reference.0.get_mut().editor.perform(action.clone());
+            assert_eq!(content.cursor(), reference.cursor(), "{action:?}");
+            assert_eq!(content.selection(), reference.selection(), "{action:?}");
+            let shaped = content
+                .0
+                .borrow()
+                .editor
+                .buffer()
+                .lines
+                .iter()
+                .filter(|line| line.shape_opt().is_some())
+                .count();
+            assert!(
+                shaped < 100,
+                "queued {action:?} eagerly shaped {shaped} rows"
+            );
+            layout_content(&mut content, 500.0, 240.0);
+            layout_content(&mut reference, 500.0, 240.0);
+            assert_eq!(
+                content.scroll_position(),
+                reference.scroll_position(),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuilt_editor_keeps_a_word_selection_made_before_layout() {
+        let mut content: Content = Content::with_text(&"row words\n".repeat(600));
+        layout_content(&mut content, 500.0, 240.0);
+        content.set_cursor(Cursor {
+            position: Position {
+                line: 400,
+                column: 0,
+            },
+            selection: Some(Position {
+                line: 100,
+                column: 0,
+            }),
+        });
+        content.perform(Action::Edit(Edit::Paste(Arc::new(
+            "new words\n".repeat(200),
+        ))));
+        content.move_to(Cursor {
+            position: Position {
+                line: 110,
+                column: 6,
+            },
+            selection: None,
+        });
+        content.perform(Action::SelectWord);
+        let selected = content.selection();
+        layout_content(&mut content, 500.0, 240.0);
+        assert_eq!(content.selection(), selected);
+        assert_eq!(selected.as_deref(), Some("words"));
+    }
+
+    #[test]
+    fn first_layout_after_a_large_splice_keeps_word_and_line_selection_modes() {
+        for selection in [Action::SelectWord, Action::SelectLine] {
+            let mut content: Content = Content::with_text(&"row words\n".repeat(600));
+            content.set_cursor(Cursor {
+                position: Position {
+                    line: 400,
+                    column: 0,
+                },
+                selection: Some(Position {
+                    line: 100,
+                    column: 0,
+                }),
+            });
+            content.perform(Action::Edit(Edit::Paste(Arc::new(
+                "new words\n".repeat(200),
+            ))));
+            content.move_to(Cursor {
+                position: Position {
+                    line: 110,
+                    column: 6,
+                },
+                selection: None,
+            });
+            content.perform(selection);
+            let selected = content.selection();
+            let cursor = content.cursor();
+            layout_content(&mut content, 500.0, 240.0);
+            assert_eq!(content.selection(), selected);
+            assert_eq!(content.cursor(), cursor);
+        }
+    }
+
+    #[test]
+    fn construction_preserves_exact_native_lines_endings_and_initial_cursor() {
+        for source in [
+            "",
+            "plain",
+            "one\ntwo\n",
+            "one\r\ntwo\r\n",
+            "one\rtwo\r",
+            "one\n\rtwo\n\r",
+            "\n\n\r\r\n\r\n",
+            "Straße\rcafé\r\n東京\n\rtail",
+            "α\r\nβ\nγ\rδ\n\r",
+        ] {
+            let original = NativeEditor::with_text(source);
+            let content: Content = Content::with_text(source);
+            let internal = content.0.borrow();
+            let lines = |editor: &NativeEditor| {
+                editor
+                    .buffer()
+                    .lines
+                    .iter()
+                    .map(|line| (line.text().to_owned(), line.ending()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(lines(&internal.editor), lines(&original), "{source:?}");
+            assert_eq!(internal.editor.cursor(), original.cursor());
+            drop(internal);
+            assert_eq!(content.text(), source);
+        }
+    }
+
+    #[test]
+    fn construction_notifies_the_first_highlighter_from_line_zero() {
+        struct ChangedLine(Option<usize>);
+        impl Highlighter for ChangedLine {
+            type Settings = ();
+            type Highlight = ();
+            type Iterator<'a> = std::iter::Empty<(ops::Range<usize>, ())>;
+            fn new(_: &()) -> Self {
+                Self(None)
+            }
+            fn update(&mut self, _: &()) {}
+            fn change_line(&mut self, line: usize) {
+                self.0 = Some(line);
+            }
+            fn highlight_line(&mut self, _: &str) -> Self::Iterator<'_> {
+                std::iter::empty()
+            }
+            fn current_line(&self) -> usize {
+                self.0.unwrap_or(usize::MAX)
+            }
+        }
+        let mut content: Content = Content::with_text(&"token\n".repeat(300));
+        let mut highlighter = ChangedLine::new(&());
+        // Match the constructor's font and metrics, so those transitions do
+        // not themselves renew the changed-line marker and mask a bad load.
+        content.0.get_mut().editor.update(
+            Size::new(800.0, 24.0),
+            cosmic::iced::Font::DEFAULT,
+            Pixels(1.0),
+            LineHeight::Absolute(Pixels(1.0)),
+            Wrapping::None,
+            &mut highlighter,
+        );
+        assert_eq!(highlighter.0, Some(0));
+        let config = EditorLayout {
+            bounds: Size::new(800.0, 24.0),
+            font: cosmic::iced::Font::DEFAULT,
+            size: Pixels(1.0),
+            line_height: LineHeight::Absolute(Pixels(1.0)),
+            wrapping: Wrapping::None,
+        };
+        content.0.get_mut().layout = Some(config);
+        content.set_cursor(Cursor {
+            position: Position {
+                line: 300,
+                column: 0,
+            },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        content.perform(Action::Edit(Edit::Paste(Arc::new("next\n".repeat(200)))));
+        content.move_to(Cursor {
+            position: Position {
+                line: 150,
+                column: 0,
+            },
+            selection: None,
+        });
+        content.perform(Action::Edit(Edit::Insert('x')));
+        highlighter.0 = None;
+        // Bounded preparation already used PlainText and these exact metrics.
+        // The actual syntax highlighter still needs a fresh line-zero marker.
+        content.0.get_mut().editor.update(
+            config.bounds,
+            config.font,
+            config.size,
+            config.line_height,
+            config.wrapping,
+            &mut highlighter,
+        );
+        assert_eq!(
+            highlighter.0,
+            Some(150),
+            "the queued native edit overwrites its marker"
+        );
+        content.0.get_mut().finish_layout(&mut highlighter);
+        assert_eq!(highlighter.0, Some(0));
+    }
+
+    #[test]
+    fn large_document_construction_leaves_unvisited_lines_unshaped() {
+        let source = "let token = 123; // native fixture\n".repeat(100_000);
+        let started = Instant::now();
+        let mut content: Content = Content::with_text(&source);
+        eprintln!("100k-line construction: {:?}", started.elapsed());
+        {
+            let internal = content.0.borrow();
+            let lines = &internal.editor.buffer().lines;
+            assert_eq!(lines.len(), 100_001);
+            assert!(lines.iter().all(|line| line.shape_opt().is_none()));
+            assert!(lines.iter().all(|line| line.layout_opt().is_none()));
+        }
+        layout_content(&mut content, 800.0, 240.0);
+        let internal = content.0.borrow();
+        let lines = &internal.editor.buffer().lines;
+        let shaped = lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        assert!(
+            (1..100).contains(&shaped),
+            "only the viewport needs shapes: {shaped}"
+        );
+        assert!(lines.last().unwrap().shape_opt().is_none());
+        assert!(lines.last().unwrap().layout_opt().is_none());
+    }
+
+    #[test]
+    #[ignore = "explicit constructor benchmark retains the old full-file glyph caches"]
+    fn native_constructor_large_file_microbenchmark() {
+        let source = "let token = 123; // native fixture\n".repeat(100_000);
+        let started = Instant::now();
+        let content: Content = Content::with_text(&source);
+        let current_elapsed = started.elapsed();
+        let current_shaped = content
+            .0
+            .borrow()
+            .editor
+            .buffer()
+            .lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        let started = Instant::now();
+        let original = NativeEditor::with_text(&source);
+        let original_elapsed = started.elapsed();
+        let original_shaped = original
+            .buffer()
+            .lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        eprintln!(
+            "100k lines / {} bytes: original {original_elapsed:?}, {original_shaped} shaped; current {current_elapsed:?}, {current_shaped} shaped (unoptimized test profile)",
+            source.len()
+        );
+        assert_eq!(original_shaped, 100_001);
+        assert_eq!(current_shaped, 0);
+    }
+
+    #[test]
+    #[ignore = "explicit full-buffer native paste benchmark"]
+    fn native_full_buffer_paste_microbenchmark() {
+        for count in [10_000, 50_000, 100_000] {
+            let mut content: Content = Content::with_text(&"token\n".repeat(count));
+            content.set_cursor(Cursor {
+                position: Position {
+                    line: count,
+                    column: 0,
+                },
+                selection: Some(Position { line: 0, column: 0 }),
+            });
+            let replacement = Arc::new("next\n".repeat(count));
+            let started = Instant::now();
+            let edit = content.perform_edit(Edit::Paste(replacement)).unwrap();
+            eprintln!(
+                "{count} lines full-buffer perform_edit(Paste): {:?} (unoptimized test profile)",
+                started.elapsed()
+            );
+            assert_eq!(content.text(), "next\n".repeat(count));
+            assert_eq!(edit.before.selection, Some(Position { line: 0, column: 0 }));
+        }
+    }
+
+    #[test]
+    fn search_snapshot_preserves_native_positions_unicode_and_mixed_endings() {
+        let source = "Straße\rSTRASSE\r\ncafé CAFÉ\n\rtail";
+        let content: Content = Content::with_text(source);
+        let snapshot = content.search_snapshot();
+        assert_eq!(snapshot.text, content.text());
+        for query in ["strasse", "café", " ", "tail", "s", ""] {
+            assert_eq!(
+                snapshot.find_matches(query, || false).unwrap(),
+                content.find_matches(query)
+            );
+        }
+        let matches = snapshot.find_matches("strasse", || false).unwrap();
+        assert_eq!(
+            snapshot.replace_matches(&matches, "road\nnext").unwrap(),
+            "road\nnext\rroad\nnext\r\ncafé CAFÉ\n\rtail"
+        );
+    }
+
+    #[test]
+    fn replace_all_builds_a_large_changed_length_document_in_source_order() {
+        let text = "token\n".repeat(100_000);
+        let content: Content = Content::with_text(&text);
+        let snapshot = content.search_snapshot();
+        let matches = snapshot.find_matches("token", || false).unwrap();
+        assert_eq!(matches.len(), 100_000);
+        assert_eq!(
+            snapshot
+                .replace_matches(&matches, "longer replacement")
+                .unwrap(),
+            "longer replacement\n".repeat(100_000)
+        );
+        assert_eq!(
+            snapshot.replace_matches(&matches, "").unwrap(),
+            "\n".repeat(100_000)
+        );
+    }
+
+    #[test]
+    fn snapshot_search_cancels_inside_a_single_long_line() {
+        let content: Content = Content::with_text(&"Straße ".repeat(100_000));
+        let snapshot = content.search_snapshot();
+        let checks = std::cell::Cell::new(0);
+        assert!(
+            snapshot
+                .find_matches("strasse", || {
+                    checks.set(checks.get() + 1);
+                    checks.get() == 3
+                })
+                .is_none()
+        );
+        assert_eq!(checks.get(), 3);
+    }
+
+    #[test]
+    fn replace_matches_rejects_overlapping_or_invalid_unicode_ranges() {
+        let content: Content = Content::with_text("café");
+        let snapshot = content.search_snapshot();
+        let at = |column| Position { line: 0, column };
+        for matches in [
+            vec![(at(0), at(3)), (at(2), at(5))],
+            vec![(at(0), at(4))],
+            vec![(at(9), at(9))],
+        ] {
+            assert!(snapshot.replace_matches(&matches, "x").is_none());
+        }
+    }
+
     #[test]
     fn find_casefolds_unicode_preserves_whitespace_and_source_offsets() {
         let content: Content = Content::with_text("Straße\n  café CAFÉ\nİ");
@@ -2886,13 +4021,31 @@ mod tests {
         // content before shaping or seeking, and scroll canonicalization
         // reads it back.
         content.0.get_mut().wrapping = Wrapping::Word;
-        content.0.get_mut().editor.update(
-            Size::new(width, height),
-            cosmic::iced::Font::MONOSPACE,
-            Pixels(16.0),
-            LineHeight::Absolute(Pixels(20.0)),
+        let internal = content.0.get_mut();
+        internal.layout = Some(EditorLayout {
+            bounds: Size::new(width, height),
+            font: cosmic::iced::Font::MONOSPACE,
+            size: Pixels(16.0),
+            line_height: LineHeight::Absolute(Pixels(20.0)),
+            wrapping: Wrapping::Word,
+        });
+        let previous = internal.pending_edit_scroll.take();
+        let lines = std::mem::take(&mut internal.pending_edit_scroll_lines);
+        shape_after_splice(
+            &mut internal.editor,
+            previous,
+            lines,
             Wrapping::Word,
-            &mut highlighter::PlainText::new(&()),
+            |editor| {
+                editor.update(
+                    Size::new(width, height),
+                    cosmic::iced::Font::MONOSPACE,
+                    Pixels(16.0),
+                    LineHeight::Absolute(Pixels(20.0)),
+                    Wrapping::Word,
+                    &mut highlighter::PlainText::new(&()),
+                )
+            },
         );
     }
 
