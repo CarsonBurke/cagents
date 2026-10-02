@@ -72,12 +72,13 @@ impl From<ServerEnvelope> for Outbound {
     }
 }
 
-/// The message kinds whose newest queued instance replaces the previous one.
+/// Message kinds that share one pending slot for a session.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum SlotKind {
     Redraw,
     ChatChanged,
     ChatActivity,
+    Bell,
 }
 
 fn coalescible(message: &ServerMessage) -> Option<(SlotKind, TerminalId)> {
@@ -85,6 +86,11 @@ fn coalescible(message: &ServerMessage) -> Option<(SlotKind, TerminalId)> {
         ServerMessage::Redraw { terminal_id, .. } => Some((SlotKind::Redraw, *terminal_id)),
         ServerMessage::ChatChanged { chat_id } => Some((SlotKind::ChatChanged, *chat_id)),
         ServerMessage::ChatActivity { chat_id, .. } => Some((SlotKind::ChatActivity, *chat_id)),
+        ServerMessage::Event {
+            terminal_id,
+            event: crate::terminal_ipc::WireTerminalEvent::Bell,
+            ..
+        } => Some((SlotKind::Bell, *terminal_id)),
         _ => None,
     }
 }
@@ -192,9 +198,10 @@ impl DeliveryQueue {
 
     /// Enqueues a message without allowing a slow client to apply backpressure
     /// to a terminal worker. Redraw edges and chat activity for the same
-    /// session are collapsed to the newest state — in constant time, through
-    /// `slots` — while responses and semantic events remain ordered and
-    /// lossless until the bounded queue disconnects the client.
+    /// session are collapsed to the newest state through `slots`. Bells keep
+    /// their earliest queued attention edge; other semantic events and
+    /// responses remain ordered and lossless until the bounded queue
+    /// disconnects the client.
     ///
     /// A disconnection is reported on the wire: the queue is replaced by a
     /// single retryable [`ProtocolErrorCode::QueueFull`] frame and closed after
@@ -210,12 +217,20 @@ impl DeliveryQueue {
             return Err(DeliveryError::Closed);
         }
 
-        // Constant-time coalescing: overwrite the queued state for this
-        // session in place instead of scanning for it.
+        // Coalesce through the indexed slot instead of scanning the queue.
         if let Some(key) = coalescible(&message.message)
             && let Some(index) = state.slot(key)
         {
             match &message.message {
+                ServerMessage::Event {
+                    event: crate::terminal_ipc::WireTerminalEvent::Bell,
+                    ..
+                } if state.messages[index].proof == message.proof => {
+                    // Keep the earliest sequence and its queue position. A
+                    // newer sequence here would overtake intervening exit or
+                    // metadata events, which clients would then reject as old.
+                    return Ok(());
+                }
                 ServerMessage::Redraw { generation, .. } => {
                     let generation = *generation;
                     if let ServerMessage::Redraw {
@@ -380,6 +395,63 @@ mod tests {
         assert!(matches!(
             delivered.message,
             ServerMessage::Redraw { generation: 11, .. }
+        ));
+    }
+
+    #[test]
+    fn bell_storm_keeps_attention_and_completion_in_sequence() {
+        let queue = DeliveryQueue::new(1, 2);
+        let terminal_id = TerminalId::new();
+        let mut envelope = redraw(terminal_id, 1);
+        envelope.message = ServerMessage::Event {
+            terminal_id,
+            sequence: 1,
+            event: crate::terminal_ipc::WireTerminalEvent::Bell,
+        };
+        queue.push(envelope.clone()).unwrap();
+        envelope.message = ServerMessage::Event {
+            terminal_id,
+            sequence: 2,
+            event: crate::terminal_ipc::WireTerminalEvent::Completed {
+                exit_code: 0,
+                signal: None,
+                intentional: false,
+            },
+        };
+        queue.push(envelope.clone()).unwrap();
+        for sequence in 3..10_000 {
+            envelope.message = ServerMessage::Event {
+                terminal_id,
+                sequence,
+                event: crate::terminal_ipc::WireTerminalEvent::Bell,
+            };
+            queue.push(envelope.clone()).unwrap();
+        }
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::Event {
+                sequence: 1,
+                event: crate::terminal_ipc::WireTerminalEvent::Bell,
+                ..
+            }
+        ));
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::Event {
+                sequence: 2,
+                event: crate::terminal_ipc::WireTerminalEvent::Completed { .. },
+                ..
+            }
+        ));
+        // A new attention edge after the old slot drains must remain visible.
+        queue.push(envelope).unwrap();
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::Event {
+                sequence: 9999,
+                event: crate::terminal_ipc::WireTerminalEvent::Bell,
+                ..
+            }
         ));
     }
 

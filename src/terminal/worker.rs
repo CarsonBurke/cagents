@@ -71,6 +71,9 @@ const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// flashes an empty screen. Ghostty bounds the hold the same way, so a program
 /// that dies or never ends the update cannot freeze its card.
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bells signal attention, not a count of bytes. Publish the first promptly,
+/// then at most one pending reminder per interval, independently of PTY rate.
+const BELL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 enum Command {
@@ -193,6 +196,78 @@ enum Effect {
     Bell,
     Title(String),
     WorkingDirectoryChanged,
+}
+
+/// Collapse parser metadata before it can allocate one effect per escape or
+/// bell byte. PTY replies remain ordered and lossless; titles and cwd describe
+/// the final parser state of this batch.
+#[derive(Default)]
+struct Effects {
+    ordered: Vec<Effect>,
+    bell: bool,
+    title: Option<usize>,
+    cwd: bool,
+}
+
+impl Effects {
+    fn push(&mut self, effect: Effect) {
+        match effect {
+            Effect::Bell => {
+                if !std::mem::replace(&mut self.bell, true) {
+                    self.ordered.push(Effect::Bell);
+                }
+            }
+            Effect::WorkingDirectoryChanged => {
+                if !std::mem::replace(&mut self.cwd, true) {
+                    self.ordered.push(Effect::WorkingDirectoryChanged);
+                }
+            }
+            Effect::Title(title) => {
+                if let Some(index) = self.title {
+                    self.ordered[index] = Effect::Title(title);
+                } else {
+                    self.title = Some(self.ordered.len());
+                    self.ordered.push(Effect::Title(title));
+                }
+            }
+            effect => self.ordered.push(effect),
+        }
+    }
+
+    fn retain_title(&mut self) {
+        let old = std::mem::take(self);
+        for effect in old.ordered {
+            if matches!(effect, Effect::Title(_)) {
+                self.push(effect);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Bell {
+    pending: bool,
+    next: Option<std::time::Instant>,
+}
+
+impl Bell {
+    fn take_ready(&mut self, now: std::time::Instant) -> bool {
+        if self.pending && self.next.is_none_or(|next| now >= next) {
+            self.pending = false;
+            self.next = Some(now + BELL_INTERVAL);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_after(&self) -> Option<Duration> {
+        self.pending.then(|| {
+            self.next.map_or(Duration::ZERO, |next| {
+                next.saturating_duration_since(std::time::Instant::now())
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1136,7 +1211,8 @@ struct Worker {
     theme: Rc<Cell<TerminalTheme>>,
     key_encoder: KeyEncoder<'static>,
     mouse_encoder: MouseEncoder<'static>,
-    effects: Rc<RefCell<Vec<Effect>>>,
+    effects: Rc<RefCell<Effects>>,
+    bell: Bell,
     visual: Option<VisualResources>,
     visibility: Visibility,
     generation: u64,
@@ -1286,7 +1362,7 @@ impl Worker {
             })
             .map_err(|error| format!("register color scheme query: {error}"))?;
 
-        let effects = Rc::new(RefCell::new(Vec::new()));
+        let effects = Rc::new(RefCell::new(Effects::default()));
         terminal
             .on_pty_write({
                 let effects = Rc::clone(&effects);
@@ -1368,9 +1444,7 @@ impl Worker {
                 // it sets: whatever it provoked, a reply or a bell, happened
                 // when its predecessor drew it.
                 terminal.vt_write(&adopted.screen);
-                effects
-                    .borrow_mut()
-                    .retain(|effect| matches!(effect, Effect::Title(_)));
+                effects.borrow_mut().retain_title();
                 if adopted.screen_lost {
                     // A crash has no emulator snapshot. Nudge full-screen
                     // clients to redraw on their surviving controlling PTY.
@@ -1483,6 +1557,7 @@ impl Worker {
             key_encoder,
             mouse_encoder,
             effects,
+            bell: Bell::default(),
             visual,
             visibility,
             generation: 0,
@@ -1524,6 +1599,7 @@ impl Worker {
         let mut shutting_down = false;
         let mut carried_command = None;
         while !shutting_down && (pty_open || !exited) {
+            self.publish_bell();
             // Output or a busy input queue must not keep resetting discovery's
             // timeout: an agent can start in an existing shell's process group.
             if self.last_foreground_observation.elapsed() >= self.foreground_poll {
@@ -1542,7 +1618,10 @@ impl Worker {
                         !exited,
                         self.foreground_poll
                             .saturating_sub(self.last_foreground_observation.elapsed()),
-                        self.synchronized_release_after(),
+                        self.synchronized_release_after()
+                            .into_iter()
+                            .chain(self.bell.release_after())
+                            .min(),
                     )
                 });
             match event {
@@ -1555,8 +1634,8 @@ impl Worker {
                 }
                 WorkerEvent::Command(None) => shutting_down = true,
                 WorkerEvent::Capture => self.capture_if_ready(),
-                // Foreground observation runs at the top of the loop once it
-                // is due. An expired synchronized update is released here.
+                // Foreground observation and pending bells run at the top of
+                // the loop. An expired synchronized update is released here.
                 WorkerEvent::Timer => self.capture_if_ready(),
                 WorkerEvent::Pty(message) => {
                     pty_open = self.handle_pty_message(message);
@@ -1568,6 +1647,13 @@ impl Worker {
                     );
                 }
             }
+        }
+
+        // A last bell may still be waiting for its cadence deadline when the
+        // PTY drains. Deliver its attention before completion, without holding
+        // teardown open for a timer.
+        if std::mem::take(&mut self.bell.pending) {
+            self.emit(TerminalEvent::Bell);
         }
 
         // The parser is about to disappear. Preserve its final grid even when
@@ -1826,6 +1912,39 @@ impl Worker {
                 reply,
                 deadline,
             } => {
+                let proposed = Some(activity.unwrap_or(crate::agent::Activity {
+                    provider: process.provider,
+                    state: crate::agent::ActivityState::Unknown,
+                }));
+                let current_activity = *self
+                    .published
+                    .agent_activity
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let unchanged = self.agent_process.as_ref() == Some(&process)
+                    && current_activity == proposed
+                    && title.as_ref().is_none_or(|title| {
+                        self.published
+                            .conversation_title
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_deref()
+                            .is_some_and(|current| current.chars().eq(title.chars().take(256)))
+                    });
+                // An unchanged sample has nothing to apply. Validate liveness
+                // without walking launchers or reading environments; periodic
+                // discovery still notices exec and refreshes hidden recovery.
+                // Never use this shortcut to publish a changed activity/title.
+                if unchanged
+                    && std::time::Instant::now() < deadline
+                    && self.foreground_group().is_some_and(|group| {
+                        crate::model::agent_recovery::process_in_foreground(&process, group)
+                            && self.foreground_group() == Some(group)
+                    })
+                {
+                    let _ = reply.send(current_activity);
+                    return false;
+                }
                 let current = self.observe_agent_process();
                 let valid = std::time::Instant::now() < deadline && current == Some(&process);
                 let activity = if valid {
@@ -2321,10 +2440,13 @@ impl Worker {
 
     fn drain_effects(&mut self) {
         let effects = std::mem::take(&mut *self.effects.borrow_mut());
-        for effect in effects {
+        for effect in effects.ordered {
             match effect {
                 Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
-                Effect::Bell => self.emit(TerminalEvent::Bell),
+                Effect::Bell => {
+                    self.bell.pending = true;
+                    self.publish_bell();
+                }
                 Effect::WorkingDirectoryChanged => {
                     let raw = self.terminal.pwd().unwrap_or_default();
                     let path = working_directory_path(raw, local_host_name());
@@ -2385,6 +2507,12 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    fn publish_bell(&mut self) {
+        if self.bell.pending && self.bell.take_ready(std::time::Instant::now()) {
+            self.emit(TerminalEvent::Bell);
         }
     }
 
@@ -4281,6 +4409,18 @@ mod tests {
         };
         let deadline = || std::time::Instant::now() + Duration::from_secs(3);
         assert_eq!(apply(&mut worker, process.clone(), deadline()), working);
+        let discovery_count = || {
+            crate::model::agent_recovery::FOREGROUND_AGENT_OBSERVATIONS.with(std::cell::Cell::get)
+        };
+        let before = discovery_count();
+        for _ in 0..100 {
+            assert_eq!(apply(&mut worker, process.clone(), deadline()), working);
+        }
+        assert_eq!(
+            discovery_count(),
+            before,
+            "unchanged samples must not descend /proc again"
+        );
         let mut replaced = process.clone();
         replaced.start = replaced.start.wrapping_add(1);
         assert_eq!(apply(&mut worker, replaced, deadline()), None);
@@ -4311,6 +4451,39 @@ mod tests {
         );
         // The disconnected command channel drives normal kill/reap teardown.
         worker.run();
+    }
+
+    #[test]
+    fn parser_metadata_storm_is_collapsed_before_semantic_delivery() {
+        let (mut worker, events) = capture_worker();
+        let mut output = vec![b'\x07'; 1024 * 1024];
+        for index in 0..10_000 {
+            output.extend_from_slice(format!("\x1b]2;title-{index}\x07").as_bytes());
+        }
+        worker.process_output(output);
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            vec![
+                TerminalEvent::Bell,
+                TerminalEvent::TitleChanged("title-9999".into()),
+            ]
+        );
+        worker.run();
+    }
+
+    #[test]
+    fn bells_publish_promptly_then_keep_one_pending_reminder() {
+        let now = std::time::Instant::now();
+        let mut bell = Bell::default();
+        bell.pending = true;
+        assert!(bell.take_ready(now));
+        for _ in 0..10_000 {
+            bell.pending = true;
+            assert!(!bell.take_ready(now + BELL_INTERVAL / 2));
+        }
+        assert!(bell.take_ready(now + BELL_INTERVAL));
+        assert!(!bell.pending);
+        assert!(!bell.take_ready(now + 2 * BELL_INTERVAL));
     }
 
     #[test]
