@@ -24,6 +24,8 @@ const BUNDLED: &[&str] = &[
     "7213ff9f5c012409711c3183c82f4dbb5293cbb309251334f83efda7fb863b33",
     // #620: chooses between the harness and a hosted session; short handles.
     "6d81922a43f4a116c5ef9b55ab14fe1b6137f240037f88c31735e860653f4f57",
+    // #621: messages between sessions.
+    "95e462bbb60fe643b37cf76aacd642b87efa781c473f7723049e7f861b31b837",
 ];
 /// Larger than any bundled revision, so an oversized file is user content
 /// without being read in full.

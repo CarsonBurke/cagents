@@ -78,6 +78,7 @@ id_type!(BrowserId);
 id_type!(OperationId);
 id_type!(AgentId);
 id_type!(RunId);
+id_type!(MessageId);
 
 macro_rules! evidence_type {
     ($name:ident) => {

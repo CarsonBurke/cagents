@@ -1920,3 +1920,226 @@ fn a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own() {
     exit(second);
     exit(rival_next);
 }
+
+#[test]
+fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_askers() {
+    use crate::agent_execution::{
+        Lineage,
+        mailbox::{Inbox, Message, Outgoing, Reach, Sent, State as Delivery, To, short},
+    };
+    if isolated("sessions_message_their_parent_peers_and_the_user_and_replies_find_their_askers")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let _courier = mailbox::Courier::start(&host).unwrap();
+    let session_of = |agent: AgentId| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .session
+            .unwrap()
+            .id()
+    };
+    let authority_of = |session: TerminalId| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_authority(session)
+            .unwrap()
+    };
+    let parent = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let parent_session = session_of(parent.agent.id);
+    let parent_authority = authority_of(parent_session);
+    let mut child_request = request;
+    child_request.idempotency_key = "child".into();
+    let child = submit(&host, &parent_authority, child_request).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let child_session = session_of(child.agent.id);
+    let child_authority = authority_of(child_session);
+
+    let send = |authority: &Authority, to: To, body: &str, wait_ms: Option<u64>| match process(
+        &host,
+        authority.clone(),
+        Operation::SendMessage(Outgoing {
+            to,
+            body: body.into(),
+            wait_ms,
+        }),
+    )? {
+        Reply::Sent(sent) => Ok::<Sent, String>(sent),
+        reply => panic!("unexpected reply {reply:?}"),
+    };
+    let read = |authority: &Authority, replies_to| {
+        let Reply::Inbox(messages) = process(
+            &host,
+            authority.clone(),
+            Operation::Inbox(Inbox {
+                all: false,
+                replies_to,
+            }),
+        )
+        .unwrap() else {
+            panic!("inbox reply")
+        };
+        messages
+    };
+    let stored = |message: &Message| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(message.id)
+            .unwrap()
+            .unwrap()
+    };
+    let delivered = |message: &Message| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = stored(message);
+            if current.state == Delivery::Delivered {
+                return current;
+            }
+            assert!(Instant::now() < deadline, "never delivered: {current:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let transcript = |session: TerminalId| {
+        let handle = host.lock().unwrap().chats[&session].handle.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = handle.snapshot(None).unwrap();
+            if !snapshot.busy && snapshot.ready {
+                return snapshot.items;
+            }
+            assert!(Instant::now() < deadline, "conversation never settled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // A child reaches the session that started it, which sees who wrote.
+    let sent = send(&child_authority, To::Parent, "Tests pass on my side", None).unwrap();
+    assert_eq!(sent.reach, Reach::Conversation);
+    assert_eq!(sent.message.to.lineage, Some(Lineage(parent_session)));
+    assert_eq!(sent.message.from.session, Some(child_session));
+    // A delegated agent without a title of its own goes by its channel's.
+    assert!(sent.message.from.title.is_some());
+    assert_eq!(delivered(&sent.message).to.session, Some(parent_session));
+    let shown = transcript(parent_session)
+        .into_iter()
+        .find_map(|item| match item.content {
+            chat::ItemContent::Delivery {
+                kind: chat::DeliveryKind::Message,
+                sender,
+                body,
+                ..
+            } => Some((item.role, sender, body)),
+            _ => None,
+        });
+    assert_eq!(
+        shown,
+        Some((
+            chat::Role::User,
+            short(child_session),
+            "Tests pass on my side".to_owned()
+        ))
+    );
+
+    // The parent answers by the message's short ID; the reply finds the child.
+    let reply = send(
+        &parent_authority,
+        To::Sender(short(sent.message.id)),
+        "Thanks; merge it",
+        None,
+    )
+    .unwrap();
+    assert_eq!(reply.message.reply_to, Some(sent.message.id));
+    assert_eq!(reply.message.to.lineage, Some(Lineage(child_session)));
+    delivered(&reply.message);
+    // Only the recipient may answer a message.
+    assert!(
+        send(
+            &parent_authority,
+            To::Sender(short(reply.message.id)),
+            "x",
+            None
+        )
+        .is_err()
+    );
+
+    // A user-started agent's parent is the user, who reads it from the CLI.
+    let to_user = send(&parent_authority, To::Parent, "Done", None).unwrap();
+    assert_eq!(to_user.message.to.lineage, None);
+    assert_eq!(to_user.reach, Reach::Inbox);
+    let inbox = read(&Authority::default(), None);
+    assert_eq!(
+        inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+        [to_user.message.id]
+    );
+    assert_eq!(inbox[0].state, Delivery::Read);
+    assert!(read(&Authority::default(), None).is_empty());
+
+    // The user names a session by a prefix of its ID, its lineage or its agent.
+    let by_agent = send(
+        &Authority::default(),
+        To::Session(child.agent.id.to_string()[..8].to_owned()),
+        "Status?",
+        None,
+    )
+    .unwrap();
+    assert_eq!(by_agent.message.to.lineage, Some(Lineage(child_session)));
+    assert_eq!(by_agent.message.from.lineage, None);
+    delivered(&by_agent.message);
+    for refused in [
+        send(
+            &parent_authority,
+            To::Session(parent_session.to_string()),
+            "me",
+            None,
+        ),
+        send(
+            &Authority::default(),
+            To::Session("abc".into()),
+            "short",
+            None,
+        ),
+        send(
+            &Authority::default(),
+            To::Session("ffffffff-none".into()),
+            "nobody",
+            None,
+        ),
+        send(&Authority::default(), To::Parent, "orphan", None),
+    ] {
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    // A reply to a waiting asker is held for it, not given to its conversation.
+    let question = send(&child_authority, To::Parent, "Which branch?", Some(60_000)).unwrap();
+    delivered(&question.message);
+    let answer = send(
+        &parent_authority,
+        To::Sender(question.message.id.to_string()),
+        "main",
+        None,
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(stored(&answer.message).state, Delivery::Pending);
+    assert!(read(&parent_authority, Some(question.message.id)).is_empty());
+    let answers = read(&child_authority, Some(question.message.id));
+    assert_eq!(
+        answers.iter().map(|m| m.id).collect::<Vec<_>>(),
+        [answer.message.id]
+    );
+    assert_eq!(stored(&answer.message).state, Delivery::Read);
+
+    close(&host, &parent_authority, child.agent.id).unwrap();
+    close(&host, &Authority::default(), parent.agent.id).unwrap();
+}

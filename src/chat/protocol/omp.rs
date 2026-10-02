@@ -700,6 +700,9 @@ impl Adapter for Omp {
         let mut step = Step::default();
         match command {
             Command::Prompt{text:message,attachments,mode} => {
+                if self.busy && mode == PromptMode::Send {
+                    return Err("OMP is busy; steer or queue instead of sending another prompt".into());
+                }
                 let kind=match mode {PromptMode::Send=>"prompt",PromptMode::Steer=>"steer",PromptMode::Queue=>"follow_up"};
                 let mut request=self.request(kind);
                 let mut message=message;
@@ -914,6 +917,14 @@ impl Adapter for Omp {
                         message: text(&frame, "error").into(),
                         fatal,
                     });
+                    // A refused prompt started no turn, so the conversation is
+                    // idle again rather than waiting for one.
+                    if text(&frame, "command") == "prompt" && !self.busy {
+                        step.events.push(Event::Status {
+                            busy: false,
+                            detail: "Ready".into(),
+                        });
+                    }
                     self.finish_execution(
                         text(&frame, "id"),
                         crate::notifications::Kind::Failed,
@@ -1636,6 +1647,16 @@ mod tests {
         assert_eq!(timing.writes[0]["type"], "set_interrupt_mode");
         assert_eq!(timing.writes[0]["mode"], "wait");
         adapter.busy = true;
+        let prompt = |mode| Command::Prompt {
+            text: "next".into(),
+            attachments: Vec::new(),
+            mode,
+        };
+        assert!(adapter.command(prompt(PromptMode::Send)).is_err());
+        assert_eq!(
+            adapter.command(prompt(PromptMode::Queue)).unwrap().writes[0]["type"],
+            "follow_up"
+        );
         assert!(
             adapter
                 .command(Command::Branch {
@@ -2256,6 +2277,10 @@ mod tests {
         assert!(
             matches!(&failure.events[0],Event::Error {message,fatal:false} if message=="Extension failed")
         );
+        assert!(failure.events.contains(&Event::Status {
+            busy: false,
+            detail: "Ready".into()
+        }));
     }
 
     /// A reply the conversation needs before it takes commands that fails

@@ -53,6 +53,24 @@ enum ActorCommand {
 }
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
 
+/// Why a provider command may not have taken effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    /// The actor never took the command, or refused it.
+    Refused(String),
+    /// The actor took the command but did not answer in time; the provider
+    /// may still receive it.
+    Unacknowledged(String),
+}
+
+impl From<Rejection> for String {
+    fn from(rejection: Rejection) -> Self {
+        match rejection {
+            Rejection::Refused(error) | Rejection::Unacknowledged(error) => error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateReadiness {
     Idle,
@@ -75,6 +93,8 @@ pub(crate) enum Update {
         state: ActivityState,
         generation: u64,
     },
+    /// The provider began taking prompts, which leaves activity unchanged.
+    Ready,
     /// The provider reported on the account the conversation runs on. It
     /// concerns every surface showing the account, whatever this
     /// conversation's visibility, and changes nothing in the snapshot.
@@ -337,6 +357,7 @@ impl Handle {
                     history_error: None,
                     dirty: false,
                     activity: ActivityState::Idle,
+                    ready: false,
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
@@ -516,6 +537,12 @@ impl Handle {
         Ok(handle)
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
+        self.submit_command(None, command).map_err(String::from)
+    }
+
+    /// Like [`Self::command`], but tells a refusal, after which the command
+    /// may be offered again, from a timeout, after which it may still run.
+    pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
         self.submit_command(None, command)
     }
 
@@ -525,20 +552,21 @@ impl Handle {
         command: Command,
     ) -> Result<(), String> {
         self.submit_command(Some(run), command)
+            .map_err(String::from)
     }
 
     fn submit_command(
         &self,
         run: Option<crate::model::RunId>,
         command: Command,
-    ) -> Result<(), String> {
+    ) -> Result<(), Rejection> {
         // `completed` is published only once teardown finished; `draining` the moment
         // the actor stopped consuming its command channel.
         let exiting = self.is_completed() || self.0.draining.load(Ordering::Acquire);
         if exiting && matches!(command, Command::LoadEarlier | Command::Refresh) {
-            let cached = page_command(&self.0.store, &command)?;
+            let cached = page_command(&self.0.store, &command).map_err(Rejection::Refused)?;
             if command == Command::LoadEarlier && !cached {
-                return Err("Earlier cached history is exhausted; the exited provider must be explicitly resumed to load more".into());
+                return Err(Rejection::Refused("Earlier cached history is exhausted; the exited provider must be explicitly resumed to load more".into()));
             }
             self.0
                 .state
@@ -551,22 +579,27 @@ impl Handle {
             return Ok(());
         }
         if exiting {
-            return Err("Provider process exited; explicitly recover the exact session".into());
+            return Err(Rejection::Refused(
+                "Provider process exited; explicitly recover the exact session".into(),
+            ));
         }
         if self.0.stop.load(Ordering::Acquire) {
-            return Err("Chat is closing".into());
+            return Err(Rejection::Refused("Chat is closing".into()));
         }
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
             .try_send((ActorCommand::Provider { run, command }, reply))
-            .map_err(|e| format!("Chat command queue unavailable: {e}"))?;
+            .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| {
-                "Provider command acknowledgement timed out; do not retry blindly".to_string()
+                Rejection::Unacknowledged(
+                    "Provider command acknowledgement timed out; do not retry blindly".into(),
+                )
             })?
+            .map_err(Rejection::Refused)
     }
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
         if self.is_completed()
@@ -747,6 +780,18 @@ impl Handle {
             state.busy || state.waiting || !state.requests.is_empty(),
             state.ready,
         )
+    }
+    /// Whether the conversation would take a prompt now without interrupting
+    /// a turn or passing over a question it put to the user.
+    pub(crate) fn is_idle(&self) -> bool {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.ready
+            && !state.busy
+            && !state.waiting
+            && !state.exited
+            && state.requests.is_empty()
+            && !self.is_completed()
+            && !self.0.draining.load(Ordering::Acquire)
     }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
@@ -955,6 +1000,7 @@ fn preflight_inner(
         return Err("Provider initialization exceeds stdin queue capacity".into());
     }
     let mut store = Store::new()?;
+    store.recognize_messages(spec.messages.clone());
     let mut metadata = Vec::new();
     for event in initial.events.drain(..) {
         if let Event::Error {
@@ -1143,6 +1189,8 @@ struct Actor {
     history_error: Option<String>,
     dirty: bool,
     activity: ActivityState,
+    /// Whether the provider was taking prompts when activity was last published.
+    ready: bool,
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
@@ -1551,13 +1599,18 @@ impl Actor {
             match prepared {
                 Ok(step) => {
                     let result = self.step(step);
-                    let _ = reply.send(result.clone());
-                    result?;
-                    if starts_turn {
+                    // Busy before the caller hears back, so whoever checks
+                    // for an idle conversation next sees this turn.
+                    let started = starts_turn && result.is_ok();
+                    if started {
                         self.apply(Event::Status {
                             busy: true,
                             detail: "Waiting for provider turn".into(),
                         });
+                    }
+                    let _ = reply.send(result.clone());
+                    result?;
+                    if started {
                         self.publish_activity();
                     }
                 }
@@ -1787,6 +1840,8 @@ impl Actor {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let activity = state.activity();
         let generation = state.generation;
+        let became_ready = state.ready && !self.ready;
+        self.ready = state.ready;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         if activity != self.activity {
@@ -1804,6 +1859,9 @@ impl Actor {
                 state: activity,
                 generation,
             });
+        }
+        if became_ready {
+            (self.notify)(Update::Ready);
         }
     }
     fn touch(&mut self) {
@@ -2263,6 +2321,7 @@ mod tests {
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
@@ -2353,6 +2412,7 @@ mod tests {
         let context = Arc::new(ExecutionContext::default());
         let spec = ProcessSpec {
             execution: Some(context.clone()),
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
@@ -2770,6 +2830,7 @@ mod tests {
         for unrelated in [None, Some("different failure"), Some("page failed")] {
             let spec = ProcessSpec {
                 execution: None,
+                messages: None,
                 unset_environment: Default::default(),
                 transport: TransportSpec::JsonLines,
                 program: "/bin/cat".into(),
@@ -2853,6 +2914,7 @@ mod tests {
         ]);
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/python3".into(),
@@ -2878,6 +2940,7 @@ mod tests {
     fn selected_account_removals_win_at_the_native_child_boundary() {
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             transport: TransportSpec::JsonLines,
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), "read line; [ -z \"${ANTHROPIC_API_KEY+x}\" ] && [ \"$CLAUDE_CONFIG_DIR\" = /selected ] && printf '%s\\n' '{\"text\":\"isolated\"}'; cat >/dev/null".into()],
@@ -2980,6 +3043,7 @@ mod tests {
         let socket = directory.path().join("server").join("control.sock");
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::OwnedUnixWebSocket {
                 socket: socket.clone(),
@@ -3032,6 +3096,7 @@ mod tests {
         }
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
@@ -3076,6 +3141,7 @@ mod tests {
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
@@ -3204,6 +3270,7 @@ mod tests {
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
@@ -3307,6 +3374,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::Ready
                 | Update::Execution { .. } => None,
             })
             .collect();
@@ -3332,6 +3400,7 @@ mod tests {
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
@@ -3385,6 +3454,7 @@ mod tests {
     fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
@@ -3417,6 +3487,7 @@ mod tests {
     fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
         let spec = ProcessSpec {
             execution: None,
+            messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),

@@ -27,6 +27,10 @@ pub struct ProcessSpec {
     /// Private spawn evidence and an optional caller-validated directory. Never
     /// serialized into launch recipes or provider configuration.
     pub(crate) execution: Option<std::sync::Arc<ExecutionContext>>,
+    /// Recognizes the messages the daemon delivered among the prompts the
+    /// transcript records, so they are shown as messages rather than as the
+    /// user's own words.
+    pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -50,6 +54,7 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
     fn from(recipe: &crate::model::LaunchRecipe) -> Self {
         Self {
             execution: None,
+            messages: None,
             transport: TransportSpec::JsonLines,
             program: recipe.program.clone(),
             arguments: recipe.arguments.clone(),

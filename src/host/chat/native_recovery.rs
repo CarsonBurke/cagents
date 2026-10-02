@@ -180,6 +180,11 @@ fn restore_authenticated(
     spec.environment = recovery.execution_environment.0.clone();
     spec.execution =
         directory.map(|identity| Arc::new(chat::protocol::ExecutionContext::restored(identity)));
+    spec.messages = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mailbox_seal
+        .clone();
     let execution_context = spec.execution.clone();
     let mut initial = adapter.initialize()?;
     let store = chat::runtime::preflight_retained(&spec, &mut initial)?;

@@ -28,6 +28,7 @@ host = [
     "dep:ashpd",
     "dep:futures-util",
     "dep:base64",
+    "dep:hmac",
     "dep:image",
     "dep:ksni",
     "dep:libghostty-vt",
@@ -134,6 +135,9 @@ futures-util = { version = "0.3", optional = true }
 # worktree opens in place instead of handing the reader to an external viewer.
 # Only the `ui` lane resolves it; the CLI and the daemon never parse a PDF.
 hayro = { version = "0.7.1", optional = true }
+# Seals the messages the daemon delivers between sessions, so a conversation
+# can tell them apart from text that merely looks like one. Daemon only.
+hmac = { version = "0.12", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }

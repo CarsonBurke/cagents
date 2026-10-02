@@ -17,11 +17,11 @@ use std::{
 };
 
 /// What the host lock yields; everything slower happens after releasing it.
-struct Live {
-    id: TerminalId,
-    surface: Surface,
-    provider: Option<Provider>,
-    title: Option<String>,
+pub(super) struct Live {
+    pub(super) id: TerminalId,
+    pub(super) surface: Surface,
+    pub(super) provider: Option<Provider>,
+    pub(super) title: Option<String>,
     state: ActivityState,
     directory: PathBuf,
 }
@@ -213,7 +213,7 @@ fn named(model: &crate::workspace_model::WorkspaceModel, name: &Path) -> Result<
     }
 }
 
-fn live_sessions(host: &SharedHost) -> Vec<Live> {
+pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
     for (id, record) in &state.chats {

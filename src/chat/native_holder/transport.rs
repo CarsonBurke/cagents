@@ -1077,6 +1077,7 @@ mod tests {
         )));
         let spec = ProcessSpec {
             execution: Some(context.clone()),
+            messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
             program: "/bin/sleep".into(),
             arguments: vec!["60".into()],
@@ -1255,6 +1256,7 @@ mod tests {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
             execution: Some(context.clone()),
+            messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
                 socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
             },

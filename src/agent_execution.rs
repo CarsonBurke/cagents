@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) mod bundled;
 pub mod directory;
+pub mod mailbox;
 
 use serde::{Deserialize, Serialize};
 
@@ -359,6 +360,10 @@ pub enum Operation {
         agent: AgentId,
         command: Control,
     },
+    /// Leave a message for another session, or answer one.
+    SendMessage(mailbox::Outgoing),
+    /// Read the messages left for the caller.
+    Inbox(mailbox::Inbox),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,6 +421,8 @@ pub enum Reply {
     Directory(directory::Directory),
     /// Requests still pending after a read or a control.
     Requests(Vec<chat::Request>),
+    Sent(mailbox::Sent),
+    Inbox(Vec<mailbox::Message>),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

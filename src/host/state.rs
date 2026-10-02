@@ -245,6 +245,11 @@ pub(crate) struct HostState {
     model: Option<super::model::Registry>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     pub(super) automations: Option<super::automations::Handle>,
+    /// Wakes the courier that hands messages to idle conversations.
+    pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
+    /// Seals the messages the courier delivers and recognizes them in
+    /// transcripts. Absent without the registry that keeps its key.
+    pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
     pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
@@ -316,6 +321,8 @@ impl HostState {
             model: None,
             execution_registry: None,
             automations: None,
+            mailbox: None,
+            mailbox_seal: None,
             execution_gates: BTreeMap::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
@@ -388,6 +395,13 @@ impl HostState {
     /// constructed for a test must not reach into the user's data directory, and
     /// a daemon that cannot open the store still has terminals to host.
     pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
+        self.mailbox_seal = match registry.mailbox_key() {
+            Ok(key) => Some(Arc::new(crate::agent_execution::mailbox::Seal::new(key))),
+            Err(error) => {
+                tracing::error!(%error, "cannot read the mailbox key; messages are unavailable");
+                None
+            }
+        };
         self.execution_registry = match registry.execution_connection() {
             Ok(connection) => Some(Arc::new(Mutex::new(connection))),
             Err(error) => {

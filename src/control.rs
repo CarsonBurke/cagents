@@ -23,6 +23,8 @@ mod automations;
 pub use automations::AutomationCommand;
 mod sessions;
 pub use sessions::SessionsArgs;
+mod messages;
+pub use messages::{AskArgs, InboxArgs, ReplyArgs, SendArgs};
 
 use crate::{
     instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
@@ -86,6 +88,14 @@ pub enum TopCommand {
     /// List live agent sessions in this project, whoever started them.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
+    /// Message another session; a live conversation receives it once idle.
+    Send(SendArgs),
+    /// Message another session and wait for its reply.
+    Ask(AskArgs),
+    /// Answer a message this session received.
+    Reply(ReplyArgs),
+    /// Read the messages left for this session.
+    Inbox(InboxArgs),
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
     Automation {
@@ -1687,6 +1697,10 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
+        TopCommand::Send(arguments) => messages::send(arguments),
+        TopCommand::Ask(arguments) => messages::ask(arguments),
+        TopCommand::Reply(arguments) => messages::reply(arguments),
+        TopCommand::Inbox(arguments) => messages::inbox(arguments),
         TopCommand::CoordinateInstall {
             prefix,
             installer,

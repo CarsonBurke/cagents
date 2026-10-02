@@ -1181,6 +1181,7 @@ dependencies = [
  "euclid",
  "futures-util",
  "hayro",
+ "hmac",
  "iced_accessibility",
  "image",
  "imara-diff",

@@ -54,6 +54,8 @@ pub(crate) struct Store {
     latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
     pending_text: Option<(String, Role, bool, String)>,
+    /// Recognizes delivered messages as they enter the transcript.
+    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
 impl Store {
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
@@ -128,6 +130,7 @@ impl Store {
                 provider_earlier: false,
                 pending_earlier: None,
                 latest_boundary: None,
+                messages: None,
                 dirty: true,
                 pending_text: None,
             })
@@ -512,9 +515,26 @@ impl Store {
         }
         Ok(warnings)
     }
+    /// Shows the prompts `seal` sealed as the messages they deliver, from the
+    /// next event on.
+    pub(crate) fn recognize_messages(
+        &mut self,
+        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+    ) {
+        self.messages = seal;
+    }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
-    pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
+    pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        if let Some(seal) = &self.messages {
+            match &mut event {
+                Event::Item(item) => seal.recognize(item),
+                Event::History { items, .. } | Event::LatestHistory { items, .. } => {
+                    items.iter_mut().for_each(|item| seal.recognize(item));
+                }
+                _ => {}
+            }
+        }
         let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })

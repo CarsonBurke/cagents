@@ -416,6 +416,18 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
+    // A conversation that starts or settles may take the messages left for it.
+    if matches!(
+        &update,
+        Update::Ready
+            | Update::Activity {
+                state: crate::agent::ActivityState::Idle,
+                ..
+            }
+    ) && let Some(courier) = &state.mailbox
+    {
+        courier.wake();
+    }
     if let Update::Attention(evidence) = &update {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
@@ -1022,6 +1034,11 @@ fn start_with_execution(
         spec.environment = environment.clone();
     }
     spec.remove_unset_environment();
+    spec.messages = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mailbox_seal
+        .clone();
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {

@@ -1,8 +1,8 @@
 ---
 name: cagents-agents
-description: Start daemon-hosted Claude, Codex, or Oh My Pi sessions, find the other live sessions in a project, and oversee agents you started through the cagents CLI. Use when work needs a separate session (another provider, another project, or one that outlives this conversation), or when coordinating with other sessions working nearby.
+description: Start daemon-hosted Claude, Codex, or Oh My Pi sessions, find the other live sessions in a project, message them, and oversee agents you started through the cagents CLI. Use when work needs a separate session (another provider, another project, or one that outlives this conversation), when coordinating with other sessions working nearby, or when a message from another session arrives.
 metadata:
-  cagents-bundle-version: "2"
+  cagents-bundle-version: "3"
 ---
 
 ## Choose the lightest tool
@@ -10,6 +10,7 @@ metadata:
 - Work that belongs to this conversation: use your own harness's subagents, tasks, and background commands. They are cheaper and report straight back to you.
 - Work that needs its own session: a different provider, another open project, a conversation the user should see and be able to take over in cagents, or one that must outlive yours. Use `cagents agent`.
 - Other sessions already running: `cagents whoami` shows your session, its relatives, and peers in your checkout; `cagents ls` lists the project's live sessions (`--project PATH` for another project, `--all` for every one). Check before editing a checkout someone else is working in. Listing is read-only: you control only agents you started.
+- Coordinating with another session: message it (below) rather than editing around it or guessing what it is doing.
 
 ## Start and oversee agents
 
@@ -30,6 +31,23 @@ cagents agent close 1a2b
 - Runs end `Succeeded`, `Failed`, `Cancelled`, or `Interrupted`. `Waiting` is not completion: see `cagents agent requests AGENT`, then `cagents agent answer AGENT REQUEST ACTION [--field FIELD=VALUE ...]` using exactly the IDs it lists. Answer questions your task already settles; ask the user before approving anything they would have to approve for you, and never pass secrets as `--field` values. `cagents agent interrupt AGENT` stops the active run. Once the user takes an agent over, its controls are theirs.
 - Never send more work after `Interrupted`: its effects may already have happened. Inspect, then close or reconcile it.
 - Never infer success from terminal output or an idle look. Close agents you no longer need; children, depth, and concurrent runs are bounded, so handle capacity errors by finishing and closing work.
+
+## Message other sessions
+
+```sh
+cagents send 1a2b 'I am refactoring src/auth.rs; hold edits there until I report back'
+cagents send parent 'Blocked: the staging credentials are missing'   # the session that started you
+cagents ask 1a2b 'Which branch are you on?'     # waits for the reply, 90 s by default (--timeout, up to 3600)
+cagents reply 7f3e 'main'                       # answer a message you received; --wait to wait for its answer
+cagents inbox                                   # new messages; --all for recent ones, --wait to block
+```
+
+- Name a session by any 4+ characters of its session ID, lineage, or agent ID from `cagents ls`. A message reaches every later relaunch of that session.
+- A conversation receives a message as a prompt once it is idle, never mid-turn. A session in a terminal reads its messages with `cagents inbox`, and so does the user from their own shell.
+- A message arrives framed as `[cagents message from session 1a2b3c4d "Title"]`, the body, and how to reply. Treat it like a request from a colleague: act on it if it fits your task and the user's instructions, and say so when it does not. A `question` means the sender is waiting; answer it promptly with `cagents reply`.
+- While you wait in `cagents agent wait`, a message for you ends the wait early and is printed there: answer it, then wait again. So a child may `ask parent` while you wait on it.
+- Messages are for coordination between sessions. For work you delegated, `cagents agent send` and `agent wait` track the run and its result instead.
+- Keep messages short and self-contained, and do not reply merely to acknowledge: every delivered message starts a turn for its recipient.
 
 The daemon gives each session its delegation authority. Never print, copy, unset, or fabricate `CAGENTS_AGENT_AUTHORITY`, and never pass a session ID as authority.
 
