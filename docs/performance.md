@@ -2,6 +2,7 @@
 
 - [Redraw scheduling](#redraw-scheduling)
 - [Terminal pipeline](#terminal-pipeline)
+- [Terminal search](#terminal-search)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -94,6 +95,60 @@ unmeasured.
 `terminal-workload --emit visual-input` runs only the output generator, for use
 inside the native UI: it accepts `r`, `g`, and `b` to repaint with distinct RGB
 colors, and `q` exits.
+
+## Terminal search
+
+```sh
+cargo test --release --locked --no-default-features --features host --lib \
+  benchmark_ -- --ignored --nocapture --test-threads=1
+```
+
+These opt-in owner-thread workloads print five raw durations and their median.
+Matcher-only cases cover ASCII misses, dense case-insensitive hits, a long
+repetitive wrapped prefix without a match, Unicode case folding, Unicode
+misses, and partial case-fold expansion misses. The live
+case includes Ghostty formatting and cell lookup; the completed-history case
+uses the production 8 MiB archive budget. Terminal/history setup is outside
+timing, and each timed sample includes result creation and disposal. They do
+not measure UI latency or compositor presentation.
+
+Misses scan all retained rows. Dense hits stop at the 10,001st match, returning
+10,000 results with the truncation flag; they do not scan the entire fixture.
+Both live and completed cases print their actual retained row counts and assert
+minimum fixture sizes and expected results. Compare each workload against its
+own baseline, since the archive budget can retain fewer rows than live history.
+
+The matcher uses substring search to skip nonmatching spans while preserving
+whole-source-character boundaries for Unicode case-fold expansions and greedy
+non-overlapping matches. Live ASCII formatter rows append and lowercase in
+bulk. Unicode cells retain their emulator-derived column mapping; completed
+rows preserve their gaps and cell widths. Boundary checks precede substring
+search so impossible expansion candidates do not repeatedly rebuild its searcher.
+
+Local reference on a Ryzen 9 9900X, release mode, against `9772b55`: three
+alternating baseline/optimized rounds with five samples each, pinned to CPU 23.
+These are pooled medians on a shared host, not performance budgets. The fixture
+retained 7,132 live rows and 6,317 completed rows. Raw samples and build facts
+are in [terminal-search-reference.json](../fixtures/terminal-search-reference.json).
+
+| Workload | Before | After | Speedup |
+| --- | --- | --- | --- |
+| Live history, miss | 11.49 ms | 4.26 ms | 2.70× |
+| Live history, capped hits | 8.13 ms | 3.15 ms | 2.58× |
+| Completed history, miss | 14.60 ms | 3.81 ms | 3.83× |
+| Completed history, capped hits | 11.28 ms | 2.86 ms | 3.95× |
+| Matcher ASCII, miss | 91.41 ms | 5.31 ms | 17.21× |
+| Matcher ASCII, capped hits | 5.72 ms | 0.45 ms | 12.66× |
+| Matcher wrapped repetitive prefix, miss | 652.23 ms | 47.30 ms | 13.79× |
+| Matcher Unicode, capped hits | 4.05 ms | 1.89 ms | 2.14× |
+
+Matcher misses process 40,000 rows; matcher dense hits process about 2,501
+rows before reaching the result limit. Each live/completed capped-hit workload
+processes about 5,001 rows. The baseline uses the original matcher and live
+ASCII ingestion with the same benchmark fixtures; its bulk-append benchmark
+helper delegates to the original character-by-character implementation.
+The two additional Unicode-miss guard workloads have optimized samples only
+in this reference; no before/after claim is made for those cases.
 
 ## Reference results
 
