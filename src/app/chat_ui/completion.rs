@@ -10,7 +10,7 @@ use crate::chat::{Skill, SkillReach, Snapshot};
 use cosmic::widget::text_editor::{self, Cursor, Position};
 use std::borrow::Cow;
 
-use super::COMPACT_COMMAND;
+use super::{COMPACT_COMMAND, PERMISSIONS_COMMAND, permissions_available};
 
 /// The sigil every provider's commands are named with, and the one the
 /// composer accepts for skills whatever the provider spells them with.
@@ -285,12 +285,22 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
     // A command is only a command at the head of a message; offered anywhere
     // else it would be sent as words the provider does not act on.
     if token.sigil == COMMAND_SIGIL && token.leading {
-        let commands = snapshot.commands.iter().map(|command| {
-            (
-                command.name.trim_start_matches(COMMAND_SIGIL),
-                command.description.as_str(),
-            )
-        });
+        let commands = snapshot
+            .commands
+            .iter()
+            .filter(|command| {
+                !permissions_available(snapshot)
+                    || !command
+                        .name
+                        .trim_start_matches(COMMAND_SIGIL)
+                        .eq_ignore_ascii_case(PERMISSIONS_COMMAND)
+            })
+            .map(|command| {
+                (
+                    command.name.trim_start_matches(COMMAND_SIGIL),
+                    command.description.as_str(),
+                )
+            });
         // Compaction is a capability rather than an advertised command for
         // some providers; the composer answers to it either way, so the list
         // says so too.
@@ -300,7 +310,11 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
                 .iter()
                 .any(|command| command.name.trim_start_matches(COMMAND_SIGIL) == COMPACT_COMMAND))
         .then_some((COMPACT_COMMAND, "Summarize earlier turns to free context"));
-        for (name, description) in commands.chain(compact) {
+        let permissions = permissions_available(snapshot).then_some((
+            PERMISSIONS_COMMAND,
+            "Resolve blocked tools and manage permissions",
+        ));
+        for (name, description) in commands.chain(compact).chain(permissions) {
             if let Some(rank) = rank(name) {
                 ranked.push((
                     rank,
@@ -738,6 +752,18 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_permissions_completion_overrides_provider_dialog_and_is_leading_only() {
+        let mut snapshot = snapshot();
+        snapshot.capabilities.permission_modes = vec!["auto".into()];
+        snapshot.commands.push(SlashCommand {
+            name: "/PERMISSIONS".into(),
+            description: "Terminal permissions dialog".into(),
+        });
+        assert_eq!(insertions(&snapshot, "/per|"), vec!["/permissions"]);
+        assert!(insertions(&snapshot, "check /per|").is_empty());
+    }
+
     #[test]
     fn file_mentions_fuzzy_match_paths_and_replace_only_the_token() {
         use super::*;

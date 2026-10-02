@@ -756,6 +756,8 @@ impl Adapter for Omp {
             Command::Compact => step.writes.push(self.request("compact")),
             Command::Refresh => return Ok(self.refresh()),
             Command::LoadEarlier => return Err("OMP history is loaded completely during connection.".into()),
+            Command::DismissPermissionDenial { tool_use_id } => step.events.push(Event::PermissionDenialDismissed { tool_use_id }),
+            Command::RefreshPermissions | Command::UpdatePermissionSettings { .. } => return Err("Permission rule settings are available for Claude sessions".into()),
             Command::Slash{command} => {let mut request=self.request("prompt");request["message"]=command.into();step.writes.push(request);}
         }
         Ok(step)

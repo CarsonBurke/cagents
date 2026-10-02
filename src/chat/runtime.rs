@@ -1713,6 +1713,7 @@ impl Actor {
                 | Command::StartQueued { .. }
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
+                Command::UpdatePermissionSettings { .. } => true,
                 Command::Answer { action, .. } => !matches!(
                     action.as_str(),
                     "deny" | "decline" | "reject" | "cancel" | "abort"
@@ -2149,6 +2150,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.error = None;
             state.plan.clear();
             state.permission_mode = None;
+            state.permissions = None;
+            state.permission_denials.clear();
         }
         Event::Session { id, title } => {
             state.session_id = Some(id);
@@ -2160,6 +2163,36 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::AccountUsage(_) => {}
         Event::Capabilities(value) => state.capabilities = value,
         Event::PermissionMode(mode) => state.permission_mode = mode,
+        Event::PermissionSettings(settings) => state.permissions = Some(settings),
+        Event::PermissionDenied(mut denial) => {
+            if let Some(previous) = state
+                .permission_denials
+                .iter_mut()
+                .find(|old| old.tool_use_id == denial.tool_use_id)
+            {
+                if denial.tool_input.is_none() {
+                    denial.tool_input = previous.tool_input.take();
+                }
+                if denial.reason.is_empty() {
+                    denial.reason = std::mem::take(&mut previous.reason);
+                }
+                if denial.reason_type.is_none() {
+                    denial.reason_type = previous.reason_type.take();
+                }
+                if denial.agent_id.is_none() {
+                    denial.agent_id = previous.agent_id.take();
+                }
+                *previous = denial;
+            } else {
+                if state.permission_denials.len() >= super::PermissionDenial::LIMIT {
+                    state.permission_denials.remove(0);
+                }
+                state.permission_denials.push(denial);
+            }
+        }
+        Event::PermissionDenialDismissed { tool_use_id } => state
+            .permission_denials
+            .retain(|denial| denial.tool_use_id != tool_use_id),
         Event::Models {
             models,
             selected,
@@ -2763,6 +2796,66 @@ mod tests {
         assert!(state.ready);
         apply_event(&mut state, &mut indices, Event::Exited { code: Some(0) });
         assert!(!state.ready);
+    }
+    #[test]
+    fn permission_denials_are_bounded_deduplicated_and_dismissible() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let denial = |id: &str| super::super::PermissionDenial {
+            tool_use_id: id.into(),
+            tool_name: "Bash".into(),
+            tool_input: Some("{\"command\":\"git push\"}".into()),
+            reason: "Classifier denied push".into(),
+            reason_type: Some("classifier".into()),
+            agent_id: Some("child".into()),
+        };
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::PermissionDenied(denial("one")),
+        );
+        let mut duplicate = denial("one");
+        duplicate.reason.clear();
+        duplicate.reason_type = None;
+        duplicate.agent_id = None;
+        apply_event(&mut state, &mut indices, Event::PermissionDenied(duplicate));
+        assert_eq!(state.permission_denials.len(), 1);
+        assert_eq!(state.permission_denials[0].reason, "Classifier denied push");
+        assert_eq!(
+            state.permission_denials[0].agent_id.as_deref(),
+            Some("child")
+        );
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert_eq!(state.permission_denials.len(), 1);
+        let encoded = postcard::to_stdvec(&state).unwrap();
+        assert_eq!(postcard::from_bytes::<Snapshot>(&encoded).unwrap(), state);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::PermissionDenialDismissed {
+                tool_use_id: "one".into(),
+            },
+        );
+        assert!(state.permission_denials.is_empty());
+        for id in 0..70 {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::PermissionDenied(denial(&id.to_string())),
+            );
+        }
+        assert_eq!(
+            state.permission_denials.len(),
+            super::super::PermissionDenial::LIMIT
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+        );
+        assert!(state.permission_denials.is_empty());
     }
     #[test]
     fn asynchronous_history_loading_ends_on_response_reset_or_provider_exit() {
