@@ -277,6 +277,18 @@ pub(crate) fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
     Some((group, fields.nth(16)?.parse().ok()?))
 }
 
+/// Cheap liveness check for a previously discovered process. This is not launch
+/// or conversation evidence: exec can retain PID/start/group, so changed facts
+/// and recovery still require the full foreground observation.
+#[cfg(feature = "host")]
+pub(crate) fn process_in_foreground(process: &AgentProcess, group: i32) -> bool {
+    process.pid > 0
+        && group > 0
+        && bounded_read(format!("/proc/{}/stat", process.pid), 4096)
+            .and_then(|stat| process_identity(&stat))
+            == Some((group, process.start))
+}
+
 #[cfg(feature = "host")]
 #[derive(Debug, PartialEq, Eq)]
 enum SessionIdentity {
@@ -1240,10 +1252,18 @@ pub(crate) fn foreground_observation(
 /// foreground walker as recovery, without resolving conversation authority.
 #[cfg(feature = "host")]
 pub(crate) fn foreground_agent(pid: libc::pid_t) -> Option<AgentProcess> {
+    #[cfg(test)]
+    FOREGROUND_AGENT_OBSERVATIONS.with(|count| count.set(count.get() + 1));
     let group = foreground_group(pid)?;
     inspect_agent_process(Path::new("/proc"), pid, group, &mut 64)
         .ok()
         .flatten()
+}
+
+#[cfg(all(test, feature = "host"))]
+thread_local! {
+    /// Owner-thread discovery count for the unchanged-observation regression.
+    pub(crate) static FOREGROUND_AGENT_OBSERVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(feature = "host")]
