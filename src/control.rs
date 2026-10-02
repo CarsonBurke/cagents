@@ -2375,10 +2375,17 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
-    // Inside an agent session the daemon lets these commands change only the
-    // terminals that session controls.
+    // Inside a hosted session the daemon lets these commands change only the
+    // terminals that session controls. Reads stay open to every caller.
     let authority = Authority::from_environment();
-    if authority.token().is_some() {
+    if authority.token().is_some()
+        && matches!(
+            command,
+            TerminalCommand::Spawn { .. }
+                | TerminalCommand::Write { .. }
+                | TerminalCommand::Close { .. }
+        )
+    {
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {

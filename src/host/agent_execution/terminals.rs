@@ -3,9 +3,9 @@
 //! session, the terminals it started and the sessions of the agents it
 //! delegated to. Anything outside the terminal surface stays with the user.
 //!
-//! The boundary is the `cagents` CLI, which authenticates whenever it runs
-//! inside an agent session. A process that reaches the socket without doing
-//! so acts for the user, as everywhere else.
+//! The boundary is the `cagents` CLI, which authenticates before it changes a
+//! terminal from inside a hosted session. A process that reaches the socket
+//! without doing so acts for the user, as everywhere else.
 use super::registry;
 use crate::{
     agent_execution::{Authority, Lineage, Origin},
@@ -13,27 +13,23 @@ use crate::{
     model::{TerminalId, TerminalSession},
     terminal_ipc::{ClientRequest, ProtocolError, ProtocolErrorCode},
 };
-use std::collections::BTreeSet;
-
-enum Access {
+enum Access<'a> {
     /// Reads, or presentation private to this connection.
     Open,
     /// Changes a terminal that other connections share.
     Control(TerminalId),
-    Spawn,
-    /// Belongs to the user alone.
+    Spawn(&'a TerminalSession),
+    /// Belongs to the user alone, or carries an authority of its own.
     Refused,
 }
 
 /// Classified without a fallback arm, so every new request has to choose.
-fn access(request: &ClientRequest) -> Access {
+fn access(request: &ClientRequest) -> Access<'_> {
     use ClientRequest as R;
     match request {
         R::Connect { .. }
         | R::Authenticate { .. }
         | R::BuildInfo
-        | R::Agent { .. }
-        | R::Automation { .. }
         | R::List
         | R::WatchTerminals
         | R::WatchWorkspaceModel
@@ -60,8 +56,10 @@ fn access(request: &ClientRequest) -> Access {
         | R::ShutdownTerminal { terminal_id }
         | R::CloseTerminalChecked { terminal_id, .. } => Access::Control(*terminal_id),
         R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
-        R::Spawn { .. } => Access::Spawn,
-        R::Shutdown
+        R::Spawn { session, .. } => Access::Spawn(session),
+        R::Agent { .. }
+        | R::Automation { .. }
+        | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }
         | R::UpgradeImpact { .. }
@@ -141,10 +139,7 @@ pub(in crate::host) fn admit(
         Access::Refused => Err(denied(
             "An agent session's connection may only read terminals and change its own",
         )),
-        Access::Spawn => match request {
-            ClientRequest::Spawn { session, .. } => fresh(host, session),
-            _ => unreachable!("only a spawn is classified as one"),
-        },
+        Access::Spawn(session) => fresh(host, session),
         Access::Control(terminal) => {
             if controls(host, lineage, terminal).map_err(internal)? {
                 Ok(())
@@ -157,8 +152,8 @@ pub(in crate::host) fn admit(
     }
 }
 
-/// Records that the agent session a connection acts for started `terminal`,
-/// and forgets the owners of terminals that are gone.
+/// Records that the agent session a connection acts for starts `terminal`,
+/// before it exists, so the agent controls it from its first output.
 pub(in crate::host) fn adopt(
     host: &SharedHost,
     client_id: ClientId,
@@ -167,22 +162,10 @@ pub(in crate::host) fn adopt(
     let Some(owner) = acting_for(host, client_id) else {
         return Ok(());
     };
-    let live = host
+    registry(host)
+        .map_err(internal)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .terminals
-        .keys()
-        .copied()
-        .collect::<Vec<_>>();
-    let registry = registry(host).map_err(internal)?;
-    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    let live = registry
-        .session_lineages(live)
-        .map_err(internal)?
-        .into_values()
-        .collect::<BTreeSet<_>>();
-    registry.retain_terminal_owners(&live).map_err(internal)?;
-    registry
         .own_terminal(Lineage(terminal), owner)
         .map_err(internal)
 }

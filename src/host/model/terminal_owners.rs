@@ -1,10 +1,10 @@
 //! Which session started each terminal an agent spawned, so the agent may go
-//! on changing it after a reconnect or a daemon restart.
+//! on changing it after a reconnect, a relaunch or a daemon restart. Like
+//! session lineages, rows are kept: a closed card can still be relaunched.
 
 use super::Registry;
 use crate::agent_execution::Lineage;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::BTreeSet;
 
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
@@ -57,29 +57,6 @@ impl Registry {
             })
             .transpose()
     }
-
-    /// Forgets the owners of terminals that no longer exist.
-    pub(crate) fn retain_terminal_owners(
-        &mut self,
-        live: &BTreeSet<Lineage>,
-    ) -> Result<(), String> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let recorded: Vec<String> = {
-            let mut statement = tx
-                .prepare("SELECT lineage FROM terminal_owners")
-                .map_err(|error| error.to_string())?;
-            statement
-                .query_map([], |row| row.get(0))
-                .and_then(Iterator::collect)
-                .map_err(|error| error.to_string())?
-        };
-        let live: BTreeSet<String> = live.iter().map(ToString::to_string).collect();
-        for lineage in recorded.iter().filter(|lineage| !live.contains(*lineage)) {
-            tx.execute("DELETE FROM terminal_owners WHERE lineage = ?1", [lineage])
-                .map_err(|error| error.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())
-    }
 }
 
 #[cfg(test)]
@@ -88,25 +65,22 @@ mod tests {
     use crate::model::TerminalId;
 
     #[test]
-    fn an_owner_is_kept_while_its_terminal_lives() {
+    fn an_owner_survives_reopening_the_registry() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.sqlite3");
         let mut registry = Registry::at(&path).unwrap();
-        let (terminal, other, owner) = (
+        let (terminal, owner, later) = (
             Lineage(TerminalId::new()),
             Lineage(TerminalId::new()),
             Lineage(TerminalId::new()),
         );
         assert_eq!(registry.terminal_owner(terminal).unwrap(), None);
         registry.own_terminal(terminal, owner).unwrap();
-        registry.own_terminal(other, owner).unwrap();
         drop(registry);
         let mut registry = Registry::at(&path).unwrap();
         assert_eq!(registry.terminal_owner(terminal).unwrap(), Some(owner));
-        registry
-            .retain_terminal_owners(&BTreeSet::from([terminal]))
-            .unwrap();
-        assert_eq!(registry.terminal_owner(terminal).unwrap(), Some(owner));
-        assert_eq!(registry.terminal_owner(other).unwrap(), None);
+        // A spawn that failed leaves its ID free for whoever starts it next.
+        registry.own_terminal(terminal, later).unwrap();
+        assert_eq!(registry.terminal_owner(terminal).unwrap(), Some(later));
     }
 }

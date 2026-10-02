@@ -2309,6 +2309,14 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     // Everything outside the terminal surface stays with the user.
     denied(request_as(AGENT, ClientRequest::ChatList));
     denied(request_as(AGENT, ClientRequest::Shutdown));
+    // Including a request that would carry the user's own authority.
+    denied(request_as(
+        AGENT,
+        ClientRequest::Agent {
+            authority: Authority::default(),
+            operation: Operation::Directory(crate::agent_execution::directory::Scope::All),
+        },
+    ));
 
     // A delegated agent's session is its owner's to change, not the reverse.
     let mut delegated = request;

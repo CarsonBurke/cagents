@@ -586,23 +586,8 @@ pub(super) fn process_request(
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {
+            super::agent_execution::terminals::adopt(host, client_id, session.id)?;
             let terminal = spawn_terminal(host, client_id, session, options)?;
-            if let Err(error) =
-                super::agent_execution::terminals::adopt(host, client_id, terminal.session.id)
-            {
-                // A terminal its agent could neither change nor close would
-                // outlive every use it was started for.
-                let handle = host
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .terminals
-                    .get(&terminal.session.id)
-                    .map(|record| record.handle.clone());
-                if let Some(handle) = handle {
-                    let _ = handle.shutdown();
-                }
-                return Err(error);
-            }
             let snapshot = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let snapshot = state.snapshot(client_id, terminal.session.id, 0)?;
