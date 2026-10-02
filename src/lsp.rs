@@ -57,6 +57,8 @@ use url::Url;
 use crate::repository::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_group};
 use crate::settings::LanguageServerSettings;
 
+mod commands;
+
 /// Capacity of the application event channel. Diagnostics are coalesced by
 /// document once it is full; results and status changes apply backpressure to
 /// the session task instead of being dropped.
@@ -2002,10 +2004,7 @@ fn initialize_params(root: &Path) -> Result<lsp_types::InitializeParams, String>
 }
 
 /// Drives one language-server session for its whole life.
-async fn run_session(
-    context: SessionContext,
-    mut commands: mpsc::UnboundedReceiver<SessionCommand>,
-) {
+async fn run_session(context: SessionContext, mut commands: commands::Receiver) {
     if context.retired.load(Ordering::Acquire) {
         return;
     }
@@ -2070,6 +2069,17 @@ async fn run_session(
             teardown(protocol, child, stderr_drain, &context.process_group).await;
             return;
         }
+        _ = commands.closed() => {
+            teardown(protocol, child, stderr_drain, &context.process_group).await;
+            if let Some(reason) = commands.failure() {
+                fail_queued_requests(&commands, &context, reason).await;
+                context.set_status(LspStatus::Failed {
+                    reason: reason.to_owned(),
+                    stderr_tail: context.stderr.snapshot(),
+                }).await;
+            }
+            return;
+        }
         result = tokio::time::timeout(INITIALIZE_TIMEOUT, initialize) => result,
     };
     let negotiated = match initialized {
@@ -2086,6 +2096,9 @@ async fn run_session(
             // for the application to drain its channel, and a process must
             // never be left running because nobody read an event.
             teardown(protocol, child, stderr_drain, &context.process_group).await;
+            if let Some(overload) = commands.failure() {
+                fail_queued_requests(&commands, &context, overload).await;
+            }
             context
                 .set_status(LspStatus::Failed {
                     reason,
@@ -2191,10 +2204,45 @@ async fn run_session(
     // stopped by the peer closing the connection or by `teardown`.
     let _ = tokio::time::timeout(EXIT_FLUSH_TIMEOUT, &mut protocol).await;
     teardown(protocol, child, stderr_drain, &context.process_group).await;
+    if let Some(reason) = commands.failure() {
+        fail_queued_requests(&commands, &context, reason).await;
+        state
+            .fail_all_in_flight(&context.events, LspError::Protocol(reason.to_owned()))
+            .await;
+        context
+            .set_status(LspStatus::Failed {
+                reason: reason.to_owned(),
+                stderr_tail: context.stderr.snapshot(),
+            })
+            .await;
+        return;
+    }
     *context
         .status
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = LspStatus::Disabled;
+}
+
+/// Requests admitted before overload must settle explicitly too, even when
+/// initialization had not yet moved them into the session's in-flight map.
+async fn fail_queued_requests(
+    commands: &commands::Receiver,
+    context: &SessionContext,
+    reason: &str,
+) {
+    if context.retired.load(Ordering::Acquire) {
+        return;
+    }
+    for request in commands.rejected_requests() {
+        context
+            .events
+            .emit(LspEvent::RequestFailed {
+                request: request.id,
+                doc: request.doc,
+                error: LspError::Protocol(reason.to_owned()),
+            })
+            .await;
+    }
 }
 
 /// Stops the protocol task, then terminates and reaps the process, then
@@ -2306,13 +2354,11 @@ impl SessionState {
                         existing.version = version;
                         existing.full = full;
                         existing.due = due;
-                        match (existing.incremental.as_mut(), incremental) {
-                            (Some(accumulated), Some(more)) => accumulated.extend(more),
-                            // Once a full resend is required it stays
-                            // required: the accumulated ranges no longer
-                            // describe a contiguous edit sequence.
-                            _ => existing.incremental = None,
-                        }
+                        // Continuous typing may postpone this deadline for a
+                        // long time. Bound pending ranges here as well as at
+                        // admission; full text remains authoritative.
+                        existing.incremental =
+                            commands::merge_incremental(existing.incremental.take(), incremental);
                     }
                     None => {
                         self.pending.insert(
@@ -3123,7 +3169,7 @@ struct RetiringSession {
 
 #[derive(Clone)]
 struct SessionHandle {
-    commands: mpsc::UnboundedSender<SessionCommand>,
+    commands: commands::Sender,
     status: Arc<Mutex<LspStatus>>,
     completion_triggers: Arc<Mutex<Option<Vec<String>>>>,
     /// Shared with the session's router: set before the handle is dropped so
@@ -3732,7 +3778,7 @@ impl LspManager {
             Ok(position) => position,
             Err(error) => return fail(&self.events, error),
         };
-        let _ = session
+        if let Err(reason) = session
             .commands
             .send(SessionCommand::Request(PendingRequest {
                 id,
@@ -3742,7 +3788,10 @@ impl LspManager {
                 kind,
                 position,
                 version: snapshot.version,
-            }));
+            }))
+        {
+            return fail(&self.events, LspError::Protocol(reason.to_owned()));
+        }
         id
     }
 
@@ -3784,7 +3833,9 @@ impl LspManager {
                 return Ok(existing.clone());
             }
             if let Some(dead) = self.sessions.remove(key) {
-                dead.retired.store(true, Ordering::Release);
+                if let Some(retiring) = dead.retire() {
+                    self.retiring.push(retiring);
+                }
             }
             orphaned = true;
         }
@@ -3796,7 +3847,7 @@ impl LspManager {
                 Arc::clone(&self.events.pending),
             )));
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = commands::channel();
         let handle = SessionHandle {
             commands: tx,
             status: Arc::new(Mutex::new(LspStatus::Starting)),
@@ -4270,6 +4321,126 @@ mod tests {
             server_id: "rust-analyzer".to_owned(),
             language_id: "rust-analyzer".to_owned(),
         }
+    }
+
+    #[test]
+    fn delayed_initialization_retains_only_current_changes_and_resynchronizes() {
+        block_on(async {
+            let (_root, worktree, first) = workspace();
+            let second = worktree.join("two.rs");
+            let slot = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&slot);
+            let mut manager = rust_manager();
+            manager.set_transport(Arc::new(move |_| {
+                let (transport, handle) = fake_transport(|incoming| {
+                    if incoming.method == "shutdown" {
+                        vec![json!({"jsonrpc":"2.0", "id":incoming.id, "result":null})]
+                    } else {
+                        Vec::new()
+                    }
+                });
+                *sink.lock().unwrap() = Some(handle);
+                Ok(transport)
+            }));
+            let initial = "a".repeat(64 * 1024);
+            manager.open(
+                LspDocumentId(1),
+                &first,
+                &worktree,
+                rust_language(),
+                1,
+                &initial,
+            );
+            manager.open(
+                LspDocumentId(2),
+                &second,
+                &worktree,
+                rust_language(),
+                1,
+                &initial,
+            );
+            let handle = handle_of(&slot).await;
+            let initialize = handle.wait_for("initialize").await;
+            let reference = manager.documents.get(&LspDocumentId(1)).unwrap().clone();
+            let mut old_versions = Vec::new();
+            let latest = "b".repeat(initial.len());
+            for version in 2..302 {
+                for doc in [LspDocumentId(1), LspDocumentId(2)] {
+                    manager.change(doc, version, &[], &latest);
+                }
+                old_versions.push(Arc::downgrade(
+                    &manager.snapshots.latest(&reference.uri).unwrap().text,
+                ));
+            }
+            assert!(
+                old_versions[..old_versions.len() - MAX_RETAINED_SNAPSHOTS]
+                    .iter()
+                    .all(|snapshot| snapshot.upgrade().is_none()),
+                "queued versions must not pin the snapshot history"
+            );
+            assert_eq!(
+                manager.sessions[&reference.session]
+                    .commands
+                    .pending_usage(),
+                (4, 4 * initial.len())
+            );
+            handle
+                .push
+                .send(Outgoing::Message(json!({
+                    "jsonrpc":"2.0", "id":initialize.id,
+                    "result":{"capabilities":full_sync_capabilities()},
+                })))
+                .unwrap();
+            await_ready(&manager.events(), LspDocumentId(1)).await;
+            let changes = handle.wait_for_count("textDocument/didChange", 2).await;
+            for change in changes {
+                assert_eq!(change.params["textDocument"]["version"], 301);
+                assert_eq!(change.params["contentChanges"][0]["text"], latest);
+            }
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn initializing_session_overload_settles_accepted_requests_and_remains_restartable() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.set_transport(Arc::new(|_| Ok(fake_transport(|_| Vec::new()).0)));
+            let doc = LspDocumentId(1);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "text");
+            let mut expected = std::collections::HashSet::new();
+            // The Open is already queued. Enough request barriers must stop
+            // admission instead of retaining an arbitrary command history.
+            for _ in 0..256 {
+                expected.insert(manager.request_hover(doc, LspPosition::new(0, 0)));
+            }
+            let events = manager.events();
+            let mut failed = std::collections::HashSet::new();
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                let event = tokio::time::timeout_at(deadline, events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match event {
+                    LspEvent::RequestFailed { request, .. } => {
+                        failed.insert(request);
+                    }
+                    LspEvent::Status {
+                        status: LspStatus::Failed { reason, .. },
+                        ..
+                    } => {
+                        assert!(reason.contains("bounded budget"));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(failed, expected);
+            assert!(manager.status(doc).can_restart());
+            manager.begin_shutdown().await;
+        });
     }
 
     // -----------------------------------------------------------------
