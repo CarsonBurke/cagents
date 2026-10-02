@@ -43,8 +43,12 @@ impl Matcher {
     pub(super) fn append(&mut self, character: char, row: u64, column: u16, end_column: u16) {
         use unicode_casefold::UnicodeCaseFold;
         let start = self.text.len();
-        if self.case_sensitive {
-            self.text.push(character);
+        if self.case_sensitive || character.is_ascii() {
+            self.text.push(if self.case_sensitive {
+                character
+            } else {
+                character.to_ascii_lowercase()
+            });
         } else {
             self.text.extend(std::iter::once(character).case_fold());
         }
@@ -52,6 +56,21 @@ impl Matcher {
         self.ends.resize(self.text.len(), None);
         self.starts[start] = Some((row, column));
         self.ends[self.text.len() - 1] = Some((row, end_column));
+    }
+
+    /// Formatter ASCII rows have exactly one byte per terminal column. Append
+    /// and fold the whole row before extending its coordinate maps once.
+    pub(super) fn append_ascii_row(&mut self, text: &str, row: u64) {
+        debug_assert!(text.is_ascii() && text.len() <= usize::from(u16::MAX));
+        let start = self.text.len();
+        self.text.push_str(text);
+        if !self.case_sensitive {
+            self.text[start..].make_ascii_lowercase();
+        }
+        self.starts
+            .extend((0..text.len()).map(|column| Some((row, column as u16))));
+        self.ends
+            .extend((0..text.len()).map(|column| Some((row, column as u16 + 1))));
     }
 
     pub(super) fn finish_row(&mut self, wrapped: bool) -> bool {
@@ -63,10 +82,23 @@ impl Matcher {
         }
         let mut offset = 0;
         while offset + self.query.len() <= self.text.len() {
-            let end = offset + self.query.len();
+            // Reject impossible source boundaries before constructing a
+            // substring searcher. Repeated partial expansion hits would
+            // otherwise rebuild it at every scalar (e.g. ß / odd-length s).
+            if self.starts[offset].is_none() || self.ends[offset + self.query.len() - 1].is_none() {
+                offset += self.text[offset..].chars().next().unwrap().len_utf8();
+                continue;
+            }
+            let Some(found) = self.text[offset..].find(&self.query) else {
+                // Retain only the unresolved suffix for a wrapped next row,
+                // just as if every remaining candidate had been examined.
+                offset = self.text.len() - self.query.len() + 1;
+                break;
+            };
+            let start = offset + found;
+            let end = start + self.query.len();
             if let (Some((start_row, start_column)), Some((end_row, end_column))) =
-                (self.starts[offset], self.ends[end - 1])
-                && self.text[offset..end] == self.query
+                (self.starts[start], self.ends[end - 1])
             {
                 if self.matches.len() == 10_000 {
                     self.truncated = true;
@@ -80,7 +112,10 @@ impl Matcher {
                 });
                 offset = end;
             } else {
-                offset += 1;
+                // A hit within a case-fold expansion is not a whole source
+                // character. Keep overlapping candidates eligible, advancing
+                // by one scalar so the next `find` starts on a UTF-8 boundary.
+                offset = start + self.text[start..].chars().next().unwrap().len_utf8();
             }
         }
         if wrapped {
@@ -200,12 +235,8 @@ pub(super) fn search(
         let text = String::from_utf8_lossy(&bytes);
         for (index, text) in text.split('\n').take((end - first) as usize).enumerate() {
             let row = first + index as u64;
-            let mut column = 0;
             if text.is_ascii() {
-                for character in text.chars() {
-                    matcher.append(character, row, column, column + 1);
-                    column += 1;
-                }
+                matcher.append_ascii_row(text, row);
             } else {
                 // Read the owner's real cells for Unicode rows. Width tables
                 // cannot reproduce both grapheme and legacy terminal modes.
@@ -247,6 +278,285 @@ pub(super) fn search(
 mod tests {
     use super::*;
     use libghostty_vt::{Terminal, TerminalOptions};
+
+    // Independent whole-logical-line oracle: deliberately scan each byte,
+    // rather than sharing the streaming matcher's search or suffix handling.
+    fn reference_matches(
+        rows: &[(&str, bool)],
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<SearchMatch> {
+        use unicode_casefold::UnicodeCaseFold;
+        let query = if case_sensitive {
+            query.to_owned()
+        } else {
+            query.case_fold().collect()
+        };
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut text = String::new();
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        let mut matches = Vec::new();
+        for (row, (line, wrapped)) in rows.iter().enumerate() {
+            for (column, character) in line.chars().enumerate() {
+                let start = text.len();
+                if case_sensitive {
+                    text.push(character);
+                } else {
+                    text.extend(std::iter::once(character).case_fold());
+                }
+                starts.resize(text.len(), None);
+                ends.resize(text.len(), None);
+                starts[start] = Some((row as u64, column as u16));
+                ends[text.len() - 1] = Some((row as u64, column as u16 + 1));
+            }
+            if *wrapped && row + 1 < rows.len() {
+                continue;
+            }
+            let mut offset = 0;
+            while offset + query.len() <= text.len() {
+                let end = offset + query.len();
+                if let (Some((start_row, start_column)), Some((end_row, end_column))) =
+                    (starts[offset], ends[end - 1])
+                    && text.get(offset..end) == Some(query.as_str())
+                {
+                    matches.push(SearchMatch {
+                        start_row,
+                        start_column,
+                        end_row,
+                        end_column,
+                    });
+                    offset = end;
+                } else {
+                    offset += 1;
+                }
+            }
+            text.clear();
+            starts.clear();
+            ends.clear();
+        }
+        matches
+    }
+
+    #[test]
+    fn streaming_matches_whole_line_oracle_with_unicode_and_wraps() {
+        let texts = [
+            "", "a", "ß", "é", "日", "ﬃ", "İ", "aa", "sß", "ßs", "aé", "éa",
+        ];
+        let queries = [
+            "", "a", "aa", "s", "ss", "sss", "é", "aé", "éa", "i", "\u{307}", "İ", "ffi", "fi",
+            "日", "日a",
+        ];
+        for left in texts {
+            for right in texts {
+                for wrapped in [false, true] {
+                    let rows = [(left, wrapped), (right, true), ("aßé日", false)];
+                    for query in queries {
+                        for case_sensitive in [false, true] {
+                            let mut matcher = Matcher::new(query, case_sensitive);
+                            for (row, (text, wrap)) in rows.iter().enumerate() {
+                                for (column, character) in text.chars().enumerate() {
+                                    matcher.append(
+                                        character,
+                                        row as u64,
+                                        column as u16,
+                                        column as u16 + 1,
+                                    );
+                                }
+                                assert!(matcher.finish_row(*wrap));
+                            }
+                            assert_eq!(
+                                matcher.results(),
+                                (reference_matches(&rows, query, case_sensitive), false),
+                                "rows={rows:?} query={query:?} case_sensitive={case_sensitive}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let rows = [("日é", true), ("ß日", true), ("éß", false)];
+        let mut matcher = Matcher::new("日éß日éß", false);
+        for (row, (text, wrapped)) in rows.iter().enumerate() {
+            for (column, character) in text.chars().enumerate() {
+                matcher.append(character, row as u64, column as u16, column as u16 + 1);
+            }
+            assert!(matcher.finish_row(*wrapped));
+        }
+        assert_eq!(
+            matcher.results().0,
+            reference_matches(&rows, "日éß日éß", false)
+        );
+    }
+
+    #[test]
+    fn result_limit_requires_an_additional_valid_match_to_truncate() {
+        for count in [10_000, 10_001] {
+            let mut matcher = Matcher::new("ss", false);
+            for row in 0..count {
+                matcher.append('ß', row, 0, 1);
+                assert_eq!(matcher.finish_row(false), row < 10_000);
+            }
+            let (matches, truncated) = matcher.results();
+            assert_eq!(matches.len(), 10_000);
+            assert_eq!(truncated, count > 10_000);
+        }
+    }
+
+    #[test]
+    fn ascii_batch_preserves_maps_after_wrapped_unicode_and_case_folding() {
+        for case_sensitive in [false, true] {
+            for query in ["ssAB", "éAB", "AB", "ab", "BC日", "日ss"] {
+                let mut batched = Matcher::new(query, case_sensitive);
+                let mut scalar = Matcher::new(query, case_sensitive);
+                for (row, text) in ["ßé", "ABC", "日ß", "", "AB"].iter().enumerate() {
+                    if text.is_ascii() {
+                        batched.append_ascii_row(text, row as u64);
+                    } else {
+                        for (column, character) in text.chars().enumerate() {
+                            batched.append(character, row as u64, column as u16, column as u16 + 1);
+                        }
+                    }
+                    for (column, character) in text.chars().enumerate() {
+                        scalar.append(character, row as u64, column as u16, column as u16 + 1);
+                    }
+                    assert_eq!(batched.text, scalar.text);
+                    assert_eq!(batched.starts, scalar.starts);
+                    assert_eq!(batched.ends, scalar.ends);
+                    assert!(batched.finish_row(true));
+                    assert!(scalar.finish_row(true));
+                }
+                assert_eq!(batched.results(), scalar.results());
+            }
+        }
+    }
+
+    /// Opt-in, in-process owner-thread workload. Run in release mode; the
+    /// formatter and cell lookups are included in the live measurements.
+    #[test]
+    #[ignore]
+    fn benchmark_search() {
+        use std::time::Instant;
+        let workloads = [
+            (
+                "ascii-miss",
+                "Build STEP completed successfully. ".repeat(4),
+                "missing needle",
+                false,
+                false,
+            ),
+            (
+                "ascii-hits",
+                "Build STEP completed successfully. ".repeat(4),
+                "step",
+                false,
+                false,
+            ),
+            (
+                "wrapped-prefix",
+                "a".repeat(128),
+                &("a".repeat(512) + "b"),
+                true,
+                true,
+            ),
+            (
+                "unicode",
+                "日 Straße É 👩‍💻 completed. ".repeat(4),
+                "STRASSE",
+                false,
+                false,
+            ),
+            (
+                "unicode-expansion-miss",
+                "ß".repeat(128),
+                &"s".repeat(511),
+                false,
+                true,
+            ),
+            (
+                "unicode-miss",
+                "日 Straße É 👩‍💻 completed. ".repeat(4),
+                "missing needle",
+                false,
+                false,
+            ),
+        ];
+        for (name, text, query, case_sensitive, wrapped) in workloads {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let started = Instant::now();
+                let mut matcher = Matcher::new(query, case_sensitive);
+                for row in 0..40_000 {
+                    if text.is_ascii() {
+                        matcher.append_ascii_row(&text, row);
+                    } else {
+                        for (column, character) in text.chars().enumerate() {
+                            matcher.append(character, row, column as u16, column as u16 + 1);
+                        }
+                    }
+                    if !matcher.finish_row(wrapped) {
+                        break;
+                    }
+                }
+                let (matches, truncated) = matcher.results();
+                let count = matches.len();
+                std::hint::black_box((matches, truncated));
+                samples.push(started.elapsed().as_micros());
+                assert_eq!(
+                    (count, truncated),
+                    if name == "ascii-hits" || name == "unicode" {
+                        (10_000, true)
+                    } else {
+                        (0, false)
+                    }
+                );
+            }
+            samples.sort_unstable();
+            println!(
+                "matcher {name}: median_us={} samples_us={samples:?}",
+                samples[2]
+            );
+        }
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 128,
+            rows: 24,
+            max_scrollback: 8 * 1024 * 1024,
+        })
+        .unwrap();
+        for _ in 0..30_000 {
+            terminal.vt_write(
+                b"Build STEP completed successfully. Build STEP completed successfully.\r\n",
+            );
+        }
+        println!("live rows={}", terminal.scrollbar().unwrap().total);
+        assert!(terminal.scrollbar().unwrap().total > 5_000);
+        for query in ["missing needle", "STEP"] {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let started = Instant::now();
+                let (matches, truncated) =
+                    search(&terminal, query, false, || false).unwrap().unwrap();
+                let count = matches.len();
+                std::hint::black_box((matches, truncated));
+                samples.push(started.elapsed().as_micros());
+                assert_eq!(
+                    (count, truncated),
+                    if query == "STEP" {
+                        (10_000, true)
+                    } else {
+                        (0, false)
+                    }
+                );
+            }
+            samples.sort_unstable();
+            println!(
+                "live {query:?}: median_us={} samples_us={samples:?}",
+                samples[2]
+            );
+        }
+    }
     #[test]
     fn searches_history_wrapped_text_and_unicode_grid_columns() {
         let mut terminal = Terminal::new(TerminalOptions {

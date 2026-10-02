@@ -419,6 +419,55 @@ mod tests {
     use super::*;
     use libghostty_vt::TerminalOptions;
 
+    #[test]
+    #[ignore]
+    fn benchmark_archived_search() {
+        use std::time::Instant;
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 128,
+            rows: 24,
+            max_scrollback: 8 * 1024 * 1024,
+        })
+        .unwrap();
+        for _ in 0..30_000 {
+            terminal.vt_write(
+                b"Build STEP completed successfully. Build STEP completed successfully.\r\n",
+            );
+        }
+        let history = History::capture(
+            &mut terminal,
+            &RenderSnapshot::empty(),
+            super::super::holder::MAX_SCREEN,
+        )
+        .unwrap();
+        let source = history.source();
+        println!("archived rows={}", source.rows.len());
+        assert!(source.rows.len() > 5_000);
+        for query in ["missing needle", "STEP"] {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let started = Instant::now();
+                let (matches, truncated) = source.search(query, false, || false).unwrap();
+                let count = matches.len();
+                std::hint::black_box((matches, truncated));
+                samples.push(started.elapsed().as_micros());
+                assert_eq!(
+                    (count, truncated),
+                    if query == "STEP" {
+                        (10_000, true)
+                    } else {
+                        (0, false)
+                    }
+                );
+            }
+            samples.sort_unstable();
+            println!(
+                "archived {query:?}: median_us={} samples_us={samples:?}",
+                samples[2]
+            );
+        }
+    }
+
     fn terminal(text: &str) -> Terminal<'static, 'static> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 12,
