@@ -244,6 +244,8 @@ pub(crate) struct HostState {
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    /// Connections that authenticated as an agent session, and its lineage.
+    pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
     pub(super) automations: Option<super::automations::Handle>,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
@@ -320,6 +322,7 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             execution_registry: None,
+            agent_clients: BTreeMap::new(),
             automations: None,
             mailbox: None,
             mailbox_seal: None,
@@ -387,6 +390,7 @@ impl HostState {
         self.clients.remove(&client_id);
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
+        self.agent_clients.remove(&client_id);
     }
 
     /// Installs the durable shared sidebar model.
@@ -680,6 +684,7 @@ impl HostState {
         }
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
+        self.agent_clients.remove(&client_id);
         handles
     }
 

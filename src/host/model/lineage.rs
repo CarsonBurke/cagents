@@ -193,6 +193,17 @@ impl Registry {
             .transpose()
     }
 
+    /// Whether `id` was registered as a session or names a lineage.
+    pub(crate) fn lineage_recorded(&self, id: TerminalId) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_lineages WHERE session_id = ?1 OR lineage = ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// Each session's lineage; one never registered is its own.
     pub(crate) fn session_lineages(
         &self,

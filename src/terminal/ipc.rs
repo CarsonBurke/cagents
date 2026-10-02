@@ -106,7 +106,9 @@ use crate::{
 /// session's lineage.
 /// Version 44 adds messages between sessions and reading the messages left
 /// for the caller.
-pub const PROTOCOL_VERSION: u16 = 44;
+/// Version 45 lets a connection act for an agent session, which may then
+/// change only the terminals it controls.
+pub const PROTOCOL_VERSION: u16 = 45;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -412,6 +414,13 @@ pub enum ClientRequest {
     /// Authenticate old ownership before allocating a new resume transport.
     ChatPrepareResume {
         source: crate::chat::Session,
+    },
+    /// Binds an agent session's capability to this connection, which may then
+    /// read terminals and change only those that session controls; it is
+    /// refused every other request. A connection that never authenticates
+    /// acts for the user.
+    Authenticate {
+        authority: crate::agent_execution::Authority,
     },
 }
 

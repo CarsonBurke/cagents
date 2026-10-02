@@ -292,8 +292,13 @@ pub(super) fn process_request(
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
+    super::agent_execution::terminals::admit(host, client_id, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Authenticate { authority } => {
+            super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::Automation {
             authority,
             operation,
@@ -581,6 +586,7 @@ pub(super) fn process_request(
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {
+            super::agent_execution::terminals::adopt(host, client_id, session.id)?;
             let terminal = spawn_terminal(host, client_id, session, options)?;
             let snapshot = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
