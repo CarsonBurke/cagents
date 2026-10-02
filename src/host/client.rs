@@ -292,8 +292,13 @@ pub(super) fn process_request(
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
+    super::agent_execution::terminals::admit(host, client_id, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Authenticate { authority } => {
+            super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::Automation {
             authority,
             operation,
@@ -582,6 +587,22 @@ pub(super) fn process_request(
         }
         ClientRequest::Spawn { session, options } => {
             let terminal = spawn_terminal(host, client_id, session, options)?;
+            if let Err(error) =
+                super::agent_execution::terminals::adopt(host, client_id, terminal.session.id)
+            {
+                // A terminal its agent could neither change nor close would
+                // outlive every use it was started for.
+                let handle = host
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .terminals
+                    .get(&terminal.session.id)
+                    .map(|record| record.handle.clone());
+                if let Some(handle) = handle {
+                    let _ = handle.shutdown();
+                }
+                return Err(error);
+            }
             let snapshot = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let snapshot = state.snapshot(client_id, terminal.session.id, 0)?;

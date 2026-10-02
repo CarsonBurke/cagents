@@ -9,7 +9,7 @@ metadata:
 
 - Work that belongs to this conversation: use your own harness's subagents, tasks, and background commands. They are cheaper and report straight back to you.
 - Work that needs its own session: a different provider, another open project, a conversation the user should see and be able to take over in cagents, or one that must outlive yours. Use `cagents agent`.
-- Other sessions already running: `cagents whoami` shows your session, its relatives, and peers in your checkout; `cagents ls` lists the project's live sessions (`--project PATH` for another project, `--all` for every one). Check before editing a checkout someone else is working in. Listing is read-only: you control only agents you started.
+- Other sessions already running: `cagents whoami` shows your session, its relatives, and peers in your checkout; `cagents ls` lists the project's live sessions (`--project PATH` for another project, `--all` for every one). Check before editing a checkout someone else is working in. Listing is read-only: you control only agents and terminals you started.
 - Coordinating with another session: message it (below) rather than editing around it or guessing what it is doing.
 
 ## Start and oversee agents

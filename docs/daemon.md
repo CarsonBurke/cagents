@@ -83,6 +83,9 @@ cagents daemon stop --confirm
   exited. Plain `daemon stop` without these flags is a force stop.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
+- Inside an agent session, `terminal write` and `close` reach only the
+  terminals that session controls; see
+  [Hosted agent execution](agent-execution.md#finding-other-sessions).
 - `project close` asks for `--yes` before deleting the channels a project
   still holds, since closing a project removes them in every window.
 

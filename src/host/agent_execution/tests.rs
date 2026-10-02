@@ -2143,3 +2143,230 @@ fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_asker
     close(&host, &parent_authority, child.agent.id).unwrap();
     close(&host, &Authority::default(), parent.agent.id).unwrap();
 }
+
+#[test]
+fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
+    use crate::{
+        host::client::process_request,
+        model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+        terminal_ipc::{ProtocolErrorCode, TerminalSpawnOptions},
+    };
+    if isolated("an_agents_connection_changes_only_the_terminals_its_lineage_controls").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let shell = |id: TerminalId| {
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "cat".into()],
+            working_directory: root.join("project"),
+            environment: Default::default(),
+        };
+        TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        }
+    };
+    const USER: u64 = 1;
+    const AGENT: u64 = 2;
+    const PEER: u64 = 3;
+    for client in [USER, AGENT, PEER] {
+        host.lock().unwrap().register_client(client);
+    }
+    let request_as = |client: u64, request: ClientRequest| {
+        process_request(&host, client, request).map(|(response, _, _)| response)
+    };
+    let spawn_as = |client: u64, session: TerminalSession| {
+        request_as(
+            client,
+            ClientRequest::Spawn {
+                session,
+                options: TerminalSpawnOptions::default(),
+            },
+        )
+    };
+    let attach = |client: u64, terminal_id: TerminalId| {
+        request_as(
+            client,
+            ClientRequest::Attach {
+                terminal_id,
+                after_generation: 0,
+                after_event_sequence: 0,
+            },
+        )
+        .unwrap();
+    };
+    let input = |client: u64, terminal_id: TerminalId| {
+        request_as(
+            client,
+            ClientRequest::Input {
+                terminal_id,
+                bytes: b"x".to_vec(),
+            },
+        )
+    };
+    let denied = |result: Result<ServerResponse, crate::terminal_ipc::ProtocolError>| {
+        assert_eq!(
+            result.unwrap_err().code,
+            ProtocolErrorCode::PermissionDenied
+        );
+    };
+    let authority = |session: TerminalId| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_authority(session)
+            .unwrap()
+    };
+
+    // The user starts two agent sessions; each connection acts for one.
+    let (agent, peer) = (TerminalId::new(), TerminalId::new());
+    for session in [agent, peer] {
+        spawn_as(USER, shell(session)).unwrap();
+    }
+    let authenticate = |client: u64, session: TerminalId| {
+        request_as(
+            client,
+            ClientRequest::Authenticate {
+                authority: authority(session),
+            },
+        )
+    };
+    authenticate(AGENT, agent).unwrap();
+    authenticate(PEER, peer).unwrap();
+    denied(authenticate(AGENT, peer));
+
+    // An agent changes its own session and the terminals it started.
+    attach(AGENT, agent);
+    input(AGENT, agent).unwrap();
+    let started = TerminalId::new();
+    spawn_as(AGENT, shell(started)).unwrap();
+    input(AGENT, started).unwrap();
+    request_as(
+        AGENT,
+        ClientRequest::Resize {
+            terminal_id: started,
+            size: crate::terminal_ipc::WireTerminalSize {
+                columns: 100,
+                rows: 30,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+        },
+    )
+    .unwrap();
+
+    // It reads a peer's terminal but cannot type into, resize or close it.
+    attach(AGENT, peer);
+    assert!(matches!(
+        request_as(
+            AGENT,
+            ClientRequest::Snapshot {
+                terminal_id: peer,
+                after_generation: 0,
+            },
+        )
+        .unwrap(),
+        ServerResponse::Snapshot { .. }
+    ));
+    denied(input(AGENT, peer));
+    denied(request_as(
+        AGENT,
+        ClientRequest::ShutdownTerminal { terminal_id: peer },
+    ));
+    denied(request_as(
+        AGENT,
+        ClientRequest::CloseTerminalChecked {
+            terminal_id: peer,
+            allow_active: true,
+        },
+    ));
+    // Nor what the peer started.
+    attach(PEER, started);
+    denied(input(PEER, started));
+
+    // An agent may start a terminal, not take over another lineage by naming
+    // a predecessor or reusing a session's ID.
+    let mut relaunch = shell(TerminalId::new());
+    relaunch.predecessor = Some(peer);
+    denied(spawn_as(AGENT, relaunch));
+    assert_eq!(
+        spawn_as(AGENT, shell(peer)).unwrap_err().code,
+        ProtocolErrorCode::TerminalAlreadyExists
+    );
+    // Everything outside the terminal surface stays with the user.
+    denied(request_as(AGENT, ClientRequest::ChatList));
+    denied(request_as(AGENT, ClientRequest::Shutdown));
+
+    // A delegated agent's session is its owner's to change, not the reverse.
+    let mut delegated = request;
+    delegated.idempotency_key = "delegated".into();
+    let child = submit(&host, &authority(agent), delegated).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let child_session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(child.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let change = |client: u64, terminal_id: TerminalId| {
+        super::terminals::admit(
+            &host,
+            client,
+            &ClientRequest::Input {
+                terminal_id,
+                bytes: Vec::new(),
+            },
+        )
+    };
+    change(AGENT, child_session).unwrap();
+    change(PEER, child_session).unwrap_err();
+    const CHILD: u64 = 4;
+    host.lock().unwrap().register_client(CHILD);
+    request_as(
+        CHILD,
+        ClientRequest::Authenticate {
+            authority: authority(child_session),
+        },
+    )
+    .unwrap();
+    change(CHILD, child_session).unwrap();
+    assert_eq!(
+        change(CHILD, agent).unwrap_err().code,
+        ProtocolErrorCode::PermissionDenied
+    );
+
+    // The user changes every terminal, and an agent's connection forgets
+    // whom it acted for once it disconnects.
+    for terminal in [agent, peer, started] {
+        attach(USER, terminal);
+        input(USER, terminal).unwrap();
+    }
+    host.lock().unwrap().unregister_client(AGENT);
+    assert!(!host.lock().unwrap().agent_clients.contains_key(&AGENT));
+    close(&host, &authority(agent), child.agent.id).unwrap();
+    for terminal in [agent, peer, started] {
+        request_as(
+            USER,
+            ClientRequest::ShutdownTerminal {
+                terminal_id: terminal,
+            },
+        )
+        .unwrap();
+    }
+}

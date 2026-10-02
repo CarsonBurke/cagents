@@ -27,6 +27,7 @@ mod messages;
 pub use messages::{AskArgs, InboxArgs, ReplyArgs, SendArgs};
 
 use crate::{
+    agent_execution::Authority,
     instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
     model::{
         ChannelId, HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
@@ -460,6 +461,16 @@ impl ControlClient {
                 "a terminal handoff acknowledgement",
                 &response,
             )),
+        }
+    }
+
+    /// Acts for the agent session `authority` was issued to, which may then
+    /// change only the terminals it controls. Without a token the connection
+    /// keeps acting for the user.
+    pub fn authenticate(&mut self, authority: Authority) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::Authenticate { authority })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("authentication", &response)),
         }
     }
 
@@ -2364,6 +2375,12 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
+    // Inside an agent session the daemon lets these commands change only the
+    // terminals that session controls.
+    let authority = Authority::from_environment();
+    if authority.token().is_some() {
+        client.authenticate(authority).map_err(protocol_error)?;
+    }
     match command {
         TerminalCommand::List => {
             let terminals = client.list().map_err(protocol_error)?;

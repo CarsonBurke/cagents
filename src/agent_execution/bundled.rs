@@ -26,6 +26,8 @@ const BUNDLED: &[&str] = &[
     "6d81922a43f4a116c5ef9b55ab14fe1b6137f240037f88c31735e860653f4f57",
     // #621: messages between sessions.
     "95e462bbb60fe643b37cf76aacd642b87efa781c473f7723049e7f861b31b837",
+    // #635: terminal commands change only the terminals a session controls.
+    "0d7d6212da9aa810c004813d2d76b2f89233a77c4b40ba31ac737eeeb3bd09f5",
 ];
 /// Larger than any bundled revision, so an oversized file is user content
 /// without being read in full.
