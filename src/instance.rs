@@ -561,7 +561,7 @@ fn install_global_subscriber(product: &'static str, default_filter: &str) {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
-        // Upstream network/keyring debug events contain cookie values and raw
+        // Upstream network/keyring info/debug events contain cookie values and raw
         // headers. This mandatory filter intersects RUST_LOG; no user-provided
         // target or span directive can enable those credential-bearing events.
         .with(tracing_subscriber::filter::filter_fn(|metadata| {
@@ -580,7 +580,7 @@ fn install_global_subscriber(product: &'static str, default_filter: &str) {
 
 #[cfg(any(feature = "host", feature = "ui"))]
 fn sensitive_browser_diagnostic(target: &str, level: &tracing::Level) -> bool {
-    *level > tracing::Level::INFO
+    *level >= tracing::Level::INFO
         && ["net", "hyper", "hyper_util", "h2", "zbus", "secret_service"]
             .iter()
             .any(|prefix| {
@@ -1664,7 +1664,7 @@ mod tests {
 
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
-    fn browser_credentials_are_excluded_even_with_explicit_debug_targets() {
+    fn browser_credentials_are_excluded_even_with_explicit_trace_targets() {
         use tracing_subscriber::{Layer, layer::SubscriberExt};
         struct Observe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl<S: tracing::Subscriber> Layer<S> for Observe {
@@ -1687,12 +1687,43 @@ mod tests {
             .with(Observe(seen.clone()));
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(target: "net::cookie", "fixture bearer cookie must be filtered");
+            // Pinned Servo emits the complete Cookie header at INFO, including
+            // when a site reads document.cookie, not just during extraction.
+            tracing::info!(target: "net::cookie_storage", " === COOKIES SENT: session=fixture-bearer");
             tracing::debug!(target: "net::http_loader", "fixture cookie headers must be filtered");
             tracing::trace!(target: "zbus::message", "fixture secret-store reply must be filtered");
+            // Servo uses `log`, whose events have different callsites from
+            // native tracing events. Exercise the production bridge too.
+            for level in [
+                tracing_log::log::Level::Info,
+                tracing_log::log::Level::Debug,
+            ] {
+                tracing_log::format_trace(
+                    &tracing_log::log::Record::builder()
+                        .target("net::cookie_storage")
+                        .level(level)
+                        .args(format_args!("session=fixture-bearer"))
+                        .build(),
+                )
+                .unwrap();
+            }
             tracing::warn!(target: "net::http_loader", "ordinary connection failure");
             tracing::debug!(target: "cagents::browser", "ordinary app diagnostic");
+            for (target, level) in [
+                ("net::http_loader", tracing_log::log::Level::Warn),
+                ("cagents::browser", tracing_log::log::Level::Info),
+            ] {
+                tracing_log::format_trace(
+                    &tracing_log::log::Record::builder()
+                        .target(target)
+                        .level(level)
+                        .args(format_args!("ordinary diagnostic"))
+                        .build(),
+                )
+                .unwrap();
+            }
         });
-        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
     }
 
     #[test]

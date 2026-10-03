@@ -190,6 +190,7 @@ wayland-protocols = { version = "=0.32.13", features = ["client"], optional = tr
 
 [dev-dependencies]
 tempfile = "3.21"
+tracing-log = "0.2"
 
 [profile.dev]
 debug = "line-tables-only"
