@@ -1227,8 +1227,7 @@ impl PullRequestTone {
             Self::Merged => cosmic::iced::Color::from_rgb8(163, 113, 247),
             Self::Review => design::accent_color(theme),
             Self::Danger => cosmic.destructive.base.into(),
-            Self::Draft => theme.current_container().component.on_disabled.into(),
-            Self::Neutral => theme.current_container().component.on.into(),
+            Self::Draft | Self::Neutral => design::muted_icon_color(theme),
         }
     }
 }
@@ -2680,6 +2679,7 @@ pub struct SidebarState {
     /// every other draft here, so a worktree switch resets it.
     changes_tab: ChangesTab,
     worktree_sort: crate::settings::WorktreeSort,
+    hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     /// Worktrees holding at least one open pane. Derived by the application
@@ -2704,6 +2704,10 @@ pub struct SidebarState {
 }
 
 impl SidebarState {
+    pub fn set_show_worktree_changes_icons(&mut self, show: bool) {
+        self.hide_worktree_changes_icons = !show;
+    }
+
     pub fn select_rows(
         &mut self,
         row: SelectionRow,
@@ -3645,6 +3649,7 @@ struct NavigationSnapshot {
     selection: Option<SidebarSelection>,
     active_worktree: Option<ActiveWorktreeKey>,
     worktree_sort: crate::settings::WorktreeSort,
+    hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
@@ -3662,6 +3667,7 @@ impl NavigationSnapshot {
             && self.selection == state.selection
             && self.active_worktree == state.active_worktree
             && self.worktree_sort == state.worktree_sort
+            && self.hide_worktree_changes_icons == state.hide_worktree_changes_icons
             && self.agent_updates == state.agent_updates
             && self.agent_activity == state.agent_activity
             && self.worktrees_with_panes == state.worktrees_with_panes
@@ -3679,6 +3685,7 @@ impl NavigationSnapshot {
             selection: state.selection,
             active_worktree: state.active_worktree.clone(),
             worktree_sort: state.worktree_sort,
+            hide_worktree_changes_icons: state.hide_worktree_changes_icons,
             agent_updates: state.agent_updates.clone(),
             agent_activity: state.agent_activity.clone(),
             worktrees_with_panes: state.worktrees_with_panes.clone(),
@@ -5051,6 +5058,7 @@ fn project_view<'a>(
                         .rows
                         .group_size(SelectionRow::Worktree(project_id, worktree.id)),
                     &project.state.query,
+                    !project.state.hide_worktree_changes_icons,
                 ),
                 SelectionRow::Worktree(project_id, worktree.id),
                 project.state,
@@ -5180,6 +5188,7 @@ fn compact_project<'a>(
                     .rows
                     .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
                 &project.state.query,
+                !project.state.hide_worktree_changes_icons,
             ),
             SelectionRow::Worktree(entity.id, worktree.id),
             project.state,
@@ -5662,6 +5671,7 @@ fn worktree_indicator(
     agent_update: bool,
     activity: Option<crate::agent::ActivityState>,
     compact: bool,
+    show_changes_icons: bool,
 ) -> Option<Element<'static, SidebarAction>> {
     let indicators = worktree_indicators(worktree);
     if let Some(indicator) = agent_indicator(activity, agent_update) {
@@ -5677,7 +5687,7 @@ fn worktree_indicator(
             "CI checks pending or running",
         ));
     }
-    if compact {
+    if compact && show_changes_icons {
         return indicators.dirty.map(|label| {
             status_icon(
                 "document-edit-symbolic",
@@ -5704,6 +5714,7 @@ fn worktree_view<'a>(
     compact: bool,
     selection_count: Option<usize>,
     query: &str,
+    show_changes_icons: bool,
 ) -> Element<'static, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
@@ -5721,7 +5732,13 @@ fn worktree_view<'a>(
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
         Some(RowDeletion::Failed(reason)) if compact => Some(deletion_failed_badge(reason)),
-        _ => worktree_indicator(worktree, agent_update, activity, compact),
+        _ => worktree_indicator(
+            worktree,
+            agent_update,
+            activity,
+            compact,
+            show_changes_icons,
+        ),
     };
     let glyph = if deleting {
         widget::container(widget::icon(worktree_icon()).size(CHILD_ROW_ICON_SIZE))
@@ -5751,7 +5768,7 @@ fn worktree_view<'a>(
     // worktree on its way out has no use for them.
     if !compact && !deleting {
         let indicators = worktree_indicators(worktree);
-        if let Some(label) = indicators.dirty {
+        if show_changes_icons && let Some(label) = indicators.dirty {
             content = content.push(status_icon(
                 "document-edit-symbolic",
                 label.to_owned(),
@@ -9076,7 +9093,7 @@ fn toned_icon<'a, Message: 'a>(icon_name: &'static str, tone: BadgeTone) -> Elem
                 BadgeTone::Success => cosmic.success.base.into(),
                 BadgeTone::Warning => cosmic.warning.base.into(),
                 BadgeTone::Danger => cosmic.destructive.base.into(),
-                _ => theme.current_container().component.on_disabled.into(),
+                _ => design::muted_icon_color(theme),
             }),
             ..Default::default()
         }
@@ -11088,6 +11105,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
+        let renderer = headless_renderer();
+        let mut worktree = worktree(3, "feature", false);
+        worktree.chrome.dirty_badge = Some("3 changed files".into());
+        fn badge_count(node: &layout::Node) -> usize {
+            usize::from(
+                node.children().is_empty()
+                    && node.bounds().size()
+                        == Size::new(f32::from(ROW_ICON_SIZE), f32::from(ROW_ICON_SIZE)),
+            ) + node.children().iter().map(badge_count).sum::<usize>()
+        }
+        for compact in [false, true] {
+            let row = |show| {
+                worktree_view(
+                    project_id(1),
+                    &worktree,
+                    false,
+                    false,
+                    None,
+                    false,
+                    false,
+                    &[],
+                    false,
+                    None,
+                    false,
+                    compact,
+                    None,
+                    "",
+                    show,
+                )
+            };
+            let counts = [true, false].map(|show| {
+                let mut element = row(show);
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(380.0, WORKTREE_ROW_HEIGHT)),
+                );
+                badge_count(&node)
+            });
+            assert_eq!(
+                counts[0],
+                counts[1] + 1,
+                "only the changes badge is removed"
+            );
+            assert_eq!(
+                accessible_names(&renderer, row(true)),
+                accessible_names(&renderer, row(false)),
+                "dirty status remains available to assistive technology"
+            );
+            assert!(worktree_indicator(&worktree, true, None, compact, false).is_some());
+        }
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let before = cache.generation(&model, &state);
+        state.set_show_worktree_changes_icons(false);
+        assert_ne!(before, cache.generation(&model, &state));
+    }
+
+    #[test]
     fn only_merged_nonprimary_worktree_rows_expose_delete_quick_action() {
         let renderer = headless_renderer();
         let mut worktree = worktree(3, "feature", false);
@@ -11115,6 +11194,7 @@ pub(crate) mod tests {
                 false,
                 Some(1),
                 "",
+                true,
             );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -11590,6 +11670,7 @@ pub(crate) mod tests {
                 false,
                 None,
                 query,
+                true,
             );
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));

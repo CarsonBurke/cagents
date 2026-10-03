@@ -1119,12 +1119,44 @@ impl Workspace {
         if self.viewport_width == width {
             return ViewportUpdate::unchanged();
         }
+        self.reflow_viewport(width, None, false);
+        self.refresh_visibility(false)
+    }
+
+    /// Geometry resizing is already animated by its owner (for example the
+    /// docked inspector). Keep a settled camera anchored to the same point in
+    /// the leading pane instead of adding a second, lagging scroll animation.
+    /// Deliberate navigation and startup reveals keep their existing spring.
+    fn reflow_viewport(&mut self, width: f32, acknowledged_offset: Option<f32>, user_input: bool) {
+        let animate = self.camera.is_animating() || self.viewport_width <= 0.0 || user_input;
+        let anchor = (!animate)
+            .then(|| {
+                let offset = self.camera.offset();
+                let geometry = self.presentation_geometry();
+                let index = geometry.intersecting_range(offset, offset + 1.0).start;
+                geometry
+                    .card_at(index)
+                    .map(|card| (card.id, (offset - card.start) / card.width()))
+            })
+            .flatten();
         self.viewport_width = width;
         self.rebuild_geometry();
-        self.reveal_focused();
-        self.camera
-            .clamp(self.geometry.max_offset(self.viewport_width));
-        self.refresh_visibility(false)
+        if let Some((id, fraction)) = anchor
+            && let Some(card) = self.geometry.card(id)
+        {
+            self.camera.jump_to(card.start + fraction * card.width());
+        } else if let Some(offset) = acknowledged_offset {
+            self.camera.jump_to(offset);
+        }
+        if animate {
+            self.reveal_focused();
+        } else if let Some(target) = self
+            .focused
+            .and_then(|id| self.geometry.focus_offset(id, width, self.camera.offset()))
+        {
+            self.camera.jump_to(target);
+        }
+        self.camera.clamp(self.geometry.max_offset(width));
     }
 
     /// Records an exact offset sent to the native scrollable. A bounded ring
@@ -1168,17 +1200,14 @@ impl Workspace {
                 .as_mut()
                 .is_some_and(|sync| sync.take_recognized_after_clamp(offset, previous_maximum));
         if width_changed {
-            self.viewport_width = viewport_width;
-            self.rebuild_geometry();
-            if clamped_programmatic {
-                self.camera.jump_to(offset);
-            }
             // Native layout feedback can report the measured width before
             // Resized. Retarget fractional panes here too; the later resize
             // sees an equal width and deliberately performs no further work.
-            self.reveal_focused();
-            self.camera
-                .clamp(self.geometry.max_offset(self.viewport_width));
+            self.reflow_viewport(
+                viewport_width,
+                clamped_programmatic.then_some(offset),
+                user_input,
+            );
         }
 
         if clamped_programmatic {
@@ -2577,6 +2606,60 @@ mod tests {
         workspace.native_scroll(0.0, 600.0);
         assert_eq!(workspace.camera().offset(), 0.0);
         assert_eq!(workspace.camera().target(), 0.0);
+        assert!(!workspace.camera().is_animating());
+    }
+
+    #[test]
+    fn viewport_reflow_keeps_fractional_panes_and_camera_in_step() {
+        for layout_first in [false, true] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fraction(1.0); 3], 800.0);
+            let focused = workspace.order().nth(1).unwrap();
+            workspace.focus(focused).unwrap();
+            workspace.tick(Duration::from_secs(1));
+            for width in [820.0, 880.0, 1_000.0, 1_180.0, 1_200.0, 1_100.0, 800.0] {
+                if layout_first {
+                    workspace.native_layout_scroll(workspace.camera().offset(), width);
+                }
+                workspace.resize_viewport(width);
+                let pane = workspace.geometry().card(focused).unwrap();
+                assert!((pane.start - workspace.camera().offset()).abs() < SCROLL_SYNC_EPSILON);
+                assert!(
+                    !workspace.camera().is_animating(),
+                    "resize must not start a second animation"
+                );
+                let settled = workspace.camera().offset();
+                workspace.tick(Duration::from_millis(16));
+                assert_eq!(workspace.camera().offset(), settled);
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_reflow_anchors_settled_last_pane_despite_native_clamping() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(1.0); 3], 800.0);
+        let focused = workspace.order().last().unwrap();
+        workspace.focus(focused).unwrap();
+        workspace.tick(Duration::from_secs(1));
+        let offset = workspace.camera().offset();
+        workspace.record_programmatic_scroll(offset);
+        let clamped = workspace.geometry().max_offset(900.0);
+        workspace.native_layout_scroll(clamped, 900.0);
+        assert_eq!(
+            workspace.camera().offset(),
+            workspace.geometry().card(focused).unwrap().start
+        );
+        assert!(!workspace.camera().is_animating());
+    }
+
+    #[test]
+    fn viewport_reflow_keeps_fixed_pane_scroll_position() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 5], 800.0);
+        let focused = workspace.order().nth(2).unwrap();
+        workspace.focus(focused).unwrap();
+        workspace.tick(Duration::from_secs(1));
+        let offset = workspace.camera().offset();
+        workspace.resize_viewport(1_000.0);
+        assert_eq!(workspace.camera().offset(), offset);
         assert!(!workspace.camera().is_animating());
     }
 

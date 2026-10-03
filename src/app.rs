@@ -2656,6 +2656,7 @@ pub enum SettingsField {
     ChatContentFraction,
     DefaultNativePaneFraction,
     ShowStatusBar,
+    ShowWorktreeChangesIcons,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
@@ -2798,6 +2799,7 @@ impl SettingsField {
             Self::DefaultNativePaneFraction => "Native pane minimum width",
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
+            Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
@@ -2828,9 +2830,11 @@ impl SettingsField {
     const fn category(self) -> SettingsCategory {
         match self {
             Self::Notifications(_) => SettingsCategory::Notifications,
-            Self::AppTheme | Self::UiScale | Self::ShowStatusBar | Self::DefaultColumnFraction => {
-                SettingsCategory::Appearance
-            }
+            Self::AppTheme
+            | Self::UiScale
+            | Self::ShowStatusBar
+            | Self::ShowWorktreeChangesIcons
+            | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
             | Self::TerminalPadding
             | Self::TerminalScrollSize
@@ -3033,6 +3037,7 @@ struct SettingsDraft {
     chat_content_fraction: String,
     default_native_pane_fraction: String,
     show_status_bar: bool,
+    show_worktree_changes_icons: bool,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
@@ -3092,6 +3097,7 @@ impl SettingsDraft {
             chat_content_fraction: settings.chat_content_fraction.to_string(),
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
+            show_worktree_changes_icons: settings.show_worktree_changes_icons,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
@@ -3145,6 +3151,9 @@ impl SettingsDraft {
             SettingsField::ChatContentFraction => self.chat_content_fraction = value,
             SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = value,
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
+            SettingsField::ShowWorktreeChangesIcons => {
+                self.show_worktree_changes_icons = value == "true"
+            }
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
             }
@@ -3372,6 +3381,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_status_bar = enabled)
             .map_err(|_| "Choose whether the status bar is shown.".to_owned()),
+        SettingsField::ShowWorktreeChangesIcons => value
+            .parse::<bool>()
+            .map(|enabled| next.show_worktree_changes_icons = enabled)
+            .map_err(|_| "Choose whether worktree changes icons are shown.".to_owned()),
         SettingsField::RelaunchAgentsOnUpgrade => value
             .parse::<bool>()
             .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
@@ -11618,6 +11631,8 @@ impl Cagents {
             self.sidebar_state
                 .set_worktree_sort(self.settings.worktree_sort);
         }
+        self.sidebar_state
+            .set_show_worktree_changes_icons(self.settings.show_worktree_changes_icons);
         if previous.app_theme != self.settings.app_theme
             || previous.ui_scale != self.settings.ui_scale
         {
@@ -12045,6 +12060,8 @@ impl Application for Cagents {
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
             .set_worktree_sort(app.settings.worktree_sort);
+        app.sidebar_state
+            .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
         // starts at zero, and `PanSurface` only publishes its real bounds once
         // it has been mounted and redrawn. A strip projected against zero
@@ -15884,10 +15901,20 @@ impl Application for Cagents {
                 }
             }
         } else {
-            widget::row::with_children(vec![sidebar, main_content])
-                .height(Length::Fill)
+            let content = widget::row::with_children(vec![
+                sidebar,
+                main_content,
+                widget::Space::new().width(0).into(),
+            ])
+            .height(Length::Fill)
+            .width(Length::Fill);
+            // Preserve the docked tree when the inspector finishes closing:
+            // changing this layer to a plain row remounts the workspace.
+            let edge = widget::container(widget::Space::new())
+                .align_x(Alignment::End)
                 .width(Length::Fill)
-                .into()
+                .height(Length::Fill);
+            crate::interaction::layer(content.into(), edge.into())
         };
         // The bar comes and goes, but the tree around the workspace must not:
         // iced matches widget state by position, so wrapping the surface only

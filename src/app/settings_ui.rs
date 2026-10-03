@@ -627,6 +627,18 @@ fn settings_category_controls<'a>(
                             },
                         ),
                     ),
+                    setting_field(
+                        "Worktree changes icons",
+                        "Show a changes badge beside worktrees with uncommitted changes in Projects.",
+                        crate::settings_widgets::toggle(
+                            "Show worktree changes icons",
+                            draft.show_worktree_changes_icons,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::ShowWorktreeChangesIcons,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
                 ],
             ),
             settings_group(
