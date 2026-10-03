@@ -1215,6 +1215,7 @@ dependencies = [
  "tokio-util",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "tungstenite",
  "two-face",

@@ -30,11 +30,12 @@ browser engine. Normal browsing subsequently sends cookies to their destination
 sites according to browser policy. Host-only versus domain cookies, paths,
 secure and HTTP-only flags, and expiration are retained. The current browser
 engine does not enforce SameSite on requests, so only cookies explicitly marked
-`SameSite=None` are imported. Lax, Strict, and unspecified cookies are skipped;
-this can prevent some imported logins from working. Partitioned cookies and
-Firefox container cookies are also skipped because flattening them into
-an ordinary jar would broaden their scope. Unsupported and expired cookies are
-reported as skipped; unsupported encryption reports a profile error.
+`SameSite=None` with Secure are imported. Lax, Strict, unspecified, and insecure
+cookies are skipped; this can prevent some imported logins from working.
+Partitioned cookies and Firefox container cookies are also skipped because
+flattening them into an ordinary jar would broaden their scope. Unsupported and
+expired cookies are reported as skipped; unsupported encryption reports a profile
+error.
 
 The browserless build contains no importer and preserves saved browser cards.
 
@@ -53,7 +54,11 @@ than copying only the main file and losing recent logins. A snapshot is capped
 at 256 MiB and a scan at 100,000 cookie records. An extracted profile is capped
 at 20,000 cookies and 16 MiB of cookie data; one combined import is capped at
 80,000 cookies and 64 MiB. Busy or oversized profiles produce a retryable error.
-No database or decryption temporary files are created.
+No database or decryption temporary files are created. SQLite temporary storage
+stays in memory; views and untrusted schema functions are disabled on both source
+and snapshot connections. Cookie and Chromium metadata tables must be ordinary
+tables without generated columns, so database schemas cannot execute expressions
+while their records are read.
 
 Chromium v10 and v11 use AES-128-CBC with the Linux PBKDF2-SHA1 scheme. For database
 version 24 and later, the decrypted SHA-256 host binding is verified before its
@@ -65,9 +70,10 @@ back to treating ciphertext as a cookie.
 Firefox schema versions through 17 are supported. Versions 16 and 17 store
 expiration in milliseconds; older schemas store seconds. Newer schemas are
 rejected until their semantics have been checked. Integrated builds suppress
-debug and trace diagnostics from browser network and keyring dependencies even
-when requested through `RUST_LOG`, because upstream diagnostics can include
-cookie values and HTTP headers.
+info, debug, and trace diagnostics from browser network and keyring dependencies
+even when requested through `RUST_LOG`, because upstream diagnostics can include
+cookie values and HTTP headers. In particular, the pinned Servo cookie store
+logs complete Cookie headers at info level during browsing.
 
 The engine imports a bounded number of cookies per turn, allowing input and
 close events between chunks. Cancellation requires confirmation and retains

@@ -21,4 +21,5 @@ url = "2.5"
 zeroize = "1.8"
 
 [dev-dependencies]
+rusqlite = { version = "0.37", features = ["hooks"] }
 tempfile = "3.21"
