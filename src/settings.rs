@@ -652,6 +652,10 @@ const fn default_show_status_bar() -> bool {
     true
 }
 
+const fn default_show_worktree_changes_icons() -> bool {
+    true
+}
+
 const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
@@ -855,6 +859,10 @@ pub struct AppSettings {
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
+    /// Dirty-worktree badges in the Projects sidebar; hiding them leaves
+    /// source-control data and agent activity indicators intact.
+    #[serde(default = "default_show_worktree_changes_icons")]
+    pub show_worktree_changes_icons: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -934,6 +942,7 @@ impl Default for AppSettings {
             chat_content_fraction: default_native_fraction(),
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
+            show_worktree_changes_icons: default_show_worktree_changes_icons(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
@@ -3143,6 +3152,27 @@ mod tests {
         fs::write(&path, without_family).unwrap();
 
         assert_eq!(load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn worktree_changes_icons_default_on_and_persist_when_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let defaults = AppSettings::default();
+        let document = toml::to_string(&defaults).unwrap();
+        let legacy = document
+            .lines()
+            .filter(|line| !line.starts_with("show_worktree_changes_icons"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, legacy).unwrap();
+        assert!(load(&path).unwrap().show_worktree_changes_icons);
+        let disabled = AppSettings {
+            show_worktree_changes_icons: false,
+            ..defaults
+        };
+        fs::write(&path, toml::to_string(&disabled).unwrap()).unwrap();
+        assert!(!load(&path).unwrap().show_worktree_changes_icons);
     }
 
     #[test]

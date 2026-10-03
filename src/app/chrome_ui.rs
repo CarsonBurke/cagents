@@ -1170,7 +1170,7 @@ impl Cagents {
                 workspace_widget::GlobalShortcut::ToggleInspector,
                 &self.settings.keyboard_shortcuts,
             ),
-            self.context_inspector_open,
+            false,
             !self.modal_is_open(),
             (!self.modal_is_open()).then_some(Message::ToggleContextInspector),
         )
