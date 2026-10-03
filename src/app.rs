@@ -10,6 +10,7 @@ mod chrome_ui;
 mod daemon_recovery;
 mod daemon_stop;
 pub(crate) mod dialog_ui;
+mod file_manager;
 mod file_ui;
 mod git_ui;
 mod history_ui;
@@ -3979,6 +3980,7 @@ pub enum Message {
     PreviewLocalFile(CardId),
     OpenTerminalOutput(CardId),
     ExternalLinkOpened(Result<(), String>),
+    FileRevealed(Result<file_manager::RevealOutcome, String>),
     NewBrowser,
     ExternalUrlOpened(Result<(), String>),
     #[cfg(feature = "integrated-browser")]
@@ -4179,6 +4181,7 @@ struct PendingPanelOpen {
     card: CardId,
     /// Worktree-relative, exactly as the card's own file list names paths.
     path: PathBuf,
+    ignored: bool,
 }
 
 struct DirtyRepositoryClose {
@@ -9430,10 +9433,25 @@ impl Cagents {
         } else {
             Task::none()
         };
+        let ignored = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key == *key)
+            .is_some_and(|source| {
+                source
+                    .files
+                    .iter()
+                    .any(|row| row.path == *path && row.ignored)
+            });
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
-                self.pending_panel_open = Some(PendingPanelOpen { card, path });
+                self.pending_panel_open = Some(PendingPanelOpen {
+                    card,
+                    path,
+                    ignored,
+                });
                 let focus = self
                     .workspace
                     .focus(card)
@@ -9456,7 +9474,11 @@ impl Cagents {
                     key.canonical_path.clone(),
                 );
                 if let Some(card) = self.repository_card_for(&key.canonical_path) {
-                    self.pending_panel_open = Some(PendingPanelOpen { card, path });
+                    self.pending_panel_open = Some(PendingPanelOpen {
+                        card,
+                        path,
+                        ignored,
+                    });
                 }
                 task
             }
@@ -10085,10 +10107,18 @@ impl Cagents {
             .pending_panel_open
             .take()
             .expect("the pending open was just matched");
-        cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
-            card,
-            path: open.path,
-        }))
+        let action = if open.ignored {
+            let Ok(path) = RepoPath::parse(&open.path) else {
+                return Task::none();
+            };
+            RepositoryAction::OpenFileFromBrowser { card, path }
+        } else {
+            RepositoryAction::OpenFile {
+                card,
+                path: open.path,
+            }
+        };
+        cosmic::task::message(Message::Repository(action))
     }
 
     /// True when this result still describes the worktree the panel is bound
@@ -10162,11 +10192,55 @@ impl Cagents {
             untracked_changes,
             untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
         };
+        let browse_files = self.context_tab == ContextTab::Files;
+        let expanded = self
+            .sidebar_state
+            .expanded_directory_paths()
+            .cloned()
+            .collect::<Vec<_>>();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
+                let service = RepositoryService::system("git");
+                let mut snapshot = service
                     .snapshot_with_options(&worktree, options, &cancellation)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                if browse_files {
+                    let ignored = service
+                        .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
+                        .map_err(|error| error.to_string())?;
+                    snapshot.files.ignored = ignored.ignored;
+                    snapshot.files.ignored_directories = ignored.ignored_directories;
+                    for path in expanded {
+                        if !snapshot
+                            .files
+                            .ignored_directories
+                            .iter()
+                            .any(|directory| path.as_path().starts_with(directory.as_path()))
+                        {
+                            continue;
+                        }
+                        if cancellation.is_cancelled() {
+                            return Err("file listing cancelled".into());
+                        }
+                        // A disappearing or unreadable ignored folder must not hide
+                        // the rest of the worktree; the next refresh retries it.
+                        if let Ok(files) =
+                            repository_widget::load_directory_listing(&worktree, path.as_path())
+                        {
+                            for file in files {
+                                let Ok(path) = RepoPath::parse(&file.path) else {
+                                    continue;
+                                };
+                                if file.directory {
+                                    snapshot.files.ignored_directories.push(path);
+                                } else {
+                                    snapshot.files.ignored.push(path);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(snapshot)
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
@@ -12361,6 +12435,18 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::FileRevealed(result) => {
+                self.status = Some(match result {
+                    Ok(file_manager::RevealOutcome::Selected) => {
+                        TransientNotice::success("Revealed in file viewer")
+                    }
+                    Ok(file_manager::RevealOutcome::OpenedContainingFolder) => {
+                        TransientNotice::success("Opened containing folder in file viewer")
+                    }
+                    Err(error) => TransientNotice::error(error),
+                });
+                Task::none()
+            }
             Message::OpenRepository => cosmic::task::future(async {
                 let dialog = file_chooser::open::Dialog::new().title("Open project folder");
                 let result = dialog
@@ -12943,7 +13029,10 @@ impl Application for Cagents {
                 // A parked source-control navigation is answered by the very
                 // file list it is waiting on, and only after the card has taken
                 // that list.
-                let files_loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
+                let files_loaded = match &action {
+                    RepositoryAction::FilesLoaded { identity, .. } => Some(identity.clone()),
+                    _ => None,
+                };
                 let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
                 let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => runtime
@@ -13003,7 +13092,13 @@ impl Application for Cagents {
                     state.kind = CardKind::Repository(view);
                     self.persist();
                 }
-                if files_loaded {
+                // A queued refresh discards this result and advances the list
+                // generation. Keep navigation parked until its replacement
+                // lands, rather than opening a file without its Git status.
+                if files_loaded.as_ref().is_some_and(|identity| {
+                    identity.path == Path::new(".")
+                        && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.accepts_file_list(identity))
+                }) {
                     tasks.push(self.flush_pending_panel_open(card));
                 }
                 if saved
@@ -13330,6 +13425,9 @@ impl Application for Cagents {
                         Task::none()
                     }
                     SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
+                    SidebarAction::ToggleDirectory { key, path } if self.sidebar_model.source_control.as_ref().is_some_and(|source| source.files.iter().any(|row| row.path == path && row.ignored)) => {
+                        self.reload_source_control(&key)
+                    }
                     SidebarAction::ToggleDirectory { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. } if self.folder_scope(&key) => {
                         self.reload_source_control(&key)
@@ -13477,6 +13575,15 @@ impl Application for Cagents {
                     // commands are pure clipboard work that a worktree browser
                     // needs regardless of file management.
                     SidebarAction::FileCommand { key, path, command } => match command {
+                        sidebar::FileCommand::RevealInFileViewer => {
+                            if !self.source_control_is_bound(&key) {
+                                return Task::none();
+                            }
+                            let path = key.canonical_path.join(path.as_path());
+                            cosmic::task::future(async move {
+                                Message::FileRevealed(file_manager::reveal(&path).await)
+                            })
+                        }
                         sidebar::FileCommand::CopyPath => iced::clipboard::write(
                             key.canonical_path.join(path.as_path()).display().to_string(),
                         )
@@ -19268,6 +19375,63 @@ mod tests {
             next_dirty_close_control(DirtyCloseControl::Save, false, false, false),
             DirtyCloseControl::Cancel
         );
+    }
+
+    #[test]
+    fn pending_browser_navigation_waits_for_the_queued_file_list_refresh() {
+        for ignored in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let card = CardId::new();
+            let worktree = PathBuf::from("/repo");
+            let mut runtime = RepositoryRuntime::file_list_fixture(
+                RepositoryView {
+                    project: ProjectId::new(),
+                    repository: worktree.clone(),
+                    worktree: worktree.clone(),
+                    selected_file: None,
+                },
+                &["tracked.rs"],
+            );
+            drop(runtime.initial_load(card));
+            drop(runtime.update(RepositoryAction::RefreshFiles { card }));
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            let pending = PendingPanelOpen {
+                card,
+                path: PathBuf::from("tracked.rs"),
+                ignored,
+            };
+            app.pending_panel_open = Some(pending.clone());
+            let completion = |generation| {
+                Message::Repository(RepositoryAction::FilesLoaded {
+                    identity: repository_widget::AsyncIdentity {
+                        card,
+                        worktree: worktree.clone(),
+                        path: PathBuf::from("."),
+                        generation,
+                    },
+                    result: Ok(vec![repository_widget::RepositoryFile {
+                        path: PathBuf::from("tracked.rs"),
+                        staged: true,
+                        ..Default::default()
+                    }]),
+                })
+            };
+            drop(app.update(completion(0)));
+            assert_eq!(app.pending_panel_open.as_ref(), Some(&pending));
+            drop(app.update(completion(1)));
+            assert_eq!(
+                app.pending_panel_open.as_ref(),
+                Some(&pending),
+                "the queued refresh must finish before browser navigation"
+            );
+            drop(app.update(completion(2)));
+            assert!(app.pending_panel_open.is_none());
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!();
+            };
+            assert!(runtime.listed_files()[0].staged);
+        }
     }
 
     #[test]

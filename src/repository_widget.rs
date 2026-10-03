@@ -420,6 +420,12 @@ pub enum RepositoryAction {
         card: CardId,
         path: PathBuf,
     },
+    /// A validated path selected in the browser, including ignored files
+    /// absent from the repository's source-control listing.
+    OpenFileFromBrowser {
+        card: CardId,
+        path: RepoPath,
+    },
     OpenWorkingDiff {
         card: CardId,
         file: RepositoryFile,
@@ -672,6 +678,7 @@ impl RepositoryAction {
             | Self::DirectorySearchLoaded { card, .. }
             | Self::NewTerminal { card }
             | Self::OpenFile { card, .. }
+            | Self::OpenFileFromBrowser { card, .. }
             | Self::OpenWorkingDiff { card, .. }
             | Self::OpenCommittedFile { card, .. }
             | Self::SelectBranchBase { card, .. }
@@ -4644,6 +4651,20 @@ impl RepositoryRuntime {
                 }
                 self.open_file(card, path)
             }
+            RepositoryAction::OpenFileFromBrowser { card, path } => {
+                if self.blocks_navigation() {
+                    return Task::none();
+                }
+                let path = path.as_path().to_path_buf();
+                let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                    path,
+                    ..RepositoryFile::default()
+                });
+                if file.directory {
+                    return Task::none();
+                }
+                self.open_file_entry(card, file)
+            }
             RepositoryAction::FileLoaded { identity, result } => {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
@@ -6192,7 +6213,7 @@ impl RepositoryRuntime {
         identity.worktree == self.descriptor.worktree && identity.generation == self.generation
     }
 
-    fn accepts_file_list(&self, identity: &AsyncIdentity) -> bool {
+    pub(crate) fn accepts_file_list(&self, identity: &AsyncIdentity) -> bool {
         identity.worktree == self.descriptor.worktree
             && identity.generation == self.file_list_generation
     }
@@ -16883,6 +16904,34 @@ mod tests {
             path: nested.to_path_buf(),
         }));
         assert_eq!(runtime.selected_path(), Some(nested));
+    }
+
+    #[test]
+    fn repository_browser_opens_ignored_files_without_a_git_listing_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::file_list_fixture(
+            RepositoryView {
+                selected_file: None,
+                project: ProjectId::new(),
+                repository: root.path().to_path_buf(),
+                worktree: root.path().to_path_buf(),
+            },
+            &["tracked.rs"],
+        );
+        let path = RepoPath::parse("generated/nested/output.txt").unwrap();
+        assert!(!runtime.can_open_file(path.as_path()));
+        drop(runtime.update(RepositoryAction::OpenFileFromBrowser {
+            card,
+            path: path.clone(),
+        }));
+        assert_eq!(runtime.selected_path(), Some(path.as_path()));
+        assert!(matches!(runtime.document, DocumentState::Loading));
+        assert!(
+            !runtime.selected.as_ref().unwrap().changed(),
+            "ignored files are not working changes"
+        );
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
     }
 
     #[test]
