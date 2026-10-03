@@ -146,14 +146,26 @@ fn firefox_version(profile: &Profile, connection: &Connection) -> Result<i64, Er
 }
 
 fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String>, Error> {
-    let kind: String = connection
+    let (kind, definition): (String, String) = connection
         .query_row(
-            "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+            "SELECT type, sql FROM sqlite_schema WHERE name = ?1 AND type IN ('table', 'view')",
             [table],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(sql)?;
-    if kind != "table" {
+    // `pragma_table_list` connects virtual tables to determine their columns,
+    // which can execute expressions in unrelated FTS shadow tables. Inspect
+    // stored declarations instead, conservatively allowing ordinary browser
+    // CREATE TABLE statements before requesting any column metadata.
+    let mut words = definition.split_whitespace();
+    if kind != "table"
+        || !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+        || !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+    {
         return Err(Error::Unsupported);
     }
     // These static identifiers name ordinary browser tables. `table_info`
@@ -518,6 +530,47 @@ mod tests {
                 .db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn schema_inspection_never_reads_unrelated_virtual_table_data() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{Arc, atomic::AtomicUsize};
+
+        let directory = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            browser: Browser::Firefox,
+            name: "Metadata fixture".into(),
+            database: directory.path().join("cookies.sqlite"),
+        };
+        let source = Connection::open(&profile.database).unwrap();
+        source.execute_batch("CREATE TABLE moz_cookies(host TEXT); CREATE VIRTUAL TABLE unrelated USING fts5(content);").unwrap();
+        let snapshot = snapshot(&profile, &AtomicBool::new(false)).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        snapshot.authorizer(Some(move |context: AuthContext<'_>| {
+            if let AuthAction::Read { table_name, .. } = context.action
+                && table_name == "unrelated_config"
+            {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Authorization::Allow
+        }));
+        assert_eq!(
+            table_columns(&snapshot, "moz_cookies").unwrap(),
+            BTreeSet::from(["host".into()])
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Prove the observer sees FTS initialization, so the zero-read check
+        // above would fail if inspection used the table-list API again.
+        snapshot
+            .prepare("PRAGMA table_list")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     #[test]
