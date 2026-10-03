@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Directory entries walked per session store, which bounds a store that is
 /// not one, such as a home directory configured by mistake.
@@ -39,9 +40,12 @@ pub struct Found {
     pub id: String,
     pub directory: PathBuf,
     pub title: String,
-    /// Whether the transcript names itself, rather than going by its
-    /// provider.
+    /// Whether the transcript gives a title at all, its first message
+    /// included, rather than going by its provider.
     pub titled: bool,
+    /// Whether that title is a name or summary the provider or the reader
+    /// gave the conversation, rather than its first message.
+    pub named: bool,
     pub updated_at_unix_ms: i64,
 }
 
@@ -51,6 +55,8 @@ struct Header {
     id: String,
     directory: PathBuf,
     title: Option<String>,
+    /// Whether `title` is a name or summary rather than the first message.
+    named: bool,
 }
 
 /// Transcript headers by path, valid while the file keeps its size and
@@ -58,8 +64,9 @@ struct Header {
 #[derive(Default)]
 pub struct Cache(Mutex<HashMap<PathBuf, (i64, u64, Option<Header>)>>);
 
-/// Every transcript in the seeds' session stores, newest first.
-pub fn candidates(seeds: &[chat::Session]) -> Vec<Candidate> {
+/// Every transcript in the seeds' session stores, newest first, or as many
+/// as were found before `cancel` was set.
+pub fn candidates(seeds: &[chat::Session], cancel: &AtomicBool) -> Vec<Candidate> {
     let mut roots = HashSet::new();
     let mut paths = HashSet::new();
     let mut candidates = Vec::new();
@@ -79,7 +86,7 @@ pub fn candidates(seeds: &[chat::Session]) -> Vec<Candidate> {
         }
         let mut files = Vec::new();
         let mut budget = ENTRY_LIMIT;
-        collect(&root, depth, &mut budget, &mut files);
+        collect(&root, depth, &mut budget, cancel, &mut files);
         for (path, metadata) in files {
             if !paths.insert(path.clone()) {
                 continue;
@@ -103,9 +110,10 @@ fn collect(
     root: &Path,
     depth: usize,
     budget: &mut usize,
+    cancel: &AtomicBool,
     files: &mut Vec<(PathBuf, std::fs::Metadata)>,
 ) {
-    if depth == 0 || *budget == 0 {
+    if depth == 0 || *budget == 0 || cancel.load(Ordering::Relaxed) {
         return;
     }
     let Ok(directory) = std::fs::read_dir(root) else {
@@ -113,7 +121,7 @@ fn collect(
     };
     // Bound directory entries too, including unrelated files and symlinks.
     for entry in directory.flatten() {
-        if *budget == 0 {
+        if *budget == 0 || cancel.load(Ordering::Relaxed) {
             break;
         }
         *budget -= 1;
@@ -122,7 +130,7 @@ fn collect(
         };
         let path = entry.path();
         if kind.is_dir() && path.file_name().is_none_or(|name| name != "subagents") {
-            collect(&path, depth - 1, budget, files);
+            collect(&path, depth - 1, budget, cancel, files);
         } else if kind.is_file()
             && path.extension().is_some_and(|ext| ext == "jsonl")
             && let Ok(metadata) = entry.metadata()
@@ -177,6 +185,7 @@ impl Cache {
             id: header.id,
             directory: header.directory,
             titled: header.title.is_some(),
+            named: header.named,
             title: header
                 .title
                 .unwrap_or_else(|| format!("{} conversation", provider.label())),
@@ -186,16 +195,18 @@ impl Cache {
 }
 
 /// The conversations `candidates` hold, in their order, read by up to
-/// `workers` threads.
+/// `workers` threads until `cancel` is set.
 pub fn find_all(
     cache: &Cache,
     seeds: &[chat::Session],
     candidates: &[Candidate],
     workers: usize,
+    cancel: &AtomicBool,
 ) -> Vec<Found> {
     let find = |chunk: &[Candidate]| {
         chunk
             .iter()
+            .take_while(|_| !cancel.load(Ordering::Relaxed))
             .filter_map(|candidate| cache.find(seeds[candidate.seed].launch.provider, candidate))
             .collect::<Vec<_>>()
     };
@@ -290,19 +301,24 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         if wants_title {
             titles.note(&value);
         }
+        // Titles past this point are looked for only in the tail, as Claude's
+        // own picker does: it appends a conversation's name again there for
+        // that reader, OMP keeps its title on the first line, and Codex keeps
+        // names apart. Reading the whole head would double a cold index.
         if identity.is_some() && prompt.is_some() {
             break;
         }
     }
     let (id, directory) = identity?;
-    let title = |titles: Titles| titles.named.or(titles.summary).or(prompt);
+    let answer = |titles: Titles| Header {
+        id,
+        directory,
+        named: titles.named.is_some() || titles.summary.is_some(),
+        title: titles.named.or(titles.summary).or(prompt),
+    };
     // Codex keeps a conversation's name apart from it, in [`names`].
     if provider == Provider::Codex {
-        return Some(Header {
-            id,
-            directory,
-            title: title(titles),
-        });
+        return Some(answer(titles));
     }
     // A title set by renaming the conversation is appended to its end.
     if len > TAIL_BYTES {
@@ -323,11 +339,7 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
             titles.note(&value);
         }
     }
-    Some(Header {
-        id,
-        directory,
-        title: title(titles),
-    })
+    Some(answer(titles))
 }
 
 /// The titles a transcript records, the latest of each kind.
@@ -520,7 +532,7 @@ mod tests {
 
     fn discover(seeds: &[chat::Session]) -> Vec<(Found, chat::Session)> {
         let cache = Cache::default();
-        candidates(seeds)
+        candidates(seeds, &AtomicBool::new(false))
             .iter()
             .filter_map(|candidate| {
                 let seed = &seeds[candidate.seed];
@@ -598,7 +610,13 @@ mod tests {
         }
         let mut files = Vec::new();
         let mut budget = 3;
-        collect(root.path(), 3, &mut budget, &mut files);
+        collect(
+            root.path(),
+            3,
+            &mut budget,
+            &AtomicBool::new(false),
+            &mut files,
+        );
         assert_eq!(budget, 0);
         assert!(files.is_empty());
     }

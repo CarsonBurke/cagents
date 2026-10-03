@@ -3,6 +3,7 @@ use crate::agent::Provider;
 use crate::chat;
 use crate::persistence::SavedConversation;
 use cosmic::iced::futures::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
 
 /// Conversations read before the first found ones are listed, so the newest
@@ -39,6 +40,9 @@ pub(super) struct State {
     /// What earlier openings read, so reopening reads only what changed.
     cache: Arc<catalog::Cache>,
     indexer: Option<iced::task::Handle>,
+    /// Tells the indexer's thread to stop reading, which aborting its
+    /// listing alone leaves to the next batch.
+    cancel: Arc<AtomicBool>,
 }
 
 /// A conversation as the picker lists it.
@@ -193,11 +197,13 @@ fn identity(provider: Provider, id: Option<&str>, recipe: &LaunchRecipe) -> Iden
 }
 
 /// Lists saved conversations, then every conversation the seeds' providers
-/// keep, newest first, until `send` reports that nobody is listening.
+/// keep, newest first, until `send` reports that nobody is listening or
+/// `cancel` is set.
 fn index(
     saved: Result<Vec<SavedConversation>, String>,
     seeds: Vec<chat::Session>,
     cache: &catalog::Cache,
+    cancel: &AtomicBool,
     mut send: impl FnMut(Progress) -> bool,
 ) {
     let (mut entries, error) = match saved {
@@ -220,7 +226,8 @@ fn index(
             launch.session_id.as_deref(),
             &launch.recipe,
         );
-        seen.insert(key, Some(entry.card)).is_none()
+        let untitled = entry.title == chat_ui::chat_card_title(launch.provider);
+        seen.insert(key, Some((entry.card, untitled))).is_none()
     });
     let seeds: Arc<[chat::Session]> = seeds.into();
     if !send(Progress::Saved {
@@ -230,7 +237,7 @@ fn index(
     }) {
         return;
     }
-    let candidates = catalog::candidates(&seeds);
+    let candidates = catalog::candidates(&seeds, cancel);
     if !send(Progress::Counted(candidates.len())) {
         return;
     }
@@ -246,17 +253,18 @@ fn index(
         .map_or(4, std::num::NonZero::get)
         .min(8);
     let mut read = 0;
-    while read < candidates.len() {
+    while read < candidates.len() && !cancel.load(Ordering::Relaxed) {
         let batch = &candidates[read..candidates
             .len()
             .min(read + if read == 0 { FIRST_BATCH } else { BATCH })];
         read += batch.len();
         let mut conversations = Vec::new();
         let mut titles = Vec::new();
-        for mut found in catalog::find_all(cache, &seeds, batch, workers) {
+        for mut found in catalog::find_all(cache, &seeds, batch, workers, cancel) {
             if let Some(name) = names.get(&found.id) {
                 found.title = name.clone();
                 found.titled = true;
+                found.named = true;
             }
             let provider = seeds[found.seed].launch.provider;
             match seen.entry((provider, Some(found.id.clone()), homes[found.seed].clone())) {
@@ -264,11 +272,12 @@ fn index(
                     vacant.insert(None);
                     conversations.push(found);
                 }
-                // A saved conversation goes by the title its provider gives
-                // it, unless the reader renamed it here.
+                // A saved conversation goes by the name its provider gives
+                // it, and one cagents never named by its first message,
+                // unless the reader renamed it here.
                 std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    if let Some(card) = occupied.get_mut().take()
-                        && found.titled
+                    if let Some((card, untitled)) = occupied.get_mut().take()
+                        && (found.named || found.titled && untitled)
                     {
                         titles.push((card, found.title));
                     }
@@ -327,12 +336,16 @@ impl Cagents {
         .map(cosmic::Action::App)
     }
 
-    /// Opens the picker from `card`'s composer: narrowed to its provider and
-    /// project, searching for `query`, and in place of `card` when it is a
-    /// draft nothing was written in.
-    pub(super) fn open_resume_from(&mut self, card: CardId, query: String) -> Task<Message> {
+    /// Opens the picker from `card`'s composer, narrowed to its provider and
+    /// project and searching for `query`, unless something else holds the
+    /// window.
+    pub(super) fn open_resume_from(
+        &mut self,
+        card: CardId,
+        query: String,
+    ) -> Option<Task<Message>> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
-            return Task::none();
+            return None;
         };
         let provider = runtime.session.launch.provider;
         let directory = runtime.session.launch.recipe.working_directory.clone();
@@ -343,24 +356,34 @@ impl Cagents {
             );
             (name, vec![directory.clone()])
         });
+        // Transcripts record the directory as their provider resolved it.
+        let roots = roots
+            .into_iter()
+            .flat_map(|root| {
+                let canonical = root.canonicalize().ok().filter(|path| *path != root);
+                std::iter::once(root).chain(canonical)
+            })
+            .collect();
         let task = self.open_resume(Some(Scope {
             provider,
             roots,
             label: format!("{} · {project}", provider.label()),
-        }));
-        if !self.resume_ui.open {
-            return task;
-        }
-        self.resume_ui.replace = self.chat_is_unused(card).then_some(card);
-        Task::batch([task, self.update_resume(Action::Query(query))])
+        }))?;
+        Some(Task::batch([
+            task,
+            self.update_resume(Action::Query(query)),
+        ]))
     }
 
-    fn open_resume(&mut self, scope: Option<Scope>) -> Task<Message> {
+    /// Opens the picker, or answers `None` while another dialog holds the
+    /// window.
+    fn open_resume(&mut self, scope: Option<Scope>) -> Option<Task<Message>> {
         if self.modal_is_open() {
-            return Task::none();
+            return None;
         }
         self.chrome_ui.close();
         let state = &mut self.resume_ui;
+        state.cancel.store(true, Ordering::Relaxed);
         if let Some(indexer) = state.indexer.take() {
             indexer.abort();
         }
@@ -380,6 +403,8 @@ impl Cagents {
         state.selected = 0;
         let generation = state.generation;
         let cache = state.cache.clone();
+        state.cancel = Arc::default();
+        let cancel = state.cancel.clone();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let current = self.durable.cards.clone();
         let accounts = self.resume_catalog_accounts();
@@ -426,7 +451,7 @@ impl Cagents {
                         .ok()
                     })
                     .collect();
-                index(saved, seeds, &cache, |progress| {
+                index(saved, seeds, &cache, &cancel, |progress| {
                     sender.send_blocking(progress).is_ok()
                 });
             });
@@ -445,15 +470,15 @@ impl Cagents {
         }))
         .abortable();
         self.resume_ui.indexer = Some(handle);
-        Task::batch([
+        Some(Task::batch([
             iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
             indexer,
-        ])
+        ]))
     }
 
     pub(super) fn update_resume(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Open => self.open_resume(None),
+            Action::Open => self.open_resume(None).unwrap_or_else(Task::none),
             Action::Close => {
                 self.close_resume();
                 // Whatever was being prepared is abandoned with the picker.
@@ -496,7 +521,11 @@ impl Cagents {
                     return Task::none();
                 };
                 let entry = match &row.source {
-                    Source::Saved(entry) => Some(SavedConversation::clone(entry)),
+                    // Resumed under the title it is listed by.
+                    Source::Saved(entry) => Some(SavedConversation {
+                        title: row.title.clone(),
+                        ..SavedConversation::clone(entry)
+                    }),
                     Source::Found(found) => self
                         .resume_ui
                         .seeds
@@ -628,6 +657,8 @@ impl Cagents {
                     .position(|&index| state.rows[index].card == card)
             })
             .unwrap_or(0);
+        // Newer rows landing above it never page the selection out of view.
+        state.limit = state.limit.max((state.selected + 1).next_multiple_of(PAGE));
     }
 
     /// Lists the rows the query and scope admit, from the first.
@@ -749,6 +780,7 @@ impl Cagents {
         state.open = false;
         state.indexing = None;
         state.replace = None;
+        state.cancel.store(true, Ordering::Relaxed);
         if let Some(indexer) = state.indexer.take() {
             indexer.abort();
         }
@@ -1085,6 +1117,7 @@ mod tests {
             directory: directory.path().into(),
             title: "Newer".into(),
             titled: true,
+            named: true,
             updated_at_unix_ms,
         };
         let arrive = |app: &mut Cagents, updated_at_unix_ms| {
@@ -1117,6 +1150,19 @@ mod tests {
         assert_eq!(selected(&app), older.card);
         arrive(&mut app, 3);
         assert_eq!(selected(&app), older.card, "the reader's choice holds");
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::Found {
+                conversations: (4..4 + PAGE as i64).map(found).collect(),
+                titles: Vec::new(),
+                read: 1,
+            },
+        ));
+        assert_eq!(selected(&app), older.card);
+        assert!(
+            app.resume_ui.selected >= PAGE && app.resume_ui.selected < app.resume_ui.limit,
+            "a page of newer rows leaves it listed"
+        );
     }
 
     /// A search narrowed to one provider and project lists only its
@@ -1198,11 +1244,17 @@ mod tests {
         entry.session = seed.clone();
         entry.session.launch.session_id = Some(ids[1].clone());
         entry.title = chat_ui::chat_card_title(Provider::Claude).into();
+        // One cagents already named keeps its name over a first message.
+        let mut named = saved(root.path());
+        named.session = seed.clone();
+        named.session.launch.session_id = Some(ids[3].clone());
+        named.title = "Flaky tests".into();
         let mut progress = Vec::new();
         index(
-            Ok(vec![entry.clone()]),
+            Ok(vec![entry.clone(), named]),
             vec![seed],
             &catalog::Cache::default(),
+            &AtomicBool::new(false),
             |step| {
                 progress.push(step);
                 true
@@ -1211,7 +1263,7 @@ mod tests {
         let Progress::Saved { entries, .. } = &progress[0] else {
             panic!("saved conversations come first")
         };
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert!(matches!(progress[1], Progress::Counted(count) if count == ids.len()));
         let Progress::Found {
             conversations,
@@ -1222,7 +1274,7 @@ mod tests {
             panic!("the newest conversations come next")
         };
         assert_eq!(*read, FIRST_BATCH);
-        assert_eq!(conversations.len(), FIRST_BATCH - 1);
+        assert_eq!(conversations.len(), FIRST_BATCH - 2);
         assert_eq!(conversations[0].id, ids[0]);
         assert_eq!(conversations[1].id, ids[2]);
         assert_eq!(titles, &[(entry.card, "Prompt 1".to_owned())]);
@@ -1236,6 +1288,7 @@ mod tests {
             Ok(Vec::new()),
             Vec::new(),
             &catalog::Cache::default(),
+            &AtomicBool::new(false),
             |_| {
                 steps += 1;
                 false

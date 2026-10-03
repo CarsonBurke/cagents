@@ -5727,9 +5727,18 @@ impl Cagents {
                 // Resuming is the composer's own command, answered here in
                 // every state the conversation can be in.
                 if let Some(query) = resume_invocation(&runtime.composer.text()) {
-                    runtime.replace_draft(text_editor::Content::new());
-                    runtime.error = None;
-                    return self.open_resume_from(target.card, query);
+                    let Some(task) = self.open_resume_from(target.card, query) else {
+                        return Task::none();
+                    };
+                    // The command is spent once the picker answers it; a draft
+                    // it leaves untouched gives its place to what is resumed.
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.replace_draft(text_editor::Content::new());
+                        runtime.error = None;
+                    }
+                    self.resume_ui.replace =
+                        self.chat_is_unused(target.card).then_some(target.card);
+                    return task;
                 }
                 if runtime.is_draft() {
                     return self.start_chat_draft(target);
@@ -10074,6 +10083,24 @@ mod tests {
         let _ = app.resume_saved_conversation(earlier(&app, card));
         assert!(app.workspace.pending_close().is_none());
         assert!(app.workspace.order().any(|id| id == card));
+    }
+
+    /// A `/resume` the picker cannot answer is left for the writer to send
+    /// again.
+    #[test]
+    fn resume_keeps_its_draft_while_another_dialog_holds_the_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let card = draft_in(&mut app, project.path());
+        write(&mut app, card, "/resume flaky");
+        app.resume_ui.open = true;
+        submit(&mut app, card);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "/resume flaky"
+        );
+        assert_eq!(app.resume_ui.replace, None);
+        assert!(app.resume_ui.query.is_empty());
     }
 
     /// A new conversation's draft in `directory`, a folder that exists.
