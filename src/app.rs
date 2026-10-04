@@ -12237,6 +12237,7 @@ impl Application for Cagents {
                             | SidebarAction::DragWindow
                             | SidebarAction::MaximizeWindow
                             | SidebarAction::WindowMenu
+                            | SidebarAction::OpenSettings
                     ) =>
                 {
                     return self.update_device(device_ui::Action::Open);
