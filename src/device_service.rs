@@ -12,6 +12,7 @@ pub enum Operation {
         operation: crate::account::remote::Operation,
     },
     AccountsCache {
+        #[serde(with = "wire_json")]
         reports: serde_json::Value,
     },
     Skills {
@@ -19,6 +20,7 @@ pub enum Operation {
     },
     AccountsUpdate {
         expected_revision: u64,
+        #[serde(with = "wire_json")]
         registry: serde_json::Value,
     },
     AccountLogin {
@@ -78,11 +80,11 @@ pub enum Reply {
             std::collections::BTreeMap<String, String>,
         >,
     },
-    Accounts(serde_json::Value),
+    Accounts(#[serde(with = "wire_json")] serde_json::Value),
     Skills(Vec<crate::chat::Skill>),
-    AccountProbe(serde_json::Value),
-    AccountRegistry(serde_json::Value),
-    AccountLifecycle(serde_json::Value),
+    AccountProbe(#[serde(with = "wire_json")] serde_json::Value),
+    AccountRegistry(#[serde(with = "wire_json")] serde_json::Value),
+    AccountLifecycle(#[serde(with = "wire_json")] serde_json::Value),
     Login(crate::model::LaunchRecipe),
     Project {
         path: PathBuf,
@@ -95,6 +97,37 @@ pub enum Reply {
     },
     Text(String),
     Saved,
+}
+
+/// JSON's self-describing value visitor cannot run on Postcard. Keep JSON
+/// schemas at the service boundary, but frame each value as an ordinary string
+/// on the binary IPC wire. Human-readable serializers keep their existing form.
+mod wire_json {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &serde_json::Value,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            value.serialize(serializer)
+        } else {
+            serde_json::to_string(value)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<serde_json::Value, D::Error> {
+        if deserializer.is_human_readable() {
+            serde_json::Value::deserialize(deserializer)
+        } else {
+            let encoded = String::deserialize(deserializer)?;
+            serde_json::from_str(&encoded).map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 #[cfg(feature = "host")]
@@ -770,4 +803,125 @@ fn worktree_name(name: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::{
+        account::{Account, AccountHome},
+        agent::Provider,
+    };
+
+    fn roundtrip<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let bytes = postcard::to_allocvec(value).expect("serialize binary device frame");
+        let decoded: T = postcard::from_bytes(&bytes).expect("deserialize binary device frame");
+        assert_eq!(&decoded, value);
+        let json = serde_json::to_value(value).unwrap();
+        assert_eq!(serde_json::from_value::<T>(json).unwrap(), *value);
+    }
+
+    #[test]
+    fn account_device_frames_roundtrip_postcard_and_keep_json_objects() {
+        let json = serde_json::json!({
+            "registry": {"revision": 3, "accounts": []},
+            "identity": {"email": "fixture@example.invalid", "organization": null},
+            "usage": [true, false, 0, -3, 0.125, {"status": "limited"}],
+            "unicode": "plan · α", "empty": {}
+        });
+        for reply in [
+            Reply::Accounts(json.clone()),
+            Reply::AccountProbe(json.clone()),
+            Reply::AccountRegistry(json.clone()),
+            Reply::AccountLifecycle(json.clone()),
+        ] {
+            roundtrip(&reply);
+            let diagnostic = serde_json::to_value(&reply).unwrap();
+            assert!(
+                diagnostic
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_object)
+            );
+        }
+        for request in [
+            Operation::AccountsRead,
+            Operation::AccountsCache {
+                reports: json.clone(),
+            },
+            Operation::AccountsUpdate {
+                expected_revision: 3,
+                registry: json,
+            },
+        ] {
+            roundtrip(&request);
+        }
+        let key = uuid::Uuid::new_v4();
+        for home in [
+            AccountHome::System,
+            AccountHome::SystemAt {
+                path: "/remote/system".into(),
+            },
+            AccountHome::Managed {
+                key,
+                path: "/remote/managed".into(),
+            },
+            AccountHome::Linked {
+                key,
+                path: "/remote/linked".into(),
+            },
+            AccountHome::Brokered {
+                service: "fixture".into(),
+                key: "fixture".into(),
+            },
+        ] {
+            let account = Account {
+                provider: Provider::Codex,
+                home,
+            };
+            roundtrip(&Operation::AccountLogin {
+                account: account.clone(),
+            });
+            roundtrip(&Operation::AccountProbe {
+                account,
+                force: true,
+            });
+        }
+        use crate::account::remote::Operation as Lifecycle;
+        for operation in [
+            Lifecycle::Create {
+                provider: Provider::Codex,
+                copy_codex_config: true,
+            },
+            Lifecycle::Link {
+                provider: Provider::Claude,
+                key,
+                path: "/remote/linked".into(),
+            },
+            Lifecycle::Register {
+                provider: Provider::Codex,
+                key,
+            },
+            Lifecycle::Abandon {
+                provider: Provider::Codex,
+                key,
+            },
+            Lifecycle::Remove {
+                id: Account::system(Provider::Codex).id(),
+            },
+        ] {
+            roundtrip(&Operation::AccountLifecycle { operation });
+        }
+        roundtrip(&Reply::Login(crate::model::LaunchRecipe {
+            program: "/remote/bin/codex".into(),
+            arguments: vec!["login".into(), "--device-auth".into()],
+            working_directory: "/remote".into(),
+            environment: [("CODEX_HOME".into(), "/remote/managed".into())].into(),
+            unset_environment: ["OPENAI_API_KEY".into()].into(),
+        }));
+    }
 }
