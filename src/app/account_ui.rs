@@ -179,7 +179,22 @@ impl State {
     /// accounts through the registry in its configuration directory.
     pub(super) fn installation() -> Self {
         if crate::device::is_remote() {
-            return Self::new(None, None, None);
+            let mut state = Self::new(None, None, None);
+            // Device preparation captures daemon environment before the UI
+            // starts. Seed system paths immediately: the async registry read
+            // must not leave startup drafts or terminals using desktop homes.
+            state.remote_system_homes = Account::PROVIDERS
+                .into_iter()
+                .filter_map(|provider| {
+                    let environment =
+                        crate::model::agent_recovery::fresh_native_environment(provider, true);
+                    Account::system(provider)
+                        .home_directory(&|name| environment.get(name).cloned())
+                        .map(|home| (provider, home))
+                })
+                .collect();
+            state.sync_accounts();
+            return state;
         }
         let mut state = Self::new(
             Cache::installation(),
