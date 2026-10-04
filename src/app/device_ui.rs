@@ -14,6 +14,8 @@ pub enum Action {
     ConfigSave,
     ConfigSaved(Result<(), String>),
     Close,
+    BackToFile,
+    DiscardChanges,
     Path(String),
     Browse,
     Visit(PathBuf),
@@ -33,6 +35,12 @@ pub enum Action {
     Device(usize),
     DeviceOpened(Result<(), String>),
 }
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    #[default]
+    Editor,
+    GitOutput,
+}
 pub(super) struct State {
     pub open: bool,
     configure: bool,
@@ -46,6 +54,7 @@ pub(super) struct State {
     original: String,
     content: text_editor::Content<cosmic::Renderer>,
     output: String,
+    view: View,
     pathspec: String,
     worktree_name: String,
     worktree_branch: String,
@@ -71,6 +80,7 @@ impl Default for State {
             original: String::new(),
             content: text_editor::Content::new(),
             output: String::new(),
+            view: View::Editor,
             pathspec: String::new(),
             worktree_name: String::new(),
             worktree_branch: String::new(),
@@ -101,6 +111,22 @@ impl Cagents {
                     | Action::ConfigSaved(_)
             )
         {
+            return Task::none();
+        }
+        if matches!(
+            &action,
+            Action::Close
+                | Action::Open
+                | Action::Configure
+                | Action::Browse
+                | Action::Visit(_)
+                | Action::Read(_)
+                | Action::OpenProject
+        ) && self.device_ui.dirty()
+        {
+            self.device_ui.notice = Some(
+                "Unsaved changes: return to the file and save, or discard changes before continuing.".into(),
+            );
             return Task::none();
         }
         let operation = match action {
@@ -207,6 +233,15 @@ impl Cagents {
                     path: self.device_ui.path.clone().into(),
                 })
             }
+            Action::BackToFile => {
+                self.device_ui.view = View::Editor;
+                return Task::none();
+            }
+            Action::DiscardChanges => {
+                self.device_ui.content = text_editor::Content::with_text(&self.device_ui.original);
+                self.device_ui.notice = Some("Unsaved changes discarded".into());
+                return Task::none();
+            }
             Action::Close => {
                 if !self.device_ui.busy {
                     self.device_ui.open = false;
@@ -274,6 +309,7 @@ impl Cagents {
                         self.device_ui.entries = entries;
                         self.device_ui.file = None;
                         self.device_ui.output.clear();
+                        self.device_ui.view = View::Editor;
                     }
                     Ok(Reply::Text(text)) if matches!(&pending, Some(Operation::Read { .. })) => {
                         if let Some(Operation::Read { root, path }) = pending {
@@ -282,6 +318,7 @@ impl Cagents {
                         }
                         self.device_ui.original = text.clone();
                         self.device_ui.content = text_editor::Content::with_text(&text);
+                        self.device_ui.view = View::Editor;
                     }
                     Ok(Reply::Text(text)) => self.device_ui.output = text,
                     Ok(Reply::Saved) => {
@@ -318,7 +355,7 @@ impl Cagents {
             return Task::none();
         }
         if matches!(operation, Operation::Git { .. }) {
-            self.device_ui.file = None;
+            self.device_ui.view = View::GitOutput;
         }
         self.device_ui.busy = true;
         self.device_ui.pending = Some(operation.clone());
@@ -411,13 +448,16 @@ impl Cagents {
             }
             files.push(item.into());
         }
-        let preview: Element<'_, Message> = if let Some(file) = &state.file {
+        let preview: Element<'_, Message> = if let Some(file) = &state.file
+            && state.view == View::Editor
+        {
             widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     widget::text::body(file.display().to_string())
                         .width(Length::Fill)
                         .into(),
                     button("Save on device", Action::Save),
+                    button("Discard changes", Action::DiscardChanges),
                 ])
                 .into(),
                 iced::widget::text_editor(&state.content)
@@ -429,8 +469,22 @@ impl Cagents {
             .width(Length::Fill)
             .into()
         } else {
-            widget::scrollable(widget::text::body(&state.output))
-                .height(420)
+            let mut output = Vec::new();
+            if state.file.is_some() {
+                let mut controls = vec![button("Back to file", Action::BackToFile)];
+                if state.dirty() {
+                    controls.push(button("Discard changes", Action::DiscardChanges));
+                }
+                output.push(widget::row::with_children(controls).spacing(8).into());
+            }
+            output.push(
+                widget::scrollable(widget::text::body(&state.output))
+                    .height(420)
+                    .width(Length::Fill)
+                    .into(),
+            );
+            widget::column::with_children(output)
+                .spacing(8)
                 .width(Length::Fill)
                 .into()
         };
@@ -519,6 +573,9 @@ impl Cagents {
 }
 
 impl State {
+    fn dirty(&self) -> bool {
+        self.file.is_some() && self.content.text() != self.original
+    }
     pub(super) fn busy(&self) -> bool {
         self.busy
     }
@@ -527,6 +584,94 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn loaded_file() -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.device_ui.open = true;
+        app.device_ui.directory = "/remote/project".into();
+        app.device_ui.path = "/remote/project".into();
+        drop(app.update_device(Action::Read("first".into())));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("original".into())),
+        }));
+        assert!(!app.device_ui.dirty());
+        app.device_ui.content = text_editor::Content::with_text("unsaved draft");
+        app
+    }
+
+    #[test]
+    fn git_output_and_back_preserve_the_loaded_file_and_unsaved_draft() {
+        let mut app = loaded_file();
+        drop(app.update_device(Action::Git(GitOperation::Status)));
+        assert_eq!(app.device_ui.view, View::GitOutput);
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("git status output".into())),
+        }));
+        assert_eq!(app.device_ui.output, "git status output");
+        drop(app.update_device(Action::BackToFile));
+        assert_eq!(app.device_ui.view, View::Editor);
+        assert_eq!(app.device_ui.file, Some("first".into()));
+        assert_eq!(app.device_ui.directory, PathBuf::from("/remote/project"));
+        assert_eq!(app.device_ui.original, "original");
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+        drop(app.update_device(Action::Save));
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::Write { path, expected, content, .. })
+            if path == &PathBuf::from("first") && expected == "original" && content == "unsaved draft")
+        );
+    }
+
+    #[test]
+    fn unsaved_file_blocks_navigation_and_close_until_explicit_save_or_discard() {
+        for action in [
+            Action::Close,
+            Action::Open,
+            Action::Configure,
+            Action::Browse,
+            Action::Visit("/elsewhere".into()),
+            Action::Read("second".into()),
+            Action::OpenProject,
+        ] {
+            let mut app = loaded_file();
+            let generation = app.device_ui.generation;
+            drop(app.update_device(action));
+            assert_eq!(app.device_ui.generation, generation);
+            assert!(!app.device_ui.busy);
+            assert!(app.device_ui.open);
+            assert_eq!(app.device_ui.file, Some("first".into()));
+            assert_eq!(app.device_ui.content.text(), "unsaved draft");
+            assert!(
+                app.device_ui
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Unsaved changes")
+            );
+        }
+        let mut app = loaded_file();
+        // Escape follows the application's shared modal cancellation path.
+        drop(app.cancel_form_dialog());
+        assert!(app.device_ui.open);
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+        drop(app.update_device(Action::DiscardChanges));
+        assert_eq!(app.device_ui.content.text(), "original");
+        assert!(!app.device_ui.dirty());
+        drop(app.update_device(Action::Close));
+        assert!(!app.device_ui.open);
+        let mut app = loaded_file();
+        drop(app.update_device(Action::Save));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Saved),
+        }));
+        assert!(!app.device_ui.dirty());
+        drop(app.update_device(Action::Read("second".into())));
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::Read { path, .. }) if path == &PathBuf::from("second"))
+        );
+    }
+
     #[test]
     fn queued_reads_cannot_rebind_a_pending_file_or_accept_a_stale_reply() {
         let mut app = super::super::tests::context_inspector_test_app(false);
