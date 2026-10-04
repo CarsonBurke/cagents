@@ -4665,6 +4665,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::account::WindowKind;
+    use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
 
