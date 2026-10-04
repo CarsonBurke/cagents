@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::Provider;
 use crate::chat::local_time;
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod cache;
 pub mod claude;
 pub mod codex;
@@ -33,7 +33,7 @@ pub mod home;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;

@@ -20,6 +20,7 @@ Open the cagents workspace window. Prefer `cagents ui`, which starts the
 daemon first and reuses an already-running window.
 
 Options:
+  --device NAME             Connect to a configured backend device (default local)
   --new-window              Open an additional window instead of reusing one
   --window NAME             Open or focus the window saved under NAME
   --from-window NAME        Adopt the session state of the window named NAME
@@ -181,6 +182,8 @@ struct Options<'a> {
     new_window: bool,
     slot: Option<&'a str>,
     source: Option<&'a str>,
+    device: Option<&'a str>,
+    device_window_scoped: bool,
 }
 
 /// `Ok(None)` means the request was answered without opening a window, which
@@ -191,10 +194,14 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
         new_window: false,
         slot: None,
         source: None,
+        device: None,
+        device_window_scoped: false,
     };
     while let Some(argument) = arguments.next() {
         match argument {
             "--new-window" => options.new_window = true,
+            "--device" => options.device = Some(arguments.next().ok_or("missing device name")?),
+            "--device-window-scoped" => options.device_window_scoped = true,
             "--window" => options.slot = Some(arguments.next().ok_or("missing window name")?),
             "--from-window" => {
                 options.source = Some(arguments.next().ok_or("missing source window name")?);
@@ -220,13 +227,26 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         new_window,
         slot,
         source,
+        device,
+        device_window_scoped,
     } = options;
+    cagents::device::select(device)?;
+    cagents::device::prepare()?;
+    let scoped_slot = if device_window_scoped {
+        slot.map(str::to_owned)
+    } else {
+        cagents::device::window_slot(slot)?
+    };
+    let slot = scoped_slot.as_deref();
     let fixture =
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
         let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
+        let device_source = cagents::device::window_slot(source)?;
         cagents::session::SessionRuntime::initialize_window(
-            source.unwrap_or(cagents::instance::PRIMARY_WINDOW),
+            device_source
+                .as_deref()
+                .unwrap_or(cagents::instance::PRIMARY_WINDOW),
         )?;
         let (activation_tx, activation_rx) = async_channel::unbounded();
         let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;

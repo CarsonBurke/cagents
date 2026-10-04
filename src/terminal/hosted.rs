@@ -1083,7 +1083,9 @@ pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
-    ensure_daemon_ready_at(&socket, application)?;
+    if !crate::device::is_remote() {
+        ensure_daemon_ready_at(&socket, application)?;
+    }
     Ok(socket)
 }
 

@@ -295,6 +295,12 @@ pub(super) fn process_request(
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::DeviceOperation { operation } => {
+            let reply = crate::device_service::execute(operation).map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false))
+        }
         ClientRequest::Authenticate { authority } => {
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
