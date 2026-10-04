@@ -162,6 +162,7 @@ pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>)
         TerminalId::new(),
         "/project".into(),
         &account,
+        false,
     )
     .expect("a session");
     let base = Snapshot {

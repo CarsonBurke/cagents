@@ -3,6 +3,46 @@
 The Accounts pane creates a separate provider home for every added login.
 Existing system and linked homes are left unchanged.
 
+New installations use **Automatic** for each provider. Add each subscription
+once with its provider's browser or device-code sign-in. Thereafter the CLI
+uses its saved login and refreshes its own tokens; cagents never reads or
+copies credentials. Multiple personal and organization plans can remain
+signed in at the same time in separate homes.
+
+Automatic keeps using the current account until the provider reports that its
+allowance is exhausted or its login needs attention, then chooses an account
+with a recent successful quota report. Unknown, stale, reset, conflicting and
+archived accounts are excluded. Of eligible accounts, it chooses the largest
+reported remaining allowance, breaking ties consistently. New native chats,
+shell terminals and unpinned CLI agent launches use the same policy.
+
+Selecting an account in a chat pins that conversation, even if it was already
+using that account. Selecting a provider default or a project account pins
+new work in that scope. Choose **Automatic** in Settings → Accounts to restore
+automatic provider routing; clear a project choice to inherit it. Existing
+saved conversations retain their previous account.
+
+For an automatic native chat, the next unsent message can switch accounts
+between turns. The daemon fences the exact idle actor, transfers only that
+conversation's transcript to the alternate home, and requires the provider
+to confirm the same conversation before saving the change and sending the
+untouched message. Busy conversations, queued work, approvals and other live
+owners prevent switching. A failed or partially executed turn is never replayed.
+Missing, divergent or unsupported history pauses the switch and preserves the
+unsent message and original saved conversation. Omp handles its own account
+rotation. Shell terminals retain their launch homes for their lifetime.
+
+Device windows read quota and account configuration from their selected
+daemon, save account preferences there, and run sign-in on that device.
+Remote Codex sign-in uses its device-code flow, so browser consent can finish
+on the desktop without forwarding localhost callbacks. Adding, linking and
+removing managed accounts operates on the daemon's device. Linked paths are
+entered as device paths; `~/` expands to the device user's home. The daemon
+refuses removal while that home still belongs to a live hosted terminal,
+sign-in or conversation. Linked homes are forgotten without deleting their
+files. Pending sign-ins survive a window restart and are verified on the
+device before joining its account list.
+
 New Claude homes receive a one-time copy of `settings.json` and user-scoped
 `mcpServers`. This preserves hooks, permissions, status-line settings and MCP
 definitions while allowing Claude to replace its settings file normally.

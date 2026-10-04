@@ -24,19 +24,23 @@ use serde::{Deserialize, Serialize};
 use crate::agent::Provider;
 use crate::chat::local_time;
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod cache;
 pub mod claude;
 pub mod codex;
+#[cfg(feature = "host")]
+pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod home;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
+pub mod remote;
+pub mod routing;
 pub mod schedule;
 
 /// A used fraction past which an account is reported as approaching its
@@ -78,6 +82,10 @@ fn fraction(value: f64) -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AccountHome {
     System,
+    /// A selected daemon's system login, resolved on that host.
+    SystemAt {
+        path: PathBuf,
+    },
     Managed {
         key: uuid::Uuid,
         path: PathBuf,
@@ -323,7 +331,9 @@ impl Account {
             AccountHome::Managed { .. } | AccountHome::Linked { .. } => {
                 credential_overrides(self.provider)
             }
-            AccountHome::System | AccountHome::Brokered { .. } => &[],
+            AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
+                &[]
+            }
         }
     }
 
@@ -379,7 +389,7 @@ impl Account {
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
         AccountId(match &self.home {
-            AccountHome::System => format!("{provider}/system"),
+            AccountHome::System | AccountHome::SystemAt { .. } => format!("{provider}/system"),
             AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
                 format!("{provider}/{key}")
             }
@@ -393,7 +403,9 @@ impl Account {
     /// a provider-brokered account.
     pub fn registry_key(&self) -> Option<uuid::Uuid> {
         match &self.home {
-            AccountHome::System | AccountHome::Brokered { .. } => None,
+            AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
+                None
+            }
             AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => Some(*key),
         }
     }
@@ -403,7 +415,10 @@ impl Account {
     }
 
     pub fn is_system(&self) -> bool {
-        self.home == AccountHome::System
+        matches!(
+            self.home,
+            AccountHome::System | AccountHome::SystemAt { .. }
+        )
     }
 
     /// Whether a CLI keeps this account among its own and picks between
@@ -416,7 +431,10 @@ impl Account {
     pub fn brokered_service(&self) -> Option<&str> {
         match &self.home {
             AccountHome::Brokered { service, .. } => Some(service),
-            AccountHome::System | AccountHome::Managed { .. } | AccountHome::Linked { .. } => None,
+            AccountHome::System
+            | AccountHome::SystemAt { .. }
+            | AccountHome::Managed { .. }
+            | AccountHome::Linked { .. } => None,
         }
     }
 
@@ -425,7 +443,9 @@ impl Account {
     /// one provider free to be probed side by side.
     pub fn lock_name(&self) -> String {
         match &self.home {
-            AccountHome::System => self.provider.executable().to_owned(),
+            AccountHome::System | AccountHome::SystemAt { .. } => {
+                self.provider.executable().to_owned()
+            }
             AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
                 format!("{}-{}", self.provider.executable(), key.simple())
             }
@@ -443,9 +463,9 @@ impl Account {
     pub fn home_directory(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         match &self.home {
             AccountHome::Brokered { .. } => None,
-            AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
-                Some(path.clone())
-            }
+            AccountHome::SystemAt { path }
+            | AccountHome::Managed { path, .. }
+            | AccountHome::Linked { path, .. } => Some(path.clone()),
             AccountHome::System => {
                 let variable = home_variable(self.provider)?;
                 if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
@@ -475,7 +495,9 @@ impl Account {
     /// exactly as it would in the user's own shell.
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
-            AccountHome::System | AccountHome::Brokered { .. } => None,
+            AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
+                None
+            }
             AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
                 Some((home_variable(self.provider)?, path.clone()))
             }

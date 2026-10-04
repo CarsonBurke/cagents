@@ -2010,15 +2010,30 @@ fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_asker
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    let transcript = |session: TerminalId| {
+    let transcript = |session: TerminalId, expected_sender: &str, expected_body: &str| {
         let handle = host.lock().unwrap().chats[&session].handle.clone();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = handle.snapshot(None).unwrap();
-            if !snapshot.busy && snapshot.ready {
+            // The mailbox records its at-most-once delivery claim before
+            // enqueueing the actor command. Its old idle snapshot can still
+            // be visible then; wait for this exact delivery as well as idle.
+            let visible = snapshot.items.iter().any(|item| {
+                item.role == chat::Role::User
+                    && matches!(&item.content, chat::ItemContent::Delivery {
+                        kind: chat::DeliveryKind::Message,
+                        sender,
+                        body,
+                        ..
+                    } if sender == expected_sender && body == expected_body)
+            });
+            if visible && !snapshot.busy && snapshot.ready {
                 return snapshot.items;
             }
-            assert!(Instant::now() < deadline, "conversation never settled");
+            assert!(
+                Instant::now() < deadline,
+                "delivery never became visible in a settled conversation"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     };
@@ -2031,18 +2046,17 @@ fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_asker
     // A delegated agent without a title of its own goes by its channel's.
     assert!(sent.message.from.title.is_some());
     assert_eq!(delivered(&sent.message).to.session, Some(parent_session));
-    let shown =
-        transcript(parent_session)
-            .into_iter()
-            .find_map(|item| match item.content.clone() {
-                chat::ItemContent::Delivery {
-                    kind: chat::DeliveryKind::Message,
-                    sender,
-                    body,
-                    ..
-                } => Some((item.role, sender, body)),
-                _ => None,
-            });
+    let shown = transcript(parent_session, &short(child_session), &sent.message.body)
+        .into_iter()
+        .find_map(|item| match item.content.clone() {
+            chat::ItemContent::Delivery {
+                kind: chat::DeliveryKind::Message,
+                sender,
+                body,
+                ..
+            } => Some((item.role, sender, body)),
+            _ => None,
+        });
     assert_eq!(
         shown,
         Some((

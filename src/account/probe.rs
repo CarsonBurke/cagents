@@ -90,7 +90,7 @@ const SHELL_SCRUBBED_ENVIRONMENT: &[&str] = &[
 ];
 
 /// What a probe learned.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     /// The account's state, which may be "signed out" or "not installed".
     Answered {

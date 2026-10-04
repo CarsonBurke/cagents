@@ -691,11 +691,60 @@ impl Cagents {
         if self.project_for_repository(&shared.repository).is_some() {
             return Adoption::Retained;
         }
+        if crate::device::is_remote() {
+            return self.adopt_device_project(shared);
+        }
         self.open_shared_repository(&shared.repository, Some(shared.kind))
+    }
+
+    /// A device's model is already authoritative about its repository. Loading
+    /// that path through the displaying computer would inspect another host's
+    /// filesystem, and cannot supply any additional project metadata.
+    fn adopt_device_project(&mut self, shared: &ModelProject) -> Adoption {
+        if self.project_ui.closed.contains(&shared.repository)
+            || self
+                .sidebar_model
+                .projects
+                .iter()
+                .any(|project| project.repository == shared.repository)
+        {
+            return Adoption::Retained;
+        }
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: shared.name.clone(),
+            repository: shared.repository.clone(),
+            kind: shared.kind,
+            existence: Existence::Open,
+        };
+        if let Some(session) = &self.session {
+            session.save_project(project.clone());
+        }
+        self.sidebar_model.projects.push(
+            SidebarProject::new(
+                project.id,
+                RepositoryId(project.id.as_uuid()),
+                project.name,
+                project.repository,
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(project.kind),
+        );
+        self.sidebar_model
+            .apply_project_order(&self.durable.project_order);
+        self.sidebar_model.data_state = SidebarDataState::Ready;
+        Adoption::Applied
     }
 
     /// Reads a repository the shared model names and this window has not opened.
     fn open_shared_repository(&mut self, repository: &Path, kind: Option<ProjectKind>) -> Adoption {
+        if crate::device::is_remote() {
+            // Projects are adopted from their model metadata before channels.
+            // Wait for that metadata instead of probing a device path locally.
+            return Adoption::Retained;
+        }
         // Once per path. `repository_load_task` mints a fresh `ProjectId` when
         // given none, so asking twice for one repository would leave the window
         // with two projects on one checkout.
@@ -733,8 +782,9 @@ impl Cagents {
             .iter()
             .find(|project| {
                 project.repository == repository
-                    || canonical_repository(&project.repository)
-                        .is_ok_and(|canonical| canonical == repository)
+                    || !crate::device::is_remote()
+                        && canonical_repository(&project.repository)
+                            .is_ok_and(|canonical| canonical == repository)
             })
             .map(|project| project.id)
     }
@@ -882,6 +932,95 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_project_metadata_creates_durable_sidebar_without_local_filesystem() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("state.sqlite3");
+        let boot = crate::model::BootId::new("device-adoption");
+        let (session, _) = crate::session::SessionRuntime::open(&database, boot.clone()).unwrap();
+        app.session = Some(session);
+        let focus = app.workspace.focused();
+        let active = app.durable.active_channel;
+        let cards = app.durable.cards.clone();
+        let repository = PathBuf::from(format!(
+            "/device-only/{}/repository/.git",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(
+            !repository.exists(),
+            "fixture must be absent on the displaying host"
+        );
+        let metadata = ModelProject {
+            repository: repository.clone(),
+            name: "Device repository".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        assert!(matches!(
+            app.adopt_device_project(&metadata),
+            Adoption::Applied
+        ));
+        let row = app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|row| row.repository == repository)
+            .unwrap();
+        let id = row.id;
+        assert_eq!(row.name, metadata.name);
+        let channel = shared(ChannelId::new(), &repository, "Remote work", 0);
+        assert!(matches!(
+            app.adopt_shared_channel(&channel, Some(ProjectKind::Git)),
+            Adoption::Applied
+        ));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|local| local.id == channel.id && local.project_id == id)
+        );
+        assert!(matches!(
+            app.adopt_device_project(&metadata),
+            Adoption::Retained
+        ));
+        assert_eq!(
+            app.sidebar_model
+                .projects
+                .iter()
+                .filter(|project| project.id == id)
+                .count(),
+            1
+        );
+        assert_eq!(app.workspace.focused(), focus);
+        assert_eq!(app.durable.active_channel, active);
+        assert_eq!(app.durable.cards, cards);
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
+        let (mut restored, _) = crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let (projects, _) = restored.take_catalog();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, id);
+        assert_eq!(projects[0].repository, repository);
+        assert_eq!(projects[0].name, metadata.name);
+        assert_eq!(projects[0].kind, ProjectKind::Git);
+        assert!(projects[0].existence.is_open());
+        restored.shutdown();
+        app.project_ui.closed.insert(repository.clone());
+        app.sidebar_model.projects.retain(|row| row.id != id);
+        assert!(matches!(
+            app.adopt_device_project(&metadata),
+            Adoption::Retained
+        ));
+        assert!(
+            app.sidebar_model
+                .projects
+                .iter()
+                .all(|row| row.repository != repository)
+        );
+    }
 
     #[test]
     fn headless_execution_adopts_exact_target_without_stealing_focus_or_resurrecting_tombstones() {

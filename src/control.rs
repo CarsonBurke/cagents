@@ -74,6 +74,9 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
     about = "Control cagents terminals and processes"
 )]
 pub struct Cli {
+    /// Backend device from devices.json; local is the default.
+    #[arg(long, global = true)]
+    pub device: Option<String>,
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
@@ -172,6 +175,9 @@ fn parse_window_slot(value: &str) -> Result<String, String> {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
+    /// Forward a framed daemon connection over stdin/stdout (used by SSH).
+    #[command(hide = true)]
+    Bridge,
     /// Start the daemon if it is not already running.
     Start,
     /// Report whether the daemon is running.
@@ -424,7 +430,11 @@ impl ControlClient {
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         stream
-            .set_read_timeout(Some(IO_TIMEOUT))
+            .set_read_timeout(Some(if crate::device::is_remote() {
+                Duration::from_secs(30)
+            } else {
+                IO_TIMEOUT
+            }))
             .map_err(ControlError::Configure)?;
         stream
             .set_write_timeout(Some(IO_TIMEOUT))
@@ -434,6 +444,10 @@ impl ControlClient {
             next_request_id: 1,
         };
         let proof = client.handshake()?;
+        client
+            .stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
         Ok(Self {
             stream: client.stream,
             proof,
@@ -1241,6 +1255,19 @@ impl ControlClient {
         }
     }
 
+    pub fn device_operation(
+        &mut self,
+        operation: crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::DeviceOperation { operation },
+            Instant::now() + Duration::from_secs(120),
+        )? {
+            ServerResponse::DeviceOperation { reply } => Ok(reply),
+            response => Err(unexpected_response("device operation", &response)),
+        }
+    }
+
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
@@ -1583,6 +1610,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
+        ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
 
@@ -1691,6 +1719,31 @@ where
         }
     };
 
+    let _device_cleanup = crate::device::Cleanup;
+    if let Err(error) = crate::device::select(cli.device.as_deref()) {
+        emit_error(cli.json, &AppError::new("device", error));
+        return ExitCode::FAILURE;
+    }
+    if matches!(
+        cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Bridge
+        }
+    ) {
+        return match crate::device::serve_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagents daemon bridge: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
+        if let Err(error) = crate::device::prepare() {
+            emit_error(cli.json, &AppError::new("device", error));
+            return ExitCode::FAILURE;
+        }
+    }
     match execute(cli.command) {
         Ok(output) => {
             emit_success(cli.json, output);
@@ -1769,6 +1822,17 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
 }
 
 fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppError> {
+    let unique_slot = uuid::Uuid::new_v4().to_string();
+    let remote_new_window = new_window && crate::device::is_remote();
+    let new_window = new_window && !remote_new_window;
+    let slot = if remote_new_window {
+        Some(unique_slot.as_str())
+    } else {
+        slot
+    };
+    let scoped_slot =
+        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?;
+    let slot = scoped_slot.as_deref();
     let activate = || match slot {
         Some(slot) => instance::activate_window(slot),
         None => instance::activate_running_ui(),
@@ -1781,6 +1845,9 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
     let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
     loop {
         let mut command = Command::new(&executable);
+        if let Some(device) = crate::device::selected() {
+            command.args(["--device", &device.name, "--device-window-scoped"]);
+        }
         if new_window {
             command.arg("--new-window");
         }
@@ -2005,7 +2072,17 @@ fn printable(text: &str) -> String {
 }
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
+    if crate::device::is_remote() && matches!(command, DaemonCommand::Upgrade { .. }) {
+        return Err(AppError::new(
+            "device",
+            "run installation upgrades in a terminal on the selected device",
+        ));
+    }
     match command {
+        DaemonCommand::Bridge => Err(AppError::new(
+            "bridge",
+            "stdio bridge must run before command output",
+        )),
         DaemonCommand::Upgrade { yes, interrupt } => {
             let job = crate::update::upgrade_installed(yes, interrupt)
                 .map_err(|error| AppError::new("update", error))?;
@@ -2035,7 +2112,9 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         DaemonCommand::Status => {
             let paths = crate::daemon::RuntimePaths::discover()
                 .map_err(|error| AppError::new("socket_path", error))?;
-            let socket = &paths.socket;
+            let selected_socket =
+                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
+            let socket = &selected_socket;
             let mut daemon_version = None;
             let running = match ControlClient::connect(socket) {
                 Ok(mut client) => {
@@ -2407,7 +2486,12 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
             let cwd = absolute_working_directory(cwd)
                 .map_err(|error| AppError::new("working_directory", error))?;
             let recipe = if argv.is_empty() {
-                LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?
+                let mut recipe = LaunchRecipe::shell(cwd)
+                    .map_err(|error| AppError::new("login_shell", error))?;
+                if let Some(shell) = crate::device::shell() {
+                    recipe.program = shell.to_owned();
+                }
+                recipe
             } else {
                 LaunchRecipe {
                     unset_environment: Default::default(),
@@ -2894,6 +2978,18 @@ fn channel_line(channel: &ModelChannel) -> String {
 fn project_directory(path: Option<PathBuf>) -> Result<PathBuf, AppError> {
     let from =
         absolute_working_directory(path).map_err(|error| AppError::new("repository", error))?;
+    if crate::device::is_remote() {
+        return match crate::device_service::request(crate::device_service::Operation::Discover {
+            path: from,
+        }) {
+            Ok(crate::device_service::Reply::Project { path, .. }) => Ok(path),
+            Ok(_) => Err(AppError::new(
+                "repository",
+                "unexpected remote project response",
+            )),
+            Err(error) => Err(AppError::new("repository", error)),
+        };
+    }
     let canonical = from
         .canonicalize()
         .map_err(|error| AppError::new("repository", error))?;
@@ -2918,6 +3014,26 @@ fn resolve_project_location(
     model: Option<&WorkspaceModel>,
 ) -> Result<crate::project_location::ProjectLocation, AppError> {
     let from = project_directory(repository)?;
+    if crate::device::is_remote() {
+        if let Some(project) = model.and_then(|model| model.project(&from)) {
+            return Ok(crate::project_location::ProjectLocation {
+                key: from,
+                kind: project.kind,
+            });
+        }
+        return match crate::device_service::request(crate::device_service::Operation::Discover {
+            path: from,
+        }) {
+            Ok(crate::device_service::Reply::Project { key, kind, .. }) => {
+                Ok(crate::project_location::ProjectLocation { key, kind })
+            }
+            Ok(_) => Err(AppError::new(
+                "repository",
+                "unexpected remote project response",
+            )),
+            Err(error) => Err(AppError::new("repository", error)),
+        };
+    }
     crate::project_location::resolve(&from, model)
         .map_err(|error| AppError::new("repository", error))
 }
@@ -2993,6 +3109,20 @@ fn descriptor_line(terminal: &TerminalDescriptor) -> String {
 }
 
 fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
+    if crate::device::is_remote() {
+        return match cwd {
+            Some(path) if path.is_absolute() => Ok(path),
+            Some(_) => Err(io::Error::other(
+                "remote working directory must be absolute",
+            )),
+            None => {
+                crate::device::prepare()?;
+                crate::device::home()
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("remote HOME is unavailable"))
+            }
+        };
+    }
     let current = std::env::current_dir()?;
     Ok(match cwd {
         Some(path) if path.is_absolute() => path,
@@ -3001,7 +3131,7 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     })
 }
 
-fn sibling_executable(name: &str) -> io::Result<PathBuf> {
+pub(crate) fn sibling_executable(name: &str) -> io::Result<PathBuf> {
     let current = std::env::current_exe()?;
     let directory = current.parent().ok_or_else(|| {
         io::Error::new(

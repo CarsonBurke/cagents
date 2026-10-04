@@ -398,7 +398,9 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Codex),
                         if state.installed.get(&Provider::Codex) == Some(&false) { "Install Codex" } else { "ChatGPT (Codex)" },
-                        if browser_busy {
+                        if crate::device::is_remote() {
+                            "Sign in on another device with a one-time code"
+                        } else if browser_busy {
                             "A browser sign-in is pending; finish it or use a code"
                         } else {
                             "Sign in through your browser"

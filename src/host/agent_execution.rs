@@ -101,11 +101,35 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
             .into_iter()
             .find(|account| account.provider == spec.provider && account.id() == *id)
             .ok_or_else(|| "The selected provider account was removed".into()),
-        None => Ok(accounts.project_default_account(
-            &spec.target.repository,
-            spec.provider,
-            homes.as_ref(),
-        )),
+        None => {
+            let preferred = accounts.project_default_account(
+                &spec.target.repository,
+                spec.provider,
+                homes.as_ref(),
+            );
+            if !accounts.automatic(spec.provider)
+                || accounts
+                    .project_choice(&spec.target.repository, spec.provider)
+                    .is_some()
+            {
+                return Ok(preferred);
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            let entries = crate::account::cache::Cache::installation()
+                .map(|cache| cache.load(now))
+                .unwrap_or_default();
+            Ok(crate::account::routing::select_cached(
+                &accounts,
+                homes.as_ref(),
+                preferred,
+                &entries,
+                now,
+            ))
+        }
     }
 }
 

@@ -9,6 +9,7 @@ mod chat_ui;
 mod chrome_ui;
 mod daemon_recovery;
 mod daemon_stop;
+mod device_ui;
 pub(crate) mod dialog_ui;
 mod file_ui;
 mod git_ui;
@@ -1441,8 +1442,11 @@ fn display_path(path: &Path) -> Cow<'_, str> {
 /// change while the process runs. The empty-workspace surface is the default
 /// first-run view and `view` re-runs on every redraw, so resolving this there
 /// cost a blocking `getcwd` plus three allocations per frame.
-static STARTING_DIRECTORY: LazyLock<PathBuf> =
-    LazyLock::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+static STARTING_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
+    crate::device::home()
+        .cloned()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
+});
 static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
     LazyLock::new(|| format!("Starting directory: {}", display_path(&STARTING_DIRECTORY)));
 
@@ -1567,7 +1571,9 @@ fn reconcile_restored_projects(
         if !project.existence.is_open() {
             return true;
         }
-        if let Ok(canonical) = project.repository.canonicalize() {
+        if !crate::device::is_remote()
+            && let Ok(canonical) = project.repository.canonicalize()
+        {
             project.repository = canonical;
         }
         match repositories.entry(project.repository.clone()) {
@@ -3781,6 +3787,7 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
         collapsed: bool,
@@ -4540,6 +4547,7 @@ impl WorkspaceDestination {
 }
 
 pub struct Cagents {
+    device_ui: device_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
@@ -4965,6 +4973,9 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
@@ -5504,11 +5515,22 @@ impl Cagents {
                 return Task::none();
             }
         };
+        if let Some(shell) = crate::device::shell() {
+            launch.program = shell.to_owned();
+        }
         // A shell can start either provider's CLI. Give it the same default
         // homes as native conversations, and persist those choices in its
         // launch recipe so a restored terminal never silently changes login.
         for provider in Account::PROVIDERS {
             let account = self.default_account_for_directory(provider, &working_directory);
+            if crate::device::is_remote() {
+                launch
+                    .environment
+                    .extend(crate::device::environment(provider, true));
+                if matches!(account.home, account::AccountHome::System) {
+                    continue;
+                }
+            }
             launch.unset_environment.extend(
                 account
                     .credential_overrides()
@@ -7198,11 +7220,14 @@ impl Cagents {
             }
             showing.to_owned()
         };
-        let window_title = if header == APPLICATION_NAME {
+        let mut window_title = if header == APPLICATION_NAME {
             header.clone()
         } else {
             format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
         };
+        if let Some(device) = crate::device::selected() {
+            window_title = format!("{} · {}", device.name, window_title);
+        }
         self.set_header_title(header);
         match self.core.main_window_id() {
             Some(id) => self.set_window_title(window_title, id),
@@ -10351,11 +10376,17 @@ impl Cagents {
     /// The worktree and pull request dialogs: forms, whose focused field
     /// captures the keys the dialog itself answers.
     fn form_dialog_is_open(&self) -> bool {
-        self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() || self.resume_ui.open
+        self.device_ui.open
+            || self.worktree_dialog.is_some()
+            || self.pull_request_dialog.is_some()
+            || self.resume_ui.open
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.device_ui.open {
+            return self.update_device(device_ui::Action::Close);
+        }
         if self.resume_ui.open {
             return self.update_resume(resume_ui::Action::Close);
         }
@@ -11956,6 +11987,7 @@ impl Application for Cagents {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
             chrome_ui: chrome_ui::State::default()
@@ -12168,6 +12200,51 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if crate::device::is_remote() {
+            match &message {
+                Message::ChatUi(
+                    chat_ui::Action::Attach(_)
+                    | chat_ui::Action::Attached(..)
+                    | chat_ui::Action::Dropped(..),
+                )
+                | Message::TerminalDropped { .. } => {
+                    self.status = Some(TransientNotice::warning(
+                        "File attachments require transfer to the selected device; use files already on that device",
+                    ));
+                    return Task::none();
+                }
+                Message::OpenRepository => return self.update_device(device_ui::Action::Open),
+                Message::RefreshUi(_) => return Task::none(),
+                Message::PreviewLocalFile(_) => return self.update_device(device_ui::Action::Open),
+                Message::ResumeConversation(_)
+                | Message::Repository(_)
+                | Message::ProjectUi(_)
+                | Message::GitUi(_)
+                | Message::SubmitWorktree => {
+                    self.status = Some(TransientNotice::warning(
+                        "Use Device files for remote files and Git operations",
+                    ));
+                    return Task::none();
+                }
+                Message::Sidebar(action)
+                    if !matches!(
+                        action,
+                        SidebarAction::ScrollProjects(_)
+                            | SidebarAction::NavigateRow { .. }
+                            | SidebarAction::OpenChannel { .. }
+                            | SidebarAction::ToggleProjects
+                            | SidebarAction::ToggleProject(_)
+                            | SidebarAction::DragWindow
+                            | SidebarAction::MaximizeWindow
+                            | SidebarAction::WindowMenu
+                            | SidebarAction::OpenSettings
+                    ) =>
+                {
+                    return self.update_device(device_ui::Action::Open);
+                }
+                _ => {}
+            }
+        }
         self.tab_history.observe(self.workspace.focused());
         if self.chrome_ui.workspace_preview.is_none() {
             self.workspace_history
@@ -12232,6 +12309,7 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
@@ -15286,6 +15364,13 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if self.device_ui.open {
+            return Some(dialog_ui::overlay(
+                self.device_dialog(),
+                (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
+                1.0,
+            ));
+        }
         if let Some(gallery) = &self.chat_ui.image_viewer {
             return Some(gallery.view());
         }
@@ -16068,6 +16153,9 @@ fn load_project(
     cancellation: CancellationToken,
     kind: Option<ProjectKind>,
 ) -> Result<LoadedRepository, String> {
+    if crate::device::is_remote() {
+        return Err("Use Device files for remote browsing and Git operations".into());
+    }
     let directory = path
         .canonicalize()
         .map_err(|error| format!("could not resolve project {}: {error}", path.display()))?;
@@ -16106,6 +16194,9 @@ fn load_repository(
     project_id: Option<ProjectId>,
     cancellation: CancellationToken,
 ) -> Result<LoadedRepository, String> {
+    if crate::device::is_remote() {
+        return Err("Use Device files for remote browsing and Git operations".into());
+    }
     let service = RepositoryService::system("git");
     // Git discovery and stable worktree identities must see the real checkout,
     // not a spelling introduced by a picker symlink or a relative launch path.
@@ -22189,6 +22280,7 @@ mod tests {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
             active_workspace: None,

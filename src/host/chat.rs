@@ -1726,11 +1726,26 @@ fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::
     session
 }
 
+struct AccountSwitchReservation {
+    host: SharedHost,
+    source: Session,
+}
+
+impl Drop for AccountSwitchReservation {
+    fn drop(&mut self) {
+        let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
+            state.chat_spawning.remove(&self.source.id);
+        }
+    }
+}
+
 fn recover_account(
     host: &SharedHost,
     client: ClientId,
     source: Session,
     replacement: Session,
+    idle_generation: Option<u64>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 ) -> Result<ServerResponse, ProtocolError> {
     if !chat::is_account_recovery(&source, &replacement)
@@ -1741,14 +1756,60 @@ fn recover_account(
             "Account recovery must retain the exact provider, conversation and launch options",
         ));
     }
+    let automatic = idle_generation.is_some();
     match check_launch_account(&source.launch) {
         Err(failure) if failure.code == ProtocolErrorCode::AccountRemoved => {}
         Err(failure) => return Err(failure),
+        Ok(()) if automatic => {}
         Ok(()) => {
             return Err(error(
                 "The original account is available; retry the saved conversation normally",
             ));
         }
+    }
+    let mut reservation = None;
+    if let Some(generation) = idle_generation {
+        if source
+            .launch
+            .recipe
+            .environment
+            .get(crate::account::routing::AUTOMATIC_MARKER)
+            .map(String::as_str)
+            != Some("1")
+        {
+            return Err(error("This conversation has an explicitly pinned account"));
+        }
+        let handle = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            validate_proof(source.proof.as_ref(), state.proof())?;
+            let record = state.chats.get(&source.id).ok_or_else(|| error("The original conversation is no longer hosted; reconnect before switching accounts"))?;
+            if record.session.launch.provider != source.launch.provider
+                || record.session.launch.recipe != source.launch.recipe
+                || record.handle.confirmed_session_id() != source.launch.session_id
+                || record.returning_terminal
+                || record.paired_terminal.is_some()
+                || state.chat_handoffs.contains_key(&source.id)
+                || state.chat_spawning.contains_key(&source.id)
+            {
+                return Err(error(
+                    "The original conversation changed or has another live owner; account switching was paused",
+                ));
+            }
+            let handle = record.handle.clone();
+            state.chat_spawning.insert(source.id, source.clone());
+            reservation = Some(AccountSwitchReservation {
+                host: host.clone(),
+                source: source.clone(),
+            });
+            handle
+        };
+        // The actor checks this generation after every previously admitted
+        // command. A UI snapshot alone cannot prove a timed-out turn is idle.
+        crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
+        handle
+            .close_if_idle_for_resume(generation)
+            .map_err(unavailable)?;
+        crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1761,7 +1822,7 @@ fn recover_account(
                 "The original hosted conversation changed before account recovery",
             ));
         }
-        if state.chat_spawning.contains_key(&source.id)
+        if (!automatic && state.chat_spawning.contains_key(&source.id))
             || state
                 .chats
                 .get(&source.id)
@@ -1800,6 +1861,10 @@ fn recover_account(
             )
             .map_err(unavailable)?;
     }
+    // Automatic requests hold the exclusive daemon control gate. Consume
+    // the source reservation before starting its successor, whose exact
+    // conversation ID intentionally matches it.
+    drop(reservation.take());
     start(
         host,
         client,
@@ -1952,8 +2017,16 @@ fn process_inner(
         ClientRequest::ChatRecoverAccount {
             source,
             replacement,
+            idle_generation,
             execution_environment,
-        } => recover_account(host, client, source, replacement, execution_environment),
+        } => recover_account(
+            host,
+            client,
+            source,
+            replacement,
+            idle_generation,
+            execution_environment,
+        ),
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
         ClientRequest::ChatCandidates { session, source } => candidates(host, session, source),
         ClientRequest::ChatStartSelected {
@@ -3834,6 +3907,225 @@ for line in sys.stdin:
     }
 
     struct Echo(bool);
+    #[test]
+    fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("No work is issued by this fixture".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![
+                        Event::Ready(true),
+                        Event::Session {
+                            id: "12345678-1234-4234-8234-123456789abc".into(),
+                            title: None,
+                        },
+                    ],
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let provider = directory.path().join("claude");
+        let conversation = "12345678-1234-4234-8234-123456789abc";
+        std::fs::write(&provider, format!(r#"#!/bin/sh
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"{conversation}"}}'
+while IFS= read -r frame; do
+    request=$(printf '%s' "$frame" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+    if [ -n "$request" ]; then
+        printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"commands":[],"models":[]}}}}}}\n' "$request"
+    fi
+done
+"#)).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original_home = directory.path().join("original");
+        let alternate_home = directory.path().join("alternate");
+        std::fs::create_dir_all(&alternate_home).unwrap();
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let transcript = original_home
+            .join("projects")
+            .join(&project)
+            .join(format!("{conversation}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let proof = HostSessionProof {
+            host_session_id: "account-handoff".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "incarnation".into(),
+        };
+        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let source = Session {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            proof: Some(proof),
+            terminal: None,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some(conversation.into()),
+                recipe: LaunchRecipe {
+                    program: provider.to_str().unwrap().into(),
+                    arguments: Vec::new(),
+                    working_directory: cwd,
+                    environment: BTreeMap::from([
+                        ("HOME".into(), directory.path().to_str().unwrap().into()),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            original_home.to_str().unwrap().into(),
+                        ),
+                        (crate::account::routing::AUTOMATIC_MARKER.into(), "1".into()),
+                    ]),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut process_recipe = source.launch.recipe.clone();
+        process_recipe.program = "/bin/cat".into();
+        let spec = ProcessSpec::from(&process_recipe);
+        let mut initial = Step {
+            writes: vec![json!({"ready": true})],
+            events: vec![
+                Event::Ready(true),
+                Event::Session {
+                    id: conversation.into(),
+                    title: None,
+                },
+            ],
+        };
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(Idle),
+            initial,
+            store,
+            Some(conversation.into()),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.chats.insert(
+                source.id,
+                Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: source.clone(),
+                    handle: handle.clone(),
+                    source_process: None,
+                    subscribers: BTreeMap::from([(1, false)]),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        replacement.proof = None;
+        replacement.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            alternate_home.to_str().unwrap().into(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.confirmed_session_id().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let generation = handle.snapshot(None).unwrap().generation;
+        let mut pinned = source.clone();
+        pinned
+            .launch
+            .recipe
+            .environment
+            .remove(crate::account::routing::AUTOMATIC_MARKER);
+        let mut pinned_replacement = replacement.clone();
+        pinned_replacement
+            .launch
+            .recipe
+            .environment
+            .remove(crate::account::routing::AUTOMATIC_MARKER);
+        assert!(
+            recover_account(
+                &host,
+                1,
+                pinned,
+                pinned_replacement,
+                Some(generation),
+                Default::default()
+            )
+            .unwrap_err()
+            .message
+            .contains("pinned")
+        );
+        assert!(
+            recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement.clone(),
+                Some(generation + 1),
+                Default::default()
+            )
+            .is_err()
+        );
+        assert!(!handle.is_completed());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        let response = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            Default::default(),
+        )
+        .unwrap();
+        let ServerResponse::ChatAttached { session, snapshot } = response else {
+            panic!("Expected confirmed account attachment")
+        };
+        assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
+        assert_eq!(snapshot.session_id.as_deref(), Some(conversation));
+        assert_eq!(
+            std::fs::read(
+                alternate_home
+                    .join("projects")
+                    .join(project)
+                    .join(format!("{conversation}.jsonl"))
+            )
+            .unwrap(),
+            b"{}\n"
+        );
+        assert!(handle.is_completed());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        process(
+            &host,
+            1,
+            ClientRequest::ChatClose {
+                chat_id: session.id,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn account_recovery_requires_provider_confirmation_not_the_resume_hint() {
         struct Confirm;

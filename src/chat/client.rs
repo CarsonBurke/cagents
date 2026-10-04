@@ -584,7 +584,30 @@ impl ClientHandle {
             None,
             false,
             None,
-            Some(source),
+            Some((source, None)),
+            wake,
+        )
+    }
+
+    pub fn switch_account(
+        source: Session,
+        replacement: Session,
+        generation: u64,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !super::is_account_recovery(&source, &replacement) {
+            return Err("Account switch changed the saved conversation".into());
+        }
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        Self::connect_on(
+            stream,
+            replacement,
+            Intent::Start,
+            None,
+            false,
+            None,
+            Some((source, Some(generation))),
             wake,
         )
     }
@@ -596,7 +619,7 @@ impl ClientHandle {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         selection: Option<String>,
-        account_recovery: Option<Session>,
+        account_recovery: Option<(Session, Option<u64>)>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
@@ -642,11 +665,12 @@ impl ClientHandle {
         let id = session.id;
         let mut attach_request = 2;
         let mut upgrade_recovery = None;
-        let request = if let Some(source) = account_recovery {
+        let request = if let Some((source, idle_generation)) = account_recovery {
             let execution_environment = native_environment(&session, true);
             ClientRequest::ChatRecoverAccount {
                 source,
                 replacement: session,
+                idle_generation,
                 execution_environment,
             }
         } else if let Some(token) = selection {

@@ -409,6 +409,15 @@ impl ProcessExecutor for SystemProcessExecutor {
         spec: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessFailure> {
+        #[cfg(feature = "ui")]
+        if crate::device::is_remote() {
+            return Err(process_failure(
+                spec,
+                ProcessFailureKind::Spawn,
+                "remote commands must run through the selected daemon",
+                false,
+            ));
+        }
         if cancellation.is_cancelled() {
             return Err(process_failure(
                 spec,

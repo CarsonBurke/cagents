@@ -625,6 +625,19 @@ impl Handle {
         self.close()
     }
 
+    pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
+        // Publish retention before the actor's close fence: it may begin
+        // teardown immediately after acknowledging that fence.
+        if matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            self.0.retain_cleanup_receipt.store(true, Ordering::Release);
+        }
+        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        self.close_for_resume()
+    }
+
     /// Checks readiness on the actor after all previously queued commands.
     /// The caller must hold the host's exclusive control gate until checkpoint
     /// preparation finishes: a snapshot alone cannot fence a command whose
