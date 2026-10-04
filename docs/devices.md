@@ -63,6 +63,12 @@ loaded content and serialize with other cagents saves; a changed file requires a
 reload. File operations refuse symlink traversal outside their chosen directory.
 Git subprocesses have output bounds and a 30-second timeout.
 
+On Linux, an SSH login without `XDG_RUNTIME_DIR` uses the existing
+`/run/user/<uid>` directory when it belongs to the current user and has mode
+0700. Explicit runtime values keep the normal daemon validation. A headless
+host without that login runtime directory must configure an owned private
+`XDG_RUNTIME_DIR` for its daemon and SSH bridge command.
+
 Closing the window detaches its SSH streams; daemon-hosted jobs continue. SSH
 keepalives detect lost connections, and the normal terminal/chat reconnect paths
 establish new streams. Startup failures identify the selected device and include

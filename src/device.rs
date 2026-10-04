@@ -288,6 +288,26 @@ pub fn serve_stdio() -> io::Result<()> {
             "a daemon bridge cannot target another device",
         ));
     }
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            // SSH sessions often lack the login session's runtime variable.
+            // Re-exec with a child environment instead of mutating the process
+            // environment while other library threads may be running.
+            let directory = bridge_runtime_directory(std::path::Path::new("/run/user"), unsafe {
+                libc::geteuid()
+            })?;
+            return Err(Command::new(std::env::current_exe()?)
+                .args(std::env::args_os().skip(1))
+                .env("XDG_RUNTIME_DIR", directory)
+                .exec());
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(io::Error::other(
+            "XDG_RUNTIME_DIR is missing; configure an owned private runtime directory for the remote daemon",
+        ));
+    }
     let path = crate::terminal::ensure_daemon_ready().map_err(io::Error::other)?;
     let stream = UnixStream::connect(path)?;
     let mut upstream = stream.try_clone()?;
@@ -305,6 +325,31 @@ pub fn serve_stdio() -> io::Result<()> {
     }
     result.map(|_| ())
 }
+#[cfg(any(target_os = "linux", test))]
+fn bridge_runtime_directory(base: &std::path::Path, uid: u32) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = base.join(uid.to_string());
+    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "XDG_RUNTIME_DIR is missing and {} is unavailable: {error}",
+                directory.display()
+            ),
+        )
+    })?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "XDG_RUNTIME_DIR is missing and {} must be an owned private directory with mode 0700",
+                directory.display()
+            ),
+        ));
+    }
+    Ok(directory)
+}
+
 fn copy_flushed(reader: &mut impl io::Read, writer: &mut impl io::Write) -> io::Result<u64> {
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0;
@@ -326,6 +371,29 @@ fn copy_flushed(reader: &mut impl io::Read, writer: &mut impl io::Write) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bridge_runtime_fallback_requires_owned_private_real_directory() {
+        use std::os::unix::fs::symlink;
+        let base = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let directory = base.path().join(uid.to_string());
+        assert!(bridge_runtime_directory(base.path(), uid).is_err());
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            bridge_runtime_directory(base.path(), uid).unwrap(),
+            directory
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(bridge_runtime_directory(base.path(), uid).is_err());
+        fs::remove_dir(&directory).unwrap();
+        symlink(base.path(), &directory).unwrap();
+        assert!(bridge_runtime_directory(base.path(), uid).is_err());
+        fs::remove_file(&directory).unwrap();
+        fs::write(&directory, b"not a directory").unwrap();
+        assert!(bridge_runtime_directory(base.path(), uid).is_err());
+    }
+
     #[test]
     fn binary_bridge_flushes_a_response_before_reading_the_next_frame() {
         struct Writer {
