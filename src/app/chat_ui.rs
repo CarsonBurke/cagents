@@ -7994,6 +7994,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn automatic_draft_routing_waits_for_untouched_send_and_same_account_choice_pins() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 105);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let now = crate::chat::now_ms().unwrap();
+        for (id, status) in [
+            (
+                Account::system(Provider::Codex).id(),
+                account::UsageStatus::Limited,
+            ),
+            (alternate.clone(), account::UsageStatus::Ok),
+        ] {
+            let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                id,
+                outcome: account::probe::Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: account::UsageSnapshot::state(status, "", now),
+                },
+            }));
+        }
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text(
+            "Retain this unsent message",
+        ));
+        assert_eq!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .unwrap()
+                .0
+                .id(),
+            alternate
+        );
+        assert!(
+            app.automatic_chat_account(target, PromptMode::Steer)
+                .is_none()
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachment_chooser_pending = true;
+        assert!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .is_none()
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachment_chooser_pending = false;
+        drop(app.choose_chat_account(target, Account::system(Provider::Codex).id()));
+        assert!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .is_none()
+        );
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "Retain this unsent message"
+        );
+        assert!(
+            !chat_runtime(&app, card)
+                .session
+                .launch
+                .recipe
+                .environment
+                .contains_key(account::routing::AUTOMATIC_MARKER)
+        );
+    }
+
     /// A new conversation, which runs nothing until its first message is
     /// sent. Tasks are dropped throughout: nothing here starts a provider or
     /// reaches a daemon.
