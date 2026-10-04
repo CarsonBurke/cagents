@@ -38,11 +38,18 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
         .map_err(|error| error.to_string())?;
     match operation {
         Operation::Register { provider, key } | Operation::Abandon { provider, key } => {
-            if !registry
+            let pending = registry
                 .pending()
                 .iter()
-                .any(|pending| pending.provider == *provider && pending.key == *key)
-            {
+                .any(|pending| pending.provider == *provider && pending.key == *key);
+            let already_registered = matches!(operation, Operation::Register { .. })
+                && registry.find(*key).is_some_and(|registered| {
+                    registered.provider == *provider && registered.linked_home.is_none()
+                });
+            if already_registered {
+                return Ok(None);
+            }
+            if !pending {
                 return Err("The pending sign-in changed on the device".into());
             }
             Ok(Some(Account::managed(
@@ -170,6 +177,18 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
         }
         Operation::Register { provider, key } => {
             let registry = store.load().map_err(|error| error.to_string())?;
+            // A transport interruption can lose a successful reply. Retrying
+            // the same pending key must not delete or replace that login.
+            if registry.find(key).is_some_and(|registered| {
+                registered.provider == provider && registered.linked_home.is_none()
+            }) {
+                return serde_json::to_value(Settled::Registered {
+                    registry,
+                    identity: None,
+                    snapshot: None,
+                })
+                .map_err(|error| error.to_string());
+            }
             if !registry
                 .pending()
                 .iter()
@@ -389,6 +408,43 @@ mod tests {
         })
         .unwrap();
         assert!(!created.home.exists());
+        let created: Created = serde_json::from_value(
+            execute(Operation::Create {
+                provider: Provider::Codex,
+                copy_codex_config: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let homes = Homes::installation().unwrap();
+        store
+            .register_pending(
+                &homes,
+                crate::account::registry::Registered {
+                    key: created.key,
+                    provider: Provider::Codex,
+                    linked_home: None,
+                    label: None,
+                    email: Some("registered@example.invalid".into()),
+                    organization: None,
+                    added_at: 0,
+                },
+                &[],
+            )
+            .unwrap()
+            .1
+            .unwrap();
+        let operation = Operation::Register {
+            provider: Provider::Codex,
+            key: created.key,
+        };
+        assert!(affected_account(&operation).unwrap().is_none());
+        let settled: Settled = serde_json::from_value(execute(operation).unwrap()).unwrap();
+        assert!(matches!(settled, Settled::Registered { .. }));
+        assert!(
+            created.home.is_dir(),
+            "lost registration replies never remove the login"
+        );
         let linked = root.join("home/linked-account");
         std::fs::create_dir_all(&linked).unwrap();
         std::fs::write(linked.join("auth.json"), "linked-private-login").unwrap();

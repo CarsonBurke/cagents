@@ -2049,10 +2049,10 @@ impl Cagents {
                             .get(&state.account.provider)
                             .copied()
                             .unwrap_or(false),
-                        entry: state
-                            .account
-                            .cache_key()
-                            .and_then(|key| snapshot.entries.get(&key).cloned()),
+                        entry: snapshot
+                            .cache_keys
+                            .get(&state.id)
+                            .and_then(|key| snapshot.entries.get(key).cloned()),
                     })
                     .collect();
                 self.update_account_ui(Action::Loaded(Loaded {
@@ -3512,6 +3512,21 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if let Err(error) = &result {
+            let login = &mut self.account_ui.logins[index];
+            if login.attempts < LOGIN_ATTEMPTS {
+                // Registration can race the auth terminal exiting or lose an
+                // RPC reply. Keep the pending login and retry verification;
+                // daemon registration is idempotent for this exact key.
+                login.phase = LoginPhase::Waiting;
+                login.next_check = now_ms() + LOGIN_RETRY * Millis::from(login.attempts.max(1));
+                self.status = Some(TransientNotice::warning(format!(
+                    "The new {} account could not be saved yet; cagents will retry: {error}",
+                    login.provider.label()
+                )));
+                return Task::none();
+            }
+        }
         let login = self.account_ui.logins.remove(index);
         match result {
             Ok(Settled::Registered {
@@ -4651,6 +4666,12 @@ mod tests {
         ));
         app.account_ui.account_mut(&managed).unwrap().snapshot =
             Some(UsageSnapshot::state(UsageStatus::Ok, "", now));
+        assert_eq!(app.default_account(Provider::Codex).id(), managed);
+        app.account_ui.account_mut(&system.id()).unwrap().snapshot = Some(UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "Codex has not been set up",
+            now,
+        ));
         assert_eq!(app.default_account(Provider::Codex).id(), managed);
         app.account_ui.registry.set_default(&system);
         assert_eq!(app.default_account(Provider::Codex), system);
@@ -6491,6 +6512,22 @@ mod app_tests {
             recovered: false,
         });
         key
+    }
+
+    #[test]
+    fn a_transient_registration_failure_keeps_the_pending_login_for_retry() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 104);
+        app.account_ui.logins[0].phase = LoginPhase::Settling;
+        app.account_ui.logins[0].attempts = 1;
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Err("auth terminal is still closing".into()),
+        }));
+        let login = &app.account_ui.logins[0];
+        assert_eq!(login.key, key);
+        assert_eq!(login.phase, LoginPhase::Waiting);
+        assert!(login.next_check > now_ms());
     }
 
     #[test]

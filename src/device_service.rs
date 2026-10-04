@@ -364,6 +364,9 @@ pub struct AccountSnapshot {
     pub homes: Option<crate::account::home::Homes>,
     pub system_homes: std::collections::BTreeMap<crate::agent::Provider, PathBuf>,
     pub entries: std::collections::BTreeMap<String, crate::account::cache::Entry>,
+    /// Canonical cache keys must be resolved by this daemon, never the UI's filesystem.
+    #[serde(default)]
+    pub cache_keys: std::collections::BTreeMap<crate::account::AccountId, String>,
     pub catalogs:
         std::collections::BTreeMap<crate::agent::Provider, crate::account::cache::Catalog>,
     pub installed: std::collections::BTreeMap<crate::agent::Provider, bool>,
@@ -398,7 +401,13 @@ fn accounts() -> Result<Reply, String> {
         )
     })
     .collect();
+    let cache_keys = registry
+        .accounts(homes.as_ref())
+        .into_iter()
+        .filter_map(|account| account.cache_key().map(|key| (account.id(), key)))
+        .collect();
     let snapshot = AccountSnapshot {
+        cache_keys,
         registry,
         homes,
         system_homes: crate::account::Account::PROVIDERS
