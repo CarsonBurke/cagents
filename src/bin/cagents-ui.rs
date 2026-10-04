@@ -216,6 +216,10 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
             _ => return Err(format!("unknown UI argument: {argument}\n\n{USAGE}").into()),
         }
     }
+    if !options.device_window_scoped && options.slot.is_some_and(|slot| slot.starts_with("device-"))
+    {
+        return Err("window names beginning device- are reserved for device windows".into());
+    }
     if options.new_window && options.slot.is_some() {
         return Err("--new-window and --window are mutually exclusive".into());
     }
@@ -230,9 +234,18 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
     } = options;
+    let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
     cagents::device::prepare()?;
-    let scoped_slot = if device_window_scoped {
+    let unique_slot = uuid::Uuid::new_v4().to_string();
+    let remote_new_window = new_window && cagents::device::is_remote();
+    let new_window = new_window && !remote_new_window;
+    let slot = if remote_new_window {
+        Some(unique_slot.as_str())
+    } else {
+        slot
+    };
+    let scoped_slot = if device_window_scoped && !remote_new_window {
         slot.map(str::to_owned)
     } else {
         cagents::device::window_slot(slot)?
@@ -242,7 +255,11 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
         let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
-        let device_source = cagents::device::window_slot(source)?;
+        let device_source = if device_window_scoped && source.is_some() {
+            source.map(str::to_owned)
+        } else {
+            cagents::device::window_slot(source)?
+        };
         cagents::session::SessionRuntime::initialize_window(
             device_source
                 .as_deref()

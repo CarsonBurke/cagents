@@ -2423,6 +2423,9 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
 /// Preview the launch policy without changing the CLI's configuration. Once
 /// connected, the thread's own reported policy replaces this preview.
 fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+    if crate::device::is_remote() {
+        return None;
+    }
     let arguments = &recipe.arguments;
     if arguments.iter().any(|argument| {
         matches!(
@@ -2678,6 +2681,9 @@ impl Cagents {
         )
     }
     fn load_chat_files(&mut self, target: Target, directory: PathBuf) -> Task<Message> {
+        if crate::device::is_remote() {
+            return self.update_device(super::device_ui::Action::Open);
+        }
         if let Some(files) = self.chat_ui.files.get(&directory).cloned() {
             return self.handle_chat_ui(Action::Files(target, directory, files));
         }
@@ -3116,9 +3122,20 @@ impl Cagents {
         let launch = runtime.session.launch.clone();
         cosmic::task::future(async move {
             let source = launch.clone();
-            let skills = tokio::task::spawn_blocking(move || chat::skills::discover(&source))
-                .await
-                .unwrap_or_default();
+            let skills = tokio::task::spawn_blocking(move || {
+                if crate::device::is_remote() {
+                    match crate::device_service::request(crate::device_service::Operation::Skills {
+                        launch: source,
+                    }) {
+                        Ok(crate::device_service::Reply::Skills(skills)) => skills,
+                        _ => Vec::new(),
+                    }
+                } else {
+                    chat::skills::discover(&source)
+                }
+            })
+            .await
+            .unwrap_or_default();
             Message::ChatUi(Action::DraftSkills(target, launch, skills))
         })
     }
@@ -4684,6 +4701,12 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        if crate::device::is_remote() && matches!(&action, Action::PastedImage(_, Some(_))) {
+            self.status = Some(TransientNotice::warning(
+                "Images need transfer to the selected device before attachment",
+            ));
+            return Task::none();
+        }
         let focus = if let Action::Switch(card) = &action {
             self.workspace
                 .focus(*card)

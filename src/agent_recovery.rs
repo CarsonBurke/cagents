@@ -773,6 +773,9 @@ pub(crate) fn fresh_native_environment(
     provider: Provider,
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {
+    if crate::device::is_remote() {
+        return crate::device::environment(provider, persistable);
+    }
     std::env::vars()
         .filter(|(name, value)| fresh_environment_key(provider, name, value, persistable))
         .collect()

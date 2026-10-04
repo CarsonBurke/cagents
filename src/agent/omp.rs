@@ -72,7 +72,7 @@ pub(super) fn data_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
     storage_root(launch, home, "XDG_DATA_HOME")
 }
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(super) fn config_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
     storage_root(launch, home, "XDG_CONFIG_HOME")
 }
