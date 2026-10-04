@@ -231,3 +231,7 @@ winit-wayland = { path = "vendor/winit-wayland" }
 # Preserve pointer positions while Iced dispatches a queued event batch.
 [patch."https://github.com/pop-os/libcosmic.git"]
 iced_runtime = { path = "vendor/iced-runtime" }
+
+# Backport upstream long-line shaping fix until cosmic-text accepts its release.
+[patch.crates-io]
+harfrust = { path = "vendor/harfrust" }
