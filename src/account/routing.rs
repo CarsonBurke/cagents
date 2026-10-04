@@ -12,7 +12,30 @@ pub fn exhausted(snapshot: &UsageSnapshot, now: u64) -> bool {
 }
 
 pub fn needs_alternate(snapshot: &UsageSnapshot, now: u64) -> bool {
-    fresh(snapshot, now) && matches!(snapshot.status, UsageStatus::Limited | UsageStatus::NeedsLogin)
+    fresh(snapshot, now)
+        && matches!(
+            snapshot.status,
+            UsageStatus::Limited | UsageStatus::NeedsLogin
+        )
+}
+
+/// A missing system home is distinct from an unknown provider failure: cagents
+/// positively observed that this login was never configured. This observation
+/// travels with remote snapshots, so clients must not inspect their own disk.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn needs_alternate_for(account: &super::Account, snapshot: &UsageSnapshot, now: u64) -> bool {
+    needs_alternate(snapshot, now)
+        || (account.is_system()
+            && fresh(snapshot, now)
+            && snapshot.status == UsageStatus::Unavailable
+            && snapshot.detail.as_deref()
+                == Some(
+                    format!(
+                        "{} has not been set up",
+                        super::probe::cli_name(account.provider)
+                    )
+                    .as_str(),
+                ))
 }
 
 /// Only positive, current provider evidence can authorize an alternate login.
@@ -31,7 +54,8 @@ pub fn select_cached(
     now: u64,
 ) -> super::Account {
     let entry = |account: &super::Account| account.cache_key().and_then(|key| entries.get(&key));
-    if !entry(&preferred).is_some_and(|entry| needs_alternate(&entry.snapshot, now)) {
+    if !entry(&preferred).is_some_and(|entry| needs_alternate_for(&preferred, &entry.snapshot, now))
+    {
         return preferred;
     }
     registry
@@ -99,6 +123,23 @@ mod tests {
         assert!(!available(&quota, now + schedule::DISPLAY_STALE_AFTER + 1));
         quota.observed_at = now + schedule::CLOCK_SLACK + 1;
         assert!(!available(&quota, now));
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn unconfigured_system_can_route_but_generic_unavailable_cannot() {
+        let account = super::super::Account::system(crate::agent::Provider::Codex);
+        let now = 10_000;
+        let snapshot =
+            UsageSnapshot::state(UsageStatus::Unavailable, "Codex has not been set up", now);
+        assert!(needs_alternate_for(&account, &snapshot, now));
+        assert!(!needs_alternate_for(
+            &account,
+            &snapshot,
+            now + schedule::DISPLAY_STALE_AFTER + 1
+        ));
+        let unknown = UsageSnapshot::state(UsageStatus::Unavailable, "provider unavailable", now);
+        assert!(!needs_alternate_for(&account, &unknown, now));
     }
 
     #[test]

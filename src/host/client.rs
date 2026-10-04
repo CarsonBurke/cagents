@@ -292,6 +292,9 @@ pub(super) fn process_request(
                 idle_generation: Some(_),
                 ..
             }
+            | ClientRequest::DeviceOperation {
+                operation: crate::device_service::Operation::AccountLifecycle { .. }
+            }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
@@ -300,6 +303,41 @@ pub(super) fn process_request(
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
+            if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
+                let account =
+                    crate::account::remote::affected_account(operation).map_err(|message| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    })?;
+                if let Some(account) = account {
+                    let variable = crate::account::home_variable(account.provider).unwrap();
+                    let home = account.resolved_home().unwrap();
+                    let uses = |recipe: &crate::model::LaunchRecipe| {
+                        recipe
+                            .environment
+                            .get(variable)
+                            .is_some_and(|path| std::path::Path::new(path) == home)
+                    };
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    if state
+                        .terminals
+                        .values()
+                        .any(|record| !record.handle.is_completed() && uses(&record.session.launch))
+                        || state.chats.values().any(|record| {
+                            record.handle.owns_work() && uses(&record.session.launch.recipe)
+                        })
+                        || state
+                            .chat_spawning
+                            .values()
+                            .any(|session| uses(&session.launch.recipe))
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
+                            false,
+                        ));
+                    }
+                }
+            }
             let reply = crate::device_service::execute(operation).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
             })?;

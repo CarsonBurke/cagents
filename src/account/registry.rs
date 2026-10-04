@@ -333,7 +333,7 @@ impl Registry {
     pub fn is_default(&self, account: &Account) -> bool {
         let chosen = self.defaults.get(account.provider.executable());
         match &account.home {
-            AccountHome::System => chosen.is_none_or(|chosen| {
+            AccountHome::System | AccountHome::SystemAt { .. } => chosen.is_none_or(|chosen| {
                 chosen == SYSTEM
                     || Uuid::parse_str(chosen)
                         .ok()
@@ -357,7 +357,7 @@ impl Registry {
             return;
         }
         let value = match &account.home {
-            AccountHome::System => SYSTEM.to_owned(),
+            AccountHome::System | AccountHome::SystemAt { .. } => SYSTEM.to_owned(),
             AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
                 key.hyphenated().to_string()
             }
@@ -379,7 +379,7 @@ impl Registry {
     /// named by its CLI, not here.
     pub fn label(&self, account: &Account) -> Option<&str> {
         match &account.home {
-            AccountHome::System => self
+            AccountHome::System | AccountHome::SystemAt { .. } => self
                 .system_labels
                 .get(account.provider.executable())
                 .map(String::as_str),
@@ -395,7 +395,7 @@ impl Registry {
         let label = label.as_deref().and_then(super::clean_label);
         match &account.home {
             AccountHome::Brokered { .. } => {}
-            AccountHome::System => {
+            AccountHome::System | AccountHome::SystemAt { .. } => {
                 let provider = account.provider.executable().to_owned();
                 match label {
                     Some(label) => {

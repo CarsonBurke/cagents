@@ -8,6 +8,12 @@ pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 pub enum Operation {
     Home,
     AccountsRead,
+    AccountLifecycle {
+        operation: crate::account::remote::Operation,
+    },
+    AccountsCache {
+        reports: serde_json::Value,
+    },
     AccountsUpdate {
         expected_revision: u64,
         registry: serde_json::Value,
@@ -65,6 +71,7 @@ pub enum Reply {
     Accounts(serde_json::Value),
     AccountProbe(serde_json::Value),
     AccountRegistry(serde_json::Value),
+    AccountLifecycle(serde_json::Value),
     Login(crate::model::LaunchRecipe),
     Project {
         path: PathBuf,
@@ -85,6 +92,33 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use std::{fs, io::Write};
     match operation {
         Operation::AccountsRead => accounts(),
+        Operation::AccountLifecycle { operation } => {
+            crate::account::remote::execute(operation).map(Reply::AccountLifecycle)
+        }
+        Operation::AccountsCache { reports } => {
+            use crate::account::{
+                Account,
+                cache::{Cache, Catalog, Entry},
+            };
+            let (entries, catalogs): (
+                Vec<(Account, Entry)>,
+                Vec<(crate::agent::Provider, Catalog)>,
+            ) = serde_json::from_value(reports).map_err(|error| error.to_string())?;
+            let cache = Cache::installation().ok_or("The device account cache is unavailable")?;
+            for (account, entry) in entries {
+                if let Some(key) = account.cache_key() {
+                    cache
+                        .store(&key, entry)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            for (provider, catalog) in catalogs {
+                cache
+                    .store_catalog(provider, catalog)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(Reply::Saved)
+        }
         Operation::AccountsUpdate {
             expected_revision,
             registry,
@@ -328,6 +362,7 @@ pub fn request(operation: Operation) -> Result<Reply, String> {
 pub struct AccountSnapshot {
     pub registry: crate::account::registry::Registry,
     pub homes: Option<crate::account::home::Homes>,
+    pub system_homes: std::collections::BTreeMap<crate::agent::Provider, PathBuf>,
     pub entries: std::collections::BTreeMap<String, crate::account::cache::Entry>,
     pub catalogs:
         std::collections::BTreeMap<crate::agent::Provider, crate::account::cache::Catalog>,
@@ -366,6 +401,14 @@ fn accounts() -> Result<Reply, String> {
     let snapshot = AccountSnapshot {
         registry,
         homes,
+        system_homes: crate::account::Account::PROVIDERS
+            .into_iter()
+            .filter_map(|provider| {
+                crate::account::Account::system(provider)
+                    .resolved_home()
+                    .map(|home| (provider, home))
+            })
+            .collect(),
         entries: cache
             .as_ref()
             .map(|cache| cache.load(now))
@@ -438,9 +481,13 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
-    if !registry.all_accounts(homes.as_ref()).contains(&account) {
-        return Err("account is not registered on this device".into());
-    }
+    let account = registry
+        .all_accounts(homes.as_ref())
+        .into_iter()
+        .find(|registered| {
+            registered.id() == account.id() && registered.resolved_home() == account.resolved_home()
+        })
+        .ok_or("account is not registered on this device")?;
     let arguments = match account.provider {
         Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
         Provider::Codex => vec!["login".into(), "--device-auth".into()],

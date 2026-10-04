@@ -2901,6 +2901,7 @@ impl Cagents {
             return None;
         };
         if runtime.target != target
+            || runtime.is_draft() && !runtime.choosing()
             || runtime.pastes_pending > 0
             || runtime.composer.text().trim().is_empty() && runtime.attachments.is_empty()
             || runtime

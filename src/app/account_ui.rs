@@ -46,6 +46,19 @@ use crate::agent::Provider;
 
 mod table;
 
+fn remote_lifecycle<T: serde::de::DeserializeOwned>(
+    operation: account::remote::Operation,
+) -> Result<T, String> {
+    match crate::device_service::request(crate::device_service::Operation::AccountLifecycle {
+        operation,
+    })? {
+        crate::device_service::Reply::AccountLifecycle(value) => {
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+        _ => Err("The device did not complete its account operation".into()),
+    }
+}
+
 pub(super) use table::Sort;
 
 /// How often a visible, focused window re-reads the clock and asks the
@@ -81,6 +94,7 @@ pub(super) struct State {
     registry: Registry,
     store: Option<Store>,
     homes: Option<Homes>,
+    remote_system_homes: BTreeMap<Provider, PathBuf>,
     /// The clock as of the last event that read it. Views format against
     /// this rather than reading the clock themselves, so a frame is a pure
     /// function of the state and a test can state the time.
@@ -164,6 +178,9 @@ impl State {
     /// of this installation through the cache in its state directory, and
     /// accounts through the registry in its configuration directory.
     pub(super) fn installation() -> Self {
+        if crate::device::is_remote() {
+            return Self::new(None, None, None);
+        }
         let mut state = Self::new(
             Cache::installation(),
             Store::installation(),
@@ -181,6 +198,7 @@ impl State {
             registry,
             store,
             homes,
+            remote_system_homes: BTreeMap::new(),
             now_ms: now_ms(),
             popover: None,
             cache,
@@ -215,6 +233,13 @@ impl State {
     /// keeps what is known about it.
     fn sync_accounts(&mut self) {
         let mut wanted = self.registry.all_accounts(self.homes.as_ref());
+        for account in &mut wanted {
+            if account.is_system()
+                && let Some(path) = self.remote_system_homes.get(&account.provider)
+            {
+                account.home = account::AccountHome::SystemAt { path: path.clone() };
+            }
+        }
         wanted.extend(self.omp.accounts.iter().cloned());
         let mut previous: BTreeMap<AccountId, AccountState> = std::mem::take(&mut self.accounts)
             .into_iter()
@@ -717,23 +742,7 @@ impl Login {
     }
 }
 
-/// How a sign-in ended.
-#[derive(Debug, Clone)]
-pub enum Settled {
-    /// The account joined the registry, now as given.
-    Registered {
-        registry: Registry,
-        identity: Option<Identity>,
-        snapshot: Option<UsageSnapshot>,
-    },
-    /// The login duplicated the account named, and was signed out again.
-    Duplicate {
-        existing: AccountId,
-        registry: Option<Registry>,
-    },
-    /// Nothing was signed in, and the home is gone.
-    Abandoned(Option<Registry>),
-}
+pub use crate::account::remote::Settled;
 
 /// What the startup load found.
 #[derive(Debug, Clone)]
@@ -757,6 +766,9 @@ pub struct Restored {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
+    RemoteLoaded(Result<crate::device_service::AccountSnapshot, String>),
+    RemoteLogin(AccountId, Result<LaunchRecipe, String>),
     Install(Provider),
     Tick,
     Loaded(Loaded),
@@ -1346,6 +1358,14 @@ impl Cagents {
             .account_ui
             .registry
             .all_accounts(self.account_ui.homes.as_ref());
+        accounts = accounts
+            .into_iter()
+            .map(|account| {
+                self.account_ui
+                    .account(&account.id())
+                    .map_or(account.clone(), |state| state.account.clone())
+            })
+            .collect();
         accounts.push(Account::system(Provider::Omp));
         accounts
     }
@@ -1405,8 +1425,11 @@ impl Cagents {
     /// Whether anything shows account usage, which is the only reason to
     /// ask for it.
     fn accounts_surface_visible(&self) -> bool {
-        self.settings.show_status_bar || self.utility_card(&CardKind::Accounts).is_some()
-            || Account::PROVIDERS.into_iter().any(|provider| self.account_ui.registry.automatic(provider))
+        self.settings.show_status_bar
+            || self.utility_card(&CardKind::Accounts).is_some()
+            || Account::PROVIDERS
+                .into_iter()
+                .any(|provider| self.account_ui.registry.automatic(provider))
     }
 
     /// Ticks while anything shows account usage. Unfocused, a tick only
@@ -1445,6 +1468,25 @@ impl Cagents {
     /// Omp's usage record is read beside it, on its own: a read that waits
     /// on Omp writing holds back no other account.
     pub(super) fn load_accounts(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return cosmic::task::future(async {
+                let result =
+                    tokio::task::spawn_blocking(|| {
+                        match crate::device_service::request(
+                            crate::device_service::Operation::AccountsRead,
+                        )? {
+                            crate::device_service::Reply::Accounts(value) => {
+                                serde_json::from_value(value).map_err(|error| error.to_string())
+                            }
+                            _ => Err("The device did not return its accounts".into()),
+                        }
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                Message::AccountUi(Action::RemoteLoaded(result))
+            });
+        }
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
@@ -1535,6 +1577,25 @@ impl Cagents {
 
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return cosmic::task::future(async {
+                let result =
+                    tokio::task::spawn_blocking(|| {
+                        match crate::device_service::request(
+                            crate::device_service::Operation::AccountsRead,
+                        )? {
+                            crate::device_service::Reply::Accounts(value) => {
+                                serde_json::from_value(value).map_err(|error| error.to_string())
+                            }
+                            _ => Err("The device did not return its accounts".into()),
+                        }
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                Message::AccountUi(Action::RemoteLoaded(result))
+            });
+        }
         let Some(store) = self.account_ui.store.clone() else {
             return Task::none();
         };
@@ -1553,6 +1614,32 @@ impl Cagents {
         &mut self,
         change: impl FnOnce(&mut Registry) + Send + 'static,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            let expected_revision = self.account_ui.registry.revision();
+            let mut registry = self.account_ui.registry.clone();
+            change(&mut registry);
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let registry =
+                        serde_json::to_value(registry).map_err(|error| error.to_string())?;
+                    match crate::device_service::request(
+                        crate::device_service::Operation::AccountsUpdate {
+                            expected_revision,
+                            registry,
+                        },
+                    )? {
+                        crate::device_service::Reply::AccountRegistry(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
+                        }
+                        _ => Err("The device did not save account preferences".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::AccountUi(Action::Saved(result))
+            });
+        }
         let Some(store) = self.account_ui.store.clone() else {
             // A window without a configuration directory keeps its choices
             // for as long as it runs.
@@ -1696,7 +1783,24 @@ impl Cagents {
         let account = state.account.clone();
         let id = state.id.clone();
         let probe = cosmic::task::future(async move {
-            let outcome = probe::run(account, cache, force).await;
+            let outcome = if crate::device::is_remote() {
+                tokio::task::spawn_blocking(move || {
+                    match crate::device_service::request(
+                        crate::device_service::Operation::AccountProbe { account, force },
+                    )? {
+                        crate::device_service::Reply::AccountProbe(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
+                        }
+                        _ => Err("The device did not return account usage".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result)
+                .unwrap_or_else(Outcome::Failed)
+            } else {
+                probe::run(account, cache, force).await
+            };
             Message::AccountUi(Action::Probed { id, outcome })
         });
         // The refresh control comes back the moment its debounce lifts,
@@ -1859,7 +1963,7 @@ impl Cagents {
             return Task::none();
         }
         self.refresh_chat_drafts();
-        if self.account_ui.cache.is_none() {
+        if self.account_ui.cache.is_none() && !crate::device::is_remote() {
             return Task::none();
         }
         self.account_ui.catalogs_unsaved.insert(provider);
@@ -1869,7 +1973,7 @@ impl Cagents {
     /// Queues `id`'s figures for the cache, written a little later together
     /// with whatever else arrives meanwhile.
     fn save_live(&mut self, id: AccountId) -> Task<Message> {
-        if self.account_ui.cache.is_none() {
+        if self.account_ui.cache.is_none() && !crate::device::is_remote() {
             return Task::none();
         }
         self.account_ui.live_unsaved.insert(id);
@@ -1905,6 +2009,76 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::RemoteHomeReady(provider, result) => match result {
+                Ok(created) => {
+                    let task = self.begin_account_login(
+                        provider,
+                        created.key,
+                        created.home,
+                        created.recipe,
+                    );
+                    Task::batch([task, self.reload_registry()])
+                }
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(error));
+                    Task::none()
+                }
+            },
+            Action::RemoteLoaded(result) => {
+                let snapshot = match result {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "The device accounts could not be read: {error}"
+                        )));
+                        return Task::none();
+                    }
+                };
+                self.account_ui.homes = snapshot.homes;
+                self.account_ui.remote_system_homes = snapshot.system_homes;
+                self.account_ui.set_registry(snapshot.registry.clone());
+                self.account_ui.sync_accounts();
+                let restored = self
+                    .account_ui
+                    .accounts
+                    .iter()
+                    .map(|state| Restored {
+                        id: state.id.clone(),
+                        present: snapshot
+                            .installed
+                            .get(&state.account.provider)
+                            .copied()
+                            .unwrap_or(false),
+                        entry: state
+                            .account
+                            .cache_key()
+                            .and_then(|key| snapshot.entries.get(&key).cloned()),
+                    })
+                    .collect();
+                self.update_account_ui(Action::Loaded(Loaded {
+                    registry: Ok(snapshot.registry),
+                    restored,
+                    installed: snapshot.installed,
+                    catalogs: snapshot.catalogs,
+                    provisional: false,
+                }))
+            }
+            Action::RemoteLogin(id, result) => {
+                let recipe = match result {
+                    Ok(recipe) => recipe,
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error));
+                        return Task::none();
+                    }
+                };
+                let now = now_ms();
+                if let Some(state) = self.account_ui.account_mut(&id) {
+                    state.schedule.await_login(now);
+                    state.signing_in_from = state.identity.clone();
+                }
+                self.open_login_terminal(recipe, "Sign in on device".into())
+                    .0
+            }
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
                 self.account_ui.installed = loaded.installed;
@@ -1972,6 +2146,19 @@ impl Cagents {
                 self.account_ui.saving_live = false;
                 let entries = self.account_ui.take_live_entries();
                 let catalogs = self.account_ui.take_live_catalogs();
+                if crate::device::is_remote() {
+                    return cosmic::iced::Task::future(async move {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let reports = serde_json::to_value((entries, catalogs))
+                                .map_err(|error| error.to_string())?;
+                            crate::device_service::request(
+                                crate::device_service::Operation::AccountsCache { reports },
+                            )
+                        })
+                        .await;
+                    })
+                    .discard();
+                }
                 let Some(cache) = self
                     .account_ui
                     .cache
@@ -2576,6 +2763,24 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if crate::device::is_remote() {
+            self.account_ui.popover = None;
+            self.account_ui.table.close_popups();
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    match crate::device_service::request(
+                        crate::device_service::Operation::AccountLogin { account },
+                    )? {
+                        crate::device_service::Reply::Login(recipe) => Ok(recipe),
+                        _ => Err("The device did not prepare its provider login".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::AccountUi(Action::RemoteLogin(id, result))
+            });
+        }
         if account.provider == Provider::Codex {
             if self.codex_browser_busy() {
                 self.status = Some(TransientNotice::warning(account::login::BUSY));
@@ -2757,6 +2962,25 @@ impl Cagents {
         }
         self.account_ui.table.linking = true;
         let key = uuid::Uuid::new_v4();
+        if crate::device::is_remote() {
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    remote_lifecycle::<(Registry, uuid::Uuid)>(account::remote::Operation::Link {
+                        provider,
+                        key,
+                        path: raw_path,
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                let (key, result) = match result {
+                    Ok((registry, key)) => (key, Ok(registry)),
+                    Err(error) => (key, Err(error)),
+                };
+                Message::AccountUi(Action::LinkReady { key, result })
+            });
+        }
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let fallback = self.account_ui.registry.clone();
@@ -2820,6 +3044,23 @@ impl Cagents {
     /// Creates the new account's home off the interface thread, with the
     /// reader's shared entries linked in, and finds its CLI.
     fn add_account(&mut self, provider: Provider, device: bool) -> Task<Message> {
+        if crate::device::is_remote() {
+            let copy_codex_config = self.account_ui.table.own_codex_config;
+            self.account_ui.table.close_popups();
+            self.account_ui.popover = None;
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    remote_lifecycle(account::remote::Operation::Create {
+                        provider,
+                        copy_codex_config,
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::AccountUi(Action::RemoteHomeReady(provider, result))
+            });
+        }
         let codex_config = if self.account_ui.table.own_codex_config {
             account::home::CodexConfig::Copy
         } else {
@@ -2902,6 +3143,16 @@ impl Cagents {
             )));
             return self.discard_home(key, provider);
         };
+        self.begin_account_login(provider, key, home, launch)
+    }
+
+    fn begin_account_login(
+        &mut self,
+        provider: Provider,
+        key: uuid::Uuid,
+        home: PathBuf,
+        launch: LaunchRecipe,
+    ) -> Task<Message> {
         let (task, _) =
             self.open_login_terminal(launch, format!("Add a {} account", provider.label()));
         let now = now_ms();
@@ -2920,6 +3171,17 @@ impl Cagents {
 
     /// Deletes a home that never became an account, and its pending entry.
     fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
+        if crate::device::is_remote() {
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    remote_lifecycle(account::remote::Operation::Abandon { provider, key })
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::AccountUi(Action::LoginSettled { key, result })
+            });
+        }
         let homes = self.account_ui.homes.clone();
         let store = self.account_ui.store.clone();
         cosmic::task::future(async move {
@@ -3089,7 +3351,27 @@ impl Cagents {
                 }
             }
             // No cache: the answer is about a home no other window knows.
-            let outcome = probe::run(account, None, true).await;
+            let outcome = if crate::device::is_remote() {
+                tokio::task::spawn_blocking(move || {
+                    match crate::device_service::request(
+                        crate::device_service::Operation::AccountProbe {
+                            account,
+                            force: true,
+                        },
+                    )? {
+                        crate::device_service::Reply::AccountProbe(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
+                        }
+                        _ => Err("The device did not verify its provider login".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result)
+                .unwrap_or_else(Outcome::Failed)
+            } else {
+                probe::run(account, None, true).await
+            };
             Message::AccountUi(Action::LoginVerified { key, outcome })
         })
     }
@@ -3150,6 +3432,17 @@ impl Cagents {
             return self.discard_home(key, provider);
         }
         login.phase = LoginPhase::Settling;
+        if crate::device::is_remote() {
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    remote_lifecycle(account::remote::Operation::Register { provider, key })
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::AccountUi(Action::LoginSettled { key, result })
+            });
+        }
         let managed = registry::Registered {
             key,
             provider,
@@ -3293,6 +3586,28 @@ impl Cagents {
         if !self.account_ui.removing.insert(id.clone()) {
             return Task::none();
         }
+        if crate::device::is_remote() {
+            return cosmic::task::future(async move {
+                let remove_id = id.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    remote_lifecycle::<(Registry, Option<String>)>(
+                        account::remote::Operation::Remove { id: remove_id },
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                let (registry, error) = match result {
+                    Ok((registry, error)) => (Some(registry), error),
+                    Err(error) => (None, Some(error)),
+                };
+                Message::AccountUi(Action::Removed {
+                    id,
+                    registry,
+                    error,
+                })
+            });
+        }
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let fallback = self.account_ui.registry.clone();
@@ -3347,6 +3662,10 @@ impl Cagents {
             .account_ui
             .registry
             .default_account(provider, self.account_ui.homes.as_ref());
+        let preferred = self
+            .account_ui
+            .account(&preferred.id())
+            .map_or(preferred.clone(), |state| state.account.clone());
         if self.account_ui.registry.automatic(provider) {
             self.automatic_account(&preferred).unwrap_or(preferred)
         } else {
@@ -3378,7 +3697,7 @@ impl Cagents {
         if !source
             .snapshot
             .as_ref()
-            .is_some_and(|snapshot| account::routing::needs_alternate(snapshot, now))
+            .is_some_and(|snapshot| account::routing::needs_alternate_for(current, snapshot, now))
         {
             return None;
         }
@@ -3515,6 +3834,10 @@ impl Cagents {
             provider,
             self.account_ui.homes.as_ref(),
         );
+        let preferred = self
+            .account_ui
+            .account(&preferred.id())
+            .map_or(preferred.clone(), |state| state.account.clone());
         if self.automatic_accounts_for_directory(provider, directory) {
             self.automatic_account(&preferred).unwrap_or(preferred)
         } else {
@@ -4314,6 +4637,55 @@ mod tests {
     use crate::account::WindowKind;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn automatic_defaults_use_a_fresh_signed_in_plan_and_explicit_defaults_pin() {
+        let mut app = context_inspector_test_app(false);
+        let system = Account::system(Provider::Codex);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 101);
+        let now = now_ms();
+        app.account_ui.account_mut(&system.id()).unwrap().snapshot = Some(UsageSnapshot::state(
+            UsageStatus::NeedsLogin,
+            "signed out",
+            now,
+        ));
+        app.account_ui.account_mut(&managed).unwrap().snapshot =
+            Some(UsageSnapshot::state(UsageStatus::Ok, "", now));
+        assert_eq!(app.default_account(Provider::Codex).id(), managed);
+        app.account_ui.registry.set_default(&system);
+        assert_eq!(app.default_account(Provider::Codex), system);
+        app.account_ui.registry.set_automatic(Provider::Codex);
+        app.account_ui
+            .account_mut(&managed)
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .observed_at = now - schedule::DISPLAY_STALE_AFTER - 1;
+        assert_eq!(app.default_account(Provider::Codex), system);
+    }
+
+    #[test]
+    fn device_system_home_is_preserved_in_defaults_and_resuming() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui
+            .remote_system_homes
+            .insert(Provider::Codex, "/device/home/.codex".into());
+        app.account_ui.sync_accounts();
+        let account = app.default_account(Provider::Codex);
+        assert!(account.is_system());
+        assert_eq!(account.id(), Account::system(Provider::Codex).id());
+        assert_eq!(
+            account.resolved_home().unwrap(),
+            PathBuf::from("/device/home/.codex")
+        );
+        let resumed = app
+            .resume_catalog_accounts()
+            .into_iter()
+            .find(|account| account.provider == Provider::Codex && account.is_system())
+            .unwrap();
+        assert_eq!(resumed.resolved_home(), account.resolved_home());
+    }
 
     #[test]
     fn provider_installation_probe_includes_omp_without_any_registered_accounts() {
