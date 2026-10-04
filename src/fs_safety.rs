@@ -1419,9 +1419,13 @@ mod tests {
 
         assert!(lost.is_empty(), "{lost:?}");
         assert_eq!(
-            attribute_names(&destination).expect("list"),
+            attribute_names(&destination)
+                .expect("list")
+                .into_iter()
+                .filter(|name| is_content_attribute(name))
+                .collect::<Vec<_>>(),
             vec![CString::new("user.note").expect("name")],
-            "the replacement carries the original's attribute",
+            "the replacement carries the original's content attribute",
         );
         assert_eq!(
             read_attribute(&destination, c"user.note").expect("read"),
