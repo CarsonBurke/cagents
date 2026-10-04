@@ -86,7 +86,7 @@ pub fn shared_entries(provider: Provider) -> &'static [&'static str] {
 }
 
 /// The directory every managed home of an installation lives under.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Homes {
     root: PathBuf,
 }

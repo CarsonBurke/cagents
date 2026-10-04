@@ -835,6 +835,7 @@ pub enum Action {
     },
     CancelLogin(uuid::Uuid),
     SetDefault(AccountId),
+    SetAutomatic(Provider),
     SetProjectDefault(crate::model::ProjectId, AccountId),
     ClearProjectDefault(crate::model::ProjectId, Provider),
     Rename(AccountId),
@@ -877,6 +878,7 @@ impl Action {
                 | Self::LinkCommit
                 | Self::CancelLogin(_)
                 | Self::SetDefault(_)
+                | Self::SetAutomatic(_)
                 | Self::SetProjectDefault(_, _)
                 | Self::ClearProjectDefault(_, _)
                 | Self::Rename(_)
@@ -1404,6 +1406,7 @@ impl Cagents {
     /// ask for it.
     fn accounts_surface_visible(&self) -> bool {
         self.settings.show_status_bar || self.utility_card(&CardKind::Accounts).is_some()
+            || Account::PROVIDERS.into_iter().any(|provider| self.account_ui.registry.automatic(provider))
     }
 
     /// Ticks while anything shows account usage. Unfocused, a tick only
@@ -2200,6 +2203,9 @@ impl Cagents {
                     Some(card) => self.close_offstrip_sign_in(card),
                     None => self.check_logins(),
                 }
+            }
+            Action::SetAutomatic(provider) => {
+                self.save_registry(move |registry| registry.set_automatic(provider))
             }
             Action::SetDefault(id) => {
                 self.account_ui.table.close_popups();
@@ -3337,9 +3343,76 @@ impl Cagents {
 
     /// The account `provider` starts new work on outside a project.
     pub(super) fn default_account(&self, provider: Provider) -> Account {
-        self.account_ui
+        let preferred = self
+            .account_ui
             .registry
-            .default_account(provider, self.account_ui.homes.as_ref())
+            .default_account(provider, self.account_ui.homes.as_ref());
+        if self.account_ui.registry.automatic(provider) {
+            self.automatic_account(&preferred).unwrap_or(preferred)
+        } else {
+            preferred
+        }
+    }
+
+    pub(super) fn automatic_accounts_for_directory(
+        &self,
+        provider: Provider,
+        directory: &Path,
+    ) -> bool {
+        self.account_ui.registry.automatic(provider)
+            && self
+                .project_for_directory(directory)
+                .is_none_or(|(_, _, repository)| {
+                    self.account_ui
+                        .registry
+                        .project_choice(repository, provider)
+                        .is_none()
+                })
+    }
+
+    /// Keep an account until the provider reports exhaustion. Alternatives
+    /// need current successful quota evidence and a nonconflicting identity.
+    pub(super) fn automatic_account(&self, current: &Account) -> Option<Account> {
+        let now = now_ms();
+        let source = self.account_ui.account(&current.id())?;
+        if !source
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| account::routing::needs_alternate(snapshot, now))
+        {
+            return None;
+        }
+        self.account_ui
+            .of(current.provider)
+            .filter(|candidate| {
+                candidate.id != source.id && candidate.present && candidate.failure.is_none()
+            })
+            .filter(|candidate| self.account_ui.login_conflict(candidate).is_none())
+            .filter(|candidate| {
+                !candidate
+                    .account
+                    .registry_key()
+                    .is_some_and(|key| self.account_ui.registry.is_archived(key))
+            })
+            .filter(|candidate| {
+                candidate
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| account::routing::available(snapshot, now))
+            })
+            .max_by(|left, right| {
+                let allowance = |candidate: &AccountState| {
+                    candidate
+                        .snapshot
+                        .as_ref()
+                        .and_then(UsageSnapshot::binding_window)
+                        .map_or(1.0, UsageWindow::left)
+                };
+                allowance(left)
+                    .total_cmp(&allowance(right))
+                    .then_with(|| right.id.cmp(&left.id))
+            })
+            .map(|candidate| candidate.account.clone())
     }
 
     /// The longest known worktree or repository root containing `directory`
@@ -3437,11 +3510,16 @@ impl Cagents {
         let Some((_, _, repository)) = self.project_for_directory(directory) else {
             return self.default_account(provider);
         };
-        self.account_ui.registry.project_default_account(
+        let preferred = self.account_ui.registry.project_default_account(
             repository,
             provider,
             self.account_ui.homes.as_ref(),
-        )
+        );
+        if self.automatic_accounts_for_directory(provider, directory) {
+            self.automatic_account(&preferred).unwrap_or(preferred)
+        } else {
+            preferred
+        }
     }
 
     /// The account named `id`, if it is still known.
@@ -3581,7 +3659,8 @@ impl Cagents {
                         .map(|account| DefaultChoice {
                             id: account.id.clone(),
                             label: state.display_name(account),
-                            selected: state.registry.is_default(&account.account),
+                            selected: !state.registry.automatic(provider)
+                                && state.registry.is_default(&account.account),
                         })
                         .collect(),
                 )

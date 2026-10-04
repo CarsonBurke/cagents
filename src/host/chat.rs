@@ -1726,11 +1726,26 @@ fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::
     session
 }
 
+struct AccountSwitchReservation {
+    host: SharedHost,
+    source: Session,
+}
+
+impl Drop for AccountSwitchReservation {
+    fn drop(&mut self) {
+        let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
+            state.chat_spawning.remove(&self.source.id);
+        }
+    }
+}
+
 fn recover_account(
     host: &SharedHost,
     client: ClientId,
     source: Session,
     replacement: Session,
+    idle_generation: Option<u64>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 ) -> Result<ServerResponse, ProtocolError> {
     if !chat::is_account_recovery(&source, &replacement)
@@ -1741,14 +1756,60 @@ fn recover_account(
             "Account recovery must retain the exact provider, conversation and launch options",
         ));
     }
+    let automatic = idle_generation.is_some();
     match check_launch_account(&source.launch) {
         Err(failure) if failure.code == ProtocolErrorCode::AccountRemoved => {}
         Err(failure) => return Err(failure),
+        Ok(()) if automatic => {}
         Ok(()) => {
             return Err(error(
                 "The original account is available; retry the saved conversation normally",
             ));
         }
+    }
+    let mut reservation = None;
+    if let Some(generation) = idle_generation {
+        if source
+            .launch
+            .recipe
+            .environment
+            .get(crate::account::routing::AUTOMATIC_MARKER)
+            .map(String::as_str)
+            != Some("1")
+        {
+            return Err(error("This conversation has an explicitly pinned account"));
+        }
+        let handle = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            validate_proof(source.proof.as_ref(), state.proof())?;
+            let record = state.chats.get(&source.id).ok_or_else(|| error("The original conversation is no longer hosted; reconnect before switching accounts"))?;
+            if record.session.launch.provider != source.launch.provider
+                || record.session.launch.recipe != source.launch.recipe
+                || record.handle.confirmed_session_id() != source.launch.session_id
+                || record.returning_terminal
+                || record.paired_terminal.is_some()
+                || state.chat_handoffs.contains_key(&source.id)
+                || state.chat_spawning.contains_key(&source.id)
+            {
+                return Err(error(
+                    "The original conversation changed or has another live owner; account switching was paused",
+                ));
+            }
+            let handle = record.handle.clone();
+            state.chat_spawning.insert(source.id, source.clone());
+            reservation = Some(AccountSwitchReservation {
+                host: host.clone(),
+                source: source.clone(),
+            });
+            handle
+        };
+        // The actor checks this generation after every previously admitted
+        // command. A UI snapshot alone cannot prove a timed-out turn is idle.
+        crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
+        handle
+            .close_if_idle_for_resume(generation)
+            .map_err(unavailable)?;
+        crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1761,7 +1822,7 @@ fn recover_account(
                 "The original hosted conversation changed before account recovery",
             ));
         }
-        if state.chat_spawning.contains_key(&source.id)
+        if (!automatic && state.chat_spawning.contains_key(&source.id))
             || state
                 .chats
                 .get(&source.id)
@@ -1800,6 +1861,10 @@ fn recover_account(
             )
             .map_err(unavailable)?;
     }
+    // Automatic requests hold the exclusive daemon control gate. Consume
+    // the source reservation before starting its successor, whose exact
+    // conversation ID intentionally matches it.
+    drop(reservation.take());
     start(
         host,
         client,
@@ -1952,8 +2017,16 @@ fn process_inner(
         ClientRequest::ChatRecoverAccount {
             source,
             replacement,
+            idle_generation,
             execution_environment,
-        } => recover_account(host, client, source, replacement, execution_environment),
+        } => recover_account(
+            host,
+            client,
+            source,
+            replacement,
+            idle_generation,
+            execution_environment,
+        ),
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
         ClientRequest::ChatCandidates { session, source } => candidates(host, session, source),
         ClientRequest::ChatStartSelected {

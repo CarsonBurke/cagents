@@ -249,6 +249,9 @@ pub enum ClientRequest {
     ChatRecoverAccount {
         source: crate::chat::Session,
         replacement: crate::chat::Session,
+        /// Automatic handoff fences the exact idle actor before replacing it.
+        #[serde(default)]
+        idle_generation: Option<u64>,
         execution_environment: ChatExecutionEnvironment,
     },
     ChatAttach {

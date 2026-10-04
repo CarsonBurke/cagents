@@ -24,19 +24,22 @@ use serde::{Deserialize, Serialize};
 use crate::agent::Provider;
 use crate::chat::local_time;
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod cache;
 pub mod claude;
 pub mod codex;
+#[cfg(feature = "host")]
+pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod home;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
+pub mod routing;
 pub mod schedule;
 
 /// A used fraction past which an account is reported as approaching its

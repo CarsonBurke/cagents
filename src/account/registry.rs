@@ -367,6 +367,14 @@ impl Registry {
             .insert(account.provider.executable().to_owned(), value);
     }
 
+    pub fn automatic(&self, provider: Provider) -> bool {
+        !self.defaults.contains_key(provider.executable())
+    }
+
+    pub fn set_automatic(&mut self, provider: Provider) {
+        self.defaults.remove(provider.executable());
+    }
+
     /// The name the reader gave `account`, if any. A brokered account is
     /// named by its CLI, not here.
     pub fn label(&self, account: &Account) -> Option<&str> {
