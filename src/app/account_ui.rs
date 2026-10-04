@@ -6261,7 +6261,6 @@ mod app_tests {
         let home = directory.path().join("redact-history");
         std::fs::create_dir(&home).unwrap();
         let mut app = app_in_repo();
-        let project = app.sidebar_model.projects[0].id;
         let key = uuid::Uuid::new_v4();
         let linked = Account::linked(Provider::Codex, key, home.clone());
         let mut registry = app.account_ui.registry.clone();
@@ -6382,7 +6381,6 @@ mod app_tests {
     fn delayed_account_save_cannot_restore_an_older_choice_in_the_window() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
-        let project = crate::model::ProjectId::new();
         let first = store
             .update(|registry| {
                 registry.set_project_default(Path::new("/repo"), &Account::system(Provider::Codex));
