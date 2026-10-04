@@ -15,6 +15,9 @@ pub(super) fn worktree_root<'a>(
 /// Missing directories are not navigable worktrees. A permission or transient
 /// I/O failure is not evidence of deletion, so retain those rows for recovery.
 pub(super) fn worktree_directory_available(path: &Path) -> bool {
+    if crate::device::is_remote() {
+        return true;
+    }
     match path.metadata() {
         Ok(metadata) => metadata.is_dir(),
         Err(error) => !matches!(
@@ -629,6 +632,12 @@ impl Cagents {
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
+        if crate::device::is_remote() {
+            return self
+                .active_workspace
+                .clone()
+                .or_else(|| crate::device::home().cloned());
+        }
         if let Some(path) = self
             .workspace
             .focused()

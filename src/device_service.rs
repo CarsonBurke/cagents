@@ -8,6 +8,9 @@ pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 pub enum Operation {
     Home,
     AccountsRead,
+    Skills {
+        launch: crate::chat::Launch,
+    },
     AccountsUpdate {
         expected_revision: u64,
         registry: serde_json::Value,
@@ -30,7 +33,7 @@ pub enum Operation {
         path: PathBuf,
     },
     /// Expected bytes make saving optimistic: changed files are never silently
-    /// overwritten after the user's read.
+    /// overwritten by another device-window save after the user's read.
     Write {
         root: PathBuf,
         path: PathBuf,
@@ -45,6 +48,9 @@ pub enum Operation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
     Status,
+    Worktrees,
+    CreateWorktree { name: String, branch: String },
+    RemoveWorktree { name: String },
     Diff { staged: bool },
     Stage { paths: Vec<PathBuf> },
     Unstage { paths: Vec<PathBuf> },
@@ -61,8 +67,13 @@ pub enum Reply {
     Home {
         path: PathBuf,
         shell: String,
+        environment: std::collections::BTreeMap<
+            crate::agent::Provider,
+            std::collections::BTreeMap<String, String>,
+        >,
     },
     Accounts(serde_json::Value),
+    Skills(Vec<crate::chat::Skill>),
     AccountProbe(serde_json::Value),
     AccountRegistry(serde_json::Value),
     Login(crate::model::LaunchRecipe),
@@ -85,6 +96,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use std::{fs, io::Write};
     match operation {
         Operation::AccountsRead => accounts(),
+        Operation::Skills { launch } => Ok(Reply::Skills(crate::chat::skills::discover(&launch))),
         Operation::AccountsUpdate {
             expected_revision,
             registry,
@@ -109,7 +121,19 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
                 .map(PathBuf::from)
                 .ok_or("remote HOME is unavailable")?;
             let shell = crate::model::login_shell().map_err(|error| error.to_string())?;
-            Ok(Reply::Home { path, shell })
+            Ok(Reply::Home {
+                path,
+                shell,
+                environment: crate::agent::Provider::ALL
+                    .into_iter()
+                    .map(|provider| {
+                        (
+                            provider,
+                            crate::model::agent_recovery::fresh_native_environment(provider, true),
+                        )
+                    })
+                    .collect(),
+            })
         }
         Operation::Discover { path } => {
             let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
@@ -159,6 +183,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             expected,
             content,
         } => {
+            let canonical_root = std::fs::canonicalize(&root).map_err(|error| error.to_string())?;
+            let lock = mutation_lock(canonical_root.join(&path));
+            let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
             if content.len() as u64 > MAX_TEXT_BYTES {
                 return Err("text exceeds remote editor limit (512 KiB)".into());
             }
@@ -176,6 +203,12 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
                 fs_safety::create_temporary_in(&parent, metadata.permissions().mode())
                     .map_err(|error| error.to_string())?;
             let saved = (|| {
+                fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
+                if !fs_safety::copy_extended_attributes(&original, &file).is_empty() {
+                    return Err(
+                        "remote save cannot preserve this file's extended attributes".into(),
+                    );
+                }
                 file.write_all(content.as_bytes())
                     .map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
@@ -216,6 +249,8 @@ fn read(root: &crate::fs_safety::Root, path: &std::path::Path) -> Result<String,
 fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
     use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
     let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let lock = mutation_lock(root.clone());
+    let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut command =
         CommandSpec::new("git")
             .cwd(root)
@@ -225,6 +260,69 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
     let staging = matches!(&operation, GitOperation::Stage { .. });
     command = match operation {
         GitOperation::Status => command.args(["status", "--short", "--branch"]),
+        GitOperation::Worktrees => command.args(["worktree", "list"]),
+        GitOperation::CreateWorktree { name, branch } => {
+            worktree_name(&name)?;
+            if branch.starts_with('-') || branch.len() > 256 {
+                return Err("worktree branch must be a valid branch name".into());
+            }
+            let check = CommandSpec::new("git")
+                .cwd(
+                    command
+                        .current_dir
+                        .clone()
+                        .ok_or("repository directory unavailable")?,
+                )
+                .args(["check-ref-format", "--branch"])
+                .arg(&branch);
+            let check = SystemProcessExecutor
+                .execute(&check, &CancellationToken::new())
+                .map_err(|error| error.to_string())?;
+            if !check.success {
+                return Err("worktree branch must be a valid branch name".into());
+            }
+            let root = command
+                .current_dir
+                .as_ref()
+                .ok_or("repository directory unavailable")?;
+            let ignored_path = format!(".worktrees/{name}/cagents-ignore-check");
+            let ignore = CommandSpec::new("git")
+                .cwd(root)
+                .args(["check-ignore", "--quiet", "--"])
+                .arg(ignored_path);
+            let ignored = SystemProcessExecutor
+                .execute(&ignore, &CancellationToken::new())
+                .map_err(|error| error.to_string())?;
+            if !ignored.success {
+                return Err("ignore .worktrees/ in .gitignore or .git/info/exclude before creating a worktree".into());
+            }
+            let directory = root.join(".worktrees");
+            crate::secure_file::reject_symlink_components(&directory)
+                .map_err(|error| error.to_string())?;
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            let destination = directory.join(name);
+            command
+                .args(["worktree", "add", "-b"])
+                .arg(branch)
+                .arg("--")
+                .arg(destination)
+        }
+        GitOperation::RemoveWorktree { name } => {
+            worktree_name(&name)?;
+            let root = command
+                .current_dir
+                .as_ref()
+                .ok_or("repository directory unavailable")?;
+            let destination = root.join(".worktrees").join(name);
+            crate::secure_file::reject_symlink_components(&destination)
+                .map_err(|error| error.to_string())?;
+            command.args(["worktree", "remove", "--"]).arg(destination)
+        }
         GitOperation::Diff { staged } => {
             let command = command.args(["diff", "--no-ext-diff", "--no-textconv"]);
             if staged {
@@ -271,6 +369,100 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
+    #[test]
+    fn git_operations_and_worktrees_target_the_daemon_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let run = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        std::fs::write(root.join("-option"), "initial\n").unwrap();
+        let invoke = |operation| {
+            execute(Operation::Git {
+                root: root.clone(),
+                operation,
+            })
+        };
+        invoke(GitOperation::Stage {
+            paths: vec!["-option".into()],
+        })
+        .unwrap();
+        invoke(GitOperation::Commit {
+            message: "initial".into(),
+        })
+        .unwrap();
+        std::fs::write(root.join("-option"), "changed\n").unwrap();
+        assert!(
+            matches!(invoke(GitOperation::Diff {staged:false}).unwrap(),Reply::Text(text) if text.contains("+changed"))
+        );
+        assert!(
+            invoke(GitOperation::CreateWorktree {
+                name: "dev".into(),
+                branch: "feature/dev".into()
+            })
+            .is_err()
+        );
+        std::fs::write(root.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        invoke(GitOperation::CreateWorktree {
+            name: "dev".into(),
+            branch: "feature/dev".into(),
+        })
+        .unwrap();
+        assert!(root.join(".worktrees/dev/-option").exists());
+        std::fs::write(root.join(".worktrees/dev/untracked"), "keep").unwrap();
+        assert!(invoke(GitOperation::RemoveWorktree { name: "dev".into() }).is_err());
+        assert!(root.join(".worktrees/dev/untracked").exists());
+        std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
+        invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
+        assert!(!root.join(".worktrees/dev").exists());
+        assert!(
+            invoke(GitOperation::CreateWorktree {
+                name: "../escape".into(),
+                branch: "escape".into()
+            })
+            .is_err()
+        );
+    }
+    #[test]
+    fn concurrent_device_saves_conflict_instead_of_overwriting() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("file"), "old").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let threads = ["first", "second"].map(|content| {
+            let barrier = barrier.clone();
+            let root = directory.path().to_owned();
+            std::thread::spawn(move || {
+                barrier.wait();
+                execute(Operation::Write {
+                    root,
+                    path: "file".into(),
+                    expected: "old".into(),
+                    content: content.into(),
+                })
+            })
+        });
+        barrier.wait();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+    }
     #[test]
     fn writes_remote_file_and_refuses_conflicts_and_escape() {
         let dir = tempfile::tempdir().unwrap();
@@ -484,4 +676,42 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             .map(|name| (*name).to_owned())
             .collect(),
     }))
+}
+
+#[cfg(feature = "host")]
+fn mutation_lock(path: PathBuf) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&path).and_then(|lock| lock.upgrade()) {
+        return lock;
+    }
+    let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    locks.insert(path, std::sync::Arc::downgrade(&lock));
+    lock
+}
+
+#[cfg(feature = "host")]
+fn worktree_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 80
+        || name == "."
+        || name == ".."
+        || name.starts_with('-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || [b'-', b'_', b'.'].contains(&byte))
+    {
+        return Err(
+            "worktree name must contain 1–80 letters, digits, dots, hyphens or underscores".into(),
+        );
+    }
+    Ok(())
 }

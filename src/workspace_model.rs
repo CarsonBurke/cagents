@@ -356,6 +356,9 @@ pub fn canonical_repository(path: &Path) -> Result<PathBuf, String> {
     // A checkout that has been removed from disk cannot be resolved at all, and
     // still has to be closable and listable, so its own absolute path stands in
     // for itself rather than failing the edit that retires it.
+    if crate::device::is_remote() {
+        return Ok(path.to_path_buf());
+    }
     Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 

@@ -609,10 +609,33 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
             let prompt = prompt.read()?;
             let absolute =
                 |path: PathBuf| std::path::absolute(path).map_err(|e| AppError::new("target", e));
-            let given = directory.map(absolute).transpose()?;
+            let given = if crate::device::is_remote() {
+                directory
+                    .map(|directory| {
+                        if directory.is_absolute() {
+                            Ok(directory)
+                        } else {
+                            Err(AppError::new(
+                                "target",
+                                "remote working directory must be absolute",
+                            ))
+                        }
+                    })
+                    .transpose()?
+            } else {
+                directory.map(absolute).transpose()?
+            };
             let here = match &given {
                 Some(directory) => directory.clone(),
-                None => std::env::current_dir().map_err(|e| AppError::new("target", e))?,
+                None => {
+                    if crate::device::is_remote() {
+                        crate::device::home()
+                            .cloned()
+                            .ok_or_else(|| AppError::new("target", "remote HOME is unavailable"))?
+                    } else {
+                        std::env::current_dir().map_err(|e| AppError::new("target", e))?
+                    }
+                }
             };
             let (containing, caller) = session.context(Scope::Containing(here.clone()))?;
             let (repository, directory) = match repository {

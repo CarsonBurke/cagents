@@ -17,7 +17,7 @@ pub(crate) mod native_holder;
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
 
 /// Local wall-clock time for a conversation stamp, as `14:32`.
@@ -1994,6 +1994,8 @@ pub(crate) fn fresh_session(
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
     if account.provider == provider
+        && !(crate::device::is_remote()
+            && matches!(account.home, crate::account::AccountHome::System))
         && let (Some(variable), Some(home)) = (
             crate::account::home_variable(provider),
             account.resolved_home(),
@@ -2049,6 +2051,9 @@ pub(crate) fn fresh_session(
 
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
+    if crate::device::is_remote() {
+        return None;
+    }
     fn setting(path: &std::path::Path) -> Option<String> {
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;

@@ -112,6 +112,8 @@ troubleshooting.
   editor, and `ceditor`
 - [Configuration](docs/configuration.md): data locations and every
   `settings.toml` key
+- [Device windows](docs/devices.md): SSH connections to remote daemons, remote
+  terminals, native chats, files, Git, and worktrees
 - [Daemon and upgrades](docs/daemon.md): the daemon, control CLI, and how
   sessions survive upgrades
 - [Development](docs/development.md): building, running, and testing from

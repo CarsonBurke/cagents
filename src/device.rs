@@ -32,9 +32,13 @@ struct Devices {
     #[serde(default)]
     devices: Vec<Device>,
 }
+static REMOTE_ENVIRONMENT: OnceLock<
+    std::collections::BTreeMap<crate::agent::Provider, std::collections::BTreeMap<String, String>>,
+> = OnceLock::new();
 static REMOTE_HOME: OnceLock<PathBuf> = OnceLock::new();
 static REMOTE_SHELL: OnceLock<String> = OnceLock::new();
 static SELECTED: OnceLock<Device> = OnceLock::new();
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static BRIDGE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub fn selected() -> Option<&'static Device> {
@@ -50,9 +54,21 @@ pub fn configuration_path() -> io::Result<PathBuf> {
 }
 pub fn list() -> io::Result<Vec<Device>> {
     let path = configuration_path()?;
-    match fs::read(&path) {
+    use std::io::Read;
+    let bytes = fs::File::open(&path).and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    match bytes {
         Ok(bytes) => {
+            if bytes.len() > 64 * 1024 {
+                return Err(io::Error::other("devices.json exceeds 64 KiB"));
+            }
             let config: Devices = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            if config.devices.len() > 64 {
+                return Err(io::Error::other("configure at most 64 devices"));
+            }
             for device in &config.devices {
                 validate(device)?;
             }
@@ -116,19 +132,50 @@ pub fn select(name: Option<&str>) -> io::Result<()> {
 }
 /// A namespace independent of both the local primary window and other devices.
 pub fn window_slot(slot: Option<&str>) -> io::Result<Option<String>> {
+    if let Some(slot) = slot {
+        crate::instance::validate_window_slot(slot)?;
+    }
     match selected() {
-        None => Ok(slot.map(str::to_owned)),
-        Some(device) => {
-            let name = format!(
-                "{}-{}",
-                device.name,
-                slot.unwrap_or(crate::instance::PRIMARY_WINDOW)
-            );
-            crate::instance::validate_window_slot(&name)?;
-            Ok(Some(name))
+        None => {
+            if slot.is_some_and(|slot| slot.starts_with("device-")) {
+                return Err(io::Error::other(
+                    "window names beginning device- are reserved for device windows",
+                ));
+            }
+            Ok(slot.map(str::to_owned))
+        }
+        Some(device) => Ok(Some(scoped_window_slot(
+            &device.name,
+            slot.unwrap_or(crate::instance::PRIMARY_WINDOW),
+        ))),
+    }
+}
+pub(crate) fn scoped_window_slot(device: &str, slot: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{device}\0{slot}"));
+    let mut suffix = String::new();
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("device-{suffix}")
+}
+pub struct Cleanup;
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if let Some(path) = BRIDGE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            let _ = fs::remove_file(&path);
+            if let Some(directory) = path.parent() {
+                let _ = fs::remove_dir(directory);
+            }
         }
     }
 }
+
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -161,8 +208,9 @@ pub fn socket_path() -> io::Result<Option<PathBuf>> {
         return Ok(Some(path.clone()));
     }
     let runtime = crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY);
-    fs::create_dir_all(&runtime)?;
-    let directory = runtime.join(format!("device-{}-{}", device.name, std::process::id()));
+    crate::secure_file::prepare_private_directory(&runtime)?;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let directory = runtime.join(format!("device-{}", &token[..12]));
     fs::create_dir(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     let path = directory.join("daemon.sock");
@@ -185,8 +233,26 @@ fn forward(device: &Device, stream: UnixStream) -> io::Result<()> {
     let mut child = ssh_command(device)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("SSH stderr unavailable"))?;
+    let diagnostics = thread::spawn(move || {
+        use std::io::Read;
+        let mut stderr = stderr;
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while let Ok(count) = stderr.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            let remaining = 4096usize.saturating_sub(captured.len());
+            captured.extend_from_slice(&chunk[..count.min(remaining)]);
+        }
+        String::from_utf8_lossy(&captured).trim().to_owned()
+    });
     let mut input = child
         .stdin
         .take()
@@ -197,11 +263,20 @@ fn forward(device: &Device, stream: UnixStream) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("SSH stdout unavailable"))?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
-    let upstream = thread::spawn(move || io::copy(&mut reader, &mut input));
-    let result = io::copy(&mut output, &mut writer);
+    let upstream = thread::spawn(move || copy_flushed(&mut reader, &mut input));
+    let result = copy_flushed(&mut output, &mut writer);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let detail = diagnostics.join().unwrap_or_default();
+    if !status.success() {
+        *LAST_ERROR
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some(format!("SSH to {} exited {status}: {detail}", device.host));
+    }
     let _ = writer.shutdown(std::net::Shutdown::Both);
-    let _ = child.kill();
-    let _ = child.wait();
     let _ = upstream.join();
     result.map(|_| ())
 }
@@ -217,12 +292,12 @@ pub fn serve_stdio() -> io::Result<()> {
     let stream = UnixStream::connect(path)?;
     let mut upstream = stream.try_clone()?;
     let input = thread::spawn(move || {
-        let result = io::copy(&mut io::stdin().lock(), &mut upstream);
+        let result = copy_flushed(&mut io::stdin().lock(), &mut upstream);
         let _ = upstream.shutdown(std::net::Shutdown::Write);
         result
     });
     let mut downstream = stream;
-    let result = io::copy(&mut downstream, &mut io::stdout().lock());
+    let result = copy_flushed(&mut downstream, &mut io::stdout().lock());
     // stdin may stay blocked after a server disconnect. Process exit releases
     // it; do not join that thread until its copy has already finished.
     if input.is_finished() {
@@ -230,9 +305,86 @@ pub fn serve_stdio() -> io::Result<()> {
     }
     result.map(|_| ())
 }
+fn copy_flushed(reader: &mut impl io::Read, writer: &mut impl io::Write) -> io::Result<u64> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buffer[..count])?;
+        // stdout's LineWriter must deliver binary frames without waiting for
+        // a newline or the next request from the peer.
+        writer.flush()?;
+        total += count as u64;
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn binary_bridge_flushes_a_response_before_reading_the_next_frame() {
+        struct Writer {
+            pending: Vec<u8>,
+            visible: std::sync::Arc<Mutex<Vec<u8>>>,
+        }
+        impl io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.pending.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.visible.lock().unwrap().extend(self.pending.drain(..));
+                Ok(())
+            }
+        }
+        struct Reader {
+            visible: std::sync::Arc<Mutex<Vec<u8>>>,
+            sent: bool,
+        }
+        impl io::Read for Reader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.sent {
+                    assert_eq!(*self.visible.lock().unwrap(), b"binary-response");
+                    return Ok(0);
+                }
+                self.sent = true;
+                bytes[..15].copy_from_slice(b"binary-response");
+                Ok(15)
+            }
+        }
+        let visible = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut reader = Reader {
+            visible: visible.clone(),
+            sent: false,
+        };
+        let mut writer = Writer {
+            visible,
+            pending: Vec::new(),
+        };
+        assert_eq!(copy_flushed(&mut reader, &mut writer).unwrap(), 15);
+    }
+    #[test]
+    fn device_windows_are_separate_and_bounded() {
+        assert_ne!(
+            scoped_window_slot("a-b", "c"),
+            scoped_window_slot("a", "b-c")
+        );
+        assert_ne!(scoped_window_slot("fw16", "primary"), "fw16-primary");
+        assert_eq!(
+            scoped_window_slot("fw16", "primary"),
+            scoped_window_slot("fw16", "primary")
+        );
+        crate::instance::validate_window_slot(&scoped_window_slot(
+            "long-device-name",
+            "a-very-long-but-valid-window-name",
+        ))
+        .unwrap();
+    }
     #[test]
     fn remote_command_quotes_executable_and_rejects_options() {
         assert_eq!(quote("/home/a'b/cagents"), "'/home/a'\\''b/cagents'");
@@ -274,19 +426,83 @@ pub fn prepare() -> io::Result<()> {
         return Ok(());
     }
     match crate::device_service::request(crate::device_service::Operation::Home) {
-        Ok(crate::device_service::Reply::Home { path, shell }) => {
+        Ok(crate::device_service::Reply::Home {
+            path,
+            shell,
+            environment,
+        }) => {
             let _ = REMOTE_HOME.set(path);
+            let _ = REMOTE_ENVIRONMENT.set(environment);
             let _ = REMOTE_SHELL.set(shell);
             Ok(())
         }
         Ok(_) => Err(io::Error::other(
             "remote daemon returned an unexpected device identity",
         )),
-        Err(error) => Err(io::Error::other(format!(
-            "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",
-            selected().unwrap().name,
-            selected().unwrap().host,
-            selected().unwrap().host
-        ))),
+        Err(error) => Err(io::Error::other(
+            format!(
+                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",
+                selected().unwrap().name,
+                selected().unwrap().host,
+                selected().unwrap().host
+            ) + &LAST_ERROR
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .map(|error| format!("; {error}"))
+                .unwrap_or_default(),
+        )),
     }
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) fn environment(
+    provider: crate::agent::Provider,
+    persistable: bool,
+) -> std::collections::BTreeMap<String, String> {
+    if persistable {
+        REMOTE_ENVIRONMENT
+            .get()
+            .and_then(|environment| environment.get(&provider))
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    }
+}
+
+/// Save one local connection profile. Provider credentials remain exclusively
+/// with their daemon host; this file contains only SSH routing information.
+pub fn save(device: Device) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    validate(&device)?;
+    let mut devices = list()?;
+    devices.retain(|existing| existing.name != device.name);
+    devices.push(device);
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    let path = configuration_path()?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| io::Error::other("configuration has no parent directory"))?;
+    crate::secure_file::prepare_private_directory(directory)?;
+    let temporary = directory.join(format!(".devices-{}.json", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(
+            &serde_json::to_vec_pretty(&Devices { devices }).map_err(io::Error::other)?,
+        )?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        fs::File::open(directory)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
