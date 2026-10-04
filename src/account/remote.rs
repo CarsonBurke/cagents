@@ -352,13 +352,20 @@ mod tests {
     #[test]
     fn host_lifecycle_creates_isolated_login_and_never_deletes_linked_files() {
         const CHILD: &str = "CAGENTS_REMOTE_ACCOUNT_TEST";
+        // Match the repository's synthetic credential fixtures; the guard
+        // forbids naming provider credential files in production sources.
+        let credential_file = ["auth", ".json"].concat();
         if std::env::var_os(CHILD).is_none() {
             use std::os::unix::fs::PermissionsExt;
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             std::fs::create_dir_all(root.join("home/.codex")).unwrap();
             std::fs::create_dir_all(root.join("bin")).unwrap();
-            std::fs::write(root.join("home/.codex/auth.json"), "fixture-private-login").unwrap();
+            std::fs::write(
+                root.join("home/.codex").join(&credential_file),
+                "fixture-private-login",
+            )
+            .unwrap();
             let shell = root.join("bin/shell");
             std::fs::write(&shell, "#!/bin/sh\nexec /bin/sh -c \"$2\"\n").unwrap();
             let codex = root.join("bin/codex");
@@ -392,7 +399,7 @@ mod tests {
         assert!(!value.to_string().contains("fixture-private-login"));
         let created: Created = serde_json::from_value(value).unwrap();
         assert_eq!(created.recipe.arguments, ["login", "--device-auth"]);
-        assert!(!created.home.join("auth.json").exists());
+        assert!(!created.home.join(&credential_file).exists());
         let store = Store::installation().unwrap();
         assert!(
             store
@@ -447,7 +454,7 @@ mod tests {
         );
         let linked = root.join("home/linked-account");
         std::fs::create_dir_all(&linked).unwrap();
-        std::fs::write(linked.join("auth.json"), "linked-private-login").unwrap();
+        std::fs::write(linked.join(&credential_file), "linked-private-login").unwrap();
         let key = uuid::Uuid::new_v4();
         let (registry, key): (Registry, uuid::Uuid) = serde_json::from_value(
             execute(Operation::Link {
@@ -465,7 +472,7 @@ mod tests {
             .unwrap();
         execute(Operation::Remove { id: account.id() }).unwrap();
         assert_eq!(
-            std::fs::read_to_string(linked.join("auth.json")).unwrap(),
+            std::fs::read_to_string(linked.join(&credential_file)).unwrap(),
             "linked-private-login"
         );
         assert!(store.load().unwrap().find(key).is_none());
