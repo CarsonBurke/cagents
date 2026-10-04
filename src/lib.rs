@@ -23,6 +23,8 @@ pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub mod design;
+pub mod device;
+pub mod device_service;
 #[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]

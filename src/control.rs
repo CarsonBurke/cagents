@@ -74,6 +74,9 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
     about = "Control cagents terminals and processes"
 )]
 pub struct Cli {
+    /// Backend device from devices.json; local is the default.
+    #[arg(long, global = true)]
+    pub device: Option<String>,
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
@@ -172,6 +175,9 @@ fn parse_window_slot(value: &str) -> Result<String, String> {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
+    /// Forward a framed daemon connection over stdin/stdout (used by SSH).
+    #[command(hide = true)]
+    Bridge,
     /// Start the daemon if it is not already running.
     Start,
     /// Report whether the daemon is running.
@@ -1241,6 +1247,16 @@ impl ControlClient {
         }
     }
 
+    pub fn device_operation(
+        &mut self,
+        operation: crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, ControlError> {
+        match self.request_strict(ClientRequest::DeviceOperation { operation })? {
+            ServerResponse::DeviceOperation { reply } => Ok(reply),
+            response => Err(unexpected_response("device operation", &response)),
+        }
+    }
+
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
@@ -1583,6 +1599,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
+        ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
 
@@ -1691,6 +1708,24 @@ where
         }
     };
 
+    if let Err(error) = crate::device::select(cli.device.as_deref()) {
+        emit_error(cli.json, &AppError::new("device", error));
+        return ExitCode::FAILURE;
+    }
+    if matches!(
+        cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Bridge
+        }
+    ) {
+        return match crate::device::serve_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagents daemon bridge: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match execute(cli.command) {
         Ok(output) => {
             emit_success(cli.json, output);
@@ -1769,6 +1804,9 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
 }
 
 fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppError> {
+    let scoped_slot =
+        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?;
+    let slot = scoped_slot.as_deref();
     let activate = || match slot {
         Some(slot) => instance::activate_window(slot),
         None => instance::activate_running_ui(),
@@ -1781,6 +1819,9 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
     let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
     loop {
         let mut command = Command::new(&executable);
+        if let Some(device) = crate::device::selected() {
+            command.args(["--device", &device.name, "--device-window-scoped"]);
+        }
         if new_window {
             command.arg("--new-window");
         }
@@ -2006,6 +2047,10 @@ fn printable(text: &str) -> String {
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
     match command {
+        DaemonCommand::Bridge => Err(AppError::new(
+            "bridge",
+            "stdio bridge must run before command output",
+        )),
         DaemonCommand::Upgrade { yes, interrupt } => {
             let job = crate::update::upgrade_installed(yes, interrupt)
                 .map_err(|error| AppError::new("update", error))?;
@@ -3001,7 +3046,7 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     })
 }
 
-fn sibling_executable(name: &str) -> io::Result<PathBuf> {
+pub(crate) fn sibling_executable(name: &str) -> io::Result<PathBuf> {
     let current = std::env::current_exe()?;
     let directory = current.parent().ok_or_else(|| {
         io::Error::new(

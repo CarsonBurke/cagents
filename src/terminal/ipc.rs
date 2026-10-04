@@ -109,7 +109,7 @@ use crate::{
 /// Version 45 lets a connection act for an agent session, which may then
 /// change only the terminals it controls.
 /// Version 47 carries native permission denials and scoped permission settings.
-pub const PROTOCOL_VERSION: u16 = 47;
+pub const PROTOCOL_VERSION: u16 = 48;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -124,6 +124,9 @@ pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
 
 /// Returns the current user's cagents daemon socket path.
 pub fn daemon_socket_path() -> io::Result<PathBuf> {
+    if let Some(path) = crate::device::socket_path()? {
+        return Ok(path);
+    }
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -426,6 +429,9 @@ pub enum ClientRequest {
     Authenticate {
         authority: crate::agent_execution::Authority,
     },
+    DeviceOperation {
+        operation: crate::device_service::Operation,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +726,9 @@ pub enum ServerResponse {
     ChatUpdate {
         chat_id: TerminalId,
         update: crate::chat::presentation::Presentation,
+    },
+    DeviceOperation {
+        reply: crate::device_service::Reply,
     },
 }
 

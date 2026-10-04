@@ -87,7 +87,7 @@ pub fn validate_window_slot(slot: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn runtime_directory() -> io::Result<PathBuf> {
+pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
     let path = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
