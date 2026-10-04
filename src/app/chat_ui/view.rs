@@ -2138,9 +2138,8 @@ impl Runtime {
         controls
     }
 
-    /// The account a new conversation runs on, chosen before its first
-    /// message and fixed after it: the conversation belongs to the account
-    /// that started it, and resuming it anywhere else would find nothing.
+    /// A draft can explicitly pin its account. Started conversations display
+    /// their current account; automatic routing may hand off between turns.
     fn account_picker<'a>(
         &'a self,
         accounts: ChatAccounts,
@@ -2155,7 +2154,8 @@ impl Runtime {
             ));
         let icon = crate::ui_controls::symbolic_icon("avatar-default-symbolic");
         if transitioning || !self.choosing() {
-            // Fixed: stated, not offered.
+            // Manual choices are made before the first message. Automatic
+            // routing can hand off later at a safe idle boundary.
             return crate::interaction::tooltip(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
@@ -2164,8 +2164,20 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center),
                 format!(
-                    "This conversation runs on {}. Start a new one to use another account.",
-                    accounts.current
+                    "This conversation runs on {}. {}",
+                    accounts.current,
+                    if self
+                        .session
+                        .launch
+                        .recipe
+                        .environment
+                        .get(account::routing::AUTOMATIC_MARKER)
+                        .is_some_and(|value| value == "1")
+                    {
+                        "Automatic can switch to another signed-in account between turns when needed."
+                    } else {
+                        "This account is pinned. Start a new conversation to use another account."
+                    }
                 ),
             );
         }
