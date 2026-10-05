@@ -11716,6 +11716,7 @@ impl Cagents {
             }));
         }
         if previous.show_status_bar != self.settings.show_status_bar {
+            self.device_ui.menu_open = false;
             tasks.push(self.accounts_surface_changed());
         }
         if previous.notifications != self.settings.notifications {
@@ -14648,6 +14649,9 @@ impl Application for Cagents {
                     && let Some(task) = self.resume_key_event(&event)
                 {
                     return task;
+                }
+                if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
+                    return self.update_device(device_ui::Action::Menu(false));
                 }
                 if is_escape_press(&event) && !captured {
                     if let Some((card, _)) = &self.terminal_paste {

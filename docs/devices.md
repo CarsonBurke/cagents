@@ -18,7 +18,9 @@ SSH (`BatchMode=yes`); authenticate and accept the verified host key with SSH
 before opening a device window. It does not expose a TCP daemon listener or copy
 provider credential files to your desktop.
 
-Use **Devices** in the window header to save a host alias and remote executable.
+Use the current-device control at the bottom right of the status bar. Its menu
+lists **This device** and your saved devices. Choose **Connect to a device…** to
+enter an SSH host alias and remote executable, then **Save and open window**.
 The profiles are stored in `devices.json` beside `settings.toml` in the desktop's cagents configuration
 directory (`~/.config/cagents/devices.json` on Linux; the development instance uses
 its own configuration directory):
@@ -47,12 +49,12 @@ cagents --device fw16 terminal list
 cagents --device fw16 terminal spawn --cwd /home/marvin/Documents/repositories/cagents
 ```
 
-The window's device selector opens or focuses that device's primary window, so
+Choosing a device from the status-bar menu opens or focuses its primary window, so
 local and remote windows can remain open together. Selecting a different device
 preserves the current window and its jobs. Named windows are also scoped to their
 device; the internal `device-` window namespace is reserved.
 
-**Device files** browses remote directories, edits UTF-8 text files up to 512 KiB,
+**Browse device files…** in the same menu browses remote directories, edits UTF-8 text files up to 512 KiB,
 and runs Git status, unstaged/staged diff, stage, unstage, and commit on the device.
 It can also list worktrees, create a branch and worktree under `.worktrees/`, and
 remove a clean worktree without forcing deletion. `.worktrees/` must be ignored

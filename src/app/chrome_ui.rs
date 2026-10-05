@@ -1127,37 +1127,6 @@ impl Cagents {
             .focus_chain()
             .iter()
             .any(|id| Some(*id) == self.core.main_window_id());
-        let selected_device = crate::device::selected()
-            .map(|device| device.name.as_str())
-            .unwrap_or("local");
-        let selected_index = self
-            .device_ui
-            .devices
-            .iter()
-            .position(|name| name == selected_device);
-        let mut start_items = vec![
-            start,
-            widget::dropdown(&self.device_ui.devices, selected_index, |index| {
-                Message::Device(super::device_ui::Action::Device(index))
-            })
-            .into(),
-        ];
-        start_items.push(
-            widget::button::text("Devices")
-                .on_press(Message::Device(super::device_ui::Action::Configure))
-                .into(),
-        );
-        if crate::device::is_remote() {
-            start_items.push(
-                widget::button::text("Device files")
-                    .on_press(Message::Device(super::device_ui::Action::Open))
-                    .into(),
-            );
-        }
-        let start: Element<'a, Message> = widget::row::with_children(start_items)
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into();
         let mut header = widget::header_bar()
             .density(cosmic::cosmic_theme::Density::Compact)
             .focused(focused)
