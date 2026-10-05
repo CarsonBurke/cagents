@@ -6,6 +6,7 @@ use cosmic::widget::text_editor;
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Menu(bool),
     Open,
     Configure,
     ConfigName(String),
@@ -43,6 +44,7 @@ enum View {
 }
 pub(super) struct State {
     pub open: bool,
+    pub menu_open: bool,
     configure: bool,
     config_name: String,
     config_host: String,
@@ -69,6 +71,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             open: false,
+            menu_open: false,
             configure: false,
             config_name: String::new(),
             config_host: String::new(),
@@ -102,6 +105,22 @@ impl Default for State {
 }
 impl Cagents {
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
+        if let Action::Menu(open) = action {
+            self.device_ui.menu_open =
+                open && self.settings.show_status_bar && !self.modal_is_open();
+            if self.device_ui.menu_open {
+                match crate::device::list() {
+                    Ok(devices) => {
+                        self.device_ui.devices = std::iter::once("local".into())
+                            .chain(devices.into_iter().map(|device| device.name))
+                            .collect()
+                    }
+                    Err(error) => self.status = Some(TransientNotice::warning(error.to_string())),
+                }
+            }
+            return Task::none();
+        }
+        self.device_ui.menu_open = false;
         if self.device_ui.busy
             && !matches!(
                 &action,
@@ -130,15 +149,14 @@ impl Cagents {
             return Task::none();
         }
         let operation = match action {
+            Action::Menu(_) => unreachable!("device menu handled above"),
             Action::Configure => {
                 self.device_ui.open = true;
                 self.device_ui.configure = true;
                 self.device_ui.notice = None;
-                if let Some(device) = crate::device::selected() {
-                    self.device_ui.config_name = device.name.clone();
-                    self.device_ui.config_host = device.host.clone();
-                    self.device_ui.config_executable = device.executable.clone();
-                }
+                self.device_ui.config_name.clear();
+                self.device_ui.config_host.clear();
+                self.device_ui.config_executable = "cagents".into();
                 return Task::none();
             }
             Action::ConfigName(value) => {
@@ -154,6 +172,14 @@ impl Cagents {
                 return Task::none();
             }
             Action::ConfigSave => {
+                if let Some(current) = crate::device::selected()
+                    && current.name == self.device_ui.config_name
+                    && (current.host != self.device_ui.config_host
+                        || current.executable != self.device_ui.config_executable)
+                {
+                    self.device_ui.notice = Some("This device is already open. Use a different device name for another connection.".into());
+                    return Task::none();
+                }
                 let device = crate::device::Device {
                     name: self.device_ui.config_name.clone(),
                     host: self.device_ui.config_host.clone(),
@@ -171,7 +197,7 @@ impl Cagents {
             }
             Action::ConfigSaved(result) => {
                 self.device_ui.busy = false;
-                self.device_ui.notice = Some(match result {
+                match result {
                     Ok(()) => {
                         self.device_ui.devices = std::iter::once("local".into())
                             .chain(
@@ -181,10 +207,18 @@ impl Cagents {
                                     .map(|device| device.name),
                             )
                             .collect();
-                        "Device saved; select it in the window header".into()
+                        self.device_ui.open = false;
+                        if let Some(index) = self
+                            .device_ui
+                            .devices
+                            .iter()
+                            .position(|name| name == &self.device_ui.config_name)
+                        {
+                            return self.update_device(Action::Device(index));
+                        }
                     }
-                    Err(error) => error,
-                });
+                    Err(error) => self.device_ui.notice = Some(error),
+                }
                 return Task::none();
             }
             Action::DeviceOpened(result) => {
@@ -373,6 +407,95 @@ impl Cagents {
             },
         )
     }
+    pub(super) fn device_status_control(&self) -> Element<'_, Message> {
+        let selected = crate::device::selected()
+            .map(|device| device.name.as_str())
+            .unwrap_or("local");
+        let label = if selected == "local" {
+            "This device"
+        } else {
+            selected
+        };
+        let open = self.device_ui.menu_open && !self.modal_is_open();
+        let control = widget::button::custom(
+            widget::row::with_children(vec![
+                design::caption(label).into(),
+                widget::icon(crate::ui_controls::symbolic_icon("go-up-symbolic"))
+                    .size(12)
+                    .into(),
+            ])
+            .spacing(design::GRID_UNIT)
+            .align_y(Alignment::Center),
+        )
+        .name(format!("Device: {label}. Open device connections"))
+        .selected(open)
+        .class(crate::ui_controls::control_style(open, None))
+        .height(20)
+        .padding(Padding::from([0.0, design::GRID_UNIT * 1.5]))
+        .on_press(Message::Device(Action::Menu(!open)));
+        let anchor = crate::interaction::tooltip(
+            crate::interaction::hover(control),
+            "Open device connections",
+        );
+        crate::ui_controls::popover(
+            anchor,
+            open.then(|| {
+                let mut rows: Vec<Element<'_, Message>> =
+                    vec![widget::text::title4("Devices").into()];
+                let mut choices = Vec::new();
+                for (index, name) in self.device_ui.devices.iter().enumerate() {
+                    let label = if name == "local" {
+                        "This device"
+                    } else {
+                        name.as_str()
+                    };
+                    choices.push(
+                        widget::button::text(label)
+                            .class(crate::ui_controls::control_style(name == selected, None))
+                            .width(Length::Fill)
+                            .on_press(Message::Device(Action::Device(index)))
+                            .into(),
+                    );
+                }
+                rows.push(
+                    widget::container(
+                        widget::scrollable(
+                            widget::column::with_children(choices)
+                                .padding(design::with_vertical_rail(Padding::ZERO)),
+                        )
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            design::scrollbar(),
+                        ))
+                        .height(Length::Shrink),
+                    )
+                    .max_height(280)
+                    .into(),
+                );
+                rows.push(design::horizontal_rule());
+                if crate::device::is_remote() {
+                    rows.push(
+                        widget::button::text("Browse device files…")
+                            .width(Length::Fill)
+                            .on_press(Message::Device(Action::Open))
+                            .into(),
+                    );
+                }
+                rows.push(
+                    widget::button::text("Connect to a device…")
+                        .width(Length::Fill)
+                        .on_press(Message::Device(Action::Configure))
+                        .into(),
+                );
+                widget::container(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                    .width(260)
+                    .padding(design::GRID_UNIT * 2.0)
+                    .into()
+            }),
+            widget::popover::Position::Top,
+            Message::Device(Action::Menu(false)),
+        )
+    }
+
     pub(super) fn device_dialog(&self) -> Element<'_, Message> {
         let state = &self.device_ui;
         let action = |action| Message::Device(action);
@@ -384,7 +507,7 @@ impl Cagents {
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save device",Action::ConfigSave)]).spacing(8).into()];
+            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and open window",Action::ConfigSave)]).spacing(8).into()];
             if let Some(notice) = &state.notice {
                 rows.push(widget::text::body(notice).into());
             }

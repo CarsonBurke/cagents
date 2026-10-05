@@ -4031,10 +4031,6 @@ impl Cagents {
             .into_iter()
             .filter_map(|provider| self.provider_chip(provider, now, compact))
             .collect();
-        // A bar with nothing to report is only a line across the window.
-        if chips.is_empty() {
-            return None;
-        }
         let bar = widget::container(
             widget::row::with_children(vec![
                 widget::row::with_children(chips)
@@ -4042,6 +4038,7 @@ impl Cagents {
                     .align_y(Alignment::Center)
                     .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
+                self.device_status_control(),
             ])
             .align_y(Alignment::Center),
         )
@@ -5338,6 +5335,23 @@ mod app_tests {
             app.account_ui.logins.first().map(|login| login.phase),
             Some(LoginPhase::Verifying)
         );
+    }
+
+    #[test]
+    fn device_connections_remain_available_without_provider_accounts() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.accounts.clear();
+        assert!(app.status_bar().is_some());
+        drop(app.update_device(super::super::device_ui::Action::Menu(true)));
+        assert!(app.device_ui.menu_open);
+        drop(app.update(Message::SettingsChanged {
+            field: SettingsField::ShowStatusBar,
+            value: "false".into(),
+        }));
+        assert!(app.status_bar().is_none());
+        assert!(!app.device_ui.menu_open);
+        drop(app.update_device(super::super::device_ui::Action::Menu(true)));
+        assert!(!app.device_ui.menu_open);
     }
 
     #[test]
