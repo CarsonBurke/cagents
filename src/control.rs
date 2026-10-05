@@ -1883,8 +1883,14 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
-    let timeout = crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
-        + UI_LAUNCH_HANDSHAKE_TIMEOUT;
+    // Remote windows attach to an already-running device daemon. Its handoff
+    // budget is not stored on the client, whose repository filesystem is gated.
+    let timeout = if crate::device::is_remote() {
+        UI_LAUNCH_HANDSHAKE_TIMEOUT
+    } else {
+        crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
+            + UI_LAUNCH_HANDSHAKE_TIMEOUT
+    };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .stdin(Stdio::null())
@@ -3173,6 +3179,45 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ui")]
+    #[test]
+    fn remote_ui_launch_does_not_read_a_local_daemon_handoff() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_UI_LAUNCH";
+        const TEST: &str = "control::tests::remote_ui_launch_does_not_read_a_local_daemon_handoff";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "launch-test".into(),
+            host: "fw16".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("launch-test".into())).unwrap();
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' \"$1\"",
+            "launch-test",
+            UI_LAUNCH_READY,
+        ]);
+        spawn_ui_process(&mut command).unwrap();
+    }
     use std::{os::unix::net::UnixStream, thread};
 
     use clap::CommandFactory;

@@ -12215,7 +12215,6 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 Message::OpenRepository => return self.update_device(device_ui::Action::Open),
-                Message::RefreshUi(_) => return Task::none(),
                 Message::PreviewLocalFile(_) => return self.update_device(device_ui::Action::Open),
                 Message::ResumeConversation(_)
                 | Message::Repository(_)
