@@ -1905,7 +1905,13 @@ impl Runtime {
                 .height(Length::Fill)
                 .width(Length::Fill),
         )
-        .padding([step::GAP_M as u16, 0])
+        // Keep the visible thumb clear of the window or pane resize edge.
+        .padding(iced::Padding {
+            top: step::GAP_M,
+            bottom: step::GAP_M,
+            right: design::SCROLLBAR_THUMB_WIDTH,
+            left: 0.0,
+        })
         .width(Length::Fill)
         .height(Length::Fill);
         // The whole pane takes a drop, not just the composer: the transcript
