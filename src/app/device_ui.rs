@@ -913,6 +913,16 @@ mod tests {
         .unwrap();
         crate::device::select(Some("navigation-test".into())).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update(Message::GitUi(git_ui::Action::Changed)));
+        drop(
+            app.update(Message::ProjectUi(project_ui::Action::EditorsLoaded(Ok(
+                Vec::new(),
+            )))),
+        );
+        assert!(
+            app.status.is_none(),
+            "Background local completions must not warn in a device window"
+        );
         let root = tempfile::tempdir().unwrap();
         let local_target = root.path().join("unrelated-local");
         std::fs::create_dir(&local_target).unwrap();

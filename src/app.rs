@@ -12297,6 +12297,10 @@ impl Application for Cagents {
     fn update(&mut self, message: Message) -> Task<Message> {
         if crate::device::is_remote() {
             match &message {
+                Message::GitUi(_)
+                | Message::ProjectUi(
+                    project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
+                ) => return Task::none(),
                 Message::ChatUi(
                     chat_ui::Action::Attach(_)
                     | chat_ui::Action::Attached(..)
