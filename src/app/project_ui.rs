@@ -618,6 +618,9 @@ impl Cagents {
     }
 
     pub(super) fn editor_discovery_task() -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         cosmic::task::future(async {
             let result = tokio::task::spawn_blocking(crate::external_editor::installed)
                 .await

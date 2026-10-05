@@ -1,3 +1,5 @@
+mod presentation;
+pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
@@ -93,6 +95,8 @@ struct OutputObservation {
 
 #[derive(Default)]
 struct Subscriptions {
+    viewports: BTreeMap<(ClientId, TerminalId), presentation::Viewport>,
+    size_owners: BTreeMap<TerminalId, ClientId>,
     by_client: BTreeMap<ClientId, BTreeMap<TerminalId, TerminalVisibility>>,
     by_terminal: BTreeMap<TerminalId, BTreeMap<ClientId, TerminalVisibility>>,
     /// The exact capture last handed to each subscription.
@@ -137,6 +141,7 @@ impl Subscriptions {
                 self.by_terminal.remove(&terminal_id);
             }
         }
+        self.viewports.remove(&(client_id, terminal_id));
         self.sent.remove(&(client_id, terminal_id));
         self.output.remove(&(client_id, terminal_id));
     }
@@ -167,6 +172,7 @@ impl Subscriptions {
         self.sent
             .retain(|(sent_client, _), _| *sent_client != client_id);
         self.output.retain(|(client, _), _| *client != client_id);
+        self.viewports.retain(|(client, _), _| *client != client_id);
         for terminal_id in terminals.keys() {
             if let Some(clients) = self.by_terminal.get_mut(terminal_id) {
                 clients.remove(&client_id);
@@ -580,6 +586,26 @@ impl HostState {
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
+        if let ModelEdit::ChangeView {
+            scope,
+            expected_revision,
+            operation,
+            ..
+        } = &edit
+        {
+            let registry = self.registry()?;
+            if !registry
+                .view_operation_seen(*operation)
+                .map_err(model_unavailable)?
+                && registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ViewConflict,
+                    "The workspace view changed; rebase this pane mutation on the current revision",
+                    true,
+                ));
+            }
+        }
         let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
@@ -673,6 +699,7 @@ impl HostState {
             .collect::<Vec<_>>();
         self.subscriptions.disconnect(client_id);
         for terminal_id in terminal_ids {
+            self.refresh_presentation_owner(terminal_id);
             let visibility = self.subscriptions.visibility(terminal_id);
             if let Some(record) = self.terminals.get(&terminal_id) {
                 let _ = apply_visibility(&record.handle, visibility);
@@ -742,6 +769,7 @@ impl HostState {
                 .attach(client_id, terminal_id, old_requested);
             return Err(send_error(error));
         }
+        self.refresh_presentation_owner(terminal_id);
         self.disarm_output_if_observed(terminal_id);
         Ok(())
     }
@@ -780,19 +808,18 @@ impl HostState {
                 .set_visibility(client_id, terminal_id, old_requested);
             return Err(send_error(error));
         }
-        // Another subscriber may already be visible, or the worker may have
-        // completed. Neither case creates a new capture when this view returns.
-        // Offer the retained generation so the returning view can catch up.
-        if requested == TerminalVisibility::Visible
-            && let Some(delivery) = self.clients.get(&client_id)
-        {
-            let _ = delivery.push(Outbound::broadcast(
-                &self.proof,
-                ServerMessage::Redraw {
-                    terminal_id,
-                    generation: record.handle.generation(),
-                },
-            ));
+        self.refresh_presentation_owner(terminal_id);
+        if requested == TerminalVisibility::Visible {
+            let generation = self.presentation_revision(client_id, terminal_id);
+            if let Some(delivery) = self.clients.get(&client_id) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::Redraw {
+                        terminal_id,
+                        generation,
+                    },
+                ));
+            }
         }
         if (old_requested == TerminalVisibility::Visible)
             != (requested == TerminalVisibility::Visible)
@@ -1225,7 +1252,13 @@ impl HostState {
         generation: u64,
     ) -> Result<TerminalHandle, ProtocolError> {
         let record = self.attached_terminal(client_id, terminal_id)?;
-        if generation > record.handle.generation() {
+        if generation
+            > self
+                .subscriptions
+                .viewports
+                .get(&(client_id, terminal_id))
+                .map_or(record.handle.generation(), |view| view.revision)
+        {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
                 "cannot acknowledge a terminal generation that was not published",
@@ -3078,6 +3111,108 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
+fn finish_pending_terminal(state: &mut HostState, terminal_id: TerminalId) {
+    // Finish a durable automatic-terminal reservation only after its exact
+    // worker exists. A client lost before this point can resume the intent.
+    let session = state.terminals[&terminal_id].session.clone();
+    if let Some(registry) = state.model.as_mut() {
+        if let Ok(model) = registry.model() {
+            for view in model.views {
+                for before in view.panes {
+                    if before.pending_terminal_start
+                        && matches!(&before.kind,crate::model::CardKind::Terminal(terminal) if terminal.id==terminal_id)
+                    {
+                        let mut pane = before.clone();
+                        pane.pending_terminal_start = false;
+                        pane.kind = crate::model::CardKind::Terminal(session.clone());
+                        let edit = ModelEdit::ChangeView {
+                            scope: view.scope.clone(),
+                            expected_revision: view.revision,
+                            operation: uuid::Uuid::new_v4(),
+                            change: crate::workspace_model::views::Change::Update { before, pane },
+                        };
+                        match registry.apply(&edit) {
+                            Ok(applied) if applied.changed => {
+                                let sequence = applied.model.sequence;
+                                for watcher in &state.model_watchers {
+                                    if let Some(delivery) = state.clients.get(watcher) {
+                                        let _ = delivery.push(Outbound::broadcast(
+                                            &state.proof,
+                                            ServerMessage::WorkspaceModelEdited {
+                                                sequence,
+                                                edit: edit.clone(),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(%terminal_id,%error,"could not finish automatic terminal reservation")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reads only the daemon's accepted reservation, never a client's launch recipe.
+fn pending_terminal_session(
+    state: &HostState,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+    require_pending: bool,
+) -> Result<TerminalSession, ProtocolError> {
+    let model = state
+        .model
+        .as_ref()
+        .ok_or_else(|| model_unavailable("registry is unavailable".into()))?
+        .model()
+        .map_err(model_unavailable)?;
+    model
+        .views
+        .into_iter()
+        .flat_map(|view| view.panes)
+        .find_map(|candidate| {
+            if candidate.id == pane && (!require_pending || candidate.pending_terminal_start) {
+                if let crate::model::CardKind::Terminal(session) = candidate.kind {
+                    if session.id == terminal_id {
+                        return Some(session);
+                    }
+                }
+            }
+            None
+        })
+        .ok_or_else(|| not_found(terminal_id))
+}
+
+pub(super) fn spawn_pending_terminal(
+    shared: &SharedHost,
+    client_id: ClientId,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+    options: TerminalSpawnOptions,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    let session = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        pending_terminal_session(&state, pane, terminal_id, false)?
+    };
+    start_terminal_view_owned(
+        shared,
+        client_id,
+        session,
+        options,
+        None,
+        false,
+        None,
+        None,
+        Some(pane),
+    )
+    .map(|(descriptor, _)| descriptor)
+}
+
 pub(super) fn spawn_terminal_with_environment(
     shared: &SharedHost,
     client_id: ClientId,
@@ -3134,6 +3269,7 @@ pub(super) fn spawn_terminal_view_owned(
         paired,
         None,
         None,
+        None,
     )
 }
 
@@ -3158,6 +3294,7 @@ fn start_terminal_view(
         paired,
         adoption,
         previous,
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3173,6 +3310,7 @@ fn start_terminal_view_owned(
     paired: bool,
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
+    pending_pane: Option<crate::model::CardId>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3186,6 +3324,20 @@ fn start_terminal_view_owned(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pane) = pending_pane {
+            // Completion is idempotent across clients, but an actor alone is
+            // insufficient: its authoritative pane must still name it.
+            if state.terminals.contains_key(&terminal_id) {
+                pending_terminal_session(&state, pane, terminal_id, false)?;
+                let descriptor = state.attach(client_id, terminal_id)?;
+                let handle = state.terminals[&terminal_id].handle.clone();
+                return Ok((descriptor, handle));
+            }
+            let accepted = pending_terminal_session(&state, pane, terminal_id, true)?;
+            if accepted.launch != session.launch {
+                return Err(not_found(terminal_id));
+            }
+        }
         state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
@@ -3340,7 +3492,30 @@ fn start_terminal_view_owned(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pane) = pending_pane {
+            let validation =
+                pending_terminal_session(&state, pane, terminal_id, true).and_then(|accepted| {
+                    if accepted.launch == session.launch {
+                        Ok(())
+                    } else {
+                        Err(not_found(terminal_id))
+                    }
+                });
+            if let Err(error) = validation {
+                state.cancel_spawn(terminal_id);
+                drop(state);
+                // The reservation was withdrawn while the worker was starting.
+                // Shut down only this unpublished worker, never an actor
+                // already attached by another client.
+                let _ = handle.shutdown();
+                drop(handle);
+                return Err(error);
+            }
+        }
         let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
+        if descriptor.is_ok() && pending_pane.is_some() {
+            finish_pending_terminal(&mut state, terminal_id);
+        }
         if descriptor.is_ok() {
             state
                 .terminals
@@ -3583,44 +3758,54 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
             return;
         }
         let proof = state.proof_handle();
-        // One capture serves every subscriber; only its encoding differs, and a
-        // row the worker did not rebuild is the same `Arc` in every delta.
-        let capture = state
-            .terminals
-            .get(&terminal_id)
-            .map(|record| record.handle.snapshot());
         for client_id in visible {
-            let Some(delivery) = state.clients.get(&client_id).cloned() else {
-                continue;
-            };
-            let snapshot = match (
-                &capture,
-                state.subscriptions.last_sent(client_id, terminal_id),
-            ) {
-                (Some(capture), Some(base))
-                    if !capture.detached && capture.generation > base.generation =>
-                {
-                    Some(TerminalSnapshot::diff(capture, base))
-                }
-                _ => None,
-            };
-            let message = match snapshot {
-                Some(snapshot) => {
-                    let capture = capture.as_ref().expect("diffed capture");
+            if let Some(delivery) = state.clients.get(&client_id).cloned() {
+                let revision = state.presentation_observed(client_id, terminal_id, generation);
+                let capture = state
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|record| record.handle.snapshot());
+                let direct = capture.filter(|capture| {
+                    !capture.detached
+                        && capture.scroll.offset == capture.scroll.max_offset()
+                        && state
+                            .subscriptions
+                            .viewports
+                            .get(&(client_id, terminal_id))
+                            .is_some_and(|view| {
+                                view.offset.is_none()
+                                    && view.size.is_none_or(|size| size.rows == capture.rows)
+                            })
+                });
+                let message = if let Some(capture) = direct {
+                    let mut projected = (*capture).clone();
+                    projected.generation = revision;
+                    let projected = Arc::new(projected);
+                    let wire = match state.subscriptions.last_sent(client_id, terminal_id) {
+                        Some(base) => TerminalSnapshot::diff(&projected, base),
+                        None => TerminalSnapshot::full(&projected),
+                    };
                     state
                         .subscriptions
-                        .record_sent(client_id, terminal_id, Arc::clone(capture));
+                        .viewports
+                        .get_mut(&(client_id, terminal_id))
+                        .expect("observed viewport")
+                        .acknowledged_source = capture.generation;
+                    state
+                        .subscriptions
+                        .record_sent(client_id, terminal_id, projected);
                     ServerMessage::Snapshot {
                         terminal_id,
-                        snapshot,
+                        snapshot: wire,
                     }
-                }
-                None => ServerMessage::Redraw {
-                    terminal_id,
-                    generation,
-                },
-            };
-            pending.push((delivery, Outbound::broadcast(&proof, message)));
+                } else {
+                    ServerMessage::Redraw {
+                        terminal_id,
+                        generation: revision,
+                    }
+                };
+                pending.push((delivery, Outbound::broadcast(&proof, message)));
+            }
         }
     }
     for (delivery, message) in pending {
@@ -3762,6 +3947,107 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn pending_terminal_completion_is_idempotent_and_fenced_by_its_pane() {
+        use crate::workspace_model::views::{Change, Pane, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_owned();
+        let mut registry =
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "test".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let scope = Scope::Worktree {
+            repository: repository.clone(),
+            path: repository.clone(),
+        };
+        let launch = crate::model::LaunchRecipe::shell(repository).unwrap();
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: launch.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: launch,
+                last_exit: None,
+            },
+        };
+        let pane = Pane {
+            id: crate::model::CardId::new(),
+            title: "terminal".into(),
+            user_title: None,
+            pending_terminal_start: true,
+            width_fraction: 0.5,
+            scope: None,
+            kind: crate::model::CardKind::Terminal(session.clone()),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        let mut state = test_host();
+        state.install_model(registry);
+        state.register_client(1);
+        state.register_client(2);
+        let host = Arc::new(Mutex::new(state));
+        // Both clients observed the reservation before either actor existed.
+        let first = spawn_pending_terminal(
+            &host,
+            1,
+            pane.id,
+            session.id,
+            TerminalSpawnOptions::default(),
+        )
+        .unwrap();
+        let second = spawn_pending_terminal(
+            &host,
+            2,
+            pane.id,
+            session.id,
+            TerminalSpawnOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(first.session.id, second.session.id);
+        let handle = {
+            let mut state = host.lock().unwrap();
+            assert_eq!(state.terminals.len(), 1);
+            let view = state.read_model().unwrap().views.pop().unwrap();
+            assert!(!view.panes[0].pending_terminal_start);
+            state
+                .model
+                .as_mut()
+                .unwrap()
+                .apply(&ModelEdit::ChangeView {
+                    scope,
+                    expected_revision: view.revision,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Remove { id: pane.id },
+                })
+                .unwrap();
+            state.terminals[&session.id].handle.clone()
+        };
+        let error = spawn_pending_terminal(
+            &host,
+            2,
+            pane.id,
+            session.id,
+            TerminalSpawnOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalNotFound);
+        handle.shutdown().unwrap();
     }
 
     #[test]

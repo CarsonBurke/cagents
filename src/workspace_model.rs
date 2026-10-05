@@ -1,15 +1,15 @@
 //! The half of the sidebar model that every window agrees on.
 //!
-//! A window keeps its own cards, their order, their widths and which one is
-//! focused. The projects and channels those cards hang under are shared, so two
-//! windows open at once show the same sidebar. These types are the wire and
-//! storage shape of that shared half: the daemon owns them durably, the CLI
-//! mutates them, and every window mirrors them into its own store.
+//! The daemon owns projects, channels and their ordered pane descriptors.
+//! Windows project the same live sessions while retaining independent focus,
+//! viewport, runtime residency and unsaved drafts.
 //!
 //! [`ChannelId`] is reused rather than redefined here. `src/model.rs` is
 //! declared ungated in `src/lib.rs`, so the CLI, the daemon and the UI already
 //! resolve it in every build lane; moving the id types into this module or
 //! re-exporting them would give one identity two spellings for no gain.
+
+pub mod views;
 
 use std::path::{Path, PathBuf};
 
@@ -43,11 +43,8 @@ pub struct ModelProject {
     pub ordinal: u32,
 }
 
-/// The half of a channel that is not window-local.
-///
-/// `cards`, `focused` and `active_channel` stay in each window's own store: two
-/// windows share which channels exist and disagree about what is open inside
-/// them, exactly as two editor windows on one folder do.
+/// Shared channel metadata. Ordered pane descriptors live in [`views::View`];
+/// the active channel and focused pane remain local to each client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelChannel {
     pub id: ChannelId,
@@ -123,7 +120,7 @@ pub fn channel_title(text: &str) -> Option<String> {
 pub const NO_REGISTRY: Uuid = Uuid::nil();
 
 /// The shared sidebar model as the registry currently holds it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceModel {
     /// Minted when the registry's store is first created and durable from then
     /// on.
@@ -140,6 +137,8 @@ pub struct WorkspaceModel {
     pub sequence: u64,
     pub projects: Vec<ModelProject>,
     pub channels: Vec<ModelChannel>,
+    #[serde(default)]
+    pub views: Vec<views::View>,
     /// Explicit removals survive a missed watch edge and a window restart.
     /// Reopening the repository clears its tombstone.
     #[serde(default)]
@@ -170,7 +169,9 @@ impl WorkspaceModel {
     pub fn fold(&mut self, sequence: u64, edit: &ModelEdit) {
         self.sequence = sequence;
         match edit {
-            ModelEdit::AgentsChanged => {}
+            ModelEdit::AgentsChanged
+            | ModelEdit::SeedView { .. }
+            | ModelEdit::ChangeView { .. } => {}
             ModelEdit::OpenProject {
                 repository,
                 name,
@@ -247,7 +248,7 @@ impl WorkspaceModel {
 /// Every variant is idempotent, because the same edit reaches the registry from
 /// a CLI invocation, from the window that made it and - after a reconnect - from
 /// a window resynchronising against a registry that already has it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ModelEdit {
     /// Upsert by path. A repeat updates the name and keeps the kind and rank.
     OpenProject {
@@ -291,6 +292,17 @@ pub enum ModelEdit {
     DeleteChannel { id: ChannelId },
     /// Daemon-only invalidation after a committed execution descriptor change.
     AgentsChanged,
+    SeedView {
+        scope: views::Scope,
+        panes: Vec<views::Pane>,
+        closed: Vec<crate::model::CardId>,
+    },
+    ChangeView {
+        scope: views::Scope,
+        expected_revision: u64,
+        operation: Uuid,
+        change: views::Change,
+    },
 }
 
 impl ModelEdit {
@@ -333,6 +345,31 @@ impl ModelEdit {
                 title,
                 title_source,
             },
+            Self::SeedView {
+                scope,
+                panes,
+                closed,
+            } => Self::SeedView {
+                scope: scope.canonicalized()?,
+                panes,
+                closed,
+            },
+            Self::ChangeView {
+                scope,
+                expected_revision,
+                operation,
+                mut change,
+            } => {
+                if let views::Change::Transfer { destination, .. } = &mut change {
+                    *destination = destination.clone().canonicalized()?;
+                }
+                Self::ChangeView {
+                    scope: scope.canonicalized()?,
+                    expected_revision,
+                    operation,
+                    change,
+                }
+            }
             edit @ (Self::RetitleChannel { .. }
             | Self::SuggestChannelTitle { .. }
             | Self::DeleteChannel { .. }

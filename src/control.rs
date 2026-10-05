@@ -119,6 +119,9 @@ pub enum TopCommand {
         /// Reopen or activate a named window slot.
         #[arg(long, value_parser = parse_window_slot)]
         window: Option<String>,
+        /// Copy initial navigation from this same-device client window.
+        #[arg(long, value_parser = parse_window_slot, requires = "new_window")]
+        source: Option<String>,
     },
     /// Manage the persistent cagents daemon.
     Daemon {
@@ -829,6 +832,34 @@ impl ControlClient {
             response => return Err(unexpected_response("a spawned terminal", &response)),
         };
         self.read_attachment_replay(expected)?;
+        Ok(terminal)
+    }
+
+    pub fn complete_pending_terminal(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        let response = self.request_attached(
+            ClientRequest::CompletePendingTerminal {
+                pane,
+                terminal_id,
+                options,
+            },
+            terminal_id,
+        )?;
+        let terminal = match response {
+            ServerResponse::Spawned { terminal } if terminal.session.id == terminal_id => terminal,
+            ServerResponse::Spawned { terminal } => {
+                return Err(ControlError::TerminalMismatch {
+                    expected: terminal_id,
+                    actual: terminal.session.id,
+                });
+            }
+            response => return Err(unexpected_response("a reserved terminal", &response)),
+        };
+        self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
 
@@ -1796,7 +1827,11 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
                 human: "Daemon replacement deferred".into(),
             })
         }
-        TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
+        TopCommand::Ui {
+            new_window,
+            window,
+            source,
+        } => launch_ui(new_window, window.as_deref(), source.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
         TopCommand::Project { command } => execute_project(command),
@@ -1821,7 +1856,11 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     }
 }
 
-fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppError> {
+fn launch_ui(
+    new_window: bool,
+    slot: Option<&str>,
+    source: Option<&str>,
+) -> Result<CommandOutput, AppError> {
     let unique_slot = uuid::Uuid::new_v4().to_string();
     let remote_new_window = new_window && crate::device::is_remote();
     let new_window = new_window && !remote_new_window;
@@ -1851,6 +1890,10 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
         if new_window {
             command.arg("--new-window");
         }
+        if let Some(source) = source {
+            command.args(["--from-window", source]);
+        }
+
         if let Some(slot) = slot {
             command.args(["--window", slot]);
         }
@@ -3536,6 +3579,7 @@ mod tests {
                     ordinal: 4,
                 }],
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             write_frame(
@@ -3788,6 +3832,7 @@ mod tests {
                 }],
                 channels: Vec::new(),
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             write_frame(
@@ -3849,6 +3894,7 @@ mod tests {
                 projects: served,
                 channels: Vec::new(),
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             write_frame(
@@ -3971,6 +4017,7 @@ mod tests {
                         projects: Vec::new(),
                         channels: Vec::new(),
                         closed_projects: Vec::new(),
+                        views: Vec::new(),
                         agents: Vec::new(),
                     },
                 ),
@@ -4030,6 +4077,7 @@ mod tests {
                 })
                 .collect(),
             closed_projects: Vec::new(),
+            views: Vec::new(),
             agents: Vec::new(),
         }
     }

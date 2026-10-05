@@ -1523,7 +1523,7 @@ impl Runtime {
     }
 
     /// Browsing sent prompts does not replace the unsent draft on disk.
-    fn unsent_text(&self) -> String {
+    pub(super) fn unsent_text(&self) -> String {
         self.history_stash
             .as_ref()
             .filter(|_| self.history_cursor.is_some())
@@ -3242,7 +3242,19 @@ impl Cagents {
         pane: settings::DefaultPane,
     ) -> Task<Message> {
         match pane {
-            settings::DefaultPane::Terminal => self.add_terminal(directory),
+            settings::DefaultPane::Terminal => {
+                if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                    && self.worktree_view_scope(&directory).is_some()
+                {
+                    self.shared_views.deferred_default = Some(directory.clone());
+                    return Task::none();
+                }
+                self.shared_views.creating_default =
+                    self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
+                let task = self.add_terminal(directory);
+                self.shared_views.creating_default = false;
+                task
+            }
             settings::DefaultPane::NativeChat => self.new_native_chat_with_lifetime(
                 self.preferred_chat_provider(),
                 Some(directory),
@@ -3271,6 +3283,10 @@ impl Cagents {
         self.add_default_pane(directory, pane)
     }
 
+    pub(super) fn chat_is_unused_default(&self, card: CardId) -> bool {
+        self.chat_ui.default_chats.contains(&card) && self.chat_is_unused(card)
+    }
+
     pub(super) fn chat_is_unused(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
             if runtime.session.is_unstarted()
@@ -3294,7 +3310,13 @@ impl Cagents {
         for card in used {
             self.chat_ui.default_chats.remove(&card);
         }
-        let defaults = &self.chat_ui.default_chats;
+        let defaults = self
+            .chat_ui
+            .default_chats
+            .iter()
+            .copied()
+            .chain(self.shared_views.defaults.keys().copied())
+            .collect::<HashSet<_>>();
         let open_cards = self
             .durable
             .cards
@@ -3647,6 +3669,60 @@ impl Cagents {
             wakes
         }
     }
+    pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        runtime.is_some_and(|runtime| {
+            !runtime.unsent_text().is_empty() || runtime.transition_blocker().is_some()
+        }) || self
+            .chat_ui
+            .drafts
+            .get(&card)
+            .is_some_and(|draft| !draft.is_empty())
+    }
+
+    pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
+        !self.chat_ui.phases.contains_key(&alias)
+            && !self.chat_ui.parked.contains_key(&alias)
+            && !self.shared_chat_has_local_work(canonical)
+    }
+
+    pub(super) fn rekey_shared_terminal_draft(&mut self, alias: CardId, canonical: CardId) -> bool {
+        if !self.can_rekey_shared_terminal_draft(alias, canonical) {
+            return false;
+        }
+        if let Some(draft) = self.chat_ui.drafts.remove(&alias) {
+            self.chat_ui.drafts.insert(canonical, draft);
+        }
+        true
+    }
+
+    pub(super) fn shared_chat_detach(&mut self, card: CardId) {
+        // Dropping a phase also fences a late attachment result. Unlike
+        // abandoned creator starts, it grants no authority to close an actor.
+        self.chat_ui.phases.remove(&card);
+        self.chat_ui.parked.remove(&card);
+        self.observe_agent_activity_for_card(card, None);
+    }
+
+    pub(super) fn device_switch_chat_blocker(&self) -> Option<&'static str> {
+        self.cards
+            .values()
+            .filter_map(|card| match card {
+                CardRuntime::Chat(runtime) => runtime.transition_blocker(),
+                _ => None,
+            })
+            .chain(
+                self.chat_ui
+                    .parked
+                    .values()
+                    .filter_map(|runtime| runtime.transition_blocker()),
+            )
+            .next()
+    }
+
     pub(super) fn chat_forget(&mut self, card: CardId) {
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
@@ -5066,6 +5142,12 @@ impl Cagents {
                     // provider process running with nothing on screen able to
                     // reach them, so the start is undone here.
                     if let Ok(handle) = result {
+                        if self.shared_views.attached.contains(&target.card) {
+                            // This was an attachment to a daemon-owned shared actor.
+                            // A peer removing its pane only detaches this client.
+                            drop(handle);
+                            return Task::none();
+                        }
                         return self.retire_chat(target.card, Some(handle), None);
                     }
                     return Task::none();

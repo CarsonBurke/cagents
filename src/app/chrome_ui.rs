@@ -1852,6 +1852,41 @@ impl Cagents {
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill);
         let body = match self.context_tab {
+            ContextTab::Files | ContextTab::Changes if crate::device::is_remote() => {
+                let device = crate::device::selected()
+                    .map(|device| device.name.as_str())
+                    .unwrap_or("device");
+                let action = self
+                    .active_workspace
+                    .clone()
+                    .map(device_ui::Action::OpenAt)
+                    .unwrap_or(device_ui::Action::Open);
+                widget::container(
+                    widget::column::with_children(vec![
+                        design::heading(format!("Files · {device}")).into(),
+                        design::caption(
+                            self.active_workspace
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| {
+                                    "Browse files and Git changes on this device.".into()
+                                }),
+                        )
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .into(),
+                        widget::button::text("Browse device files")
+                            .on_press_maybe(
+                                (!self.modal_is_open()).then_some(Message::Device(action)),
+                            )
+                            .into(),
+                    ])
+                    .spacing(8),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .into()
+            }
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
                 &self.sidebar_state,

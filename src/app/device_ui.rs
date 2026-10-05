@@ -8,6 +8,7 @@ use cosmic::widget::text_editor;
 pub enum Action {
     Menu(bool),
     Open,
+    OpenAt(PathBuf),
     Configure,
     ConfigName(String),
     ConfigHost(String),
@@ -34,7 +35,11 @@ pub enum Action {
         result: Result<Reply, String>,
     },
     Device(usize),
-    DeviceOpened(Result<(), String>),
+    OpenDeviceWindow(usize),
+    DeviceOpened {
+        result: Result<(), String>,
+        replace: bool,
+    },
 }
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -104,6 +109,125 @@ impl Default for State {
     }
 }
 impl Cagents {
+    pub(super) fn device_project_read_task(
+        &mut self,
+        repository: PathBuf,
+        project_id: ProjectId,
+        generation: u64,
+        kind: Option<ProjectKind>,
+    ) -> Task<Message> {
+        self.workspace_model_opens.insert(repository.clone());
+        self.refresh_ui.schedule_remote_started(project_id);
+        self.refresh_ui
+            .projects
+            .insert(project_id, CancellationToken::new());
+        let kind = kind
+            .or_else(|| {
+                self.sidebar_model
+                    .project(project_id)
+                    .map(|project| project.kind)
+            })
+            .unwrap_or_default();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::device_service::request(Operation::ProjectNavigation { repository, kind })
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .and_then(|reply| match reply {
+                Reply::ProjectNavigation(navigation) => Ok(navigation),
+                _ => Err("Unexpected project navigation reply".into()),
+            });
+            Message::DeviceProjectLoaded {
+                project_id,
+                generation,
+                result,
+            }
+        })
+    }
+
+    pub(super) fn device_project_loaded(
+        &mut self,
+        project_id: ProjectId,
+        generation: u64,
+        result: Result<crate::device_service::Navigation, String>,
+    ) -> Task<Message> {
+        if self.repository_generations.get(&project_id) != Some(&generation) {
+            return Task::none();
+        }
+        self.refresh_ui.projects.remove(&project_id);
+        let Some(project) = self
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        else {
+            return Task::none();
+        };
+        if self.project_ui.closed.contains(&project.repository) {
+            return Task::none();
+        }
+        let navigation = match result {
+            Ok(navigation) if navigation.repository == project.repository => navigation,
+            Ok(_) => {
+                self.status = Some(TransientNotice::warning(
+                    "The device returned a different project identity",
+                ));
+                return Task::none();
+            }
+            Err(error) => {
+                project.unreachable = Some(error.clone());
+                project.reloading = false;
+                self.refresh_ui.finished(project_id, false);
+                self.status = Some(TransientNotice::warning(error));
+                return Task::none();
+            }
+        };
+        let records = navigation
+            .worktrees
+            .into_iter()
+            .map(|record| WorktreeRecord {
+                id: crate::repository::stable_worktree_id(&record.path),
+                path: record.path,
+                branch: record.branch,
+                head_oid: record.head_oid,
+                detached: record.detached,
+                bare: record.bare,
+                lock: crate::repository::WorktreeLock {
+                    locked: record.locked,
+                    reason: record.lock_reason,
+                },
+                prunable_reason: record.prunable_reason,
+                created_at_unix_ms: None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(session) = &self.session {
+            session.save_worktrees(records.iter().map(|record| WorktreeState {
+                id: record.id,
+                project_id,
+                generation: 0,
+                path: record.path.clone(),
+                branch: record.branch.as_deref().map(|branch| {
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch)
+                        .to_owned()
+                }),
+                existence: Existence::Open,
+            }));
+        }
+        project.worktrees = records
+            .iter()
+            .map(|record| SidebarWorktree::from_repository(record, None))
+            .collect();
+        project.unreachable = None;
+        project.reloading = false;
+        self.refresh_ui.finished(project_id, true);
+        self.refresh_sidebar_channels();
+        self.reconcile_shared_views()
+    }
+
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
         if let Action::Menu(open) = action {
             self.device_ui.menu_open =
@@ -126,7 +250,8 @@ impl Cagents {
                 &action,
                 Action::Loaded { .. }
                     | Action::Device(_)
-                    | Action::DeviceOpened(_)
+                    | Action::OpenDeviceWindow(_)
+                    | Action::DeviceOpened { .. }
                     | Action::ConfigSaved(_)
             )
         {
@@ -136,6 +261,7 @@ impl Cagents {
             &action,
             Action::Close
                 | Action::Open
+                | Action::OpenAt(_)
                 | Action::Configure
                 | Action::Browse
                 | Action::Visit(_)
@@ -232,37 +358,62 @@ impl Cagents {
                 }
                 return Task::none();
             }
-            Action::DeviceOpened(result) => {
-                if let Err(error) = result {
-                    self.status = Some(TransientNotice::warning(error));
+            Action::DeviceOpened { result, replace } => {
+                self.device_ui.busy = false;
+                match result {
+                    Ok(()) if replace => return self.exit_after_language_servers(),
+                    Ok(()) => {}
+                    Err(error) => self.status = Some(TransientNotice::warning(error)),
                 }
                 return Task::none();
             }
-            Action::Device(index) => {
+            Action::Device(index) | Action::OpenDeviceWindow(index) => {
+                let replace = matches!(action, Action::Device(_));
                 let Some(name) = self.device_ui.devices.get(index).cloned() else {
                     return Task::none();
                 };
-                if name
-                    == crate::device::selected()
-                        .map(|device| device.name.as_str())
-                        .unwrap_or("local")
+                if replace
+                    && name
+                        == crate::device::selected()
+                            .map(|device| device.name.as_str())
+                            .unwrap_or("local")
                 {
                     return Task::none();
                 }
+                if replace && (self.device_ui.dirty() || self.cards.values().any(|runtime| matches!(runtime, CardRuntime::Repository(editor) if editor.is_dirty() || editor.is_saving()))) {
+                    self.status = Some(TransientNotice::warning("Save or discard your editor changes before switching devices."));
+                    return Task::none();
+                }
+                let source = (name
+                    == crate::device::selected()
+                        .map(|device| device.name.as_str())
+                        .unwrap_or("local"))
+                .then(|| crate::instance::window_slot().to_owned());
+                if replace && let Some(message) = self.device_switch_chat_blocker() {
+                    self.status = Some(TransientNotice::warning(message));
+                    return Task::none();
+                }
+                self.persist();
+                self.device_ui.busy = true;
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                        let executable = crate::control::sibling_executable("cagents").map_err(|error| error.to_string())?;
-                        let status = std::process::Command::new(executable).args(["--device", &name, "ui"]).status().map_err(|error| error.to_string())?;
-                        if status.success() { Ok(Reply::Saved) } else { Err(format!("could not open device {name}; verify devices.json and SSH access")) }
-                    }).await.unwrap_or_else(|error| Err(error.to_string()))
+                            let executable = crate::control::sibling_executable("cagents").map_err(|error| error.to_string())?;
+                            let status = std::process::Command::new(executable).args(["--device", &name, "ui", "--new-window"]).args(source.as_ref().map(|source| ["--source", source.as_str()]).into_iter().flatten()).status().map_err(|error| error.to_string())?;
+                            if status.success() { Ok(()) } else { Err(format!("Could not connect to {name}. Check its SSH connection and cagents daemon.")) }
+                        }).await.unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    |result| {
-                        cosmic::Action::App(Message::Device(Action::DeviceOpened(
-                            result.map(|_| ()),
-                        )))
+                    move |result| {
+                        cosmic::Action::App(Message::Device(Action::DeviceOpened {
+                            result,
+                            replace,
+                        }))
                     },
                 );
+            }
+            Action::OpenAt(path) => {
+                self.device_ui.path = path.display().to_string();
+                return self.update_device(Action::Open);
             }
             Action::Open => {
                 self.device_ui.open = true;
@@ -460,12 +611,24 @@ impl Cagents {
                     } else {
                         name.as_str()
                     };
+                    let switch = widget::button::text(label)
+                        .class(crate::ui_controls::control_style(name == selected, None))
+                        .width(Length::Fill)
+                        .on_press(Message::Device(Action::Device(index)));
+                    let open = widget::button::custom(
+                        widget::icon(crate::ui_controls::symbolic_icon("view-pop-out-symbolic"))
+                            .size(16),
+                    )
+                    .name(format!("Open {label} in another window"))
+                    .on_press(Message::Device(Action::OpenDeviceWindow(index)));
                     choices.push(
-                        widget::button::text(label)
-                            .class(crate::ui_controls::control_style(name == selected, None))
-                            .width(Length::Fill)
-                            .on_press(Message::Device(Action::Device(index)))
-                            .into(),
+                        widget::row::with_children(vec![
+                            switch.into(),
+                            crate::interaction::tooltip(open, "Open in another window").into(),
+                        ])
+                        .align_y(Alignment::Center)
+                        .spacing(design::GRID_UNIT)
+                        .into(),
                     );
                 }
                 rows.push(
@@ -518,7 +681,7 @@ impl Cagents {
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and open window",Action::ConfigSave)]).spacing(8).into()];
+            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(8).into()];
             if let Some(notice) = &state.notice {
                 rows.push(widget::text::body(notice).into());
             }
@@ -718,6 +881,122 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_row_navigation_and_metadata_keep_daemon_paths() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_NAVIGATION";
+        const TEST: &str =
+            "app::device_ui::tests::remote_row_navigation_and_metadata_keep_daemon_paths";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "navigation-test".into(),
+            host: "fw16".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("navigation-test".into())).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update(Message::GitUi(git_ui::Action::Changed)));
+        drop(
+            app.update(Message::ProjectUi(project_ui::Action::EditorsLoaded(Ok(
+                Vec::new(),
+            )))),
+        );
+        assert!(
+            app.status.is_none(),
+            "Background local completions must not warn in a device window"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let local_target = root.path().join("unrelated-local");
+        std::fs::create_dir(&local_target).unwrap();
+        let path = root.path().join("daemon-path");
+        std::os::unix::fs::symlink(&local_target, &path).unwrap();
+        let project_id = ProjectId::new();
+        let repository = path.join(".git");
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project_id,
+            RepositoryId(project_id.as_uuid()),
+            "Remote".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )];
+        app.repository_generations.insert(project_id, 2);
+        let navigation = crate::device_service::Navigation {
+            repository: repository.clone(),
+            worktrees: vec![crate::device_service::NavigationWorktree {
+                path: path.clone(),
+                branch: Some("refs/heads/main".into()),
+                ..Default::default()
+            }],
+        };
+        drop(app.device_project_loaded(project_id, 1, Ok(navigation.clone())));
+        assert!(
+            app.sidebar_model
+                .project(project_id)
+                .unwrap()
+                .worktrees
+                .is_empty()
+        );
+        drop(app.device_project_loaded(project_id, 2, Ok(navigation)));
+        let worktree = app.sidebar_model.project(project_id).unwrap().worktrees[0].id;
+        drop(app.update(Message::Sidebar(SidebarAction::SelectRows {
+            row: sidebar::SelectionRow::Worktree(project_id, worktree),
+            intent: sidebar::SelectionIntent::Navigate,
+        })));
+        assert!(!app.device_ui.open);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenWorktree {
+            project_id,
+            worktree_id: worktree,
+            path: path.clone(),
+        })));
+        assert!(!app.device_ui.open);
+        assert!(app.sidebar_model.source_control.is_none());
+        assert!(app.refresh_ui.source_cancel.is_none());
+        assert_eq!(app.active_workspace, Some(path));
+        assert_ne!(app.active_workspace.as_ref(), Some(&local_target));
+        drop(app.update(Message::Sidebar(SidebarAction::ClearRowSelection)));
+        assert!(!app.device_ui.open);
+        // A closed project's late RPC cannot leave a global in-flight fence
+        // that suppresses catalog refresh for all surviving projects.
+        let closed = ProjectId::new();
+        let other = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            other,
+            RepositoryId(other.as_uuid()),
+            "Other remote".into(),
+            "/remote/other/.git".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.refresh_ui
+            .projects
+            .insert(closed, CancellationToken::new());
+        drop(app.device_project_loaded(closed, 1, Err("late reply".into())));
+        app.refresh_ui.focused = true;
+        app.refresh_ui.schedule_remote_started(project_id);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        assert!(!app.refresh_ui.projects.contains_key(&closed));
+        assert!(app.refresh_ui.projects.contains_key(&other));
+    }
+
     fn loaded_file() -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.device_ui.open = true;

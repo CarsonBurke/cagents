@@ -30,8 +30,9 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod terminal_owners;
+mod views;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 8;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -171,6 +172,7 @@ impl Registry {
             .map(PathBuf::from)
             .collect();
         Ok(WorkspaceModel {
+            views: views::all(&self.db)?,
             agents: self.agents(None)?,
             identity,
             sequence: sequence as u64,
@@ -188,6 +190,7 @@ impl Registry {
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
         let changed = match edit {
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
@@ -578,6 +581,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 6 {
         terminal_owners::migrate(db)?;
+    }
+    if version < 8 {
+        views::migrate(db)?;
     }
     Ok(())
 }

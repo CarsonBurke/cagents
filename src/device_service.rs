@@ -7,6 +7,10 @@ pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Home,
+    ProjectNavigation {
+        repository: PathBuf,
+        kind: crate::model::ProjectKind,
+    },
     AccountsRead,
     AccountLifecycle {
         operation: crate::account::remote::Operation,
@@ -97,6 +101,26 @@ pub enum Reply {
     },
     Text(String),
     Saved,
+    ProjectNavigation(Navigation),
+}
+
+/// Daemon-resolved directories used for workspace navigation. No displaying
+/// client may reinterpret these paths through its own filesystem.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Navigation {
+    pub repository: PathBuf,
+    pub worktrees: Vec<NavigationWorktree>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NavigationWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head_oid: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub prunable_reason: Option<String>,
 }
 
 /// JSON's self-describing value visitor cannot run on Postcard. Keep JSON
@@ -135,6 +159,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::{fs, io::Write};
     match operation {
+        Operation::ProjectNavigation { repository, kind } => {
+            navigation(repository, kind).map(Reply::ProjectNavigation)
+        }
         Operation::AccountsRead => accounts(),
         Operation::AccountLifecycle { operation } => {
             crate::account::remote::execute(operation).map(Reply::AccountLifecycle)
@@ -295,6 +322,92 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
         Operation::Git { root, operation } => git(root, operation).map(Reply::Text),
     }
 }
+#[cfg(feature = "host")]
+fn navigation(repository: PathBuf, kind: crate::model::ProjectKind) -> Result<Navigation, String> {
+    use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+    let repository = std::fs::canonicalize(repository).map_err(|error| error.to_string())?;
+    if kind == crate::model::ProjectKind::Folder {
+        if !repository.is_dir() {
+            return Err("Project directory is unavailable".into());
+        }
+        return Ok(Navigation {
+            worktrees: vec![NavigationWorktree {
+                path: repository.clone(),
+                ..Default::default()
+            }],
+            repository,
+        });
+    }
+    let mut command = CommandSpec::new("git").cwd(repository.clone()).args([
+        "worktree",
+        "list",
+        "--porcelain",
+        "-z",
+    ]);
+    command.stdout_limit = MAX_TEXT_BYTES as usize;
+    command.timeout = Some(std::time::Duration::from_secs(30));
+    let output = SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .map_err(|error| error.to_string())?;
+    if !output.success {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    let worktrees = parse_navigation(&output.stdout)?;
+    Ok(Navigation {
+        repository,
+        worktrees,
+    })
+}
+
+#[cfg(any(feature = "host", test))]
+fn parse_navigation(bytes: &[u8]) -> Result<Vec<NavigationWorktree>, String> {
+    // -z separates both fields and records without quoting directory names.
+    let mut result = Vec::new();
+    let mut current: Option<NavigationWorktree> = None;
+    for field in bytes.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(record) = current.take() {
+                result.push(record);
+            }
+            continue;
+        }
+        let field = std::str::from_utf8(field).map_err(|_| "Worktree metadata is not UTF-8")?;
+        if let Some(path) = field.strip_prefix("worktree ") {
+            if current.is_some() {
+                return Err("Malformed worktree record".into());
+            }
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err("Worktree directory is not absolute".into());
+            }
+            current = Some(NavigationWorktree {
+                path,
+                ..Default::default()
+            });
+        } else {
+            let record = current.as_mut().ok_or("Worktree field has no directory")?;
+            if let Some(head) = field.strip_prefix("HEAD ") {
+                record.head_oid = Some(head.into());
+            } else if let Some(branch) = field.strip_prefix("branch ") {
+                record.branch = Some(branch.into());
+            } else if field == "detached" {
+                record.detached = true;
+            } else if field == "bare" {
+                record.bare = true;
+            } else if field == "locked" || field.starts_with("locked ") {
+                record.locked = true;
+                record.lock_reason = field.strip_prefix("locked ").map(str::to_owned);
+            } else if field == "prunable" || field.starts_with("prunable ") {
+                record.prunable_reason = Some(field.strip_prefix("prunable ").unwrap_or("").into());
+            }
+        }
+    }
+    if let Some(record) = current {
+        result.push(record);
+    }
+    Ok(result)
+}
+
 #[cfg(feature = "host")]
 fn read(root: &crate::fs_safety::Root, path: &std::path::Path) -> Result<String, String> {
     let mut file = crate::fs_safety::open_beneath(root, path).map_err(|error| error.to_string())?;
@@ -923,5 +1036,70 @@ mod wire_tests {
             environment: [("CODEX_HOME".into(), "/remote/managed".into())].into(),
             unset_environment: ["OPENAI_API_KEY".into()].into(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod navigation_contract_tests {
+    use super::*;
+    #[test]
+    fn nul_worktree_metadata_preserves_paths_and_flags() {
+        let rows = parse_navigation(b"worktree /repo with\nnewline\0HEAD 0000000000000000000000000000000000000000\0branch refs/heads/main\0\0worktree /linked\0detached\0locked reason with spaces\0prunable missing directory\0\0").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, PathBuf::from("/repo with\nnewline"));
+        assert_eq!(rows[0].branch.as_deref(), Some("refs/heads/main"));
+        assert!(rows[1].detached && rows[1].locked);
+        assert_eq!(rows[1].lock_reason.as_deref(), Some("reason with spaces"));
+        assert!(parse_navigation(b"branch refs/heads/main\0").is_err());
+        assert!(parse_navigation(b"worktree relative\0\0").is_err());
+    }
+    #[test]
+    fn navigation_round_trips_on_binary_wire() {
+        let operation = Operation::ProjectNavigation {
+            repository: "/repo/.git".into(),
+            kind: crate::model::ProjectKind::Git,
+        };
+        let encoded = postcard::to_allocvec(&operation).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<Operation>(&encoded).unwrap(),
+            operation
+        );
+        let reply = Reply::ProjectNavigation(Navigation {
+            repository: "/repo/.git".into(),
+            worktrees: vec![NavigationWorktree {
+                path: "/repo".into(),
+                ..Default::default()
+            }],
+        });
+        let encoded = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(postcard::from_bytes::<Reply>(&encoded).unwrap(), reply);
+    }
+    #[cfg(feature = "host")]
+    #[test]
+    fn unborn_git_and_folder_navigation_are_resolved_on_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--initial-branch=main")
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let result = navigation(repo.join(".git"), crate::model::ProjectKind::Git).unwrap();
+        assert_eq!(result.worktrees.len(), 1);
+        assert_eq!(result.worktrees[0].path, repo.canonicalize().unwrap());
+        assert_eq!(
+            result.worktrees[0].branch.as_deref(),
+            Some("refs/heads/main")
+        );
+        let result = navigation(root.path().into(), crate::model::ProjectKind::Folder).unwrap();
+        assert_eq!(
+            result.worktrees[0].path,
+            root.path().canonicalize().unwrap()
+        );
     }
 }
