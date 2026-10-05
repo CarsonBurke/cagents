@@ -54,6 +54,9 @@ fn message_actions<'a>(
 /// three-step one.
 const PLAN_CEILING: f32 = 120.0;
 
+/// Waiting prompts stay within reach without taking over the conversation.
+const QUEUE_CEILING: f32 = 180.0;
+
 /// The padding a status-line control is drawn with.
 ///
 /// The default dropdown padding is sized for a settings page; on a status line
@@ -917,15 +920,6 @@ impl Runtime {
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
             }
-            if let Some((text, _)) = &self.followup {
-                transcript.push(self.followup_view(text, true));
-            }
-            for queued in &snapshot.queued_messages {
-                transcript.push(self.provider_queue_view(queued));
-            }
-            if snapshot.queued_messages.len() == chat::QueuedMessage::LIMIT {
-                transcript.push(body("Queue preview is limited to the first 128 messages."));
-            }
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -1258,6 +1252,7 @@ impl Runtime {
                 );
             }
         }
+        content.extend(self.queue_view());
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
         if let Some(provided) = &snapshot.composer
@@ -2512,66 +2507,109 @@ impl Runtime {
         }
     }
 
-    fn followup_view<'a>(&'a self, text: &'a str, editable: bool) -> Element<'a, Message> {
-        let mut controls = vec![
-            design::caption("Queued for next turn").into(),
-            small_icon(
-                "edit-copy-symbolic",
-                "Copy queued message",
-                Action::CopyLiteral(text.to_owned()),
-            ),
-        ];
-        if editable {
-            controls.push(
-                crate::ui_controls::compact_icon_control(
-                    crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-                    "Take queued follow-up back to edit",
-                    (!self
-                        .pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.followup))
-                    .then(|| action(Action::CancelFollowup(self.target))),
-                )
-                .into(),
-            );
+    fn queue_view(&self) -> Option<Element<'_, Message>> {
+        let count = self.snapshot.queued_messages.len() + usize::from(self.followup.is_some());
+        if count == 0 {
+            return None;
         }
-        let message = widget::container(
-            widget::selectable_text(if text.is_empty() {
+        let mut rows = Vec::new();
+        for queued in &self.snapshot.queued_messages {
+            rows.push(self.provider_queue_view(queued));
+        }
+        if let Some((text, attachments)) = &self.followup {
+            let sending = self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.followup);
+            let controls = vec![
+                design::caption(if sending { "Sending…" } else { "Next turn" })
+                    .width(Length::Fill)
+                    .into(),
+                small_icon(
+                    "edit-copy-symbolic",
+                    "Copy queued message",
+                    Action::CopyLiteral(text.clone()),
+                ),
+                widget::button::text("Edit")
+                    .on_press_maybe((!sending).then(|| action(Action::CancelFollowup(self.target))))
+                    .into(),
+            ];
+            let mut content = vec![body(if text.trim().is_empty() {
                 "Queued attachment"
             } else {
                 text
-            })
-            .size(design::TEXT_PROSE)
-            .class(cosmic::theme::Text::Custom(design::muted_text)),
-        )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_M; 4],
-            false,
-        ))
-        .padding(step::GAP_M)
-        .max_width(PROMPT_MEASURE)
-        .into();
-        widget::container(
-            widget::column::with_children(vec![
-                message,
+            })];
+            for attachment in attachments {
+                content.push(
+                    design::caption(
+                        attachment
+                            .path
+                            .file_name()
+                            .unwrap_or(attachment.path.as_os_str())
+                            .to_string_lossy(),
+                    )
+                    .into(),
+                );
+            }
+            content.insert(
+                0,
                 widget::row::with_children(controls)
                     .spacing(step::GAP_S)
                     .align_y(Alignment::Center)
                     .into(),
-            ])
-            .spacing(step::GAP_XS)
-            .max_width(PROMPT_MEASURE),
+            );
+            rows.push(
+                widget::column::with_children(content)
+                    .spacing(step::GAP_XS)
+                    .into(),
+            );
+        }
+        if self.snapshot.queued_messages.len() == chat::QueuedMessage::LIMIT {
+            rows.push(design::caption("Showing the first 128 queued messages").into());
+        }
+        Some(
+            widget::container(
+                widget::column::with_children(vec![
+                    design::caption(format!("Queued · {count}")).into(),
+                    widget::container(
+                        widget::scrollable(
+                            widget::column::with_children(rows)
+                                .spacing(step::GAP_M)
+                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
+                        .id(card_control_id(self.target.card, "chat-queue"))
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            design::scrollbar(),
+                        ))
+                        .height(Length::Shrink),
+                    )
+                    .max_height(QUEUE_CEILING)
+                    .into(),
+                ])
+                .spacing(step::GAP_S),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .into(),
         )
-        .align_x(Alignment::End)
-        .width(Length::Fill)
-        .into()
     }
 
     fn provider_queue_view<'a>(&'a self, queued: &'a chat::QueuedMessage) -> Element<'a, Message> {
         let caps = &self.snapshot.capabilities;
-        let available = self.pending.is_none() && !self.disconnected;
-        let mut controls: Vec<Element<'a, Message>> = Vec::new();
+        let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
+        let mut controls: Vec<Element<'a, Message>> = vec![
+            widget::Space::new().width(Length::Fill).into(),
+            small_icon(
+                "edit-copy-symbolic",
+                "Copy queued message",
+                Action::CopyLiteral(queued.text.clone()),
+            ),
+        ];
         if caps.queue_remove {
             controls.push(
                 widget::button::text("Remove")
@@ -2600,19 +2638,22 @@ impl Runtime {
                     .into(),
             );
         }
-        if caps.queue_edit && queued.editable {
+        let editing = self
+            .queue_edit
+            .as_ref()
+            .is_some_and(|(id, _)| id == &queued.id);
+        if caps.queue_edit && queued.editable && !editing {
             controls.push(
                 widget::button::text("Edit")
-                    .on_press(action(Action::EditQueue(
-                        self.target,
-                        Some(queued.id.clone()),
-                    )))
+                    .on_press_maybe(
+                        available.then(|| {
+                            action(Action::EditQueue(self.target, Some(queued.id.clone())))
+                        }),
+                    )
                     .into(),
             );
         }
-        let mut content =
-            widget::column::with_children(vec![self.followup_view(&queued.text, false)])
-                .spacing(step::GAP_XS);
+        let mut content = widget::column::with_children(Vec::new()).spacing(step::GAP_XS);
         if let Some((id, draft)) = &self.queue_edit
             && id == &queued.id
         {
@@ -2622,7 +2663,10 @@ impl Runtime {
             );
             controls.push(
                 widget::button::text("Save")
-                    .on_press_maybe(available.then(|| action(Action::SaveQueue(self.target))))
+                    .on_press_maybe(
+                        (available && !draft.trim().is_empty())
+                            .then(|| action(Action::SaveQueue(self.target))),
+                    )
                     .into(),
             );
             controls.push(
@@ -2630,10 +2674,22 @@ impl Runtime {
                     .on_press(action(Action::EditQueue(self.target, None)))
                     .into(),
             );
+        } else {
+            content = content.push(body(if queued.text.trim().is_empty() {
+                "Queued attachment"
+            } else {
+                &queued.text
+            }));
         }
-        content
-            .push(widget::row::with_children(controls).spacing(step::GAP_S))
-            .into()
+        widget::column::with_children(vec![
+            widget::row::with_children(controls)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+            content.into(),
+        ])
+        .spacing(step::GAP_XS)
+        .into()
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
@@ -3737,6 +3793,52 @@ mod frame_cost;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_queue_is_bounded_and_independent_of_transcript_scroll() {
+        let mut runtime = Runtime::draft(
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: chat::Launch {
+                    provider: Provider::Claude,
+                    recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: chat::NativeContinuity::ReconnectOnly,
+            },
+            Snapshot::default(),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        assert!(runtime.queue_view().is_none());
+        runtime.followup = Some(("Local follow-up".into(), Vec::new()));
+        assert!(runtime.queue_view().is_some());
+        runtime.selected_subagent = Some("child".into());
+        Arc::make_mut(&mut runtime.snapshot).queued_messages = (0..chat::QueuedMessage::LIMIT)
+            .map(|id| chat::QueuedMessage::new(id.to_string(), "Long queued prompt\n".repeat(100)))
+            .collect();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = runtime.queue_view().unwrap();
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 1000.0)),
+        );
+        assert_eq!(node.size().width, 400.0);
+        assert!(
+            node.size().height < 240.0,
+            "queue must leave room for transcript and composer: {:?}",
+            node.size()
+        );
+    }
 
     #[test]
     fn concrete_activity_is_inferred_from_streamed_items() {

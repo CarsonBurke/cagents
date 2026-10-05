@@ -796,7 +796,7 @@ pub struct Snapshot {
     pub forked: Option<String>,
 }
 
-/// A bounded preview from the provider's confirmed queue, independent of history pages.
+/// A bounded preview of pending provider input, independent of history pages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: String,
