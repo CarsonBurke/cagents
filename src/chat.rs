@@ -734,6 +734,11 @@ pub struct BindingCandidate {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Daemon wall-clock milliseconds sampled for this publication. Clients
+    /// advance this with their monotonic clock instead of comparing timestamps
+    /// from two machines. Absent only in older data and synthetic snapshots.
+    #[serde(default)]
+    pub sampled_at: Option<u64>,
     pub generation: u64,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
@@ -1314,6 +1319,11 @@ impl ItemContent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
+    /// Unix milliseconds when this item was first observed. Unlike `at`,
+    /// this remains stable while text and tool output stream. Replayed items
+    /// without a known start retain `None`.
+    #[serde(default)]
+    pub started_at: Option<u64>,
     pub id: String,
     pub role: Role,
     pub content: ItemContent,

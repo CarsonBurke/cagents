@@ -19580,6 +19580,7 @@ mod tests {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    started_at: None,
                     at: None,
                 }
                 .into(),
@@ -19592,6 +19593,7 @@ mod tests {
                         output: String::new(),
                         status: ToolStatus::Running,
                     },
+                    started_at: None,
                     at: None,
                 }
                 .into(),
@@ -19603,6 +19605,7 @@ mod tests {
                         thinking: false,
                         phase: Phase::Commentary,
                     },
+                    started_at: None,
                     at: None,
                 }
                 .into(),

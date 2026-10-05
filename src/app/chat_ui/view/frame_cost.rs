@@ -55,6 +55,7 @@ fn item(id: String, role: chat::Role, content: ItemContent) -> chat::Item {
         id,
         role,
         content,
+        started_at: None,
         at: Some(1_700_000_000_000),
     }
 }

@@ -94,6 +94,7 @@ impl ItemChange {
             let item = Item {
                 id: current.id.clone(),
                 role: current.role,
+                started_at: current.started_at,
                 at: current.at,
                 content,
             };
@@ -268,6 +269,7 @@ mod tests {
         let tool = Item {
             id: "tool".into(),
             role: super::super::Role::Assistant,
+            started_at: None,
             at: None,
             content: ItemContent::Tool {
                 name: "shell".into(),
@@ -334,6 +336,7 @@ mod tests {
                 thinking: false,
                 phase: crate::chat::Phase::Final,
             },
+            started_at: Some(1),
             at: Some(1),
         }
     }

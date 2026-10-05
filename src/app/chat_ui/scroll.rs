@@ -7,6 +7,7 @@ use iced::advanced::{
     widget::{Id, Operation, Tree, operation, tree},
 };
 use iced::{Event, Rectangle, Size, Vector};
+use std::{cell::Cell, rc::Rc};
 
 /// `anchors` names direct children of the transcript column. Only their bounds
 /// and stable identities are retained; the transcript's layout tree is not.
@@ -16,8 +17,21 @@ pub(super) fn transcript<'a>(
     subagent: Option<&'a str>,
     anchors: Vec<(usize, &'a str)>,
 ) -> Element<'a, Message> {
+    let captured = Rc::new(Cell::new(false));
+    let content = widget::scrollable(Element::new(InputCapture {
+        content: content.into(),
+        captured: captured.clone(),
+    }))
+    .direction(iced::widget::scrollable::Direction::Vertical(
+        design::scrollbar(),
+    ))
+    .id(card_control_id(target.card, "chat-transcript"))
+    .anchor_bottom()
+    .height(Length::Fill)
+    .width(Length::Fill);
     Element::new(Anchored {
         content: content.into(),
+        captured: Some(captured),
         target: Some(target),
         subagent,
         anchors,
@@ -30,12 +44,14 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
     Element::new(Anchored {
         content: content.into(),
         target: None,
+        captured: None,
         subagent: None,
         anchors: Vec::new(),
     })
 }
 
 struct Anchored<'a> {
+    captured: Option<Rc<Cell<bool>>>,
     target: Option<Target>,
     content: Element<'a, Message>,
     subagent: Option<&'a str>,
@@ -81,10 +97,29 @@ impl Context {
                 next.travel()
             };
         };
-        if previous.travel() - top <= 0.5 && (previous.travel() > 0.0 || self.subagent.is_none()) {
+        // Fitting live content normally follows its end. But an earlier page
+        // can prepend surviving rows to that same short transcript: preserve
+        // the exchange the reader was looking at instead of jumping past it.
+        let prepended = previous.travel() == 0.0
+            && self.rows.first().is_some_and(|old| {
+                rows.iter()
+                    .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
+            });
+        if !prepended
+            && previous.travel() - top <= 0.5
+            && (previous.travel() > 0.0 || self.subagent.is_none())
+        {
             return next.travel();
         }
-        if self.rows.is_empty() && rows.is_empty() {
+        // Most relayouts only refresh a timer or hover state. Avoid building
+        // a lookup table when every measured row is unchanged.
+        if self.rows.len() == rows.len()
+            && self
+                .rows
+                .iter()
+                .zip(rows)
+                .all(|(old, (id, bounds))| old.id == *id && old.bounds == *bounds)
+        {
             return top.clamp(0.0, next.travel());
         }
         let next_rows: std::collections::HashMap<_, _> = rows.iter().copied().collect();
@@ -155,6 +190,7 @@ struct Anchor {
     clock: u64,
     reported: Option<Report>,
     pending_input: bool,
+    modifiers: iced::keyboard::Modifiers,
 }
 
 impl Anchor {
@@ -231,6 +267,129 @@ impl Anchor {
         }
         (switched || freeze_reading || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
             .then_some(bottom)
+    }
+}
+
+/// Wheel direction also matters when a notch moves *away* from a nearby
+/// threshold, or when it cannot move at a pinned edge after a failed request.
+fn navigation_input(
+    before: Option<f32>,
+    top: f32,
+    scroll: Scroll,
+    wheel: Option<f32>,
+    child_captured: bool,
+) -> bool {
+    match wheel {
+        Some(y) => {
+            !child_captured
+                && ((y > 0.0 && scroll.at_top() && before.is_none_or(|old| top <= old))
+                    || (y < 0.0 && scroll.at_bottom() && before.is_none_or(|old| top >= old)))
+        }
+        None => before.is_some_and(|old| {
+            old != top && (!scroll.at_top() || top < old) && (!scroll.at_bottom() || top > old)
+        }),
+    }
+}
+
+/// The native scrollable updates its content first. Record whether the
+/// content consumed the event before the outer scrollable sees it, so nested
+/// tool output never triggers conversation pagination.
+struct InputCapture<'a> {
+    content: Element<'a, Message>,
+    captured: Rc<Cell<bool>>,
+}
+
+impl Widget<Message, cosmic::Theme, cosmic::Renderer> for InputCapture<'_> {
+    fn tag(&self) -> tree::Tag {
+        self.content.as_widget().tag()
+    }
+    fn state(&self) -> tree::State {
+        self.content.as_widget().state()
+    }
+    fn children(&self) -> Vec<Tree> {
+        self.content.as_widget().children()
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        self.content.as_widget_mut().diff(tree);
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content.as_widget_mut().layout(tree, renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
+        self.captured.set(shell.is_event_captured());
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &cosmic::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, cosmic::Theme, cosmic::Renderer>> {
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
     }
 }
 
@@ -367,8 +526,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut after,
             );
-            if before.0 != after.0 {
-                tree.state.downcast_mut::<Anchor>().pending_input = true;
+            let anchor = tree.state.downcast_mut::<Anchor>();
+            if let Some((top, geometry)) = after.0.zip(anchor.geometry()) {
+                anchor.pending_input |= navigation_input(
+                    before.0,
+                    top,
+                    Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                    None,
+                    false,
+                );
             }
         }
     }
@@ -392,6 +558,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut before,
             );
+        }
+        if let Some(captured) = &self.captured {
+            captured.set(false);
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -426,14 +595,35 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     || previous.top != top
                     || previous.geometry != geometry
             });
-            // A fresh gesture at a pinned edge is also a retry signal. A
-            // failed request must not require moving away and back again.
-            let wheel = matches!(event, Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. }
-            }) if *y != 0.0)
-                && cursor.is_over(layout.bounds())
-                && cursor.is_over(*viewport);
-            let user_input = wheel || before.0 != Some(top) || anchor.pending_input;
+            let scroll = Scroll::new(top, geometry.content.height, geometry.viewport.height);
+            if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+                anchor.modifiers = *modifiers;
+            }
+            // Only navigation toward an edge can request its page. Content
+            // scrollables own their gestures, including retries at their ends.
+            let wheel = match event {
+                Event::Mouse(mouse::Event::WheelScrolled { delta })
+                    if cursor.is_over(layout.bounds()) && cursor.is_over(*viewport) =>
+                {
+                    Some(match *delta {
+                        mouse::ScrollDelta::Lines { x, y } => {
+                            if anchor.modifiers.shift() && !cfg!(target_os = "macos") {
+                                x
+                            } else {
+                                y
+                            }
+                        }
+                        mouse::ScrollDelta::Pixels { y, .. } => y,
+                    })
+                }
+                _ => None,
+            };
+            let child_captured = self
+                .captured
+                .as_ref()
+                .is_some_and(|captured| captured.get());
+            let user_input = navigation_input(before.0, top, scroll, wheel, child_captured)
+                || anchor.pending_input;
             if changed || user_input {
                 anchor.pending_input = false;
                 anchor.reported = Some(Report {
@@ -586,11 +776,7 @@ mod tests {
                 })
                 .collect();
             transcript(
-                widget::scrollable(widget::column::with_children(children).width(Length::Fill))
-                    .anchor_bottom()
-                    .id(Id::new("anchor-native-test"))
-                    .height(Length::Fill)
-                    .width(Length::Fill),
+                widget::column::with_children(children).width(Length::Fill),
                 target,
                 None,
                 anchors,
@@ -731,7 +917,7 @@ mod tests {
             if *scroll == Scroll::new(2100.0, 2500.0, 400.0))
         );
         let mut home = operation::scrollable::snap_to::<()>(
-            Id::new("anchor-native-test"),
+            card_control_id(target.card, "chat-transcript"),
             iced::widget::scrollable::RelativeOffset {
                 x: None,
                 y: Some(1.0),
@@ -768,6 +954,191 @@ mod tests {
             &bounds,
         );
         assert!(messages.is_empty(), "input signal must be consumed once");
+        replaced.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        replaced.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            messages.is_empty(),
+            "Shift-wheel remaps to horizontal input and must not page"
+        );
+    }
+
+    #[test]
+    fn nested_output_consumes_wheel_without_paging_transcript() {
+        use iced::advanced::renderer::Headless;
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                iced::Font::default(),
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let nested = tool_output(
+            widget::scrollable(widget::Space::new().height(1000.0))
+                .height(200.0)
+                .width(Length::Fill)
+                .anchor_bottom(),
+        );
+        let mut element = transcript(
+            widget::column::with_children(vec![nested, widget::Space::new().height(1400.0).into()])
+                .width(Length::Fill),
+            target,
+            None,
+            vec![],
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 400.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(1200.0),
+        );
+        let mut messages = Vec::new();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        // Consume the deliberate outer navigation before wheeling its child.
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: iced::Point::new(50.0, 50.0),
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut clipboard,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        messages.clear();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut clipboard,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            messages.is_empty(),
+            "output scroll must not become outer pagination: {messages:?}"
+        );
+        let mut measured = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut measured);
+        assert_eq!(measured.0, Some(0.0));
+        // The same upward gesture over plain transcript is a retry at its edge.
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 300.0)),
+            &renderer,
+            &mut clipboard,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::ChatUi(Action::Scrolled(_, None, _, true))]
+        ));
+    }
+
+    #[test]
+    fn wheel_navigation_respects_direction_and_nested_capture() {
+        let top = Scroll::new(10.0, 1000.0, 400.0);
+        assert!(navigation_input(Some(20.0), 10.0, top, Some(1.0), false));
+        assert!(!navigation_input(Some(0.0), 10.0, top, Some(-1.0), false));
+        assert!(!navigation_input(Some(10.0), 10.0, top, Some(1.0), true));
+        let bottom = Scroll::new(590.0, 1000.0, 400.0);
+        assert!(navigation_input(
+            Some(580.0),
+            590.0,
+            bottom,
+            Some(-1.0),
+            false
+        ));
+        assert!(!navigation_input(
+            Some(600.0),
+            590.0,
+            bottom,
+            Some(1.0),
+            false
+        ));
+        assert!(!navigation_input(
+            Some(590.0),
+            590.0,
+            bottom,
+            Some(-1.0),
+            true
+        ));
+        assert!(navigation_input(Some(100.0), 200.0, bottom, None, false));
+        assert!(!navigation_input(Some(10.0), 10.0, top, Some(0.0), false));
+    }
+
+    #[test]
+    fn thumb_touch_and_keyboard_moves_away_from_edges_do_not_page() {
+        let top = Scroll::new(10.0, 1000.0, 400.0);
+        assert!(!navigation_input(Some(0.0), 10.0, top, None, false));
+        assert!(navigation_input(Some(20.0), 10.0, top, None, false));
+        let bottom = Scroll::new(590.0, 1000.0, 400.0);
+        assert!(!navigation_input(Some(600.0), 590.0, bottom, None, false));
+        assert!(navigation_input(Some(580.0), 590.0, bottom, None, false));
+    }
+
+    #[test]
+    fn fitting_page_preserves_exchange_when_both_ends_grow() {
+        let mut anchor = Anchor::default();
+        anchor.layout(None, &rows(&[("short", 0.0, 300.0)]), geometry(300.0), None);
+        let next = rows(&[
+            ("older", 0.0, 500.0),
+            ("short", 500.0, 300.0),
+            ("newer", 800.0, 600.0),
+        ]);
+        assert_eq!(
+            anchor.layout(None, &next, geometry(1400.0), Some(0.0)),
+            Some(500.0)
+        );
+        assert_eq!(anchor.contexts[0].top, Some(500.0));
     }
 
     #[test]

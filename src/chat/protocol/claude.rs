@@ -869,6 +869,7 @@ impl Claude {
                     id: format!("{id}:{index}"),
                     role,
                     content,
+                    started_at: None,
                     at: None,
                 }));
             }
@@ -970,6 +971,7 @@ impl Claude {
                                 &block["input"],
                                 &self.cwd,
                             ),
+                            started_at: None,
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
@@ -1006,6 +1008,7 @@ impl Claude {
                                 output: String::new(),
                                 status: ToolStatus::Running,
                             },
+                            started_at: None,
                             at: None,
                         });
                         apply_result(
@@ -1047,6 +1050,7 @@ impl Claude {
                                     id: format!("{}:image:{index}", item.id),
                                     role: Role::Assistant,
                                     content: image_content(attachment),
+                                    started_at: None,
                                     at: None,
                                 }));
                             }
@@ -1058,6 +1062,7 @@ impl Claude {
                         id: format!("{id}:{index}"),
                         role,
                         content: image_content(block),
+                        started_at: None,
                         at: None,
                     })),
                     "document" => step.events.push(Event::Item(Item {
@@ -1067,6 +1072,7 @@ impl Claude {
                             path: String::new(),
                             description: format!("Claude document: {}", string(block, "title")),
                         },
+                        started_at: None,
                         at: None,
                     })),
                     other => step.events.push(Event::Item(text_item(
@@ -2665,6 +2671,7 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
             thinking,
             phase: Phase::Final,
         },
+        started_at: None,
         at: None,
     }
 }
@@ -3022,6 +3029,7 @@ impl Claude {
                             output: String::new(),
                             status: ToolStatus::Running,
                         },
+                        started_at: None,
                         at: None,
                     },
                     other => {
@@ -3240,6 +3248,7 @@ impl Claude {
                         output: String::new(),
                         status: ToolStatus::Running,
                     },
+                    started_at: None,
                     at: None,
                 });
                 let patch = if frame["patch"].is_object() {
@@ -3343,6 +3352,7 @@ impl Claude {
                             id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
                             role: Role::User,
                             content,
+                            started_at: None,
                             at: None,
                         }));
                     }

@@ -324,13 +324,11 @@ impl Runtime {
             None => None,
         };
         line.push(design::caption(turn.summary.clone()).into());
-        // How long this stretch of work has taken. It is measured as the view
-        // is built rather than stored on the group, so a running group's label
-        // advances with the frames the arriving provider items already cause
-        // and needs no clock of its own.
-        let elapsed = chat::now_ms()
-            .and_then(|now| turn.working_for(now))
-            .map(format_duration);
+        // The one-second chat tick advances running timers even while a tool
+        // is quiet. The label shares its cadence with the retained-turn cache.
+        let elapsed = self
+            .source_now_ms()
+            .and_then(|now| turn.duration_label(now));
         if let Some(elapsed) = &elapsed {
             line.push(design::caption(elapsed.clone()).into());
         }
