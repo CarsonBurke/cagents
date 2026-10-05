@@ -219,6 +219,18 @@ fn notice_entry<'a>(message: &'a str) -> Element<'a, Message> {
     .into()
 }
 
+/// Center readable content inside a pane-wide interaction surface.
+fn pane_column<'a>(content: Element<'a, Message>, width: f32) -> Element<'a, Message> {
+    widget::container(
+        widget::container(content)
+            .padding([0, step::GAP_M as u16])
+            .max_width(width.max(1.0))
+            .width(Length::Fill),
+    )
+    .center_x(Length::Fill)
+    .into()
+}
+
 /// What a key press does to an open completion list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionKey {
@@ -1045,10 +1057,17 @@ impl Runtime {
                 .into(),
             );
         }
-        let transcript = widget::column::with_children(transcript)
-            .spacing(step::GAP_L)
-            .padding(design::with_vertical_rail(iced::Padding::ZERO))
-            .width(Length::Fill);
+        // Keep each direct row centered without narrowing the scroll viewport.
+        // Direct row indices still identify the same exchanges for anchoring.
+        let transcript = widget::column::with_children(
+            transcript
+                .into_iter()
+                .map(|row| pane_column(row, content_width)),
+        )
+        .spacing(step::GAP_L)
+        .padding(design::with_vertical_rail(iced::Padding::ZERO))
+        .width(Length::Fill);
+        let transcript_slot = content.len();
         content.push(selection::transcript(
             scroll::transcript(
                 transcript,
@@ -1402,6 +1421,13 @@ impl Runtime {
         // Keep the named composer in a fixed sibling slot as provider controls,
         // requests, and attachments arrive. The pinned Iced child reconciler
         // finds named siblings but does not move their trees to new indices.
+        let content = content.into_iter().enumerate().map(|(index, entry)| {
+            if index == transcript_slot {
+                entry
+            } else {
+                pane_column(entry, content_width)
+            }
+        });
         let mut content = vec![
             widget::column::with_children(content)
                 .spacing(8)
@@ -1866,19 +1892,28 @@ impl Runtime {
             widget::popover::Position::Top,
             action(Action::PermissionPicker(target, false)),
         ));
+        let content = content.into_iter().enumerate().map(|(index, entry)| {
+            if index == 0 {
+                entry
+            } else {
+                pane_column(entry, content_width)
+            }
+        });
         let pane = widget::container(
             widget::column::with_children(content)
                 .spacing(step::GAP_S)
                 .height(Length::Fill)
                 .width(Length::Fill),
         )
-        .padding(step::GAP_M)
-        .max_width(content_width.max(1.0))
+        // Keep the visible thumb clear of the window or pane resize edge.
+        .padding(iced::Padding {
+            top: step::GAP_M,
+            bottom: step::GAP_M,
+            right: design::SCROLLBAR_THUMB_WIDTH,
+            left: 0.0,
+        })
         .width(Length::Fill)
         .height(Length::Fill);
-        let pane = widget::container(pane)
-            .center_x(Length::Fill)
-            .height(Length::Fill);
         // The whole pane takes a drop, not just the composer: the transcript
         // is most of what a reader aims at, and a drop lands in the draft
         // wherever it was aimed.
