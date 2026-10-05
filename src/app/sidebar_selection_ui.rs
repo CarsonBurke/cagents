@@ -316,10 +316,7 @@ impl Cagents {
         sidebar::visible_selection_rows(
             &self.sidebar_model,
             &self.sidebar_state,
-            matches!(
-                SidebarMode::for_width(self.window_width),
-                SidebarMode::Compact
-            ),
+            matches!(self.projects_sidebar_mode(), SidebarMode::Compact),
         )
     }
 

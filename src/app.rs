@@ -10501,7 +10501,7 @@ impl Cagents {
         if self.chrome_ui.projects_collapsed {
             SidebarMode::Compact
         } else {
-            SidebarMode::for_width(self.window_width)
+            SidebarMode::Expanded
         }
     }
 
@@ -12108,19 +12108,14 @@ impl Application for Cagents {
         // window's own resize only re-derives the densities. Card widths are
         // fractions re-derived per frame, so an estimate costs nothing but is
         // enough to mount them.
-        let sidebar_width = sidebar::effective_width(
-            SidebarMode::for_width(app.window_width),
-            app.settings.sidebar_width,
-        );
-        let inspector_width = if app.context_inspector_open
-            && matches!(
-                design::ShellLayout::for_width(app.window_width).inspector,
-                InspectorLayout::Docked
-            ) {
-            app.settings.inspector_width
-        } else {
-            0.0
-        };
+        let sidebar_width =
+            sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+        let inspector_width =
+            if matches!(app.context_inspector_mount(), Some(InspectorLayout::Docked)) {
+                app.settings.inspector_width
+            } else {
+                0.0
+            };
         let _ = app
             .workspace
             .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));

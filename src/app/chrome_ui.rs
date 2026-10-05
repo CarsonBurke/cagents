@@ -32,6 +32,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sidebar_toggle_keeps_the_users_choice_across_window_resizes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        for width in [900.0, 1199.0, 1200.0, 1600.0] {
+            let _ = app.update(Message::WindowResized(width, 900.0));
+            assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
+            let _ = app.update_chrome(Action::ToggleProjects);
+            assert_eq!(app.projects_sidebar_mode(), SidebarMode::Compact);
+            let _ = app.update(Message::WindowResized(1600.0, 900.0));
+            assert_eq!(app.projects_sidebar_mode(), SidebarMode::Compact);
+            let _ = app.update(Message::WindowResized(width, 900.0));
+            let _ = app.update_chrome(Action::ToggleProjects);
+            assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
+        }
+    }
+
+    #[test]
+    fn sidebar_toggle_synchronizes_the_inspector_overlay() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let _ = app.update(Message::WindowResized(1000.0, 900.0));
+        assert!(app.context_inspector_overlay_active);
+        let _ = app.update_chrome(Action::ToggleProjects);
+        assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
+        assert!(!app.context_inspector_overlay_active);
+        assert!(!app.workspace_inputs_blocked());
+        let _ = app.update_chrome(Action::ToggleProjects);
+        assert_eq!(
+            app.context_inspector_mount(),
+            Some(InspectorLayout::Overlay)
+        );
+        assert!(app.context_inspector_overlay_active);
+        assert!(app.workspace_inputs_blocked());
+    }
+
+    #[test]
+    fn revealing_a_card_expands_the_sidebar_and_synchronizes_the_inspector() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let _ = app.update(Message::WindowResized(1000.0, 900.0));
+        let _ = app.update_chrome(Action::ToggleProjects);
+        assert!(!app.context_inspector_overlay_active);
+        let _ = app.update_chrome(Action::Reveal(card));
+        assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
+        assert!(app.context_inspector_overlay_active);
+    }
+
+    #[test]
     fn showing_a_switch_failure_keeps_its_explanation_open() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
@@ -785,11 +831,17 @@ impl Cagents {
                 iced::clipboard::write(path.display().to_string())
             }),
             Action::Reveal(id) => {
+                let was_collapsed = self.chrome_ui.projects_collapsed;
+                // FocusCard must see the new mounting decision so it does not
+                // focus a workspace widget underneath an inspector overlay.
+                self.chrome_ui.projects_collapsed = false;
                 let focus = self.update(Message::FocusCard(id));
                 if self.workspace.focused() != Some(id) {
-                    return focus;
+                    self.chrome_ui.projects_collapsed = was_collapsed;
+                    let overlay = self.sync_context_overlay_state();
+                    return Task::batch([focus, overlay]);
                 }
-                self.chrome_ui.projects_collapsed = false;
+                let overlay = self.sync_context_overlay_state();
                 self.synchronize_sidebar_selection();
                 let destination = self.active_workspace_destination();
                 let target = self.sidebar_model.projects.iter().find_map(|project| {
@@ -814,19 +866,21 @@ impl Cagents {
                 if let Some((project, row)) = target {
                     self.sidebar_state.reveal_project(project);
                     self.persist();
-                    Task::batch([
-                        focus,
+                    let reveal = if self.context_inspector_is_overlay() {
+                        Task::none()
+                    } else {
                         sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
-                            .map(cosmic::Action::App),
-                    ])
+                            .map(cosmic::Action::App)
+                    };
+                    Task::batch([focus, reveal, overlay])
                 } else {
-                    focus
+                    Task::batch([focus, overlay])
                 }
             }
             Action::ToggleProjects => {
                 self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
                 self.persist();
-                Task::none()
+                self.sync_context_overlay_state()
             }
             Action::ToggleNewTab | Action::ToggleNotices | Action::ShowNoticesFor(_) => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
