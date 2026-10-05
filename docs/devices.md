@@ -86,3 +86,7 @@ in a remote terminal. Accounts, native provider sign-in, and managed account
 creation, linking, registration, and removal belong to the selected device.
 Codex uses device authentication so its callback need not be forwarded.
 Per-pane device switching is tracked separately in [#687](https://github.com/CarsonBurke/cagents/issues/687).
+
+**New window** beside the device control opens another independent client window
+on the current device. It saves the current workspace before copying its layout
+into a new durable window slot; existing windows and daemon-hosted jobs stay open.
