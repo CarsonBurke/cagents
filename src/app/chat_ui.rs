@@ -16,6 +16,7 @@ mod clipboard_image;
 mod completion;
 mod fold;
 mod images;
+mod layout;
 mod permissions;
 mod prose;
 mod retained;

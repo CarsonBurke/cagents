@@ -1660,11 +1660,8 @@ impl Runtime {
             .into(),
         );
         let usage = &snapshot.usage;
-        // The status line has two halves. What the agent is doing, where it is
-        // doing it and the settings a reader changes mid-conversation scroll
-        // sideways rather than wrapping, because a chat pane is often narrow
-        // and a status line that grows to three rows takes that space from the
-        // transcript.
+        // Prefer a wider chat over hiding its status and settings behind a
+        // scrollbar. The footer wraps only when the pane itself is too narrow.
         // The line always says what the conversation is doing, idle
         // included: a reader glancing at a card should never have to infer
         // its state from the absence of a word. The order is the order of
@@ -1750,12 +1747,7 @@ impl Runtime {
             );
         }
         status.extend(self.session_controls(transitioning, accounts, offers));
-        // What the conversation has spent is pinned to the pane's right edge
-        // instead of joining that run. The budget and the money are the two
-        // figures a reader consults deliberately, and mixing them into the
-        // same left-to-right sequence as a transient activity line pushed them
-        // out of reach exactly when the agent was busy enough for them to
-        // matter.
+        // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
             // A context budget is a quantity a reader acts on - compact now,
@@ -1800,22 +1792,7 @@ impl Runtime {
             // and four decimals of a dollar is a number nobody reads.
             spend.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
         }
-        let mut footer = vec![
-            widget::scrollable(
-                widget::row::with_children(status)
-                    .spacing(step::GAP_S)
-                    .align_y(Alignment::Center)
-                    // The thumb floats over the row it belongs to, so its
-                    // rail is reserved below the content the way every
-                    // other scrollable in the app reserves one.
-                    .padding(design::with_horizontal_rail(iced::Padding::ZERO)),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            ))
-            .width(Length::Fill)
-            .into(),
-        ];
+        let mut footer = status;
         if let Some(notice) = permissions::notice(snapshot) {
             footer.push(
                 widget::button::custom(
@@ -1849,26 +1826,27 @@ impl Runtime {
             widget::row::with_children(spend)
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
-                .padding(design::with_horizontal_rail(iced::Padding::ZERO))
                 .into(),
         );
-        content.push(crate::ui_controls::popover(
-            widget::row::with_children(footer)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center),
+        let footer = crate::ui_controls::popover(
+            widget::flex_row(footer)
+                .spacing(step::GAP_S as u16)
+                .align_items(Alignment::Center),
             self.permission_picker
                 .then(|| self.permissions_view(available, content_width - 32.0)),
             widget::popover::Position::Top,
             action(Action::PermissionPicker(target, false)),
-        ));
-        let pane = widget::container(
+        );
+        let pane = widget::container(super::layout::pane(
             widget::column::with_children(content)
                 .spacing(step::GAP_S)
                 .height(Length::Fill)
-                .width(Length::Fill),
-        )
+                .width(Length::Fill)
+                .into(),
+            footer,
+            (content_width - 2.0 * step::GAP_M).max(1.0),
+        ))
         .padding(step::GAP_M)
-        .max_width(content_width.max(1.0))
         .width(Length::Fill)
         .height(Length::Fill);
         let pane = widget::container(pane)
