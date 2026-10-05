@@ -25,8 +25,9 @@ app-server 0.159.3, and Oh My Pi 18.2.9.
 
 Claude async steering and queueing are enabled for 2.1.286 and newer. Messages
 are written to the running provider immediately with `next` or `later`
-priority. Provider lifecycle acknowledgments determine the queued preview;
-background child work does not keep the parent composer busy after its result.
+priority. Queued input appears immediately in a bounded panel above the composer;
+provider lifecycle acknowledgments move it into the transcript only when consumed.
+Background child work does not keep the parent composer busy after its result.
 Older versions retain local follow-up delivery after the current turn.
 
 Codex retains additional typed APIs without corresponding native UI controls:
