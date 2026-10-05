@@ -13,6 +13,7 @@ pub(super) fn tool_result(
     let mut items = vec![Item {
         id: id.into(),
         role: Role::Assistant,
+        started_at: None,
         at: None,
         content: ItemContent::Tool {
             name,
@@ -28,6 +29,7 @@ pub(super) fn tool_result(
     items.extend(images.into_iter().enumerate().map(|(index, path)| Item {
         id: format!("{id}/image/{index}"),
         role: Role::Assistant,
+        started_at: None,
         at: None,
         content: ItemContent::Image {
             path,

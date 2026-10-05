@@ -500,6 +500,7 @@ mod tests {
                 thinking: false,
                 phase: Phase::default(),
             },
+            started_at: None,
             at: None,
         };
         let mut prompt = item(Role::User, &text);

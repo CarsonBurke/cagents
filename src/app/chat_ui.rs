@@ -1064,6 +1064,7 @@ fn snapshot_channel_name(
 enum HistoryNavigation {
     EarlierEdge,
     EarlierExplicit,
+    LatestEdge,
     Latest,
 }
 
@@ -1174,6 +1175,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    source_clock: Option<chat::client::SourceClock>,
     cache: HashMap<String, CachedItem>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
@@ -1551,6 +1553,7 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            source_clock: None,
             connection,
             queued: None,
             followup: None,
@@ -1695,6 +1698,12 @@ impl Runtime {
             cached.rehighlight(theme);
         }
     }
+    fn source_now_ms(&self) -> Option<u64> {
+        self.source_clock
+            .map(chat::client::SourceClock::now)
+            .or_else(chat::now_ms)
+    }
+
     fn active_scroll(&self) -> view::Scroll {
         match self.selected_subagent.as_ref() {
             Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
@@ -1709,7 +1718,7 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let mut snapshot = handle.snapshot();
+        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -1896,6 +1905,7 @@ impl Runtime {
                 self.asked_after.insert(last.id.clone());
             }
         }
+        self.source_clock = source_clock;
         self.turns = turn::group(&snapshot.items, &self.asked_after);
         reconcile_disclosure(&mut self.opened, &self.turns);
         self.snapshot = snapshot;
@@ -4585,6 +4595,13 @@ impl Cagents {
         };
         match page {
             HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
+            HistoryNavigation::LatestEdge
+                if runtime.scroll.at_bottom()
+                    && !runtime.scroll.at_top()
+                    && runtime.snapshot.has_later =>
+            {
+                self.handle_chat_action(Action::Latest(target))
+            }
             HistoryNavigation::EarlierExplicit if runtime.snapshot.has_earlier => {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
@@ -4647,6 +4664,15 @@ impl Cagents {
                 || !runtime.snapshot.has_earlier
                 || runtime.snapshot.history_loading
                 || runtime.page_request.is_some())
+        {
+            return Task::none();
+        }
+        // The ACK confirms dispatch, not arrival of the newest history.
+        // Coalesce repeated gestures while that same navigation is in flight.
+        if command == Command::Refresh
+            && runtime
+                .page_request
+                .is_some_and(|(page, _)| page == view::Page::Newer)
         {
             return Task::none();
         }
@@ -6948,7 +6974,7 @@ impl Cagents {
                 }
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
-                if at_bottom {
+                if at_bottom && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
                 }
                 // Leaving an end is what arms the page at it, so a reader who
@@ -6961,6 +6987,9 @@ impl Cagents {
                     runtime.earlier_asked = None;
                 }
                 if !at_bottom {
+                    if runtime.deferred_page == Some(HistoryNavigation::LatestEdge) {
+                        runtime.deferred_page = None;
+                    }
                     runtime.later_asked = None;
                 }
                 let height = Some(scroll.content());
@@ -6994,7 +7023,9 @@ impl Cagents {
                     && runtime.later_asked != height
                 {
                     if runtime.pending.is_some() {
-                        runtime.deferred_page = Some(HistoryNavigation::Latest);
+                        if runtime.deferred_page.is_none() {
+                            runtime.deferred_page = Some(HistoryNavigation::LatestEdge);
+                        }
                         return Task::none();
                     }
                     return self.chat_send(target, Command::Refresh, false);
@@ -7199,6 +7230,7 @@ mod tests {
                 id: "image".into(),
                 role: chat::Role::Assistant,
                 content,
+                started_at: None,
                 at: None,
             }
             .into(),
@@ -7537,6 +7569,7 @@ mod tests {
                 id: "prompt".into(),
                 role: chat::Role::User,
                 content: text("Implement the requested feature"),
+                started_at: None,
                 at: None,
             }
             .into(),
@@ -7837,6 +7870,125 @@ mod tests {
     }
 
     #[test]
+    fn history_latest_gesture_cancels_when_reader_leaves_bottom() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        drop(app.chat_send(
+            target,
+            Command::SetPermissionMode {
+                mode: "manual".into(),
+            },
+            false,
+        ));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            true,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).deferred_page,
+            Some(HistoryNavigation::LatestEdge)
+        );
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(300.0, 1000.0, 400.0),
+            true,
+        )));
+        assert!(chat_runtime(&app, card).deferred_page.is_none());
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn history_explicit_latest_survives_leaving_bottom() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.has_later = true;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.chat_send(
+            target,
+            Command::SetPermissionMode {
+                mode: "manual".into(),
+            },
+            false,
+        ));
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(300.0, 1000.0, 400.0),
+            true,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).deferred_page,
+            Some(HistoryNavigation::Latest)
+        );
+        settle(&mut app, card, Ok(()));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Newer)
+        );
+    }
+
+    #[test]
+    fn history_bottom_does_not_mark_unloaded_latest_activity_seen() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.unseen_activity = true;
+        Arc::make_mut(&mut runtime.snapshot).has_later = true;
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            false,
+        )));
+        assert!(chat_runtime(&app, card).unseen_activity);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = false;
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            false,
+        )));
+        assert!(!chat_runtime(&app, card).unseen_activity);
+    }
+
+    #[test]
+    fn history_repeated_latest_after_ack_waits_for_provider_history() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.has_later = true;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        snapshot.generation += 1;
+        snapshot.history_loading = true;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        settle(&mut app, card, Ok(()));
+        assert_eq!(
+            chat_runtime(&app, card).page_request.map(|(page, _)| page),
+            Some(view::Page::Newer)
+        );
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        assert!(chat_runtime(&app, card).pending.is_none());
+        snapshot.generation += 1;
+        snapshot.history_loading = false;
+        snapshot.has_later = false;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).page_request.is_none());
+    }
+
+    #[test]
     fn history_repeated_latest_is_fulfilled_by_the_pending_refresh() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture(&mut app);
@@ -7927,6 +8079,7 @@ mod tests {
                     id: "u1".into(),
                     role: chat::Role::User,
                     content: text("hello"),
+                    started_at: None,
                     at: None,
                 }],
                 &HashSet::new(),
@@ -9749,6 +9902,7 @@ mod tests {
                         id: "prompt".into(),
                         role: chat::Role::User,
                         content: text("hello"),
+                        started_at: None,
                         at: None,
                     }
                     .into(),
@@ -10934,6 +11088,7 @@ mod tests {
                     id: "prompt".into(),
                     role: chat::Role::User,
                     content: text("hello"),
+                    started_at: None,
                     at: None,
                 }
                 .into(),

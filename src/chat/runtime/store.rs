@@ -190,10 +190,12 @@ impl Store {
         // provider supplied.
         if !older {
             item.at = observed_at();
+            item.started_at = item.at;
         }
         let mut preserve_input = false;
         if let Some((_, metadata, _)) = &previous {
             let old: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
+            item.started_at = old.started_at.or(old.at).or(item.started_at);
             if let (
                 ItemContent::Tool { name, input, .. },
                 ItemContent::Tool { name: old_name, .. },
@@ -584,7 +586,9 @@ impl Store {
                 if length != offset {
                     return Err("Output delta does not follow the cached output".into());
                 }
-                item.at = observed_at();
+                let at = observed_at();
+                item.started_at = item.started_at.or(item.at).or(at);
+                item.at = at;
                 let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
                 let transaction = self.db.transaction().map_err(|error| error.to_string())?;
                 insert_body(&transaction, &id, field, offset as i64, &delta)?;
@@ -763,6 +767,7 @@ impl Store {
                         thinking,
                         phase: Phase::Final,
                     },
+                    started_at: None,
                     at: None,
                 },
                 false,
@@ -787,7 +792,9 @@ impl Store {
         if !delta.is_empty() {
             // A streaming item is restamped by every delta, so the stamp a
             // finished item carries is the moment its last delta arrived.
-            item.at = observed_at();
+            let at = observed_at();
+            item.started_at = item.started_at.or(item.at).or(at);
+            item.at = at;
             let stamped = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
             let transaction = self.db.transaction().map_err(|e| e.to_string())?;
             insert_body(&transaction, id, 0, length, delta)?;
@@ -1271,6 +1278,7 @@ mod tests {
         let item = Item {
             id: id.clone(),
             role: Role::Assistant,
+            started_at: None,
             at: None,
             content: ItemContent::Tool {
                 name: "tool".into(),
@@ -1302,6 +1310,7 @@ mod tests {
         let item = Item {
             id: "tool".into(),
             role: Role::Assistant,
+            started_at: None,
             at: None,
             content: ItemContent::Tool {
                 name: "shell".into(),
@@ -1426,6 +1435,7 @@ mod tests {
                 thinking: false,
                 phase: Phase::Final,
             },
+            started_at: None,
             at: None,
         }
     }
@@ -1689,6 +1699,7 @@ mod tests {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                started_at: None,
                 at: None,
             };
             store
@@ -1731,6 +1742,7 @@ mod tests {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -1772,6 +1784,7 @@ mod tests {
                 id: "report".into(),
                 role: Role::User,
                 content: delivery.clone(),
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -1794,6 +1807,7 @@ mod tests {
                     path: payload.clone(),
                     description: "screenshot".into(),
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -1818,6 +1832,7 @@ mod tests {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -1831,6 +1846,7 @@ mod tests {
                 .apply(Event::Item(Item {
                     id: id.into(),
                     role: Role::Assistant,
+                    started_at: None,
                     at: None,
                     content: ItemContent::Image {
                         path: if id == "invalid" {
@@ -1875,6 +1891,7 @@ mod tests {
                     output: String::new(),
                     status: crate::chat::ToolStatus::Running,
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -1914,6 +1931,7 @@ mod tests {
                     }],
                     status: crate::chat::ToolStatus::Succeeded,
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -1970,6 +1988,7 @@ mod tests {
                     duration_ms: Some(12),
                     output: original.clone(),
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -2028,6 +2047,7 @@ mod tests {
                     output: output.clone(),
                     status: crate::chat::ToolStatus::Running,
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -2050,6 +2070,7 @@ mod tests {
                     duration_ms: Some(3),
                     output,
                 },
+                started_at: None,
                 at: None,
             }))
             .unwrap();
@@ -2062,6 +2083,153 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn replayed_items_acquire_a_stable_start_on_the_first_live_delta() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let text = Item {
+            id: "text".into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: String::new(),
+                thinking: true,
+                phase: Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        };
+        let tool = Item {
+            id: "tool".into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: "exec".into(),
+                input: "run".into(),
+                output: String::new(),
+                status: crate::chat::ToolStatus::Running,
+            },
+            started_at: None,
+            at: None,
+        };
+        store
+            .apply(Event::History {
+                items: vec![text, tool],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(
+            store
+                .window()
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| item.started_at.is_none())
+        );
+        let mut initial_starts = Vec::new();
+        for offset in 0..2 {
+            store
+                .apply(Event::TextDelta {
+                    id: "text".into(),
+                    role: Role::Assistant,
+                    thinking: true,
+                    delta: "x".into(),
+                })
+                .unwrap();
+            store
+                .apply(Event::OutputDelta {
+                    id: "tool".into(),
+                    offset,
+                    delta: "x".into(),
+                })
+                .unwrap();
+            let first = store.window().unwrap().items;
+            let starts: Vec<_> = first.iter().map(|item| item.started_at.unwrap()).collect();
+            if offset == 0 {
+                initial_starts = starts.clone();
+            } else {
+                assert_eq!(starts, initial_starts);
+            }
+            // A same-ID replay must not replace the timing acquired by live work.
+            store
+                .apply(Event::History {
+                    items: first
+                        .iter()
+                        .map(|item| {
+                            let mut replay = (**item).clone();
+                            replay.started_at = None;
+                            replay.at = None;
+                            replay
+                        })
+                        .collect(),
+                    has_earlier: false,
+                })
+                .unwrap();
+            let replayed = store.window().unwrap().items;
+            assert_eq!(
+                replayed
+                    .iter()
+                    .map(|item| item.started_at.unwrap())
+                    .collect::<Vec<_>>(),
+                starts
+            );
+            if offset == 0 {
+                // Set last observations apart from the starts deterministically;
+                // the next delta must preserve the first start, not this later stamp.
+                for item in first {
+                    let mut updated = (*item).clone();
+                    updated.at = Some(updated.started_at.unwrap() + 1_000);
+                    let metadata = postcard::to_stdvec(&updated).unwrap();
+                    store
+                        .db
+                        .execute(
+                            "UPDATE items SET metadata=?2 WHERE id=?1",
+                            params![updated.id, metadata],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let items = store.window().unwrap().items;
+        for item in items {
+            assert!(item.started_at.is_some());
+        }
+    }
+
+    #[test]
+    fn tool_start_survives_output_deltas_and_completion_replacement() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let tool = |status| Item {
+            id: "tool".into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: "exec".into(),
+                input: "run".into(),
+                output: String::new(),
+                status,
+            },
+            started_at: None,
+            at: None,
+        };
+        store
+            .apply(Event::Item(tool(crate::chat::ToolStatus::Running)))
+            .unwrap();
+        let started = store.window().unwrap().items[0].started_at.unwrap();
+        store
+            .apply(Event::OutputDelta {
+                id: "tool".into(),
+                offset: 0,
+                delta: "working".into(),
+            })
+            .unwrap();
+        let streaming = store.window().unwrap().items[0].clone();
+        assert_eq!(streaming.started_at, Some(started));
+        assert!(streaming.at.unwrap() >= started);
+        store
+            .apply(Event::Item(tool(crate::chat::ToolStatus::Succeeded)))
+            .unwrap();
+        let completed = store.window().unwrap().items[0].clone();
+        assert_eq!(completed.started_at, Some(started));
+        assert!(completed.at.unwrap() >= streaming.at.unwrap());
+    }
+
     /// The stamp is read as the moment an item finished, and a running daemon
     /// reaches its transcript through this cache, so the stamp has to survive
     /// caching, streaming and paging back out.
@@ -2076,12 +2244,14 @@ mod tests {
                 thinking: false,
                 phase: Phase::Final,
             },
+            started_at: None,
             at: None,
         };
         store.apply(Event::Item(text("live", "first"))).unwrap();
         let created = store.window().unwrap().items[0]
             .at
             .expect("a cached observation carries a stamp");
+        assert_eq!(store.window().unwrap().items[0].started_at, Some(created));
         store
             .apply(Event::TextDelta {
                 id: "live".into(),
@@ -2094,6 +2264,7 @@ mod tests {
             .at
             .expect("accumulating a delta keeps the item stamped");
         assert!(streamed >= created);
+        assert_eq!(store.window().unwrap().items[0].started_at, Some(created));
         store
             .apply(Event::History {
                 items: vec![text("older", "replay")],
@@ -2102,6 +2273,8 @@ mod tests {
             .unwrap();
         let items = store.window().unwrap().items;
         assert_eq!(items[0].at, None);
+        assert_eq!(items[0].started_at, None);
         assert_eq!(items[1].at, Some(streamed));
+        assert_eq!(items[1].started_at, Some(created));
     }
 }

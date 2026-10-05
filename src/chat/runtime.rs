@@ -731,7 +731,9 @@ impl Handle {
                 .map(|agent| (agent.id.clone(), agent.items.clone()))
                 .collect();
         }
-        Some(state.clone())
+        let mut snapshot = state.clone();
+        snapshot.sampled_at = observed_at();
+        Some(snapshot)
     }
     /// The last publication is retained for other readers of the same revision.
     /// Readers that missed it receive the authoritative full snapshot instead.
@@ -829,14 +831,15 @@ impl Handle {
             .as_ref()
             .filter(|update| after == Some(update.base_generation))
         {
-            Some(crate::terminal_ipc::ServerResponse::ChatUpdate {
-                chat_id,
-                update: presentation.clone(),
-            })
+            let mut update = presentation.clone();
+            update.metadata.sampled_at = observed_at();
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update })
         } else {
+            let mut snapshot = state.clone();
+            snapshot.sampled_at = observed_at();
             Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
                 chat_id,
-                snapshot: Some(state.clone()),
+                snapshot: Some(snapshot),
             })
         }
     }
@@ -2114,7 +2117,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 };
                 if let Some(body) = body.filter(|body| body.len() == offset) {
                     body.push_str(&delta);
-                    item.at = observed_at();
+                    let at = observed_at();
+                    item.started_at = item.started_at.or(item.at).or(at);
+                    item.at = at;
                 }
             }
         }
@@ -2227,7 +2232,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             // The adapters do not know wall-clock time, so the item is stamped
             // here, where the daemon actually observes the change.
             item.at = observed_at();
+            item.started_at = item.at;
             if let Some(&index) = indices.get(&item.id) {
+                item.started_at = state.items[index]
+                    .started_at
+                    .or(state.items[index].at)
+                    .or(item.at);
                 if let (
                     ItemContent::Tool { name, input, .. },
                     ItemContent::Tool {
@@ -2269,8 +2279,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::SubagentItem { id, mut item } => {
             item.at = observed_at();
+            item.started_at = item.at;
             let agent = subagent(state, &id);
             if let Some(old) = agent.items.iter_mut().find(|old| old.id == item.id) {
+                item.started_at = old.started_at.or(old.at).or(item.at);
                 *old = Arc::new(item);
             } else {
                 agent.items.push(Arc::new(item));
@@ -2289,9 +2301,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 let item = Arc::make_mut(item);
                 if let ItemContent::Text { text, .. } = &mut item.content {
                     text.push_str(&delta);
-                    item.at = observed_at();
+                    let at = observed_at();
+                    item.started_at = item.started_at.or(item.at).or(at);
+                    item.at = at;
                 }
             } else {
+                let at = observed_at();
                 agent.items.push(Arc::new(Item {
                     id: item_id,
                     role,
@@ -2300,7 +2315,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         thinking,
                         phase: Phase::Final,
                     },
-                    at: observed_at(),
+                    started_at: at,
+                    at,
                 }));
             }
             trim_subagent(agent);
@@ -2319,7 +2335,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                     && output.len() == offset
                 {
                     output.push_str(&delta);
-                    item.at = observed_at();
+                    let at = observed_at();
+                    item.started_at = item.started_at.or(item.at).or(at);
+                    item.at = at;
                 }
             }
             trim_subagent(agent);
@@ -2380,6 +2398,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 let item = Arc::make_mut(&mut state.items[index]);
                 if let ItemContent::Text { text, .. } = &mut item.content {
                     text.push_str(&delta);
+                    item.started_at = item.started_at.or(item.at).or(at);
                     item.at = at;
                 } else {
                     state.error = Some(format!(
@@ -2399,6 +2418,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         thinking,
                         phase: Phase::Final,
                     },
+                    started_at: at,
                     at,
                 }));
             }
@@ -2723,6 +2743,7 @@ mod tests {
                 thinking: false,
                 phase: Phase::Final,
             },
+            started_at: None,
             at: None,
         }
     }
@@ -2734,6 +2755,7 @@ mod tests {
             .map(|item| {
                 let mut item = (**item).clone();
                 item.at = None;
+                item.started_at = None;
                 item
             })
             .collect()
@@ -3011,11 +3033,92 @@ mod tests {
         );
     }
     #[test]
+    fn replayed_parent_and_child_items_keep_the_first_live_delta_start() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let tool = Item {
+            id: "tool".into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: "exec".into(),
+                input: "run".into(),
+                output: String::new(),
+                status: super::super::ToolStatus::Running,
+            },
+            started_at: None,
+            at: None,
+        };
+        let replayed = vec![text("text", ""), tool];
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::History {
+                items: replayed.clone(),
+                has_earlier: false,
+            },
+        );
+        subagent(&mut state, "child").items = replayed.into_iter().map(Arc::new).collect();
+        let mut initial_starts = Vec::new();
+        for offset in 0..2 {
+            for event in [
+                Event::TextDelta {
+                    id: "text".into(),
+                    role: Role::Assistant,
+                    thinking: false,
+                    delta: "x".into(),
+                },
+                Event::OutputDelta {
+                    id: "tool".into(),
+                    offset,
+                    delta: "x".into(),
+                },
+                Event::SubagentTextDelta {
+                    id: "child".into(),
+                    item_id: "text".into(),
+                    role: Role::Assistant,
+                    thinking: false,
+                    delta: "x".into(),
+                },
+                Event::SubagentOutputDelta {
+                    id: "child".into(),
+                    item_id: "tool".into(),
+                    offset,
+                    delta: "x".into(),
+                },
+            ] {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let starts: Vec<_> = state
+                .items
+                .iter()
+                .chain(&state.subagents[0].items)
+                .map(|item| {
+                    item.started_at
+                        .expect("the first live delta stamps replayed items")
+                })
+                .collect();
+            if offset == 0 {
+                initial_starts = starts;
+                for item in state.items.iter_mut().chain(&mut state.subagents[0].items) {
+                    let item = Arc::make_mut(item);
+                    item.at = Some(item.started_at.unwrap() + 1_000);
+                }
+            } else {
+                assert_eq!(
+                    starts, initial_starts,
+                    "later output must not move the start"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn observed_items_are_stamped_and_replayed_history_is_not() {
         let mut state = Snapshot::default();
         let mut indices = BTreeMap::new();
         apply_event(&mut state, &mut indices, Event::Item(text("live", "first")));
         let created = state.items[0].at.expect("an observed item carries a stamp");
+        assert_eq!(state.items[0].started_at, Some(created));
         apply_event(
             &mut state,
             &mut indices,
@@ -3030,6 +3133,7 @@ mod tests {
             .at
             .expect("accumulating a delta keeps the item stamped");
         assert!(streamed >= created);
+        assert_eq!(state.items[0].started_at, Some(created));
         apply_event(
             &mut state,
             &mut indices,
@@ -3268,11 +3372,17 @@ mod tests {
         // A console/full-snapshot reader at the same revision must not
         // erase the incremental patch another subscriber is about to read.
         assert_eq!(handle.snapshot(None).unwrap().generation, first.generation);
-        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update: second, .. }) =
-            handle.presentation(id, Some(baseline.generation))
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate {
+            update: mut second, ..
+        }) = handle.presentation(id, Some(baseline.generation))
         else {
             panic!("second reader lost its update");
         };
+        // The transcript patch is retained; its source clock is freshly
+        // sampled for each reader, including readers of cached revisions.
+        assert!(update.metadata.sampled_at.is_some());
+        assert!(second.metadata.sampled_at.is_some());
+        second.metadata.sampled_at = update.metadata.sampled_at;
         assert_eq!(update, second);
         handle.command(Command::Refresh).unwrap();
         assert!(matches!(

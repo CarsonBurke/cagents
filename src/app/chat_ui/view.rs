@@ -469,13 +469,18 @@ impl Scroll {
         (self.content - self.window).max(0.0)
     }
 
+    /// Keep the edge regions separate even when only a few pixels overflow.
+    fn page_reach(self) -> f32 {
+        PAGE_REACH.min(self.travel() * 0.25)
+    }
+
     /// Whether the reader has reached the oldest message that is loaded.
     ///
     /// A transcript shorter than the pane it is drawn in counts as reached:
     /// no gesture can take the reader any further up it. The explicit history
     /// control remains available without starting a paging loop.
     pub(super) fn at_top(self) -> bool {
-        self.travel() <= 0.0 || self.from_top <= PAGE_REACH
+        self.travel() <= 0.0 || self.from_top <= self.page_reach()
     }
 
     /// Whether the reader has reached the newest message that is loaded.
@@ -485,7 +490,7 @@ impl Scroll {
     /// and reaching the bottom of that page is how a reader asks to be
     /// returned to the live end of the conversation.
     pub(super) fn at_bottom(self) -> bool {
-        self.travel() <= 0.0 || self.from_top >= self.travel() - PAGE_REACH
+        self.travel() <= 0.0 || self.from_top >= self.travel() - self.page_reach()
     }
 
     /// The height of the loaded transcript, which is what tells the page the
@@ -1040,25 +1045,10 @@ impl Runtime {
                 .into(),
             );
         }
-        let transcript = widget::scrollable(
-            widget::column::with_children(transcript)
-                // Turns are held apart further than anything inside one,
-                // so the whitespace itself says where an exchange ends.
-                // That is the separation a divider between messages was
-                // doing badly.
-                .spacing(step::GAP_L)
-                .padding(design::with_vertical_rail(iced::Padding::ZERO))
-                .width(Length::Fill),
-        )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .id(card_control_id(target.card, "chat-transcript"))
-        .anchor_bottom()
-        // The wrapper reports fitting pages too and distinguishes user
-        // navigation from layout corrections, so reflow never requests history.
-        .height(Length::Fill)
-        .width(Length::Fill);
+        let transcript = widget::column::with_children(transcript)
+            .spacing(step::GAP_L)
+            .padding(design::with_vertical_rail(iced::Padding::ZERO))
+            .width(Length::Fill);
         content.push(scroll::transcript(
             transcript,
             target,
@@ -2394,6 +2384,10 @@ impl Runtime {
     /// It reads the items' change tokens rather than their bodies, so it
     /// costs the same for a one-line answer as for a long one.
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
+        self.turn_fingerprint_at(turn, dark, self.source_now_ms())
+    }
+
+    fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
         (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
@@ -2411,8 +2405,8 @@ impl Runtime {
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
-            chat::now_ms()
-                .and_then(|now| turn.working_for(now))
+            now.and_then(|now| turn.working_for(now))
+                .map(|millis| if turn.running { millis / 1_000 } else { millis })
                 .hash(&mut hasher);
         }
         let placed = turn.prompt.iter().map(|index| (*index, None)).chain(
@@ -2425,7 +2419,9 @@ impl Runtime {
             let Some(item) = self.snapshot.items.get(index) else {
                 continue;
             };
-            (&item.id, item.at, slot).hash(&mut hasher);
+            // The latest observation can change at provider heartbeat speed
+            // even when the rendered content and elapsed second are unchanged.
+            (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
             self.cache
                 .get(&item.id)
                 .map(|cached| cached.token)
@@ -3035,13 +3031,13 @@ impl Runtime {
                         )
                     });
             let expanded = !finished || self.expanded.contains(&item.id);
-            let elapsed = item.at.and_then(|start| {
+            let elapsed = item.started_at.or(item.at).and_then(|start| {
                 self.snapshot
                     .items
                     .iter()
                     .skip_while(|candidate| candidate.id != item.id)
                     .skip(1)
-                    .find_map(|candidate| candidate.at)
+                    .find_map(|candidate| candidate.started_at.or(candidate.at))
                     .map(|end| format_duration(end.saturating_sub(start)))
             });
             let label = elapsed.filter(|_| finished).map_or_else(
@@ -3148,12 +3144,9 @@ pub(super) fn permission_mode_label(mode: &str) -> &str {
 /// What sits at the end of the loaded window while the conversation
 /// carries on past it.
 ///
-/// There is no control here, because the page is asked for by the gesture
-/// that reaches this edge. What a reader needs at it is the two things
-/// they cannot otherwise know: that the conversation does not begin, or
-/// end, where the transcript does, and that a page they have just asked
-/// for by scrolling is on its way. Both belong at the edge the rows will
-/// appear at rather than in a button beside it.
+/// Gestures toward this edge request a page. Its control also gives fitting
+/// transcripts and failed requests an explicit way to navigate. The loading
+/// state stays at the edge where the requested rows will appear.
 fn paging_view(
     target: Target,
     page: Page,
@@ -3752,6 +3745,7 @@ mod tests {
             chat::Item {
                 id: "thought".into(),
                 role: chat::Role::Assistant,
+                started_at: None,
                 at: None,
                 content: ItemContent::Text {
                     text: "Planning".into(),
@@ -3793,6 +3787,44 @@ mod tests {
             ..Snapshot::default()
         });
         runtime.refresh();
+    }
+
+    #[test]
+    fn tool_heartbeats_do_not_rebuild_the_turn_within_an_elapsed_second() {
+        let mut items = vec![chat::Item {
+            id: "tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "sleep 5".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            started_at: Some(1000),
+            at: Some(1500),
+        }];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let fingerprint = runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(2500));
+        items[0].at = Some(1800);
+        publish(&mut runtime, &handle, &items, 1);
+        assert_eq!(
+            fingerprint,
+            runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(2900))
+        );
+        assert_ne!(
+            fingerprint,
+            runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(3000))
+        );
+        if let ItemContent::Tool { status, .. } = &mut items[0].content {
+            *status = chat::ToolStatus::Succeeded;
+        }
+        items[0].at = Some(3500);
+        publish(&mut runtime, &handle, &items, 2);
+        assert_eq!(
+            runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(4000)),
+            runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(60000)),
+            "completed durations stay fixed",
+        );
     }
 
     /// A streaming answer is the only exchange that changes, so it is the
@@ -4219,6 +4251,19 @@ mod tests {
         // arrive without one.
         let short = scroll(0.0, 200.0, 400.0);
         assert!(short.at_top() && short.at_bottom());
+    }
+
+    #[test]
+    fn scrollable_short_pages_have_separate_pagination_edges() {
+        for travel in [0.01, 1.0, 24.0, 48.0, 96.0] {
+            let content = 400.0 + travel;
+            let top = scroll(0.0, content, 400.0);
+            assert!(top.at_top() && !top.at_bottom());
+            let bottom = scroll(content - 400.0, content, 400.0);
+            assert!(bottom.at_bottom() && !bottom.at_top());
+            let middle = scroll((content - 400.0) * 0.5, content, 400.0);
+            assert!(!middle.at_top() && !middle.at_bottom());
+        }
     }
 
     /// A question's own prose and the command or payload it is about read as

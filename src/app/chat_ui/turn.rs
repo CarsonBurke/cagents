@@ -67,11 +67,10 @@ pub(super) struct Turn {
     /// How the group's last resolved step went, so a collapsed strip reports
     /// the state the work reached.
     pub(super) outcome: Option<ToolStatus>,
-    /// Unix milliseconds of the group's first item, which is when this stretch
-    /// of work began.
+    /// Earliest first observation in the group, when this stretch of work began.
     started_at: Option<u64>,
-    /// Unix milliseconds of the group's last item. For a running group this is
-    /// the last sign of life, not the end of the work.
+    /// Latest observation in the group. An earlier item can finish after later
+    /// items appeared; for a running group this is the last sign of life.
     ended_at: Option<u64>,
     /// The key the reader's disclosure choice is stored under, and the
     /// collapsed strip's own line. Both are formed here, once per snapshot,
@@ -99,7 +98,7 @@ impl Turn {
             prose: Vec::new(),
             running: false,
             outcome: None,
-            started_at: item.and_then(|item| item.at),
+            started_at: item.and_then(|item| item.started_at.or(item.at)),
             ended_at: item.and_then(|item| item.at),
             key: item.map(|item| item.id.clone()).unwrap_or_default(),
             summary: String::new(),
@@ -125,7 +124,7 @@ impl Turn {
 
     /// How long this stretch of work has taken, in milliseconds.
     ///
-    /// A finished group is measured from its first item to its last. A running
+    /// A finished group spans its earliest start to its latest update. A running
     /// one is measured to `now`, so the strip counts up for as long as the
     /// agent is working rather than reporting the age of its most recent
     /// frame. `None` where the store has no stamp for either end, which is how
@@ -134,6 +133,22 @@ impl Turn {
         let start = self.started_at?;
         let end = if self.running { now } else { self.ended_at? };
         Some(end.saturating_sub(start))
+    }
+
+    /// Running timers advance at a readable, whole-second cadence. Finished
+    /// durations retain their precision; the cache uses the same cadence so
+    /// unrelated redraws cannot invalidate a turn at millisecond frequency.
+    pub(super) fn duration_label(&self, now: u64) -> Option<String> {
+        self.working_for(now).map(|millis| {
+            if self.running {
+                match millis / 1_000 {
+                    seconds @ 0..60 => format!("{seconds}s"),
+                    seconds => format!("{}m {}s", seconds / 60, seconds % 60),
+                }
+            } else {
+                super::format_duration(millis)
+            }
+        })
     }
 
     /// Fills in the summary once the group's membership is final.
@@ -184,13 +199,19 @@ impl Turn {
 
     /// Extends the group's span to take in an item's stamp.
     ///
-    /// The first and last stamp the group actually has, rather than the stamps
-    /// of its first and last item: a resumed session's history reaches the
-    /// store unstamped, and a group that mixes it with live work should report
+    /// The earliest start and latest observation the group actually has. Resumed
+    /// history reaches the store unstamped, and a group that mixes it with live work should report
     /// the span it can account for rather than nothing at all.
-    fn spans(&mut self, at: Option<u64>) {
-        self.started_at = self.started_at.or(at);
-        self.ended_at = at.or(self.ended_at);
+    fn spans(&mut self, item: &Item) {
+        if let Some(start) = item.started_at.or(item.at) {
+            self.started_at = Some(
+                self.started_at
+                    .map_or(start, |previous| previous.min(start)),
+            );
+        }
+        if let Some(end) = item.at {
+            self.ended_at = Some(self.ended_at.map_or(end, |previous| previous.max(end)));
+        }
     }
 
     fn observe(&mut self, status: Option<ToolStatus>) {
@@ -283,7 +304,7 @@ pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>)
             match turns.last_mut() {
                 Some(turn) if state == Open::Taking && turn.awaiting_activity() => {
                     turn.prompt.push(index);
-                    turn.spans(item.at);
+                    turn.spans(item);
                 }
                 _ => turns.push(Turn::opened(items, index, true)),
             }
@@ -304,7 +325,7 @@ pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>)
         // the states that skip it only occur once a group exists.
         let turn = turns.last_mut().expect("a group is open");
         turn.observe(item.content.status());
-        turn.spans(item.at);
+        turn.spans(item);
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
             Slot::Thinking | Slot::Commentary | Slot::Prose => {
@@ -525,6 +546,7 @@ mod tests {
                 thinking,
                 phase,
             },
+            started_at: None,
             at: None,
         }
     }
@@ -543,12 +565,14 @@ mod tests {
                 duration_ms: None,
                 output: String::new(),
             },
+            started_at: None,
             at: None,
         }
     }
 
     fn stamped(item: Item, at: u64) -> Item {
         Item {
+            started_at: None,
             at: Some(at),
             ..item
         }
@@ -585,6 +609,7 @@ mod tests {
                     summary: String::new(),
                     body: "Done".into(),
                 },
+                started_at: None,
                 at: None,
             },
             command("c1", ToolStatus::Succeeded),
@@ -696,6 +721,7 @@ mod tests {
                     path: "/home/reader/diagram.png".into(),
                     description: "User attachment".into(),
                 },
+                started_at: None,
                 at: None,
             },
             command("c1", ToolStatus::Succeeded),
@@ -817,6 +843,54 @@ mod tests {
     }
 
     #[test]
+    fn finished_group_includes_late_updates_to_earlier_items() {
+        let mut tool = command("c1", ToolStatus::Succeeded);
+        tool.started_at = Some(1_000);
+        tool.at = Some(5_000);
+        let mut reasoning = text("r1", Role::Assistant, Phase::Final, true);
+        reasoning.started_at = Some(2_000);
+        reasoning.at = Some(3_000);
+        let turns = group(&[tool, reasoning], &unasked());
+        assert_eq!(turns[0].working_for(9_000), Some(4_000));
+    }
+
+    #[test]
+    fn streamed_tool_duration_keeps_its_first_observation() {
+        let mut tool = command("c1", ToolStatus::Running);
+        tool.started_at = Some(1_000);
+        tool.at = Some(5_950);
+        let first = group(&[tool.clone()], &unasked());
+        assert_eq!(first[0].working_for(6_000), Some(5_000));
+        assert_eq!(first[0].duration_label(6_000).as_deref(), Some("5s"));
+        assert_eq!(
+            first[0].duration_label(6_999),
+            first[0].duration_label(6_000)
+        );
+        assert_eq!(first[0].duration_label(7_000).as_deref(), Some("6s"));
+        tool.at = Some(6_050);
+        let updated = group(&[tool.clone()], &unasked());
+        assert_eq!(updated[0].working_for(6_100), Some(5_100));
+        if let ItemContent::Command { status, .. } = &mut tool.content {
+            *status = ToolStatus::Succeeded;
+        }
+        let finished = group(&[tool], &unasked());
+        assert_eq!(finished[0].working_for(90_000), Some(5_050));
+        assert_eq!(finished[0].duration_label(90_000).as_deref(), Some("5.0s"));
+    }
+
+    #[test]
+    fn running_timer_handles_subsecond_and_minute_boundaries() {
+        let mut tool = command("c1", ToolStatus::Running);
+        tool.started_at = Some(1_000);
+        tool.at = Some(1_100);
+        let turns = group(&[tool], &unasked());
+        assert_eq!(turns[0].duration_label(999).as_deref(), Some("0s"));
+        assert_eq!(turns[0].duration_label(1_999).as_deref(), Some("0s"));
+        assert_eq!(turns[0].duration_label(60_999).as_deref(), Some("59s"));
+        assert_eq!(turns[0].duration_label(61_000).as_deref(), Some("1m 0s"));
+    }
+
+    #[test]
     fn activity_before_any_user_message_forms_a_promptless_group() {
         let items = vec![
             text("a1", Role::Assistant, Phase::Final, false),
@@ -899,6 +973,7 @@ mod tests {
                 thinking: false,
                 phase: Phase::Final,
             },
+            started_at: None,
             at: None,
         };
         assert_eq!(group(std::slice::from_ref(&empty), &unasked()).len(), 0);
@@ -939,6 +1014,7 @@ mod tests {
                     path: "/fixture.png".into(),
                     description: "Preview".into(),
                 },
+                started_at: None,
                 at: None,
             },
             command("tool4", ToolStatus::Succeeded),

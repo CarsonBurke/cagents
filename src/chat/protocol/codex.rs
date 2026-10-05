@@ -2331,6 +2331,7 @@ impl Adapter for Codex {
                     output: string(params, "diff")?.into(),
                     status: ToolStatus::Succeeded,
                 },
+                started_at: None,
                 at: None,
             })),
             "turn/plan/updated" => step.events.push(Event::Plan {
@@ -2617,6 +2618,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             thinking,
             phase: Phase::Final,
         },
+        started_at: None,
         at: None,
     };
     // A non-zero exit code is deliberately not a failure here. `grep` with no
@@ -2645,6 +2647,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 output,
                 status,
             },
+            started_at: None,
             at: None,
         }]
     };
@@ -2657,6 +2660,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 thinking: false,
                 phase: message_phase(value),
             },
+            started_at: None,
             at: None,
         }],
         "userMessage" => {
@@ -2681,6 +2685,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                                 .into(),
                             description: "User attachment".into(),
                         },
+                        started_at: None,
                         at: None,
                     }),
                     // A skill or a mention part names what the text beside it
@@ -2730,6 +2735,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     duration_ms: value["durationMs"].as_u64(),
                     output: value["aggregatedOutput"].as_str().unwrap_or("").into(),
                 },
+                started_at: None,
                 at: None,
             }]
         }
@@ -2740,6 +2746,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 changes: file_changes(value)?,
                 status,
             },
+            started_at: None,
             at: None,
         }],
         "mcpToolCall" => images::tool_result(
@@ -2789,6 +2796,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     })
                     .unwrap_or_default(),
             },
+            started_at: None,
             at: None,
         }],
         "functionCallOutput" => tool(
@@ -2803,6 +2811,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 path: string(value, "path")?.into(),
                 description: "Codex image".into(),
             },
+            started_at: None,
             at: None,
         }],
         "imageGeneration" => {
@@ -2830,6 +2839,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     vec![Item {
                         id: id.into(),
                         role: Role::Assistant,
+                        started_at: None,
                         at: None,
                         content: ItemContent::Image {
                             path,
