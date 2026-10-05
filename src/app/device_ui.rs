@@ -188,6 +188,17 @@ impl Cagents {
                 self.device_ui.busy = true;
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
+                        let saved = crate::device::list().map_err(|error| error.to_string())?;
+                        if saved.iter().any(|existing| {
+                            existing.name == device.name
+                                && (existing.host != device.host
+                                    || existing.executable != device.executable)
+                        }) {
+                            return Err(
+                                "That device name belongs to another connection. Use a new name."
+                                    .into(),
+                            );
+                        }
                         crate::device::save(device).map_err(|error| error.to_string())
                     })
                     .await
