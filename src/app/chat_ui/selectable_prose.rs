@@ -13,12 +13,16 @@ type ParagraphBuffer = <cosmic::Renderer as TextRenderer>::Paragraph;
 static NEXT_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-struct State {
-    identity: u64,
-    spans: Option<Arc<[Span<'static, String>]>>,
+pub(super) struct State {
+    pub(super) identity: u64,
+    pub(super) plain: Arc<str>,
+    pub(super) target: Option<Target>,
+    pub(super) managed: bool,
+    pub(super) dirty: bool,
+    pub(super) spans: Option<Arc<[Span<'static, String>]>>,
     paragraph: ParagraphBuffer,
-    anchor: usize,
-    end: usize,
+    pub(super) anchor: usize,
+    pub(super) end: usize,
     dragging: bool,
     focused: bool,
 }
@@ -27,6 +31,10 @@ impl Default for State {
     fn default() -> Self {
         Self {
             identity: NEXT_SELECTION.fetch_add(1, Ordering::Relaxed),
+            plain: Arc::from(""),
+            target: None,
+            managed: false,
+            dirty: false,
             spans: None,
             paragraph: ParagraphBuffer::default(),
             anchor: 0,
@@ -38,6 +46,17 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn hit(&self, position: Point) -> usize {
+        hit(&self.paragraph, &self.plain, position)
+    }
+
+    pub(super) fn link(&self, position: Point) -> Option<String> {
+        self.paragraph
+            .hit_span(position)
+            .and_then(|index| self.spans.as_ref()?.get(index))
+            .and_then(|span| span.link.clone())
+    }
+
     fn validate_selection(&mut self, plain: &str) {
         if !plain.is_char_boundary(self.anchor) || !plain.is_char_boundary(self.end) {
             self.anchor = 0;
@@ -54,10 +73,11 @@ pub(super) fn text(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
-    let plain = spans
+    let plain: Arc<str> = spans
         .iter()
         .map(|span| span.text.as_ref())
-        .collect::<String>();
+        .collect::<String>()
+        .into();
     let matches = find
         .filter(|query| !query.is_empty())
         .map_or_else(Vec::new, |query| {
@@ -80,7 +100,7 @@ pub(super) fn text(
 struct Selectable {
     matches: Vec<std::ops::Range<usize>>,
     spans: Arc<[Span<'static, String>]>,
-    plain: String,
+    plain: Arc<str>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -138,30 +158,30 @@ impl Selectable {
     }
 
     fn hit(&self, state: &State, position: Point) -> usize {
-        if position.y < 0.0 {
-            return 0;
-        }
-        if position.y >= state.paragraph.min_bounds().height {
-            return self.plain.len();
-        }
-        let buffer = state.paragraph.buffer();
-        let Some(cursor) = buffer.hit(position.x, position.y) else {
-            return if position.x <= 0.0 {
-                0
-            } else {
-                self.plain.len()
-            };
-        };
-        // Iced's paragraph Hit omits the line number. Code blocks and hard
-        // breaks need the cursor's full byte offset in the original source.
-        let prefix: usize = buffer
-            .lines
-            .iter()
-            .take(cursor.line)
-            .map(|line| line.text().len() + line.ending().as_str().len())
-            .sum();
-        (prefix + cursor.index).min(self.plain.len())
+        hit(&state.paragraph, &self.plain, position)
     }
+}
+
+fn hit(paragraph: &ParagraphBuffer, plain: &str, position: Point) -> usize {
+    if position.y < 0.0 {
+        return 0;
+    }
+    if position.y >= paragraph.min_bounds().height {
+        return plain.len();
+    }
+    let buffer = paragraph.buffer();
+    let Some(cursor) = buffer.hit(position.x, position.y) else {
+        return if position.x <= 0.0 { 0 } else { plain.len() };
+    };
+    // Iced's paragraph Hit omits the line number. Code blocks and hard
+    // breaks need the cursor's full byte offset in the original source.
+    let prefix: usize = buffer
+        .lines
+        .iter()
+        .take(cursor.line)
+        .map(|line| line.text().len() + line.ending().as_str().len())
+        .sum();
+    (prefix + cursor.index).min(plain.len())
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
@@ -185,6 +205,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
+        state.dirty = false;
+        state.target = Some(self.target);
+        if state
+            .spans
+            .as_ref()
+            .is_none_or(|previous| !Arc::ptr_eq(previous, &self.spans))
+        {
+            if !self.plain.starts_with(state.plain.as_ref()) {
+                state.identity = NEXT_SELECTION.fetch_add(1, Ordering::Relaxed);
+                state.anchor = 0;
+                state.end = 0;
+                state.dragging = false;
+            }
+            state.plain = self.plain.clone();
+        }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
         state.validate_selection(&self.plain);
         let description = iced::advanced::Text {
@@ -226,6 +261,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &cosmic::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        operation.custom(None, layout.bounds(), tree.state.downcast_mut::<State>());
+    }
+
     fn draw(
         &self,
         tree: &Tree,
@@ -258,6 +303,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        if std::mem::take(&mut state.dirty) {
+            shell.invalidate_layout();
+        }
+        if state.managed {
+            return;
+        }
         state.validate_selection(&self.plain);
         let position = cursor.position_in(layout.bounds());
         match event {
@@ -440,7 +491,7 @@ mod tests {
                 .iter()
                 .map(|span| span.text.as_ref())
                 .collect::<String>(),
-            selectable.plain
+            selectable.plain.as_ref()
         );
         assert_eq!(
             selected

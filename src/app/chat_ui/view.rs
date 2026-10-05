@@ -1049,11 +1049,15 @@ impl Runtime {
             .spacing(step::GAP_L)
             .padding(design::with_vertical_rail(iced::Padding::ZERO))
             .width(Length::Fill);
-        content.push(scroll::transcript(
-            transcript,
+        content.push(selection::transcript(
+            scroll::transcript(
+                transcript,
+                target,
+                self.selected_subagent.as_deref(),
+                anchors,
+            ),
             target,
             self.selected_subagent.as_deref(),
-            anchors,
         ));
         if !self.active_scroll().at_bottom() || (selected.is_none() && snapshot.has_later) {
             content.push(

@@ -21,6 +21,7 @@ mod prose;
 mod retained;
 mod scroll;
 mod selectable_prose;
+mod selection;
 mod step;
 mod tool_text;
 mod turn;
