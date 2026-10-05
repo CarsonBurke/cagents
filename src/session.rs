@@ -2558,6 +2558,7 @@ mod tests {
             chat_drafts: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            pending_terminal_creations: HashSet::new(),
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,

@@ -5248,6 +5248,7 @@ impl Cagents {
         explicit_retry: bool,
     ) -> Task<Message> {
         if self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
             || (self.shared_views.attached.contains(&card)
                 && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
                 && !explicit_retry)
@@ -5661,6 +5662,8 @@ impl Cagents {
         );
         if self.shared_views.creating_default {
             self.shared_views.defaults.insert(card_id, session.clone());
+        } else if session.continuity.live_proof().is_none() {
+            self.reserve_terminal_creation(card_id);
         }
         self.persist();
         Task::batch([
@@ -6768,6 +6771,20 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
+        if !self.durable.pending_terminal_creations.is_empty() {
+            let open = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| {
+                    card.existence.is_open() && matches!(card.kind, CardKind::Terminal(_))
+                })
+                .map(|card| card.id)
+                .collect::<HashSet<_>>();
+            Arc::make_mut(&mut self.durable)
+                .pending_terminal_creations
+                .retain(|id| open.contains(id));
+        }
         self.focus_save_pending = false;
         self.snapshot_workspace_scope();
         self.publish_view_changes();

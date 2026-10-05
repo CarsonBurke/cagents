@@ -127,6 +127,7 @@ fn scope_descriptor(
         // was shared with which registry.
         workspace_model_identity: None,
         local_only_cards: HashSet::new(),
+        pending_terminal_creations: HashSet::new(),
     }
 }
 
@@ -151,6 +152,29 @@ impl Cagents {
             return;
         }
         let focused = self.workspace.focused();
+        let active_order = self.durable.active_channel.and_then(|id| {
+            self.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .map(|channel| {
+                    let members = channel.cards.iter().copied().collect::<HashSet<_>>();
+                    let mut order = self
+                        .workspace
+                        .order()
+                        .filter(|card| members.contains(card))
+                        .collect::<Vec<_>>();
+                    let mounted = order.iter().copied().collect::<HashSet<_>>();
+                    order.extend(
+                        channel
+                            .cards
+                            .iter()
+                            .copied()
+                            .filter(|card| !mounted.contains(card)),
+                    );
+                    (id, order)
+                })
+        });
         if let Some(id) = self.durable.active_channel {
             self.channel_offsets
                 .insert(id, self.workspace.camera().offset());
@@ -165,6 +189,12 @@ impl Cagents {
         }
         let needs_update = self.durable.active_worktree != self.active_workspace
             || self.durable.worktree_focus != self.worktree_focus
+            || active_order.as_ref().is_some_and(|(id, order)| {
+                self.durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == *id && &channel.cards != order)
+            })
             || self.durable.channels.iter().any(|channel| {
                 (Some(channel.id) == self.durable.active_channel && channel.focused != focused)
                     || channel.cards.iter().any(|id| {
@@ -179,6 +209,11 @@ impl Cagents {
             return;
         }
         let durable = Arc::make_mut(&mut self.durable);
+        if let Some((id, order)) = active_order {
+            if let Some(channel) = durable.channels.iter_mut().find(|channel| channel.id == id) {
+                channel.cards = order;
+            }
+        }
         for channel in &mut durable.channels {
             channel.cards.retain(|id| {
                 durable

@@ -263,6 +263,7 @@ pub struct WorkspaceManifest {
     pub chat_drafts: HashMap<CardId, String>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
+    pub pending_terminal_creations: HashSet<CardId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -1282,6 +1283,7 @@ impl StateStore {
             chat_drafts: manifest.chat_drafts,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
+            pending_terminal_creations: manifest.pending_terminal_creations,
         };
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -2766,6 +2768,11 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:local_only_cards"),
         &to_json(&state.local_only_cards)?,
     )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:pending_terminal_creations"),
+        &to_json(&state.pending_terminal_creations)?,
+    )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -4053,6 +4060,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("local-only pane identities", &value))
         .transpose()?
         .unwrap_or_default(),
+        pending_terminal_creations: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:pending_terminal_creations"),
+        )?
+        .map(|value| from_json("pending terminal creation identities", &value))
+        .transpose()?
+        .unwrap_or_default(),
         workspace_model_identity: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_model_identity"),
@@ -4662,7 +4676,32 @@ mod tests {
             chat_drafts: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            pending_terminal_creations: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn explicit_pending_terminal_creation_survives_store_restore() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("pending-creation");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let id = state.cards[0].id;
+        state.pending_terminal_creations.insert(id);
+        state.card_scopes.insert(id, PathBuf::from("/repo"));
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        let restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.pending_terminal_creations, HashSet::from([id]));
+        let (CardKind::Terminal(before), CardKind::Terminal(after)) =
+            (&state.cards[0].kind, &restored.cards[0].kind)
+        else {
+            panic!()
+        };
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.launch, before.launch);
+        assert_eq!(restored.card_scopes, state.card_scopes);
     }
 
     #[test]

@@ -54,6 +54,24 @@ impl Cagents {
         Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
     }
 
+    pub(super) fn reserve_terminal_creation(&mut self, id: CardId) {
+        // Reserve in the selected, registered view. A directory under a
+        // folder project may belong to a shared child not yet loaded locally;
+        // that is insufficient authority to pin it to the parent view.
+        let scope = self.durable.active_channel.map(Scope::Channel).or_else(|| {
+            self.active_workspace
+                .as_deref()
+                .and_then(|path| self.worktree_view_scope(path))
+        });
+        if scope.is_some() {
+            // Preserve directory-derived ownership until the daemon accepts
+            // the pane. A shared child may still be loading in the sidebar.
+            Arc::make_mut(&mut self.durable)
+                .pending_terminal_creations
+                .insert(id);
+        }
+    }
+
     pub(super) fn worktree_view_scope(&self, path: &Path) -> Option<Scope> {
         let project = self.sidebar_model.projects.iter().find(|project| {
             project
@@ -152,12 +170,13 @@ impl Cagents {
                 )?;
                 pane.user_title = self.chrome_ui.user_titles.get(&id).cloned();
                 pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
-                    && self
-                        .workspace_model
-                        .views
-                        .iter()
-                        .flat_map(|view| &view.panes)
-                        .any(|shared| shared.id == id && shared.pending_terminal_start);
+                    && (self.durable.pending_terminal_creations.contains(&id)
+                        || self
+                            .workspace_model
+                            .views
+                            .iter()
+                            .flat_map(|view| &view.panes)
+                            .any(|shared| shared.id == id && shared.pending_terminal_start));
                 if let Scope::Worktree { path, .. } = scope {
                     pane.scope = Some(path.clone());
                 }
@@ -260,12 +279,19 @@ impl Cagents {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // Explicit creations replay as stable Insert operations
+                    // after the seed acknowledgment, preserving their anchor.
+                    // They must not migrate as append-only legacy panes.
+                    let legacy = panes
+                        .into_iter()
+                        .filter(|pane| !self.durable.pending_terminal_creations.contains(&pane.id))
+                        .collect::<Vec<_>>();
                     self.publish_model_edit(ModelEdit::SeedView {
                         scope: scope.clone(),
-                        panes: panes.clone(),
+                        panes: legacy.clone(),
                         closed,
                     });
-                    self.shared_views.baseline.insert(scope.clone(), panes);
+                    self.shared_views.baseline.insert(scope.clone(), legacy);
                 }
                 continue;
             }
@@ -283,7 +309,14 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
-                let operation = uuid::Uuid::new_v4();
+                let operation = match &change {
+                    Change::Insert { pane, .. }
+                        if self.durable.pending_terminal_creations.contains(&pane.id) =>
+                    {
+                        pane.id.as_uuid()
+                    }
+                    _ => uuid::Uuid::new_v4(),
+                };
                 self.shared_views
                     .pending
                     .push((operation, scope.clone(), change.clone()));
@@ -566,11 +599,18 @@ impl Cagents {
                 .views
                 .iter()
                 .any(|view| view.panes.iter().any(|shared| shared.id == pane.id));
-            if accepted_default && self.shared_views.defaults.contains_key(&pane.id) {
-                let session = self.shared_views.defaults.remove(&pane.id).unwrap();
+            if accepted_default {
+                let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
-                self.shared_views.attached.insert(pane.id);
-                tasks.push(self.start_terminal(pane.id, session, true, false));
+                let explicit = Arc::make_mut(&mut self.durable)
+                    .pending_terminal_creations
+                    .remove(&pane.id);
+                if automatic.is_some() || explicit {
+                    if let CardKind::Terminal(session) = &pane.kind {
+                        self.shared_views.attached.insert(pane.id);
+                        tasks.push(self.start_terminal(pane.id, session.clone(), true, false));
+                    }
+                }
             }
             self.shared_views.attached.insert(pane.id);
             match &pane.user_title {
@@ -748,6 +788,9 @@ impl Cagents {
     /// Passive removal detaches surfaces; it never calls a host close request.
     fn detach_shared_pane(&mut self, id: CardId) {
         self.shared_views.defaults.remove(&id);
+        Arc::make_mut(&mut self.durable)
+            .pending_terminal_creations
+            .remove(&id);
         self.shared_views.default_requests.remove(&id);
         self.shared_chat_detach(id);
         self.retire_lsp_card(id);
@@ -1185,6 +1228,63 @@ mod tests {
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.workspace_model.views = vec![view];
         drop(app.reconcile_shared_views());
+        assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn explicit_terminal_creation_is_durable_and_waits_for_reservation() {
+        let (mut app, a, _, first) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(a);
+        let mut view = View::empty(a);
+        view.panes.push(first.clone());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.project_shared_view(&view, &HashSet::from([first.id])));
+        app.shared_views
+            .baseline
+            .insert(Scope::Channel(a), vec![first.clone()]);
+        app.shared_views.pending.clear();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, Some((0, 0))));
+        let id = app.workspace.focused().unwrap();
+        assert!(app.durable.pending_terminal_creations.contains(&id));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { operation, change: Change::Insert { pane, before }, .. }
+                if operation == id.as_uuid() && pane.id == id && pane.pending_terminal_start && before == Some(first.id))));
+        let saved = app.persistent_workspace();
+        assert!(saved.pending_terminal_creations.contains(&id));
+        assert!(
+            saved
+                .cards
+                .iter()
+                .any(|card| card.id == id && card.existence.is_open())
+        );
+        // Restart before acknowledgment: the persisted intent still exports
+        // the same pane and exact actor identity, and cannot spawn generically.
+        app.shared_views = State::for_workspace(&saved);
+        app.durable = saved;
+        app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
+        let pane = app
+            .local_view_panes(&Scope::Channel(a))
+            .into_iter()
+            .find(|pane| pane.id == id)
+            .unwrap();
+        assert!(pane.pending_terminal_start);
+        let CardKind::Terminal(session) = pane.kind.clone() else {
+            panic!()
+        };
+        drop(app.start_terminal(id, session, true, false));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.shared_views.initialized.insert(Scope::Channel(a));
+        let mut view = View::empty(a);
+        view.panes = vec![pane, first];
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert!(!app.durable.pending_terminal_creations.contains(&id));
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
     }
 
