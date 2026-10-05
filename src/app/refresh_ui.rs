@@ -189,7 +189,13 @@ impl Cagents {
             }
             Action::Tick => false,
         };
-        if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
+        // Device windows still own focus and account polling. Repository and
+        // filesystem refreshes below belong to a local workspace only.
+        if crate::device::is_remote()
+            || !self.refresh_ui.focused
+            || self.modal_is_open()
+            || self.update_prepared
+        {
             return Task::none();
         }
         let mut tasks = Vec::new();
@@ -543,6 +549,51 @@ mod tests {
             next(&schedule, false, SELECTED_PROJECT_INTERVAL),
             Some(project)
         );
+    }
+
+    #[test]
+    fn remote_windows_record_focus_without_scheduling_local_repository_refresh() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_WINDOW_FOCUS";
+        const TEST: &str = "app::refresh_ui::tests::remote_windows_record_focus_without_scheduling_local_repository_refresh";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "focus-test".into(),
+            host: "fw16".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("focus-test".into())).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let window = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        let source_generation = app.refresh_ui.source_generation;
+        let projects = app.refresh_ui.projects.len();
+        drop(app.update(Message::RefreshUi(Action::Focused(window, true))));
+        assert!(app.refresh_ui.focused);
+        assert_eq!(app.refresh_ui.source_generation, source_generation);
+        assert_eq!(app.refresh_ui.projects.len(), projects);
+        drop(app.update(Message::RefreshUi(Action::Tick)));
+        assert_eq!(app.refresh_ui.source_generation, source_generation);
+        assert_eq!(app.refresh_ui.projects.len(), projects);
+        drop(app.update(Message::RefreshUi(Action::Focused(window, false))));
+        assert!(!app.refresh_ui.focused);
     }
 
     #[test]
