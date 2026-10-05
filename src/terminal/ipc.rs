@@ -116,7 +116,7 @@ use crate::{
 /// Device workspace and account operations require a matched executable set.
 /// Version 52 shares durable pane views across clients with revision-fenced edits.
 /// Version 53 adds worktree view scopes and durable automatic-terminal reservations.
-pub const PROTOCOL_VERSION: u16 = 53;
+pub const PROTOCOL_VERSION: u16 = 54;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

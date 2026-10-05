@@ -8,6 +8,7 @@ use cosmic::widget::text_editor;
 pub enum Action {
     Menu(bool),
     Open,
+    OpenAt(PathBuf),
     Configure,
     ConfigName(String),
     ConfigHost(String),
@@ -108,6 +109,125 @@ impl Default for State {
     }
 }
 impl Cagents {
+    pub(super) fn device_project_read_task(
+        &mut self,
+        repository: PathBuf,
+        project_id: ProjectId,
+        generation: u64,
+        kind: Option<ProjectKind>,
+    ) -> Task<Message> {
+        self.workspace_model_opens.insert(repository.clone());
+        self.refresh_ui.schedule_remote_started(project_id);
+        self.refresh_ui
+            .projects
+            .insert(project_id, CancellationToken::new());
+        let kind = kind
+            .or_else(|| {
+                self.sidebar_model
+                    .project(project_id)
+                    .map(|project| project.kind)
+            })
+            .unwrap_or_default();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::device_service::request(Operation::ProjectNavigation { repository, kind })
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .and_then(|reply| match reply {
+                Reply::ProjectNavigation(navigation) => Ok(navigation),
+                _ => Err("Unexpected project navigation reply".into()),
+            });
+            Message::DeviceProjectLoaded {
+                project_id,
+                generation,
+                result,
+            }
+        })
+    }
+
+    pub(super) fn device_project_loaded(
+        &mut self,
+        project_id: ProjectId,
+        generation: u64,
+        result: Result<crate::device_service::Navigation, String>,
+    ) -> Task<Message> {
+        if self.repository_generations.get(&project_id) != Some(&generation) {
+            return Task::none();
+        }
+        self.refresh_ui.projects.remove(&project_id);
+        let Some(project) = self
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        else {
+            return Task::none();
+        };
+        if self.project_ui.closed.contains(&project.repository) {
+            return Task::none();
+        }
+        let navigation = match result {
+            Ok(navigation) if navigation.repository == project.repository => navigation,
+            Ok(_) => {
+                self.status = Some(TransientNotice::warning(
+                    "The device returned a different project identity",
+                ));
+                return Task::none();
+            }
+            Err(error) => {
+                project.unreachable = Some(error.clone());
+                project.reloading = false;
+                self.refresh_ui.finished(project_id, false);
+                self.status = Some(TransientNotice::warning(error));
+                return Task::none();
+            }
+        };
+        let records = navigation
+            .worktrees
+            .into_iter()
+            .map(|record| WorktreeRecord {
+                id: crate::repository::stable_worktree_id(&record.path),
+                path: record.path,
+                branch: record.branch,
+                head_oid: record.head_oid,
+                detached: record.detached,
+                bare: record.bare,
+                lock: crate::repository::WorktreeLock {
+                    locked: record.locked,
+                    reason: record.lock_reason,
+                },
+                prunable_reason: record.prunable_reason,
+                created_at_unix_ms: None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(session) = &self.session {
+            session.save_worktrees(records.iter().map(|record| WorktreeState {
+                id: record.id,
+                project_id,
+                generation: 0,
+                path: record.path.clone(),
+                branch: record.branch.as_deref().map(|branch| {
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch)
+                        .to_owned()
+                }),
+                existence: Existence::Open,
+            }));
+        }
+        project.worktrees = records
+            .iter()
+            .map(|record| SidebarWorktree::from_repository(record, None))
+            .collect();
+        project.unreachable = None;
+        project.reloading = false;
+        self.refresh_ui.finished(project_id, true);
+        self.refresh_sidebar_channels();
+        self.reconcile_shared_views()
+    }
+
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
         if let Action::Menu(open) = action {
             self.device_ui.menu_open =
@@ -141,6 +261,7 @@ impl Cagents {
             &action,
             Action::Close
                 | Action::Open
+                | Action::OpenAt(_)
                 | Action::Configure
                 | Action::Browse
                 | Action::Visit(_)
@@ -289,6 +410,10 @@ impl Cagents {
                         }))
                     },
                 );
+            }
+            Action::OpenAt(path) => {
+                self.device_ui.path = path.display().to_string();
+                return self.update_device(Action::Open);
             }
             Action::Open => {
                 self.device_ui.open = true;
@@ -756,6 +881,112 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_row_navigation_and_metadata_keep_daemon_paths() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_NAVIGATION";
+        const TEST: &str =
+            "app::device_ui::tests::remote_row_navigation_and_metadata_keep_daemon_paths";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "navigation-test".into(),
+            host: "fw16".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("navigation-test".into())).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let root = tempfile::tempdir().unwrap();
+        let local_target = root.path().join("unrelated-local");
+        std::fs::create_dir(&local_target).unwrap();
+        let path = root.path().join("daemon-path");
+        std::os::unix::fs::symlink(&local_target, &path).unwrap();
+        let project_id = ProjectId::new();
+        let repository = path.join(".git");
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project_id,
+            RepositoryId(project_id.as_uuid()),
+            "Remote".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )];
+        app.repository_generations.insert(project_id, 2);
+        let navigation = crate::device_service::Navigation {
+            repository: repository.clone(),
+            worktrees: vec![crate::device_service::NavigationWorktree {
+                path: path.clone(),
+                branch: Some("refs/heads/main".into()),
+                ..Default::default()
+            }],
+        };
+        drop(app.device_project_loaded(project_id, 1, Ok(navigation.clone())));
+        assert!(
+            app.sidebar_model
+                .project(project_id)
+                .unwrap()
+                .worktrees
+                .is_empty()
+        );
+        drop(app.device_project_loaded(project_id, 2, Ok(navigation)));
+        let worktree = app.sidebar_model.project(project_id).unwrap().worktrees[0].id;
+        drop(app.update(Message::Sidebar(SidebarAction::SelectRows {
+            row: sidebar::SelectionRow::Worktree(project_id, worktree),
+            intent: sidebar::SelectionIntent::Navigate,
+        })));
+        assert!(!app.device_ui.open);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenWorktree {
+            project_id,
+            worktree_id: worktree,
+            path: path.clone(),
+        })));
+        assert!(!app.device_ui.open);
+        assert!(app.sidebar_model.source_control.is_none());
+        assert!(app.refresh_ui.source_cancel.is_none());
+        assert_eq!(app.active_workspace, Some(path));
+        assert_ne!(app.active_workspace.as_ref(), Some(&local_target));
+        drop(app.update(Message::Sidebar(SidebarAction::ClearRowSelection)));
+        assert!(!app.device_ui.open);
+        // A closed project's late RPC cannot leave a global in-flight fence
+        // that suppresses catalog refresh for all surviving projects.
+        let closed = ProjectId::new();
+        let other = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            other,
+            RepositoryId(other.as_uuid()),
+            "Other remote".into(),
+            "/remote/other/.git".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.refresh_ui
+            .projects
+            .insert(closed, CancellationToken::new());
+        drop(app.device_project_loaded(closed, 1, Err("late reply".into())));
+        app.refresh_ui.focused = true;
+        app.refresh_ui.schedule_remote_started(project_id);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        assert!(!app.refresh_ui.projects.contains_key(&closed));
+        assert!(app.refresh_ui.projects.contains_key(&other));
+    }
+
     fn loaded_file() -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.device_ui.open = true;

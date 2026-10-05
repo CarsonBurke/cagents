@@ -3880,6 +3880,11 @@ pub enum Message {
     },
     OpenRepository,
     RepositorySelected(Result<PathBuf, String>),
+    DeviceProjectLoaded {
+        project_id: ProjectId,
+        generation: u64,
+        result: Result<crate::device_service::Navigation, String>,
+    },
     RepositoryLoaded {
         open_cards: bool,
         project_id: ProjectId,
@@ -4976,7 +4981,11 @@ impl Cagents {
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
         if crate::device::is_remote() {
-            return Task::none();
+            let project_id = project_id.unwrap_or_default();
+            self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
+            let generation = self.repository_load_sequence;
+            self.repository_generations.insert(project_id, generation);
+            return self.device_project_read_task(path, project_id, generation, kind);
         }
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
@@ -9430,10 +9439,23 @@ impl Cagents {
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
         let focus = self.sidebar_focus();
-        if !self
+        let changed = self
             .sidebar_state
-            .sync_active_worktree(&self.sidebar_model, &focus)
-        {
+            .sync_active_worktree(&self.sidebar_model, &focus);
+        if crate::device::is_remote() {
+            if changed
+                || self.sidebar_model.source_control.is_some()
+                || self.refresh_ui.source_cancel.is_some()
+            {
+                self.cancel_source_read();
+                self.cancel_branch_changes();
+                self.history_ui.cancel();
+                self.history_ui.next_page_request();
+            }
+            self.sidebar_model.source_control = None;
+            return Task::none();
+        }
+        if !changed {
             return self.load_pending_history();
         }
         self.cancel_source_read();
@@ -9460,6 +9482,9 @@ impl Cagents {
     /// tab is showing: a page is a `git log` walk, and a view nobody opened is
     /// not worth one.
     fn load_pending_history(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         if self.active_folder_scope() {
             return Task::none();
         }
@@ -10205,6 +10230,9 @@ impl Cagents {
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
@@ -10277,6 +10305,9 @@ impl Cagents {
         head: Option<crate::repository::Oid>,
         page: u32,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         let Some(head) = head else {
             return Task::none();
         };
@@ -12295,6 +12326,12 @@ impl Application for Cagents {
                         SidebarAction::ScrollProjects(_)
                             | SidebarAction::NavigateRow { .. }
                             | SidebarAction::OpenChannel { .. }
+                            | SidebarAction::SelectRows { .. }
+                            | SidebarAction::ClearRowSelection
+                            | SidebarAction::OpenRepository { .. }
+                            | SidebarAction::OpenWorktree { .. }
+                            | SidebarAction::Refresh
+                            | SidebarAction::RefreshProject { .. }
                             | SidebarAction::ToggleProjects
                             | SidebarAction::ToggleProject(_)
                             | SidebarAction::DragWindow
@@ -12534,6 +12571,11 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
+            Message::DeviceProjectLoaded {
+                project_id,
+                generation,
+                result,
+            } => self.device_project_loaded(project_id, generation, result),
             Message::RepositoryLoaded {
                 open_cards,
                 project_id,

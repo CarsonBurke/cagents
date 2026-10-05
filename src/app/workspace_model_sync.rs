@@ -773,7 +773,17 @@ impl Cagents {
         if self.project_ui.closed.contains(&shared.repository) {
             return Adoption::Retained;
         }
-        if self.project_for_repository(&shared.repository).is_some() {
+        if let Some(project_id) = self.project_for_repository(&shared.repository) {
+            if crate::device::is_remote()
+                && !self.workspace_model_opens.contains(&shared.repository)
+            {
+                return Adoption::Opening(self.project_load_task(
+                    shared.repository.clone(),
+                    Some(project_id),
+                    false,
+                    Some(shared.kind),
+                ));
+            }
             return Adoption::Retained;
         }
         if crate::device::is_remote() {
@@ -820,7 +830,12 @@ impl Cagents {
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
         self.sidebar_model.data_state = SidebarDataState::Ready;
-        Adoption::Applied
+        Adoption::Opening(self.project_load_task(
+            shared.repository.clone(),
+            Some(project.id),
+            false,
+            Some(shared.kind),
+        ))
     }
 
     /// Reads a repository the shared model names and this window has not opened.
@@ -1045,7 +1060,7 @@ mod tests {
         };
         assert!(matches!(
             app.adopt_device_project(&metadata),
-            Adoption::Applied
+            Adoption::Opening(_)
         ));
         let row = app
             .sidebar_model

@@ -2919,7 +2919,7 @@ fn bytes_to_path(value: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(value.to_vec()))
 }
 
-fn stable_worktree_id(path: &Path) -> WorktreeId {
+pub(crate) fn stable_worktree_id(path: &Path) -> WorktreeId {
     WorktreeId::from_uuid(stable_path_uuid(path))
 }
 

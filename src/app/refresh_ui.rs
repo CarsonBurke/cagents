@@ -128,6 +128,10 @@ impl ProjectSchedule {
 }
 
 impl State {
+    pub(super) fn schedule_remote_started(&mut self, project_id: ProjectId) {
+        self.schedule.started(project_id, Instant::now());
+    }
+
     pub(super) fn started(&mut self, project: ProjectId) {
         self.schedule.started(project, Instant::now());
     }
@@ -189,14 +193,37 @@ impl Cagents {
             }
             Action::Tick => false,
         };
-        // Device windows still own focus and account polling. Repository and
-        // filesystem refreshes below belong to a local workspace only.
-        if crate::device::is_remote()
-            || !self.refresh_ui.focused
-            || self.modal_is_open()
-            || self.update_prepared
-        {
+        // Device windows refresh their navigation catalog through the daemon.
+        // Git, editor and filesystem refreshes below remain local-only.
+        if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
             return Task::none();
+        }
+        if crate::device::is_remote() {
+            self.refresh_ui.projects.retain(|id, cancellation| {
+                self.repository_generations.contains_key(id) && !cancellation.is_cancelled()
+            });
+            let projects = &self.sidebar_model.projects;
+            self.refresh_ui
+                .schedule
+                .retain(|id| projects.iter().any(|project| project.id == id));
+            let selected = sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
+                .map(|project| project.id);
+            let target = self.refresh_ui.schedule.next(
+                selected,
+                projects
+                    .iter()
+                    .filter(|project| project.unreachable.is_none())
+                    .map(|project| (project.id, ACTIVE_PROJECT_INTERVAL)),
+                &self.refresh_ui.projects,
+                regained_focus,
+                Instant::now(),
+            );
+            return target
+                .and_then(|id| self.sidebar_model.project(id))
+                .map(|project| (project.id, project.repository.clone(), project.kind))
+                .map_or_else(Task::none, |(id, repository, kind)| {
+                    self.project_load_task(repository, Some(id), false, Some(kind))
+                });
         }
         let mut tasks = Vec::new();
         tasks.push(self.git_fallback_tick());
@@ -306,6 +333,9 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            return self.device_project_read_task(path, project_id, generation, kind);
+        }
         self.refresh_ui.schedule.started(project_id, Instant::now());
         self.refresh_ui.git.forget(project_id);
         let cancellation = CancellationToken::default();

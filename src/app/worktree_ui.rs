@@ -358,15 +358,23 @@ impl Cagents {
             .map(|path| {
                 (
                     path.as_path(),
-                    path.canonicalize().unwrap_or_else(|_| path.clone()),
+                    if crate::device::is_remote() {
+                        path.clone()
+                    } else {
+                        path.canonicalize().unwrap_or_else(|_| path.clone())
+                    },
                     self.sidebar_model.worktree_at(path).is_some(),
                 )
             })
             .collect::<Vec<_>>();
         let resolve = |directory: &Path| {
-            let canonical = directory
-                .canonicalize()
-                .unwrap_or_else(|_| directory.into());
+            let canonical = if crate::device::is_remote() {
+                directory.to_path_buf()
+            } else {
+                directory
+                    .canonicalize()
+                    .unwrap_or_else(|_| directory.into())
+            };
             roots
                 .iter()
                 .filter(|(_, root, _)| canonical.starts_with(root))
