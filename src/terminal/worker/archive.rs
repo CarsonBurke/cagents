@@ -283,6 +283,30 @@ impl History {
         Arc::new(snapshot)
     }
 
+    pub(super) fn snapshot_at(
+        &self,
+        offset: Option<u64>,
+        rows: u16,
+        generation: u64,
+    ) -> Arc<RenderSnapshot> {
+        let mut snapshot = self.base.clone();
+        snapshot.generation = generation;
+        snapshot.detached = false;
+        snapshot.rows = rows.max(1).min(500);
+        snapshot.scroll.len = u64::from(snapshot.rows).min(snapshot.scroll.total);
+        snapshot.scroll.offset = offset
+            .unwrap_or(snapshot.scroll.max_offset())
+            .min(snapshot.scroll.max_offset());
+        let first = snapshot.scroll.offset as usize;
+        let end = (first + snapshot.rows as usize).min(self.rows.len());
+        snapshot.lines = self.rows[first..end]
+            .iter()
+            .map(|row| row.view(snapshot.columns))
+            .collect::<Vec<_>>()
+            .into();
+        Arc::new(snapshot)
+    }
+
     pub(super) fn scroll(&mut self, command: &super::ScrollCommand) {
         let offset = self.base.scroll.offset;
         self.base.scroll.offset = match command {

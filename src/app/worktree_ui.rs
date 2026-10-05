@@ -46,15 +46,14 @@ fn belongs_to_scope(
     owners: &HashMap<CardId, PathBuf>,
 ) -> bool {
     card.existence.is_open()
-        && card_directory(card).is_none_or(|directory| {
-            owners
-                .get(&card.id)
-                .map(PathBuf::as_path)
-                .unwrap_or_else(|| {
-                    worktree_root(directory, roots.iter().copied()).unwrap_or(directory)
+        && owners.get(&card.id).map_or_else(
+            || {
+                card_directory(card).is_none_or(|directory| {
+                    worktree_root(directory, roots.iter().copied()).unwrap_or(directory) == scope
                 })
-                == scope
-        })
+            },
+            |owner| owner == scope,
+        )
 }
 
 /// A view descriptor, not a replacement for the persisted workspace. Global
@@ -127,6 +126,7 @@ fn scope_descriptor(
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,
+        local_only_cards: HashSet::new(),
     }
 }
 
@@ -204,6 +204,21 @@ impl Cagents {
 
     pub(super) fn register_channel_card(&mut self, card: CardId) {
         let Some(id) = self.durable.active_channel else {
+            // Browsers have no launch directory from which to infer a view.
+            // Directory-bearing panes retain their explicit or inferred owner,
+            // and utility panes follow the user's navigation between views.
+            if self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Browser(_)))
+                && !self.durable.card_scopes.contains_key(&card)
+            {
+                if let Some(path) = &self.active_workspace {
+                    Arc::make_mut(&mut self.durable)
+                        .card_scopes
+                        .insert(card, path.clone());
+                    self.worktree_owners.insert(card, path.clone());
+                }
+            }
             return;
         };
         let durable = Arc::make_mut(&mut self.durable);
@@ -400,7 +415,6 @@ impl Cagents {
 
     /// `card_worktree` for a card the caller already knows is in no channel.
     fn unchanneled_card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
-        let directory = card_directory(card)?;
         if let Some(scope) = self
             .worktree_owners
             .get(&card.id)
@@ -408,6 +422,7 @@ impl Cagents {
         {
             return Some(scope.as_path());
         }
+        let directory = card_directory(card)?;
         Some(
             worktree_root(
                 directory,
@@ -1247,6 +1262,8 @@ mod tests {
             ),
         ] {
             let mut app = super::super::tests::context_inspector_test_app(false);
+            // These selection checks run after the shared registry has hydrated.
+            app.workspace_model.identity = uuid::Uuid::new_v4();
             register_worktrees(&mut app, &["/repo"]);
             app.settings.default_worktree_pane = worktree;
             app.settings.default_channel_pane = channel;
@@ -1572,6 +1589,8 @@ mod tests {
     #[test]
     fn legacy_unscoped_terminals_remain_accessible_without_owning_new_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        // These selection checks run after the shared registry has hydrated.
+        app.workspace_model.identity = uuid::Uuid::new_v4();
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let legacy = terminal("/home/user");
         let owned = terminal("/repo");
@@ -2010,6 +2029,8 @@ mod tests {
         let nested = root.path().join("worktrees/topic");
         let project = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
+        // These selection checks run after the shared registry has hydrated.
+        app.workspace_model.identity = uuid::Uuid::new_v4();
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let parent_terminal = terminal(root.path().to_str().unwrap());
         app.durable = Arc::new(WorkspaceState {

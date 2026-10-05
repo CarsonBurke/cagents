@@ -321,6 +321,10 @@ impl IdentityReplacement {
 #[derive(Debug)]
 enum ConversionCheckpoint {
     Snapshot(Arc<WorkspaceState>),
+    PaneAdoptions {
+        snapshot: Arc<WorkspaceState>,
+        adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+    },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
 }
@@ -544,6 +548,36 @@ impl SessionRuntime {
             queue
                 .conversions
                 .push_back(ConversionCheckpoint::Snapshot(state));
+            changed.notify_one();
+        }
+    }
+
+    pub fn snapshot_terminal_adoptions(
+        &self,
+        state: Arc<WorkspaceState>,
+        adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+    ) {
+        let (lock, changed) = &*self.queue;
+        if let Ok(mut queue) = lock.lock()
+            && !queue.shutdown
+        {
+            queue.ordered_identities = true;
+            for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
+                queue
+                    .conversions
+                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+            }
+            if let Some(previous) = queue.latest.take() {
+                queue
+                    .conversions
+                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::PaneAdoptions {
+                    snapshot: state,
+                    adoptions,
+                });
             changed.notify_one();
         }
     }
@@ -1215,6 +1249,20 @@ trait SessionStore {
         state: &WorkspaceState,
         base: SnapshotBase<'_>,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError>;
+    fn save_workspace_with_terminal_adoptions(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[crate::persistence::TerminalPaneAdoption],
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        if adoptions.is_empty() {
+            self.save_workspace(state, base)
+        } else {
+            Err(StoreError::InvalidState(
+                "This store does not support canonical pane adoption".into(),
+            ))
+        }
+    }
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError>;
     fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError>;
     /// Reads the generations storage currently holds for a workspace, so a
@@ -1272,6 +1320,14 @@ impl SessionStore for StateStore {
         Self::save_workspace(self, state, base)
     }
 
+    fn save_workspace_with_terminal_adoptions(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[crate::persistence::TerminalPaneAdoption],
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace_with_terminal_adoptions(self, state, base, adoptions)
+    }
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
         Self::save_project(self, project)
     }
@@ -1470,7 +1526,8 @@ impl PendingWrites {
         self.conversions
             .iter()
             .find_map(|checkpoint| match checkpoint {
-                ConversionCheckpoint::Snapshot(snapshot) => Some(snapshot.id),
+                ConversionCheckpoint::Snapshot(snapshot)
+                | ConversionCheckpoint::PaneAdoptions { snapshot, .. } => Some(snapshot.id),
                 ConversionCheckpoint::IdentityReplacement(_)
                 | ConversionCheckpoint::ChatRecovery(_) => None,
             })
@@ -1566,7 +1623,15 @@ impl PendingWrites {
             else {
                 return Ok(());
             };
+            let (checkpoint, adoptions) = match checkpoint {
+                ConversionCheckpoint::PaneAdoptions {
+                    snapshot,
+                    adoptions,
+                } => (ConversionCheckpoint::Snapshot(snapshot), adoptions),
+                other => (other, Vec::new()),
+            };
             match checkpoint {
+                ConversionCheckpoint::PaneAdoptions { .. } => unreachable!(),
                 ConversionCheckpoint::ChatRecovery(recovery) => {
                     let result = match recovery.kind {
                         ChatRecoveryKind::Account => store.rebind_chat_account(
@@ -1621,12 +1686,13 @@ impl PendingWrites {
                             }
                         }
                     }
-                    match store.save_workspace(
+                    match store.save_workspace_with_terminal_adoptions(
                         &snapshot,
                         SnapshotBase {
                             workspace: self.workspace_generation,
                             cards: &self.card_generations,
                         },
+                        &adoptions,
                     ) {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
@@ -1640,8 +1706,14 @@ impl PendingWrites {
                             if autosave {
                                 self.workspace = Some(snapshot);
                             } else {
-                                self.conversions
-                                    .push_front(ConversionCheckpoint::Snapshot(snapshot));
+                                self.conversions.push_front(if adoptions.is_empty() {
+                                    ConversionCheckpoint::Snapshot(snapshot)
+                                } else {
+                                    ConversionCheckpoint::PaneAdoptions {
+                                        snapshot,
+                                        adoptions,
+                                    }
+                                });
                             }
                             return Err(error);
                         }
@@ -2485,6 +2557,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_model_identity: None,
+            local_only_cards: HashSet::new(),
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,

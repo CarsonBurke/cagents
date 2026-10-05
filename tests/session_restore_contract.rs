@@ -94,6 +94,7 @@ impl RestoreFixture {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            local_only_cards: Default::default(),
             workspace_model_identity: None,
             cards: vec![
                 CardState {

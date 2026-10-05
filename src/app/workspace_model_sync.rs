@@ -50,6 +50,11 @@ pub enum ModelUpdate {
     /// It is also the proof that the registry holds the channel, which is what
     /// marks it shared: from here on, the registry's silence about that channel
     /// means it was deleted somewhere rather than never known.
+    ViewApplied {
+        scope: crate::workspace_model::views::Scope,
+        operation: Option<uuid::Uuid>,
+        model: WorkspaceModel,
+    },
     Ranked {
         channel: ChannelId,
         ordinal: u32,
@@ -99,9 +104,24 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         // Reading the model afterwards is how an adopting window learns where
         // the new channel sorts, and it is one request on a connection that is
         // otherwise idle until the next edge.
+        if matches!(
+            edit,
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. }
+        ) {
+            let model = client
+                .read_workspace_model()
+                .map_err(|error| error.to_string())?;
+            sender
+                .send_blocking(ModelUpdate::Read(model))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         let ranked = matches!(
             edit,
-            ModelEdit::CreateChannel { .. } | ModelEdit::AgentsChanged
+            ModelEdit::CreateChannel { .. }
+                | ModelEdit::AgentsChanged
+                | ModelEdit::SeedView { .. }
+                | ModelEdit::ChangeView { .. }
         );
         sender
             .send_blocking(ModelUpdate::Edited { sequence, edit })
@@ -202,7 +222,54 @@ fn send(
         ModelEdit::ReopenProject { repository, .. } => Some(repository.clone()),
         _ => None,
     };
-    let model = client.edit_workspace_model(edit)?;
+    let view_edit = match &edit {
+        ModelEdit::SeedView { scope, .. } => Some((scope.clone(), None)),
+        ModelEdit::ChangeView {
+            scope, operation, ..
+        } => Some((scope.clone(), Some(*operation))),
+        _ => None,
+    };
+    let mut request = edit;
+    let mut conflicts = 0;
+    let model = loop {
+        match client.edit_workspace_model(request.clone()) {
+            Ok(model) => break model,
+            Err(
+                error @ ControlError::Remote {
+                    code: crate::terminal::ipc::ProtocolErrorCode::ViewConflict,
+                    ..
+                },
+            ) => {
+                conflicts += 1;
+                if conflicts > 8 {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(20 * conflicts));
+                let model = client.read_workspace_model()?;
+                if let ModelEdit::ChangeView {
+                    scope,
+                    expected_revision,
+                    ..
+                } = &mut request
+                {
+                    *expected_revision = model
+                        .views
+                        .iter()
+                        .find(|view| view.scope == *scope)
+                        .map(|view| view.revision)
+                        .unwrap_or(0);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if let Some((scope, operation)) = view_edit {
+        let _ = updates.send_blocking(ModelUpdate::ViewApplied {
+            scope,
+            operation,
+            model: model.clone(),
+        });
+    }
     // The originating client is deliberately not sent its own echo, so this
     // response is how the window that minted the channel learns the rank the
     // registry gave it - and learns that the registry now holds it.
@@ -234,6 +301,22 @@ enum Adoption {
 impl Cagents {
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::ViewApplied {
+                scope,
+                operation,
+                model,
+            } => {
+                if self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+                    && model.identity != self.workspace_model.identity
+                {
+                    return Task::none();
+                }
+                self.acknowledge_view_edit(scope, operation);
+                if model.sequence >= self.workspace_model.sequence {
+                    self.workspace_model = model;
+                }
+                self.reconcile_workspace_model()
+            }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.workspace_model.sequence
@@ -325,7 +408,7 @@ impl Cagents {
                     {
                         channel.shared = true;
                     }
-                    self.delete_channel(id)
+                    self.retire_peer_channel(id)
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
@@ -395,6 +478,7 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
         for channel in durable.channels.iter_mut() {
@@ -487,7 +571,7 @@ impl Cagents {
                 // The window's own deletion path, so a channel that disappeared
                 // elsewhere retires its cards exactly as a local delete retires
                 // them.
-                tasks.push(self.delete_channel(id));
+                tasks.push(self.retire_peer_channel(id));
                 changed = true;
             } else {
                 republished.push(id);
@@ -525,6 +609,7 @@ impl Cagents {
             self.persist();
             tasks.push(self.sync_chrome());
         }
+        tasks.push(self.reconcile_shared_views());
         Task::batch(tasks)
     }
 
@@ -776,7 +861,7 @@ impl Cagents {
     ///
     /// Compared canonically, because the shared key is canonical and a window
     /// may have opened the same checkout through a symlink.
-    fn project_for_repository(&self, repository: &Path) -> Option<ProjectId> {
+    pub(super) fn project_for_repository(&self, repository: &Path) -> Option<ProjectId> {
         self.sidebar_model
             .projects
             .iter()
@@ -1204,6 +1289,7 @@ mod tests {
             projects: Vec::new(),
             channels,
             closed_projects: Vec::new(),
+            views: Vec::new(),
             agents: Vec::new(),
         }
     }
@@ -1498,9 +1584,9 @@ mod tests {
     }
 
     /// A channel deleted anywhere disappears everywhere, and its cards are
-    /// retired by the same path a local deletion uses.
+    /// detached locally after the initiating client has retired host work.
     #[test]
-    fn a_deleted_channel_retires_its_cards_through_the_local_path() {
+    fn a_deleted_channel_detaches_its_cards_without_a_second_host_close() {
         let (mut app, project, repository) = app_with_project();
         let id = ChannelId::new();
         let conversation = app.durable.cards[0].id;
@@ -1515,9 +1601,9 @@ mod tests {
             sequence: 5,
             edit: ModelEdit::DeleteChannel { id },
         });
-        assert!(app.channel_ui.is_deleting(id));
+        assert!(app.channel_ui.was_deleted(id));
+        assert!(!app.channel_ui.is_deleting(id));
         assert!(!drain(&published).iter().any(|edit| matches!(edit, ModelEdit::CreateChannel { id: revived, .. } if *revived == id)), "an in-flight deletion must not resurrect an unacknowledged channel");
-        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(id, Ok(())));
 
         assert!(
             !app.durable.channels.iter().any(|channel| channel.id == id),
@@ -1604,8 +1690,13 @@ mod tests {
                 .is_some_and(|card| card.existence.is_open()),
             "nothing was tombstoned"
         );
+        let edits = drain(&published);
+        assert!(edits.iter().any(|edit| matches!(edit,ModelEdit::SeedView{scope,panes,..} if *scope==crate::workspace_model::views::Scope::Channel(id) && panes.iter().any(|pane|pane.id==conversation))));
         assert_eq!(
-            drain(&published),
+            edits
+                .into_iter()
+                .filter(|edit| !matches!(edit, ModelEdit::SeedView { .. }))
+                .collect::<Vec<_>>(),
             vec![
                 ModelEdit::OpenProject {
                     kind: Default::default(),

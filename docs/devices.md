@@ -20,7 +20,7 @@ provider credential files to your desktop.
 
 Use the current-device control at the bottom right of the status bar. Its menu
 lists **This device** and your saved devices. Choose **Connect to a device…** to
-enter an SSH host alias and remote executable, then **Save and open window**.
+enter an SSH host alias and remote executable, then **Save and switch device**.
 The profiles are stored in `devices.json` beside `settings.toml` in the desktop's cagents configuration
 directory (`~/.config/cagents/devices.json` on Linux; the development instance uses
 its own configuration directory):
@@ -49,10 +49,10 @@ cagents --device fw16 terminal list
 cagents --device fw16 terminal spawn --cwd /home/marvin/Documents/repositories/cagents
 ```
 
-Choosing a device from the status-bar menu opens or focuses its primary window, so
-local and remote windows can remain open together. Selecting a different device
-preserves the current window and its jobs. Named windows are also scoped to their
-device; the internal `device-` window namespace is reserved.
+Choosing a device from the status-bar menu switches the current client after the
+new connection is ready. Its hosted jobs continue. Each device row also offers
+**Open in another window** for keeping local and remote clients open together.
+Named windows are scoped to their device; the internal `device-` namespace is reserved.
 
 **Browse device files…** in the same menu browses remote directories, edits UTF-8 text files up to 512 KiB,
 and runs Git status, unstaged/staged diff, stage, unstage, and commit on the device.
@@ -87,6 +87,14 @@ creation, linking, registration, and removal belong to the selected device.
 Codex uses device authentication so its callback need not be forwarded.
 Per-pane device switching is tracked separately in [#687](https://github.com/CarsonBurke/cagents/issues/687).
 
-**New window** beside the device control opens another independent client window
-on the current device. It saves the current workspace before copying its layout
-into a new durable window slot; existing windows and daemon-hosted jobs stay open.
+Choose a device from the bottom-right device menu to switch the current window.
+The replacement connects successfully before the current client closes; daemon
+jobs continue. Save or discard editor changes before switching. Each device row
+also has an **Open in another window** action, so a desktop window and an fw16
+window can stay open together.
+
+Clients on the same device and repository view (channel or worktree) share ordered pane IDs, titles, widths,
+and exact terminal/chat sessions. Creating, moving or closing a pane updates the
+other clients live. Focus, scrolling and unsent drafts belong to each window.
+When another client removes a pane with local unsaved work, that work stays
+available here until it is saved or discarded.

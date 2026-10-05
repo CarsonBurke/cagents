@@ -227,6 +227,31 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for session in terminals {
+            let waiting = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| {
+                    card.existence.is_open()
+                        && self.shared_views.attached.contains(&card.id)
+                        && matches!(&card.kind, CardKind::Terminal(saved) if saved.id == session.id)
+                        && matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
+                        && !self.terminal_start_in_flight(card.id)
+                })
+                .map(|card| (card.id, card.exposure))
+                .collect::<Vec<_>>();
+            for (id, exposure) in &waiting {
+                if let Some(card) = self.card_state_mut(*id) {
+                    card.kind = CardKind::Terminal(session.clone());
+                    card.residency = Residency::Cold;
+                }
+                self.cards.insert(*id, CardRuntime::Loading);
+                self.lifecycle
+                    .register(*id, *exposure, Residency::Cold, Instant::now());
+            }
+            if !waiting.is_empty() {
+                tasks.push(self.lifecycle_sweep());
+            }
             if !self.adoptable(&session) {
                 continue;
             }

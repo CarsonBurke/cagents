@@ -262,6 +262,7 @@ pub struct WorkspaceManifest {
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
     pub workspace_model_identity: Option<uuid::Uuid>,
+    pub local_only_cards: HashSet<CardId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -336,6 +337,15 @@ pub struct SnapshotBase<'a> {
     /// Per-card generations from the previous commit. A card missing from the
     /// map is new, and must therefore be absent from storage.
     pub cards: &'a BTreeMap<CardId, u64>,
+}
+
+/// An explicit adoption of a daemon's canonical pane identity. The actor and
+/// its transcript keep their identity; only the local historical alias retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPaneAdoption {
+    pub alias: CardId,
+    pub canonical: CardId,
+    pub terminal: TerminalId,
 }
 
 /// What storage holds after a workspace snapshot commits. The writer lane keeps
@@ -532,6 +542,125 @@ impl StateStore {
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
+        transaction.commit()?;
+        Ok(commit)
+    }
+
+    /// Commit canonical pane adoption and the complete navigation snapshot in
+    /// one transaction. Ordinary snapshots cannot transfer resource ownership.
+    pub fn save_workspace_with_terminal_adoptions(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[TerminalPaneAdoption],
+    ) -> Result<WorkspaceCommit> {
+        if adoptions.is_empty() {
+            return self.save_workspace(state, base);
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+        let mut prepared = state.clone();
+        let mut generations = base.cards.clone();
+        for adoption in adoptions {
+            let source = state
+                .cards
+                .iter()
+                .find(|card| card.id == adoption.alias)
+                .ok_or_else(|| {
+                    StoreError::InvalidState("pane adoption needs its closed alias".into())
+                })?;
+            let target = state
+                .cards
+                .iter()
+                .find(|card| card.id == adoption.canonical)
+                .ok_or_else(|| {
+                    StoreError::InvalidState("pane adoption needs its canonical pane".into())
+                })?;
+            if adoption.alias == adoption.canonical
+                || source.existence.is_open()
+                || !target.existence.is_open()
+                || !matches!(&source.kind, CardKind::Terminal(session) if session.id == adoption.terminal)
+                || !matches!(&target.kind, CardKind::Terminal(session) if session.id == adoption.terminal)
+            {
+                return Err(StoreError::InvalidState(
+                    "pane adoption must retain an exact terminal identity and retire its alias"
+                        .into(),
+                ));
+            }
+            let owner: Option<String> = transaction
+                .query_row(
+                    "SELECT card_id FROM terminal_recipes WHERE terminal_id=?1",
+                    [adoption.terminal.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if owner.as_deref() == Some(&adoption.canonical.to_string()) {
+                continue;
+            }
+            let row: Option<(String, u64)> = transaction
+                .query_row(
+                    "SELECT workspace_id,generation FROM cards WHERE card_id=?1",
+                    [adoption.alias.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((workspace, generation)) = row else {
+                if owner.is_some() {
+                    return Err(StoreError::InvalidState(
+                        "terminal is owned by an unrelated pane".into(),
+                    ));
+                }
+                // Inventory discovery may not have been written yet. There is
+                // no historical row to archive or resurrect in this case.
+                prepared.cards.retain(|card| card.id != adoption.alias);
+                continue;
+            };
+            if workspace != state.id.to_string()
+                || owner.as_deref() != Some(&adoption.alias.to_string())
+            {
+                return Err(StoreError::InvalidState(
+                    "pane adoption cannot take another pane's resource".into(),
+                ));
+            }
+            let expected = base.cards.get(&adoption.alias).copied().unwrap_or(0);
+            if generation != expected {
+                return Err(StoreError::StaleGeneration {
+                    entity: format!("card {}", adoption.alias),
+                    expected,
+                    actual: generation,
+                });
+            }
+            let archived = load_terminal_record(&transaction, adoption.alias)?;
+            let next = next_generation(generation, "card", adoption.alias)?;
+            transaction.execute("UPDATE cards SET content_json=?1, content_hash=NULL, existence_json=?2,generation=?3,updated_at_unix_ms=?4 WHERE card_id=?5", params![to_json(&archived)?,to_json(&source.existence)?,u64_to_i64(next,"card generation")?,now_unix_ms(),adoption.alias.to_string()])?;
+            let moved = transaction.execute(
+                "UPDATE terminal_recipes SET card_id=?1 WHERE terminal_id=?2 AND card_id=?3",
+                params![
+                    adoption.canonical.to_string(),
+                    adoption.terminal.to_string(),
+                    adoption.alias.to_string()
+                ],
+            )?;
+            if moved != 1 {
+                return Err(StoreError::InvalidState(
+                    "terminal ownership changed during pane adoption".into(),
+                ));
+            }
+            transaction.execute(INVALIDATE_CARD_HASH, [adoption.canonical.to_string()])?;
+            generations.insert(adoption.alias, next);
+        }
+        let commit = save_workspace_transaction(
+            &transaction,
+            &prepared,
+            SnapshotBase {
+                workspace: base.workspace,
+                cards: &generations,
+            },
+        )?;
         transaction.commit()?;
         Ok(commit)
     }
@@ -1152,6 +1281,7 @@ impl StateStore {
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
             workspace_model_identity: manifest.workspace_model_identity,
+            local_only_cards: manifest.local_only_cards,
         };
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -2631,6 +2761,12 @@ fn save_workspace_transaction(
         &to_json(&state.workspace_model_identity)?,
     )?;
 
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:local_only_cards"),
+        &to_json(&state.local_only_cards)?,
+    )?;
+
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
         .cards
@@ -3910,6 +4046,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat drafts", &value))
         .transpose()?
         .unwrap_or_default(),
+        local_only_cards: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:local_only_cards"),
+        )?
+        .map(|value| from_json("local-only pane identities", &value))
+        .transpose()?
+        .unwrap_or_default(),
         workspace_model_identity: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_model_identity"),
@@ -4518,7 +4661,125 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_model_identity: None,
+            local_only_cards: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn canonical_terminal_adoption_is_atomic_and_preserves_history() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("adoption");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        let alias = state.cards[0].id;
+        let CardKind::Terminal(session) = state.cards[0].kind.clone() else {
+            panic!()
+        };
+        let canonical = CardId::new();
+        let mut pane = state.cards[0].clone();
+        pane.id = canonical;
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("adopted".into()),
+            },
+        };
+        state.cards.push(pane);
+        state.focused = Some(canonical);
+        state.chat_drafts.insert(canonical, "draft".into());
+        let adoption = TerminalPaneAdoption {
+            alias,
+            canonical,
+            terminal: session.id,
+        };
+        assert!(
+            store
+                .save_workspace(
+                    &state,
+                    SnapshotBase {
+                        workspace: lane.workspace,
+                        cards: &lane.cards
+                    }
+                )
+                .is_err()
+        );
+        let stale = store.save_workspace_with_terminal_adoptions(
+            &state,
+            SnapshotBase {
+                workspace: 0,
+                cards: &lane.cards,
+            },
+            &[adoption],
+        );
+        assert!(stale.is_err());
+        assert!(
+            store
+                .load_card(alias, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        let commit = store
+            .save_workspace_with_terminal_adoptions(
+                &state,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                &[adoption],
+            )
+            .unwrap();
+        lane.workspace = commit.generation;
+        lane.cards = commit.card_generations;
+        let old = store.load_card(alias, None).unwrap().unwrap();
+        assert!(!old.existence.is_open());
+        assert!(
+            matches!(old.kind,CardKind::Terminal(ref old) if old.id==session.id && old.transcript_path==session.transcript_path)
+        );
+        let restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.focused, Some(canonical));
+        assert_eq!(
+            restored.chat_drafts.get(&canonical).map(String::as_str),
+            Some("draft")
+        );
+        let inner = store.lock_inner().unwrap();
+        let owner: String = inner
+            .connection
+            .query_row(
+                "SELECT card_id FROM terminal_recipes WHERE terminal_id=?1",
+                [session.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, canonical.to_string());
+        let transcript: String = inner
+            .connection
+            .query_row(
+                "SELECT path_json FROM transcript_metadata WHERE terminal_id=?1",
+                [session.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(transcript.contains("transcript"));
+        drop(inner);
+        let replay = store
+            .save_workspace_with_terminal_adoptions(
+                &state,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                &[adoption],
+            )
+            .unwrap();
+        lane.workspace = replay.generation;
+        lane.cards = replay.card_generations;
+        lane.save(&store, &state).unwrap();
     }
 
     /// Tracks base generations across successive saves the way the writer lane

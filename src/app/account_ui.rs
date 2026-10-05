@@ -4038,13 +4038,6 @@ impl Cagents {
                     .align_y(Alignment::Center)
                     .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::custom(design::caption("New window"))
-                    .name("Open a new client window on this device")
-                    .class(crate::ui_controls::control_style(false, None))
-                    .height(CHIP_HEIGHT)
-                    .padding(Padding::from([0.0, design::GRID_UNIT * 1.5]))
-                    .on_press(Message::NewWindow)
-                    .into(),
                 self.device_status_control(),
             ])
             .align_y(Alignment::Center),

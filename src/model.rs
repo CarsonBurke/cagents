@@ -1174,6 +1174,8 @@ pub struct WorkspaceState {
     /// cleared then, because nothing local has been shared with *that* registry.
     #[serde(default)]
     pub workspace_model_identity: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub local_only_cards: HashSet<CardId>,
 }
 
 impl Default for WorkspaceState {
@@ -1193,6 +1195,7 @@ impl Default for WorkspaceState {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_model_identity: None,
+            local_only_cards: HashSet::new(),
         }
     }
 }

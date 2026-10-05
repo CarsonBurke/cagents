@@ -34,7 +34,11 @@ pub enum Action {
         result: Result<Reply, String>,
     },
     Device(usize),
-    DeviceOpened(Result<(), String>),
+    OpenDeviceWindow(usize),
+    DeviceOpened {
+        result: Result<(), String>,
+        replace: bool,
+    },
 }
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -126,7 +130,8 @@ impl Cagents {
                 &action,
                 Action::Loaded { .. }
                     | Action::Device(_)
-                    | Action::DeviceOpened(_)
+                    | Action::OpenDeviceWindow(_)
+                    | Action::DeviceOpened { .. }
                     | Action::ConfigSaved(_)
             )
         {
@@ -232,35 +237,56 @@ impl Cagents {
                 }
                 return Task::none();
             }
-            Action::DeviceOpened(result) => {
-                if let Err(error) = result {
-                    self.status = Some(TransientNotice::warning(error));
+            Action::DeviceOpened { result, replace } => {
+                self.device_ui.busy = false;
+                match result {
+                    Ok(()) if replace => return self.exit_after_language_servers(),
+                    Ok(()) => {}
+                    Err(error) => self.status = Some(TransientNotice::warning(error)),
                 }
                 return Task::none();
             }
-            Action::Device(index) => {
+            Action::Device(index) | Action::OpenDeviceWindow(index) => {
+                let replace = matches!(action, Action::Device(_));
                 let Some(name) = self.device_ui.devices.get(index).cloned() else {
                     return Task::none();
                 };
-                if name
-                    == crate::device::selected()
-                        .map(|device| device.name.as_str())
-                        .unwrap_or("local")
+                if replace
+                    && name
+                        == crate::device::selected()
+                            .map(|device| device.name.as_str())
+                            .unwrap_or("local")
                 {
                     return Task::none();
                 }
+                if replace && (self.device_ui.dirty() || self.cards.values().any(|runtime| matches!(runtime, CardRuntime::Repository(editor) if editor.is_dirty() || editor.is_saving()))) {
+                    self.status = Some(TransientNotice::warning("Save or discard your editor changes before switching devices."));
+                    return Task::none();
+                }
+                let source = (name
+                    == crate::device::selected()
+                        .map(|device| device.name.as_str())
+                        .unwrap_or("local"))
+                .then(|| crate::instance::window_slot().to_owned());
+                if replace && let Some(message) = self.device_switch_chat_blocker() {
+                    self.status = Some(TransientNotice::warning(message));
+                    return Task::none();
+                }
+                self.persist();
+                self.device_ui.busy = true;
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                        let executable = crate::control::sibling_executable("cagents").map_err(|error| error.to_string())?;
-                        let status = std::process::Command::new(executable).args(["--device", &name, "ui"]).status().map_err(|error| error.to_string())?;
-                        if status.success() { Ok(Reply::Saved) } else { Err(format!("could not open device {name}; verify devices.json and SSH access")) }
-                    }).await.unwrap_or_else(|error| Err(error.to_string()))
+                            let executable = crate::control::sibling_executable("cagents").map_err(|error| error.to_string())?;
+                            let status = std::process::Command::new(executable).args(["--device", &name, "ui", "--new-window"]).args(source.as_ref().map(|source| ["--source", source.as_str()]).into_iter().flatten()).status().map_err(|error| error.to_string())?;
+                            if status.success() { Ok(()) } else { Err(format!("Could not connect to {name}. Check its SSH connection and cagents daemon.")) }
+                        }).await.unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    |result| {
-                        cosmic::Action::App(Message::Device(Action::DeviceOpened(
-                            result.map(|_| ()),
-                        )))
+                    move |result| {
+                        cosmic::Action::App(Message::Device(Action::DeviceOpened {
+                            result,
+                            replace,
+                        }))
                     },
                 );
             }
@@ -460,12 +486,24 @@ impl Cagents {
                     } else {
                         name.as_str()
                     };
+                    let switch = widget::button::text(label)
+                        .class(crate::ui_controls::control_style(name == selected, None))
+                        .width(Length::Fill)
+                        .on_press(Message::Device(Action::Device(index)));
+                    let open = widget::button::custom(
+                        widget::icon(crate::ui_controls::symbolic_icon("view-pop-out-symbolic"))
+                            .size(16),
+                    )
+                    .name(format!("Open {label} in another window"))
+                    .on_press(Message::Device(Action::OpenDeviceWindow(index)));
                     choices.push(
-                        widget::button::text(label)
-                            .class(crate::ui_controls::control_style(name == selected, None))
-                            .width(Length::Fill)
-                            .on_press(Message::Device(Action::Device(index)))
-                            .into(),
+                        widget::row::with_children(vec![
+                            switch.into(),
+                            crate::interaction::tooltip(open, "Open in another window").into(),
+                        ])
+                        .align_y(Alignment::Center)
+                        .spacing(design::GRID_UNIT)
+                        .into(),
                     );
                 }
                 rows.push(
@@ -518,7 +556,7 @@ impl Cagents {
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and open window",Action::ConfigSave)]).spacing(8).into()];
+            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(8).into()];
             if let Some(notice) = &state.notice {
                 rows.push(widget::text::body(notice).into());
             }

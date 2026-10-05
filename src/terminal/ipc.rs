@@ -114,7 +114,9 @@ use crate::{
 /// Version 50 frames device account JSON values as strings for binary IPC.
 /// Version 51 carries native chat start timestamps and publication clock samples.
 /// Device workspace and account operations require a matched executable set.
-pub const PROTOCOL_VERSION: u16 = 51;
+/// Version 52 shares durable pane views across clients with revision-fenced edits.
+/// Version 53 adds worktree view scopes and durable automatic-terminal reservations.
+pub const PROTOCOL_VERSION: u16 = 53;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -436,6 +438,12 @@ pub enum ClientRequest {
     },
     DeviceOperation {
         operation: crate::device_service::Operation,
+    },
+    /// Complete the daemon's durable intent, using its authoritative recipe.
+    CompletePendingTerminal {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        options: TerminalSpawnOptions,
     },
 }
 
@@ -832,6 +840,7 @@ pub enum ProtocolErrorCode {
     QueueFull,
     PermissionDenied,
     Internal,
+    ViewConflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

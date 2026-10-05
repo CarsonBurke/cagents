@@ -26,6 +26,7 @@ mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
+mod shared_views;
 mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
@@ -4609,6 +4610,7 @@ pub struct Cagents {
     relaunched_terminals: HashSet<TerminalId>,
     terminal_crash_notices: HashMap<CardId, crate::model::HostSessionProof>,
     /// The shared sidebar model as this window last saw it.
+    shared_views: shared_views::State,
     workspace_model: crate::workspace_model::WorkspaceModel,
     /// Repositories this window has already been asked to open on the shared
     /// model's behalf. Asking twice would mint a second project on one checkout.
@@ -5245,15 +5247,51 @@ impl Cagents {
         visible: bool,
         explicit_retry: bool,
     ) -> Task<Message> {
+        if self.shared_views.defaults.contains_key(&card)
+            || (self.shared_views.attached.contains(&card)
+                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                && !explicit_retry)
+        {
+            return Task::none();
+        }
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start(card);
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
+        let shared = self.shared_views.attached.contains(&card);
+        let reserved = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let (recovered, mode) = recover_terminal(session, explicit_retry)?;
+                let (recovered, mode) = if shared && !explicit_retry {
+                    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+                    let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+                    let mut hosted = client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
+                    if hosted.is_none() && reserved {
+                        for _ in 0..100 {
+                            match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
+                                Ok(created) => { hosted=Some(created);break; }
+                                Err(crate::control::ControlError::Remote {code:crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists | crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,..}) => {
+                                    hosted=client.list().map_err(|error|error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
+                                    if hosted.is_some() {break;}
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                Err(error) => return Err(error.to_string()),
+                            }
+                        }
+                    }
+                    let hosted=hosted.ok_or("This shared terminal is disconnected; another client must restore its hosted session")?;
+                    let proof = client.proof().clone();
+                    (daemon_recovery::RecoveredTerminal { session: hosted.session,
+                        expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
+                        TerminalStartMode::Attach(proof))
+                } else { recover_terminal(session, explicit_retry)? };
                 open_terminal(card, recovered, mode, config, sender)
             })
             .await
@@ -5621,6 +5659,9 @@ impl Cagents {
             Residency::Hydrating { epoch: 1 },
             Instant::now(),
         );
+        if self.shared_views.creating_default {
+            self.shared_views.defaults.insert(card_id, session.clone());
+        }
         self.persist();
         Task::batch([
             self.start_terminal(card_id, session, true, false),
@@ -6729,14 +6770,22 @@ impl Cagents {
     fn persist(&mut self) {
         self.focus_save_pending = false;
         self.snapshot_workspace_scope();
+        self.publish_view_changes();
         let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
-            session.snapshot(saved);
+            let adoptions = std::mem::take(&mut self.shared_views.adoptions);
+            if adoptions.is_empty() {
+                session.snapshot(saved);
+            } else {
+                session.snapshot_terminal_adoptions(saved, adoptions);
+            }
         }
     }
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
         match self.install_chat_session(card, session) {
             Some(true) => {
+                self.snapshot_workspace_scope();
+                self.publish_view_changes();
                 let saved = self.persistent_workspace();
                 if let Some(writer) = &self.session {
                     writer.snapshot_conversion(saved);
@@ -8647,7 +8696,7 @@ impl Cagents {
         // typing aimed at the dialog and write it into a shell, which runs
         // what it is given. An overlay inspector additionally hides the workspace, so
         // that shell would not even be on screen.
-        let card_focused = focused && !self.workspace_inputs_blocked();
+        let card_focused = focused && self.refresh_ui.focused && !self.workspace_inputs_blocked();
         #[cfg(not(feature = "integrated-browser"))]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {
             let address = chrome
@@ -11911,6 +11960,7 @@ impl Application for Cagents {
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
+        let shared_views = shared_views::State::for_workspace(&durable);
         let mut app = Self {
             core,
             workspace,
@@ -11942,6 +11992,7 @@ impl Application for Cagents {
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
             terminal_crash_notices: HashMap::new(),
+            shared_views,
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx,
@@ -14956,7 +15007,18 @@ impl Application for Cagents {
                 let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
                     self.accounts_focus_changed(focused, regained)
                 });
-                Task::batch([preview_task, refresh, self.flush_document_tone(), accounts])
+                let shared = if self.shared_views.blocked.is_empty() {
+                    Task::none()
+                } else {
+                    self.reconcile_shared_views()
+                };
+                Task::batch([
+                    preview_task,
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -17868,6 +17930,7 @@ mod tests {
                 projects: Vec::new(),
                 channels,
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             match frame {
@@ -22224,6 +22287,7 @@ mod tests {
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
             terminal_crash_notices: HashMap::new(),
+            shared_views: shared_views::State::default(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx: async_channel::unbounded().1,

@@ -636,15 +636,43 @@ pub(super) fn process_request(
         ClientRequest::Spawn { session, options } => {
             super::agent_execution::terminals::adopt(host, client_id, session.id)?;
             let terminal = spawn_terminal(host, client_id, session, options)?;
-            let snapshot = {
-                let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let snapshot = state.snapshot(client_id, terminal.session.id, 0)?;
+            {
+                let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Every other observer learns that this terminal exists here,
                 // and only here: a spawn is the one inventory edge that no
                 // redraw, event or snapshot broadcast implies.
                 state.announce_created(client_id, terminal.session.id);
-                snapshot
             };
+            let snapshot = super::state::client_snapshot(host, client_id, terminal.session.id, 0)?;
+            let mut extras = snapshot
+                .map(|snapshot| ServerMessage::Snapshot {
+                    terminal_id: terminal.session.id,
+                    snapshot,
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            extras.push(ServerMessage::Synchronized {
+                terminal_id: terminal.session.id,
+                generation: terminal.generation,
+                event_sequence: terminal.event_sequence,
+            });
+            Ok((ServerResponse::Spawned { terminal }, extras, false))
+        }
+        ClientRequest::CompletePendingTerminal {
+            pane,
+            terminal_id,
+            options,
+        } => {
+            let terminal =
+                super::state::spawn_pending_terminal(host, client_id, pane, terminal_id, options)?;
+            {
+                let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Every other observer learns that this terminal exists here,
+                // and only here: a spawn is the one inventory edge that no
+                // redraw, event or snapshot broadcast implies.
+                state.announce_created(client_id, terminal.session.id);
+            };
+            let snapshot = super::state::client_snapshot(host, client_id, terminal.session.id, 0)?;
             let mut extras = snapshot
                 .map(|snapshot| ServerMessage::Snapshot {
                     terminal_id: terminal.session.id,
@@ -664,13 +692,15 @@ pub(super) fn process_request(
             after_generation,
             after_event_sequence,
         } => {
-            let (terminal, events, snapshot) = {
+            let (terminal, events) = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let terminal = state.attach(client_id, terminal_id)?;
+                state.resume_presentation(client_id, terminal_id, after_generation);
                 let events = state.replay_events(terminal_id, after_event_sequence)?;
-                let snapshot = state.snapshot(client_id, terminal_id, after_generation)?;
-                (terminal, events, snapshot)
+                (terminal, events)
             };
+            let snapshot =
+                super::state::client_snapshot(host, client_id, terminal_id, after_generation)?;
             let extras = replay_messages(
                 terminal_id,
                 events,
@@ -772,16 +802,9 @@ pub(super) fn process_request(
             terminal_id,
             focused,
         } => {
-            let handle = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .focus_handle(client_id, terminal_id)?;
-            if let Some(handle) = handle {
-                match handle.focus(focused) {
-                    Ok(()) | Err(crate::terminal::TerminalSendError::Closed) => {}
-                    Err(error) => return Err(send_error(error)),
-                }
-            }
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .focus_client(client_id, terminal_id, focused)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::SetTheme { terminal_id, theme } => {
@@ -850,35 +873,9 @@ pub(super) fn process_request(
                     false,
                 ));
             }
-            let handle = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .history_handle(client_id, terminal_id)?;
-            match scroll {
-                TerminalScroll::Lines(delta) => {
-                    let delta = isize::try_from(delta).map_err(|_| {
-                        ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            "terminal scroll delta is outside supported bounds",
-                            false,
-                        )
-                    })?;
-                    handle.scroll_lines(delta)
-                }
-                TerminalScroll::Top => handle.scroll_to_top(),
-                TerminalScroll::Bottom => handle.scroll_to_bottom(),
-                TerminalScroll::Row(row) => {
-                    let row = usize::try_from(row).map_err(|_| {
-                        ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            "terminal scroll row is outside supported bounds",
-                            false,
-                        )
-                    })?;
-                    handle.scroll_to_row(row)
-                }
-            }
-            .map_err(send_error)?;
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .scroll_client(client_id, terminal_id, scroll)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::Resize { terminal_id, size } => {
@@ -897,11 +894,9 @@ pub(super) fn process_request(
                     false,
                 ));
             }
-            let handle = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .history_handle(client_id, terminal_id)?;
-            handle.resize(size.into()).map_err(send_error)?;
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .resize_client(client_id, terminal_id, size.into())?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::SetVisibility {
@@ -937,10 +932,8 @@ pub(super) fn process_request(
             terminal_id,
             after_generation,
         } => {
-            let snapshot = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .snapshot(client_id, terminal_id, after_generation)?;
+            let snapshot =
+                super::state::client_snapshot(host, client_id, terminal_id, after_generation)?;
             Ok((
                 ServerResponse::Snapshot {
                     terminal_id,
@@ -964,7 +957,11 @@ pub(super) fn process_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .redraw_ack_handle(client_id, terminal_id, generation)?;
-            handle.acknowledge_redraw(generation);
+            let source = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .redraw_source(client_id, terminal_id, generation);
+            handle.acknowledge_redraw(source);
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ShutdownTerminal { terminal_id } => {
@@ -1151,26 +1148,27 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
-        let prepared = {
-            let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (terminal, events) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
                 continue;
             };
+            state.resume_presentation(client_id, cursor.terminal_id, cursor.generation);
             let events = state
                 .replay_events(cursor.terminal_id, cursor.event_sequence)
                 .unwrap_or_default();
-            let snapshot = state
-                .snapshot(client_id, cursor.terminal_id, cursor.generation)
-                .unwrap_or_default();
-            let messages = replay_messages(
-                cursor.terminal_id,
-                events,
-                snapshot,
-                terminal.generation,
-                terminal.event_sequence,
-            );
-            (terminal, messages)
+            (terminal, events)
         };
+        let snapshot =
+            super::state::client_snapshot(host, client_id, cursor.terminal_id, cursor.generation)?;
+        let messages = replay_messages(
+            cursor.terminal_id,
+            events,
+            snapshot,
+            terminal.generation,
+            terminal.event_sequence,
+        );
+        let prepared = (terminal, messages);
         resumed.push(prepared.0);
         replay.extend(prepared.1);
     }
