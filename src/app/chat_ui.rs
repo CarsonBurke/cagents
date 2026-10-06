@@ -9196,6 +9196,43 @@ mod tests {
     }
 
     #[test]
+    fn window_close_protects_attachments_local_followups_and_request_answers() {
+        for kind in 0..3 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("expected chat");
+            };
+            match kind {
+                0 => runtime.attachments.push(Attachment {
+                    path: "/workspace/draft.txt".into(),
+                }),
+                1 => runtime
+                    .followups
+                    .push(followup(0, "accepted local task", &[])),
+                _ => {
+                    runtime.answers.insert(
+                        ("request".into(), "question".into()),
+                        vec!["partial answer".into()],
+                    );
+                }
+            }
+            let window = cosmic::iced::window::Id::unique();
+            drop(app.update(Message::WindowCloseRequested(window)));
+            assert!(app.exit.is_none());
+            assert_eq!(app.transient_work_close, Some(window));
+            drop(app.update(Message::CancelTransientWorkClose));
+            assert!(app.window_close_transient_blocker().is_some());
+            if let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) {
+                app.chat_ui.parked.insert(card, runtime);
+            }
+            drop(app.update(Message::WindowCloseRequested(window)));
+            assert!(app.exit.is_none(), "hidden chat input also blocks closing");
+            assert_eq!(app.transient_work_close, Some(window));
+        }
+    }
+
+    #[test]
     fn update_snapshot_restores_live_stashed_and_parked_composers() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let live = draft_chat(&mut app);

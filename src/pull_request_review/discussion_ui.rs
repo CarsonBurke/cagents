@@ -124,7 +124,63 @@ impl Default for DiscussionState {
     }
 }
 
+impl DiscussionState {
+    /// Park only local input; conversations and rendered threads reload on return.
+    pub(super) fn into_draft_state(mut self) -> Self {
+        Self {
+            composer: self.composer.take(),
+            summary: std::mem::take(&mut self.summary),
+            event: self.event,
+            review_open: self.review_open,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn has_local_work(&self) -> bool {
+        self.composer.is_some() || !self.summary.text().is_empty()
+    }
+}
+
 impl State {
+    /// Local review input and write receipts must survive until explicitly resolved.
+    pub fn restart_blocker(&self) -> Option<&'static str> {
+        if self.discussion.busy {
+            Some("Wait for the GitHub review write to finish before closing the window.")
+        } else if self.discussion.unknown.is_some() {
+            Some(
+                "Check the unresolved review write on GitHub and acknowledge its outcome before closing the window.",
+            )
+        } else if self.discussion.has_local_work()
+            || self
+                .parked_discussions
+                .iter()
+                .any(|(_, discussion)| discussion.has_local_work())
+        {
+            Some(
+                "The window contains local PR review drafts. Save or clear the comment and review summary before closing; reopen reviews with drafts if needed.",
+            )
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn block_discussion_navigation(&mut self) -> bool {
+        let message = if self.discussion.busy {
+            Some("Wait for the GitHub write to finish before leaving this review.")
+        } else if self.discussion.unknown.is_some() {
+            Some(
+                "Check the unresolved write on GitHub and acknowledge its outcome before leaving this review.",
+            )
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            self.notice = Some(message.into());
+            true
+        } else {
+            false
+        }
+    }
     pub(super) fn load_discussion(&mut self) -> ActionTask {
         let Some(target) = self.target.clone() else {
             return ActionTask::none();
@@ -1331,6 +1387,53 @@ mod tests {
             start_line: 4,
             line: 7,
         }
+    }
+
+    #[test]
+    fn review_navigation_preserves_drafts_and_blocks_unresolved_writes() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        drop(
+            state.update_discussion(Action::Composer(text_editor::Action::Edit(
+                text_editor::Edit::Insert('x'),
+            ))),
+        );
+        state.discussion.summary = text_editor::Content::with_text("summary for first PR");
+        drop(state.update(super::super::Action::Close));
+        assert!(state.target.is_none());
+        assert_eq!(state.parked_discussions.len(), 1);
+        assert!(
+            state.restart_blocker().is_some(),
+            "parked drafts still block app exit"
+        );
+        drop(state.update(super::super::Action::Open(target(2))));
+        state.discussion.summary = text_editor::Content::with_text("second PR");
+        drop(state.update(super::super::Action::Open(target(1))));
+        assert_eq!(state.discussion.summary.text(), "summary for first PR");
+        assert_eq!(
+            state.discussion.composer.as_ref().unwrap().content.text(),
+            "x"
+        );
+        assert!(
+            state.discussion.conversation.is_none(),
+            "reload fetched metadata"
+        );
+        state.discussion.busy = true;
+        let generation = state.generation;
+        drop(state.update(super::super::Action::Close));
+        drop(state.update(super::super::Action::Open(target(2))));
+        assert_eq!(state.target.as_ref().unwrap().pull_request.number, 1);
+        assert_eq!(
+            state.generation, generation,
+            "retain ownership of write callbacks"
+        );
+        state.discussion.busy = false;
+        state.discussion.unknown = Some("lost receipt".into());
+        drop(state.update(super::super::Action::Close));
+        drop(state.update(super::super::Action::Open(target(2))));
+        assert_eq!(state.generation, generation);
+        assert_eq!(state.discussion.unknown.as_deref(), Some("lost receipt"));
+        assert!(!state.can_mutate_discussion());
     }
 
     #[test]

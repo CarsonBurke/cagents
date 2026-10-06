@@ -2462,6 +2462,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::Viewport { .. }
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
+                | Message::CancelTransientWorkClose
+                | Message::ReturnToDeviceBeforeClose
                 | Message::CommitClose(_)
                 | Message::ConfirmTerminalClose
                 | Message::CancelTerminalClose
@@ -3955,6 +3957,8 @@ pub enum Message {
     CloseCard(CardId),
     CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
+    CancelTransientWorkClose,
+    ReturnToDeviceBeforeClose,
     /// iced has removed a window, and winit has queued its destruction.
     WindowClosed(window::Id),
     NewWindow,
@@ -4748,6 +4752,7 @@ pub struct Cagents {
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
     pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
+    transient_work_close: Option<window::Id>,
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     terminal_close_attempts: HashSet<TerminalId>,
@@ -10534,6 +10539,9 @@ impl Cagents {
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.transient_work_close.is_some() {
+            return cosmic::task::message(Message::CancelTransientWorkClose);
+        }
         if self.device_ui.open {
             return self.update_device(device_ui::Action::Close);
         }
@@ -10567,6 +10575,7 @@ impl Cagents {
             return true;
         }
         self.dirty_repository_close.is_some()
+            || self.transient_work_close.is_some()
             || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
@@ -11117,6 +11126,30 @@ impl Cagents {
         iced::Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Activate(
             token.unwrap_or_default(),
         )))
+    }
+
+    fn window_close_transient_blocker(&self) -> Option<&'static str> {
+        if self.device_ui.dirty() {
+            return Some(
+                "The device file has unsaved edits. Return to the file to save or discard them, then close the window again.",
+            );
+        }
+        if self.device_ui.busy() {
+            return Some("Wait for the device operation to finish before closing the window.");
+        }
+        if self.chat_ui.transition_pending() {
+            return Some(
+                "Wait for the chat to finish starting or changing views before closing the window.",
+            );
+        }
+        self.cards
+            .values()
+            .find_map(|runtime| match runtime {
+                CardRuntime::Chat(runtime) => runtime.restart_blocker(),
+                CardRuntime::PullRequests(runtime) => runtime.review.restart_blocker(),
+                _ => None,
+            })
+            .or_else(|| self.parked_chat_restart_blocker())
     }
 
     fn primary_dirty_close_control(&self, card: CardId) -> DirtyCloseControl {
@@ -12177,6 +12210,7 @@ impl Application for Cagents {
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
+            transient_work_close: None,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
@@ -14085,6 +14119,14 @@ impl Application for Cagents {
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
                     return Task::none();
                 }
+                if self.window_close_transient_blocker().is_some() {
+                    self.transient_work_close = Some(window);
+                    return iced::widget::operation::focus(widget::Id::new(
+                        "dialog.transient-close.cancel",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                self.transient_work_close = None;
                 let dirty = self
                     .durable
                     .cards
@@ -14096,6 +14138,33 @@ impl Application for Cagents {
                     })
                     .collect::<VecDeque<_>>();
                 self.begin_dirty_close(DirtyCloseIntent::Application(window), dirty)
+            }
+            Message::CancelTransientWorkClose => {
+                self.transient_work_close = None;
+                let target = if self.device_ui.open && self.device_ui.dirty() {
+                    Some(device_ui::file_editor_id())
+                } else {
+                    self.nested_modal_focus_target().or_else(|| {
+                        self.workspace
+                            .focused()
+                            .map(|card| self.card_keyboard_focus(card))
+                    })
+                };
+                target.map_or_else(Task::none, |target| {
+                    iced::widget::operation::focus(target).map(cosmic::Action::App)
+                })
+            }
+            Message::ReturnToDeviceBeforeClose => {
+                if self.transient_work_close.is_none() || !self.device_ui.dirty() {
+                    return Task::none();
+                }
+                self.transient_work_close = None;
+                self.device_ui.open = true;
+                Task::batch([
+                    self.update_device(device_ui::Action::BackToFile),
+                    iced::widget::operation::focus(device_ui::file_editor_id())
+                        .map(cosmic::Action::App),
+                ])
             }
             Message::CloseCard(id)
                 if self
@@ -14866,6 +14935,9 @@ impl Application for Cagents {
                     });
                 }
                 if is_escape_press(&event) && !captured {
+                    if self.transient_work_close.is_some() {
+                        return cosmic::task::message(Message::CancelTransientWorkClose);
+                    }
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
                             .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
@@ -15591,6 +15663,38 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if self.transient_work_close.is_some() {
+            let mut controls: Vec<Element<'_, Message>> = vec![
+                widget::button::standard("Cancel close")
+                    .id(widget::Id::new("dialog.transient-close.cancel"))
+                    .on_press(Message::CancelTransientWorkClose)
+                    .into(),
+            ];
+            if self.device_ui.dirty() {
+                controls.push(
+                    widget::button::suggested("Return to file")
+                        .on_press(Message::ReturnToDeviceBeforeClose)
+                        .into(),
+                );
+            }
+            return Some(dialog_ui::overlay(
+                dialog_ui::surface(
+                    widget::column::with_children(vec![
+                        widget::text::title3("Keep unsaved work before closing").into(),
+                        notice_detail(self.window_close_transient_blocker().unwrap_or(
+                            "The pending work is complete. Cancel this dialog and close again.",
+                        )),
+                        widget::row::with_children(controls)
+                            .spacing(cosmic::theme::spacing().space_xxs)
+                            .into(),
+                    ])
+                    .spacing(3.0 * design::GRID_UNIT),
+                    480.0,
+                ),
+                Some(Message::CancelTransientWorkClose),
+                1.0,
+            ));
+        }
         if self.device_ui.open {
             return Some(dialog_ui::overlay(
                 self.device_dialog(),
@@ -22772,6 +22876,7 @@ mod tests {
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
+            transient_work_close: None,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
