@@ -6720,6 +6720,53 @@ pub fn search_directory_files_for_quick_open_cancellable(
     search_directory_files(root, query, token).map(|(files, _)| files)
 }
 
+/// Lists expanded ignored folders without allowing one failed read to hide
+/// the worktree. Failed folders are retried only after an explicit user action.
+pub(crate) fn expand_ignored_directories(
+    root: &Path,
+    files: &mut crate::repository::WorkingFiles,
+    expanded: &[RepoPath],
+    previous_errors: &BTreeMap<RepoPath, String>,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    for path in expanded {
+        if !files
+            .ignored_directories
+            .iter()
+            .any(|directory| path.as_path().starts_with(directory.as_path()))
+        {
+            continue;
+        }
+        if cancellation.is_cancelled() {
+            return Err("file listing cancelled".into());
+        }
+        if let Some(error) = previous_errors.get(path) {
+            files
+                .ignored_directory_errors
+                .insert(path.clone(), error.clone());
+            continue;
+        }
+        match load_directory_listing(root, path.as_path()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(path) = RepoPath::parse(&entry.path) else {
+                        continue;
+                    };
+                    if entry.directory {
+                        files.ignored_directories.push(path);
+                    } else {
+                        files.ignored.push(path);
+                    }
+                }
+            }
+            Err(error) => {
+                files.ignored_directory_errors.insert(path.clone(), error);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn load_directory_listing(
     root: &Path,
     relative: &Path,
@@ -16932,6 +16979,75 @@ mod tests {
             "ignored files are not working changes"
         );
         assert_eq!(runtime.source_surface, SourceSurface::Editor);
+    }
+
+    #[test]
+    fn ignored_folder_errors_preserve_other_entries_and_wait_for_explicit_retry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("good")).unwrap();
+        std::fs::write(root.path().join("good/output.txt"), "generated").unwrap();
+        // A folder can be replaced while its expansion is still mounted.
+        std::fs::write(root.path().join("bad"), "replaced directory").unwrap();
+        let bad = RepoPath::parse("bad").unwrap();
+        let good = RepoPath::parse("good").unwrap();
+        let expanded = vec![bad.clone(), good.clone()];
+        let fresh_listing = || crate::repository::WorkingFiles {
+            ignored_directories: expanded.clone(),
+            ..Default::default()
+        };
+        let mut files = fresh_listing();
+        expand_ignored_directories(
+            root.path(),
+            &mut files,
+            &expanded,
+            &BTreeMap::new(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(files.ignored_directory_errors.contains_key(&bad));
+        assert!(
+            files
+                .ignored
+                .contains(&RepoPath::parse("good/output.txt").unwrap())
+        );
+        let failures = files.ignored_directory_errors.clone();
+
+        std::fs::remove_file(root.path().join("bad")).unwrap();
+        std::fs::create_dir(root.path().join("bad")).unwrap();
+        std::fs::write(root.path().join("bad/recovered.txt"), "recovered").unwrap();
+        let mut files = fresh_listing();
+        expand_ignored_directories(
+            root.path(),
+            &mut files,
+            &expanded,
+            &failures,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(files.ignored_directory_errors, failures);
+        assert!(
+            !files
+                .ignored
+                .contains(&RepoPath::parse("bad/recovered.txt").unwrap()),
+            "background refreshes must not retry failed folders"
+        );
+
+        let mut files = fresh_listing();
+        expand_ignored_directories(
+            root.path(),
+            &mut files,
+            &expanded,
+            &BTreeMap::new(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(files.ignored_directory_errors.is_empty());
+        assert!(
+            files
+                .ignored
+                .contains(&RepoPath::parse("bad/recovered.txt").unwrap()),
+            "clearing the failure explicitly must retry the listing"
+        );
     }
 
     #[test]

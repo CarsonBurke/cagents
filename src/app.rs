@@ -10348,6 +10348,13 @@ impl Cagents {
             untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
         };
         let browse_files = self.context_tab == ContextTab::Files;
+        let previous_errors = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key == key)
+            .map(|source| source.ignored_directory_errors.clone())
+            .unwrap_or_default();
         let expanded = self
             .sidebar_state
             .expanded_directory_paths()
@@ -10365,35 +10372,13 @@ impl Cagents {
                         .map_err(|error| error.to_string())?;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
-                    for path in expanded {
-                        if !snapshot
-                            .files
-                            .ignored_directories
-                            .iter()
-                            .any(|directory| path.as_path().starts_with(directory.as_path()))
-                        {
-                            continue;
-                        }
-                        if cancellation.is_cancelled() {
-                            return Err("file listing cancelled".into());
-                        }
-                        // A disappearing or unreadable ignored folder must not hide
-                        // the rest of the worktree; the next refresh retries it.
-                        if let Ok(files) =
-                            repository_widget::load_directory_listing(&worktree, path.as_path())
-                        {
-                            for file in files {
-                                let Ok(path) = RepoPath::parse(&file.path) else {
-                                    continue;
-                                };
-                                if file.directory {
-                                    snapshot.files.ignored_directories.push(path);
-                                } else {
-                                    snapshot.files.ignored.push(path);
-                                }
-                            }
-                        }
-                    }
+                    repository_widget::expand_ignored_directories(
+                        &worktree,
+                        &mut snapshot.files,
+                        &expanded,
+                        &previous_errors,
+                        &cancellation,
+                    )?;
                 }
                 Ok(snapshot)
             })
@@ -13648,6 +13633,9 @@ impl Application for Cagents {
                     }
                     SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
                     SidebarAction::ToggleDirectory { key, path } if self.sidebar_model.source_control.as_ref().is_some_and(|source| source.files.iter().any(|row| row.path == path && row.ignored)) => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            source.ignored_directory_errors.remove(&path);
+                        }
                         self.reload_source_control(&key)
                     }
                     SidebarAction::ToggleDirectory { key, .. }
@@ -13682,7 +13670,14 @@ impl Application for Cagents {
                             Task::none()
                         }
                     }
-                    SidebarAction::RefreshWorktree { key } => self.reload_source_control(&key),
+                    SidebarAction::RefreshWorktree { key } => {
+                        if self.source_control_is_bound(&key) {
+                            if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                                source.ignored_directory_errors.clear();
+                            }
+                        }
+                        self.reload_source_control(&key)
+                    },
                     SidebarAction::OpenFile { key, path } => {
                         self.route_panel_open(&key, &path)
                     }

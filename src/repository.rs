@@ -852,6 +852,9 @@ pub struct WorkingFiles {
     pub ignored: Vec<RepoPath>,
     #[serde(default)]
     pub ignored_directories: Vec<RepoPath>,
+    /// Failed lazy folder reads, retained until the user explicitly retries.
+    #[serde(default)]
+    pub ignored_directory_errors: std::collections::BTreeMap<RepoPath, String>,
 }
 
 /// Everything the source-control surfaces need about one worktree in one shot.

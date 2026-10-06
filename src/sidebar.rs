@@ -1892,6 +1892,7 @@ pub struct SourceControlModel {
     pub error: Option<String>,
     pub staged_count: usize,
     pub files: Vec<FileRow>,
+    pub ignored_directory_errors: BTreeMap<RepoPath, String>,
     groups: Vec<ChangeGroup>,
     /// How many distinct paths the change groups hold, as the Changes tab
     /// states it; `None` for a clean worktree. A path both staged and
@@ -2037,6 +2038,7 @@ impl SourceControlModel {
             error: None,
             staged_count: 0,
             files: Vec::new(),
+            ignored_directory_errors: BTreeMap::new(),
             groups: Vec::new(),
             change_count_label: None,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
@@ -2156,6 +2158,7 @@ impl SourceControlModel {
             error: None,
             staged_count,
             files,
+            ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
             groups,
             change_count_label,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
@@ -7268,6 +7271,19 @@ fn files_section<'a>(
             file_management,
             modal_open || source.reloading || source.busy(),
         ));
+        if expanded && let Some(error) = source.ignored_directory_errors.get(&row.path) {
+            rows = rows.push(
+                widget::container(
+                    design::caption(format!(
+                        "Could not list {}: {error} Collapse and expand the folder to retry.",
+                        row.path.display()
+                    ))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                )
+                .padding([0, spacing.space_xxs])
+                .width(Length::Fill),
+            );
+        }
     }
     let list = widget::column::with_children(vec![
         rows.into(),
@@ -14719,8 +14735,16 @@ pub(crate) mod tests {
         snapshot.files.ignored_directories = vec![repo_path("build"), repo_path("empty")];
         snapshot.files.paths.push(repo_path("build/tracked.rs"));
         snapshot.files.paths.sort();
+        snapshot
+            .files
+            .ignored_directory_errors
+            .insert(repo_path("empty"), "Folder is not readable".into());
         let original_changes = snapshot.status.entries.clone();
         let model = SourceControlModel::ready(source_control().key, &snapshot);
+        assert_eq!(
+            model.ignored_directory_errors,
+            snapshot.files.ignored_directory_errors
+        );
         for name in [
             "build",
             "build/nested",
