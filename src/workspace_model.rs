@@ -119,6 +119,43 @@ pub fn channel_title(text: &str) -> Option<String> {
 /// where nothing local counts as shared and therefore nothing is retired.
 pub const NO_REGISTRY: Uuid = Uuid::nil();
 
+/// Stable identities in a project's manually arranged navigation list.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NavigationItem {
+    Worktree(PathBuf),
+    Channel(ChannelId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavigationOrder {
+    pub repository: PathBuf,
+    pub items: Vec<NavigationItem>,
+}
+
+pub fn reorder_navigation(
+    items: &mut Vec<NavigationItem>,
+    source: &NavigationItem,
+    before: Option<&NavigationItem>,
+) -> bool {
+    let Some(from) = items.iter().position(|item| item == source) else {
+        return false;
+    };
+    let target = match before {
+        Some(item) => match items.iter().position(|candidate| candidate == item) {
+            Some(index) => index,
+            None => return false,
+        },
+        None => items.len(),
+    };
+    let to = target.saturating_sub(usize::from(from < target));
+    if from == to {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+
 /// The shared sidebar model as the registry currently holds it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceModel {
@@ -135,6 +172,8 @@ pub struct WorkspaceModel {
     /// Monotonic, bumped by every applied edit. An edit that changes nothing
     /// does not bump it, so a watcher can tell a real edge from a no-op.
     pub sequence: u64,
+    #[serde(default)]
+    pub navigation_orders: Vec<NavigationOrder>,
     pub projects: Vec<ModelProject>,
     pub channels: Vec<ModelChannel>,
     #[serde(default)]
@@ -198,6 +237,8 @@ impl WorkspaceModel {
                 }
             }
             ModelEdit::CloseProject { repository } => {
+                self.navigation_orders
+                    .retain(|order| order.repository != *repository);
                 if !self.closed_projects.contains(repository) {
                     self.closed_projects.push(repository.clone());
                 }
@@ -221,6 +262,35 @@ impl WorkspaceModel {
                         ordinal: PENDING_ORDINAL,
                     });
                 }
+            }
+            ModelEdit::ResetNavigation { repository } => {
+                self.navigation_orders
+                    .retain(|order| order.repository != *repository);
+            }
+            ModelEdit::ReorderNavigation {
+                repository,
+                source,
+                before,
+                fallback,
+            } => {
+                let index = self
+                    .navigation_orders
+                    .iter()
+                    .position(|order| order.repository == *repository)
+                    .unwrap_or_else(|| {
+                        self.navigation_orders.push(NavigationOrder {
+                            repository: repository.clone(),
+                            items: fallback.clone(),
+                        });
+                        self.navigation_orders.len() - 1
+                    });
+                let items = &mut self.navigation_orders[index].items;
+                for item in fallback {
+                    if !items.contains(item) {
+                        items.push(item.clone());
+                    }
+                }
+                reorder_navigation(items, source, before.as_ref());
             }
             ModelEdit::RetitleChannel { id, title } => {
                 if let Some(channel) = self.channels.iter_mut().find(|channel| channel.id == *id) {
@@ -277,6 +347,15 @@ pub enum ModelEdit {
         #[serde(default)]
         title_source: crate::model::ChannelTitleSource,
     },
+    /// Return this project to automatic sidebar ordering.
+    ResetNavigation { repository: PathBuf },
+    /// Merge a stable-successor move against the current shared order.
+    ReorderNavigation {
+        repository: PathBuf,
+        source: NavigationItem,
+        before: Option<NavigationItem>,
+        fallback: Vec<NavigationItem>,
+    },
     /// A no-op on an unknown id: a retitle racing a delete must not resurrect
     /// what the delete removed.
     RetitleChannel { id: ChannelId, title: String },
@@ -330,6 +409,20 @@ impl ModelEdit {
                 repository: canonical_repository(&repository)?,
                 name,
                 kind,
+            },
+            Self::ResetNavigation { repository } => Self::ResetNavigation {
+                repository: canonical_repository(&repository)?,
+            },
+            Self::ReorderNavigation {
+                repository,
+                source,
+                before,
+                fallback,
+            } => Self::ReorderNavigation {
+                repository: canonical_repository(&repository)?,
+                source,
+                before,
+                fallback,
             },
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,

@@ -55,6 +55,7 @@ pub enum ModelUpdate {
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
     },
+    NavigationFailed(String),
     Ranked {
         channel: ChannelId,
         ordinal: u32,
@@ -106,7 +107,10 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         // otherwise idle until the next edge.
         if matches!(
             edit,
-            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. }
+            ModelEdit::SeedView { .. }
+                | ModelEdit::ChangeView { .. }
+                | ModelEdit::ReorderNavigation { .. }
+                | ModelEdit::ResetNavigation { .. }
         ) {
             let model = client
                 .read_workspace_model()
@@ -196,6 +200,13 @@ fn publish(
                     }
                 ) {
                     *pending = None;
+                    if matches!(
+                        &request,
+                        ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+                    ) {
+                        let _ =
+                            updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
+                    }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
@@ -214,6 +225,10 @@ fn send(
     edit: ModelEdit,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
+    let reordered = matches!(
+        &edit,
+        ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+    );
     let created = match &edit {
         ModelEdit::CreateChannel { id, .. } => Some(*id),
         _ => None,
@@ -281,6 +296,9 @@ fn send(
             ordinal: channel.ordinal,
         });
     }
+    if reordered {
+        let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
+    }
     if let Some(repository) = reopened {
         let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
     }
@@ -299,8 +317,90 @@ enum Adoption {
 }
 
 impl Cagents {
+    pub(super) fn reorder_sidebar_member(
+        &mut self,
+        project: crate::model::ProjectId,
+        source: crate::sidebar::SelectionRow,
+        before: Option<crate::sidebar::SelectionRow>,
+    ) -> Task<Message> {
+        use crate::workspace_model::{ModelEdit, NavigationItem};
+        let Some(entity) = self.sidebar_model.project(project) else {
+            return Task::none();
+        };
+        let item = |row| match row {
+            crate::sidebar::SelectionRow::Channel(id) => entity
+                .channels
+                .iter()
+                .find(|row| {
+                    row.id == id && row.deletion != Some(crate::sidebar::RowDeletion::Deleting)
+                })
+                .map(|row| NavigationItem::Channel(row.id)),
+            crate::sidebar::SelectionRow::Worktree(owner, id) if owner == project => entity
+                .worktrees
+                .iter()
+                .find(|row| {
+                    row.id == id && row.deletion != Some(crate::sidebar::RowDeletion::Deleting)
+                })
+                .map(|row| NavigationItem::Worktree(row.path.clone())),
+            _ => None,
+        };
+        let Some(source) = item(source) else {
+            return Task::none();
+        };
+        let before = match before {
+            Some(row) => match item(row) {
+                Some(item) => Some(item),
+                None => return Task::none(),
+            },
+            None => None,
+        };
+        if before.as_ref() == Some(&source) {
+            return Task::none();
+        }
+        let mut fallback: Vec<_> = crate::sidebar::channels_in_display_order(
+            entity
+                .channels
+                .iter()
+                .filter(|row| row.deletion != Some(crate::sidebar::RowDeletion::Deleting)),
+        )
+        .into_iter()
+        .map(|row| NavigationItem::Channel(row.id))
+        .chain(
+            crate::sidebar::worktrees_in_display_order(
+                &entity.repository,
+                self.settings.worktree_sort,
+                entity
+                    .worktrees
+                    .iter()
+                    .filter(|row| row.deletion != Some(crate::sidebar::RowDeletion::Deleting)),
+            )
+            .into_iter()
+            .map(|row| NavigationItem::Worktree(row.path.clone())),
+        )
+        .collect();
+        crate::sidebar::apply_navigation_order(
+            &mut fallback,
+            &entity.navigation_order,
+            Clone::clone,
+        );
+        let edit = ModelEdit::ReorderNavigation {
+            repository: entity.repository.clone(),
+            source,
+            before,
+            fallback,
+        };
+        self.publish_model_edit(edit);
+        Task::none()
+    }
+
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::NavigationFailed(error) => {
+                self.status = Some(TransientNotice::warning(format!(
+                    "Could not reorder the sidebar: {error}"
+                )));
+                Task::none()
+            }
             ModelUpdate::ViewApplied {
                 scope,
                 operation,
@@ -527,6 +627,14 @@ impl Cagents {
                 Adoption::Opening(task) => tasks.push(task),
                 Adoption::Retained => {}
             }
+        }
+        for project in &mut self.sidebar_model.projects {
+            project.navigation_order = model
+                .navigation_orders
+                .iter()
+                .find(|order| order.repository == project.repository)
+                .map(|order| order.items.clone())
+                .unwrap_or_default();
         }
         for shared in &model.channels {
             if self.channel_ui.is_deleting(shared.id) || self.channel_ui.was_deleted(shared.id) {
@@ -1023,8 +1131,17 @@ impl Cagents {
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
     pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
+        let navigation = matches!(
+            &edit,
+            ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+        );
         if let Err(error) = self.workspace_model_tx.try_send(edit) {
             tracing::debug!(%error, "a shared workspace model edit was not queued");
+            if navigation {
+                self.status = Some(TransientNotice::warning(
+                    "Could not save the sidebar order; try again once the selected device is connected",
+                ));
+            }
         }
     }
 }
@@ -1299,6 +1416,7 @@ mod tests {
     /// has reconciled against it would have recorded.
     fn registry(channels: Vec<ModelChannel>) -> WorkspaceModel {
         WorkspaceModel {
+            navigation_orders: Vec::new(),
             identity: uuid::Uuid::new_v4(),
             sequence: channels.len() as u64,
             projects: Vec::new(),

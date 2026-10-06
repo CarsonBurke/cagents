@@ -27,7 +27,15 @@ fn dialog_controls<'a>(children: Vec<Element<'a, Message>>, narrow: bool) -> Ele
 pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
     matches!(
         action,
-        SidebarAction::SearchChanged(_)
+        SidebarAction::ReorderMember { .. }
+            | SidebarAction::ReorderProject { .. }
+            | SidebarAction::ProjectCommand {
+                command: crate::sidebar::ProjectCommand::ResetSidebarOrder
+                    | crate::sidebar::ProjectCommand::MoveUp
+                    | crate::sidebar::ProjectCommand::MoveDown,
+                ..
+            }
+            | SidebarAction::SearchChanged(_)
             | SidebarAction::SetFilter(_)
             | SidebarAction::ToggleControls
             | SidebarAction::OpenFirstSearchResult
@@ -1378,6 +1386,20 @@ mod tests {
             SidebarAction::OpenFirstSearchResult,
             SidebarAction::Resize { width: 300.0 },
             SidebarAction::ResizeFinished,
+            SidebarAction::ReorderMember {
+                project: ProjectId::new(),
+                source: sidebar::SelectionRow::Channel(crate::model::ChannelId::new()),
+                before: None,
+            },
+            SidebarAction::ReorderProject {
+                project: ProjectId::new(),
+                before: None,
+            },
+            SidebarAction::ProjectCommand {
+                project_id: ProjectId::new(),
+                worktree_id: None,
+                command: sidebar::ProjectCommand::ResetSidebarOrder,
+            },
         ] {
             assert!(supports_sidebar_action(&action));
         }

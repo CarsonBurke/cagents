@@ -799,6 +799,8 @@ struct EditorDocument {
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
     history: History,
+    #[cfg(test)]
+    history_time: Option<Instant>,
 }
 
 /// What one editor action did to the buffer's text.
@@ -854,6 +856,8 @@ impl EditorDocument {
             error: None,
             durability_warning: None,
             history: History::default(),
+            #[cfg(test)]
+            history_time: None,
         }
     }
 
@@ -889,12 +893,15 @@ impl EditorDocument {
                 } else {
                     protocol_edit(&self.content, &recorded.change)
                 };
+                let now = Instant::now();
+                #[cfg(test)]
+                let now = self.history_time.unwrap_or(now);
                 self.history.record(
                     recorded.change,
                     kind,
                     recorded.before,
                     self.content.cursor(),
-                    Instant::now(),
+                    now,
                 );
                 self.text_changed();
                 Applied::Changed(protocol)
@@ -15516,6 +15523,12 @@ mod tests {
     fn undo_and_redo_step_through_typing_and_report_exact_edits() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        // Scheduler pauses in a loaded parallel suite must not become a user
+        // typing pause. Explicit idle-boundary coverage lives in editor_history.
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("editable fixture");
+        };
+        document.history_time = Some(Instant::now());
         drop(runtime.take_lsp_intents());
         move_to_start(&mut runtime, card);
         for character in ['a', 'b'] {

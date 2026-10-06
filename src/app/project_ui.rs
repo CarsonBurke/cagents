@@ -869,6 +869,14 @@ impl Cagents {
                             None,
                         );
                     }
+                    ProjectCommand::ResetSidebarOrder => {
+                        self.publish_model_edit(
+                            crate::workspace_model::ModelEdit::ResetNavigation {
+                                repository: target.repository,
+                            },
+                        );
+                        return Task::none();
+                    }
                     ProjectCommand::MoveUp | ProjectCommand::MoveDown => {
                         let order: Vec<_> = self
                             .sidebar_model
