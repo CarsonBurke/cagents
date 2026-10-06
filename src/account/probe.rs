@@ -39,6 +39,17 @@ use crate::{agent::Provider, chat::Model};
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a CLI's stdout a probe reads before giving up on it.
 pub const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// A cached identity cannot override the provider explicitly rejecting its
+/// credentials. Unsupported quota reporting can still confirm an identity.
+pub(crate) fn confirms_login(identity: Option<&Identity>, status: UsageStatus) -> bool {
+    status != UsageStatus::NeedsLogin
+        && (identity.is_some()
+            || matches!(
+                status,
+                UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+            ))
+}
 /// How long the reader's shell is given to say what `PATH` it sets up.
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a CLI is given to exit after its input closes.
@@ -1027,6 +1038,16 @@ fn rpc_result(mut frame: Value) -> RpcResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_authentication_failure_overrides_a_cached_identity() {
+        let identity = Identity::default();
+        assert!(!confirms_login(Some(&identity), UsageStatus::NeedsLogin));
+        assert!(!confirms_login(None, UsageStatus::NeedsLogin));
+        assert!(confirms_login(Some(&identity), UsageStatus::Unavailable));
+        assert!(!confirms_login(None, UsageStatus::Unavailable));
+        assert!(confirms_login(None, UsageStatus::Limited));
+    }
+
     use super::*;
 
     #[tokio::test]

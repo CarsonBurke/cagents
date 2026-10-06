@@ -648,6 +648,9 @@ struct AccountState {
     /// The login the account reported when the reader started signing it
     /// in, while that sign-in is watched for.
     signing_in_from: Option<Identity>,
+    /// This window's explicit re-login intent lasts through its terminal,
+    /// including browser handoffs that outlive the usual polling grace.
+    sign_in_terminal: Option<TerminalId>,
 }
 
 impl AccountState {
@@ -662,6 +665,7 @@ impl AccountState {
             failure: None,
             queued: None,
             signing_in_from: None,
+            sign_in_terminal: None,
         }
     }
 
@@ -811,10 +815,12 @@ pub enum Action {
     ShowAccount(AccountId),
     OpenPane,
     SignIn(AccountId),
+    SignInWithCode(AccountId),
     /// The CLI and browser callback were checked off the interface thread.
     LoginReady {
         id: AccountId,
         provider: Provider,
+        device: bool,
         program: Result<PathBuf, String>,
     },
     /// The registry was read again, as another window may have changed it.
@@ -900,6 +906,7 @@ impl Action {
                 | Self::ShowAccount(_)
                 | Self::OpenPane
                 | Self::SignIn(_)
+                | Self::SignInWithCode(_)
                 | Self::Add { .. }
                 | Self::LinkStart(_)
                 | Self::LinkCommit
@@ -1750,6 +1757,7 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        self.refresh_login_watch(id, now);
         let focused = self.refresh_ui.focused;
         let cache = self.account_ui.cache.clone();
         let account = &self.account_ui.account(id)?.account;
@@ -1935,7 +1943,7 @@ impl Cagents {
             } else if let Some(snapshot) = state.snapshot.as_mut()
                 && report.apply(snapshot, observed_at, now)
             {
-                state.schedule.observe(observed_at);
+                state.schedule.observe(snapshot.observed_at);
                 observed = true;
             }
         }
@@ -2086,13 +2094,26 @@ impl Cagents {
                         return Task::none();
                     }
                 };
+                if self
+                    .account_ui
+                    .account(&id)
+                    .is_some_and(|state| self.account_sign_in_running(&state.account))
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This account is already signing in. Finish or close its sign-in terminal first.",
+                    ));
+                    return Task::none();
+                }
                 let now = now_ms();
                 if let Some(state) = self.account_ui.account_mut(&id) {
                     state.schedule.await_login(now);
                     state.signing_in_from = state.identity.clone();
                 }
-                self.open_login_terminal(recipe, "Sign in on device".into())
-                    .0
+                let (task, terminal) = self.open_login_terminal(recipe, "Sign in on device".into());
+                if let Some(state) = self.account_ui.account_mut(&id) {
+                    state.sign_in_terminal = Some(terminal);
+                }
+                task
             }
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
@@ -2226,12 +2247,14 @@ impl Cagents {
                 let open = self.open_utility_card(CardKind::Accounts);
                 Task::batch([open, self.accounts_surface_changed()])
             }
-            Action::SignIn(id) => self.sign_in(id),
+            Action::SignIn(id) => self.sign_in(id, false),
+            Action::SignInWithCode(id) => self.sign_in(id, true),
             Action::LoginReady {
                 id,
                 provider,
+                device,
                 program,
-            } => self.open_login(&id, provider, program),
+            } => self.open_login(&id, provider, device, program),
             Action::RegistryLoaded(result) => {
                 if let Ok(mut registry) = result {
                     let projects = self
@@ -2582,6 +2605,7 @@ impl Cagents {
 
     fn account_probed(&mut self, id: AccountId, mut outcome: Outcome) -> Task<Message> {
         let now = now_ms();
+        self.refresh_login_watch(&id, now);
         self.account_ui.now_ms = now;
         // The probe cached what its CLI listed itself.
         if let Outcome::Answered { catalog, .. } = &mut outcome
@@ -2638,6 +2662,7 @@ impl Cagents {
                 if snapshot.status != UsageStatus::NeedsLogin && !unchanged_by_login {
                     state.schedule.login_settled();
                     state.signing_in_from = None;
+                    state.sign_in_terminal = None;
                 }
                 state.present =
                     snapshot.status != UsageStatus::Unavailable || !state.account.is_system();
@@ -2770,7 +2795,7 @@ impl Cagents {
     }
 
     /// Finds the CLI to sign in with off the interface thread, as probes do.
-    fn sign_in(&mut self, id: AccountId) -> Task<Message> {
+    fn sign_in(&mut self, id: AccountId, device: bool) -> Task<Message> {
         let Some(account) = self
             .account_ui
             .account(&id)
@@ -2778,6 +2803,12 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if self.account_sign_in_running(&account) {
+            self.status = Some(TransientNotice::warning(
+                "This account is already signing in. Finish or close its sign-in terminal first.",
+            ));
+            return Task::none();
+        }
         if crate::device::is_remote() {
             self.account_ui.popover = None;
             self.account_ui.table.close_popups();
@@ -2796,7 +2827,7 @@ impl Cagents {
                 Message::AccountUi(Action::RemoteLogin(id, result))
             });
         }
-        if account.provider == Provider::Codex {
+        if account.provider == Provider::Codex && !device {
             if self.codex_browser_busy() {
                 self.status = Some(TransientNotice::warning(account::login::BUSY));
                 return Task::none();
@@ -2809,7 +2840,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let search_path = probe::search_path().await;
             let program = tokio::task::spawn_blocking(move || {
-                if account.provider == Provider::Codex {
+                if account.provider == Provider::Codex && !device {
                     browser_login_available()?;
                 }
                 probe::find_executable(account.provider.executable(), search_path.as_deref())
@@ -2823,6 +2854,7 @@ impl Cagents {
             Message::AccountUi(Action::LoginReady {
                 id,
                 provider,
+                device,
                 program,
             })
         })
@@ -2832,9 +2864,10 @@ impl Cagents {
         &mut self,
         id: &AccountId,
         provider: Provider,
+        device: bool,
         program: Result<PathBuf, String>,
     ) -> Task<Message> {
-        if provider == Provider::Codex {
+        if provider == Provider::Codex && !device {
             self.account_ui.browser_preparing = false;
         }
         let program = match program {
@@ -2847,10 +2880,18 @@ impl Cagents {
         let Some(state) = self.account_ui.account(id) else {
             return Task::none();
         };
+        // Discovery is asynchronous: another request may have opened this
+        // home's login before this one found the CLI.
+        if self.account_sign_in_running(&state.account) {
+            self.status = Some(TransientNotice::warning(
+                "This account is already signing in. Finish or close its sign-in terminal first.",
+            ));
+            return Task::none();
+        }
         let launch = program
             .zip(std::env::var_os("HOME"))
             .and_then(|(program, home)| {
-                login_launch(&state.account, &program, PathBuf::from(home), false)
+                login_launch(&state.account, &program, PathBuf::from(home), device)
             });
         let Some(launch) = launch else {
             self.status = Some(TransientNotice::error(format!(
@@ -2865,7 +2906,56 @@ impl Cagents {
             state.schedule.await_login(now);
             state.signing_in_from = state.identity.clone();
         }
-        self.open_login_terminal(launch, title).0
+        let (task, terminal) = self.open_login_terminal(launch, title);
+        if let Some(state) = self.account_ui.account_mut(id) {
+            state.sign_in_terminal = Some(terminal);
+        }
+        task
+    }
+
+    fn refresh_login_watch(&mut self, id: &AccountId, now: Millis) {
+        let Some(terminal) = self
+            .account_ui
+            .account(id)
+            .and_then(|state| state.sign_in_terminal)
+        else {
+            return;
+        };
+        let running = self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal && !terminal_ended(session))
+                && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
+        });
+        if let Some(state) = self.account_ui.account_mut(id) {
+            if running {
+                state.schedule.extend_login_watch(now);
+            } else {
+                state.schedule.await_login(now);
+            }
+            if !running {
+                // Give the completed or cancelled terminal one final fresh
+                // verification window, then release its explicit intent.
+                state.sign_in_terminal = None;
+            }
+        }
+    }
+
+    fn account_sign_in_running(&self, account: &Account) -> bool {
+        let (Some(variable), Some(home)) = (
+            account::home_variable(account.provider),
+            account.resolved_home(),
+        ) else {
+            return false;
+        };
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
+                && matches!(&card.kind, CardKind::Terminal(session)
+                    if is_sign_in(&session.launch)
+                        && !terminal_ended(session)
+                        && session.launch.environment.get(variable)
+                            .is_some_and(|value| Path::new(value) == home))
+        })
     }
 
     /// Opens a terminal running a provider's login, which keeps no
@@ -3392,6 +3482,19 @@ impl Cagents {
     }
 
     fn login_verified(&mut self, key: uuid::Uuid, outcome: Outcome) -> Task<Message> {
+        let outcome = match outcome {
+            Outcome::Answered {
+                ref identity,
+                ref snapshot,
+                ..
+            } if identity.is_some() && snapshot.status == UsageStatus::NeedsLogin => {
+                // The CLI can retain an identity after its credentials have
+                // expired. Keep the configured home pending and retry rather
+                // than register it or mistake this for a cancelled sign-in.
+                Outcome::Failed("The provider needs this account to sign in again".into())
+            }
+            outcome => outcome,
+        };
         let now = now_ms();
         let Some(index) = self
             .account_ui
@@ -3426,11 +3529,7 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let signed_in = identity.is_some()
-            || matches!(
-                snapshot.status,
-                UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
-            );
+        let signed_in = probe::confirms_login(identity.as_ref(), snapshot.status);
         let provider = login.provider;
         let account = login.account();
         if !signed_in {
@@ -5029,6 +5128,110 @@ mod tests {
 #[cfg(test)]
 mod app_tests {
     #[test]
+    fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 513);
+        let home = app
+            .account_ui
+            .account(&id)
+            .unwrap()
+            .account
+            .resolved_home()
+            .unwrap();
+        app.account_ui.browser_preparing = true;
+        let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
+        assert!(app.account_ui.browser_preparing);
+        assert!(
+            app.account_ui.logins.is_empty(),
+            "re-login must not add another home"
+        );
+        let card = app.sign_in_card(Provider::Codex, &home).unwrap();
+        let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+            panic!("sign-in terminal expected");
+        };
+        assert_eq!(session.launch.arguments, ["login", "--device-auth"]);
+        assert_eq!(
+            session.launch.environment["CODEX_HOME"],
+            home.display().to_string()
+        );
+        let count = app.durable.cards.len();
+        let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
+        assert_eq!(
+            app.durable.cards.len(),
+            count,
+            "same-home login cannot race"
+        );
+        let _ = app.open_login(&id, Provider::Codex, true, Err("fixture".into()));
+        assert!(app.account_ui.browser_preparing);
+    }
+
+    #[test]
+    fn a_slow_relogin_remains_intentional_until_verified_and_then_releases_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state
+            .schedule
+            .await_login(now_ms() - 2 * account::schedule::LOGIN_WATCH);
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        assert!(state.sign_in_terminal.is_some());
+        let _ = app.update(signed_in_as(&id, "new@example.com"));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("new@example.com")
+        );
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.sign_in_terminal.is_none());
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        // Even if the auth terminal remains open, its completed intent cannot
+        // authorize a later replacement of this home's credentials.
+        let _ = app.update(signed_in_as(&id, "unexpected@example.com"));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("new@example.com")
+        );
+        assert!(matches!(
+            app.account_ui
+                .login_conflict(app.account_ui.account(&id).unwrap()),
+            Some(LoginConflict::Changed { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_relogin_has_one_final_verification_grace() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 514);
+        let home = app
+            .account_ui
+            .account(&id)
+            .unwrap()
+            .account
+            .resolved_home()
+            .unwrap();
+        let _ = app.open_login(&id, Provider::Claude, false, Ok("/tools/claude".into()));
+        let card = app.sign_in_card(Provider::Claude, &home).unwrap();
+        app.cards
+            .insert(card, CardRuntime::Failed("fixture failure".into()));
+        app.refresh_login_watch(&id, NOW);
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.sign_in_terminal.is_none());
+        assert!(state.schedule.awaiting_login(NOW));
+        app.refresh_login_watch(&id, NOW + 2 * account::schedule::LOGIN_WATCH);
+        assert!(
+            !app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .awaiting_login(NOW + 2 * account::schedule::LOGIN_WATCH)
+        );
+    }
+
+    #[test]
     fn browser_add_is_fenced_before_async_home_creation_and_errors_release_it() {
         let mut app = context_inspector_test_app(false);
         app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
@@ -5900,6 +6103,42 @@ mod app_tests {
         );
     }
 
+    #[test]
+    fn live_codex_percentages_do_not_postpone_a_due_permission_probe() {
+        for (allowed, used) in [(true, 100), (false, 10)] {
+            for limit_id in ["codex", "codex_bengalfox"] {
+                let mut app = context_inspector_test_app(false);
+                let managed = app.account_ui.add_managed_fixture(Provider::Codex, 7);
+                let recipe = recipe_on(&app, &managed);
+                let now = now_ms();
+                let observed_at = now - schedule::DISPLAY_STALE_AFTER - 1;
+                let probed = account::codex::parse_rate_limits(
+                    &serde_json::json!({"ordinaryUsageAllowed": allowed, "rateLimits": {
+                        "primary": {"usedPercent": used, "windowDurationMins": 300},
+                    }}),
+                    observed_at,
+                );
+                let state = app.account_ui.account_mut(&managed).unwrap();
+                state.snapshot = Some(probed);
+                state.schedule.succeed(observed_at);
+                let update = account::codex::parse_update(&serde_json::json!({"rateLimits": {
+                    "limitId": limit_id,
+                    "primary": {"usedPercent": used, "windowDurationMins": 300},
+                }}))
+                .unwrap();
+                let _ = app.account_reported(
+                    Provider::Codex,
+                    &recipe,
+                    vec![(LiveReport::CodexLimits(update), now)],
+                );
+                let state = app.account_ui.account(&managed).unwrap();
+                assert_eq!(state.snapshot.as_ref().unwrap().observed_at, observed_at);
+                assert!(state.schedule.should_probe(Trigger::Tick, now, true));
+                assert!(state.schedule.should_probe(Trigger::Focus, now, true));
+            }
+        }
+    }
+
     /// Figures a running conversation reports refine the reading of the
     /// account its launch points at, count as a probe - a focused window's
     /// tick asks every other account that is due, but not that one - and
@@ -6015,6 +6254,7 @@ mod app_tests {
                 }],
                 credits: None,
                 status: UsageStatus::Ok,
+                ordinary_usage_allowed: None,
                 observed_at: now,
                 source: UsageSource::Probe,
                 plan: None,
@@ -6556,6 +6796,49 @@ mod app_tests {
         assert_eq!(login.key, key);
         assert_eq!(login.phase, LoginPhase::Waiting);
         assert!(login.next_check > now_ms());
+    }
+
+    #[test]
+    fn a_cached_identity_with_expired_credentials_keeps_its_home_pending() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 515);
+        app.account_ui
+            .registry
+            .begin(Provider::Claude, key, now_ms());
+        for attempt in 1..=LOGIN_ATTEMPTS {
+            app.account_ui.logins[0].next_check = 0;
+            let _ = app.check_logins();
+            let _ = app.login_verified(
+                key,
+                Outcome::Answered {
+                    catalog: None,
+                    identity: Some(Identity {
+                        email: Some("cached@example.com".into()),
+                        ..Identity::default()
+                    }),
+                    snapshot: UsageSnapshot::state(
+                        UsageStatus::NeedsLogin,
+                        "expired credentials",
+                        NOW,
+                    ),
+                },
+            );
+            assert!(app.account_ui.registry.find(key).is_none());
+            assert!(
+                app.account_ui
+                    .registry
+                    .pending()
+                    .iter()
+                    .any(|pending| pending.key == key)
+            );
+            if attempt < LOGIN_ATTEMPTS {
+                assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Waiting);
+            }
+        }
+        assert!(
+            app.account_ui.logins.is_empty(),
+            "stop retrying without discarding the pending home"
+        );
     }
 
     #[test]

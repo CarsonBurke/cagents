@@ -209,12 +209,10 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                         );
                     }
                 };
-            if identity.is_none()
-                && !matches!(
-                    snapshot.status,
-                    UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
-                )
-            {
+            if identity.is_some() && snapshot.status == UsageStatus::NeedsLogin {
+                return Err("The provider needs this account to sign in again".into());
+            }
+            if !probe::confirms_login(identity.as_ref(), snapshot.status) {
                 let (registry, _) = store
                     .remove_home(&homes, provider, key, false)
                     .map_err(|error| error.to_string())?;
