@@ -8319,6 +8319,17 @@ fn changes_footer<'a>(
     } else {
         "Commit"
     };
+    let commit_hint = if !has_subject {
+        "Enter a commit summary"
+    } else if source.busy() {
+        "Git operation in progress"
+    } else if source.staged_count == 0 && !state.amend_commit {
+        "Stage changes to commit"
+    } else if !can_commit && state.amend_commit && source.head_oid.is_none() {
+        "No commit to amend"
+    } else {
+        commit_label
+    };
     let commit = crate::interaction::tooltip(
         button::suggested(commit_label)
             .leading_icon(crate::ui_controls::symbolic_icon("vcs-commit-symbolic"))
@@ -8327,7 +8338,7 @@ fn changes_footer<'a>(
             .padding([0, 8])
             .height(design::PRIMARY_CONTROL_SIZE)
             .on_press_maybe(can_commit.then_some(commit_action)),
-        format!("{commit_label} (Ctrl+Enter)"),
+        format!("{commit_hint} (Ctrl+Enter)"),
     );
 
     if has_subject {
@@ -8347,11 +8358,6 @@ fn changes_footer<'a>(
                 }
             }),
         );
-    if has_subject && source.staged_count == 0 && !state.amend_commit {
-        column = column.push(design::caption(
-            "Stage changes to commit. Ctrl+Enter commits.",
-        ));
-    }
     let mut buttons = widget::row::with_capacity(4)
         .spacing(spacing.space_xxs)
         .align_y(cosmic::iced::Alignment::Center);
