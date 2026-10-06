@@ -939,16 +939,16 @@ impl SidebarWorktree {
                 Some(WorktreePullRequestState::Merged) => "merged",
                 None => "unknown state",
             };
-            let _ = write!(
-                status,
-                ", pull request #{} {state}, checks {}",
-                pr.number,
-                check_description(pr.checks)
-            );
-            if pr.review_requested_again {
-                status.push_str(", review re-requested from you");
-            } else if pr.needs_review {
-                status.push_str(", needs your review");
+            let _ = write!(status, ", pull request #{} {state}", pr.number,);
+            if let Some(checks) = pr.active_checks() {
+                let _ = write!(status, ", checks {}", check_description(checks));
+            }
+            if pr.review_requested() {
+                status.push_str(if pr.review_requested_again {
+                    ", review re-requested from you"
+                } else {
+                    ", needs your review"
+                });
             }
         }
         let branch = self.branch.as_deref().unwrap_or("Detached HEAD");
@@ -1169,12 +1169,25 @@ impl SidebarPullRequest {
         row
     }
 
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
+        )
+    }
+
+    // Keep the last remote facts for a later refresh or reopening, but do not
+    // present them as outstanding work after the pull request has finished.
+    fn review_requested(&self) -> bool {
+        self.needs_review && !self.is_terminal()
+    }
+
+    fn active_checks(&self) -> Option<CheckStatus> {
+        (!self.is_terminal()).then_some(self.checks)
+    }
+
     fn has_pending_checks(&self) -> bool {
-        self.checks == CheckStatus::Pending
-            && !matches!(
-                self.state,
-                Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
-            )
+        self.active_checks() == Some(CheckStatus::Pending)
     }
 }
 
@@ -1215,7 +1228,7 @@ fn pull_request_tone(pr: &SidebarPullRequest) -> PullRequestTone {
     match pr.state {
         Some(WorktreePullRequestState::Merged) => PullRequestTone::Merged,
         Some(WorktreePullRequestState::Closed) => PullRequestTone::Danger,
-        _ if pr.needs_review => PullRequestTone::Review,
+        _ if pr.review_requested() => PullRequestTone::Review,
         _ if pr.draft => PullRequestTone::Draft,
         _ => PullRequestTone::Neutral,
     }
@@ -5881,7 +5894,7 @@ fn worktree_view<'a>(
             ));
         }
         content = content.push(slot(indicators.pull_request.and_then(|pr| {
-            pr.needs_review.then(|| {
+            pr.review_requested().then(|| {
                 crate::interaction::tooltip(
                     design::caption(if pr.review_requested_again {
                         "Review again"
@@ -5896,13 +5909,15 @@ fn worktree_view<'a>(
                 )
             })
         })));
-        if let Some(pr) = indicators.pull_request
+        if let Some(checks) = indicators
+            .pull_request
+            .and_then(SidebarPullRequest::active_checks)
             && matches!(
-                pr.checks,
+                checks,
                 CheckStatus::Failing | CheckStatus::Pending | CheckStatus::Passing
             )
         {
-            content = content.push(check_indicator(pr.checks));
+            content = content.push(check_indicator(checks));
         }
         if primary {
             content = content.push(status_icon(
@@ -14952,19 +14967,157 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn completed_pull_requests_do_not_present_stale_checks_as_activity() {
+    fn terminal_pull_request_rows_hide_retained_review_and_check_badges() {
+        use cosmic::iced::{
+            Color, Rectangle,
+            advanced::{
+                mouse,
+                renderer::{Headless, Style},
+            },
+        };
+
+        // Draw the actual expanded row and compact rail. Terminal rows with
+        // stale remote flags must look exactly like those with no live flags.
+        let frame = |row: &SidebarWorktree, compact: bool| {
+            let mut renderer = headless_renderer();
+            let mut element = worktree_view(
+                project_id(1),
+                row,
+                false,
+                false,
+                None,
+                false,
+                true,
+                &[],
+                false,
+                None,
+                true,
+                compact,
+                None,
+                "",
+                true,
+            );
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(460.0, WORKTREE_ROW_HEIGHT));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::Theme::dark(),
+                &Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            renderer.screenshot(
+                Size::new(460, WORKTREE_ROW_HEIGHT as u32),
+                1.0,
+                Color::BLACK,
+            )
+        };
+
+        for state in [
+            WorktreePullRequestState::Merged,
+            WorktreePullRequestState::Closed,
+        ] {
+            let mut row = project().worktrees.remove(1);
+            let mut pr = project().pull_requests.remove(0);
+            pr.state = Some(state);
+            pr.needs_review = true;
+            pr.review_requested_again = true;
+            for checks in [
+                CheckStatus::Pending,
+                CheckStatus::Passing,
+                CheckStatus::Failing,
+            ] {
+                pr.checks = checks;
+                row.set_pull_request(pr.clone());
+                let terminal = row.pull_request().unwrap();
+                assert!(terminal.needs_review);
+                assert!(terminal.review_requested_again);
+                assert_eq!(terminal.checks, checks, "remote metadata is retained");
+                assert!(!worktree_indicators(&row).pending_checks);
+                for description in [&row.chrome.accessible_name, &row.chrome.tooltip] {
+                    assert!(description.contains(match state {
+                        WorktreePullRequestState::Merged => "merged",
+                        _ => "closed",
+                    }));
+                    assert!(!description.contains(", checks "), "{description}");
+                    assert!(!description.contains("needs your review"), "{description}");
+                    assert!(
+                        !description.contains("review re-requested"),
+                        "{description}"
+                    );
+                }
+                assert_eq!(
+                    pull_request_tone(terminal),
+                    match state {
+                        WorktreePullRequestState::Merged => PullRequestTone::Merged,
+                        _ => PullRequestTone::Danger,
+                    }
+                );
+
+                let mut cleared = row.clone();
+                let mut no_flags = pr.clone();
+                no_flags.needs_review = false;
+                no_flags.review_requested_again = false;
+                no_flags.checks = CheckStatus::Unknown;
+                cleared.set_pull_request(no_flags);
+                for compact in [false, true] {
+                    assert_eq!(
+                        frame(&row, compact),
+                        frame(&cleared, compact),
+                        "terminal badges leaked: state={state:?}, checks={checks:?}, compact={compact}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_and_reopened_pull_request_rows_keep_review_and_check_status() {
+        let mut row = project().worktrees.remove(1);
         let mut pr = project().pull_requests.remove(0);
+        pr.needs_review = true;
+        pr.review_requested_again = true;
         pr.checks = CheckStatus::Pending;
-        pr.state = Some(WorktreePullRequestState::Open);
-        assert!(pr.has_pending_checks());
+        for state in [
+            None,
+            Some(WorktreePullRequestState::Open),
+            Some(WorktreePullRequestState::Draft),
+        ] {
+            pr.state = state;
+            row.set_pull_request(pr.clone());
+            assert!(worktree_indicators(&row).pending_checks);
+            assert!(row.pull_request().unwrap().review_requested());
+            assert_eq!(
+                row.pull_request().unwrap().active_checks(),
+                Some(CheckStatus::Pending)
+            );
+            assert!(row.chrome.accessible_name.contains(", checks pending"));
+            assert!(row.chrome.tooltip.contains(", checks pending"));
+            assert!(
+                row.chrome
+                    .accessible_name
+                    .contains("review re-requested from you")
+            );
+            assert!(row.chrome.tooltip.contains("review re-requested from you"));
+        }
 
-        pr.state = Some(WorktreePullRequestState::Merged);
-        assert!(!pr.has_pending_checks());
         pr.state = Some(WorktreePullRequestState::Closed);
-        assert!(!pr.has_pending_checks());
-
-        pr.state = Some(WorktreePullRequestState::Open);
-        assert!(pr.has_pending_checks(), "reopening restores ongoing checks");
+        row.set_pull_request(pr);
+        let mut reopened = row.pull_request().unwrap().clone();
+        reopened.state = Some(WorktreePullRequestState::Open);
+        reopened.review_requested_again = false;
+        row.set_pull_request(reopened);
+        assert!(worktree_indicators(&row).pending_checks);
+        assert!(row.chrome.accessible_name.contains("needs your review"));
+        assert!(row.chrome.tooltip.contains("needs your review"));
+        assert!(!row.chrome.accessible_name.contains("review re-requested"));
     }
 
     #[test]
