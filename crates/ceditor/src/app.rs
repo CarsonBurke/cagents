@@ -194,6 +194,7 @@ pub enum Message {
     Theme(AppTheme),
     Scale(f32),
     SettingsSaved(Result<(), String>),
+    FileRevealed(Result<cagents::file_manager::RevealOutcome, String>),
     Lsp(u64, Option<LspEvent>),
     Complete,
     Hover,
@@ -3791,27 +3792,41 @@ impl Application for Editor {
                                 Message::Pushed(id, result)
                             })
                         }
-                        SidebarAction::FileCommand { path, command, .. } => match command {
-                            FileCommand::CopyPath => iced::clipboard::write(
-                                tab.runtime
-                                    .descriptor
-                                    .worktree
-                                    .join(path.as_path())
-                                    .to_string_lossy()
-                                    .into_owned(),
-                            )
-                            .map(cosmic::Action::App),
-                            FileCommand::CopyRelativePath => iced::clipboard::write(
-                                path.as_path().to_string_lossy().into_owned(),
-                            )
-                            .map(cosmic::Action::App),
-                            FileCommand::Rename | FileCommand::CopyFile => self
-                                .begin_file_operation(
-                                    id,
-                                    path.as_path().to_path_buf(),
-                                    command == FileCommand::CopyFile,
-                                ),
-                        },
+                        SidebarAction::FileCommand { path, command, .. } => {
+                            match command {
+                                FileCommand::RevealInFileManager => {
+                                    if cagents::device::is_remote() {
+                                        self.notice = Some("Reveal in file manager is unavailable on remote devices.".into());
+                                        return Task::none();
+                                    }
+                                    let path = tab.runtime.descriptor.worktree.join(path.as_path());
+                                    cosmic::task::future(async move {
+                                        Message::FileRevealed(
+                                            cagents::file_manager::reveal(&path).await,
+                                        )
+                                    })
+                                }
+                                FileCommand::CopyPath => iced::clipboard::write(
+                                    tab.runtime
+                                        .descriptor
+                                        .worktree
+                                        .join(path.as_path())
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                )
+                                .map(cosmic::Action::App),
+                                FileCommand::CopyRelativePath => iced::clipboard::write(
+                                    path.as_path().to_string_lossy().into_owned(),
+                                )
+                                .map(cosmic::Action::App),
+                                FileCommand::Rename | FileCommand::CopyFile => self
+                                    .begin_file_operation(
+                                        id,
+                                        path.as_path().to_path_buf(),
+                                        command == FileCommand::CopyFile,
+                                    ),
+                            }
+                        }
                         SidebarAction::OpenFile { path, .. } => {
                             self.request_file(id, path.as_path().to_path_buf())
                         }
@@ -4284,6 +4299,18 @@ impl Application for Editor {
                 Message::Scale(scale) => {
                     self.set_ui_scale(scale);
                     Task::batch([self.save_settings(), self.appearance()])
+                }
+                Message::FileRevealed(result) => {
+                    self.notice = match result {
+                        Ok(cagents::file_manager::RevealOutcome::Selected) => {
+                            Some("Revealed in file manager".into())
+                        }
+                        Ok(cagents::file_manager::RevealOutcome::OpenedContainingFolder) => {
+                            Some("Opened containing folder in file manager".into())
+                        }
+                        Err(error) => Some(error),
+                    };
+                    Task::none()
                 }
                 Message::SettingsSaved(result) => {
                     if let Err(error) = result {

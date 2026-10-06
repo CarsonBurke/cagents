@@ -1531,6 +1531,7 @@ pub struct FileRow {
     pub path: RepoPath,
     pub depth: usize,
     pub directory: bool,
+    pub ignored: bool,
     chrome: FileRowChrome,
 }
 
@@ -1893,6 +1894,7 @@ pub struct SourceControlModel {
     pub error: Option<String>,
     pub staged_count: usize,
     pub files: Vec<FileRow>,
+    pub ignored_directory_errors: BTreeMap<RepoPath, String>,
     groups: Vec<ChangeGroup>,
     /// How many distinct paths the change groups hold, as the Changes tab
     /// states it; `None` for a clean worktree. A path both staged and
@@ -1956,6 +1958,7 @@ fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<Fi
                 path: entry.path,
                 depth: entry.depth,
                 directory: entry.directory,
+                ignored: false,
                 chrome,
             }
         })
@@ -2037,6 +2040,7 @@ impl SourceControlModel {
             error: None,
             staged_count: 0,
             files: Vec::new(),
+            ignored_directory_errors: BTreeMap::new(),
             groups: Vec::new(),
             change_count_label: None,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
@@ -2095,7 +2099,40 @@ impl SourceControlModel {
             .collect::<BTreeSet<_>>()
             .len();
         let change_count_label = (changed_paths > 0).then(|| tab_count_label(changed_paths));
-        let files = file_rows(&snapshot.files.paths);
+        let mut paths;
+        let paths = if snapshot.files.ignored.is_empty() {
+            &snapshot.files.paths
+        } else {
+            paths = snapshot.files.paths.clone();
+            paths.extend(snapshot.files.ignored.iter().cloned());
+            &paths
+        };
+        let mut files = file_rows_from_tree(build_file_tree_with_directories(
+            paths,
+            &snapshot.files.ignored_directories,
+        ));
+        let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
+        let ignored_directories: BTreeSet<_> = snapshot
+            .files
+            .ignored_directories
+            .iter()
+            .map(|path| path.as_path())
+            .collect();
+        for row in &mut files {
+            row.ignored = ignored.contains(&row.path)
+                || row
+                    .path
+                    .as_path()
+                    .ancestors()
+                    .any(|path| ignored_directories.contains(path));
+            // A force-added file inside an ignored folder is still tracked.
+            if row.ignored
+                && !row.directory
+                && snapshot.files.paths.binary_search(&row.path).is_ok()
+            {
+                row.ignored = false;
+            }
+        }
 
         // An unborn `HEAD` has no commit and no history to walk; an unreadable
         // one has neither either, but it is not an empty repository.
@@ -2123,6 +2160,7 @@ impl SourceControlModel {
             error: None,
             staged_count,
             files,
+            ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
             groups,
             change_count_label,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
@@ -3268,6 +3306,7 @@ pub enum FileCommand {
     CopyFile,
     CopyPath,
     CopyRelativePath,
+    RevealInFileManager,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6197,6 +6236,11 @@ fn file_commands(
             "edit-copy-relative-path-symbolic",
             FileCommand::CopyRelativePath,
         ),
+        (
+            "Reveal in file manager",
+            "folder-open-symbolic",
+            FileCommand::RevealInFileManager,
+        ),
     ]
     .into_iter()
     .filter(move |(_, _, command)| {
@@ -6219,7 +6263,7 @@ fn file_context_controls<'a>(
         return content;
     }
     let path = &row.path;
-    let mut entries = Vec::with_capacity(4 + editors.len());
+    let mut entries = Vec::with_capacity(5 + editors.len());
     for (label, icon, command) in file_commands(row.directory, file_management) {
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
@@ -7236,7 +7280,8 @@ fn files_section<'a>(
             crate::file_icon::folder(expanded)
         } else {
             crate::file_icon::icon(row.path.as_path())
-        };
+        }
+        .opacity(if row.ignored { 0.5 } else { 1.0 });
         let selected = matches!(
             state.panel_selection.as_ref(),
             Some(PanelSelection::File(path)) if *path == row.path
@@ -7252,6 +7297,11 @@ fn files_section<'a>(
                     row.path.display()
                 } else {
                     Cow::Borrowed(&*chrome.label)
+                })
+                .class(if row.ignored {
+                    theme::Text::Custom(design::muted_text)
+                } else {
+                    theme::Text::Default
                 })
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -7274,6 +7324,19 @@ fn files_section<'a>(
             file_management,
             modal_open || source.reloading || source.busy(),
         ));
+        if expanded && let Some(error) = source.ignored_directory_errors.get(&row.path) {
+            rows = rows.push(
+                widget::container(
+                    design::caption(format!(
+                        "Could not list {}: {error} Collapse and expand the folder to retry.",
+                        row.path.display()
+                    ))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                )
+                .padding([0, spacing.space_xxs])
+                .width(Length::Fill),
+            );
+        }
     }
     let list = widget::column::with_children(vec![
         rows.into(),
@@ -12616,13 +12679,21 @@ pub(crate) mod tests {
         for directory in [false, true] {
             assert_eq!(
                 commands(directory, false),
-                vec![FileCommand::CopyPath, FileCommand::CopyRelativePath],
+                vec![
+                    FileCommand::CopyPath,
+                    FileCommand::CopyRelativePath,
+                    FileCommand::RevealInFileManager
+                ],
                 "a clipboard write is not a working-tree mutation (directory={directory})"
             );
         }
         assert_eq!(
             commands(true, true),
-            vec![FileCommand::CopyPath, FileCommand::CopyRelativePath],
+            vec![
+                FileCommand::CopyPath,
+                FileCommand::CopyRelativePath,
+                FileCommand::RevealInFileManager
+            ],
             "a directory has nothing to rename or duplicate"
         );
         assert_eq!(
@@ -12632,6 +12703,7 @@ pub(crate) mod tests {
                 FileCommand::CopyFile,
                 FileCommand::CopyPath,
                 FileCommand::CopyRelativePath,
+                FileCommand::RevealInFileManager,
             ],
         );
     }
@@ -12937,9 +13009,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A worktree row under the pointer whether the list is scrolled or not,
-    /// and far enough down the short window that a menu taller than it has to
-    /// open upwards.
+    /// A worktree row under the pointer whether the list is scrolled or not.
+    /// The short window slices its menu to the available vertical space.
     const MENU_ROW: cosmic::iced::Point = cosmic::iced::Point::new(56.0, 136.0);
     /// How far the wheel moves the list in the scrolled half of each case.
     const MENU_SCROLL: f32 = -80.0;
@@ -12947,9 +13018,9 @@ pub(crate) mod tests {
     #[test]
     fn a_row_menu_in_a_scrolled_list_runs_the_entry_for_its_row() {
         use cosmic::iced::{Point, advanced::mouse};
-        // A menu opens over its anchor, so a short reach below the point that
-        // opened it lands on an entry under either placement.
-        let entry_cursor = Point::new(86.0, 144.0);
+        // The anchor is above the window's center, so the native popup picks
+        // the larger space below it. A short reach selects its first entry.
+        let entry_cursor = Point::new(86.0, MENU_ROW.y + 8.0);
         let mut outcomes = Vec::new();
         for scroll in [0.0, MENU_SCROLL] {
             let mut sidebar = Sidebar::scrolling();
@@ -12963,6 +13034,12 @@ pub(crate) mod tests {
             };
             let under_pointer = *worktree_id;
             sidebar.click(mouse::Button::Right, MENU_ROW);
+            sidebar.feed(
+                &[cosmic::iced::Event::Window(
+                    cosmic::iced::window::Event::RedrawRequested(std::time::Instant::now()),
+                )],
+                MENU_ROW,
+            );
             sidebar.move_to(entry_cursor);
             let chosen = sidebar.click(mouse::Button::Left, entry_cursor);
             let (worktree, command) = match chosen.first() {
@@ -15119,6 +15196,7 @@ pub(crate) mod tests {
                     repo_path("src/sidebar.rs"),
                 ],
                 tracked_count: 3,
+                ..WorkingFiles::default()
             },
             remotes: vec![panel_remote(
                 "origin",
@@ -15140,6 +15218,66 @@ pub(crate) mod tests {
 
     fn source_control() -> SourceControlModel {
         SourceControlModel::ready(main_key(), &snapshot())
+    }
+
+    #[test]
+    fn ignored_files_and_folders_are_muted_without_affecting_change_review() {
+        let mut snapshot = snapshot();
+        snapshot.files.ignored = vec![repo_path("build/nested/output.log"), repo_path("debug.log")];
+        snapshot.files.ignored_directories = vec![repo_path("build"), repo_path("empty")];
+        snapshot.files.paths.push(repo_path("build/tracked.rs"));
+        snapshot.files.paths.sort();
+        snapshot
+            .files
+            .ignored_directory_errors
+            .insert(repo_path("empty"), "Folder is not readable".into());
+        let original_changes = snapshot.status.entries.clone();
+        let model = SourceControlModel::ready(source_control().key, &snapshot);
+        assert_eq!(
+            model.ignored_directory_errors,
+            snapshot.files.ignored_directory_errors
+        );
+        for name in [
+            "build",
+            "build/nested",
+            "build/nested/output.log",
+            "debug.log",
+            "empty",
+        ] {
+            assert!(
+                model
+                    .files
+                    .iter()
+                    .find(|row| row.path == repo_path(name))
+                    .unwrap()
+                    .ignored,
+                "{name}"
+            );
+        }
+        assert!(
+            !model
+                .files
+                .iter()
+                .find(|row| row.path == repo_path("build/tracked.rs"))
+                .unwrap()
+                .ignored
+        );
+        assert!(
+            !model
+                .files
+                .iter()
+                .find(|row| row.path == repo_path("README.md"))
+                .unwrap()
+                .ignored
+        );
+        assert_eq!(
+            model
+                .groups
+                .iter()
+                .map(|group| group.rows.len())
+                .sum::<usize>(),
+            original_changes.len()
+        );
     }
 
     #[test]
