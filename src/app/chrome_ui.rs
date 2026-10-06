@@ -635,9 +635,6 @@ impl Cagents {
                     ring.push(Cow::Borrowed(NOTICES_DISMISS_ALL_ID));
                 }
                 ring.push(Cow::Borrowed(NOTICES_CLOSE_ID));
-                if self.retained_update_notice() && self.window_update_blocker().is_none() {
-                    ring.push(Cow::Borrowed(super::update_ui::REVIEW_UPDATE_ID));
-                }
                 ring.extend(
                     self.notices
                         .recent()
@@ -673,7 +670,8 @@ impl Cagents {
     /// Gives an open popup sole ownership of Tab, and hands it back to the
     /// shell's traversal once the popup is gone or a dialog has taken over.
     pub(super) fn sync_popup_keyboard_nav(&mut self) {
-        let owned = self.chrome_ui.popup.is_some() && !self.modal_is_open();
+        let owned = (self.chrome_ui.popup.is_some() || self.chat_picker_owns_keyboard())
+            && !self.modal_is_open();
         match (owned, self.chrome_ui.restore_keyboard_nav) {
             (true, None) => {
                 self.chrome_ui.restore_keyboard_nav = Some(self.core.keyboard_nav());
@@ -966,30 +964,28 @@ impl Cagents {
                             crate::ui_controls::symbolic_icon("internet-web-browser-symbolic")
                         }
                     };
-                    crate::ui_controls::popover_item(
-                        icon,
-                        label,
-                        match kind {
-                            NewTab::Thread => format!(
-                                "{description} · {}",
-                                workspace_widget::shortcut_chords(
-                                    workspace_widget::GlobalShortcut::NewThread,
-                                    &self.settings.keyboard_shortcuts
-                                )
-                            ),
-                            NewTab::Terminal => format!(
-                                "{description} · {}",
-                                workspace_widget::shortcut_chords(
-                                    workspace_widget::GlobalShortcut::NewTerminal,
-                                    &self.settings.keyboard_shortcuts
-                                )
-                            ),
-                            NewTab::Browser | NewTab::Resume => description.to_owned(),
-                        },
-                        Message::ChromeUi(Action::Launch(kind)),
+                    let tooltip = match kind {
+                        NewTab::Thread => workspace_widget::shortcut_tooltip(
+                            workspace_widget::GlobalShortcut::NewThread,
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                        NewTab::Terminal => workspace_widget::shortcut_tooltip(
+                            workspace_widget::GlobalShortcut::NewTerminal,
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                        NewTab::Browser | NewTab::Resume => description.to_owned(),
+                    };
+                    crate::interaction::tooltip(
+                        crate::ui_controls::popover_item(
+                            icon,
+                            label,
+                            description,
+                            Message::ChromeUi(Action::Launch(kind)),
+                        )
+                        .id(widget::Id::new(id))
+                        .name(format!("New {label} tab")),
+                        tooltip,
                     )
-                    .id(widget::Id::new(id))
-                    .name(format!("New {label} tab"))
                     .into()
                 });
             widget::column::with_children(vec![
@@ -1013,7 +1009,6 @@ impl Cagents {
 
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
-            || self.retained_update_notice()
             || self
                 .save_health
                 .as_ref()
@@ -1048,41 +1043,27 @@ impl Cagents {
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
-        let update_only = recorded_severity.is_none() && self.retained_update_notice();
         let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
-        let mut control = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon(if update_only {
-                "software-update-available-symbolic"
-            } else {
-                severity.icon()
-            }),
-            if update_only {
-                "Application update available"
-            } else {
-                match severity {
-                    NoticeSeverity::Success => "Application notices: success",
-                    NoticeSeverity::Warning => "Application notices",
-                    NoticeSeverity::Error => "Application errors",
-                }
+        let control = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon(severity.icon()),
+            match severity {
+                NoticeSeverity::Success => "Application notices: success",
+                NoticeSeverity::Warning => "Application notices",
+                NoticeSeverity::Error => "Application errors",
             },
             self.chrome_ui.popup == Some(Popup::Notices),
             !self.modal_is_open(),
             (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)),
         )
-        .id(widget::Id::new("chrome.notices"));
-        if !update_only {
-            control = control.icon_color(match severity {
-                NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
-                NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
-                NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
-            });
-        }
+        .id(widget::Id::new("chrome.notices"))
+        .icon_color(match severity {
+            NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
+            NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
+            NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
+        });
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
-                if let Some(update) = self.update_notice(true) {
-                    notices.push(update);
-                }
                 for entry in self.notices.recent() {
                     let body: Element<'_, Message> = if entry.repeats > 1 {
                         widget::column::with_children(vec![

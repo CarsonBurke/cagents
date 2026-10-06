@@ -916,6 +916,27 @@ fn settings_category_controls<'a>(
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(
+                    "Choose chat account",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.chat_account,
+                    SettingsField::ShortcutChatAccount,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Choose chat model",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.chat_model,
+                    SettingsField::ShortcutChatModel,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Choose chat permission mode",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.chat_permissions,
+                    SettingsField::ShortcutChatPermissions,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
                     "New thread",
                     "Leave blank to unbind.",
                     &draft.keyboard_shortcuts.new_native_thread,

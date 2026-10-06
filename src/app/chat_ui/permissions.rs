@@ -212,6 +212,10 @@ impl Runtime {
                         ])
                         .spacing(step::GAP_XS),
                     )
+                    .id(card_control_id(
+                        target.card,
+                        &format!("chat-permission-mode-{mode}"),
+                    ))
                     .width(Length::Fill)
                     .class(crate::ui_controls::control_style(
                         snapshot.permission_mode.as_ref() == Some(mode),

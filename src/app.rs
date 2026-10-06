@@ -2689,6 +2689,9 @@ pub enum SettingsField {
     ShortcutReviewPreviousChange,
     ShortcutCommandPalette,
     ShortcutNewThread,
+    ShortcutChatPermissions,
+    ShortcutChatModel,
+    ShortcutChatAccount,
     ShortcutToggleInspector,
     ShortcutOpenSettings,
     ShortcutMovePaneLeft,
@@ -2709,7 +2712,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 34] = [
+    const SHORTCUTS: [Self; 37] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2728,6 +2731,9 @@ impl SettingsField {
         Self::ShortcutReviewPreviousChange,
         Self::ShortcutCommandPalette,
         Self::ShortcutNewThread,
+        Self::ShortcutChatPermissions,
+        Self::ShortcutChatModel,
+        Self::ShortcutChatAccount,
         Self::ShortcutToggleInspector,
         Self::ShortcutOpenSettings,
         Self::ShortcutMovePaneLeft,
@@ -2787,6 +2793,9 @@ impl SettingsField {
             Self::ShortcutRenamePane => "Rename focused pane",
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
+            Self::ShortcutChatPermissions => "Choose chat permission mode",
+            Self::ShortcutChatModel => "Choose chat model",
+            Self::ShortcutChatAccount => "Choose chat account",
             Self::ShortcutToggleInspector => "Toggle inspector",
             Self::ShortcutOpenSettings => "Open settings",
             Self::ShortcutMovePaneLeft => "Move pane left",
@@ -2881,6 +2890,9 @@ impl SettingsField {
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
+            | Self::ShortcutChatPermissions
+            | Self::ShortcutChatModel
+            | Self::ShortcutChatAccount
             | Self::ShortcutToggleInspector
             | Self::ShortcutOpenSettings
             | Self::ShortcutMovePaneLeft
@@ -2935,6 +2947,9 @@ struct ShortcutDraft {
     rename_pane: String,
     command_palette: String,
     new_native_thread: String,
+    chat_permissions: String,
+    chat_model: String,
+    chat_account: String,
     toggle_inspector: String,
     open_settings: String,
     move_pane_left: String,
@@ -2974,6 +2989,9 @@ impl ShortcutDraft {
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
+            chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
+            chat_model: settings::format_chords(&shortcuts.chat_model),
+            chat_account: settings::format_chords(&shortcuts.chat_account),
             toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
             open_settings: settings::format_chords(&shortcuts.open_settings),
             move_pane_left: settings::format_chords(&shortcuts.move_pane_left),
@@ -3195,6 +3213,11 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.command_palette = value
             }
             SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_native_thread = value,
+            SettingsField::ShortcutChatPermissions => {
+                self.keyboard_shortcuts.chat_permissions = value
+            }
+            SettingsField::ShortcutChatModel => self.keyboard_shortcuts.chat_model = value,
+            SettingsField::ShortcutChatAccount => self.keyboard_shortcuts.chat_account = value,
             SettingsField::ShortcutToggleInspector => {
                 self.keyboard_shortcuts.toggle_inspector = value
             }
@@ -3286,6 +3309,18 @@ fn settings_update(
         }
         SettingsField::ShortcutCommandPalette => {
             next.keyboard_shortcuts.command_palette = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatAccount => {
+            next.keyboard_shortcuts.chat_account = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatModel => {
+            next.keyboard_shortcuts.chat_model = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatPermissions => {
+            next.keyboard_shortcuts.chat_permissions = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutNewThread => {
@@ -6278,6 +6313,7 @@ impl Cagents {
             {
                 workspace_widget::FocusedPane::Terminal
             }
+            Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
@@ -12262,7 +12298,6 @@ impl Application for Cagents {
             app.initialize_runtimes(),
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
-            app.update_update_ui(update_ui::Action::LoadDismissal),
             app.update_update_ui(update_ui::Action::Poll),
             app.load_accounts(),
         ];
@@ -14761,6 +14796,17 @@ impl Application for Cagents {
                 if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
                     return self.update_device(device_ui::Action::Menu(false));
                 }
+                // The model search field captures Escape to blur itself. Close
+                // its picker in the same press, while dialogs retain priority.
+                if is_escape_press(&event)
+                    && !self.workspace_inputs_blocked()
+                    && self.dismiss_chat_picker()
+                {
+                    return self.workspace.focused().map_or_else(Task::none, |card| {
+                        iced::widget::operation::focus(card_control_id(card, "chat-composer"))
+                            .map(cosmic::Action::App)
+                    });
+                }
                 if is_escape_press(&event) && !captured {
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
@@ -14795,9 +14841,6 @@ impl Application for Cagents {
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
-                    if self.dismiss_chat_picker() {
-                        return Task::none();
-                    }
                     if let Some(card) = self.focused_repository_card_with_find() {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
@@ -14833,6 +14876,9 @@ impl Application for Cagents {
                 // is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
+                }
+                if let Some(task) = self.chat_picker_key(&event) {
+                    return task;
                 }
                 if let Some(card) = self.workspace.focused()
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
@@ -15844,35 +15890,35 @@ impl Application for Cagents {
                 .unwrap_or_else(|| "Workspace".into());
             let action_buttons = || {
                 let buttons: Vec<Element<'_, Message>> = vec![
-                    widget::button::suggested(format!(
-                        "New thread · {}",
-                        workspace_widget::shortcut_chords(
+                    crate::interaction::tooltip(
+                        widget::button::suggested("New thread")
+                            .name("New thread")
+                            .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                                chrome_ui::NewTab::Thread,
+                            ))),
+                        workspace_widget::shortcut_tooltip(
                             workspace_widget::GlobalShortcut::NewThread,
-                            &self.settings.keyboard_shortcuts
-                        )
-                    ))
-                    .name("New thread")
-                    .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                        chrome_ui::NewTab::Thread,
-                    )))
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                    )
                     .into(),
                     widget::button::standard("Resume conversation")
                         .id(widget::Id::new("empty.resume-conversation"))
                         .on_press(Message::ResumeConversation(resume_ui::Action::Open))
                         .into(),
-                    widget::button::standard(format!(
-                        "New terminal · {}",
-                        workspace_widget::shortcut_chords(
+                    crate::interaction::tooltip(
+                        widget::button::standard("New terminal")
+                            .id(widget::Id::new("empty.new-terminal"))
+                            .name("New terminal")
+                            .leading_icon(crate::ui_controls::symbolic_icon(
+                                "utilities-terminal-symbolic",
+                            ))
+                            .on_press(Message::NewTerminal),
+                        workspace_widget::shortcut_tooltip(
                             workspace_widget::GlobalShortcut::NewTerminal,
-                            &self.settings.keyboard_shortcuts
-                        )
-                    ))
-                    .id(widget::Id::new("empty.new-terminal"))
-                    .name("New terminal")
-                    .leading_icon(crate::ui_controls::symbolic_icon(
-                        "utilities-terminal-symbolic",
-                    ))
-                    .on_press(Message::NewTerminal)
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                    )
                     .into(),
                     widget::button::standard(if cfg!(feature = "integrated-browser") {
                         "New browser"
@@ -16130,15 +16176,10 @@ impl Application for Cagents {
         let bar = self
             .status_bar()
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
-        let update = widget::container(
-            self.update_notice(false)
-                .unwrap_or_else(|| widget::Space::new().height(Length::Shrink).into()),
-        );
-        let surface: Element<'_, Message> =
-            widget::column::with_children(vec![update.into(), surface, bar])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+        let surface: Element<'_, Message> = widget::column::with_children(vec![surface, bar])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())

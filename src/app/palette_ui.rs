@@ -332,6 +332,9 @@ impl Cagents {
             return Task::none();
         }
         match command {
+            Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
+                self.open_chat_control(command)
+            }
             Command::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
             Command::RenamePane => self.workspace.focused().map_or_else(Task::none, |id| {
                 self.update_chrome(chrome_ui::Action::Rename(id))
@@ -509,6 +512,9 @@ impl SettingsField {
             Self::ShortcutReviewPreviousChange => Some(Command::ReviewPreviousChange),
             Self::ShortcutCommandPalette => Some(Command::CommandPalette),
             Self::ShortcutNewThread => Some(Command::NewThread),
+            Self::ShortcutChatPermissions => Some(Command::ChatPermissions),
+            Self::ShortcutChatModel => Some(Command::ChatModel),
+            Self::ShortcutChatAccount => Some(Command::ChatAccount),
             Self::ShortcutToggleInspector => Some(Command::ToggleInspector),
             Self::ShortcutOpenSettings => Some(Command::OpenSettings),
             Self::ShortcutMovePaneLeft => Some(Command::MovePaneLeft),
@@ -577,6 +583,9 @@ impl ShortcutDraft {
             ),
             (Command::CommandPalette, self.command_palette.as_str()),
             (Command::NewThread, self.new_native_thread.as_str()),
+            (Command::ChatPermissions, self.chat_permissions.as_str()),
+            (Command::ChatModel, self.chat_model.as_str()),
+            (Command::ChatAccount, self.chat_account.as_str()),
             (Command::ToggleInspector, self.toggle_inspector.as_str()),
             (Command::OpenSettings, self.open_settings.as_str()),
             (Command::MovePaneLeft, self.move_pane_left.as_str()),

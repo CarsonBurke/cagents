@@ -49,6 +49,9 @@ pub enum GlobalShortcut {
     RenamePane,
     CommandPalette,
     NewThread,
+    ChatAccount,
+    ChatModel,
+    ChatPermissions,
     ToggleInspector,
     OpenSettings,
     MovePaneLeft,
@@ -99,6 +102,8 @@ pub enum ShortcutScope {
     /// Only while a pull request pane has focus; a terminal or editor with
     /// focus receives the chord as ordinary input.
     Review,
+    /// Only in a native chat pane; other panes retain the configured keys.
+    Chat,
 }
 
 impl ShortcutScope {
@@ -109,6 +114,7 @@ impl ShortcutScope {
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::Review => focused == FocusedPane::Review,
+            Self::Chat => focused == FocusedPane::Chat,
         }
     }
 }
@@ -120,6 +126,8 @@ pub enum FocusedPane {
     Terminal,
     /// A pull request review pane.
     Review,
+    /// A native chat composer and transcript.
+    Chat,
     /// Any other pane, or none.
     #[default]
     Other,
@@ -141,6 +149,24 @@ pub struct ShortcutDescriptor {
 pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatPermissions,
+        label: "Choose chat permission mode",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatModel,
+        label: "Choose chat model",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ChatAccount,
+        label: "Choose chat account",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
     ShortcutDescriptor {
         action: GlobalShortcut::ToggleProjects,
         label: "Toggle Projects sidebar",
@@ -361,6 +387,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::RenamePane => &shortcuts.rename_pane,
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
+        GlobalShortcut::ChatPermissions => &shortcuts.chat_permissions,
+        GlobalShortcut::ChatModel => &shortcuts.chat_model,
+        GlobalShortcut::ChatAccount => &shortcuts.chat_account,
         GlobalShortcut::ToggleInspector => &shortcuts.toggle_inspector,
         GlobalShortcut::OpenSettings => &shortcuts.open_settings,
         GlobalShortcut::MovePaneLeft => &shortcuts.move_pane_left,
@@ -3756,6 +3785,64 @@ mod tests {
             workspace.focus_adjacent(direction).unwrap();
         }
         assert_eq!(workspace.focused(), Some(cards[0]));
+    }
+
+    #[test]
+    fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
+        use keyboard::key::Code;
+        let shortcuts = KeyboardShortcuts::default();
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for (key, code, action) in [
+            ("a", Code::KeyA, GlobalShortcut::ChatAccount),
+            ("m", Code::KeyM, GlobalShortcut::ChatModel),
+            ("o", Code::KeyO, GlobalShortcut::ChatPermissions),
+        ] {
+            for focused in [
+                FocusedPane::Terminal,
+                FocusedPane::Review,
+                FocusedPane::Other,
+                FocusedPane::Chat,
+            ] {
+                assert_eq!(
+                    global_shortcut(&key_press(key, code, modifiers, false), &shortcuts, focused),
+                    (focused == FocusedPane::Chat).then_some(action),
+                );
+                assert_eq!(
+                    is_global_shortcut_chord(
+                        &keyboard::Key::Character(key.into()),
+                        keyboard::key::Physical::Code(code),
+                        modifiers,
+                        &shortcuts,
+                        focused
+                    ),
+                    focused == FocusedPane::Chat,
+                );
+                assert_eq!(
+                    global_shortcut(&key_press(key, code, modifiers, true), &shortcuts, focused),
+                    None
+                );
+            }
+        }
+        let customized = KeyboardShortcuts {
+            chat_model: vec!["Alt+M".into()],
+            ..shortcuts
+        };
+        assert_eq!(
+            global_shortcut(
+                &key_press("m", Code::KeyM, keyboard::Modifiers::ALT, false),
+                &customized,
+                FocusedPane::Chat
+            ),
+            Some(GlobalShortcut::ChatModel)
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("m", Code::KeyM, modifiers, false),
+                &customized,
+                FocusedPane::Chat
+            ),
+            None
+        );
     }
 
     #[test]
