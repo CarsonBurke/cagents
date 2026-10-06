@@ -5,7 +5,7 @@ use crate::device_service::{GitOperation, Operation, Reply};
 use cosmic::widget::text_editor;
 use std::collections::BTreeMap;
 
-fn file_editor_id() -> widget::Id {
+pub(super) fn file_editor_id() -> widget::Id {
     widget::Id::new("device-file-editor")
 }
 
@@ -1315,7 +1315,7 @@ impl State {
             .collect();
     }
 
-    fn dirty(&self) -> bool {
+    pub(super) fn dirty(&self) -> bool {
         self.file.is_some() && self.content.text() != self.original
     }
     pub(super) fn busy(&self) -> bool {
@@ -1809,6 +1809,40 @@ mod tests {
         assert_eq!(app.device_ui.output, "Git status");
         assert_eq!(app.device_ui.worktree_output, "Worktrees");
         assert!(app.device_ui.pending.is_none());
+    }
+
+    #[test]
+    fn window_close_preserves_device_edits_until_explicit_resolution() {
+        let mut app = loaded_file();
+        let window = cosmic::iced::window::Id::unique();
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_none());
+        assert_eq!(app.transient_work_close, Some(window));
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+        drop(app.update(Message::ReturnToDeviceBeforeClose));
+        assert!(app.transient_work_close.is_none());
+        assert!(app.device_ui.open);
+        drop(app.update_device(Action::Save));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(
+            app.exit.is_none(),
+            "an in-flight save must keep the UI alive"
+        );
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Err("write failed".into()),
+        }));
+        drop(app.update(Message::CancelTransientWorkClose));
+        assert!(
+            app.device_ui.dirty(),
+            "failed save must not clear the dirty buffer"
+        );
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_none());
+        drop(app.update(Message::CancelTransientWorkClose));
+        drop(app.update_device(Action::DiscardChanges));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_some());
     }
 
     #[test]
