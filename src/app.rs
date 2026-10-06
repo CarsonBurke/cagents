@@ -13281,6 +13281,10 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
+                if matches!(&action, SidebarAction::FilesPage { key, .. } if !self.source_control_is_bound(key))
+                {
+                    return Task::none();
+                }
                 let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
                     let Some(source) = &self.sidebar_model.source_control else {
                         return Task::none();
@@ -13528,6 +13532,12 @@ impl Application for Cagents {
                     }
                     SidebarAction::DeleteChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
+                    }
+                    SidebarAction::FilesPage { key, .. } => {
+                        iced::widget::scrollable::scroll_to(
+                            sidebar::files_scroll_id(&key),
+                            iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(0.0) },
+                        ).map(cosmic::Action::App)
                     }
                     SidebarAction::ToggleFilesFilter { key } => {
                         if self.source_control_is_bound(&key) && self.sidebar_state.files_filter_open() {
@@ -22208,6 +22218,99 @@ mod tests {
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
         assert_eq!(notice(&app), None);
+    }
+
+    #[test]
+    fn files_page_turn_resets_scroll_and_rejects_departed_worktrees() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let task = app.update(Message::Sidebar(SidebarAction::FilesPage {
+            key: key.clone(),
+            page: 1,
+        }));
+        let renderer = headless_renderer();
+        let mut element: Element<'_, Message> =
+            widget::scrollable(widget::Space::new().height(1000))
+                .id(sidebar::files_scroll_id(&key))
+                .height(200)
+                .into();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(300.0, 200.0)),
+        );
+        let mut scroll = operation::scrollable::scroll_to(
+            sidebar::files_scroll_id(&key),
+            operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(500.0),
+            },
+        );
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut scroll);
+        #[derive(Default)]
+        struct Offset(f32);
+        impl Operation for Offset {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = translation.y;
+            }
+        }
+        let mut before = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        assert_eq!(before.0, 500.0);
+        let mut stream =
+            iced::runtime::task::into_stream(task).expect("page change issues widget operation");
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        while let Some(action) = executor.block_on(stream.next()) {
+            if let iced::runtime::Action::Widget(mut operation) = action {
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation,
+                );
+            }
+        }
+        let mut after = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_eq!(after.0, 0.0, "new page starts at its first row");
+        let departed = ActiveWorktreeKey {
+            worktree_id: WorktreeId::new(),
+            ..key
+        };
+        assert!(
+            iced::runtime::task::into_stream(app.update(Message::Sidebar(
+                SidebarAction::FilesPage {
+                    key: departed,
+                    page: 9
+                }
+            )))
+            .is_none()
+        );
     }
 
     /// Who holds the keyboard once a task's widget operations have run.

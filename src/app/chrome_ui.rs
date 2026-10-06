@@ -32,6 +32,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blank_rename_keeps_the_draft_open_until_it_is_corrected() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        let original = app.card_state(id).unwrap().title.clone();
+        for draft in ["", "   ", "\t\n"] {
+            for target in [
+                RenameTarget::Pane(id),
+                RenameTarget::Channel(crate::model::ChannelId::new()),
+            ] {
+                app.chrome_ui.rename = Some((target, draft.into()));
+                drop(app.update_chrome(Action::RenameSubmit));
+                assert_eq!(app.chrome_ui.rename.as_ref().unwrap().1, draft);
+                assert_eq!(app.card_state(id).unwrap().title, original);
+            }
+        }
+        app.chrome_ui.rename = Some((RenameTarget::Pane(id), original));
+        drop(app.update_chrome(Action::RenameChanged(" New name ".into())));
+        drop(app.update_chrome(Action::RenameSubmit));
+        assert!(app.chrome_ui.rename.is_none());
+        assert_eq!(app.card_state(id).unwrap().title, "New name");
+    }
+
+    #[test]
     fn sidebar_toggle_keeps_the_users_choice_across_window_resizes() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         for width in [900.0, 1199.0, 1200.0, 1600.0] {
@@ -756,12 +779,14 @@ impl Cagents {
                 Task::none()
             }
             Action::RenameSubmit => {
-                let Some((target, draft)) = self.chrome_ui.rename.take() else {
+                let Some((target, draft)) = self.chrome_ui.rename.as_ref() else {
                     return Task::none();
                 };
                 let Some(title) = normalize_card_name(&draft) else {
                     return Task::none();
                 };
+                let target = *target;
+                self.chrome_ui.rename = None;
                 let id = match target {
                     RenameTarget::Pane(id) => id,
                     RenameTarget::Channel(id) => {
@@ -1473,17 +1498,32 @@ impl Cagents {
                         RenameTarget::Channel(_) => "Rename channel",
                     })
                     .into(),
-                    widget::text_input("Pane name", draft)
-                        .id(widget::Id::new("chrome.rename.input"))
-                        .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
-                        .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
-                        .into(),
+                    widget::text_input(
+                        match target {
+                            RenameTarget::Pane(_) => "Pane name",
+                            RenameTarget::Channel(_) => "Channel name",
+                        },
+                        draft,
+                    )
+                    .id(widget::Id::new("chrome.rename.input"))
+                    .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
+                    .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
+                    .into(),
+                    design::caption(if normalize_card_name(draft).is_none() {
+                        "Name cannot be blank."
+                    } else {
+                        ""
+                    })
+                    .into(),
                     widget::row::with_children(vec![
                         widget::button::standard("Cancel")
                             .on_press(Message::ChromeUi(Action::RenameCancel))
                             .into(),
                         widget::button::suggested("Rename")
-                            .on_press(Message::ChromeUi(Action::RenameSubmit))
+                            .on_press_maybe(
+                                normalize_card_name(draft)
+                                    .map(|_| Message::ChromeUi(Action::RenameSubmit)),
+                            )
                             .into(),
                     ])
                     .spacing(design::GRID_UNIT)
