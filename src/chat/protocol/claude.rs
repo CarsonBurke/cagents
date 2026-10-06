@@ -477,7 +477,7 @@ impl Claude {
         }
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
-        for attachment in attachments {
+        for attachment in &attachments {
             let block = attachment_block(&self.cwd, &attachment.path)?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
@@ -519,7 +519,11 @@ impl Claude {
         };
         self.message(&frame, &mut step)?;
         if self.async_input {
-            let preview = chat::QueuedMessage::new(id.clone(), text);
+            let mut preview = chat::QueuedMessage::new(id.clone(), text);
+            preview.attachments = attachments;
+            if mode == PromptMode::Steer {
+                preview.delivery = chat::QueueDelivery::NextStep;
+            }
             let deferred = if mode != PromptMode::Send {
                 let mut items = Vec::new();
                 for event in std::mem::take(&mut step.events) {
@@ -1453,8 +1457,7 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
-            Command::UpdateQueued { .. }
-            | Command::StartQueued { .. }
+            Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches
             | Command::Branch { .. } => Err("This operation is not supported by Claude".into()),
@@ -1700,6 +1703,14 @@ impl Adapter for Claude {
                     }
                 }
                 if string(response, "subtype") == "error" {
+                    if string(&request, "subtype") == "cancel_async_message"
+                        && let Some(id) = request["message_uuid"].as_str()
+                    {
+                        step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                            id: id.into(),
+                            removed: false,
+                        }));
+                    }
                     step.events.push(Event::Error {
                         message: format!(
                             "Claude {}: {}",
@@ -2002,6 +2013,10 @@ impl Adapter for Claude {
                                 // A delayed replay acknowledgement must not
                                 // resurrect a message the provider discarded.
                                 self.remember_retracted(id);
+                                step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                                    id: id.into(),
+                                    removed: true,
+                                }));
                             }
                         }
                     }
@@ -4677,6 +4692,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["next one", "next two", "later one", "later two"]
         );
+        // Each entry says when it is delivered, and can return to a composer.
+        assert_eq!(
+            adapter
+                .queued
+                .iter()
+                .map(|message| (message.delivery, message.editable))
+                .collect::<Vec<_>>(),
+            [
+                (chat::QueueDelivery::NextStep, true),
+                (chat::QueueDelivery::NextStep, true),
+                (chat::QueueDelivery::NextTurn, true),
+                (chat::QueueDelivery::NextTurn, true),
+            ]
+        );
     }
 
     #[test]
@@ -4729,7 +4758,9 @@ mod tests {
         let submitted = adapter
             .send_prompt(
                 text.clone(),
-                vec![Attachment { path: attachment }],
+                vec![Attachment {
+                    path: attachment.clone(),
+                }],
                 PromptMode::Queue,
             )
             .unwrap();
@@ -4739,12 +4770,15 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Item(_)))
         );
-        assert!(
-            submitted
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 1))
-        );
+        // The preview names its files, and a truncated one is not offered
+        // back to a composer as though it were the whole message.
+        assert!(submitted.events.iter().any(|event| matches!(
+            event,
+            Event::QueueChanged(messages)
+                if messages.len() == 1
+                    && !messages[0].editable
+                    && messages[0].attachments == [Attachment { path: attachment.clone() }]
+        )));
         let frame = submitted.writes[0].clone();
         let id = frame["uuid"].clone();
         let echo = adapter.receive(frame.clone()).unwrap();
@@ -4871,6 +4905,12 @@ mod tests {
             );
             assert!(adapter.queued.is_empty());
             assert!(adapter.submissions.is_empty());
+            // A client that asked for the message back is told it was let go
+            // of, which a message merely leaving the queue does not say.
+            assert!(removed.events.iter().any(|event| matches!(
+                event,
+                Event::QueueRemoval(removal) if removal.removed && id == removal.id.as_str()
+            )));
             let replay = adapter.receive(submitted.writes[0].clone()).unwrap();
             assert!(
                 !replay

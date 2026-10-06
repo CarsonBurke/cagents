@@ -537,13 +537,35 @@ the conversation available and explains the refusal without starting a writer.
 ### Messages, branches, and child agents
 
 **Steer** delivers a correction during the current turn; **Queue** schedules a
-later turn. Claude 2.1.286 and newer receive these messages immediately through
-their async protocol: steering uses the next delivery boundary, and queued
-messages wait for a later turn. Older Claude versions retain the local follow-up
-behavior. Queued previews come from provider acknowledgments. Claude supports
-removing a confirmed queued message; Codex additionally supports editing plain
-text entries and starting an entry next. Attachments are preserved and cannot
-be replaced through the plain text editor.
+later turn. While an agent works, the send key (Enter, or `Ctrl+Enter` when
+Enter is set to break the line) steers where the provider can and queues
+otherwise, and `Ctrl+Shift+Enter` sends the other way. Claude 2.1.286
+and newer receive these messages immediately through their async protocol:
+steering uses the next delivery boundary, and queued messages wait for a later
+turn. A provider without a queue of its own has its follow-ups held by the
+chat and sent together as one prompt when the turn ends.
+
+Everything waiting is listed in the queue above the composer, one row per
+message: a marker for when it is delivered (the agent's next step, or the end
+of the turn), the start of its text, and how many files it carries. Each row
+can be copied, removed, or taken back; Codex can also send an entry next,
+ahead of the rest.
+
+Revising a waiting message means taking it back. The message leaves the queue
+and returns to the composer with its attachments, ahead of anything typed
+since, so the agent cannot start on a message that is being rewritten. `Up`
+in an empty composer takes back the newest waiting message, and recalls sent
+messages once nothing is waiting; `Alt+Up` takes one back into a draft that
+is already under way. The queue names whichever key applies. Sent again, the
+message goes to the end of the queue, and the send key delivers it the way
+it was queued before.
+
+A message the provider holds returns only once the provider confirms it was
+removed, and its row shows a spinner until then. If the agent started on it
+first, it stays the turn it became, the composer is left alone, and the chat
+says so. OMP has no way to remove a queued message, and an entry longer than
+the 16 KiB preview or holding input the composer cannot represent can be
+removed but not taken back.
 
 The branch control opens a separate Codex conversation, either from the whole
 thread or after a completed turn. OMP branches before the selected user message
@@ -690,13 +712,15 @@ Usage and cost come from provider reports.
 - With chat focused, `Ctrl+F` finds matching transcript turns, including tool
   output. Enter visits the next match, Shift+Enter the previous one, and
   Escape closes find. Matching prose is highlighted and matching tools expand.
-- While Claude is working, **Queue** holds one follow-up for the next turn.
-  **Undo** returns it to the composer. Escape in the composer interrupts active
+- While an agent is working, messages you send wait in the queue above the
+  composer. `Up` in an empty composer (or `Alt+Up` with a draft) takes the
+  newest one back to edit. Escape in the composer interrupts active
   work when no picker is open. `Ctrl+End` returns to the latest messages;
   **New activity** indicates messages received while reading earlier history.
 - Type `@` to search tracked files by name. Attachment chips show the file name,
   offer removal, and reveal the full path on hover. Up on the first line
-  recalls earlier prompts, including restored conversation history. Down past
+  recalls earlier prompts, including restored conversation history, once
+  no queued message is waiting to be taken back. Down past
   the newest recalled prompt restores the unsent draft and its cursor position.
 - Claude permission controls describe each available mode and follow changes
   reported by the provider. Finished reasoning collapses into a summary that

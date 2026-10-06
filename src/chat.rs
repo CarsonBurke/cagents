@@ -784,6 +784,11 @@ pub struct Snapshot {
     pub ready: bool,
     #[serde(default)]
     pub queued_messages: Vec<QueuedMessage>,
+    /// How the provider answered recent requests to remove a queued message,
+    /// oldest first. A message leaving `queued_messages` does not say whether
+    /// it was removed or delivered; this does.
+    #[serde(default)]
+    pub queue_removals: Vec<QueueRemoval>,
     /// A provider history request remains in flight after its command was
     /// acknowledged. Cached pages do not enter this state.
     #[serde(default)]
@@ -796,13 +801,43 @@ pub struct Snapshot {
     pub forked: Option<String>,
 }
 
+/// When a provider takes a message it is holding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueDelivery {
+    /// At the provider's next delivery boundary inside the running turn.
+    NextStep,
+    /// As a turn of its own, once the running one has ended.
+    #[default]
+    NextTurn,
+}
+
+/// The provider's answer to a request to remove a queued message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRemoval {
+    pub id: String,
+    /// Whether the message left the queue without being delivered.
+    pub removed: bool,
+}
+
+impl QueueRemoval {
+    /// Answers kept for a client that reads snapshots rather than events.
+    pub const LIMIT: usize = 32;
+}
+
 /// A bounded preview of pending provider input, independent of history pages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: String,
     pub text: String,
+    /// Whether `text` and `attachments` are the whole message, so that taking
+    /// it back puts in the composer exactly what was queued.
     #[serde(default)]
     pub editable: bool,
+    #[serde(default)]
+    pub delivery: QueueDelivery,
+    /// The files queued with the message, where the provider names them.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -833,14 +868,17 @@ impl QueuedMessage {
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
         const PREVIEW_BYTES: usize = 16 * 1024;
-        if text.len() > PREVIEW_BYTES {
+        let whole = text.len() <= PREVIEW_BYTES;
+        if !whole {
             text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {
             id,
             text,
-            editable: false,
+            editable: whole,
+            delivery: QueueDelivery::default(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -957,10 +995,6 @@ pub enum Command {
     /// Mutate an authoritative provider queue entry, never a transcript item.
     RemoveQueued {
         id: String,
-    },
-    UpdateQueued {
-        id: String,
-        text: String,
     },
     StartQueued {
         id: String,
@@ -1437,8 +1471,6 @@ pub struct Capabilities {
     #[serde(default)]
     pub queue_remove: bool,
     #[serde(default)]
-    pub queue_edit: bool,
-    #[serde(default)]
     pub queue_start: bool,
     #[serde(default)]
     pub interrupt_modes: Vec<String>,
@@ -1625,6 +1657,7 @@ pub enum Event {
         event: crate::agent_execution::ProviderEvent,
     },
     QueueChanged(Vec<QueuedMessage>),
+    QueueRemoval(QueueRemoval),
     /// Published until the provider has answered the asynchronous history
     /// request, independently of the command acknowledgement.
     HistoryLoading(bool),
