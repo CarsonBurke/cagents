@@ -3,6 +3,7 @@
 use super::*;
 use crate::device_service::{GitOperation, Operation, Reply};
 use cosmic::widget::text_editor;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -71,9 +72,11 @@ pub(super) struct State {
     pending: Option<Operation>,
     notice: Option<String>,
     pub devices: Vec<String>,
+    device_hosts: BTreeMap<String, String>,
 }
 impl Default for State {
     fn default() -> Self {
+        let devices = crate::device::list().unwrap_or_default();
         Self {
             open: false,
             menu_open: false,
@@ -98,12 +101,11 @@ impl Default for State {
             pending: None,
             notice: None,
             devices: std::iter::once("local".to_owned())
-                .chain(
-                    crate::device::list()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|device| device.name),
-                )
+                .chain(devices.iter().map(|device| device.name.clone()))
+                .collect(),
+            device_hosts: devices
+                .into_iter()
+                .map(|device| (device.name, device.host))
                 .collect(),
         }
     }
@@ -233,11 +235,10 @@ impl Cagents {
             self.device_ui.menu_open =
                 open && self.settings.show_status_bar && !self.modal_is_open();
             if self.device_ui.menu_open {
+                self.dismiss_chat_picker();
                 match crate::device::list() {
                     Ok(devices) => {
-                        self.device_ui.devices = std::iter::once("local".into())
-                            .chain(devices.into_iter().map(|device| device.name))
-                            .collect()
+                        self.device_ui.set_devices(devices);
                     }
                     Err(error) => self.status = Some(TransientNotice::warning(error.to_string())),
                 }
@@ -336,14 +337,8 @@ impl Cagents {
                 self.device_ui.busy = false;
                 match result {
                     Ok(()) => {
-                        self.device_ui.devices = std::iter::once("local".into())
-                            .chain(
-                                crate::device::list()
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|device| device.name),
-                            )
-                            .collect();
+                        self.device_ui
+                            .set_devices(crate::device::list().unwrap_or_default());
                         self.device_ui.open = false;
                         if let Some(index) = self
                             .device_ui
@@ -602,8 +597,23 @@ impl Cagents {
         crate::ui_controls::popover(
             anchor,
             open.then(|| {
-                let mut rows: Vec<Element<'_, Message>> =
-                    vec![widget::text::title4("Devices").into()];
+                let enabled = !self.device_ui.busy;
+                let mut rows: Vec<Element<'_, Message>> = vec![
+                    widget::row::with_children(vec![
+                        design::heading("Devices").width(Length::Fill).into(),
+                        crate::ui_controls::icon_control(
+                            crate::ui_controls::symbolic_icon("list-add-symbolic"),
+                            "Connect to a device",
+                            false,
+                            enabled,
+                            Some(Message::Device(Action::Configure)),
+                        )
+                        .into(),
+                    ])
+                    .align_y(Alignment::Center)
+                    .padding(Padding::from([0.0, design::GRID_UNIT * 2.0]))
+                    .into(),
+                ];
                 let mut choices = Vec::new();
                 for (index, name) in self.device_ui.devices.iter().enumerate() {
                     let label = if name == "local" {
@@ -611,20 +621,57 @@ impl Cagents {
                     } else {
                         name.as_str()
                     };
-                    let switch = widget::button::text(label)
-                        .class(crate::ui_controls::control_style(name == selected, None))
+                    let current = name == selected;
+                    let detail = if name == "local" {
+                        "Local workspace"
+                    } else {
+                        self.device_ui
+                            .device_hosts
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or("SSH device")
+                    };
+                    let mut contents: Vec<Element<'_, Message>> = vec![
+                        widget::column::with_children(vec![
+                            design::body(label).into(),
+                            design::caption(detail).into(),
+                        ])
                         .width(Length::Fill)
-                        .on_press(Message::Device(Action::Device(index)));
-                    let open = widget::button::custom(
-                        widget::icon(crate::ui_controls::symbolic_icon("view-pop-out-symbolic"))
-                            .size(16),
+                        .into(),
+                    ];
+                    if current {
+                        contents.push(design::caption("Current").into());
+                    }
+                    let switch = widget::button::custom(
+                        widget::row::with_children(contents)
+                            .spacing(design::GRID_UNIT * 2.0)
+                            .align_y(Alignment::Center),
                     )
-                    .name(format!("Open {label} in another window"))
-                    .on_press(Message::Device(Action::OpenDeviceWindow(index)));
+                    .name(format!("Switch to {label}"))
+                    .selected(current)
+                    .class(crate::ui_controls::control_style(current, None))
+                    .width(Length::Fill)
+                    .padding(design::GRID_UNIT * 2.0)
+                    .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
+                    let open = crate::ui_controls::icon_control(
+                        crate::ui_controls::symbolic_icon("view-pop-out-symbolic"),
+                        format!("Open {label} in another window"),
+                        false,
+                        enabled,
+                        Some(Message::Device(Action::OpenDeviceWindow(index))),
+                    );
                     choices.push(
                         widget::row::with_children(vec![
-                            switch.into(),
-                            crate::interaction::tooltip(open, "Open in another window").into(),
+                            crate::interaction::tooltip(
+                                crate::interaction::hover(switch),
+                                if current {
+                                    format!("{label} is open in this window")
+                                } else {
+                                    format!("Switch this window to {label}")
+                                },
+                            )
+                            .into(),
+                            open.into(),
                         ])
                         .align_y(Alignment::Center)
                         .spacing(design::GRID_UNIT)
@@ -645,24 +692,29 @@ impl Cagents {
                     .max_height(280)
                     .into(),
                 );
-                rows.push(design::horizontal_rule());
                 if crate::device::is_remote() {
+                    rows.push(design::horizontal_rule());
                     rows.push(
-                        widget::button::text("Browse device files…")
-                            .width(Length::Fill)
-                            .on_press(Message::Device(Action::Open))
-                            .into(),
+                        widget::button::custom(
+                            widget::row::with_children(vec![
+                                widget::icon(crate::ui_controls::symbolic_icon("folder-symbolic"))
+                                    .size(design::ROW_ICON_SIZE)
+                                    .into(),
+                                design::body("Browse device files").into(),
+                            ])
+                            .spacing(design::GRID_UNIT * 2.0)
+                            .align_y(Alignment::Center),
+                        )
+                        .name("Browse device files")
+                        .class(crate::ui_controls::control_style(false, None))
+                        .width(Length::Fill)
+                        .padding(design::GRID_UNIT * 2.0)
+                        .on_press_maybe(enabled.then_some(Message::Device(Action::Open)))
+                        .into(),
                     );
                 }
-                rows.push(
-                    widget::button::text("Connect to a device…")
-                        .width(Length::Fill)
-                        .on_press(Message::Device(Action::Configure))
-                        .into(),
-                );
                 widget::container(widget::column::with_children(rows).spacing(design::GRID_UNIT))
-                    .width(260)
-                    .padding(design::GRID_UNIT * 2.0)
+                    .width(304)
                     .into()
             }),
             widget::popover::Position::Top,
@@ -870,6 +922,16 @@ impl Cagents {
 }
 
 impl State {
+    fn set_devices(&mut self, devices: Vec<crate::device::Device>) {
+        self.devices = std::iter::once("local".into())
+            .chain(devices.iter().map(|device| device.name.clone()))
+            .collect();
+        self.device_hosts = devices
+            .into_iter()
+            .map(|device| (device.name, device.host))
+            .collect();
+    }
+
     fn dirty(&self) -> bool {
         self.file.is_some() && self.content.text() != self.original
     }
@@ -881,6 +943,33 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Provider;
+
+    #[test]
+    fn devices_menu_and_keyboard_chat_picker_transfer_keyboard_ownership() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.show_status_bar = true;
+        app.core.set_keyboard_nav(true);
+        drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/unused"))));
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::ChatPermissions,
+        )));
+        assert!(app.chat_picker_owns_keyboard());
+        assert!(!app.core.keyboard_nav());
+        drop(app.update(Message::Device(Action::Menu(true))));
+        assert!(app.device_ui.menu_open);
+        assert!(!app.chat_picker_owns_keyboard());
+        assert!(
+            app.core.keyboard_nav(),
+            "Devices retains ordinary Tab traversal"
+        );
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::ChatPermissions,
+        )));
+        assert!(!app.device_ui.menu_open);
+        assert!(app.chat_picker_owns_keyboard());
+        assert!(!app.core.keyboard_nav());
+    }
 
     #[test]
     fn remote_row_navigation_and_metadata_keep_daemon_paths() {

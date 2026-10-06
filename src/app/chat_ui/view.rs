@@ -710,6 +710,7 @@ impl Cagents {
                 let view = runtime.view(
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
+                    &self.settings.keyboard_shortcuts,
                     self.workspace.viewport_width() * self.settings.chat_content_fraction,
                     place,
                     !self.workspace_inputs_blocked(),
@@ -790,6 +791,7 @@ impl Runtime {
         &'a self,
         transitioning: bool,
         enter_sends: bool,
+        shortcuts: &crate::settings::KeyboardShortcuts,
         content_width: f32,
         place: Place,
         accepting_drops: bool,
@@ -1746,7 +1748,7 @@ impl Runtime {
                 .into(),
             );
         }
-        status.extend(self.session_controls(transitioning, accounts, offers));
+        status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
@@ -1973,12 +1975,13 @@ impl Runtime {
         transitioning: bool,
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
+        shortcuts: &crate::settings::KeyboardShortcuts,
     ) -> Vec<Element<'a, Message>> {
         let target = self.target;
         let snapshot = &self.snapshot;
         let mut controls: Vec<Element<'a, Message>> = Vec::new();
         if let Some(accounts) = accounts {
-            controls.push(self.account_picker(accounts, transitioning));
+            controls.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
@@ -2003,7 +2006,7 @@ impl Runtime {
             if transitioning {
                 controls.push(design::caption(label).into());
             } else {
-                controls.push(self.model_picker(label, offers));
+                controls.push(self.model_picker(label, offers, shortcuts));
             }
         }
         if snapshot.capabilities.reasoning_selection
@@ -2099,7 +2102,13 @@ impl Runtime {
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::PermissionPicker(target, !open)));
-                controls.push(anchor.into());
+                controls.push(crate::interaction::tooltip(
+                    anchor,
+                    crate::workspace_widget::shortcut_tooltip(
+                        crate::workspace_widget::GlobalShortcut::ChatPermissions,
+                        shortcuts,
+                    ),
+                ));
             }
         }
         controls
@@ -2111,6 +2120,7 @@ impl Runtime {
         &'a self,
         accounts: ChatAccounts,
         transitioning: bool,
+        shortcuts: &crate::settings::KeyboardShortcuts,
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.account_picker && !transitioning;
@@ -2163,12 +2173,20 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::AccountPicker(target, !open)));
+        let anchor = crate::interaction::tooltip(
+            anchor,
+            crate::workspace_widget::shortcut_tooltip(
+                crate::workspace_widget::GlobalShortcut::ChatAccount,
+                shortcuts,
+            ),
+        );
         let choices = open.then(|| {
             widget::column::with_children(
                 accounts
                     .choices
                     .into_iter()
-                    .map(|choice| {
+                    .enumerate()
+                    .map(|(index, choice)| {
                         let mut row: Vec<Element<'a, Message>> = Vec::new();
                         match choice.used {
                             Some(used) => row.push(crate::ui_controls::budget_radial(used)),
@@ -2201,6 +2219,10 @@ impl Runtime {
                                 .align_y(Alignment::Center),
                         )
                         .name(choice.label)
+                        .id(card_control_id(
+                            target.card,
+                            &format!("chat-account-choice-{index}"),
+                        ))
                         .selected(choice.selected)
                         .class(crate::ui_controls::control_style(choice.selected, None))
                         .padding([step::GAP_XS, step::GAP_S])
@@ -2248,6 +2270,7 @@ impl Runtime {
         &'a self,
         label: Cow<'a, str>,
         offers: Vec<Offer<'a>>,
+        shortcuts: &crate::settings::KeyboardShortcuts,
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
@@ -2272,6 +2295,13 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
+        let anchor = crate::interaction::tooltip(
+            anchor,
+            crate::workspace_widget::shortcut_tooltip(
+                crate::workspace_widget::GlobalShortcut::ChatModel,
+                shortcuts,
+            ),
+        );
         crate::ui_controls::popover(
             anchor,
             self.model_search(offers),

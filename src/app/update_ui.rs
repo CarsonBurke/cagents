@@ -1,9 +1,6 @@
 use super::*;
 use crate::update::{UpdateJob, UpdatePhase, UpdateState};
 
-/// The update notice's "Review update" control, for keyboard focus.
-pub(super) const REVIEW_UPDATE_ID: &str = "update.review";
-
 #[derive(Default)]
 pub(super) struct State {
     result: Option<UpdateState>,
@@ -19,8 +16,6 @@ pub(super) struct State {
     restarting: bool,
     pub(super) confirmation: Option<crate::update::UpdateConfirmation>,
     submitted_confirmation: Option<String>,
-    dismissed: Option<String>,
-    dismissal_loaded: bool,
     /// When a check last reached the release server.
     last_checked: Option<std::time::SystemTime>,
     /// Background checks that failed in a row, which spaces out the next.
@@ -97,10 +92,6 @@ pub(super) struct UpdateSummary {
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    LoadDismissal,
-    DismissalLoaded(Result<Option<String>, String>),
-    DismissNotice(String),
-    DismissalSaved(Result<(), String>),
     /// A background check, which stays quiet when it cannot reach the
     /// release server and retries with backoff.
     Check,
@@ -288,85 +279,6 @@ impl Cagents {
         }
     }
 
-    fn available_update_notice(&self) -> Option<(String, String, Action)> {
-        if !self.update_ui.dismissal_loaded
-            || self.update_ui.updating()
-            || self.update_ui.restarting
-        {
-            return None;
-        }
-        if let Some(installed) = &self.update_ui.superseded {
-            return Some((
-                format!("installed:{}", installed.display()),
-                "An installed update is ready to finish.".into(),
-                Action::Restart,
-            ));
-        }
-        match &self.update_ui.result {
-            Some(UpdateState::Available { release }) => Some((
-                release.notice_identity(),
-                format!("cagents {} is available.", release.version),
-                Action::Apply,
-            )),
-            _ => None,
-        }
-    }
-
-    pub(super) fn retained_update_notice(&self) -> bool {
-        self.available_update_notice()
-            .is_some_and(|(identity, _, _)| self.update_ui.dismissed.as_ref() == Some(&identity))
-    }
-
-    pub(super) fn update_notice(&self, retained: bool) -> Option<Element<'_, Message>> {
-        let (identity, message, action) = self.available_update_notice()?;
-        if (self.update_ui.dismissed.as_ref() == Some(&identity)) != retained {
-            return None;
-        }
-        let blocker = self.window_update_blocker();
-        let mut description = vec![widget::text::body(message).into()];
-        if let Some(reason) = blocker {
-            description.push(design::caption(reason).into());
-        }
-        let mut controls = vec![
-            widget::column::with_children(description)
-                .width(Length::Fill)
-                .into(),
-        ];
-        // An installed build waiting for a restart is already chosen; notes
-        // belong to a release still being decided on.
-        if let (Action::Apply, Some(UpdateState::Available { release })) =
-            (&action, &self.update_ui.result)
-        {
-            controls.push(release_notes_button(&release.url));
-        }
-        controls.extend([widget::button::standard("Review update")
-            .id(widget::Id::new(REVIEW_UPDATE_ID))
-            .on_press_maybe((blocker.is_none()).then_some(Message::UpdateUi(action)))
-            .into()]);
-        if !retained {
-            controls.push(
-                crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("window-close-symbolic"),
-                    "Keep this update in application notices",
-                    false,
-                    !self.modal_is_open(),
-                    Some(Message::UpdateUi(Action::DismissNotice(identity))),
-                )
-                .into(),
-            );
-        }
-        Some(
-            widget::container(
-                widget::row::with_children(controls)
-                    .align_y(Alignment::Center)
-                    .spacing(8),
-            )
-            .padding([8, 12])
-            .width(Length::Fill)
-            .into(),
-        )
-    }
-
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
         if self.other_modal_is_open()
             || self.has_active_worktree_operations()
@@ -509,7 +421,7 @@ impl Cagents {
             crate::ui_controls::icon_control(
                 crate::ui_controls::symbolic_icon(icon),
                 label,
-                false,
+                true,
                 enabled,
                 enabled.then_some(action).flatten(),
             )
@@ -612,62 +524,6 @@ impl Cagents {
 
     pub(super) fn update_update_ui(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::LoadDismissal => {
-                let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
-                    self.update_ui.dismissal_loaded = true;
-                    return Task::none();
-                };
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        store
-                            .load_dismissed_update()
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|value| value);
-                    Message::UpdateUi(Action::DismissalLoaded(result))
-                })
-            }
-            Action::DismissalLoaded(result) => {
-                self.update_ui.dismissal_loaded = true;
-                match result {
-                    Ok(identity) => self.update_ui.dismissed = identity,
-                    Err(error) => tracing::warn!(%error, "could not load update notice dismissal"),
-                }
-                Task::none()
-            }
-            Action::DismissNotice(identity) => {
-                if self
-                    .available_update_notice()
-                    .is_none_or(|(current, _, _)| current != identity)
-                {
-                    return Task::none();
-                }
-                self.update_ui.dismissed = Some(identity.clone());
-                let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
-                    return Task::none();
-                };
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        store
-                            .save_dismissed_update(&identity)
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|value| value);
-                    Message::UpdateUi(Action::DismissalSaved(result))
-                })
-            }
-            Action::DismissalSaved(result) => {
-                if let Err(error) = result {
-                    self.status = Some(TransientNotice::warning(format!(
-                        "Could not remember update notice dismissal: {error}"
-                    )));
-                }
-                Task::none()
-            }
             Action::Check => {
                 if !self.settings.check_for_updates {
                     return Task::none();
@@ -1074,27 +930,6 @@ mod tests {
         assert!(app.update_ui.confirmation.is_some());
     }
 
-    #[test]
-    fn update_banner_moves_to_retained_notices_and_new_builds_announce_again() {
-        let mut app = crate::app::tests::context_inspector_test_app(true);
-        app.update_ui.dismissal_loaded = true;
-        app.update_ui.superseded = Some(PathBuf::from("/install/versions/one/bin/cagents-ui"));
-        assert!(app.update_notice(false).is_some());
-        assert!(!app.retained_update_notice());
-        let identity = app.available_update_notice().unwrap().0;
-        drop(app.update_update_ui(Action::DismissNotice(identity.clone())));
-        assert!(app.update_notice(false).is_none());
-        assert!(app.retained_update_notice());
-        assert!(app.update_notice(true).is_some());
-        app.update_ui.superseded = Some(PathBuf::from("/install/versions/two/bin/cagents-ui"));
-        drop(app.update_update_ui(Action::DismissNotice(identity)));
-        assert!(
-            app.update_notice(false).is_some(),
-            "an old button cannot dismiss a newer build"
-        );
-        assert!(!app.retained_update_notice());
-    }
-
     fn custom_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
         use cosmic::iced::advanced::widget::Tree;
         use iced_accessibility::id::Internal;
@@ -1121,6 +956,11 @@ mod tests {
     fn the_update_icon_sits_immediately_right_of_the_alerts() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         app.update_ui.superseded = Some(PathBuf::from("/nonexistent/current/bin/cagents-ui"));
+        let update_only = custom_widget_ids(&mut app.view());
+        assert!(
+            !update_only.iter().any(|id| id == "chrome.notices"),
+            "available updates must not duplicate their toolbar icon in application notices"
+        );
         app.notices
             .record(TransientNotice::warning("A saved notice"));
         app.context_inspector_open = true;
@@ -1128,6 +968,10 @@ mod tests {
         app.window_width = 1600.0;
 
         let open = custom_widget_ids(&mut app.view());
+        assert!(
+            !open.iter().any(|id| id == "update.review"),
+            "available updates stay in the toolbar instead of mounting a banner"
+        );
         assert_eq!(
             open.iter()
                 .filter(|id| id.as_str() == "application-update")

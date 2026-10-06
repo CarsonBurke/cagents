@@ -1233,6 +1233,8 @@ pub(super) struct Runtime {
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
+    picker_focus: usize,
+    picker_keyboard: bool,
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
     history: Vec<String>,
@@ -1599,6 +1601,8 @@ impl Runtime {
             permission_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
+            picker_focus: 0,
+            picker_keyboard: false,
             history: Vec::new(),
             history_cursor: None,
             history_stash: None,
@@ -2613,6 +2617,156 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    /// Keyboard and palette commands use the same pickers as the composer.
+    /// Respect the control's availability before capturing a selection gesture.
+    pub(super) fn open_chat_control(
+        &mut self,
+        command: crate::workspace_widget::GlobalShortcut,
+    ) -> Task<Message> {
+        use crate::workspace_widget::GlobalShortcut;
+        let Some(card) = self.workspace.focused() else {
+            return Task::none();
+        };
+        if self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let target = runtime.target;
+        let action = match command {
+            GlobalShortcut::ChatAccount
+                if runtime.choosing()
+                    && self
+                        .chat_accounts(
+                            runtime.session.launch.provider,
+                            &runtime.session.launch.recipe,
+                        )
+                        .is_some() =>
+            {
+                Action::AccountPicker(target, !runtime.account_picker)
+            }
+            GlobalShortcut::ChatModel
+                if runtime.is_draft()
+                    || (runtime.snapshot.capabilities.model_selection
+                        && !runtime.snapshot.models.is_empty()) =>
+            {
+                Action::ModelPicker(target, runtime.model_picker.is_none())
+            }
+            GlobalShortcut::ChatPermissions
+                if !runtime.snapshot.capabilities.permission_modes.is_empty()
+                    && !(runtime.session.launch.provider == Provider::Codex
+                        && runtime.snapshot.busy) =>
+            {
+                Action::PermissionPicker(target, !runtime.permission_picker)
+            }
+            _ => return Task::none(),
+        };
+        let focus = match &action {
+            Action::AccountPicker(_, true) => Some(card_control_id(card, "chat-account-choice-0")),
+            Action::PermissionPicker(_, true) => runtime
+                .snapshot
+                .permission_mode
+                .as_ref()
+                .filter(|mode| {
+                    runtime
+                        .snapshot
+                        .capabilities
+                        .permission_modes
+                        .contains(mode)
+                })
+                .or_else(|| runtime.snapshot.capabilities.permission_modes.first())
+                .map(|mode| card_control_id(card, &format!("chat-permission-mode-{mode}"))),
+            _ => None,
+        };
+        self.device_ui.menu_open = false;
+        let task = self.handle_chat_ui(action);
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.picker_keyboard = focus.is_some();
+            runtime.picker_focus = if command == GlobalShortcut::ChatPermissions {
+                runtime
+                    .snapshot
+                    .capabilities
+                    .permission_modes
+                    .iter()
+                    .position(|mode| Some(mode) == runtime.snapshot.permission_mode.as_ref())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        }
+        match focus {
+            Some(id) => Task::batch([
+                task,
+                iced::widget::operation::focus(id).map(cosmic::Action::App),
+            ]),
+            None => task,
+        }
+    }
+
+    pub(super) fn chat_picker_owns_keyboard(&self) -> bool {
+        self.workspace
+            .focused()
+            .and_then(|card| self.cards.get(&card))
+            .is_some_and(|card| {
+                matches!(card, CardRuntime::Chat(runtime)
+                if runtime.picker_keyboard
+                    && (runtime.account_picker || (runtime.permission_picker
+                        && runtime.permissions_form.page == permissions::Page::Blocked)))
+            })
+    }
+
+    pub(super) fn chat_picker_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        if !self.chat_picker_owns_keyboard() {
+            return None;
+        }
+        let card = self.workspace.focused()?;
+        let CardRuntime::Chat(runtime) = self.cards.get(&card)? else {
+            return None;
+        };
+        let backwards = super::is_tab_press(event).or_else(|| match event {
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => match key {
+                keyboard::key::Named::ArrowUp => Some(true),
+                keyboard::key::Named::ArrowDown => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })?;
+        let ring: Vec<_> = if runtime.account_picker {
+            let accounts = self.chat_accounts(
+                runtime.session.launch.provider,
+                &runtime.session.launch.recipe,
+            )?;
+            (0..accounts.choices.len())
+                .map(|index| card_control_id(card, &format!("chat-account-choice-{index}")))
+                .collect()
+        } else {
+            runtime
+                .snapshot
+                .capabilities
+                .permission_modes
+                .iter()
+                .map(|mode| card_control_id(card, &format!("chat-permission-mode-{mode}")))
+                .collect()
+        };
+        if ring.is_empty() {
+            return None;
+        }
+        let target = runtime.target;
+        let current = runtime.picker_focus.min(ring.len() - 1);
+        let next = if backwards {
+            (current + ring.len() - 1) % ring.len()
+        } else {
+            (current + 1) % ring.len()
+        };
+        self.chat_runtime_mut(target)?.picker_focus = next;
+        Some(iced::widget::operation::focus(ring[next].clone()).map(cosmic::Action::App))
+    }
+
     pub(super) fn chat_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let card = self.workspace.focused()?;
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
@@ -3431,6 +3585,7 @@ impl Cagents {
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.account_picker = false;
+        runtime.picker_keyboard = false;
         open
     }
     /// Opens a new native conversation in a new card.
@@ -4805,6 +4960,44 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        let restore = match &action {
+            Action::AccountPicker(target, false)
+            | Action::PermissionPicker(target, false)
+            | Action::ModelPicker(target, false)
+            | Action::ChooseAccount(target, _)
+            | Action::DraftModel(target, _, _)
+            | Action::Model(target, _)
+            | Action::PermissionMode(target, _) => {
+                self.cards.get(&target.card).and_then(|card| match card {
+                    CardRuntime::Chat(runtime)
+                        if runtime.target == *target
+                            && (runtime.picker_keyboard || runtime.model_picker.is_some()) =>
+                    {
+                        Some(*target)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        let task = self.handle_chat_ui_inner(action);
+        if let Some(target) = restore
+            && let Some(runtime) = self.chat_runtime_mut(target)
+            && !runtime.account_picker
+            && !runtime.permission_picker
+            && runtime.model_picker.is_none()
+        {
+            runtime.picker_keyboard = false;
+            return Task::batch([
+                task,
+                iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                    .map(cosmic::Action::App),
+            ]);
+        }
+        task
+    }
+
+    fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
         if crate::device::is_remote() && matches!(&action, Action::PastedImage(_, Some(_))) {
             self.status = Some(TransientNotice::warning(
                 "Images need transfer to the selected device before attachment",
@@ -4868,6 +5061,7 @@ impl Cagents {
             }
             Action::AccountPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.picker_keyboard = false;
                     runtime.account_picker = open && runtime.choosing();
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
@@ -6131,6 +6325,7 @@ impl Cagents {
             }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
                     if open {
                         runtime.model_picker = None;
@@ -7119,6 +7314,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                runtime.picker_keyboard = false;
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
                 runtime.model_picker = open.then(String::new);
@@ -8317,6 +8513,196 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn chat_selection_commands_open_exclusive_pickers_without_changing_the_draft() {
+        use crate::workspace_widget::GlobalShortcut;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.account_ui.add_managed_fixture(Provider::Codex, 22);
+        let card = draft_chat(&mut app);
+        let original = chat_runtime(&app, card).session.clone();
+        let permission_mode = chat_runtime(&app, card).snapshot.permission_mode.clone();
+        for command in [
+            GlobalShortcut::ChatAccount,
+            GlobalShortcut::ChatModel,
+            GlobalShortcut::ChatPermissions,
+        ] {
+            drop(app.open_chat_control(command));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime.account_picker,
+                command == GlobalShortcut::ChatAccount
+            );
+            assert_eq!(
+                runtime.model_picker.is_some(),
+                command == GlobalShortcut::ChatModel
+            );
+            assert_eq!(
+                runtime.permission_picker,
+                command == GlobalShortcut::ChatPermissions
+            );
+            assert_eq!(runtime.session, original);
+            assert_eq!(runtime.snapshot.permission_mode, permission_mode);
+            assert!(!app.chat_start_pending(card));
+            drop(app.open_chat_control(command));
+            let runtime = chat_runtime(&app, card);
+            assert!(
+                !runtime.account_picker
+                    && runtime.model_picker.is_none()
+                    && !runtime.permission_picker
+            );
+            assert!(!runtime.picker_keyboard);
+        }
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachment_chooser_pending = true;
+        drop(app.open_chat_control(GlobalShortcut::ChatAccount));
+        assert!(!chat_runtime(&app, card).account_picker);
+    }
+
+    #[test]
+    fn chat_keyboard_pickers_own_tab_and_restore_the_shell_preference_on_close() {
+        use crate::workspace_widget::GlobalShortcut;
+        for initial in [false, true] {
+            for command in [GlobalShortcut::ChatAccount, GlobalShortcut::ChatPermissions] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.account_ui.add_managed_fixture(Provider::Codex, 22);
+                let card = draft_chat(&mut app);
+                app.core.set_keyboard_nav(initial);
+                drop(app.update(Message::RunCommand(command)));
+                assert!(app.chat_picker_owns_keyboard());
+                assert!(!app.core.keyboard_nav());
+                drop(app.update(Message::RunCommand(command)));
+                assert!(!app.chat_picker_owns_keyboard());
+                assert_eq!(app.core.keyboard_nav(), initial);
+
+                drop(app.update(Message::RunCommand(command)));
+                assert!(!app.core.keyboard_nav());
+                assert!(app.dismiss_chat_picker());
+                app.sync_popup_keyboard_nav();
+                assert_eq!(app.core.keyboard_nav(), initial);
+                assert!(!chat_runtime(&app, card).picker_keyboard);
+            }
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        app.core.set_keyboard_nav(true);
+        drop(app.update(Message::RunCommand(GlobalShortcut::ChatPermissions)));
+        let target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::PermissionPage(
+            target,
+            permissions::Page::Rules,
+        ))));
+        assert!(!app.chat_picker_owns_keyboard());
+        assert!(
+            app.core.keyboard_nav(),
+            "Rules page fields retain ordinary Tab traversal"
+        );
+    }
+
+    #[test]
+    fn captured_escape_closes_model_search_without_closing_the_inspector() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        app.context_inspector_open = true;
+        drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
+        assert!(chat_runtime(&app, card).model_picker.is_some());
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        }));
+        assert!(chat_runtime(&app, card).model_picker.is_none());
+        assert!(app.context_inspector_open);
+    }
+
+    #[test]
+    fn permission_picker_keyboard_navigation_selects_a_mode_on_enter() {
+        use crate::workspace_widget::GlobalShortcut;
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Rectangle, Size};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let renderer = crate::app::tests::headless_renderer();
+        let card = draft_chat(&mut app);
+        drop(app.open_chat_control(GlobalShortcut::ChatPermissions));
+        let press = |key, code| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let down = press(
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Code::ArrowDown,
+        );
+        let original = chat_runtime(&app, card).snapshot.permission_mode.clone();
+        let count = chat_runtime(&app, card)
+            .snapshot
+            .capabilities
+            .permission_modes
+            .len();
+        assert!(count > 1);
+        let initial = chat_runtime(&app, card).picker_focus;
+        assert!(app.chat_picker_key(&down).is_some());
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.picker_focus, (initial + 1) % count);
+        assert_eq!(runtime.snapshot.permission_mode, original);
+        let chosen = runtime.snapshot.capabilities.permission_modes[runtime.picker_focus].clone();
+        let mut messages = Vec::new();
+        {
+            let mut element = runtime.permissions_view(true, 320.0);
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = Rectangle::with_size(Size::new(320.0, 600.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                    card,
+                    &format!("chat-permission-mode-{chosen}"),
+                )),
+            );
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(press(
+                    keyboard::key::Named::Enter,
+                    keyboard::key::Code::Enter,
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+        }
+        assert!(messages.iter().any(|message| matches!(message, Message::ChatUi(Action::PermissionMode(_, mode)) if mode == &chosen)));
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.permission_mode.as_ref(),
+            Some(&chosen)
+        );
+        assert!(!app.chat_start_pending(card));
     }
 
     #[test]

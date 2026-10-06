@@ -1056,11 +1056,14 @@ impl Editor {
 
     fn settings_footer(&self) -> Element<'_, Message> {
         widget::row::with_children(vec![
-            widget::button::text("Worktrees")
-                .on_press_maybe(
-                    (!self.modal_open()).then_some(Message::Checkout(checkout::Action::History)),
-                )
-                .into(),
+            icon_control(
+                symbolic_icon("git-branch-symbolic"),
+                "Worktrees",
+                self.checkout_history_open,
+                !self.modal_open(),
+                Some(Message::Checkout(checkout::Action::History)),
+            )
+            .into(),
             icon_control(
                 symbolic_icon("emblem-system-symbolic"),
                 "Settings",

@@ -75,6 +75,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | --- | --- |
 | New terminal | `Ctrl+Shift+T` |
 | New native thread tab | `Ctrl+T` or `Ctrl+Shift+N` |
+| Choose native chat account | `Ctrl+Shift+A` |
+| Choose native chat model | `Ctrl+Shift+M` |
+| Choose native chat permission mode | `Ctrl+Shift+O` |
 | Command palette | `Ctrl+Shift+P` |
 | Open settings | `Ctrl+Comma` |
 | Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
@@ -95,8 +98,14 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Next / previous changed hunk in a diff | `Alt+J` / `Alt+K` |
 | Stage / unstage the open file | `Ctrl+Shift+S` |
 
-Workspace and review shortcuts are configurable; see
+Workspace, native chat, and review shortcuts are configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
+
+The chat selection shortcuts apply to the focused native chat. Use Up/Down or
+Tab/Shift+Tab to choose an account or permission mode, Enter to select, and Escape
+to close. The model picker supports search and Enter to select a result. Account
+selection is available before starting a conversation; provider capabilities
+determine which models and permission modes are available.
 
 - Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
   its pane, **Alt+R** cycles its width, and **Ctrl+T** creates a native thread

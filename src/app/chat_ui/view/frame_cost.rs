@@ -193,6 +193,7 @@ fn measure(turns: usize) {
     let theme = cosmic::Theme::dark();
     let mut renderer = crate::app::tests::headless_renderer();
     let mut cache = Cache::new();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
     let (mut update, mut view, mut layout, mut draw) = (
         Stage::default(),
         Stage::default(),
@@ -223,6 +224,7 @@ fn measure(turns: usize) {
         let element = runtime.view(
             false,
             true,
+            &shortcuts,
             720.0,
             Place {
                 name: "project".into(),
