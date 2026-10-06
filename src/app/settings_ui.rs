@@ -1273,7 +1273,7 @@ pub(super) fn settings_pane<'a>(
     query: &'a str,
     context: SettingsContext<'a>,
 ) -> Element<'a, Message> {
-    iced::widget::responsive(move |size| {
+    crate::ui_controls::responsive(move |size| {
         settings_layout(category, draft, query, &context, size.width)
     })
     .into()

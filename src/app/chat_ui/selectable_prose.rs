@@ -15,6 +15,7 @@ static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 pub(super) struct State {
     pub(super) identity: u64,
+    a11y_id: iced::advanced::widget::Id,
     pub(super) plain: Arc<str>,
     pub(super) target: Option<Target>,
     pub(super) managed: bool,
@@ -30,6 +31,7 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            a11y_id: iced::advanced::widget::Id::unique(),
             identity: NEXT_SELECTION.fetch_add(1, Ordering::Relaxed),
             plain: Arc::from(""),
             target: None,
@@ -200,6 +202,27 @@ fn hit(paragraph: &ParagraphBuffer, plain: &str, position: Point) -> usize {
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Node, Rect, Role};
+        let mut bounds = layout.bounds();
+        bounds.x -= layout.virtual_offset().x;
+        bounds.y -= layout.virtual_offset().y;
+        let mut node = Node::new(Role::Label);
+        node.set_value(self.plain.to_string());
+        node.set_bounds(Rect::new(
+            bounds.x as f64,
+            bounds.y as f64,
+            (bounds.x + bounds.width) as f64,
+            (bounds.y + bounds.height) as f64,
+        ));
+        iced_accessibility::A11yTree::leaf(node, tree.state.downcast_ref::<State>().a11y_id.clone())
+    }
+
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
     }
@@ -425,6 +448,40 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prose_exposes_full_text_and_stable_accessible_identity() {
+        let element = text(
+            vec![Span::new("α first\nβ second")].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+        );
+        let tree = Tree::new(&element);
+        let node = layout::Node::new(Size::new(80.0, 40.0));
+        let scrolled = Layout::with_offset(iced::Vector::new(12.0, 50.0), &node)
+            .with_virtual_offset(iced::Vector::new(0.0, 37.0));
+        let first = element
+            .as_widget()
+            .a11y_nodes(scrolled, &tree, mouse::Cursor::Unavailable);
+        let second = element
+            .as_widget()
+            .a11y_nodes(scrolled, &tree, mouse::Cursor::Unavailable);
+        assert_eq!(first.root()[0].id(), second.root()[0].id());
+        let bounds = first.root()[0].node().bounds().unwrap();
+        assert_eq!(
+            (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+            (12.0, 13.0, 92.0, 53.0)
+        );
+        assert_eq!(first.root()[0].node().value(), Some("α first\nβ second"));
+        assert_eq!(
+            first.root()[0].node().role(),
+            iced_accessibility::accesskit::Role::Label
+        );
+    }
 
     #[test]
     fn shaped_hit_testing_keeps_multiline_offsets_and_outside_drag_direction() {

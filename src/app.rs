@@ -8676,7 +8676,7 @@ impl Cagents {
             {
                 let phase = browser_runtime.map_or(0.0, |browser| browser.progress_phase);
                 rows.push(
-                    widget::container(iced::widget::responsive(move |size| {
+                    widget::container(crate::ui_controls::responsive(move |size| {
                         let width = size.width * 0.25;
                         widget::row::with_children(vec![
                             iced::widget::Space::new()

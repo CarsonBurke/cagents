@@ -1849,9 +1849,10 @@ impl State {
     /// directory. Folders start open and may be folded independently.
     pub fn file_list(&self, modal_open: bool) -> Element<'_, Action> {
         let spacing = cosmic::theme::spacing();
-        let list: Element<'_, Action> =
-            iced::widget::responsive(move |size| self.file_scrollable(modal_open, size.height))
-                .into();
+        let list: Element<'_, Action> = crate::ui_controls::responsive(move |size| {
+            self.file_scrollable(modal_open, size.height)
+        })
+        .into();
         let (mode_icon, mode_label, next_mode) = match self.file_list_mode {
             FileListMode::Tree => ("view-list-symbolic", "View as list", FileListMode::Flat),
             FileListMode::Flat => (
