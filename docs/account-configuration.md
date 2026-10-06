@@ -9,6 +9,15 @@ uses its saved login and refreshes its own tokens; cagents never reads or
 copies credentials. Multiple personal and organization plans can remain
 signed in at the same time in separate homes.
 
+To refresh an existing login, choose **Sign in again** in its account menu.
+Local Codex accounts also offer **Sign in again with a code**, which keeps
+the same home and works without an available local browser callback port.
+Finish or close an account's current sign-in terminal before starting another.
+Re-login stays watched while its terminal runs, even during a long browser
+handoff; after it finishes, cagents verifies the account before accepting its
+new identity. This explicit re-login intent belongs to the window that started
+it; reopening a window does not authorize an unexpected change of identity.
+
 Automatic keeps using the current account until the provider reports that its
 allowance is exhausted or its login needs attention, then chooses an account
 with a recent successful quota report. Unknown, stale, reset, conflicting and
