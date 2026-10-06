@@ -1207,6 +1207,32 @@ mod tests {
 
     #[test]
     fn widget_drag_updates_retained_exchanges_and_copy_respects_focus_operations() {
+        // Other gesture tests set the process-wide active selection. Keep the
+        // drag and copy in one isolated process so they exercise real focus
+        // arbitration without another test taking focus between these events.
+        const CHILD: &str = "CAGENTS_TEST_TRANSCRIPT_FOCUS";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "app::chat_ui::selection::tests::",
+                        "widget_drag_updates_retained_exchanges_and_copy_respects_focus_operations"
+                    ),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         let renderer = crate::app::tests::headless_renderer();
         let mut element = surface(
             widget::column::with_children(vec![
