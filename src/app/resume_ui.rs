@@ -12,6 +12,8 @@ const FIRST_BATCH: usize = 64;
 const BATCH: usize = 512;
 /// Rows listed at a time; more are listed on request.
 const PAGE: usize = 100;
+const ROW_HEIGHT: f32 = 96.0;
+const ROW_SPACING: f32 = 8.0;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -294,6 +296,48 @@ fn index(
     }
 }
 
+/// Reveal against the scrollable's current layout, including short or scaled windows.
+struct RevealSelection {
+    selected: usize,
+}
+impl iced::advanced::widget::Operation<Message> for RevealSelection {
+    fn traverse(
+        &mut self,
+        visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<Message>),
+    ) {
+        visit(self);
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: iced::Rectangle,
+        content: iced::Rectangle,
+        translation: iced::Vector,
+        state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        if id != Some(&widget::Id::new("conversation-resume.results")) {
+            return;
+        }
+        let y =
+            resume_selection_offset(self.selected, bounds.height, content.height, translation.y);
+        state.scroll_to(
+            iced::advanced::widget::operation::scrollable::AbsoluteOffset { x: None, y: Some(y) },
+        );
+    }
+}
+fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current: f32) -> f32 {
+    let top = selected as f32 * (ROW_HEIGHT + ROW_SPACING);
+    let bottom = top + ROW_HEIGHT;
+    let target = if top < current {
+        top
+    } else if bottom > current + viewport {
+        bottom - viewport
+    } else {
+        current
+    };
+    target.clamp(0.0, (content - viewport).max(0.0))
+}
+
 impl Cagents {
     pub(super) fn resume_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if !self.resume_ui.open {
@@ -321,18 +365,9 @@ impl Cagents {
     }
 
     fn reveal_resume_selection(&self) -> Task<Message> {
-        let count = self.resume_ui.visible.len().min(self.resume_ui.limit);
-        let content_height = count as f32 * 104.0;
-        let y = (self.resume_ui.selected as f32 * 104.0 - 180.0)
-            .max(0.0)
-            .min((content_height - 420.0).max(0.0));
-        iced::widget::scrollable::scroll_to(
-            widget::Id::new("conversation-resume.results"),
-            iced::widget::scrollable::AbsoluteOffset {
-                x: None,
-                y: Some(y),
-            },
-        )
+        iced::advanced::widget::operate(RevealSelection {
+            selected: self.resume_ui.selected,
+        })
         .map(cosmic::Action::App)
     }
 
@@ -858,7 +893,7 @@ impl Cagents {
                 widget::button::custom(contents)
                     .name(format!("Resume {}", row.title))
                     .width(Length::Fill)
-                    .height(Length::Fixed(96.0))
+                    .height(Length::Fixed(ROW_HEIGHT))
                     .class(cosmic::theme::Button::ListItem([8.0; 4]))
                     .selected(index == state.selected)
                     .on_press_maybe(
@@ -927,20 +962,26 @@ impl Cagents {
                 // does not move the list.
                 .height(Length::Fixed(32.0))
                 .into(),
-            widget::scrollable(widget::column::with_children(rows).spacing(8))
+            widget::scrollable(widget::column::with_children(rows).spacing(ROW_SPACING))
                 .id(widget::Id::new("conversation-resume.results"))
-                .height(Length::Fixed(420.0))
+                .height(Length::Fill)
                 .into(),
         ])
-        .spacing(12);
+        .spacing(12)
+        .height(Length::Fill);
         if let Some(error) = &state.error {
             content = content.push(design::caption(error));
         }
         content = content.push(
-            widget::button::standard("Cancel").on_press(Message::ResumeConversation(Action::Close)),
+            widget::button::standard("Cancel")
+                .id(widget::Id::new("conversation-resume.cancel"))
+                .on_press(Message::ResumeConversation(Action::Close)),
         );
         Some(dialog_ui::overlay(
-            dialog_ui::surface(content, 800.0),
+            widget::container(dialog_ui::surface(content, 800.0))
+                .height(Length::Fill)
+                .max_height(680.0)
+                .into(),
             Some(Message::ResumeConversation(Action::Close)),
             1.0,
         ))
@@ -1025,6 +1066,96 @@ mod tests {
         let before = app.durable.cards.len();
         let _ = app.resume_saved_conversation(entry);
         assert_eq!(app.durable.cards.len(), before);
+    }
+
+    #[test]
+    fn resume_footer_remains_inside_short_and_scaled_window_layouts() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree, operation},
+        };
+        #[derive(Default)]
+        struct Bounds {
+            list: Option<iced::Rectangle>,
+            cancel: Option<iced::Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("conversation-resume.results")) {
+                    self.list = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&widget::Id::new("conversation-resume.cancel")) {
+                    self.cancel = Some(bounds);
+                }
+            }
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        for _ in 0..20 {
+            app.resume_ui.rows.push(Row::saved(
+                saved(std::path::Path::new("/fixture")),
+                "Fixture".into(),
+            ));
+        }
+        app.resume_ui.visible = (0..20).collect();
+        let renderer = crate::app::tests::headless_renderer();
+        for size in [
+            iced::Size::new(1100.0, 900.0),
+            iced::Size::new(1100.0, 600.0),
+            iced::Size::new(880.0, 480.0),
+        ] {
+            let mut element = app.resume_dialog().unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, size),
+            );
+            let mut bounds = Bounds::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+                &mut bounds,
+            );
+            let cancel = bounds.cancel.expect("Cancel remains mounted");
+            let list = bounds.list.expect("results viewport remains mounted");
+            assert!(list.height > 96.0, "{size:?}: {list:?}");
+            assert!(
+                list.y + list.height <= cancel.y,
+                "list cannot displace footer"
+            );
+            assert!(
+                cancel.y + cancel.height <= size.height,
+                "{size:?}: {cancel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_selection_uses_the_actual_viewport_and_preserves_visible_rows() {
+        assert_eq!(resume_selection_offset(3, 160.0, 1040.0, 0.0), 248.0);
+        assert_eq!(resume_selection_offset(3, 420.0, 1040.0, 0.0), 0.0);
+        assert_eq!(resume_selection_offset(0, 160.0, 1040.0, 248.0), 0.0);
+        assert_eq!(resume_selection_offset(9, 160.0, 1040.0, 248.0), 872.0);
     }
 
     #[test]
