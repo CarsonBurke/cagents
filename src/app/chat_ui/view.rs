@@ -2404,6 +2404,7 @@ impl Runtime {
                     })
                     .chain(std::iter::once(
                         widget::button::custom(design::caption("Manage accounts…"))
+                            .id(card_control_id(target.card, "chat-manage-accounts"))
                             .class(crate::ui_controls::control_style(false, None))
                             .padding([step::GAP_XS, step::GAP_S])
                             .width(Length::Fill)

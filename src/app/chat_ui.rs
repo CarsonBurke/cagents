@@ -2906,6 +2906,10 @@ impl Cagents {
             )?;
             (0..accounts.choices.len())
                 .map(|index| card_control_id(card, &format!("chat-account-choice-{index}")))
+                .chain(std::iter::once(card_control_id(
+                    card,
+                    "chat-manage-accounts",
+                )))
                 .collect()
         } else {
             runtime
@@ -8967,6 +8971,94 @@ mod tests {
         }));
         assert!(chat_runtime(&app, card).model_picker.is_none());
         assert!(app.context_inspector_open);
+    }
+
+    #[test]
+    fn account_picker_keyboard_reaches_manage_accounts_and_activates_it() {
+        use crate::workspace_widget::GlobalShortcut;
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Rectangle, Size};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.account_ui.add_managed_fixture(Provider::Codex, 22);
+        let renderer = crate::app::tests::headless_renderer();
+        let card = draft_chat(&mut app);
+        drop(app.open_chat_control(GlobalShortcut::ChatAccount));
+        let press = |key, code| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let up = press(keyboard::key::Named::ArrowUp, keyboard::key::Code::ArrowUp);
+        let down = press(
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Code::ArrowDown,
+        );
+        let runtime = chat_runtime(&app, card);
+        let accounts = app
+            .chat_accounts(
+                runtime.session.launch.provider,
+                &runtime.session.launch.recipe,
+            )
+            .unwrap();
+        let choices = accounts.choices.len();
+        assert!(app.chat_picker_key(&up).is_some());
+        assert_eq!(chat_runtime(&app, card).picker_focus, choices);
+        assert!(app.chat_picker_key(&down).is_some());
+        assert_eq!(chat_runtime(&app, card).picker_focus, 0);
+        for _ in 0..choices {
+            assert!(app.chat_picker_key(&down).is_some());
+        }
+        assert_eq!(chat_runtime(&app, card).picker_focus, choices);
+        let mut messages = Vec::new();
+        {
+            let mut element = app.chat_view(card);
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = Rectangle::with_size(Size::new(320.0, 600.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    iced::Vector::ZERO,
+                )
+                .expect("account menu overlay");
+            let popup = overlay.as_overlay_mut().layout(&renderer, viewport.size());
+            overlay.as_overlay_mut().operate(
+                Layout::new(&popup),
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                    card,
+                    "chat-manage-accounts",
+                )),
+            );
+            overlay.as_overlay_mut().update(
+                &Event::Keyboard(press(
+                    keyboard::key::Named::Enter,
+                    keyboard::key::Code::Enter,
+                )),
+                Layout::new(&popup),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+            );
+        }
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::AccountUi(crate::app::account_ui::Action::OpenPane)
+        )));
+        assert!(!app.chat_start_pending(card));
     }
 
     #[test]
