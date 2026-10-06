@@ -5,11 +5,62 @@ use crate::device_service::{GitOperation, Operation, Reply};
 use cosmic::widget::text_editor;
 use std::collections::BTreeMap;
 
+fn file_editor_id() -> widget::Id {
+    widget::Id::new("device-file-editor")
+}
+
+fn dialog_controls<'a>(children: Vec<Element<'a, Message>>, narrow: bool) -> Element<'a, Message> {
+    if narrow {
+        widget::column::with_children(children)
+            .spacing(8)
+            .width(Length::Fill)
+            .into()
+    } else {
+        widget::row::with_children(children)
+            .spacing(8)
+            .width(Length::Fill)
+            .into()
+    }
+}
+
+/// Navigation presentation and device-owned row opening never need desktop Git or files.
+pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
+    matches!(
+        action,
+        SidebarAction::SearchChanged(_)
+            | SidebarAction::SetFilter(_)
+            | SidebarAction::ToggleControls
+            | SidebarAction::OpenFirstSearchResult
+            | SidebarAction::FocusFirstSearchResult
+            | SidebarAction::Resize { .. }
+            | SidebarAction::ResizeFinished
+            | SidebarAction::ScrollProjects(_)
+            | SidebarAction::NavigateRow { .. }
+            | SidebarAction::OpenChannel { .. }
+            | SidebarAction::SelectRows { .. }
+            | SidebarAction::ClearRowSelection
+            | SidebarAction::OpenRepository { .. }
+            | SidebarAction::OpenWorktree { .. }
+            | SidebarAction::Refresh
+            | SidebarAction::RefreshProject { .. }
+            | SidebarAction::ToggleProjects
+            | SidebarAction::ToggleProject(_)
+            | SidebarAction::DragWindow
+            | SidebarAction::MaximizeWindow
+            | SidebarAction::WindowMenu
+            | SidebarAction::OpenSettings
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Menu(bool),
     Open,
     OpenAt(PathBuf),
+    OpenFile {
+        path: PathBuf,
+        fragment: Option<String>,
+    },
     Configure,
     ConfigName(String),
     ConfigHost(String),
@@ -70,6 +121,8 @@ pub(super) struct State {
     busy: bool,
     generation: u64,
     pending: Option<Operation>,
+    linked_file: Option<PathBuf>,
+    linked_fragment: Option<String>,
     notice: Option<String>,
     pub devices: Vec<String>,
     device_hosts: BTreeMap<String, String>,
@@ -99,6 +152,8 @@ impl Default for State {
             busy: false,
             generation: 0,
             pending: None,
+            linked_file: None,
+            linked_fragment: None,
             notice: None,
             devices: std::iter::once("local".to_owned())
                 .chain(devices.iter().map(|device| device.name.clone()))
@@ -263,6 +318,7 @@ impl Cagents {
             Action::Close
                 | Action::Open
                 | Action::OpenAt(_)
+                | Action::OpenFile { .. }
                 | Action::Configure
                 | Action::Browse
                 | Action::Visit(_)
@@ -406,6 +462,22 @@ impl Cagents {
                     },
                 );
             }
+            Action::OpenFile { path, fragment } => {
+                let Some((directory, file)) = path.parent().zip(path.file_name()) else {
+                    self.status = Some(TransientNotice::warning(
+                        "The link does not name a device file",
+                    ));
+                    return Task::none();
+                };
+                self.device_ui.linked_file = Some(file.into());
+                self.device_ui.linked_fragment = fragment;
+                self.device_ui.path = directory.display().to_string();
+                self.device_ui.open = true;
+                self.device_ui.configure = false;
+                Some(Operation::List {
+                    path: directory.to_owned(),
+                })
+            }
             Action::OpenAt(path) => {
                 self.device_ui.path = path.display().to_string();
                 return self.update_device(Action::Open);
@@ -480,7 +552,7 @@ impl Cagents {
                 content: self.device_ui.content.text(),
             }),
             Action::Git(operation) => Some(Operation::Git {
-                root: self.device_ui.path.clone().into(),
+                root: self.device_ui.directory.clone(),
                 operation,
             }),
             Action::OpenProject => Some(Operation::Discover {
@@ -493,7 +565,11 @@ impl Cagents {
                 self.device_ui.busy = false;
                 let pending = self.device_ui.pending.take();
                 match result {
-                    Err(error) => self.device_ui.notice = Some(error),
+                    Err(error) => {
+                        self.device_ui.linked_file = None;
+                        self.device_ui.linked_fragment = None;
+                        self.device_ui.notice = Some(error);
+                    }
                     Ok(Reply::Directory { path, entries }) => {
                         self.device_ui.path = path.display().to_string();
                         self.device_ui.directory = path;
@@ -501,6 +577,9 @@ impl Cagents {
                         self.device_ui.file = None;
                         self.device_ui.output.clear();
                         self.device_ui.view = View::Editor;
+                        if let Some(file) = self.device_ui.linked_file.clone() {
+                            return self.update_device(Action::Read(file));
+                        }
                     }
                     Ok(Reply::Text(text)) if matches!(&pending, Some(Operation::Read { .. })) => {
                         if let Some(Operation::Read { root, path }) = pending {
@@ -509,7 +588,15 @@ impl Cagents {
                         }
                         self.device_ui.original = text.clone();
                         self.device_ui.content = text_editor::Content::with_text(&text);
+                        let linked = self.device_ui.linked_file.take().is_some();
+                        if let Some(fragment) = self.device_ui.linked_fragment.take() {
+                            self.device_ui.jump_to_fragment(&fragment);
+                        }
                         self.device_ui.view = View::Editor;
+                        if linked {
+                            return iced::widget::operation::focus(file_editor_id())
+                                .map(cosmic::Action::App);
+                        }
                     }
                     Ok(Reply::Text(text)) => self.device_ui.output = text,
                     Ok(Reply::Saved) => {
@@ -523,6 +610,9 @@ impl Cagents {
                         self.device_ui.directory = path.clone();
                         self.active_workspace = Some(path.clone());
                         self.device_ui.file = None;
+                        self.device_ui.entries.clear();
+                        self.device_ui.output.clear();
+                        self.device_ui.view = View::Editor;
                         let edit = crate::workspace_model::ModelEdit::ReopenProject {
                             repository: key,
                             name: path
@@ -533,6 +623,7 @@ impl Cagents {
                             kind,
                         };
                         self.publish_model_edit(edit);
+                        return self.update_device(Action::Browse);
                     }
                     Ok(_) => self.device_ui.notice = Some("Unexpected device response".into()),
                 }
@@ -723,7 +814,18 @@ impl Cagents {
     }
 
     pub(super) fn device_dialog(&self) -> Element<'_, Message> {
+        // Use the tracked window geometry: Responsive hides its descendants from AccessKit.
+        let padding = 8.0 * design::GRID_UNIT;
+        self.device_dialog_layout(iced::Size::new(
+            (self.window_width - padding).max(1.0),
+            (self.window_height - padding).max(1.0),
+        ))
+    }
+
+    fn device_dialog_layout(&self, size: iced::Size) -> Element<'_, Message> {
         let state = &self.device_ui;
+        let narrow = size.width < 900.0;
+        let controls = |children| dialog_controls(children, narrow);
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
             let mut button = widget::button::standard(label.to_owned());
@@ -753,16 +855,14 @@ impl Cagents {
             ])
             .spacing(8)
             .into(),
-            widget::row::with_children(vec![
+            controls(vec![
                 widget::text_input("Absolute directory on device", &state.path)
                     .on_input(|value| Message::Device(Action::Path(value)))
                     .width(Length::Fill)
                     .into(),
                 button("Browse", Action::Browse),
                 button("Use directory", Action::OpenProject),
-            ])
-            .spacing(8)
-            .into(),
+            ]),
         ];
         if let Some(notice) = &state.notice {
             rows.push(widget::text::body(notice).into());
@@ -801,17 +901,17 @@ impl Cagents {
             && state.view == View::Editor
         {
             widget::column::with_children(vec![
-                widget::row::with_children(vec![
+                controls(vec![
                     widget::text::body(file.display().to_string())
                         .width(Length::Fill)
                         .into(),
                     button("Save on device", Action::Save),
                     button("Discard changes", Action::DiscardChanges),
-                ])
-                .into(),
+                ]),
                 iced::widget::text_editor(&state.content)
+                    .id(file_editor_id())
                     .on_action(|value| Message::Device(Action::Edit(value)))
-                    .height(420)
+                    .height(if narrow { 300 } else { 420 })
                     .into(),
             ])
             .spacing(8)
@@ -828,7 +928,7 @@ impl Cagents {
             }
             output.push(
                 widget::scrollable(widget::text::body(&state.output))
-                    .height(420)
+                    .height(if narrow { 300 } else { 420 })
                     .width(Length::Fill)
                     .into(),
             );
@@ -837,91 +937,117 @@ impl Cagents {
                 .width(Length::Fill)
                 .into()
         };
-        rows.push(
-            widget::row::with_children(vec![
-                widget::scrollable(widget::column::with_children(files))
-                    .width(260)
-                    .height(460)
-                    .into(),
-                preview,
-            ])
-            .spacing(12)
-            .into(),
-        );
-        rows.push(
-            widget::row::with_children(vec![
-                button("Git status", Action::Git(GitOperation::Status)),
-                button("Diff", Action::Git(GitOperation::Diff { staged: false })),
-                button(
-                    "Staged diff",
-                    Action::Git(GitOperation::Diff { staged: true }),
-                ),
-                widget::text_input("Relative file path", &state.pathspec)
-                    .on_input(|value| Message::Device(Action::Pathspec(value)))
-                    .into(),
-                button(
-                    "Stage",
-                    Action::Git(GitOperation::Stage {
-                        paths: vec![state.pathspec.clone().into()],
-                    }),
-                ),
-                button(
-                    "Unstage",
-                    Action::Git(GitOperation::Unstage {
-                        paths: vec![state.pathspec.clone().into()],
-                    }),
-                ),
-            ])
-            .spacing(8)
-            .into(),
-        );
-        rows.push(
-            widget::row::with_children(vec![
-                widget::text_input("Commit message", &state.commit_message)
-                    .on_input(|value| Message::Device(Action::CommitMessage(value)))
-                    .width(Length::Fill)
-                    .into(),
-                button(
-                    "Commit staged changes",
-                    Action::Git(GitOperation::Commit {
-                        message: state.commit_message.clone(),
-                    }),
-                ),
-            ])
-            .spacing(8)
-            .into(),
-        );
-        rows.push(
-            widget::row::with_children(vec![
-                button("List worktrees", Action::Git(GitOperation::Worktrees)),
-                widget::text_input("Worktree name under .worktrees/", &state.worktree_name)
-                    .on_input(|value| Message::Device(Action::WorktreeName(value)))
-                    .into(),
-                widget::text_input("New branch", &state.worktree_branch)
-                    .on_input(|value| Message::Device(Action::WorktreeBranch(value)))
-                    .into(),
-                button(
-                    "Create worktree",
-                    Action::Git(GitOperation::CreateWorktree {
-                        name: state.worktree_name.clone(),
-                        branch: state.worktree_branch.clone(),
-                    }),
-                ),
-                button(
-                    "Remove clean worktree",
-                    Action::Git(GitOperation::RemoveWorktree {
-                        name: state.worktree_name.clone(),
-                    }),
-                ),
-            ])
-            .spacing(8)
-            .into(),
-        );
-        dialog_ui::surface(widget::column::with_children(rows).spacing(12), 1100.0)
+        let files = widget::scrollable(widget::column::with_children(files))
+            .width(if narrow {
+                Length::Fill
+            } else {
+                Length::Fixed(260.0)
+            })
+            .height(if narrow { 160 } else { 460 });
+        rows.push(controls(vec![files.into(), preview]));
+        rows.push(design::caption(format!("Git directory: {}", state.directory.display())).into());
+        rows.push(controls(vec![
+            button("Git status", Action::Git(GitOperation::Status)),
+            button("Diff", Action::Git(GitOperation::Diff { staged: false })),
+            button(
+                "Staged diff",
+                Action::Git(GitOperation::Diff { staged: true }),
+            ),
+            widget::text_input("Relative file path", &state.pathspec)
+                .on_input(|value| Message::Device(Action::Pathspec(value)))
+                .into(),
+            button(
+                "Stage",
+                Action::Git(GitOperation::Stage {
+                    paths: vec![state.pathspec.clone().into()],
+                }),
+            ),
+            button(
+                "Unstage",
+                Action::Git(GitOperation::Unstage {
+                    paths: vec![state.pathspec.clone().into()],
+                }),
+            ),
+        ]));
+        rows.push(controls(vec![
+            widget::text_input("Commit message", &state.commit_message)
+                .on_input(|value| Message::Device(Action::CommitMessage(value)))
+                .width(Length::Fill)
+                .into(),
+            button(
+                "Commit staged changes",
+                Action::Git(GitOperation::Commit {
+                    message: state.commit_message.clone(),
+                }),
+            ),
+        ]));
+        rows.push(controls(vec![
+            button("List worktrees", Action::Git(GitOperation::Worktrees)),
+            widget::text_input("Worktree name under .worktrees/", &state.worktree_name)
+                .on_input(|value| Message::Device(Action::WorktreeName(value)))
+                .into(),
+            widget::text_input("New branch", &state.worktree_branch)
+                .on_input(|value| Message::Device(Action::WorktreeBranch(value)))
+                .into(),
+            button(
+                "Create worktree",
+                Action::Git(GitOperation::CreateWorktree {
+                    name: state.worktree_name.clone(),
+                    branch: state.worktree_branch.clone(),
+                }),
+            ),
+            button(
+                "Remove clean worktree",
+                Action::Git(GitOperation::RemoveWorktree {
+                    name: state.worktree_name.clone(),
+                }),
+            ),
+        ]));
+        let content = widget::scrollable(widget::column::with_children(rows).spacing(12))
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .height(Length::Fill);
+        widget::container(dialog_ui::surface(content, 1100.0))
+            .height(Length::Fill)
+            .max_height(size.height.min(820.0))
+            .width(Length::Fill)
+            .max_width(1100.0)
+            .into()
     }
 }
 
 impl State {
+    fn jump_to_fragment(&mut self, fragment: &str) {
+        let Some(coordinates) = fragment.strip_prefix('L') else {
+            self.notice = Some(format!(
+                "Opened file; this viewer cannot jump to heading #{fragment}"
+            ));
+            return;
+        };
+        let (line, column) = coordinates
+            .split_once(':')
+            .or_else(|| coordinates.split_once('C'))
+            .unwrap_or((coordinates, "1"));
+        let (Ok(line), Ok(column)) = (line.parse::<usize>(), column.parse::<usize>()) else {
+            return;
+        };
+        let line = line
+            .saturating_sub(1)
+            .min(self.content.line_count().saturating_sub(1));
+        // The native iced editor's cursor column is a UTF-8 byte index.
+        let column = self.content.line(line).map_or(0, |text| {
+            text.text
+                .char_indices()
+                .nth(column.saturating_sub(1))
+                .map_or(text.text.len(), |(byte, _)| byte)
+        });
+        self.content.move_to(text_editor::Cursor {
+            position: text_editor::Position { line, column },
+            selection: None,
+        });
+    }
+
     fn set_devices(&mut self, devices: Vec<crate::device::Device>) {
         self.devices = std::iter::once("local".into())
             .chain(devices.iter().map(|device| device.name.clone()))
@@ -1084,6 +1210,196 @@ mod tests {
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         assert!(!app.refresh_ui.projects.contains_key(&closed));
         assert!(app.refresh_ui.projects.contains_key(&other));
+
+        // Exercise the actual document-link entry point in the isolated remote process.
+        let mut links = super::super::tests::context_inspector_test_app(false);
+        let directory = PathBuf::from("/remote/chat-only-project");
+        links.active_workspace = Some(directory.clone());
+        drop(links.new_native_chat(Provider::Codex, Some(directory)));
+        let chat = links.workspace.focused().unwrap();
+        assert!(matches!(links.cards.get(&chat), Some(CardRuntime::Chat(_))));
+        drop(links.open_document_link(Some(CardId::new()), "file:///remote/other.txt"));
+        assert!(!links.device_ui.open);
+        assert!(links.device_ui.pending.is_none());
+        drop(links.open_document_link(Some(chat), "src/main.rs:2:3"));
+        assert_eq!(
+            links.device_ui.linked_file.as_deref(),
+            Some(Path::new("main.rs"))
+        );
+        assert_eq!(links.device_ui.linked_fragment.as_deref(), Some("L2:3"));
+        assert!(
+            matches!(&links.device_ui.pending, Some(Operation::List { path })
+            if path == Path::new("/remote/chat-only-project/src"))
+        );
+
+        let mut navigation = super::super::tests::context_inspector_test_app(false);
+        drop(
+            navigation.update(Message::Sidebar(SidebarAction::SearchChanged(
+                "remote".into(),
+            ))),
+        );
+        assert_eq!(navigation.sidebar_state.query(), "remote");
+        assert!(!navigation.device_ui.open);
+        drop(navigation.update(Message::Sidebar(SidebarAction::SetFilter(
+            sidebar::SidebarFilter::Attention,
+        ))));
+        assert_eq!(
+            navigation.sidebar_state.filter(),
+            sidebar::SidebarFilter::Attention
+        );
+        assert!(!navigation.device_ui.open);
+    }
+
+    #[test]
+    fn opening_a_project_replaces_the_previous_directory_listing_even_on_failure() {
+        for succeeds in [true, false] {
+            let mut app = loaded_file();
+            drop(app.update_device(Action::DiscardChanges));
+            app.device_ui.entries = vec![crate::device_service::Entry {
+                name: "old-file".into(),
+                directory: false,
+                symlink: false,
+            }];
+            app.device_ui.output = "old Git output".into();
+            drop(app.update_device(Action::Path("/remote/other".into())));
+            drop(app.update_device(Action::OpenProject));
+            drop(app.update_device(Action::Loaded {
+                generation: app.device_ui.generation,
+                result: Ok(Reply::Project {
+                    path: "/remote/other".into(),
+                    key: "/remote/other/.git".into(),
+                    kind: ProjectKind::Git,
+                }),
+            }));
+            assert_eq!(app.device_ui.directory, Path::new("/remote/other"));
+            assert!(app.device_ui.file.is_none());
+            assert!(app.device_ui.entries.is_empty());
+            assert!(app.device_ui.output.is_empty());
+            assert!(
+                matches!(&app.device_ui.pending, Some(Operation::List { path })
+                if path == Path::new("/remote/other"))
+            );
+            let result = if succeeds {
+                Ok(Reply::Directory {
+                    path: "/remote/other".into(),
+                    entries: vec![crate::device_service::Entry {
+                        name: "new-file".into(),
+                        directory: false,
+                        symlink: false,
+                    }],
+                })
+            } else {
+                Err("Cannot list the selected project".into())
+            };
+            drop(app.update_device(Action::Loaded {
+                generation: app.device_ui.generation,
+                result,
+            }));
+            if succeeds {
+                assert_eq!(app.device_ui.entries[0].name, "new-file");
+            } else {
+                assert!(app.device_ui.entries.is_empty());
+                assert!(
+                    app.device_ui
+                        .notice
+                        .as_deref()
+                        .unwrap()
+                        .contains("Cannot list")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_uses_the_browsed_directory_while_the_address_is_a_draft() {
+        let mut app = loaded_file();
+        drop(app.update_device(Action::Path("/remote/other-checkout".into())));
+        drop(app.update_device(Action::Git(GitOperation::Commit {
+            message: "change".into(),
+        })));
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::Git { root, .. })
+            if root == Path::new("/remote/project"))
+        );
+        assert_eq!(app.device_ui.directory, Path::new("/remote/project"));
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+    }
+
+    #[test]
+    fn linked_file_browses_its_parent_then_reads_and_positions_the_file() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update_device(Action::OpenFile {
+            path: "/remote/project/src/main.rs".into(),
+            fragment: Some("L2:3".into()),
+        }));
+        assert!(app.device_ui.open);
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::List { path })
+            if path == Path::new("/remote/project/src"))
+        );
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Directory {
+                path: "/remote/project/src".into(),
+                entries: vec![],
+            }),
+        }));
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::Read { root, path })
+            if root == Path::new("/remote/project/src") && path == Path::new("main.rs"))
+        );
+        assert_eq!(
+            app.device_ui.linked_file.as_deref(),
+            Some(Path::new("main.rs")),
+            "The link keeps focus intent until its read succeeds"
+        );
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("first\nsecond\nthird".into())),
+        }));
+        assert_eq!(app.device_ui.file.as_deref(), Some(Path::new("main.rs")));
+        assert_eq!(
+            app.device_ui.content.cursor().position,
+            text_editor::Position { line: 1, column: 2 }
+        );
+        assert!(app.device_ui.linked_file.is_none());
+        assert!(app.device_ui.linked_fragment.is_none());
+        assert!(!app.device_ui.dirty());
+    }
+
+    #[test]
+    fn remote_sidebar_presentation_stays_in_the_sidebar() {
+        for action in [
+            SidebarAction::SearchChanged("project".into()),
+            SidebarAction::SearchChanged(String::new()),
+            SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
+            SidebarAction::ToggleControls,
+            SidebarAction::FocusFirstSearchResult,
+            SidebarAction::OpenFirstSearchResult,
+            SidebarAction::Resize { width: 300.0 },
+            SidebarAction::ResizeFinished,
+        ] {
+            assert!(supports_sidebar_action(&action));
+        }
+        assert!(!supports_sidebar_action(
+            &SidebarAction::OpenRepositoryPicker
+        ));
+    }
+
+    #[test]
+    fn linked_coordinates_preserve_unicode_boundaries_and_clamp_to_the_file() {
+        let mut state = State::default();
+        state.content = text_editor::Content::with_text("first\néx");
+        state.jump_to_fragment("L2:2");
+        assert_eq!(
+            state.content.cursor().position,
+            text_editor::Position { line: 1, column: 2 }
+        );
+        state.jump_to_fragment("L99:99");
+        assert_eq!(
+            state.content.cursor().position,
+            text_editor::Position { line: 1, column: 3 }
+        );
     }
 
     fn loaded_file() -> Cagents {
@@ -1129,6 +1445,10 @@ mod tests {
         for action in [
             Action::Close,
             Action::Open,
+            Action::OpenFile {
+                path: "/other/file.rs".into(),
+                fragment: Some("L2".into()),
+            },
             Action::Configure,
             Action::Browse,
             Action::Visit("/elsewhere".into()),
