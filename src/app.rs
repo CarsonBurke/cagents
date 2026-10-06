@@ -15942,132 +15942,130 @@ impl Application for Cagents {
                         .map(|name| name.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "Workspace".into());
-            let action_buttons = || {
-                let buttons: Vec<Element<'_, Message>> = vec![
-                    crate::interaction::tooltip(
-                        widget::button::suggested("New thread")
-                            .name("New thread")
-                            .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                                chrome_ui::NewTab::Thread,
-                            ))),
-                        workspace_widget::shortcut_tooltip(
-                            workspace_widget::GlobalShortcut::NewThread,
-                            &self.settings.keyboard_shortcuts,
-                        ),
+            let quick = |glyph, label, id, message| {
+                Element::from(
+                    crate::ui_controls::icon_control(
+                        crate::ui_controls::symbolic_icon(glyph),
+                        label,
+                        false,
+                        true,
+                        Some(message),
                     )
-                    .into(),
-                    widget::button::standard("Resume conversation")
-                        .id(widget::Id::new("empty.resume-conversation"))
-                        .on_press(Message::ResumeConversation(resume_ui::Action::Open))
-                        .into(),
-                    crate::interaction::tooltip(
-                        widget::button::standard("New terminal")
-                            .id(widget::Id::new("empty.new-terminal"))
-                            .name("New terminal")
-                            .leading_icon(crate::ui_controls::symbolic_icon(
-                                "utilities-terminal-symbolic",
-                            ))
-                            .on_press(Message::NewTerminal),
-                        workspace_widget::shortcut_tooltip(
-                            workspace_widget::GlobalShortcut::NewTerminal,
-                            &self.settings.keyboard_shortcuts,
-                        ),
-                    )
-                    .into(),
-                    widget::button::standard(if cfg!(feature = "integrated-browser") {
+                    .id(widget::Id::new(id)),
+                )
+            };
+            let mut actions: Vec<Element<'_, Message>> = vec![
+                crate::interaction::tooltip(
+                    widget::button::suggested("New conversation")
+                        .name("New conversation")
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "chat-bubble-text-symbolic",
+                        ))
+                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                            chrome_ui::NewTab::Thread,
+                        ))),
+                    workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::NewThread,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                ),
+                quick(
+                    "document-open-recent-symbolic",
+                    "Resume conversation".to_owned(),
+                    "empty.resume-conversation",
+                    Message::ResumeConversation(resume_ui::Action::Open),
+                ),
+                quick(
+                    "utilities-terminal-symbolic",
+                    workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::NewTerminal,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                    "empty.new-terminal",
+                    Message::NewTerminal,
+                ),
+                quick(
+                    "internet-web-browser-symbolic",
+                    if cfg!(feature = "integrated-browser") {
                         "New browser"
                     } else {
-                        "Open in system browser…"
-                    })
-                    .id(widget::Id::new("empty.new-browser"))
-                    .name("New browser")
-                    .leading_icon(crate::ui_controls::symbolic_icon(
-                        "internet-web-browser-symbolic",
-                    ))
-                    .on_press(Message::NewBrowser)
+                        "Open in system browser"
+                    }
+                    .to_owned(),
+                    "empty.new-browser",
+                    Message::NewBrowser,
+                ),
+                quick(
+                    "avatar-default-symbolic",
+                    "Agent accounts".to_owned(),
+                    "empty.accounts",
+                    Message::AccountUi(account_ui::Action::OpenPane),
+                ),
+            ];
+            if !scoped {
+                actions.pop();
+            }
+            let primary = actions.remove(0);
+            let actions = widget::column::with_children(vec![
+                primary,
+                widget::row::with_children(actions)
+                    .align_y(Alignment::Center)
+                    .spacing(8)
                     .into(),
-                ];
-                buttons
-            };
-            let actions: Element<'_, Message> = if matches!(
-                design::ShellLayout::for_width(window_width).dock,
-                DockLayout::Overlay
-            ) {
-                widget::column::with_children(action_buttons())
-                    .spacing(spacing.space_xxs)
-                    .width(Length::Fill)
-                    .into()
-            } else {
-                // The welcome card is narrower than the window. Keep conversation
-                // and tool actions on separate rows so every action fits its card.
-                let mut conversations = action_buttons();
-                let tools = conversations.split_off(2);
-                widget::column::with_children(vec![
-                    widget::row::with_children(conversations)
-                        .spacing(spacing.space_xxs)
-                        .into(),
-                    widget::row::with_children(tools)
-                        .spacing(spacing.space_xxs)
-                        .into(),
-                ])
-                .spacing(spacing.space_xxs)
-                .into()
-            };
-            let surface = widget::container(
-                widget::column::with_children(vec![
-                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
-                        .icon()
-                        .size(32)
-                        .into(),
-                    widget::text::title2(if scoped {
-                        format!("{scope_name} has no panes")
-                    } else {
-                        "Start a workspace".into()
-                    })
-                    .into(),
-                    widget::text::body(if scoped {
-                        "Start a thread or terminal in this workspace."
-                    } else {
-                        "Start a conversation or terminal, or open a project folder."
-                    })
-                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                    .into(),
-                    design::caption(format!("Directory: {}", display_path(&directory)))
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                        .into(),
-                    actions,
-                    if scoped {
-                        iced::widget::Space::new().into()
-                    } else {
-                        let mut providers: Vec<Element<'_, Message>> = crate::agent::Provider::ALL
+            ])
+            .spacing(12);
+            let mut content: Vec<Element<'_, Message>> = vec![
+                crate::ui_controls::passive_icon(
+                    crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic"),
+                    32,
+                ),
+                widget::text::title2(if scoped {
+                    scope_name
+                } else {
+                    "Workspace".into()
+                })
+                .into(),
+                crate::interaction::tooltip(
+                    design::caption(display_path(&directory).into_owned())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill),
+                    directory.display().to_string(),
+                ),
+                actions.into(),
+            ];
+            if !scoped {
+                content.push(
+                    widget::row::with_children(
+                        crate::agent::Provider::ALL
                             .into_iter()
                             .map(|provider| {
-                                widget::row::with_children(vec![
-                                    design::body(provider.label()).width(Length::Fill).into(),
-                                    design::caption(self.account_ui.provider_status(provider))
-                                        .into(),
-                                ])
-                                .spacing(design::GRID_UNIT * 2.0)
-                                .into()
+                                let status = self.account_ui.provider_status(provider);
+                                let control = crate::ui_controls::icon_control(
+                                    crate::ui_controls::provider_icon(provider),
+                                    format!("{} · {status} · Manage accounts", provider.label()),
+                                    false,
+                                    true,
+                                    Some(Message::AccountUi(account_ui::Action::OpenPane)),
+                                );
+                                Element::from(if status == "Account available" {
+                                    control.icon_tone(design::Tone::Themed(design::success_color))
+                                } else {
+                                    control
+                                })
                             })
-                            .collect();
-                        providers.push(
-                            widget::button::standard("Manage agent accounts")
-                                .on_press(Message::AccountUi(account_ui::Action::OpenPane))
-                                .into(),
-                        );
-                        widget::column::with_children(providers)
-                            .spacing(design::GRID_UNIT)
-                            .into()
-                    },
-                ])
-                .spacing(spacing.space_s)
-                .max_width(CONTENT_MAX_WIDTH),
-            )
-            .class(cosmic::theme::Container::Card)
-            .padding(spacing.space_m)
-            .width(Length::Fill)
-            .max_width(CONTENT_MAX_WIDTH);
+                            .collect::<Vec<_>>(),
+                    )
+                    .spacing(12)
+                    .into(),
+                );
+            }
+            let surface = widget::container(widget::column::with_children(content).spacing(16))
+                .padding(24)
+                .width(Length::Fill)
+                .max_width(440);
             widget::container(surface)
                 .center(Length::Fill)
                 .padding(spacing.space_m)
@@ -18692,6 +18690,39 @@ mod tests {
         log.clear();
         assert!(log.is_empty());
         assert_eq!(log.severity(), None);
+    }
+
+    #[test]
+    fn empty_workspace_exposes_provider_status_on_real_account_controls() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let app = context_inspector_test_app(false);
+        let renderer = headless_renderer();
+        let mut element = app.view();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1200.0, 800.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        for provider in crate::agent::Provider::ALL {
+            let expected = format!(
+                "{} · {} · Manage accounts",
+                provider.label(),
+                app.account_ui.provider_status(provider)
+            );
+            assert!(
+                nodes.root().iter().chain(nodes.children()).any(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(expected.as_str())
+                }),
+                "provider identity and status must remain accessible: {expected}"
+            );
+        }
     }
 
     #[test]
