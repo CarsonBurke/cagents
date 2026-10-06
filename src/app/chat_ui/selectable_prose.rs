@@ -471,6 +471,11 @@ mod tests {
                 .as_widget()
                 .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
         assert_eq!(first.root()[0].id(), second.root()[0].id());
+        let bounds = first.root()[0].node().bounds().unwrap();
+        assert_eq!(
+            (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+            (12.0, 13.0, 92.0, 53.0)
+        );
         assert_eq!(first.root()[0].node().value(), Some("α first\nβ second"));
         assert_eq!(
             first.root()[0].node().role(),
