@@ -2738,6 +2738,7 @@ pub struct SidebarState {
     /// Change review starts open; only folders the user folded are stored.
     collapsed_change_directories: BTreeMap<ChangeTreeScope, BTreeSet<RepoPath>>,
     change_pages: BTreeMap<ChangeTreeScope, usize>,
+    files_page: usize,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
     panel_selection: Option<PanelSelection>,
@@ -3063,6 +3064,7 @@ impl SidebarState {
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
         self.change_pages.clear();
+        self.files_page = 0;
         // Every section is one worktree's change area now, not a view of the
         // panel, so none of their disclosures carry to the next worktree.
         self.toggled_sections.clear();
@@ -3136,11 +3138,14 @@ impl SidebarState {
                 toggle_membership(&mut self.toggled_sections, *section);
             }
             SidebarAction::ToggleSourceControlPanel { .. } => self.panel_open = !self.panel_open,
+            SidebarAction::FilesPage { page, .. } => self.files_page = *page,
             SidebarAction::FilesQueryChanged { query, .. } => {
+                self.files_page = 0;
                 self.files_query.clone_from(query);
                 self.files_filter_open = true;
             }
             SidebarAction::ToggleFilesFilter { .. } => {
+                self.files_page = 0;
                 self.files_filter_open = !self.files_filter_open;
                 if !self.files_filter_open {
                     self.files_query.clear();
@@ -3473,6 +3478,10 @@ pub enum SidebarAction {
     },
     ToggleFilesFilter {
         key: ActiveWorktreeKey,
+    },
+    FilesPage {
+        key: ActiveWorktreeKey,
+        page: usize,
     },
     FilesQueryChanged {
         key: ActiveWorktreeKey,
@@ -7251,13 +7260,15 @@ fn files_section<'a>(
         FileSearch::Pending { query }
             if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
         {
-            let (visible, hidden) = visible_file_rows(
+            let (visible, hidden) = file_row_page(
                 &source.files,
                 &state.expanded_directories,
                 &folded,
                 true,
                 false,
+                state.files_page,
             );
+            let hidden = hidden.saturating_sub(visible.len());
             (visible, hidden, Some("Searching…"))
         }
         FileSearch::Ready {
@@ -7274,12 +7285,13 @@ fn files_section<'a>(
             (Vec::new(), 0, Some(message.as_str()))
         }
         _ => {
-            let (visible, hidden) = visible_file_rows(
+            let (visible, hidden) = file_row_page(
                 &source.files,
                 &state.expanded_directories,
                 &folded,
                 flat,
                 false,
+                state.files_page,
             );
             let notice = if source.files.is_empty() {
                 Some("This worktree has no tracked files.")
@@ -7287,6 +7299,11 @@ fn files_section<'a>(
                 Some("No files match this filter.")
             } else {
                 None
+            };
+            let hidden = if flat {
+                hidden.saturating_sub(visible.len())
+            } else {
+                hidden
             };
             (visible, hidden, notice)
         }
@@ -7318,12 +7335,16 @@ fn files_section<'a>(
         );
         let identity = panel_row(
             &*chrome.accessible_name,
-            if flat { 0 } else { row.depth },
+            if flat || state.files_page > 0 {
+                0
+            } else {
+                row.depth
+            },
             widget::row::with_children(vec![
                 widget::container(file_icon)
                     .center_x(Length::Fixed(ROW_ICON_WIDTH))
                     .into(),
-                design::body(if flat {
+                design::body(if flat || state.files_page > 0 {
                     row.path.display()
                 } else {
                     Cow::Borrowed(&*chrome.label)
@@ -7370,7 +7391,7 @@ fn files_section<'a>(
     }
     let list = widget::column::with_children(vec![
         rows.into(),
-        slot((hidden > 0).then(|| {
+        slot((flat && hidden > 0).then(|| {
             design::caption(format!("{hidden} more files not shown — narrow the filter"))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into()
@@ -7400,12 +7421,46 @@ fn files_section<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into(),
+        if flat {
+            cosmic::iced::widget::Space::new().height(0).into()
+        } else {
+            file_pager(state, key, hidden, modal_open)
+        },
     ])
     .height(Length::Fill)
     .into()
 }
 
-/// The file rows a frame renders, and how many further rows the cap hid.
+fn file_pager<'a>(
+    state: &SidebarState,
+    key: &ActiveWorktreeKey,
+    total: usize,
+    disabled: bool,
+) -> Element<'a, SidebarAction> {
+    if total <= MAX_VISIBLE_FILE_ROWS {
+        return cosmic::iced::widget::Space::new().height(0).into();
+    }
+    let last = total.saturating_sub(1) / MAX_VISIBLE_FILE_ROWS;
+    let page = state.files_page.min(last);
+    let action = |page| {
+        gated(
+            SidebarAction::FilesPage {
+                key: key.clone(),
+                page,
+            },
+            disabled,
+        )
+    };
+    widget::column::with_children(vec![
+        design::caption(format!("{}–{} of {total}", page * MAX_VISIBLE_FILE_ROWS + 1, ((page + 1) * MAX_VISIBLE_FILE_ROWS).min(total))).into(),
+        widget::row::with_children(vec![
+            button::standard("Previous").width(Length::Fill).on_press_maybe((page > 0).then(|| action(page - 1)).flatten()).into(),
+            button::standard("Next").width(Length::Fill).on_press_maybe((page < last).then(|| action(page + 1)).flatten()).into(),
+        ]).spacing(design::GRID_UNIT).into(),
+    ]).spacing(design::GRID_UNIT).padding(design::GRID_UNIT).into()
+}
+
+/// One bounded page of browsable file rows and the total visible row count.
 ///
 /// Flat mode and queries show file paths without directory rows. Tree mode
 /// shows only the children of expanded directories: everything starts
@@ -7418,6 +7473,7 @@ fn files_section<'a>(
 /// paths must not make a frame fill - and drop - a hundred-thousand-entry
 /// vector to render four hundred rows. Counting the remainder allocates
 /// nothing.
+#[cfg(test)]
 fn visible_file_rows<'a>(
     rows: &'a [FileRow],
     expanded: &BTreeSet<RepoPath>,
@@ -7425,20 +7481,31 @@ fn visible_file_rows<'a>(
     flat: bool,
     expand_all: bool,
 ) -> (Vec<&'a FileRow>, usize) {
+    file_row_page(rows, expanded, folded_query, flat, expand_all, 0)
+}
+
+fn file_row_page<'a>(
+    rows: &'a [FileRow],
+    expanded: &BTreeSet<RepoPath>,
+    folded_query: &str,
+    flat: bool,
+    expand_all: bool,
+    page: usize,
+) -> (Vec<&'a FileRow>, usize) {
     let mut visible: Vec<&'a FileRow> = Vec::with_capacity(rows.len().min(MAX_VISIBLE_FILE_ROWS));
-    let mut hidden = 0usize;
+    let start = page.saturating_mul(MAX_VISIBLE_FILE_ROWS);
+    let mut count = 0usize;
     if flat {
         for row in rows {
             if row.directory || !row.chrome.folded.contains(folded_query) {
                 continue;
             }
-            if visible.len() < MAX_VISIBLE_FILE_ROWS {
+            if count >= start && visible.len() < MAX_VISIBLE_FILE_ROWS {
                 visible.push(row);
-            } else {
-                hidden += 1;
             }
+            count += 1;
         }
-        return (visible, hidden);
+        return (visible, count);
     }
     let mut skip_below: Option<usize> = None;
     for row in rows {
@@ -7448,16 +7515,25 @@ fn visible_file_rows<'a>(
             }
             skip_below = None;
         }
-        if visible.len() < MAX_VISIBLE_FILE_ROWS {
+        if count >= start && visible.len() < MAX_VISIBLE_FILE_ROWS {
             visible.push(row);
-        } else {
-            hidden += 1;
         }
+        count += 1;
         if row.directory && !expand_all && !expanded.contains(&row.path) {
             skip_below = Some(row.depth);
         }
     }
-    (visible, hidden)
+    if visible.is_empty() && count > 0 && page > 0 {
+        return file_row_page(
+            rows,
+            expanded,
+            folded_query,
+            flat,
+            expand_all,
+            (count - 1) / MAX_VISIBLE_FILE_ROWS,
+        );
+    }
+    (visible, count)
 }
 
 /// Change trees start expanded. A folded directory hides its descendants
@@ -15510,6 +15586,34 @@ pub(crate) mod tests {
         let mut restored = SidebarState::default();
         restored.restore_view(serde_json::from_str(&serialized).unwrap());
         assert_eq!(paths(&restored, scope, false), ["src", "README.md"]);
+    }
+
+    #[test]
+    fn file_pages_reach_later_siblings_without_mounting_the_entire_tree() {
+        let paths = (0..450)
+            .map(|i| repo_path(&format!("early/file-{i:03}.txt")))
+            .chain(std::iter::once(repo_path("later/file.txt")))
+            .collect::<Vec<_>>();
+        let rows = file_rows(&paths);
+        let expanded = BTreeSet::from([repo_path("early")]);
+        let (first, total) = file_row_page(&rows, &expanded, "", false, false, 0);
+        assert_eq!(first.len(), MAX_VISIBLE_FILE_ROWS);
+        assert_eq!(total, 452);
+        let (second, _) = file_row_page(&rows, &expanded, "", false, false, 1);
+        assert_eq!(second.len(), 52);
+        assert_eq!(second.last().unwrap().path, repo_path("later"));
+        let (clamped, total) = file_row_page(&rows, &BTreeSet::new(), "", false, false, 1);
+        assert_eq!(total, 2);
+        assert_eq!(clamped.len(), 2);
+        let top_level = file_rows(
+            &(0..450)
+                .map(|i| repo_path(&format!("file-{i:03}.txt")))
+                .collect::<Vec<_>>(),
+        );
+        let (last, total) = file_row_page(&top_level, &BTreeSet::new(), "", false, false, 1);
+        assert_eq!(total, 450);
+        assert_eq!(last.len(), 50);
+        assert_eq!(last.last().unwrap().path, repo_path("file-449.txt"));
     }
 
     #[test]

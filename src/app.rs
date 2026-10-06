@@ -13587,6 +13587,7 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
                     | SidebarAction::SetChangeListMode { .. }
+                    | SidebarAction::FilesPage { .. }
                     | SidebarAction::ChangePage { .. }
                     | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
