@@ -300,6 +300,15 @@ struct InputCapture<'a> {
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for InputCapture<'_> {
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(layout, tree, cursor)
+    }
+
     fn tag(&self) -> tree::Tag {
         self.content.as_widget().tag()
     }
@@ -432,6 +441,17 @@ impl Operation for SetBottom {
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<Anchor>()
     }
@@ -702,6 +722,24 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_capture_and_anchor_preserve_accessible_children() {
+        let captured = Rc::new(Cell::new(false));
+        let child = Element::new(InputCapture {
+            content: Element::new(crate::ui_controls::accessibility_probe::Probe),
+            captured,
+        });
+        let element = tool_output(child);
+        let tree = Tree::new(&element);
+        let node = layout::Node::new(Size::new(80.0, 40.0));
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node).with_virtual_offset(Vector::new(0.0, 37.0)),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(nodes.root().len(), 1);
+        assert_eq!(nodes.root()[0].node().label(), Some("Retained child"));
+    }
 
     fn geometry(height: f32) -> Geometry {
         Geometry {

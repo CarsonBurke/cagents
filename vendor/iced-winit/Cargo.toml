@@ -1,0 +1,88 @@
+[package]
+name = "iced_winit"
+description = "A runtime for iced on top of winit"
+version = "0.14.0"
+edition = "2024"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+homepage = "https://iced.rs"
+categories = ["gui"]
+keywords = ["gui", "ui", "graphics", "interface", "widgets"]
+
+
+[features]
+wayland = [
+    "winit/wayland",
+    "wayland-csd-adwaita",
+    "wayland-protocols",
+    "raw-window-handle",
+    "iced_runtime/wayland",
+    "wayland-backend",
+    "xkbcommon",
+    "xkbcommon-dl",
+    "xkeysym",
+    "dep:cctk",
+]
+default = ["x11", "wayland-dlopen"]
+debug = ["iced_debug/enable"]
+sysinfo = ["dep:sysinfo"]
+unconditional-rendering = []
+linux-theme-detection = ["dep:mundy", "mundy/async-io", "mundy/color-scheme"]
+x11 = ["winit/x11"]
+system = ["sysinfo"]
+program = []
+wayland-dlopen = ["winit/wayland-dlopen"]
+wayland-csd-adwaita = ["winit/wayland-csd-adwaita"]
+a11y = ["iced_accessibility", "iced_runtime/a11y"]
+# Prevents multiple separate process instances.
+single-instance = []
+
+
+[dependencies]
+iced_futures = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_graphics = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_runtime = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true, features = ["accesskit_winit"] }
+log = { version = "0.4" }
+rustc-hash = { version = "2.0" }
+thiserror = { version = "2" }
+window_clipboard = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+dnd = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+winit = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14" }
+winit-core = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14" }
+cursor-icon = { version = "1.1.0" }
+
+sysinfo = { version = "0.33", optional = true }
+
+iced_debug = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_program = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+
+
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
+
+mundy = { version = "0.2", default-features = false, optional = true }
+
+raw-window-handle = { version = "0.6", optional = true }
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "32283d7", optional = true }
+wayland-protocols = { version = "0.32.1", features = ["staging"], optional = true }
+wayland-client = { version = "0.31.5" }
+wayland-backend = { version = "0.3.1", features = [
+    "client_system",
+], optional = true }
+xkbcommon = { version = "0.7", features = ["wayland"], optional = true }
+xkbcommon-dl = { version = "0.4.1", optional = true }
+xkeysym = { version = "0.2.0", optional = true }
+rustix = { version = "0.38" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3.69", features = ["Document", "Window", "HtmlCanvasElement"] }
+wasm-bindgen-futures = { version = "0.4" }
+
+[build-dependencies]
+build_helpers = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+
+[workspace]

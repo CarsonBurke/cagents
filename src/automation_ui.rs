@@ -999,7 +999,7 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
-        cosmic::iced::widget::responsive(move |size| self.view_layout(size.width)).into()
+        crate::ui_controls::responsive(move |size| self.view_layout(size.width)).into()
     }
 
     fn view_layout(&self, width: f32) -> Element<'_, Action> {

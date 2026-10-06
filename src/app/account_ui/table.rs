@@ -283,7 +283,7 @@ fn rows<'a>(state: &'a State, provider: Provider, sort: Sort) -> Vec<&'a Account
 }
 
 pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
-    iced::widget::responsive(move |size| table(app, size.width)).into()
+    crate::ui_controls::responsive(move |size| table(app, size.width)).into()
 }
 
 fn table(app: &Cagents, width: f32) -> Element<'_, Message> {

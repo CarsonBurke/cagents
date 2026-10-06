@@ -1,5 +1,10 @@
 //! Compact, keyboard-accessible icon tabs and toolbar actions.
 
+#[cfg(test)]
+pub(crate) mod accessibility_probe;
+mod responsive;
+pub use responsive::responsive;
+
 use std::borrow::Cow;
 
 use cosmic::{

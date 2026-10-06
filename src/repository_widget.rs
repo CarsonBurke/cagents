@@ -8895,7 +8895,7 @@ fn diff_model_view<'a>(
             format!("{old_label} and {new_label} hold identical text."),
         )
     } else {
-        iced::widget::responsive(move |size| {
+        crate::ui_controls::responsive(move |size| {
             // One native two-axis scrollable owns both coordinates. The canvas
             // counter-translates the fixed gutters/center; only code moves in X.
             let gutter =

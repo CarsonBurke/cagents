@@ -421,6 +421,17 @@ impl Operation for Apply<'_> {
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
     }
@@ -862,6 +873,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selection_preserves_accessible_child_state_and_offset() {
+        let element = surface(Element::new(crate::ui_controls::accessibility_probe::Probe));
+        let tree = Tree::new(&element);
+        let node = layout::Node::new(Size::new(80.0, 40.0));
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node).with_virtual_offset(Vector::new(0.0, 37.0)),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(nodes.root().len(), 1);
+        assert_eq!(nodes.root()[0].node().label(), Some("Retained child"));
+    }
     fn surface<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
         Element::new(Selection {
             content: content.into(),
