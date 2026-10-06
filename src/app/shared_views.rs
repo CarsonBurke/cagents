@@ -579,7 +579,14 @@ impl Cagents {
             }
 
             if let CardKind::Repository(repository) = &mut projected.kind {
-                if let Some(project) = self.project_for_repository(&repository.repository) {
+                if let Some(project) =
+                    self.project_for_repository(&repository.repository)
+                        .or_else(|| {
+                            self.sidebar_model
+                                .worktree_at(&repository.worktree)
+                                .map(|key| key.project_id)
+                        })
+                {
                     repository.project = project;
                 }
             }
@@ -777,12 +784,37 @@ impl Cagents {
             Residency::Cold,
             Instant::now(),
         );
-        match &pane.kind {
+        let task = match &pane.kind {
             CardKind::Chat(session) => {
-                self.open_chat(pane.id, session.clone(), crate::chat::Intent::Restore)
+                return self.open_chat(pane.id, session.clone(), crate::chat::Intent::Restore);
             }
-            _ => Task::none(),
+            CardKind::Repository(view) => self.attach_repository_pane(pane.id, view.clone()),
+            CardKind::PullRequests(view) => self.attach_pull_request_pane(pane.id, view.clone()),
+            kind @ (CardKind::Settings | CardKind::Accounts | CardKind::Automations) => {
+                self.cards.insert(pane.id, CardRuntime::utility(kind));
+                if matches!(kind, CardKind::Automations) {
+                    self.update_automation_ui(crate::automation_ui::Action::Refresh)
+                } else {
+                    Task::none()
+                }
+            }
+            #[cfg(not(feature = "integrated-browser"))]
+            CardKind::Browser(_) => {
+                self.cards.insert(pane.id, CardRuntime::Failed(
+                    "This cagents build does not include the integrated browser. Open the saved URL in your system browser.".into(),
+                ));
+                Task::none()
+            }
+            _ => return Task::none(),
+        };
+        // Lightweight panes are ready immediately; terminal/browser engines
+        // continue through their deferred lifecycle hydration above.
+        self.lifecycle
+            .register(pane.id, Exposure::Offscreen, Residency::Hot, Instant::now());
+        if let Some(card) = self.card_state_mut(pane.id) {
+            card.residency = Residency::Hot;
         }
+        task
     }
 
     /// Passive removal detaches surfaces; it never calls a host close request.
@@ -947,6 +979,212 @@ mod tests {
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
     }
+    #[test]
+    fn shared_pull_request_adoption_initializes_native_viewer() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = CardKind::PullRequests(crate::model::PullRequestView {
+            repository: PathBuf::from("/repo/.git"),
+            selected_number: None,
+            file_panel_width: None,
+            file_panel_collapsed: None,
+        });
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::PullRequests(_))
+        ));
+        assert_eq!(app.card_state(pane.id).unwrap().residency, Residency::Hot);
+    }
+
+    #[test]
+    fn remote_shared_native_panes_do_not_initialize_local_viewers() {
+        // Device selection is process-wide and cannot be reset. Test the real
+        // remote guards without changing the backend of parallel local tests.
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_NATIVE_PANES";
+        if std::env::var_os(CHILD).is_none() {
+            let config = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "app::shared_views::tests::",
+                        "remote_shared_native_panes_do_not_initialize_local_viewers"
+                    ),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", config.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let config = crate::device::configuration_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "devices": [{"name": "test-remote", "host": "localhost", "executable": "cagents"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::device::select(Some("test-remote")).unwrap();
+        let (mut app, channel, _, mut pane) = fixture();
+        let repository = PathBuf::from("/remote-only/project");
+        for kind in [
+            CardKind::Repository(RepositoryView {
+                project: ProjectId::new(),
+                repository: repository.clone(),
+                worktree: repository.clone(),
+                selected_file: Some("file.rs".into()),
+            }),
+            CardKind::PullRequests(crate::model::PullRequestView {
+                repository,
+                selected_number: Some(1),
+                file_panel_width: None,
+                file_panel_collapsed: None,
+            }),
+        ] {
+            pane.kind = kind.clone();
+            let mut view = View::empty(channel);
+            view.panes.push(pane.clone());
+            drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+            assert!(
+                matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(reason))
+                if reason.contains("unavailable on remote devices"))
+            );
+            assert_eq!(app.card_state(pane.id).unwrap().kind, kind);
+        }
+    }
+
+    #[test]
+    fn shared_repository_adoption_and_retarget_initialize_native_viewers() {
+        let (mut app, channel, _, mut pane) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let repository = RepositoryView {
+            project: ProjectId::from_uuid(uuid::Uuid::nil()),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: Some(PathBuf::from("first.rs")),
+        };
+        pane.kind = CardKind::Repository(repository.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("a shared repository must start its native viewer immediately");
+        };
+        assert_eq!(runtime.selected_path(), Some(Path::new("first.rs")));
+        assert_eq!(app.card_state(pane.id).unwrap().residency, Residency::Hot);
+
+        let mut replacement = repository;
+        replacement.selected_file = Some(PathBuf::from("second.rs"));
+        view.panes[0].kind = CardKind::Repository(replacement.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("a replacement shared descriptor must start a new viewer");
+        };
+        assert_eq!(runtime.descriptor, replacement);
+        assert_eq!(runtime.selected_path(), Some(Path::new("second.rs")));
+    }
+
+    #[test]
+    fn checkout_descriptors_keep_local_project_and_live_repository_selection() {
+        let (mut app, channel, _, mut pane) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            root.path().join(".git"),
+            vec![crate::sidebar::SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                root.path().to_path_buf(),
+                Some("main".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        ));
+        let descriptor = RepositoryView {
+            project,
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: None,
+        };
+        pane.kind = CardKind::Repository(descriptor.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let mut runtime = RepositoryRuntime::file_list_fixture(descriptor.clone(), &["first.rs"]);
+        drop(runtime.update(RepositoryAction::OpenFile {
+            card: pane.id,
+            path: "first.rs".into(),
+        }));
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        view.panes[0].kind = views::shared_kind(&pane.kind);
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("the local repository runtime must remain attached");
+        };
+        assert_eq!(runtime.descriptor.project, project);
+        assert_eq!(
+            runtime.selected_path(),
+            Some(Path::new("first.rs")),
+            "remapping a window-local project identity must not recreate its live viewer"
+        );
+    }
+
+    #[test]
+    fn retargeted_shared_repository_preserves_unsaved_document() {
+        let (mut app, channel, _, mut pane) = fixture();
+        let runtime = RepositoryRuntime::dirty_fixture(pane.id);
+        let original = runtime.descriptor.clone();
+        pane.kind = CardKind::Repository(original.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        let mut replacement = original.clone();
+        replacement.selected_file = Some(PathBuf::from("other.rs"));
+        view.panes[0].kind = CardKind::Repository(replacement);
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("shared metadata must not discard an unsaved document");
+        };
+        assert!(runtime.is_dirty());
+        assert_eq!(runtime.descriptor, original);
+    }
+
+    #[cfg(not(feature = "integrated-browser"))]
+    #[test]
+    fn browserless_shared_browser_keeps_saved_descriptor_and_external_open_state() {
+        let (mut app, channel, _, pane) = fixture();
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(
+            matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(reason))
+            if reason.contains("Open the saved URL in your system browser"))
+        );
+    }
+
     #[test]
     fn two_clients_project_identical_pane_ids_and_peer_removal() {
         let (mut first, a, _, pane) = fixture();

@@ -5244,25 +5244,10 @@ impl Cagents {
                     );
                 }
                 CardKind::Repository(view) => {
-                    let mut runtime = self.repository_runtime(view);
-                    runtime.set_auto_save(self.settings.editor_auto_save);
-                    runtime.set_editor_font(
-                        crate::terminal::monospace_font(self.settings.editor_font_family()),
-                        self.settings.editor_font_size(),
-                    );
-                    runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                    drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-                    runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-                    repository_tasks.push(repository_task(runtime.initial_load(card.id)));
-                    self.cards
-                        .insert(card.id, CardRuntime::Repository(Box::new(runtime)));
+                    repository_tasks.push(self.attach_repository_pane(card.id, view));
                 }
                 CardKind::PullRequests(view) => {
-                    let pane = self.pull_request_pane(&view);
-                    self.cards
-                        .insert(card.id, CardRuntime::PullRequests(Box::new(pane)));
-                    repository_tasks.push(self.open_pending_pull_request(card.id));
+                    repository_tasks.push(self.attach_pull_request_pane(card.id, view));
                 }
                 kind @ (CardKind::Settings | CardKind::Accounts | CardKind::Automations) => {
                     if let Some(state) = self.card_state_mut(card.id) {
@@ -5865,28 +5850,8 @@ impl Cagents {
             CardKind::Browser(_) => self.retry_card(id),
             #[cfg(not(feature = "integrated-browser"))]
             CardKind::Browser(_) => unreachable!("browserless clones open externally"),
-            CardKind::Repository(view) => {
-                let mut runtime = self.repository_runtime(view);
-                runtime.set_auto_save(self.settings.editor_auto_save);
-                runtime.set_editor_font(
-                    crate::terminal::monospace_font(self.settings.editor_font_family()),
-                    self.settings.editor_font_size(),
-                );
-                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-                runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-                let load = repository_task(runtime.initial_load(id));
-                self.cards
-                    .insert(id, CardRuntime::Repository(Box::new(runtime)));
-                load
-            }
-            CardKind::PullRequests(view) => {
-                let pane = self.pull_request_pane(&view);
-                self.cards
-                    .insert(id, CardRuntime::PullRequests(Box::new(pane)));
-                self.open_pending_pull_request(id)
-            }
+            CardKind::Repository(view) => self.attach_repository_pane(id, view),
+            CardKind::PullRequests(view) => self.attach_pull_request_pane(id, view),
             CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes are refused before cloning")
             }
@@ -6611,8 +6576,17 @@ impl Cagents {
             .into()
     }
 
-    fn repository_runtime(&self, view: RepositoryView) -> RepositoryRuntime {
-        if self
+    /// Repository panes have no engine surface to hydrate. Start their reads
+    /// when attached, including when a shared descriptor replaces a local one.
+    fn attach_repository_pane(&mut self, card: CardId, view: RepositoryView) -> Task<Message> {
+        if crate::device::is_remote() {
+            self.cards.insert(
+                card,
+                CardRuntime::Failed("File viewing is unavailable on remote devices.".into()),
+            );
+            return Task::none();
+        }
+        let mut runtime = if self
             .sidebar_model
             .project(view.project)
             .is_some_and(|project| project.kind == ProjectKind::Folder)
@@ -6620,7 +6594,40 @@ impl Cagents {
             RepositoryRuntime::new_directory(view)
         } else {
             RepositoryRuntime::new(view)
+        };
+        runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_font(
+            crate::terminal::monospace_font(self.settings.editor_font_family()),
+            self.settings.editor_font_size(),
+        );
+        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_external_editors(self.sidebar_model.external_editors.clone());
+        let load = repository_task(runtime.initial_load(card));
+        self.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        load
+    }
+
+    fn attach_pull_request_pane(
+        &mut self,
+        card: CardId,
+        view: crate::model::PullRequestView,
+    ) -> Task<Message> {
+        if crate::device::is_remote() {
+            self.cards.insert(
+                card,
+                CardRuntime::Failed(
+                    "Pull request viewing is unavailable on remote devices.".into(),
+                ),
+            );
+            return Task::none();
         }
+        let pane = self.pull_request_pane(&view);
+        self.cards
+            .insert(card, CardRuntime::PullRequests(Box::new(pane)));
+        self.open_pending_pull_request(card)
     }
 
     fn folder_scope(&self, key: &ActiveWorktreeKey) -> bool {
@@ -6666,19 +6673,7 @@ impl Cagents {
         durable.cards.push(card);
         durable.focused = Some(card_id);
         self.register_channel_card(card_id);
-        let mut runtime = self.repository_runtime(view);
-        runtime.set_auto_save(self.settings.editor_auto_save);
-        runtime.set_editor_font(
-            crate::terminal::monospace_font(self.settings.editor_font_family()),
-            self.settings.editor_font_size(),
-        );
-        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-        drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-        runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-        let load = repository_task(runtime.initial_load(card_id));
-        self.cards
-            .insert(card_id, CardRuntime::Repository(Box::new(runtime)));
+        let load = self.attach_repository_pane(card_id, view);
         let index = self.workspace.cards().len();
         let update = self
             .workspace
@@ -7586,28 +7581,8 @@ impl Cagents {
             CardKind::Browser(_) => {
                 unreachable!("browserless retries return before mutating durable state")
             }
-            CardKind::Repository(view) => {
-                let mut runtime = self.repository_runtime(view);
-                runtime.set_auto_save(self.settings.editor_auto_save);
-                runtime.set_editor_font(
-                    crate::terminal::monospace_font(self.settings.editor_font_family()),
-                    self.settings.editor_font_size(),
-                );
-                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-                runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-                let task = repository_task(runtime.initial_load(card));
-                self.cards
-                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
-                task
-            }
-            CardKind::PullRequests(view) => {
-                let pane = self.pull_request_pane(&view);
-                self.cards
-                    .insert(card, CardRuntime::PullRequests(Box::new(pane)));
-                self.open_pending_pull_request(card)
-            }
+            CardKind::Repository(view) => self.attach_repository_pane(card, view),
+            CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
             CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
             CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes return before a retry registers them")
