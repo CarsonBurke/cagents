@@ -1987,6 +1987,28 @@ pub struct Startup {
     window_view: Option<WindowView>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PullRequestDescription(iced::widget::text_editor::Content);
+
+impl From<String> for PullRequestDescription {
+    fn from(value: String) -> Self {
+        Self(iced::widget::text_editor::Content::with_text(&value))
+    }
+}
+
+impl From<&str> for PullRequestDescription {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
+impl PartialEq for PullRequestDescription {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.text() == other.0.text()
+    }
+}
+impl Eq for PullRequestDescription {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestDialog {
     repository: GitHubRepoKey,
@@ -1996,7 +2018,7 @@ pub struct PullRequestDialog {
     base: String,
     head: String,
     title: String,
-    body: String,
+    body: PullRequestDescription,
     draft: bool,
     /// An uncertain remote outcome requires reconciliation before another create.
     retry_confirmation: Option<bool>,
@@ -4110,7 +4132,7 @@ pub enum Message {
     PullRequestBaseChanged(String),
     PullRequestHeadChanged(String),
     PullRequestTitleChanged(String),
-    PullRequestBodyChanged(String),
+    PullRequestBodyChanged(iced::widget::text_editor::Action),
     PullRequestDraftChanged(bool),
     PullRequestRetryConfirmed(bool),
     SubmitPullRequest,
@@ -13521,7 +13543,7 @@ impl Application for Cagents {
                             base,
                             head,
                             title: String::new(),
-                            body: String::new(),
+                            body: String::new().into(),
                             draft: false,
                             retry_confirmation: None,
                         });
@@ -14616,9 +14638,9 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::PullRequestBodyChanged(value) => {
+            Message::PullRequestBodyChanged(action) => {
                 if let Some(dialog) = &mut self.pull_request_dialog {
-                    dialog.body = value;
+                    dialog.body.0.perform(action);
                 }
                 Task::none()
             }
@@ -14669,7 +14691,7 @@ impl Application for Cagents {
                     base: dialog.base.clone(),
                     head: dialog.head.clone(),
                     title: dialog.title.clone(),
-                    body: dialog.body.clone(),
+                    body: dialog.body.0.text(),
                     draft: dialog.draft,
                     labels: Vec::new(),
                     reviewers: Vec::new(),
@@ -15824,9 +15846,10 @@ impl Application for Cagents {
             .into(),
             widget::column::with_children(vec![
                 design::caption("Description").into(),
-                widget::text_input("Description", &dialog.body)
-                    .id(widget::Id::new("dialog.pull-request.description"))
-                    .on_input(Message::PullRequestBodyChanged)
+                iced::widget::text_editor(&dialog.body.0)
+                    .placeholder("Describe the change (Markdown supported)")
+                    .height(160)
+                    .on_action(Message::PullRequestBodyChanged)
                     .into(),
             ])
             .spacing(spacing.space_xxxs)
@@ -15875,7 +15898,12 @@ impl Application for Cagents {
         );
         Some(dialog_ui::overlay(
             dialog_ui::surface(
-                widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+                widget::scrollable(
+                    widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+                )
+                .height(Length::Fixed(
+                    (self.window_height - 112.0).clamp(120.0, 620.0),
+                )),
                 620.0,
             ),
             Some(Message::CancelDialog),
@@ -19476,6 +19504,30 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_editor_preserves_multiline_markdown_on_rejection() {
+        let mut app = context_inspector_test_app(false);
+        let mut dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        dialog.title.clear();
+        app.pull_request_dialog = Some(dialog);
+        let markdown =
+            "Summary\n\n- [ ] First task\n- [x] Second task\n\n~~~rust\nlet value = 1;\n~~~";
+        let _ = app.update(Message::PullRequestBodyChanged(
+            iced::widget::text_editor::Action::SelectAll,
+        ));
+        let _ = app.update(Message::PullRequestBodyChanged(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                std::sync::Arc::new(markdown.into()),
+            )),
+        ));
+        let _ = app.update(Message::SubmitPullRequest);
+        assert_eq!(
+            app.pull_request_dialog.as_ref().unwrap().body.0.text(),
+            markdown
+        );
+    }
+
+    #[test]
     fn pull_request_local_rejection_preserves_authored_draft() {
         let mut app = context_inspector_test_app(false);
         let mut dialog = pull_request_test_dialog();
@@ -19537,9 +19589,16 @@ mod tests {
         assert_eq!(app.pull_request_dialog.as_ref(), Some(&expected));
 
         let revised_body = "Revised description after checking the remote".to_owned();
-        let _ = app.update(Message::PullRequestBodyChanged(revised_body.clone()));
+        let _ = app.update(Message::PullRequestBodyChanged(
+            iced::widget::text_editor::Action::SelectAll,
+        ));
+        let _ = app.update(Message::PullRequestBodyChanged(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                std::sync::Arc::new(revised_body.clone()),
+            )),
+        ));
         let _ = app.update(Message::SubmitPullRequest);
-        expected.body = revised_body;
+        expected.body = revised_body.into();
         assert_eq!(app.pull_request_dialog.as_ref(), Some(&expected));
 
         let _ = app.update(Message::PullRequestRetryConfirmed(true));
@@ -19595,7 +19654,11 @@ mod tests {
         let _ = app.update(Message::PullRequestTitleChanged("Newer PR".into()));
         let _ = app.update(Message::PullRequestHeadChanged("new-topic".into()));
         let _ = app.update(Message::PullRequestBaseChanged("trunk".into()));
-        let _ = app.update(Message::PullRequestBodyChanged("Newer description".into()));
+        let _ = app.update(Message::PullRequestBodyChanged(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                std::sync::Arc::new("Newer description".into()),
+            )),
+        ));
         let newer = app.pull_request_dialog.clone().unwrap();
         let failure = Message::PullRequestCreated {
             dialog,
@@ -20138,7 +20201,7 @@ mod tests {
             base: "main".into(),
             head: "topic".into(),
             title: String::new(),
-            body: String::new(),
+            body: String::new().into(),
             draft: false,
             retry_confirmation: None,
         });
