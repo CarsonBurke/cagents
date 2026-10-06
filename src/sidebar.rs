@@ -5088,11 +5088,10 @@ fn project_view<'a>(
             });
         }
         let ids = members.iter().map(|(_, row, _)| *row).collect();
-        let content = widget::column::with_children(
-            members.into_iter().map(|(_, _, element)| element).collect(),
-        )
-        .spacing(0)
-        .width(Length::Fill);
+        let content =
+            widget::column::with_children(members.into_iter().map(|(_, _, element)| element))
+                .spacing(0)
+                .width(Length::Fill);
         let disabled = entity
             .channels
             .iter()
@@ -9196,6 +9195,24 @@ struct FilteredProject<'a> {
     channels: Vec<&'a SidebarChannel>,
     editors: &'a [SidebarEditor],
     state: &'a SidebarState,
+}
+
+/// Cache each visible row's rank once; terminal redraws must not scan the
+/// complete durable order for every comparison.
+pub(crate) fn apply_navigation_order<T>(
+    rows: &mut [T],
+    order: &[crate::workspace_model::NavigationItem],
+    item: impl Fn(&T) -> crate::workspace_model::NavigationItem,
+) {
+    if order.is_empty() || rows.len() < 2 {
+        return;
+    }
+    let ranks: std::collections::HashMap<_, _> = order
+        .iter()
+        .enumerate()
+        .map(|(rank, item)| (item, rank))
+        .collect();
+    rows.sort_by_cached_key(|row| ranks.get(&item(row)).copied().unwrap_or(usize::MAX));
 }
 
 fn navigation_item(
@@ -13373,7 +13390,7 @@ pub(crate) mod tests {
     fn nested_member_drag_translates_accessibility_bounds_once_when_scrolled() {
         use cosmic::iced::{Vector, mouse};
         let renderer = headless_renderer();
-        let row = SelectionRow::Worktree(project_id(9), worktree_id(1));
+        let row = SelectionRow::Worktree(project_id(9), WorktreeId::from_uuid(Uuid::from_u128(1)));
         let button = button::custom(widget::text::body("Worktree"))
             .name("Drag accessibility worktree")
             .width(240)
@@ -13428,7 +13445,7 @@ pub(crate) mod tests {
             mouse,
         };
         let renderer = headless_renderer();
-        let row = SelectionRow::Worktree(project_id(9), worktree_id(1));
+        let row = SelectionRow::Worktree(project_id(9), WorktreeId::from_uuid(Uuid::from_u128(1)));
         let content = widget::column::with_children(vec![
             button::custom(widget::text::body("Deleting worktree"))
                 .width(240)
@@ -13504,7 +13521,7 @@ pub(crate) mod tests {
             content.into(),
             project_id(9),
             vec![
-                SelectionRow::Worktree(project_id(9), worktree_id(1)),
+                SelectionRow::Worktree(project_id(9), WorktreeId::from_uuid(Uuid::from_u128(1))),
                 SelectionRow::Channel(ChannelId::new()),
             ],
             Vec::new(),
@@ -13593,7 +13610,10 @@ pub(crate) mod tests {
             ),
             vec![SidebarAction::ReorderMember {
                 project: project_id(9),
-                source: SelectionRow::Worktree(project_id(9), worktree_id(1)),
+                source: SelectionRow::Worktree(
+                    project_id(9),
+                    WorktreeId::from_uuid(Uuid::from_u128(1))
+                ),
                 before: None
             }],
         );
