@@ -5,6 +5,10 @@ use crate::device_service::{GitOperation, Operation, Reply};
 use cosmic::widget::text_editor;
 use std::collections::BTreeMap;
 
+fn file_editor_id() -> widget::Id {
+    widget::Id::new("device-file-editor")
+}
+
 fn dialog_controls<'a>(children: Vec<Element<'a, Message>>, narrow: bool) -> Element<'a, Message> {
     if narrow {
         widget::column::with_children(children)
@@ -573,7 +577,7 @@ impl Cagents {
                         self.device_ui.file = None;
                         self.device_ui.output.clear();
                         self.device_ui.view = View::Editor;
-                        if let Some(file) = self.device_ui.linked_file.take() {
+                        if let Some(file) = self.device_ui.linked_file.clone() {
                             return self.update_device(Action::Read(file));
                         }
                     }
@@ -584,10 +588,15 @@ impl Cagents {
                         }
                         self.device_ui.original = text.clone();
                         self.device_ui.content = text_editor::Content::with_text(&text);
+                        let linked = self.device_ui.linked_file.take().is_some();
                         if let Some(fragment) = self.device_ui.linked_fragment.take() {
                             self.device_ui.jump_to_fragment(&fragment);
                         }
                         self.device_ui.view = View::Editor;
+                        if linked {
+                            return iced::widget::operation::focus(file_editor_id())
+                                .map(cosmic::Action::App);
+                        }
                     }
                     Ok(Reply::Text(text)) => self.device_ui.output = text,
                     Ok(Reply::Saved) => {
@@ -900,6 +909,7 @@ impl Cagents {
                     button("Discard changes", Action::DiscardChanges),
                 ]),
                 iced::widget::text_editor(&state.content)
+                    .id(file_editor_id())
                     .on_action(|value| Message::Device(Action::Edit(value)))
                     .height(if narrow { 300 } else { 420 })
                     .into(),
@@ -1337,6 +1347,11 @@ mod tests {
         assert!(
             matches!(&app.device_ui.pending, Some(Operation::Read { root, path })
             if root == Path::new("/remote/project/src") && path == Path::new("main.rs"))
+        );
+        assert_eq!(
+            app.device_ui.linked_file.as_deref(),
+            Some(Path::new("main.rs")),
+            "The link keeps focus intent until its read succeeds"
         );
         drop(app.update_device(Action::Loaded {
             generation: app.device_ui.generation,
