@@ -884,13 +884,18 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         _style: &cosmic::iced::advanced::renderer::Style,
         layout: cosmic::iced::advanced::Layout<'_>,
         _cursor: cosmic::iced::mouse::Cursor,
-        _viewport: &cosmic::iced::Rectangle,
+        viewport: &cosmic::iced::Rectangle,
     ) {
         use cosmic::iced::advanced::Renderer as _;
         use cosmic::iced::advanced::graphics::geometry::Renderer as _;
         use cosmic::widget::canvas;
 
         let bounds = layout.bounds();
+        // Offscreen columns can remain mounted. Limit geometry to the same
+        // viewport that schedules animation frames.
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
         if bounds.width < 1.0 || bounds.height < 1.0 {
             return;
         }
@@ -912,17 +917,31 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
             start_angle: cosmic::iced::Radians(start),
             end_angle: cosmic::iced::Radians(end),
         });
-        frame.stroke(
-            &builder.build(),
-            canvas::Stroke::default()
-                .with_color(self.tone.resolve(theme))
-                .with_width(bar_height)
-                .with_line_cap(canvas::LineCap::Round),
+        // Canvas meshes carry their own clipping bounds. Clip the geometry as
+        // well as the renderer layer so both native rendering backends respect
+        // a partially visible indicator.
+        frame.with_clip(
+            cosmic::iced::Rectangle {
+                x: clip.x - bounds.x,
+                y: clip.y - bounds.y,
+                ..clip
+            },
+            |frame| {
+                frame.stroke(
+                    &builder.build(),
+                    canvas::Stroke::default()
+                        .with_color(self.tone.resolve(theme))
+                        .with_width(bar_height)
+                        .with_line_cap(canvas::LineCap::Round),
+                );
+            },
         );
         let geometry = frame.into_geometry();
 
-        renderer.with_translation(cosmic::iced::Vector::new(bounds.x, bounds.y), |renderer| {
-            renderer.draw_geometry(geometry);
+        renderer.with_layer(clip, |renderer| {
+            renderer.with_translation(cosmic::iced::Vector::new(bounds.x, bounds.y), |renderer| {
+                renderer.draw_geometry(geometry);
+            });
         });
     }
 }
@@ -1655,6 +1674,65 @@ mod tests {
         let (hidden, frozen) = requested(Point::new(8.0, 900.0));
         assert_eq!(hidden, window::RedrawRequest::Wait);
         assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
+    }
+
+    #[test]
+    fn spinner_draws_only_inside_its_current_viewport_after_navigation() {
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{
+            Layout, Renderer as _, layout, mouse, renderer, widget::Tree,
+        };
+        use cosmic::iced::{Color, Point, Rectangle, Size};
+
+        let mut renderer = headless_renderer();
+        let theme = cosmic::Theme::default();
+        let extent = Rectangle::with_size(Size::new(64.0, 64.0));
+        let element: Element<'_, ()> = spinner(24.0, crate::design::Tone::Fixed(Color::WHITE));
+        let tree = Tree::new(element.as_widget());
+        let node = layout::Node::new(Size::new(24.0, 24.0)).move_to(Point::new(8.0, 8.0));
+        let size = Size::new(64, 64);
+        let mut draw = |viewport: Rectangle| {
+            renderer.reset(extent);
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &theme,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            renderer.screenshot(size, 1.0, Color::BLACK)
+        };
+        let painted = |pixels: &[u8]| {
+            pixels
+                .chunks_exact(4)
+                .filter(|pixel| pixel[..3] != [0, 0, 0])
+                .count()
+        };
+        assert!(painted(&draw(extent)) > 0, "the visible spinner must paint");
+
+        // The old pane is still mounted at its previous on-screen position,
+        // but its viewport no longer includes it after navigation.
+        let hidden = Rectangle::new(Point::new(40.0, 0.0), Size::new(24.0, 64.0));
+        assert_eq!(
+            painted(&draw(hidden)),
+            0,
+            "a hidden pane leaked a frozen arc"
+        );
+        let clipped = Rectangle::new(Point::new(20.0, 0.0), Size::new(44.0, 64.0));
+        let pixels = draw(clipped);
+        assert!(painted(&pixels) > 0, "the visible portion must still paint");
+        for y in 0..64 {
+            for x in 0..20 {
+                let index = (y * 64 + x) * 4;
+                assert_eq!(
+                    &pixels[index..index + 3],
+                    &[0, 0, 0],
+                    "arc escaped its pane at ({x}, {y})"
+                );
+            }
+        }
     }
 
     /// The ring is the only thing a reader looks at before deciding to
