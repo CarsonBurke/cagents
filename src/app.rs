@@ -11,7 +11,9 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
-mod file_manager;
+#[cfg(test)]
+use crate::file_manager::open_system_url_with_opener;
+use crate::file_manager::{self, open_system_url};
 mod file_ui;
 mod git_ui;
 mod history_ui;
@@ -4805,50 +4807,6 @@ pub struct Cagents {
     settings_invalid: HashMap<SettingsField, String>,
     settings_save_error: Option<String>,
     status: Option<TransientNotice>,
-}
-
-async fn open_system_url(url: Url) -> Result<(), String> {
-    let portal_result = async {
-        let request = ashpd::desktop::open_uri::OpenFileRequest::default()
-            .send_uri(&url)
-            .await
-            .map_err(|error| error.to_string())?;
-        request.response().map_err(|error| error.to_string())
-    }
-    .await;
-    match portal_result {
-        Ok(()) => Ok(()),
-        // Portal diagnostics are also intentionally omitted: they are an
-        // external error boundary and may include the URI supplied above.
-        Err(_) => open_system_url_with_opener(&url, tokio::process::Command::new("xdg-open")).await,
-    }
-}
-
-async fn open_system_url_with_opener(
-    url: &Url,
-    mut opener: tokio::process::Command,
-) -> Result<(), String> {
-    let presented = SanitizedLocation::from(url);
-    let result = opener
-        .arg(url.as_str())
-        .stdin(Stdio::null())
-        // An opener can echo its argument in diagnostics. The authoritative
-        // URL may contain credentials, query data, or a fragment, so neither
-        // child stream may inherit cagents' presentation or logging streams.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "desktop portal could not open {presented}; system opener exited with {status}"
-        )),
-        Err(error) => Err(format!(
-            "desktop portal could not open {presented}; system opener could not be started: {error}"
-        )),
-    }
 }
 
 impl Cagents {
@@ -12615,10 +12573,10 @@ impl Application for Cagents {
             Message::FileRevealed(result) => {
                 self.status = Some(match result {
                     Ok(file_manager::RevealOutcome::Selected) => {
-                        TransientNotice::success("Revealed in file viewer")
+                        TransientNotice::success("Revealed in file manager")
                     }
                     Ok(file_manager::RevealOutcome::OpenedContainingFolder) => {
-                        TransientNotice::success("Opened containing folder in file viewer")
+                        TransientNotice::success("Opened containing folder in file manager")
                     }
                     Err(error) => TransientNotice::error(error),
                 });
@@ -13767,10 +13725,10 @@ impl Application for Cagents {
                     // commands are pure clipboard work that a worktree browser
                     // needs regardless of file management.
                     SidebarAction::FileCommand { key, path, command } => match command {
-                        sidebar::FileCommand::RevealInFileViewer => {
+                        sidebar::FileCommand::RevealInFileManager => {
                             if crate::device::is_remote() {
                                 self.status = Some(TransientNotice::warning(
-                                    "Remote files cannot be revealed in the local file viewer",
+                                    "Remote files cannot be revealed in the local file manager",
                                 ));
                                 return Task::none();
                             }

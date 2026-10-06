@@ -1,7 +1,9 @@
-use std::{future::Future, path::Path, time::Duration};
+use std::{future::Future, path::Path, process::Stdio, time::Duration};
 
 use ashpd::zbus;
 use url::Url;
+
+use crate::location::SanitizedLocation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevealOutcome {
@@ -9,8 +11,8 @@ pub enum RevealOutcome {
     OpenedContainingFolder,
 }
 
-pub(super) async fn reveal(path: &Path) -> Result<RevealOutcome, String> {
-    reveal_with(path, show_item, super::open_system_url).await
+pub async fn reveal(path: &Path) -> Result<RevealOutcome, String> {
+    reveal_with(path, show_item, open_system_url).await
 }
 
 async fn show_item(uri: Url) -> Result<(), String> {
@@ -60,6 +62,50 @@ where
         .await
         .map_err(|error| format!("Could not open the containing folder: {error}"))?;
     Ok(RevealOutcome::OpenedContainingFolder)
+}
+
+pub(crate) async fn open_system_url(url: Url) -> Result<(), String> {
+    let portal_result = async {
+        let request = ashpd::desktop::open_uri::OpenFileRequest::default()
+            .send_uri(&url)
+            .await
+            .map_err(|error| error.to_string())?;
+        request.response().map_err(|error| error.to_string())
+    }
+    .await;
+    match portal_result {
+        Ok(()) => Ok(()),
+        // Portal diagnostics are also intentionally omitted: they are an
+        // external error boundary and may include the URI supplied above.
+        Err(_) => open_system_url_with_opener(&url, tokio::process::Command::new("xdg-open")).await,
+    }
+}
+
+pub(crate) async fn open_system_url_with_opener(
+    url: &Url,
+    mut opener: tokio::process::Command,
+) -> Result<(), String> {
+    let presented = SanitizedLocation::from(url);
+    let result = opener
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        // An opener can echo its argument in diagnostics. The authoritative
+        // URL may contain credentials, query data, or a fragment, so neither
+        // child stream may inherit cagents' presentation or logging streams.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "desktop portal could not open {presented}; system opener exited with {status}"
+        )),
+        Err(error) => Err(format!(
+            "desktop portal could not open {presented}; system opener could not be started: {error}"
+        )),
+    }
 }
 
 #[cfg(test)]

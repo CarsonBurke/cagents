@@ -3303,7 +3303,7 @@ pub enum FileCommand {
     CopyFile,
     CopyPath,
     CopyRelativePath,
-    RevealInFileViewer,
+    RevealInFileManager,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6184,9 +6184,9 @@ fn file_commands(
             FileCommand::CopyRelativePath,
         ),
         (
-            "Reveal in file viewer",
+            "Reveal in file manager",
             "folder-open-symbolic",
-            FileCommand::RevealInFileViewer,
+            FileCommand::RevealInFileManager,
         ),
     ]
     .into_iter()
@@ -12502,7 +12502,7 @@ pub(crate) mod tests {
                 vec![
                     FileCommand::CopyPath,
                     FileCommand::CopyRelativePath,
-                    FileCommand::RevealInFileViewer
+                    FileCommand::RevealInFileManager
                 ],
                 "a clipboard write is not a working-tree mutation (directory={directory})"
             );
@@ -12512,7 +12512,7 @@ pub(crate) mod tests {
             vec![
                 FileCommand::CopyPath,
                 FileCommand::CopyRelativePath,
-                FileCommand::RevealInFileViewer
+                FileCommand::RevealInFileManager
             ],
             "a directory has nothing to rename or duplicate"
         );
@@ -12523,7 +12523,7 @@ pub(crate) mod tests {
                 FileCommand::CopyFile,
                 FileCommand::CopyPath,
                 FileCommand::CopyRelativePath,
-                FileCommand::RevealInFileViewer,
+                FileCommand::RevealInFileManager,
             ],
         );
     }
