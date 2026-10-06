@@ -44,10 +44,14 @@ impl CodeBlock {
             .map(|language| crate::diff_view::highlight_snippet(code, language, theme));
         let palette = |index: usize| -> Arc<[Span<'static, String>]> {
             let mut spans = Vec::new();
-            for (number, line) in code.lines().enumerate() {
-                if number > 0 {
-                    spans.push(Span::new("\n"));
-                }
+            for (number, source) in code.split_inclusive('\n').enumerate() {
+                let (line, ending) = if let Some(line) = source.strip_suffix("\r\n") {
+                    (line, "\r\n")
+                } else if let Some(line) = source.strip_suffix('\n') {
+                    (line, "\n")
+                } else {
+                    (source, "")
+                };
                 match &syntax {
                     Some(lines) => spans.extend(
                         crate::diff_view::syntax_spans(
@@ -72,6 +76,9 @@ impl CodeBlock {
                         }),
                     ),
                     None => spans.push(Span::new(line.to_owned())),
+                }
+                if !ending.is_empty() {
+                    spans.push(Span::new(ending));
                 }
             }
             spans.into()
@@ -354,5 +361,28 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
         "Center" => iced::alignment::Horizontal::Center,
         "Right" => iced::alignment::Horizontal::Right,
         _ => iced::alignment::Horizontal::Left,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_selection_preserves_source_line_endings_and_trailing_newlines() {
+        for code in ["", "line", "line\n", "first\r\nsecond\r\n", "\n\n"] {
+            for language in [None, Some("rust")] {
+                let block =
+                    CodeBlock::new(language, code, crate::settings::EditorSyntaxTheme::Auto);
+                for dark in [false, true] {
+                    let rendered = block
+                        .spans(dark)
+                        .iter()
+                        .map(|span| span.text.as_ref())
+                        .collect::<String>();
+                    assert_eq!(rendered, code);
+                }
+            }
+        }
     }
 }

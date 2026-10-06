@@ -6,6 +6,17 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
         .width(Length::Fill)
         .into()
 }
+
+fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
+    widget::container(selectable_prose::plain(
+        text,
+        design::TEXT_BODY,
+        iced::Font::default(),
+        target,
+    ))
+    .width(Length::Fill)
+    .into()
+}
 /// The composer's own line height and inner padding.
 ///
 /// Named because the composer's height is computed from the draft rather than
@@ -197,17 +208,25 @@ fn history_key(
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
-fn notice_entry<'a>(message: &'a str) -> Element<'a, Message> {
+fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
             widget::icon(crate::ui_controls::symbolic_icon("dialog-warning-symbolic"))
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
-            design::caption(message)
-                .class(cosmic::theme::Text::Custom(design::warning_text))
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::Word)
+            widget::container(selectable_prose::text(
+                vec![
+                    iced::widget::text::Span::new(message.to_owned())
+                        .color(design::warning_color(&cosmic::theme::active())),
+                ]
                 .into(),
+                design::TEXT_CAPTION.into(),
+                iced::Font::default(),
+                target,
+                None,
+            ))
+            .width(Length::Fill)
+            .into(),
         ])
         .spacing(step::GAP_S)
         .align_y(Alignment::Start),
@@ -845,11 +864,14 @@ impl Runtime {
                     .into(),
             );
             if agent.items.is_empty() {
-                transcript.push(body(if agent.status == chat::ToolStatus::Running {
-                    "Waiting for subagent activity…"
-                } else {
-                    "No recent subagent activity is available here."
-                }));
+                transcript.push(transcript_body(
+                    if agent.status == chat::ToolStatus::Running {
+                        "Waiting for subagent activity…"
+                    } else {
+                        "No recent subagent activity is available here."
+                    },
+                    target,
+                ));
             }
             for item in &agent.items {
                 let Some(cached) = self.cache.get(&item.id) else {
@@ -898,7 +920,7 @@ impl Runtime {
                 );
             }
             for (_, error) in self.failures.iter().filter(|(anchor, _)| anchor.is_none()) {
-                transcript.push(notice_entry(error));
+                transcript.push(notice_entry(error, target));
             }
             for turn in &self.turns {
                 anchors.push((transcript.len(), turn.key.as_str()));
@@ -908,7 +930,7 @@ impl Runtime {
                     .iter()
                     .filter(|(anchor, _)| anchor.as_ref() == Some(&turn.key))
                 {
-                    transcript.push(notice_entry(error));
+                    transcript.push(notice_entry(error, target));
                 }
             }
             if snapshot.has_later {
@@ -995,7 +1017,7 @@ impl Runtime {
         if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
-            transcript.push(notice_entry(error));
+            transcript.push(notice_entry(error, target));
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
@@ -2542,11 +2564,14 @@ impl Runtime {
                     .on_press_maybe((!sending).then(|| action(Action::CancelFollowup(self.target))))
                     .into(),
             ];
-            let mut content = vec![body(if text.trim().is_empty() {
-                "Queued attachment"
-            } else {
-                text
-            })];
+            let mut content = vec![transcript_body(
+                if text.trim().is_empty() {
+                    "Queued attachment"
+                } else {
+                    text
+                },
+                self.target,
+            )];
             for attachment in attachments {
                 content.push(
                     design::caption(
@@ -2683,11 +2708,14 @@ impl Runtime {
                     .into(),
             );
         } else {
-            content = content.push(body(if queued.text.trim().is_empty() {
-                "Queued attachment"
-            } else {
-                &queued.text
-            }));
+            content = content.push(transcript_body(
+                if queued.text.trim().is_empty() {
+                    "Queued attachment"
+                } else {
+                    &queued.text
+                },
+                self.target,
+            ));
         }
         widget::column::with_children(vec![
             widget::row::with_children(controls)
@@ -2731,11 +2759,12 @@ impl Runtime {
             .as_ref()
             .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
         let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(
-                widget::selectable_text(queued.text.trim_end())
-                    .size(design::TEXT_PROSE)
-                    .width(Length::Shrink),
-            )
+            widget::container(selectable_prose::plain(
+                queued.text.trim_end(),
+                design::TEXT_PROSE,
+                iced::Font::default(),
+                self.target,
+            ))
             .class(design::surface(
                 Some(design::accent_wash),
                 [
@@ -2831,18 +2860,23 @@ impl Runtime {
                 ))
                 .size(12)
                 .into(),
-                widget::selectable_text(text)
-                    .size(design::TEXT_CAPTION)
-                    .into(),
+                selectable_prose::plain(
+                    text,
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
             .into()
         } else {
-            let text: Element<'static, Message> = widget::selectable_text(text)
-                .size(design::TEXT_PROSE)
-                .width(Length::Shrink)
-                .into();
+            let text = selectable_prose::plain(
+                text,
+                design::TEXT_PROSE,
+                iced::Font::default(),
+                self.target,
+            );
             if long {
                 widget::column::with_children(vec![
                     text,
@@ -2951,11 +2985,14 @@ impl Runtime {
                     body.clone()
                 };
                 rows.push(
-                    widget::selectable_text(text)
-                        .size(design::TEXT_CAPTION)
-                        .font(iced::Font::MONOSPACE)
-                        .width(Length::Fill)
-                        .into(),
+                    widget::container(selectable_prose::plain(
+                        text,
+                        design::TEXT_CAPTION,
+                        iced::Font::MONOSPACE,
+                        self.target,
+                    ))
+                    .width(Length::Fill)
+                    .into(),
                 );
                 if long {
                     rows.push(toggle("Show more"));
@@ -3313,6 +3350,7 @@ pub(super) fn request_view<'a>(
             None,
             Some(REQUEST_CONTEXT_CEILING),
             None,
+            target,
         ));
     }
     for field in &request.fields {
@@ -3801,6 +3839,147 @@ mod frame_cost;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_notice_and_raw_output_share_transcript_selection() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let prompt = items
+            .iter()
+            .find(|item| item.role == chat::Role::User)
+            .expect("user prompt");
+        let expected = match &prompt.content {
+            ItemContent::Text { text, .. } => text.clone(),
+            _ => panic!("fixture prompt must be text"),
+        };
+        let output = tool_text::ToolText::update(None, "tool output\n", tool_text::Language::Plain);
+        let content = widget::column::with_children(vec![
+            runtime.prompt_view(prompt),
+            transcript_body("Queued message", runtime.target),
+            notice_entry("Provider warning", runtime.target),
+            output.view(
+                crate::settings::EditorSyntaxTheme::Auto,
+                None,
+                runtime.target,
+            ),
+        ]);
+        let mut element = selection::transcript(content, runtime.target, None);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1200.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct ReadText(Vec<(String, iced::Rectangle)>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push((prose.plain.to_string(), bounds));
+                }
+            }
+        }
+        let mut text = ReadText::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut text,
+        );
+        assert_eq!(
+            text.0
+                .iter()
+                .map(|(text, _)| text.clone())
+                .collect::<Vec<_>>(),
+            [
+                expected.clone(),
+                "Queued message".into(),
+                "Provider warning".into(),
+                "tool output\n".into()
+            ]
+        );
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                self.0 = contents;
+            }
+        }
+        let first = text.0.first().unwrap().1;
+        let last = text.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+        let mut clipboard = ClipboardText::default();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 1200.0));
+        for (event, pointer) in [
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                start,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                end,
+            ),
+            (
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("c".into()),
+                    modified_key: keyboard::Key::Character("c".into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+        }
+        assert_eq!(
+            clipboard.0,
+            format!("{expected}\n\nQueued message\n\nProvider warning\n\ntool output\n")
+        );
+    }
 
     #[test]
     fn waiting_queue_is_bounded_and_independent_of_transcript_scroll() {

@@ -11,6 +11,7 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 use std::any::Any;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
+use unicode_segmentation::UnicodeSegmentation;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -46,6 +47,80 @@ struct State {
     dragging: bool,
     focused: bool,
     link: Option<(Target, String)>,
+    pointer: Option<Point>,
+    origin: Option<Point>,
+    moved: bool,
+    modifiers: keyboard::Modifiers,
+    click: Option<mouse::Click>,
+    unit: Unit,
+    initial: Option<(Endpoint, Endpoint)>,
+    next_scroll: Option<iced::time::Instant>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Unit {
+    #[default]
+    Character,
+    Word,
+    Paragraph,
+}
+
+impl Unit {
+    fn range(self, text: &str, byte: usize) -> Range<usize> {
+        let byte = byte.min(text.len());
+        match self {
+            Self::Character => byte..byte,
+            Self::Word => text
+                .split_word_bound_indices()
+                .find(|(start, word)| *start <= byte && byte < start + word.len())
+                .map(|(start, word)| start..start + word.len())
+                .or_else(|| {
+                    (byte == text.len())
+                        .then(|| text.split_word_bound_indices().last())
+                        .flatten()
+                        .map(|(start, word)| start..start + word.len())
+                })
+                .unwrap_or(byte..byte),
+            Self::Paragraph => {
+                let start = text[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+                let end = text[byte..]
+                    .find('\n')
+                    .map_or(text.len(), |newline| byte + newline + 1);
+                start..end
+            }
+        }
+    }
+}
+
+impl State {
+    fn extend(&mut self, read: &Read, block: &Block) {
+        let range = self.unit.range(&block.plain, block.hit);
+        let low = Endpoint {
+            identity: block.identity,
+            byte: range.start,
+        };
+        let high = Endpoint {
+            identity: block.identity,
+            byte: range.end,
+        };
+        if let Some((start, end)) = self.initial {
+            let index = |point: Endpoint| {
+                read.blocks
+                    .iter()
+                    .position(|block| block.identity == point.identity)
+                    .map(|index| (index, point.byte))
+            };
+            if index(low) < index(start) {
+                self.anchor = Some(end);
+                self.end = Some(low);
+            } else {
+                self.anchor = Some(start);
+                self.end = Some(high);
+            }
+        } else {
+            self.end = Some(high);
+        }
+    }
 }
 
 impl Default for State {
@@ -59,6 +134,14 @@ impl Default for State {
             dragging: false,
             focused: false,
             link: None,
+            pointer: None,
+            origin: None,
+            moved: false,
+            modifiers: keyboard::Modifiers::empty(),
+            click: None,
+            unit: Unit::Character,
+            initial: None,
+            next_scroll: None,
         }
     }
 }
@@ -119,8 +202,9 @@ impl Read {
         };
         self.blocks
             .iter()
+            .filter(|block| block.visible.is_some())
             .filter(|block| !inside || block.visible.is_some_and(|visible| visible.contains(point)))
-            .min_by(|a, b| distance(a.bounds).total_cmp(&distance(b.bounds)))
+            .min_by(|a, b| distance(a.visible.unwrap()).total_cmp(&distance(b.visible.unwrap())))
     }
 
     fn ranges(&self, anchor: Endpoint, end: Endpoint) -> Option<Vec<Range<usize>>> {
@@ -213,7 +297,8 @@ impl Operation for Read {
             ..bounds
         };
         let position = self
-            .pointer
+            .clip
+            .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
             .map(|point| point - Vector::new(bounds.x, bounds.y));
         self.blocks.push(Block {
             identity: prose.identity,
@@ -235,6 +320,72 @@ struct Apply<'a> {
     index: usize,
     changed: usize,
     exchanges: Vec<usize>,
+}
+
+struct DragScroll {
+    delta: f32,
+    visited: bool,
+    changed: bool,
+    bottom_id: Option<Id>,
+}
+impl Operation for DragScroll {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        if !self.visited {
+            visit(self);
+        }
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        content: Rectangle,
+        translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if self.visited {
+            return;
+        }
+        self.visited = true;
+        let top =
+            (translation.y + self.delta).clamp(0.0, (content.height - bounds.height).max(0.0));
+        self.changed = (top - translation.y).abs() > f32::EPSILON;
+        if self.changed {
+            let delta = top - translation.y;
+            state.scroll_by(
+                operation::scrollable::AbsoluteOffset {
+                    x: 0.0,
+                    y: if id.is_some() && id == self.bottom_id.as_ref() {
+                        -delta
+                    } else {
+                        delta
+                    },
+                },
+                bounds,
+                content,
+            );
+        }
+    }
+}
+
+fn edge_delta(pointer: Point, viewport: Rectangle) -> f32 {
+    if pointer.y < viewport.y {
+        -((viewport.y - pointer.y) * 0.3).clamp(2.0, 30.0)
+    } else if pointer.y > viewport.y + viewport.height {
+        ((pointer.y - viewport.y - viewport.height) * 0.3).clamp(2.0, 30.0)
+    } else {
+        0.0
+    }
+}
+
+fn clipped_pointer(pointer: Option<Point>, viewport: Rectangle) -> Option<Point> {
+    pointer.map(|point| {
+        Point::new(
+            point.x.clamp(viewport.x, viewport.x + viewport.width),
+            point
+                .y
+                .clamp(viewport.y, viewport.y + (viewport.height - 0.01).max(0.0)),
+        )
+    })
 }
 impl Operation for Apply<'_> {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -383,6 +534,20 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.modifiers = *modifiers;
+        }
+        if let Some(pointer) = cursor.position() {
+            state.pointer = Some(pointer);
+        }
+        if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+            // A release outside the application may never reach this tree.
+            // Preserve the selected text, but do not resume the old gesture
+            // when the pointer returns to the window.
+            state.dragging = false;
+            state.link = None;
+            state.next_scroll = None;
+        }
         let press = matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
@@ -408,8 +573,51 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             _ => None,
         };
         let mut captured = false;
+        let visible = layout.bounds().intersection(viewport).unwrap_or_default();
+        if state
+            .pointer
+            .is_some_and(|point| edge_delta(point, visible) == 0.0)
+        {
+            state.next_scroll = None;
+        }
+        let mut autoscrolled = false;
+        if let Event::Window(iced::window::Event::RedrawRequested(now)) = event
+            && state.dragging
+            && state.next_scroll.is_none_or(|next| *now >= next)
+        {
+            if let Some(pointer) = state.pointer {
+                let elapsed = state.next_scroll.map_or(0.016, |next| {
+                    now.saturating_duration_since(next - std::time::Duration::from_millis(16))
+                        .as_secs_f32()
+                        .min(0.05)
+                });
+                let delta = edge_delta(pointer, visible) * (elapsed / 0.016);
+                if delta != 0.0 {
+                    let mut scroll = DragScroll {
+                        delta,
+                        visited: false,
+                        changed: false,
+                        bottom_id: self
+                            .context
+                            .map(|(target, _)| card_control_id(target.card, "chat-transcript")),
+                    };
+                    self.content.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        &mut scroll,
+                    );
+                    autoscrolled = scroll.changed;
+                    state.next_scroll = Some(*now + std::time::Duration::from_millis(16));
+                }
+            }
+        }
         if press || (state.dragging && (motion || release)) || command.is_some() {
-            let mut read = Read::new(cursor.position());
+            let mut read = Read::new(if state.dragging && !press {
+                clipped_pointer(cursor.position(), visible)
+            } else {
+                cursor.position()
+            });
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -422,30 +630,64 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                     && read.endpoint(true).is_some()
                     && !shell.is_event_captured();
                 state.dragging = state.focused;
-                state.anchor = if state.focused {
+                if state.focused {
                     let block = read.endpoint(true).unwrap();
-                    state.link = block.link.clone();
                     ACTIVE.store(state.identity, Ordering::Relaxed);
-                    Some(Endpoint {
-                        identity: block.identity,
-                        byte: block.hit,
-                    })
+                    let point = cursor.position().unwrap();
+                    state.origin = Some(point);
+                    state.moved = false;
+                    state.next_scroll = None;
+                    let click = mouse::Click::new(point, mouse::Button::Left, state.click);
+                    state.click = Some(click);
+                    if state.modifiers.shift() && state.anchor.is_some() {
+                        state.unit = Unit::Character;
+                        state.initial = None;
+                        state.end = Some(Endpoint {
+                            identity: block.identity,
+                            byte: block.hit,
+                        });
+                        state.link = None;
+                    } else {
+                        state.unit = match click.kind() {
+                            mouse::click::Kind::Single => Unit::Character,
+                            mouse::click::Kind::Double => Unit::Word,
+                            mouse::click::Kind::Triple => Unit::Paragraph,
+                        };
+                        let range = state.unit.range(&block.plain, block.hit);
+                        let start = Endpoint {
+                            identity: block.identity,
+                            byte: range.start,
+                        };
+                        let end = Endpoint {
+                            identity: block.identity,
+                            byte: range.end,
+                        };
+                        state.anchor = Some(start);
+                        state.end = Some(end);
+                        state.initial = Some((start, end));
+                        state.link = matches!(state.unit, Unit::Character)
+                            .then(|| block.link.clone())
+                            .flatten();
+                    }
                 } else {
                     state.link = None;
-                    None
-                };
-                state.end = state.anchor;
+                    state.anchor = None;
+                    state.end = None;
+                }
                 captured = state.focused;
             } else if state.dragging {
+                state.moved |= state
+                    .origin
+                    .zip(cursor.position())
+                    .is_some_and(|(origin, pointer)| origin.distance(pointer) > 3.0);
                 if let Some(block) = read.endpoint(false) {
-                    state.end = Some(Endpoint {
-                        identity: block.identity,
-                        byte: block.hit,
-                    });
+                    state.extend(&read, block);
                 }
                 if release {
                     state.dragging = false;
-                    if state.anchor == state.end
+                    state.next_scroll = None;
+                    if !state.moved
+                        && state.anchor == state.end
                         && let Some((target, link)) = state.link.take()
                         && read.endpoint(true).is_some_and(|block| {
                             block.link.as_ref() == Some(&(target, link.clone()))
@@ -509,8 +751,58 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             shell,
             viewport,
         );
+        if (autoscrolled || matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. })))
+            && tree.state.downcast_ref::<State>().dragging
+        {
+            // Scrollables update their native offsets above. Hit-test again
+            // in that coordinate space even when the pointer stayed still.
+            let mut read = Read::new(clipped_pointer(
+                tree.state.downcast_ref::<State>().pointer,
+                visible,
+            ));
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut read,
+            );
+            let state = tree.state.downcast_mut::<State>();
+            if let Some(block) = read.endpoint(false) {
+                state.extend(&read, block);
+                state.moved = true;
+            }
+            let ranges = state
+                .anchor
+                .zip(state.end)
+                .and_then(|(anchor, end)| read.ranges(anchor, end));
+            let mut apply = Apply {
+                ranges: ranges.as_deref().unwrap_or(&[]),
+                index: 0,
+                changed: 0,
+                exchanges: Vec::new(),
+            };
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut apply,
+            );
+            if apply.changed > 0 {
+                shell.invalidate_layout();
+            }
+        }
         if captured {
             shell.capture_event();
+        }
+        let state = tree.state.downcast_ref::<State>();
+        if state.dragging
+            && state
+                .pointer
+                .is_some_and(|point| edge_delta(point, visible) != 0.0)
+        {
+            shell.request_redraw_at(state.next_scroll.unwrap_or_else(|| {
+                iced::time::Instant::now() + std::time::Duration::from_millis(16)
+            }));
         }
     }
     fn draw(
@@ -592,6 +884,183 @@ mod tests {
             .collect();
         read
     }
+    #[test]
+    fn word_and_paragraph_units_preserve_unicode_and_extend_in_both_directions() {
+        let text = "cafe\u{301} naïve\nsecond line\n";
+        assert_eq!(&text[Unit::Word.range(text, 2)], "cafe\u{301}");
+        assert_eq!(&text[Unit::Paragraph.range(text, 2)], "cafe\u{301} naïve\n");
+        assert_eq!(
+            &text[Unit::Paragraph.range(text, text.find("second").unwrap())],
+            "second line\n"
+        );
+        let mut read = read();
+        let mut state = State {
+            unit: Unit::Word,
+            initial: Some((
+                Endpoint {
+                    identity: 2,
+                    byte: 0,
+                },
+                Endpoint {
+                    identity: 2,
+                    byte: 6,
+                },
+            )),
+            ..State::default()
+        };
+        read.blocks[2].hit = "β ".len();
+        state.extend(&read, &read.blocks[2]);
+        assert_eq!(
+            read.copy(
+                &read
+                    .ranges(state.anchor.unwrap(), state.end.unwrap())
+                    .unwrap()
+            ),
+            "middle\ncode\n\nβ last"
+        );
+        read.blocks[0].hit = "α ".len();
+        state.extend(&read, &read.blocks[0]);
+        assert_eq!(
+            read.copy(
+                &read
+                    .ranges(state.anchor.unwrap(), state.end.unwrap())
+                    .unwrap()
+            ),
+            "first\n\nmiddle"
+        );
+    }
+
+    #[test]
+    fn click_units_shift_extension_and_returned_link_drags_use_the_shared_selection() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = surface(super::super::selectable_prose::text(
+            vec![
+                iced::widget::text::Span::new("one two three")
+                    .link("https://example.com".to_owned()),
+            ]
+            .into(),
+            16.0.into(),
+            iced::Font::default(),
+            target,
+            None,
+        ));
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let viewport = Rectangle::with_size(Size::new(300.0, 100.0));
+        let mut clipboard = ClipboardText::default();
+        let mut messages = Vec::new();
+        let mut send = |event: Event,
+                        pointer: Point,
+                        element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &mut layout::Node| {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(node),
+                mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            if shell.is_layout_invalid() {
+                *node = element.as_widget_mut().layout(tree, &renderer, &limits);
+            }
+        };
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let point = Point::new(4.0, 4.0);
+        send(press.clone(), point, &mut element, &mut tree, &mut node);
+        send(
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(90.0, 4.0),
+            }),
+            Point::new(90.0, 4.0),
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        send(
+            Event::Mouse(mouse::Event::CursorMoved { position: point }),
+            point,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        send(release.clone(), point, &mut element, &mut tree, &mut node);
+        assert!(tree.state.downcast_ref::<State>().moved);
+        send(press.clone(), point, &mut element, &mut tree, &mut node);
+        send(release.clone(), point, &mut element, &mut tree, &mut node);
+        let mut read = Read::new(None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!(
+            read.copy(
+                &read
+                    .ranges(state.anchor.unwrap(), state.end.unwrap())
+                    .unwrap()
+            ),
+            "one"
+        );
+        send(press.clone(), point, &mut element, &mut tree, &mut node);
+        send(release.clone(), point, &mut element, &mut tree, &mut node);
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!(
+            read.copy(
+                &read
+                    .ranges(state.anchor.unwrap(), state.end.unwrap())
+                    .unwrap()
+            ),
+            "one two three"
+        );
+        send(
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::SHIFT,
+            )),
+            point,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        send(
+            press,
+            Point::new(38.0, 4.0),
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        send(
+            release,
+            Point::new(38.0, 4.0),
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!(
+            state.anchor.unwrap().byte,
+            0,
+            "Shift-click keeps the original selection anchor"
+        );
+        assert!(state.end.unwrap().byte > 0 && state.end.unwrap().byte < "one two three".len());
+        drop(send);
+        assert!(
+            messages.is_empty(),
+            "a moved drag returning to the link never activates it"
+        );
+    }
+
     #[test]
     fn forward_and_reverse_drag_copy_partial_endpoints_and_entire_middle_blocks() {
         let read = read();
@@ -878,6 +1347,379 @@ mod tests {
             }
         }
         cleared(&tree);
+    }
+
+    #[test]
+    fn dragging_tracks_wheel_scroll_under_a_stationary_pointer_and_stops_on_window_blur() {
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = surface(
+            widget::scrollable(
+                widget::column::with_children(
+                    (0..12)
+                        .map(|index| prose(&format!("line {index} selection")))
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(10),
+            )
+            .height(100)
+            .width(300),
+        );
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let viewport = Rectangle::with_size(Size::new(300.0, 100.0));
+        let mut clipboard = ClipboardText::default();
+        let pointer = Point::new(20.0, 50.0);
+        let mut send = |event: Event,
+                        point: Point,
+                        element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &mut layout::Node| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            if shell.is_layout_invalid() {
+                *node = element.as_widget_mut().layout(tree, &renderer, &limits);
+            }
+        };
+        send(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Point::new(5.0, 4.0),
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        send(
+            Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+            pointer,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let before = tree.state.downcast_ref::<State>().end;
+        send(
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 },
+            }),
+            pointer,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let mut read = Read::new(Some(pointer));
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        let block = read.endpoint(false).unwrap();
+        let after = tree.state.downcast_ref::<State>().end;
+        assert_eq!(
+            after,
+            Some(Endpoint {
+                identity: block.identity,
+                byte: block.hit
+            })
+        );
+        assert_ne!(
+            after, before,
+            "scrolling changes the text under the pointer without another motion event"
+        );
+        let outside = Point::new(20.0, 140.0);
+        send(
+            Event::Mouse(mouse::Event::CursorMoved { position: outside }),
+            outside,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let mut before_scroll = Read::new(None);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut before_scroll,
+        );
+        send(
+            Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+            outside,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let mut after_scroll = Read::new(Some(Point::new(20.0, 99.99)));
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut after_scroll,
+        );
+        assert!(
+            after_scroll.blocks[0].bounds.y < before_scroll.blocks[0].bounds.y,
+            "dragging beyond the viewport scrolls on redraw without pointer motion"
+        );
+        let endpoint = after_scroll.endpoint(false).unwrap();
+        let after = Some(Endpoint {
+            identity: endpoint.identity,
+            byte: endpoint.hit,
+        });
+        assert_eq!(tree.state.downcast_ref::<State>().end, after);
+        send(
+            Event::Window(iced::window::Event::Unfocused),
+            pointer,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        assert!(!tree.state.downcast_ref::<State>().dragging);
+        send(
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(10.0, 90.0),
+            }),
+            Point::new(10.0, 90.0),
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().end, after);
+    }
+
+    #[test]
+    fn bottom_anchored_transcript_scrolls_toward_the_drag_and_ignores_early_redraws() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = transcript(
+            scroll::transcript(
+                widget::column::with_children(
+                    (0..30)
+                        .map(|index| prose(&format!("line {index} text")))
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(10),
+                target,
+                None,
+                Vec::new(),
+            ),
+            target,
+            None,
+        );
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let viewport = Rectangle::with_size(Size::new(300.0, 100.0));
+        let mut clipboard = ClipboardText::default();
+        let mut send = |event: Event,
+                        point: Point,
+                        element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &mut layout::Node| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            if shell.is_layout_invalid() {
+                *node = element.as_widget_mut().layout(tree, &renderer, &limits);
+            }
+        };
+        let top = |element: &mut Element<'_, Message>, tree: &mut Tree, node: &layout::Node| {
+            let mut read = Read::new(None);
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), &renderer, &mut read);
+            read.blocks[0].bounds.y
+        };
+        let mut initial_read = Read::new(None);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut initial_read,
+        );
+        let visible = initial_read
+            .blocks
+            .iter()
+            .filter_map(|block| block.visible)
+            .find(|bounds| bounds.height > 1.0)
+            .unwrap();
+        send(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Point::new(visible.x + 2.0, visible.y + visible.height / 2.0),
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let outside = Point::new(5.0, -40.0);
+        send(
+            Event::Mouse(mouse::Event::CursorMoved { position: outside }),
+            outside,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let before = top(&mut element, &mut tree, &node);
+        let now = iced::time::Instant::now();
+        send(
+            Event::Window(iced::window::Event::RedrawRequested(now)),
+            outside,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let first = top(&mut element, &mut tree, &node);
+        assert!(
+            first > before,
+            "upward dragging scrolls toward earlier text with Anchor::End"
+        );
+        send(
+            Event::Window(iced::window::Event::RedrawRequested(
+                now + std::time::Duration::from_millis(8),
+            )),
+            outside,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        assert_eq!(
+            top(&mut element, &mut tree, &node),
+            first,
+            "stream/high-refresh redraws cannot accelerate drag scrolling"
+        );
+        send(
+            Event::Window(iced::window::Event::RedrawRequested(
+                now + std::time::Duration::from_millis(32),
+            )),
+            outside,
+            &mut element,
+            &mut tree,
+            &mut node,
+        );
+        let second = top(&mut element, &mut tree, &node);
+        assert!(
+            ((second - first) - 2.0 * (first - before)).abs() < 0.1,
+            "scroll movement scales with elapsed time"
+        );
+    }
+
+    #[test]
+    fn nested_output_hidden_bounds_do_not_steal_the_following_paragraph_endpoint() {
+        let renderer = crate::app::tests::headless_renderer();
+        let output = (0..50)
+            .map(|index| format!("output {index}\n"))
+            .collect::<String>();
+        let mut element: Element<'_, Message> = widget::column::with_children(vec![
+            widget::scrollable(prose(&output))
+                .height(80)
+                .width(300)
+                .into(),
+            prose("following paragraph"),
+        ])
+        .spacing(12)
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 300.0)),
+        );
+        let mut read = Read::new(None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert!(read.blocks[0].bounds.height > 300.0);
+        let point = Point::new(5.0, read.blocks[1].bounds.y + 4.0);
+        let mut read = Read::new(Some(point));
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert_eq!(
+            read.endpoint(false).unwrap().identity,
+            read.blocks[1].identity
+        );
+        assert!(
+            read.blocks[0].hit < output.len() / 2,
+            "an endpoint outside nested output clamps to visible lines"
+        );
+    }
+
+    #[test]
+    fn streaming_tool_append_preserves_transcript_selection_endpoints() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let theme = crate::settings::EditorSyntaxTheme::default();
+        let initial = "first λ line\nselected text\n";
+        let mut block = tool_text::ToolText::update(None, initial, tool_text::Language::Plain);
+        let mut element = surface(block.view(theme, None, target));
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 300.0));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut read = Read::new(None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        let identity = read.blocks[0].identity;
+        let state = tree.state.downcast_mut::<State>();
+        state.anchor = Some(Endpoint {
+            identity,
+            byte: "first λ line\n".len(),
+        });
+        state.end = Some(Endpoint {
+            identity,
+            byte: "first λ line\nselected".len(),
+        });
+        let expected = (state.anchor, state.end);
+        block = tool_text::ToolText::update(
+            Some(block),
+            &format!("{initial}appended output\n"),
+            tool_text::Language::Plain,
+        );
+        element = surface(block.view(theme, None, target));
+        tree.diff(&mut element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!((state.anchor, state.end), expected);
+        let mut read = Read::new(None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        assert_eq!(
+            read.copy(
+                &read
+                    .ranges(expected.0.unwrap(), expected.1.unwrap())
+                    .unwrap()
+            ),
+            "selected"
+        );
     }
 
     #[test]

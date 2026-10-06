@@ -99,7 +99,7 @@ fn kind_glyph(content: &ItemContent) -> &'static str {
 
 /// Monospaced content inside its own surface.
 ///
-/// Built from `selectable_text` because the transcript's whole purpose is
+/// Uses the shared transcript selection because the transcript's whole purpose is
 /// handing output to the reader: a command's output that cannot be selected
 /// forces them to use a copy button for a single word.
 ///
@@ -113,13 +113,15 @@ pub(super) fn code_surface<'a>(
     caption: Option<&'a str>,
     limit: Option<f32>,
     copy: Option<Action>,
+    target: Target,
 ) -> Element<'a, Message> {
-    let body = widget::container(
-        widget::selectable_text(text)
-            .size(design::TEXT_BODY)
-            .font(iced::Font::MONOSPACE)
-            .width(Length::Fill),
-    )
+    let body = widget::container(selectable_prose::plain(
+        text,
+        design::TEXT_BODY,
+        iced::Font::MONOSPACE,
+        target,
+    ))
+    .width(Length::Fill)
     .padding([GAP_S as u16, GAP_M as u16]);
     let body: Element<'_, Message> = match limit {
         Some(height) => widget::container(
@@ -215,7 +217,7 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
         .into()
 }
 
-fn search_result_view(result: &SearchResult) -> Element<'_, Message> {
+fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Message> {
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
     let title = if result.title.is_empty() {
         result.url.as_str()
@@ -223,29 +225,39 @@ fn search_result_view(result: &SearchResult) -> Element<'_, Message> {
         result.title.as_str()
     };
     if result.url.is_empty() {
-        rows.push(
-            widget::selectable_text(title)
-                .size(design::TEXT_BODY)
-                .into(),
-        );
+        rows.push(selectable_prose::plain(
+            title,
+            design::TEXT_BODY,
+            iced::Font::default(),
+            target,
+        ));
     } else {
-        rows.push(
-            widget::button::link(title.to_owned())
-                .on_press(action(Action::OpenUrl(result.url.clone())))
-                .into(),
-        );
-        rows.push(
-            widget::selectable_text(result.url.as_str())
-                .size(design::TEXT_CAPTION)
-                .into(),
-        );
+        rows.push(selectable_prose::text(
+            vec![
+                iced::widget::text::Span::new(title.to_owned())
+                    .link(result.url.clone())
+                    .color(design::accent_color(&cosmic::theme::active())),
+            ]
+            .into(),
+            design::TEXT_BODY.into(),
+            iced::Font::default(),
+            target,
+            None,
+        ));
+        rows.push(selectable_prose::plain(
+            result.url.as_str(),
+            design::TEXT_CAPTION,
+            iced::Font::default(),
+            target,
+        ));
     }
     if !result.snippet.is_empty() {
-        rows.push(
-            widget::selectable_text(result.snippet.as_str())
-                .size(design::TEXT_BODY)
-                .into(),
-        );
+        rows.push(selectable_prose::plain(
+            result.snippet.as_str(),
+            design::TEXT_BODY,
+            iced::Font::default(),
+            target,
+        ));
     }
     widget::column::with_children(rows)
         .spacing(design::GRID_UNIT)
@@ -274,9 +286,7 @@ impl Runtime {
         let id = item.id.clone();
         let copy = Action::Copy(target, id.clone(), part.clone());
         code_frame(
-            block.view(self.syntax_theme, limit, move |event| {
-                action(Action::ToolText(target, id.clone(), part.clone(), event))
-            }),
+            block.view(self.syntax_theme, limit, target),
             Some(caption.to_owned()),
             Some(copy),
         )
@@ -513,7 +523,13 @@ impl Runtime {
                 ..
             } => {
                 if !body.is_empty() {
-                    rows.push(code_surface(body, None, Some(Self::OUTPUT_HEIGHT), None));
+                    rows.push(code_surface(
+                        body,
+                        None,
+                        Some(Self::OUTPUT_HEIGHT),
+                        None,
+                        self.target,
+                    ));
                 }
             }
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
@@ -570,15 +586,20 @@ impl Runtime {
                 }
             }
             ItemContent::WebSearch { query, results } => {
-                rows.push(
-                    widget::selectable_text(query.as_str())
-                        .size(design::TEXT_BODY)
-                        .into(),
-                );
+                rows.push(selectable_prose::plain(
+                    query.as_str(),
+                    design::TEXT_BODY,
+                    iced::Font::default(),
+                    self.target,
+                ));
                 if results.is_empty() {
                     rows.push(design::caption("No results were reported.").into());
                 }
-                rows.extend(results.iter().map(search_result_view));
+                rows.extend(
+                    results
+                        .iter()
+                        .map(|result| search_result_view(result, self.target)),
+                );
             }
             ItemContent::Tool { input, output, .. } => {
                 if !input.is_empty() {
@@ -620,11 +641,12 @@ impl Runtime {
                     );
                 }
                 if !description.is_empty() {
-                    rows.push(
-                        widget::selectable_text(description.as_str())
-                            .size(design::TEXT_BODY)
-                            .into(),
-                    );
+                    rows.push(selectable_prose::plain(
+                        description.as_str(),
+                        design::TEXT_BODY,
+                        iced::Font::default(),
+                        self.target,
+                    ));
                 }
                 if path.starts_with("http://") || path.starts_with("https://") {
                     rows.push(
@@ -633,11 +655,12 @@ impl Runtime {
                             .into(),
                     );
                 } else if !path.is_empty() && !path.starts_with("data:") {
-                    rows.push(
-                        widget::selectable_text(path.as_str())
-                            .size(design::TEXT_CAPTION)
-                            .into(),
-                    );
+                    rows.push(selectable_prose::plain(
+                        path.as_str(),
+                        design::TEXT_CAPTION,
+                        iced::Font::default(),
+                        self.target,
+                    ));
                 }
             }
         }
