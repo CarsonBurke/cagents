@@ -381,6 +381,7 @@ impl ReviewSource {
 pub struct State {
     unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
+    parked_discussions: Vec<(ReviewTarget, discussion_ui::DiscussionState)>,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
     cache_dirty: bool,
@@ -577,6 +578,7 @@ impl State {
         Self {
             unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
+            parked_discussions: Vec::new(),
             api,
             cache: None,
             cache_dirty: false,
@@ -627,6 +629,9 @@ impl State {
     /// the list and any review of the old one.
     pub fn set_source(&mut self, source: Option<ReviewSource>) -> ActionTask {
         if self.source == source {
+            return ActionTask::none();
+        }
+        if self.block_discussion_navigation() {
             return ActionTask::none();
         }
         self.source = source;
@@ -1057,6 +1062,9 @@ impl State {
         let Some(source) = self.source.clone() else {
             return ActionTask::none();
         };
+        if self.block_discussion_navigation() {
+            return ActionTask::none();
+        }
         let closed = self.close();
         let generation = self.generation;
         let cancellation = self.cancellation.clone();
@@ -1157,8 +1165,18 @@ impl State {
         if self.target.as_ref() == Some(&target) {
             return ActionTask::none();
         }
+        if self.block_discussion_navigation() {
+            return ActionTask::none();
+        }
         let number = target.pull_request.number;
         self.reset_target();
+        if let Some(index) = self.parked_discussions.iter().position(|(saved, _)| {
+            saved.repository == target.repository
+                && saved.worktree == target.worktree
+                && saved.pull_request.number == number
+        }) {
+            self.discussion = self.parked_discussions.swap_remove(index).1;
+        }
         self.target = Some(target);
         self.load = LoadState::Loading;
         self.effects.push(Effect::SelectionChanged(Some(number)));
@@ -1185,6 +1203,9 @@ impl State {
     }
 
     fn close(&mut self) -> ActionTask {
+        if self.block_discussion_navigation() {
+            return ActionTask::none();
+        }
         let was_open = self.target.is_some();
         self.reset_target();
         if was_open {
@@ -1198,7 +1219,13 @@ impl State {
         self.cache_dirty = false;
         self.cached_viewer = None;
         self.restore_selection = None;
-        self.discussion = discussion_ui::DiscussionState::default();
+        let discussion = std::mem::take(&mut self.discussion);
+        if discussion.has_local_work()
+            && let Some(target) = self.target.clone()
+        {
+            self.parked_discussions
+                .push((target, discussion.into_draft_state()));
+        }
         self.cancellation.cancel();
         self.cancellation = CancellationToken::new();
         self.generation = self.generation.wrapping_add(1);
