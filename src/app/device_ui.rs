@@ -601,6 +601,9 @@ impl Cagents {
                         self.device_ui.directory = path.clone();
                         self.active_workspace = Some(path.clone());
                         self.device_ui.file = None;
+                        self.device_ui.entries.clear();
+                        self.device_ui.output.clear();
+                        self.device_ui.view = View::Editor;
                         let edit = crate::workspace_model::ModelEdit::ReopenProject {
                             repository: key,
                             name: path
@@ -611,6 +614,7 @@ impl Cagents {
                             kind,
                         };
                         self.publish_model_edit(edit);
+                        return self.update_device(Action::Browse);
                     }
                     Ok(_) => self.device_ui.notice = Some("Unexpected device response".into()),
                 }
@@ -1234,6 +1238,66 @@ mod tests {
             sidebar::SidebarFilter::Attention
         );
         assert!(!navigation.device_ui.open);
+    }
+
+    #[test]
+    fn opening_a_project_replaces_the_previous_directory_listing_even_on_failure() {
+        for succeeds in [true, false] {
+            let mut app = loaded_file();
+            drop(app.update_device(Action::DiscardChanges));
+            app.device_ui.entries = vec![crate::device_service::Entry {
+                name: "old-file".into(),
+                directory: false,
+                symlink: false,
+            }];
+            app.device_ui.output = "old Git output".into();
+            drop(app.update_device(Action::Path("/remote/other".into())));
+            drop(app.update_device(Action::OpenProject));
+            drop(app.update_device(Action::Loaded {
+                generation: app.device_ui.generation,
+                result: Ok(Reply::Project {
+                    path: "/remote/other".into(),
+                    key: "/remote/other/.git".into(),
+                    kind: ProjectKind::Git,
+                }),
+            }));
+            assert_eq!(app.device_ui.directory, Path::new("/remote/other"));
+            assert!(app.device_ui.file.is_none());
+            assert!(app.device_ui.entries.is_empty());
+            assert!(app.device_ui.output.is_empty());
+            assert!(
+                matches!(&app.device_ui.pending, Some(Operation::List { path })
+                if path == Path::new("/remote/other"))
+            );
+            let result = if succeeds {
+                Ok(Reply::Directory {
+                    path: "/remote/other".into(),
+                    entries: vec![crate::device_service::Entry {
+                        name: "new-file".into(),
+                        directory: false,
+                        symlink: false,
+                    }],
+                })
+            } else {
+                Err("Cannot list the selected project".into())
+            };
+            drop(app.update_device(Action::Loaded {
+                generation: app.device_ui.generation,
+                result,
+            }));
+            if succeeds {
+                assert_eq!(app.device_ui.entries[0].name, "new-file");
+            } else {
+                assert!(app.device_ui.entries.is_empty());
+                assert!(
+                    app.device_ui
+                        .notice
+                        .as_deref()
+                        .unwrap()
+                        .contains("Cannot list")
+                );
+            }
+        }
     }
 
     #[test]
