@@ -1118,6 +1118,10 @@ impl Cagents {
                         .spacing(4)
                         .into(),
                         iced::widget::text_editor(&state.content)
+                            .font(crate::terminal::monospace_font(
+                                self.settings.editor_font_family(),
+                            ))
+                            .size(self.settings.editor_font_size())
                             .id(file_editor_id())
                             .on_action(|value| Message::Device(Action::Edit(value)))
                             .height((height - 38.0).max(120.0))
