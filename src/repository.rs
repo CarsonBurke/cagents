@@ -686,8 +686,8 @@ impl StatusSnapshot {
 /// One row of the synthesized file tree.
 ///
 /// Directory rows exist only in memory: they are derived from the paths Git
-/// listed, never from reading the filesystem, so no symlinked directory can be
-/// walked into and no ignored subtree can appear.
+/// listed. Shallow filesystem listings can supply explicit directory leaves
+/// without recursively walking their descendants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTreeEntry {
     pub path: RepoPath,
@@ -847,6 +847,14 @@ pub struct WorkingFiles {
     /// their own and duplicating the listing of a large worktree to answer one
     /// number would not be free.
     pub tracked_count: usize,
+    /// Ignored entries for file browsing, read separately from source control.
+    #[serde(default)]
+    pub ignored: Vec<RepoPath>,
+    #[serde(default)]
+    pub ignored_directories: Vec<RepoPath>,
+    /// Failed lazy folder reads, retained until the user explicitly retries.
+    #[serde(default)]
+    pub ignored_directory_errors: std::collections::BTreeMap<RepoPath, String>,
 }
 
 /// Everything the source-control surfaces need about one worktree in one shot.
@@ -2476,6 +2484,7 @@ pub fn parse_working_files(output: &[u8]) -> Result<WorkingFiles, GitParseError>
     Ok(WorkingFiles {
         paths: tagged.into_keys().collect(),
         tracked_count,
+        ..WorkingFiles::default()
     })
 }
 
@@ -3398,6 +3407,88 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// number of untracked files. `-z` keeps every path byte-exact.
     pub fn working_files_command(&self, worktree: &Path) -> CommandSpec {
         self.git_read(worktree, ["ls-files", "-tco", "--exclude-standard", "-z"])
+    }
+
+    /// Lists ignored files and collapsed folders without walking build trees.
+    pub fn ignored_files(
+        &self,
+        worktree: &Path,
+        known_files: &[RepoPath],
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                [
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--directory",
+                    "-z",
+                ],
+            ),
+            cancellation,
+        )?;
+        let parsed = (|| {
+            let mut files = WorkingFiles::default();
+            for (record, field) in nul_fields(&output.stdout, "git ls-files --ignored")?
+                .into_iter()
+                .enumerate()
+            {
+                if field.is_empty() {
+                    continue;
+                }
+                let (name, directory) = field
+                    .strip_suffix(b"/")
+                    .map_or((field, false), |name| (name, true));
+                let path = repo_path_field(name, "git ls-files --ignored", record)?;
+                if directory {
+                    files.ignored_directories.push(path);
+                } else {
+                    files.ignored.push(path);
+                }
+            }
+            Ok(files)
+        })();
+        let mut files = invalid_output(parsed, output)?;
+        // A force-tracked child makes Git list an ignored folder's contents
+        // instead of the folder itself. Classify their ancestors as well so
+        // the folder retains its own ignored styling.
+        let candidates: std::collections::BTreeSet<_> = files
+            .ignored
+            .iter()
+            .chain(&files.ignored_directories)
+            .chain(known_files)
+            .flat_map(|path| path.as_path().ancestors().skip(1))
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        if !candidates.is_empty() {
+            let input: Vec<u8> = candidates
+                .into_iter()
+                .flat_map(|path| {
+                    path.as_os_str()
+                        .as_encoded_bytes()
+                        .iter()
+                        .copied()
+                        .chain([0])
+                })
+                .collect();
+            let command = self
+                .git_read(worktree, ["check-ignore", "--no-index", "-z", "--stdin"])
+                .stdin(input);
+            let output = self.run(&command, cancellation)?;
+            if !output.success && output.exit_code != Some(1) {
+                return Err(git_failure(&command, output).into());
+            }
+            let parsed = parse_path_list(&output.stdout, "git check-ignore");
+            files
+                .ignored_directories
+                .extend(invalid_output(parsed, output)?);
+            files.ignored_directories.sort();
+            files.ignored_directories.dedup();
+        }
+        Ok(files)
     }
 
     /// Tracked paths alone are sufficient to watch the sidebar's tracked-only
@@ -6195,6 +6286,61 @@ mod tests {
 
         fn service() -> RepositoryService<IsolatedExecutor> {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
+        }
+
+        #[test]
+        fn ignored_file_listing_preserves_collapsed_folders_and_git_rules() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(
+                root.join(".gitignore"),
+                "build/\nempty/\n*.log\n!keep.log\n",
+            )
+            .unwrap();
+            fs::create_dir_all(root.join("build/nested")).unwrap();
+            fs::create_dir(root.join("empty")).unwrap();
+            fs::write(root.join("build/nested/artifact"), "generated").unwrap();
+            fs::write(root.join("build/tracked"), "tracked").unwrap();
+            git(root, &["add", "-f", "build/tracked"]);
+            fs::write(root.join("ignored #1.log"), "ignored").unwrap();
+            fs::write(root.join("keep.log"), "included").unwrap();
+            fs::write(root.join("private.txt"), "local ignore").unwrap();
+            fs::write(root.join(".git/info/exclude"), "private.txt\n").unwrap();
+            let files = service()
+                .ignored_files(
+                    root,
+                    &[path("build/tracked")],
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                files.ignored,
+                vec![path("ignored #1.log"), path("private.txt")]
+            );
+            assert_eq!(
+                files.ignored_directories,
+                vec![path("build"), path("build/nested"), path("empty")]
+            );
+            assert!(
+                !files
+                    .ignored
+                    .iter()
+                    .any(|path| path.display().contains("artifact")),
+                "collapsed folders must not enumerate descendants"
+            );
+            fs::remove_dir_all(root.join("build/nested")).unwrap();
+            let files = service()
+                .ignored_files(
+                    root,
+                    &[path("build/tracked")],
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+            assert!(
+                files.ignored_directories.contains(&path("build")),
+                "an ignored folder with only tracked children still has ignored styling"
+            );
         }
 
         #[test]

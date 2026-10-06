@@ -25,6 +25,7 @@ pub(super) fn surface<'a, Message: Clone + 'static>(
         ),
         items,
         builder: None,
+        footprint: layout::Node::new(Size::ZERO),
     })
 }
 
@@ -40,6 +41,7 @@ pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
         ),
         items: 0,
         builder: Some(Box::new(builder)),
+        footprint: layout::Node::new(Size::ZERO),
     })
 }
 
@@ -49,12 +51,17 @@ pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
 /// native widget stores one `MenuState` per open level, and its `MenuBounds`
 /// holds a position and a size per item of the list that level was opened on.
 /// Our menus are flat, so the top-level item count is their entire shape.
-struct MenuItems(usize);
+/// Retain the click in window space as well, to size the popup's anchor.
+struct MenuItems {
+    count: usize,
+    anchor: Point,
+}
 
 struct MenuSurface<'a, Message> {
     native: widget::ContextMenu<'a, Message>,
     items: usize,
     builder: Option<Box<dyn Fn() -> Vec<widget::menu::Tree<Message>> + 'a>>,
+    footprint: layout::Node,
 }
 
 impl<Message: Clone + 'static> MenuSurface<'_, Message> {
@@ -92,7 +99,10 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(MenuItems(self.items))
+        tree::State::new(MenuItems {
+            count: self.items,
+            anchor: Point::ORIGIN,
+        })
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -100,7 +110,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        if tree.state.downcast_ref::<MenuItems>().0 > 0 {
+        if tree.state.downcast_ref::<MenuItems>().count > 0 {
             self.build_menu();
         }
         // An open menu measures its items once, at the click that opens it, and
@@ -120,8 +130,8 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // an open menu that silently restructures under the pointer is a
         // mis-click waiting to happen either way.
         let measured = tree.state.downcast_mut::<MenuItems>();
-        let remeasured = measured.0 != self.items;
-        measured.0 = self.items;
+        let remeasured = measured.count != self.items;
+        measured.count = self.items;
         if remeasured || tree.children.is_empty() {
             tree.children = vec![self.native_tree()];
         }
@@ -168,7 +178,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         if opening {
             if self.builder.is_some() && self.items == 0 {
                 self.build_menu();
-                tree.state.downcast_mut::<MenuItems>().0 = self.items;
+                tree.state.downcast_mut::<MenuItems>().count = self.items;
                 tree.children = vec![self.native_tree()];
             }
             self.native.diff(&mut tree.children[0]);
@@ -195,6 +205,10 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // an overlay without re-applying the offset would silently anchor
         // that one menu in content space again.
         let scroll = layout.virtual_offset();
+        if opening {
+            tree.state.downcast_mut::<MenuItems>().anchor =
+                cursor.position().unwrap_or_default() - scroll;
+        }
         let row = layout.bounds();
         let anchor = layout::Node::new(row.size()).move_to(row.position() - scroll);
         self.native.update(
@@ -237,7 +251,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
     fn overlay<'a>(
         &'a mut self,
         tree: &'a mut Tree,
-        layout: Layout<'a>,
+        _layout: Layout<'a>,
         renderer: &Renderer,
         viewport: &Rectangle,
         _translation: Vector,
@@ -249,18 +263,153 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // runtime drives overlays in, so the native menu needs no translation:
         // it derives one offset for its layout and the opposite one for its
         // hit tests, and the two only agree at none at all.
+        // COSMIC uses the content bounds as the popup's parent footprint,
+        // moved to the click. A full-width file row therefore adds its width
+        // to a leftward popup, placing its right edge beyond the window.
+        // Supply a popup footprint instead. The pinned native menu is 240px
+        // wide; its overlapping placement aligns either left or right edges.
+        // Shortening this footprint near the right edge makes both choices
+        // keep the popup inside the window, including clicks near its center
+        // where neither side of a point anchor has enough room.
+        let anchor = tree.state.downcast_ref::<MenuItems>().anchor;
+        let menu_width = 240.0;
+        // A scrollable may supply only its clipped viewport. Its right edge
+        // is in window space just like the anchor; its width alone is not.
+        let right = viewport.x + viewport.width;
+        let left = anchor.x.clamp(0.0, (right - menu_width).max(0.0));
+        // Keep the anchor nonempty for native containment checks, but below
+        // one pixel high so its integer vertical offset rounds to zero. That
+        // lets an upward menu end before the click, even at the bottom edge.
+        self.footprint = layout::Node::new(Size::new(
+            (left + menu_width - anchor.x).max(f32::EPSILON),
+            0.5,
+        ));
         let native = self.native.overlay(
             &mut tree.children[0],
-            layout,
+            Layout::new(&self.footprint),
             renderer,
             viewport,
             Vector::ZERO,
         );
         if native.is_none() && self.builder.is_some() {
-            tree.state.downcast_mut::<MenuItems>().0 = 0;
+            tree.state.downcast_mut::<MenuItems>().count = 0;
             self.items = 0;
         }
-        native.map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner })))
+        native.map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner, anchor })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{clipboard, renderer::Headless};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Action;
+
+    impl widget::menu::Action for Action {
+        type Message = ();
+
+        fn message(&self) {}
+    }
+
+    #[test]
+    fn full_width_rows_keep_popups_inside_the_window() {
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("headless renderer");
+        for (window, viewport, positions) in [
+            (
+                Size::new(400.0, 400.0),
+                Rectangle::new(Point::ORIGIN, Size::new(400.0, 400.0)),
+                vec![
+                    Point::new(20.0, 16.0),
+                    Point::new(180.0, 16.0),
+                    Point::new(220.0, 16.0),
+                    Point::new(390.0, 16.0),
+                    Point::new(390.0, 380.0),
+                    Point::new(399.75, 399.75),
+                ],
+            ),
+            (
+                Size::new(1902.0, 2100.0),
+                Rectangle::new(Point::new(1519.0, 0.0), Size::new(383.0, 2100.0)),
+                vec![Point::new(1586.0, 299.0), Point::new(1901.75, 299.0)],
+            ),
+        ] {
+            for position in positions {
+                let mut element: Element<'_, ()> = surface(widget::menu::items(
+                    &std::collections::HashMap::new(),
+                    vec![widget::menu::Item::Button("Action", None, Action)],
+                ));
+                let widget = element.as_widget_mut();
+                let mut tree = Tree::new(&*widget);
+                widget.diff(&mut tree);
+                let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                let mut messages = Vec::new();
+                widget.update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&row),
+                    mouse::Cursor::Available(position),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let mut popup = widget
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&row),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .expect("opened menu");
+                let popup_layout = popup.as_overlay_mut().layout(&renderer, window);
+                popup.as_overlay_mut().update(
+                    &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                    Layout::new(&popup_layout),
+                    mouse::Cursor::Available(position),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                let popup_layout = popup.as_overlay_mut().layout(&renderer, window);
+                let menu = popup_layout.children().first().expect("measured menu");
+                assert!(
+                    menu.bounds().is_within(&viewport),
+                    "{position:?}: {:?}",
+                    menu.bounds()
+                );
+                let pointer = mouse::Cursor::Available(menu.bounds().center());
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    popup.as_overlay_mut().update(
+                        &Event::Mouse(event),
+                        Layout::new(&popup_layout),
+                        pointer,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                    );
+                }
+                assert_eq!(
+                    messages,
+                    [()],
+                    "the visible popup must remain clickable at {position:?}"
+                );
+            }
+        }
     }
 }
 
@@ -269,6 +418,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
 /// item from the actual press position instead of requiring prior motion.
 struct PointerAwareMenu<'a, Message> {
     inner: overlay::Element<'a, Message, Theme, Renderer>,
+    anchor: Point,
 }
 impl<Message> overlay::Overlay<Message, Theme, Renderer> for PointerAwareMenu<'_, Message> {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
@@ -289,6 +439,23 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for PointerAwareMenu<'_
         };
         let mut messages = Vec::new();
         let mut motion = Shell::new(&mut messages);
+        // Native menus measure only on their first update, while the cursor
+        // is still inside the parent anchor. Motion can arrive before the
+        // opening redraw, so initialize at the retained click before passing
+        // that motion on. Once measured, the overlay has a menu child and
+        // subsequent updates preserve its normal hover and scrolling state.
+        if layout.children().next().is_none() {
+            self.inner.as_overlay_mut().update(
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: self.anchor,
+                }),
+                layout,
+                mouse::Cursor::Available(self.anchor),
+                renderer,
+                clipboard,
+                &mut motion,
+            );
+        }
         if let Some(position) = press {
             self.inner.as_overlay_mut().update(
                 &Event::Mouse(mouse::Event::CursorMoved { position }),

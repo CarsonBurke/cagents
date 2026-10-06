@@ -2249,8 +2249,8 @@ mod tests {
         fn a_single_item_context_menu_activates_its_visible_item() {
             for move_before_press in [false, true] {
                 let mut frames = Frames::new();
-                // The full-width row makes COSMIC place this popup leftwards:
-                // its measured bounds are x=180..420, y=16..52.
+                // The popup stays inside the window even when the clicked
+                // row fills its width; this point is inside its visible item.
                 let point = Point::new(220.0, 32.0);
                 let _ = frames.frame(row(1), &[], ANCHOR);
                 let _ = frames.frame(row(1), &right_click(), ANCHOR);
@@ -2274,6 +2274,17 @@ mod tests {
                 );
                 assert_eq!(frames.messages, vec![Act::Item(0)]);
             }
+        }
+
+        #[test]
+        fn a_menu_initializes_before_the_pointer_leaves_its_anchor() {
+            let mut frames = Frames::new();
+            frames.frame(row(3), &[], ANCHOR);
+            frames.frame(row(3), &right_click(), ANCHOR);
+            // Cursor motion may arrive before the requested redraw. The menu
+            // must measure at the opening click before handling that motion.
+            frames.frame(row(3), &[moved(OVER_MENU)], OVER_MENU);
+            assert!(frames.menu_is_open(row(3)));
         }
 
         #[test]
