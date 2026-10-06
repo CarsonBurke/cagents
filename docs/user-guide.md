@@ -682,8 +682,11 @@ Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.
 
-- Drag over an answer paragraph or fenced code block and press `Ctrl+C` to
-  copy the selected text. Each code block also has its own **Copy** button.
+- Drag across prompts, answers, code, and tool output and press `Ctrl+C` to
+  copy the selected text. Double-click selects a word; triple-click selects
+  a paragraph. Shift-click extends the selection, and dragging beyond the
+  transcript scrolls it. `Ctrl+A` selects the transcript when its text has
+  focus. Each code block also has its own **Copy** button.
 - With chat focused, `Ctrl+F` finds matching transcript turns, including tool
   output. Enter visits the next match, Shift+Enter the previous one, and
   Escape closes find. Matching prose is highlighted and matching tools expand.

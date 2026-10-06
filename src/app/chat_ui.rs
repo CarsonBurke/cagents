@@ -111,7 +111,6 @@ pub enum ReturnRefused {
 
 #[derive(Clone)]
 pub enum Action {
-    ToolText(Target, String, CopyPart, text_editor::Action),
     /// Points a draft at a model of any provider, or at a provider's default
     /// model where none is named.
     DraftModel(Target, Provider, Option<String>),
@@ -5030,19 +5029,6 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::ToolText(target, id, part, event) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && let Some(cached) = runtime.cache.get_mut(&id)
-                    && let Some(block) = match part {
-                        CopyPart::Input => cached.tool_input.as_mut(),
-                        CopyPart::Output => cached.tool_output.as_mut(),
-                        CopyPart::Change(index) => cached.patches.get_mut(index),
-                        _ => None,
-                    }
-                {
-                    block.perform(event);
-                }
-            }
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }
@@ -12502,7 +12488,7 @@ mod tests {
             .expect("the Rust fence is cached");
         for dark in [false, true] {
             let spans = block.spans(dark);
-            assert_eq!(text_of(spans), "fn main() {}\nlet x = 1;");
+            assert_eq!(text_of(spans), "fn main() {}\nlet x = 1;\n");
             assert!(
                 spans.iter().any(|span| span.color.is_some()),
                 "a keyword takes a color"
@@ -12511,7 +12497,7 @@ mod tests {
         let plain = cached
             .block(None, "plain\n")
             .expect("an unnamed fence is cached too");
-        assert_eq!(text_of(plain.spans(true)), "plain");
+        assert_eq!(text_of(plain.spans(true)), "plain\n");
         assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
         assert!(cached.block(Some("rust"), "fn other() {}\n").is_none());
     }

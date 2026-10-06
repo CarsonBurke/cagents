@@ -97,6 +97,21 @@ pub(super) fn text(
     })
 }
 
+pub(super) fn plain(
+    text: impl Into<String>,
+    size: f32,
+    font: iced::Font,
+    target: Target,
+) -> Element<'static, Message> {
+    self::text(
+        vec![Span::new(text.into())].into(),
+        size.into(),
+        font,
+        target,
+        None,
+    )
+}
+
 struct Selectable {
     matches: Vec<std::ops::Range<usize>>,
     spans: Arc<[Span<'static, String>]>,
@@ -309,6 +324,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if state.managed {
             return;
         }
+        if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+            state.dragging = false;
+        }
         state.validate_selection(&self.plain);
         let position = cursor.position_in(layout.bounds());
         match event {
@@ -335,6 +353,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
                 state.dragging = false;
+                if let Some(position) = cursor.position() {
+                    state.end = self.hit(
+                        state,
+                        position - iced::Vector::new(layout.bounds().x, layout.bounds().y),
+                    );
+                }
                 if state.anchor == state.end
                     && let Some(position) = position
                     && let Some(span) = state.paragraph.hit_span(position)

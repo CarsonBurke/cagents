@@ -1221,6 +1221,7 @@ dependencies = [
  "two-face",
  "unicode-casefold",
  "unicode-linebreak",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "uuid",
