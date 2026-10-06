@@ -520,6 +520,7 @@ pub struct State {
     history: Vec<Firing>,
     history_status: HistoryStatus,
     history_next: Option<HistoryCursor>,
+    history_newer: bool,
     all_history: bool,
     run: Option<RunDetail>,
     error: Option<String>,
@@ -641,6 +642,7 @@ impl State {
                         self.draft = None;
                         self.all_history = false;
                         self.history.clear();
+                        self.history_newer = false;
                         self.history_status = HistoryStatus::Unrequested;
                         self.history_next = None;
                         self.notice = Some(
@@ -663,27 +665,38 @@ impl State {
                 Ok(Response::History(page)) => {
                     self.history_status = HistoryStatus::Loaded;
                     if matches!(pending, Pending::RefreshHistory) {
-                        // Refresh the newest page without dropping older pages or
-                        // moving the cursor used by Older runs.
-                        let had_history = !self.history.is_empty();
-                        let ids = page
-                            .firings
-                            .iter()
-                            .map(|firing| firing.id)
-                            .collect::<Vec<_>>();
-                        let overlaps = self.history.iter().any(|firing| ids.contains(&firing.id));
-                        // More than a page of new runs can arrive between ticks.
-                        // Keep the loaded rows, but allow paging across that gap.
-                        let has_gap = had_history && !ids.is_empty() && !overlaps;
-                        self.history.retain(|firing| !ids.contains(&firing.id));
-                        self.history.splice(0..0, page.firings);
-                        if !had_history || has_gap {
+                        // Keep the reader's paginated snapshot stable. Automatically
+                        // inserting every new run would grow the mounted list forever
+                        // and create gaps between its newest and older pages.
+                        if self.history.is_empty() {
+                            self.history = page.firings;
                             self.history_next = page.next;
+                            self.history_newer = false;
+                        } else {
+                            let newest = self
+                                .history
+                                .iter()
+                                .map(|firing| (firing.created_ms, firing.id))
+                                .max();
+                            for firing in page.firings {
+                                if let Some(current) = self
+                                    .history
+                                    .iter_mut()
+                                    .find(|current| current.id == firing.id)
+                                {
+                                    *current = firing;
+                                } else if newest
+                                    .is_some_and(|latest| (firing.created_ms, firing.id) > latest)
+                                {
+                                    self.history_newer = true;
+                                }
+                            }
                         }
                         return self.refresh_history_runs(0);
                     }
                     if !matches!(pending, Pending::History { append: true }) {
                         self.history.clear();
+                        self.history_newer = false;
                     }
                     for firing in page.firings {
                         if let Some(current) = self
@@ -758,6 +771,7 @@ impl State {
             self.all_history = false;
             self.run = None;
             self.history.clear();
+            self.history_newer = false;
             self.history_next = None;
             return self.request(Pending::Run, Request::ShowRun { run });
         }
@@ -878,6 +892,7 @@ impl State {
                 self.all_history = false;
                 self.selected = None;
                 self.history.clear();
+                self.history_newer = false;
                 self.history_status = HistoryStatus::Unrequested;
                 self.history_next = None;
                 self.run = None;
@@ -1071,6 +1086,7 @@ impl State {
                 if matches!(action, Action::AllHistory) {
                     self.all_history = true;
                     self.history.clear();
+                    self.history_newer = false;
                     self.history_next = None;
                     self.history_status = HistoryStatus::Unrequested;
                     self.selected = None;
@@ -1328,6 +1344,11 @@ impl State {
                 }
                 if self.selected.is_some() || self.all_history {
                     content = content.push(button("Refresh history", Action::History, !busy));
+                    if self.history_newer {
+                        content = content.push(widget::text::body(
+                            "Newer runs are available. Refresh history to show the latest page.",
+                        ));
+                    }
                     let history_notice = match self.history_status {
                         HistoryStatus::Unrequested => Some("History has not been loaded."),
                         HistoryStatus::Loading => Some("Loading run history…"),
@@ -2278,54 +2299,119 @@ mod tests {
     }
 
     #[test]
-    fn history_poll_keeps_a_gap_pageable_without_duplicating_loaded_runs() {
+    fn background_new_runs_preserve_snapshot_and_cursor_without_growing_the_list() {
         use crate::automations::{FiringState, HistoryPage};
-        let older = history_firing(1, FiringState::Succeeded);
-        let newest = history_firing(100, FiringState::Succeeded);
+        let original = (0..PAGE)
+            .rev()
+            .map(|i| history_firing((i + 100) as u64, FiringState::Succeeded))
+            .collect::<Vec<_>>();
         let cursor = HistoryCursor {
             created_ms: 100,
-            id: newest.id,
+            id: original.last().unwrap().id,
         };
         let mut state = State {
             all_history: true,
-            history: vec![older.clone()],
+            history: original.clone(),
+            history_next: Some(cursor.clone()),
             history_status: HistoryStatus::Loaded,
             ..Default::default()
         };
-        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
-            panic!("history poll expected");
+        for poll in 1..=20 {
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!("history poll expected");
+            };
+            let firings = (0..PAGE)
+                .map(|i| history_firing((1000 + poll * PAGE + i) as u64, FiringState::Succeeded))
+                .collect();
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings,
+                    next: None,
+                }))),
+            });
+            assert_eq!(
+                state.history.len(),
+                PAGE,
+                "automatic polls never add unrequested pages"
+            );
+            assert_eq!(state.history_next, Some(cursor.clone()));
+            assert!(state.history_newer);
+        }
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
+            panic!("explicit refresh expected");
         };
         state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                firings: vec![newest],
-                next: Some(cursor.clone()),
-            }))),
+            result: std::sync::Arc::new(Err("offline".into())),
         });
+        assert_eq!(
+            state.history.len(),
+            PAGE,
+            "failed refresh retains the reader's snapshot"
+        );
         assert_eq!(state.history_next, Some(cursor.clone()));
-        assert_eq!(state.history.len(), 2);
+        assert!(
+            state.history_newer,
+            "failed refresh retains the newer-runs notice"
+        );
         let Some(Effect::Request { sequence, request }) = state.update(Action::MoreHistory) else {
-            panic!("gap page request expected");
+            panic!("older snapshot page expected");
         };
         assert!(
             matches!(request, Request::History { before: Some(before), .. } if before == cursor)
         );
+        let older = history_firing(0, FiringState::Succeeded);
         state.update(Action::Received {
             sequence,
             result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                firings: vec![history_firing(50, FiringState::Succeeded), older],
+                firings: vec![older],
                 next: None,
             }))),
         });
-        assert_eq!(state.history.len(), 3);
         assert_eq!(
-            state
-                .history
-                .iter()
-                .map(|firing| firing.created_ms)
-                .collect::<Vec<_>>(),
-            vec![100, 50, 1]
+            state.history.len(),
+            PAGE + 1,
+            "only explicit pagination adds older rows"
         );
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
+            panic!("explicit newest-page refresh expected");
+        };
+        let newest = history_firing(5000, FiringState::Succeeded);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![newest.clone()],
+                next: None,
+            }))),
+        });
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].id, newest.id);
+        assert!(!state.history_newer);
+    }
+
+    #[test]
+    fn an_initially_empty_history_can_populate_one_bounded_page_automatically() {
+        use crate::automations::{FiringState, HistoryPage};
+        let mut state = State {
+            all_history: true,
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!("empty history poll expected");
+        };
+        let newest = history_firing(100, FiringState::Succeeded);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![newest.clone()],
+                next: None,
+            }))),
+        });
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].id, newest.id);
+        assert!(!state.history_newer);
     }
 
     #[test]
