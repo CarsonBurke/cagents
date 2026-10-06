@@ -462,14 +462,14 @@ mod tests {
         );
         let tree = Tree::new(&element);
         let node = layout::Node::new(Size::new(80.0, 40.0));
-        let first =
-            element
-                .as_widget()
-                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-        let second =
-            element
-                .as_widget()
-                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let scrolled = Layout::with_offset(iced::Vector::new(12.0, 50.0), &node)
+            .with_virtual_offset(iced::Vector::new(0.0, 37.0));
+        let first = element
+            .as_widget()
+            .a11y_nodes(scrolled, &tree, mouse::Cursor::Unavailable);
+        let second = element
+            .as_widget()
+            .a11y_nodes(scrolled, &tree, mouse::Cursor::Unavailable);
         assert_eq!(first.root()[0].id(), second.root()[0].id());
         let bounds = first.root()[0].node().bounds().unwrap();
         assert_eq!(
