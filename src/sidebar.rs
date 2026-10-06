@@ -379,6 +379,7 @@ pub struct SidebarProject {
     pub name: String,
     pub repository: PathBuf,
     pub kind: ProjectKind,
+    pub navigation_order: Vec<crate::workspace_model::NavigationItem>,
     pub worktrees: Vec<SidebarWorktree>,
     pub channels: Vec<SidebarChannel>,
     pub pull_requests: Vec<SidebarPullRequest>,
@@ -494,6 +495,7 @@ impl SidebarProject {
             name,
             repository,
             kind: ProjectKind::Git,
+            navigation_order: Vec::new(),
             worktrees,
             channels: Vec::new(),
             pull_requests,
@@ -3223,6 +3225,7 @@ impl SidebarState {
             | SidebarAction::NewChannel { .. }
             | SidebarAction::OpenChannel { .. }
             | SidebarAction::DeleteChannel { .. }
+            | SidebarAction::ReorderMember { .. }
             | SidebarAction::ReorderProject { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
@@ -3313,6 +3316,11 @@ pub enum SidebarAction {
     DragWindow,
     MaximizeWindow,
     WindowMenu,
+    ReorderMember {
+        project: ProjectId,
+        source: SelectionRow,
+        before: Option<SelectionRow>,
+    },
     ReorderProject {
         project: ProjectId,
         before: Option<ProjectId>,
@@ -5021,50 +5029,90 @@ fn project_view<'a>(
     }
 
     if expanded {
+        let mut members = Vec::new();
         for channel in &project.channels {
-            column = column.push(RowInteraction::selectable(
-                channel_view(
-                    channel,
-                    modal_open,
-                    false,
-                    project
-                        .state
-                        .rows
-                        .group_size(SelectionRow::Channel(channel.id)),
-                    &project.state.query,
-                ),
+            members.push((
+                crate::workspace_model::NavigationItem::Channel(channel.id),
                 SelectionRow::Channel(channel.id),
-                project.state,
-                !modal_open && channel.deletion != Some(RowDeletion::Deleting),
+                RowInteraction::selectable(
+                    channel_view(
+                        channel,
+                        modal_open,
+                        false,
+                        project
+                            .state
+                            .rows
+                            .group_size(SelectionRow::Channel(channel.id)),
+                        &project.state.query,
+                    ),
+                    SelectionRow::Channel(channel.id),
+                    project.state,
+                    !modal_open && channel.deletion != Some(RowDeletion::Deleting),
+                ),
             ));
         }
         for &worktree in &project.worktrees {
-            column = column.push(RowInteraction::selectable(
-                worktree_view(
-                    project_id,
-                    worktree,
-                    is_primary_worktree(&entity.repository, &worktree.path),
-                    project.state.filter == SidebarFilter::PullRequests,
-                    selection,
-                    modal_open,
-                    entity.github_ready,
-                    project.editors,
-                    project.state.has_agent_update(project_id, worktree.id),
-                    project.state.agent_activity(project_id, worktree.id),
-                    project.state.worktree_has_panes(project_id, worktree.id),
-                    false,
-                    project
-                        .state
-                        .rows
-                        .group_size(SelectionRow::Worktree(project_id, worktree.id)),
-                    &project.state.query,
-                    !project.state.hide_worktree_changes_icons,
-                ),
+            members.push((
+                crate::workspace_model::NavigationItem::Worktree(worktree.path.clone()),
                 SelectionRow::Worktree(project_id, worktree.id),
-                project.state,
-                !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
+                RowInteraction::selectable(
+                    worktree_view(
+                        project_id,
+                        worktree,
+                        is_primary_worktree(&entity.repository, &worktree.path),
+                        project.state.filter == SidebarFilter::PullRequests,
+                        selection,
+                        modal_open,
+                        entity.github_ready,
+                        project.editors,
+                        project.state.has_agent_update(project_id, worktree.id),
+                        project.state.agent_activity(project_id, worktree.id),
+                        project.state.worktree_has_panes(project_id, worktree.id),
+                        false,
+                        project
+                            .state
+                            .rows
+                            .group_size(SelectionRow::Worktree(project_id, worktree.id)),
+                        &project.state.query,
+                        !project.state.hide_worktree_changes_icons,
+                    ),
+                    SelectionRow::Worktree(project_id, worktree.id),
+                    project.state,
+                    !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
+                ),
             ));
         }
+        if project.state.query.trim().is_empty() {
+            apply_navigation_order(&mut members, &entity.navigation_order, |(item, _, _)| {
+                item.clone()
+            });
+        }
+        let ids = members.iter().map(|(_, row, _)| *row).collect();
+        let content = widget::column::with_children(
+            members.into_iter().map(|(_, _, element)| element).collect(),
+        )
+        .spacing(0)
+        .width(Length::Fill);
+        let disabled = entity
+            .channels
+            .iter()
+            .filter(|row| row.deletion == Some(RowDeletion::Deleting))
+            .map(|row| SelectionRow::Channel(row.id))
+            .chain(
+                entity
+                    .worktrees
+                    .iter()
+                    .filter(|row| row.deletion == Some(RowDeletion::Deleting))
+                    .map(|row| SelectionRow::Worktree(project_id, row.id)),
+            )
+            .collect();
+        column = column.push(RowInteraction::members(
+            content.into(),
+            project_id,
+            ids,
+            disabled,
+            !modal_open && project.state.query.trim().is_empty(),
+        ));
     }
 
     RowInteraction::group(header, column.into(), sticky_viewport)
@@ -5953,6 +6001,7 @@ pub enum ProjectCommand {
     NewWorktreeFromBranch,
     MoveUp,
     MoveDown,
+    ResetSidebarOrder,
     Reveal,
     NewTerminal,
     NewChannel,
@@ -6025,6 +6074,11 @@ fn context_controls<'a>(
         } else {
             commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
             commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
+            commands.push((
+                "Reset sidebar order".into(),
+                None,
+                ProjectCommand::ResetSidebarOrder,
+            ));
         }
         commands.extend(editors.iter().map(|editor| {
             (
@@ -9144,6 +9198,22 @@ struct FilteredProject<'a> {
     state: &'a SidebarState,
 }
 
+fn navigation_item(
+    project: &SidebarProject,
+    row: SelectionRow,
+) -> Option<crate::workspace_model::NavigationItem> {
+    use crate::workspace_model::NavigationItem;
+    match row {
+        SelectionRow::Channel(id) => Some(NavigationItem::Channel(id)),
+        SelectionRow::Worktree(_, id) => project
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == id)
+            .map(|worktree| NavigationItem::Worktree(worktree.path.clone())),
+        _ => None,
+    }
+}
+
 /// The selectable rows actually drawn, including disclosure and filter state.
 pub fn visible_selection_rows(
     model: &SidebarModel,
@@ -9155,6 +9225,7 @@ pub fn visible_selection_rows(
     for project in filtered_projects(model, state, compact) {
         rows.push(SelectionRow::Project(project.project.id));
         if searching || !state.collapsed_projects.contains(&project.project.id) {
+            let first = rows.len();
             rows.extend(
                 project
                     .channels
@@ -9192,6 +9263,13 @@ pub fn visible_selection_rows(
                     })
                     .map(|worktree| SelectionRow::Worktree(project.project.id, worktree.id)),
             );
+            if !compact && !searching {
+                apply_navigation_order(
+                    &mut rows[first..],
+                    &project.project.navigation_order,
+                    |row| navigation_item(project.project, *row).expect("project member"),
+                );
+            }
         }
     }
     rows
@@ -9403,6 +9481,7 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
                 repository: project.repository.clone(),
             });
         }
+        let first = destinations.len();
         destinations.extend(
             channels_in_display_order(&project.channels)
                 .into_iter()
@@ -9424,6 +9503,19 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
                 worktree_id: worktree.id,
                 path: worktree.path.clone(),
             }),
+        );
+        apply_navigation_order(
+            &mut destinations[first..],
+            &project.navigation_order,
+            |action| match action {
+                SidebarAction::OpenChannel { channel_id } => {
+                    crate::workspace_model::NavigationItem::Channel(*channel_id)
+                }
+                SidebarAction::OpenWorktree { path, .. } => {
+                    crate::workspace_model::NavigationItem::Worktree(path.clone())
+                }
+                _ => unreachable!(),
+            },
         );
     }
     destinations
@@ -9687,8 +9779,10 @@ mod row_interaction {
         Search {
             enabled: bool,
         },
-        Projects {
-            ids: Vec<ProjectId>,
+        Reorder {
+            ids: Vec<super::SelectionRow>,
+            disabled: Vec<super::SelectionRow>,
+            project: Option<ProjectId>,
             enabled: bool,
             viewport: StickyViewport,
         },
@@ -9708,9 +9802,9 @@ mod row_interaction {
     struct State {
         modifiers: keyboard::Modifiers,
         selection_bounds: Option<Rectangle>,
-        origin: Option<(ProjectId, Point)>,
+        origin: Option<(super::SelectionRow, Point)>,
         dragging: bool,
-        drop: Option<(Option<ProjectId>, f32)>,
+        drop: Option<(Option<super::SelectionRow>, f32)>,
         hovered: bool,
         focused: bool,
         header_node: Option<layout::Node>,
@@ -9803,10 +9897,31 @@ mod row_interaction {
         ) -> Element<'a, SidebarAction> {
             Element::new(Self {
                 children: vec![content],
-                kind: Kind::Projects {
-                    ids,
+                kind: Kind::Reorder {
+                    ids: ids.into_iter().map(super::SelectionRow::Project).collect(),
+                    disabled: Vec::new(),
+                    project: None,
                     enabled,
                     viewport,
+                },
+            })
+        }
+
+        pub(super) fn members(
+            content: Element<'a, SidebarAction>,
+            project: ProjectId,
+            ids: Vec<super::SelectionRow>,
+            disabled: Vec<super::SelectionRow>,
+            enabled: bool,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::Reorder {
+                    ids,
+                    disabled,
+                    project: Some(project),
+                    enabled,
+                    viewport: StickyViewport::default(),
                 },
             })
         }
@@ -9859,11 +9974,13 @@ mod row_interaction {
             state.selection_bounds = focus.2;
         }
 
-        fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<ProjectId> {
-            let Kind::Projects {
+        fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
+            let Kind::Reorder {
                 ids,
                 enabled: true,
                 viewport,
+                project,
+                disabled,
             } = &self.kind
             else {
                 return None;
@@ -9871,27 +9988,39 @@ mod row_interaction {
             ids.iter()
                 .zip(layout.children().next()?.children())
                 .find_map(|(id, row)| {
-                    let bounds =
-                        sticky_header_bounds(row.bounds(), PROJECT_HEADER_HEIGHT, viewport.0.get());
+                    let bounds = if project.is_some() {
+                        row.bounds()
+                    } else {
+                        sticky_header_bounds(row.bounds(), PROJECT_HEADER_HEIGHT, viewport.0.get())
+                    };
                     // Leave expansion and new-worktree buttons as ordinary controls.
                     let header = Rectangle {
                         x: bounds.x,
                         y: bounds.y,
                         width: (bounds.width - HEADER_ACTION_WIDTH).max(0.0),
-                        height: PROJECT_HEADER_HEIGHT,
+                        height: bounds.height,
                     };
-                    header.contains(point).then_some(*id)
+                    (header.contains(point) && !disabled.contains(id)).then_some(*id)
                 })
         }
 
-        fn drop_at(&self, layout: Layout<'_>, point: Point) -> (Option<ProjectId>, f32) {
-            let Kind::Projects { ids, viewport, .. } = &self.kind else {
+        fn drop_at(&self, layout: Layout<'_>, point: Point) -> (Option<super::SelectionRow>, f32) {
+            let Kind::Reorder {
+                ids,
+                viewport,
+                project,
+                ..
+            } = &self.kind
+            else {
                 unreachable!();
             };
             for (id, row) in ids.iter().zip(layout.children().next().unwrap().children()) {
-                let header =
-                    sticky_header_bounds(row.bounds(), PROJECT_HEADER_HEIGHT, viewport.0.get());
-                if point.y < header.y + PROJECT_HEADER_HEIGHT / 2.0 {
+                let header = if project.is_some() {
+                    row.bounds()
+                } else {
+                    sticky_header_bounds(row.bounds(), PROJECT_HEADER_HEIGHT, viewport.0.get())
+                };
+                if point.y < header.y + header.height / 2.0 {
                     return (Some(*id), header.y);
                 }
             }
@@ -9964,9 +10093,19 @@ mod row_interaction {
                 }
             }
             tree.diff_children(&mut self.children);
-            if let Kind::Projects { ids, enabled, .. } = &self.kind {
+            if let Kind::Reorder {
+                ids,
+                disabled,
+                enabled,
+                ..
+            } = &self.kind
+            {
                 let state = tree.state.downcast_mut::<State>();
-                if !enabled || state.origin.is_some_and(|(id, _)| !ids.contains(&id)) {
+                if !enabled
+                    || state
+                        .origin
+                        .is_some_and(|(id, _)| !ids.contains(&id) || disabled.contains(&id))
+                {
                     *state = State::default();
                 }
             }
@@ -10049,7 +10188,7 @@ mod row_interaction {
             renderer: &Renderer,
             operation: &mut dyn Operation,
         ) {
-            if let Kind::Projects { viewport, .. } = &self.kind {
+            if let Kind::Reorder { viewport, .. } = &self.kind {
                 viewport
                     .0
                     .set(layout.bounds().y + layout.virtual_offset().y);
@@ -10086,7 +10225,7 @@ mod row_interaction {
             viewport: &Rectangle,
         ) {
             self.focus(tree, layout, renderer);
-            if let Kind::Projects {
+            if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
             {
@@ -10193,7 +10332,7 @@ mod row_interaction {
                     shell.invalidate_layout();
                 }
             }
-            if matches!(self.kind, Kind::Projects { enabled: true, .. }) {
+            if matches!(self.kind, Kind::Reorder { enabled: true, .. }) {
                 match event {
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                         if hovered && state.modifiers.is_empty() =>
@@ -10239,8 +10378,32 @@ mod row_interaction {
                         if let Some((project, _)) = state.origin.take() {
                             if state.dragging {
                                 if let Some((before, _)) = state.drop.take().filter(|_| hovered) {
-                                    shell
-                                        .publish(SidebarAction::ReorderProject { project, before });
+                                    shell.publish(match (&self.kind, project) {
+                                        (
+                                            Kind::Reorder {
+                                                project: Some(owner),
+                                                ..
+                                            },
+                                            source,
+                                        ) => SidebarAction::ReorderMember {
+                                            project: *owner,
+                                            source,
+                                            before,
+                                        },
+                                        (_, super::SelectionRow::Project(project)) => {
+                                            SidebarAction::ReorderProject {
+                                                project,
+                                                before: before.and_then(|row| {
+                                                    if let super::SelectionRow::Project(id) = row {
+                                                        Some(id)
+                                                    } else {
+                                                        None
+                                                    }
+                                                }),
+                                            }
+                                        }
+                                        _ => unreachable!(),
+                                    });
                                 }
                                 state.dragging = false;
                                 shell.request_redraw();
@@ -10368,7 +10531,7 @@ mod row_interaction {
             renderer: &Renderer,
         ) -> mouse::Interaction {
             let state = tree.state.downcast_ref::<State>();
-            if let Kind::Projects {
+            if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
             {
@@ -10432,7 +10595,7 @@ mod row_interaction {
             viewport: &Rectangle,
         ) {
             let state = tree.state.downcast_ref::<State>();
-            if let Kind::Projects {
+            if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
             {
@@ -10549,7 +10712,7 @@ mod row_interaction {
             viewport: &Rectangle,
             translation: Vector,
         ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
-            if let Kind::Projects {
+            if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
             {
@@ -10584,7 +10747,7 @@ mod row_interaction {
             tree: &Tree,
             cursor: mouse::Cursor,
         ) -> iced_accessibility::A11yTree {
-            if let Kind::Projects { viewport, .. } = &self.kind {
+            if let Kind::Reorder { viewport, .. } = &self.kind {
                 viewport
                     .0
                     .set(layout.bounds().y + layout.virtual_offset().y);
@@ -10619,7 +10782,7 @@ mod row_interaction {
             // libcosmic buttons report content-coordinate bounds; its scrollable
             // forwards a virtual offset without translating their AccessKit nodes.
             // Translate once at the list boundary, not per nested decorator.
-            if matches!(self.kind, Kind::Projects { .. }) {
+            if matches!(self.kind, Kind::Reorder { project: None, .. }) {
                 let offset = layout.virtual_offset();
                 let translate = |node: &mut iced_accessibility::A11yNode| {
                     if let Some(bounds) = node.node().bounds() {
@@ -10645,7 +10808,7 @@ mod row_interaction {
             renderer: &Renderer,
             destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
         ) {
-            if let Kind::Projects { viewport, .. } = &self.kind {
+            if let Kind::Reorder { viewport, .. } = &self.kind {
                 viewport
                     .0
                     .set(layout.bounds().y + layout.virtual_offset().y);
@@ -13122,6 +13285,315 @@ pub(crate) mod tests {
             ),
             vec![SidebarAction::ReorderProject {
                 project: project_id(1),
+                before: None
+            }],
+        );
+        // A release outside the pane cancels instead of using a stale target.
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin
+            )
+            .is_empty()
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                end
+            )
+            .is_empty()
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Point::new(-10.0, end.y),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn manual_navigation_interleaves_channels_and_worktrees_for_keyboard_navigation() {
+        use crate::workspace_model::NavigationItem;
+        let mut entry = project();
+        entry.worktrees = vec![worktree(20, "main", false), worktree(21, "feature", false)];
+        let channel = ChannelId::new();
+        entry.channels.push(SidebarChannel::new(
+            channel,
+            "Discussion".into(),
+            false,
+            None,
+            false,
+            0,
+            false,
+            1,
+        ));
+        entry.navigation_order = vec![
+            NavigationItem::Worktree(entry.worktrees[1].path.clone()),
+            NavigationItem::Channel(channel),
+            NavigationItem::Worktree(entry.worktrees[0].path.clone()),
+        ];
+        let owner = entry.id;
+        let first = entry.worktrees[1].id;
+        let last = entry.worktrees[0].id;
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![
+                SelectionRow::Project(owner),
+                SelectionRow::Worktree(owner, first),
+                SelectionRow::Channel(channel),
+                SelectionRow::Worktree(owner, last)
+            ]
+        );
+        let cycle = workspace_cycle(&model, &state);
+        assert!(
+            matches!(&cycle[0], SidebarAction::OpenWorktree { worktree_id, .. } if *worktree_id == first)
+        );
+        assert!(
+            matches!(&cycle[1], SidebarAction::OpenChannel { channel_id } if *channel_id == channel)
+        );
+        assert!(
+            matches!(&cycle[2], SidebarAction::OpenWorktree { worktree_id, .. } if *worktree_id == last)
+        );
+        // Search keeps its existing relevance order instead of a manual override.
+        let mut search = state;
+        search.query = "feature".into();
+        assert_eq!(
+            visible_selection_rows(&model, &search, false),
+            vec![
+                SelectionRow::Project(owner),
+                SelectionRow::Worktree(owner, first)
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_member_drag_translates_accessibility_bounds_once_when_scrolled() {
+        use cosmic::iced::{Vector, mouse};
+        let renderer = headless_renderer();
+        let row = SelectionRow::Worktree(project_id(9), worktree_id(1));
+        let button = button::custom(widget::text::body("Worktree"))
+            .name("Drag accessibility worktree")
+            .width(240)
+            .height(PROJECT_HEADER_HEIGHT)
+            .on_press(SidebarAction::OpenRepositoryPicker);
+        let members = RowInteraction::members(
+            widget::column::with_children(vec![button.into()]).into(),
+            project_id(9),
+            vec![row],
+            Vec::new(),
+            true,
+        );
+        let mut element = RowInteraction::projects(
+            widget::column::with_children(vec![members]).into(),
+            vec![project_id(9)],
+            true,
+            row_interaction::StickyViewport::default(),
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(240.0, 512.0)),
+        );
+        let bounds = |offset| {
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node).with_virtual_offset(Vector::new(0.0, offset)),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| node.node().label() == Some("Drag accessibility worktree"))
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap()
+        };
+        let normal = bounds(0.0);
+        let scrolled = bounds(40.0);
+        assert_eq!(scrolled.y0, normal.y0 - 40.0);
+        assert_eq!(scrolled.y1, normal.y1 - 40.0);
+    }
+
+    #[test]
+    fn deleting_member_cannot_initiate_a_reorder() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let row = SelectionRow::Worktree(project_id(9), worktree_id(1));
+        let content = widget::column::with_children(vec![
+            button::custom(widget::text::body("Deleting worktree"))
+                .width(240)
+                .height(PROJECT_HEADER_HEIGHT)
+                .into(),
+        ]);
+        let mut element =
+            RowInteraction::members(content.into(), project_id(9), vec![row], vec![row], true);
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(240.0, PROJECT_HEADER_HEIGHT));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let origin = Point::new(100.0, PROJECT_HEADER_HEIGHT / 2.0);
+        let end = Point::new(100.0, PROJECT_HEADER_HEIGHT - 1.0);
+        assert_ne!(
+            element.as_widget().mouse_interaction(
+                &tree,
+                Layout::new(&node),
+                mouse::Cursor::Available(origin),
+                &viewport,
+                &renderer
+            ),
+            mouse::Interaction::Grab
+        );
+        let mut messages = Vec::new();
+        for (event, point) in [
+            (
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin,
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                end,
+            ),
+            (
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                end,
+            ),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(messages.is_empty(), "disabled member emitted {messages:?}");
+    }
+
+    #[test]
+    fn member_drag_does_not_activate_the_pressed_row() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let content = widget::column::with_children((1..=2).map(|id| {
+            button::custom(widget::text::body("Project"))
+                .height(PROJECT_HEADER_HEIGHT)
+                .width(240)
+                .on_press(SidebarAction::ToggleProject(project_id(id)))
+                .into()
+        }));
+        let mut element = RowInteraction::members(
+            content.into(),
+            project_id(9),
+            vec![
+                SelectionRow::Worktree(project_id(9), worktree_id(1)),
+                SelectionRow::Channel(ChannelId::new()),
+            ],
+            Vec::new(),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(240.0, 2.0 * PROJECT_HEADER_HEIGHT));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let origin = Point::new(100.0, PROJECT_HEADER_HEIGHT / 2.0);
+        let end = Point::new(100.0, 1.9 * PROJECT_HEADER_HEIGHT);
+        assert_eq!(
+            element.as_widget().mouse_interaction(
+                &tree,
+                Layout::new(&node),
+                mouse::Cursor::Available(origin),
+                &viewport,
+                &renderer,
+            ),
+            mouse::Interaction::Grab,
+            "project titles expose their existing drag gesture",
+        );
+        let mut dispatch = |event: Event, point: Point| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        // A scrollable translates the cursor but not CursorMoved's raw position.
+        // Jitter below the threshold must remain a click even after scrolling.
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin
+            )
+            .is_empty()
+        );
+        let jitter = Point::new(origin.x + 3.0, origin.y);
+        let raw_jitter = Point::new(jitter.x, jitter.y - 100.0);
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: raw_jitter
+                }),
+                jitter
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                jitter
+            ),
+            vec![SidebarAction::ToggleProject(project_id(1))],
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin
+            )
+            .is_empty()
+        );
+        let raw_end = Point::new(end.x, end.y - 100.0);
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved { position: raw_end }),
+                end
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                end
+            ),
+            vec![SidebarAction::ReorderMember {
+                project: project_id(9),
+                source: SelectionRow::Worktree(project_id(9), worktree_id(1)),
                 before: None
             }],
         );

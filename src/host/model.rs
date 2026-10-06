@@ -29,10 +29,11 @@ pub(super) use automations::Claimed;
 mod execution;
 mod lineage;
 mod mailbox;
+mod navigation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -171,7 +172,25 @@ impl Registry {
             .into_iter()
             .map(PathBuf::from)
             .collect();
+        let navigation_orders = self
+            .db
+            .prepare("SELECT repository, items FROM navigation_orders ORDER BY repository")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(repository, items)| {
+                Ok(crate::workspace_model::NavigationOrder {
+                    repository: PathBuf::from(repository),
+                    items: serde_json::from_str(&items).map_err(|error| error.to_string())?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(WorkspaceModel {
+            navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
             identity,
@@ -191,6 +210,7 @@ impl Registry {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
+            ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
@@ -514,6 +534,10 @@ fn migrate(db: &Connection) -> Result<(), String> {
              name TEXT NOT NULL,
              ordinal INTEGER NOT NULL
          ) STRICT;
+         CREATE TABLE IF NOT EXISTS navigation_orders(
+             repository TEXT PRIMARY KEY REFERENCES projects(repository) ON DELETE CASCADE,
+             items TEXT NOT NULL
+         ) STRICT;
          CREATE TABLE IF NOT EXISTS channels(
              id TEXT PRIMARY KEY,
              repository TEXT NOT NULL REFERENCES projects(repository) ON DELETE CASCADE,
@@ -585,12 +609,117 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 8 {
         views::migrate(db)?;
     }
+    if version < 9 {
+        db.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_rejects_cross_project_channels_and_relative_paths_without_writing() {
+        use crate::workspace_model::NavigationItem;
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("navigation.sqlite3")).unwrap();
+        registry.apply(&open("/repo")).unwrap();
+        registry.apply(&open("/other")).unwrap();
+        let channel = ChannelId::new();
+        registry
+            .apply(&create(channel, "/other", "Other channel"))
+            .unwrap();
+        let sequence = registry.model().unwrap().sequence;
+        for source in [
+            NavigationItem::Channel(channel),
+            NavigationItem::Worktree("relative".into()),
+        ] {
+            let edit = ModelEdit::ReorderNavigation {
+                repository: "/repo".into(),
+                source: source.clone(),
+                before: None,
+                fallback: vec![source],
+            };
+            assert!(registry.apply(&edit).is_err());
+            let restored = registry.model().unwrap();
+            assert_eq!(restored.sequence, sequence);
+            assert!(restored.navigation_orders.is_empty());
+        }
+    }
+
+    #[test]
+    fn navigation_reorder_is_shared_idempotent_and_survives_restart() {
+        use crate::workspace_model::NavigationItem;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("navigation.sqlite3");
+        let mut registry = Registry::at(&database).unwrap();
+        registry.apply(&open("/repo")).unwrap();
+        let channel = ChannelId::new();
+        registry
+            .apply(&create(channel, "/repo", "Channel"))
+            .unwrap();
+        let first = NavigationItem::Worktree("/repo".into());
+        let second = NavigationItem::Worktree("/repo/.worktrees/feature".into());
+        let chat = NavigationItem::Channel(channel);
+        let no_move = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: second.clone(),
+            before: None,
+            fallback: vec![chat.clone(), first.clone(), second.clone()],
+        };
+        assert!(!registry.apply(&no_move).unwrap().changed);
+        assert!(registry.model().unwrap().navigation_orders.is_empty());
+        let edit = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: second.clone(),
+            before: Some(chat.clone()),
+            fallback: vec![chat.clone(), first.clone(), second.clone()],
+        };
+        let applied = registry.apply(&edit).unwrap();
+        assert!(applied.changed);
+        assert_eq!(
+            applied.model.navigation_orders[0].items,
+            vec![second.clone(), chat.clone(), first.clone()]
+        );
+        assert!(!registry.apply(&edit).unwrap().changed);
+        let mut folded = WorkspaceModel::default();
+        folded.fold(applied.model.sequence, &edit);
+        assert_eq!(folded.navigation_orders, applied.model.navigation_orders);
+        drop(registry);
+        let mut registry = Registry::at(&database).unwrap();
+        assert_eq!(
+            registry.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        // A stale window moves one sibling without replacing another window's order.
+        let next = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: first.clone(),
+            before: Some(second.clone()),
+            fallback: vec![chat.clone(), first.clone(), second.clone()],
+        };
+        assert_eq!(
+            registry.apply(&next).unwrap().model.navigation_orders[0].items,
+            vec![first, second, chat]
+        );
+        let reset = ModelEdit::ResetNavigation {
+            repository: "/repo".into(),
+        };
+        assert!(registry.apply(&reset).unwrap().changed);
+        assert!(!registry.apply(&reset).unwrap().changed);
+        drop(registry);
+        let mut registry = Registry::at(&database).unwrap();
+        assert!(registry.model().unwrap().navigation_orders.is_empty());
+        assert!(registry.apply(&edit).unwrap().changed);
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/repo".into(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().navigation_orders.is_empty());
+    }
 
     #[test]
     fn inferred_names_upgrade_once_and_manual_renames_win_even_when_text_matches() {

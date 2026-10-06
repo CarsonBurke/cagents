@@ -13355,6 +13355,7 @@ impl Application for Cagents {
                     SidebarAction::DragWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Drag)),
                     SidebarAction::MaximizeWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Maximize)),
                     SidebarAction::WindowMenu => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ShowWindowMenu)),
+                    SidebarAction::ReorderMember { project, source, before } => self.reorder_sidebar_member(project, source, before),
                     SidebarAction::ReorderProject { project, before } => {
                         if self.sidebar_model.reorder_project(project, before) {
                             Arc::make_mut(&mut self.durable).project_order =
@@ -18021,6 +18022,7 @@ mod tests {
 
         draw_frames(&mut app, 4, |app, frame| {
             let model = |channels| crate::workspace_model::WorkspaceModel {
+                navigation_orders: Vec::new(),
                 identity,
                 sequence: frame as u64 + 1,
                 projects: Vec::new(),
