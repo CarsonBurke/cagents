@@ -165,27 +165,34 @@ fn default_account_choice<'a>(
     let (label, detail) = match provider {
         crate::agent::Provider::Claude => (
             "Claude",
-            "The account new Claude conversations and shell terminals use unless the project has its own choice. Existing sessions keep their account.",
+            "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",
         ),
         _ => (
             "ChatGPT (Codex)",
-            "The account new ChatGPT conversations and shell terminals use unless the project has its own choice. Existing sessions keep their account.",
+            "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",
         ),
     };
-    let selected = choices.iter().position(|choice| choice.selected);
-    let labels = choices
-        .iter()
-        .map(|choice| choice.label.clone())
-        .collect::<Vec<_>>();
-    let ids = choices
-        .iter()
-        .map(|choice| choice.id.clone())
+    let selected = Some(
+        choices
+            .iter()
+            .position(|choice| choice.selected)
+            .map_or(0, |index| index + 1),
+    );
+    let labels =
+        std::iter::once("Automatic — use another signed-in plan when exhausted".to_owned())
+            .chain(choices.iter().map(|choice| choice.label.clone()))
+            .collect::<Vec<_>>();
+    let ids = std::iter::once(None)
+        .chain(choices.iter().map(|choice| Some(choice.id.clone())))
         .collect::<Vec<_>>();
     setting_field(
         label,
         detail,
         widget::dropdown(labels, selected, move |index| {
-            Message::AccountUi(account_ui::Action::SetDefault(ids[index].clone()))
+            Message::AccountUi(match &ids[index] {
+                Some(id) => account_ui::Action::SetDefault(id.clone()),
+                None => account_ui::Action::SetAutomatic(provider),
+            })
         })
         .into(),
     )
@@ -906,6 +913,27 @@ fn settings_category_controls<'a>(
                     "Leave blank to unbind.",
                     &draft.keyboard_shortcuts.command_palette,
                     SettingsField::ShortcutCommandPalette,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Choose chat account",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.chat_account,
+                    SettingsField::ShortcutChatAccount,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Choose chat model",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.chat_model,
+                    SettingsField::ShortcutChatModel,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Choose chat permission mode",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.chat_permissions,
+                    SettingsField::ShortcutChatPermissions,
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(

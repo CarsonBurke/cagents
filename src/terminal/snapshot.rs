@@ -742,3 +742,135 @@ mod tests {
         assert!(Arc::ptr_eq(&first.lines, &second.lines) || first.lines == second.lines);
     }
 }
+
+/// Reads an independent viewport without moving Ghostty's viewport or consuming
+/// its damage. Only the worker thread can borrow the parser; all returned rows
+/// own their text, styles and links.
+#[cfg(feature = "host")]
+pub(crate) fn capture_viewport(
+    terminal: &Terminal<'static, 'static>,
+    base: &RenderSnapshot,
+    offset: Option<u64>,
+    rows: u16,
+) -> Result<Arc<RenderSnapshot>, libghostty_vt::Error> {
+    use libghostty_vt::{
+        style::StyleColor,
+        terminal::{Point, PointCoordinate},
+    };
+    let mut snapshot = base.clone();
+    snapshot.columns = terminal.cols()?;
+    snapshot.rows = rows.max(1).min(500);
+    snapshot.scroll.total = terminal.total_rows()? as u64;
+    snapshot.scroll.mouse_tracking = terminal.is_mouse_tracking()?;
+    snapshot.scroll.bracketed_paste =
+        terminal.mode(libghostty_vt::terminal::Mode::BRACKETED_PASTE)?;
+    snapshot.scroll.len = u64::from(snapshot.rows).min(snapshot.scroll.total);
+    snapshot.scroll.alternate_screen =
+        terminal.active_screen()? == libghostty_vt::screen::Screen::Alternate;
+    snapshot.scroll.offset = offset
+        .unwrap_or(snapshot.scroll.max_offset())
+        .min(snapshot.scroll.max_offset());
+    let palette = terminal.color_palette()?;
+    let foreground = terminal
+        .fg_color()?
+        .map(Rgb::from)
+        .unwrap_or(base.foreground);
+    let background = terminal
+        .bg_color()?
+        .map(Rgb::from)
+        .unwrap_or(base.background);
+    snapshot.foreground = foreground;
+    snapshot.background = background;
+    let color = |value: StyleColor, default| match value {
+        StyleColor::None => default,
+        StyleColor::Rgb(rgb) => Rgb::from(rgb),
+        StyleColor::Palette(index) => Rgb::from(palette.get(index)),
+    };
+    let mut lines = Vec::new();
+    let mut graphemes = vec!['\0'; 32];
+    let mut uri = vec![0; 1024];
+    for row in snapshot.scroll.offset..snapshot.scroll.offset + snapshot.scroll.len {
+        let mut cells = Vec::with_capacity(snapshot.columns as usize);
+        let mut hyperlinks: Vec<HyperlinkSpan> = Vec::new();
+        let mut wrapped = false;
+        for column in 0..snapshot.columns {
+            let reference = terminal.grid_ref(Point::Screen(PointCoordinate {
+                x: column,
+                y: row as u32,
+            }))?;
+            if column == 0 {
+                wrapped = reference.row()?.is_wrapped()?;
+            }
+            let style = reference.style()?;
+            let mut fg = color(style.fg_color, foreground);
+            let mut bg = color(style.bg_color, background);
+            if style.inverse {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let length = match reference.graphemes(&mut graphemes) {
+                Err(libghostty_vt::Error::OutOfSpace { required }) => {
+                    graphemes.resize(required, '\0');
+                    reference.graphemes(&mut graphemes)?
+                }
+                result => result?,
+            };
+            let text = graphemes[..length].iter().collect::<String>();
+            cells.push(CellSnapshot {
+                text: CellText::new(&text),
+                foreground: fg,
+                background: bg,
+                style: CellStyle {
+                    bold: style.bold,
+                    italic: style.italic,
+                    faint: style.faint,
+                    blink: style.blink,
+                    invisible: style.invisible,
+                    strikethrough: style.strikethrough,
+                    overline: style.overline,
+                    underline: map_underline(style.underline),
+                },
+                selected: false,
+            });
+            let length = match reference.hyperlink_uri(&mut uri) {
+                Err(libghostty_vt::Error::OutOfSpace { required }) if required <= 65536 => {
+                    uri.resize(required, 0);
+                    reference.hyperlink_uri(&mut uri)?
+                }
+                result => result.unwrap_or(0),
+            };
+            if let Ok(link) = std::str::from_utf8(&uri[..length]) {
+                if !link.is_empty() {
+                    if let Some(last) = hyperlinks
+                        .last_mut()
+                        .filter(|last| last.end == column && last.uri == link)
+                    {
+                        last.end += 1;
+                    } else {
+                        hyperlinks.push(HyperlinkSpan {
+                            start: column,
+                            end: column + 1,
+                            uri: link.into(),
+                        });
+                    }
+                }
+            }
+        }
+        lines.push(Arc::new(RowSnapshot {
+            cells,
+            wrapped,
+            hyperlinks,
+        }));
+    }
+    snapshot.lines = lines.into();
+    if let Some(cursor) = &mut snapshot.cursor {
+        let absolute = terminal
+            .total_rows()?
+            .saturating_sub(terminal.rows()? as usize) as u64
+            + u64::from(terminal.cursor_y()?);
+        cursor.visible &= absolute >= snapshot.scroll.offset
+            && absolute < snapshot.scroll.offset + snapshot.scroll.len;
+        cursor.row = absolute.saturating_sub(snapshot.scroll.offset) as u16;
+        cursor.column = terminal.cursor_x()?;
+    }
+    Ok(Arc::new(snapshot))
+}

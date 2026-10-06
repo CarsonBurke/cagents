@@ -21,6 +21,7 @@ latency-harness = ["ui"]
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
 host = [
+    "dep:yaml-rust",
     "dep:diesel",
     "dep:unicode-casefold",
     "dep:croner",
@@ -73,6 +74,7 @@ ui = [
     "dep:unicode-casefold",
     "dep:yaml-rust",
     "dep:unicode-width",
+    "dep:unicode-segmentation",
 ]
 integrated-browser = [
     "full",
@@ -117,6 +119,7 @@ yaml-rust = { version = "0.4.5", optional = true }
 unicode-width = { version = "0.2.2", optional = true }
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
+unicode-segmentation = { version = "1.13.3", optional = true }
 arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }
@@ -231,3 +234,7 @@ winit-wayland = { path = "vendor/winit-wayland" }
 # Preserve pointer positions while Iced dispatches a queued event batch.
 [patch."https://github.com/pop-os/libcosmic.git"]
 iced_runtime = { path = "vendor/iced-runtime" }
+
+# Backport upstream long-line shaping fix until cosmic-text accepts its release.
+[patch.crates-io]
+harfrust = { path = "vendor/harfrust" }

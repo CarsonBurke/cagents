@@ -8,6 +8,11 @@ impl Cagents {
         source: Option<CardId>,
         target: &str,
     ) -> Task<Message> {
+        if crate::device::is_remote()
+            && !Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        {
+            return self.update_device(super::device_ui::Action::Open);
+        }
         if source.is_some_and(|card| self.workspace.card(card).is_none()) {
             return Task::none();
         }

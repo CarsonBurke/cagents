@@ -30,22 +30,13 @@ impl Language {
             Self::Diff => Some("diff"),
         }
     }
-
-    fn path(self) -> &'static Path {
-        Path::new(match self {
-            Self::Plain => "snippet.txt",
-            Self::Shell => "snippet.sh",
-            Self::Json => "snippet.json",
-            Self::Diff => "snippet.diff",
-        })
-    }
 }
 
 pub(super) struct ToolText {
     key: u64,
-    bytes: usize,
     language: Language,
-    pub(super) content: iced::widget::text_editor::Content,
+    pub(super) text: Arc<str>,
+    syntax: std::cell::RefCell<Option<(crate::settings::EditorSyntaxTheme, prose::CodeBlock)>>,
 }
 
 pub(super) struct Preview {
@@ -143,76 +134,54 @@ impl ToolText {
         // does, rather than hashing all of it: a running command's output is
         // updated on every refresh, and grows for as long as it runs.
         let key = tail_digest(language as u64, text);
-        if let Some(mut previous) = previous {
-            if previous.key == key {
-                return previous;
-            }
-            if let Some(prefix) = text.get(..previous.bytes)
-                && tail_digest(previous.language as u64, prefix) == previous.key
-            {
-                let cursor = previous.content.cursor();
-                previous
-                    .content
-                    .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
-                previous
-                    .content
-                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        Arc::new(text[previous.bytes..].to_owned()),
-                    )));
-                previous.content.move_to(cursor);
-                previous.key = key;
-                previous.bytes = text.len();
-                previous.language = language;
-                return previous;
-            }
+        if let Some(previous) = previous
+            && previous.key == key
+        {
+            return previous;
         }
         Self {
             key,
-            bytes: text.len(),
             language,
-            content: iced::widget::text_editor::Content::with_text(text),
+            text: Arc::from(text),
+            syntax: std::cell::RefCell::new(None),
         }
     }
 
-    pub(super) fn perform(&mut self, action: text_editor::Action) {
-        if !action.is_edit() {
-            self.content.perform(action);
-        }
-    }
-
-    pub(super) fn view<'a>(
-        &'a self,
+    pub(super) fn view(
+        &self,
         theme: crate::settings::EditorSyntaxTheme,
         limit: Option<f32>,
-        on_action: impl Fn(text_editor::Action) -> Message + 'a,
-    ) -> Element<'a, Message> {
-        let editor = iced::widget::text_editor(&self.content)
-            .highlight_with::<iced::highlighter::Highlighter>(
-                crate::diff_view::highlighter_settings(
-                    self.language.path(),
-                    theme,
-                    cosmic::theme::is_dark(),
-                ),
-                |highlight, _theme: &cosmic::Theme| highlight.to_format(),
-            )
-            .font(iced::Font::MONOSPACE)
-            .size(design::TEXT_BODY)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-            .padding(design::with_vertical_rail(iced::Padding::from([
-                step::GAP_S,
-                step::GAP_M,
-            ])))
-            .height(Length::Shrink)
-            .key_binding(read_only_binding)
-            .on_action(on_action)
-            .style(|theme, _| iced::widget::text_editor::Style {
-                background: iced::Background::Color(iced::Color::TRANSPARENT),
-                border: iced::Border::default(),
-                placeholder: design::muted_color(theme),
-                value: theme.cosmic().palette.neutral_9.into(),
-                selection: theme.cosmic().accent.base.into(),
-            });
-        let body = crate::interaction::parent_wheel(editor);
+        target: Target,
+    ) -> Element<'static, Message> {
+        let mut syntax = self.syntax.borrow_mut();
+        if syntax
+            .as_ref()
+            .is_none_or(|(previous, _)| *previous != theme)
+        {
+            *syntax = Some((
+                theme,
+                prose::CodeBlock::new(self.language.token(), &self.text, theme),
+            ));
+        }
+        let spans = syntax
+            .as_ref()
+            .unwrap()
+            .1
+            .spans(cosmic::theme::is_dark())
+            .clone();
+        let body: Element<'static, Message> = widget::container(selectable_prose::text(
+            spans,
+            design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE,
+            target,
+            None,
+        ))
+        .padding(design::with_vertical_rail(iced::Padding::from([
+            step::GAP_S,
+            step::GAP_M,
+        ])))
+        .width(Length::Fill)
+        .into();
         match limit {
             Some(height) => widget::container(scroll::tool_output(
                 widget::scrollable(body)
@@ -229,33 +198,89 @@ impl ToolText {
     }
 }
 
-fn read_only_binding(
-    press: iced::widget::text_editor::KeyPress,
-) -> Option<iced::widget::text_editor::Binding<Message>> {
-    if !press.modifiers.shift()
-        && matches!(
-            press.key,
-            keyboard::Key::Named(keyboard::key::Named::PageUp | keyboard::key::Named::PageDown)
-        )
-    {
-        return None;
-    }
-    use iced::widget::text_editor::Binding;
-    match Binding::from_key_press(press)? {
-        binding @ (Binding::Copy
-        | Binding::Unfocus
-        | Binding::Move(_)
-        | Binding::Select(_)
-        | Binding::SelectWord
-        | Binding::SelectLine
-        | Binding::SelectAll) => Some(binding),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_shares_cached_syntax_spans_and_keeps_complete_tool_text() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct ReadText(Vec<Arc<str>>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push(prose.plain.clone());
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let theme = crate::settings::EditorSyntaxTheme::default();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let source = "printf 'λ'\nsecond line\n";
+        let mut block = ToolText::update(None, source, Language::Shell);
+        let read = |block: &ToolText| {
+            let mut element = block.view(theme, None, target);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 400.0)),
+            );
+            let mut read = ReadText(Vec::new());
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+            assert_eq!(read.0.len(), 1);
+            read.0.pop().unwrap()
+        };
+        assert_eq!(read(&block).as_ref(), source);
+        let first = block
+            .syntax
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .1
+            .spans(cosmic::theme::is_dark())
+            .clone();
+        read(&block);
+        assert!(Arc::ptr_eq(
+            &first,
+            block
+                .syntax
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .1
+                .spans(cosmic::theme::is_dark())
+        ));
+        let appended = format!("{source}next\n");
+        block = ToolText::update(Some(block), &appended, Language::Shell);
+        assert_eq!(read(&block).as_ref(), appended);
+        assert!(!Arc::ptr_eq(
+            &first,
+            block
+                .syntax
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .1
+                .spans(cosmic::theme::is_dark())
+        ));
+    }
 
     #[test]
     fn expanded_patches_retain_lines_beyond_the_old_inline_limit() {
@@ -274,12 +299,12 @@ mod tests {
         let collapsed = CachedItem::updated(&item, theme, None, false);
         assert!(collapsed.patches.is_empty());
         let expanded = CachedItem::updated(&item, theme, Some(collapsed), true);
-        assert_eq!(expanded.patches[0].content.text(), diff);
+        assert_eq!(expanded.patches[0].text.as_ref(), diff);
         assert_eq!(
             copy_text(CopyPart::Change(0), &item).as_deref(),
             Some(diff.as_str())
         );
-        assert!(expanded.patches[0].content.text().contains("value_599"));
+        assert!(expanded.patches[0].text.as_ref().contains("value_599"));
     }
 
     fn tool(input: &str) -> ItemContent {
@@ -292,21 +317,13 @@ mod tests {
     }
 
     #[test]
-    fn appended_output_preserves_complete_text_and_selection() {
+    fn appended_output_preserves_complete_text() {
         let initial = "first λ line\nselected text\nlast";
         let mut block = ToolText::update(None, initial, Language::Plain);
-        let cursor = text_editor::Cursor {
-            position: text_editor::Position { line: 1, column: 8 },
-            selection: Some(text_editor::Position { line: 1, column: 0 }),
-        };
-        block.content.move_to(cursor);
-        assert_eq!(block.content.selection().as_deref(), Some("selected"));
         for suffix in [" + continuation", "\nnew λ line\n"] {
-            let complete = format!("{}{suffix}", block.content.text());
+            let complete = format!("{}{suffix}", block.text);
             block = ToolText::update(Some(block), &complete, Language::Plain);
-            assert_eq!(block.content.text(), complete);
-            assert_eq!(block.content.cursor(), cursor);
-            assert_eq!(block.content.selection().as_deref(), Some("selected"));
+            assert_eq!(block.text.as_ref(), complete);
         }
     }
 
@@ -314,11 +331,11 @@ mod tests {
     fn rewritten_output_replaces_text_instead_of_appending() {
         let block = ToolText::update(None, "original λ", Language::Plain);
         let block = ToolText::update(Some(block), "replacement λ", Language::Plain);
-        assert_eq!(block.content.text(), "replacement λ");
+        assert_eq!(block.text.as_ref(), "replacement λ");
     }
 
     #[test]
-    fn collapsed_cache_is_lazy_and_metadata_updates_keep_expanded_selection() {
+    fn collapsed_cache_is_lazy_and_metadata_updates_reuse_expanded_source() {
         let source = format!("{{\"text\":\"{}\"}}", "λ".repeat(700));
         let mut item = tool(&source);
         let theme = crate::settings::EditorSyntaxTheme::Auto;
@@ -330,26 +347,16 @@ mod tests {
             copy_text(CopyPart::Input, &item).as_deref(),
             Some(source.as_str())
         );
-        let mut cached = CachedItem::updated(&item, theme, Some(cached), true);
-        cached
-            .tool_input
-            .as_mut()
-            .unwrap()
-            .perform(text_editor::Action::SelectAll);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true);
+        let source_cache = cached.tool_input.as_ref().unwrap().text.clone();
         if let ItemContent::Tool { status, .. } = &mut item {
             *status = chat::ToolStatus::Failed;
         }
         let cached = CachedItem::updated(&item, theme, Some(cached), true);
-        assert_eq!(
-            cached
-                .tool_input
-                .as_ref()
-                .unwrap()
-                .content
-                .selection()
-                .as_deref(),
-            Some(source.as_str())
-        );
+        assert!(Arc::ptr_eq(
+            &source_cache,
+            &cached.tool_input.as_ref().unwrap().text
+        ));
         let cached = CachedItem::updated(&item, theme, Some(cached), false);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
@@ -357,25 +364,6 @@ mod tests {
             copy_text(CopyPart::Input, &item).as_deref(),
             Some(source.as_str())
         );
-    }
-
-    #[test]
-    fn readonly_actions_allow_selection_but_never_mutate_content() {
-        let original = "select and copy λ\nsecond line";
-        let mut block = ToolText::update(None, original, Language::Shell);
-        block.perform(text_editor::Action::SelectAll);
-        assert_eq!(block.content.selection().as_deref(), Some(original));
-        for edit in [
-            text_editor::Edit::Insert('!'),
-            text_editor::Edit::Delete,
-            text_editor::Edit::Backspace,
-            text_editor::Edit::Enter,
-            text_editor::Edit::Paste(Arc::new("replacement".into())),
-        ] {
-            block.perform(text_editor::Action::Edit(edit));
-            assert_eq!(block.content.text(), original);
-            assert_eq!(block.content.selection().as_deref(), Some(original));
-        }
     }
 
     #[test]
@@ -393,7 +381,7 @@ mod tests {
         assert_eq!(Language::structured(&large), Language::Plain);
         let block = ToolText::update(None, &large, Language::Json);
         assert_eq!(block.language, Language::Plain);
-        assert_eq!(block.content.text(), large);
+        assert_eq!(block.text.as_ref(), large);
         let preview = Preview::update(
             None,
             &tool(&large),

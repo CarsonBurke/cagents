@@ -2925,7 +2925,7 @@ fn bytes_to_path(value: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(value.to_vec()))
 }
 
-fn stable_worktree_id(path: &Path) -> WorktreeId {
+pub(crate) fn stable_worktree_id(path: &Path) -> WorktreeId {
     WorktreeId::from_uuid(stable_path_uuid(path))
 }
 
@@ -9436,6 +9436,32 @@ mod tests {
         }
     }
 
+    /// Subscriber interest is cached across threads. Give logging assertions
+    /// their own process so other tests cannot change the active dispatcher set.
+    fn isolated_logging_test(name: &str) -> bool {
+        const CHILD: &str = "CAGENTS_REPOSITORY_LOGGING_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("repository::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, name)
+            .output()
+            .expect("start isolated logging test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated logging test {name} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        true
+    }
+
     /// Collects one subscriber's output so a test can read what was logged.
     #[derive(Clone)]
     struct LogSink(Arc<Mutex<Vec<u8>>>);
@@ -9471,6 +9497,10 @@ mod tests {
     /// argv, its status and Git's message.
     #[test]
     fn a_failing_git_command_is_logged_with_its_argv_status_and_reason() {
+        if isolated_logging_test("a_failing_git_command_is_logged_with_its_argv_status_and_reason")
+        {
+            return;
+        }
         let refusal = Ok(ProcessOutput {
             exit_code: Some(128),
             signal: None,
@@ -9496,6 +9526,9 @@ mod tests {
     /// failures worth reading under the noise of ordinary typing.
     #[test]
     fn a_cancelled_git_command_is_not_logged_as_a_failure() {
+        if isolated_logging_test("a_cancelled_git_command_is_not_logged_as_a_failure") {
+            return;
+        }
         let cancelled = ProcessFailure {
             kind: ProcessFailureKind::Cancelled,
             program: "git".into(),

@@ -81,6 +81,11 @@ enum Command {
     Paste(String, PasteOrigin),
     Key(KeyInput),
     Mouse(MouseInput),
+    ReadViewport {
+        offset: Option<u64>,
+        rows: u16,
+        reply: Sender<Result<Arc<RenderSnapshot>, String>>,
+    },
     Focus(bool),
     Resize(TerminalSize),
     Scroll(ScrollCommand),
@@ -385,7 +390,8 @@ impl PublishedState {
         }
         if !matches!(
             &command,
-            Command::Search { .. }
+            Command::ReadViewport { .. }
+                | Command::Search { .. }
                 | Command::CopySelection { .. }
                 | Command::Scroll(_)
                 | Command::Resize(_)
@@ -447,6 +453,18 @@ impl PublishedState {
                             },
                         };
                         self.emit_archived(&events, event);
+                        return Ok(());
+                    }
+                    Command::ReadViewport {
+                        offset,
+                        rows,
+                        reply,
+                    } => {
+                        let _ = reply.send(Ok(history.snapshot_at(
+                            offset,
+                            rows,
+                            self.published_generation.load(Ordering::Acquire),
+                        )));
                         return Ok(());
                     }
                     Command::Scroll(scroll) => history.scroll(&scroll),
@@ -665,6 +683,33 @@ impl TerminalHandle {
                 Err(TerminalStartError::WorkerExited)
             }
         }
+    }
+
+    pub(crate) fn viewport_snapshot(
+        &self,
+        offset: Option<u64>,
+        rows: u16,
+    ) -> Result<Arc<RenderSnapshot>, String> {
+        let published = self.snapshot();
+        if published.detached || published.rows == 0 {
+            return Ok(published);
+        }
+        if offset.is_none()
+            && rows == published.rows
+            && published.scroll.offset == published.scroll.max_offset()
+        {
+            return Ok(published);
+        }
+        let (reply, receive) = crossbeam_channel::bounded(1);
+        self.try_command(Command::ReadViewport {
+            offset,
+            rows,
+            reply,
+        })
+        .map_err(|error| error.to_string())?;
+        receive
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|error| error.to_string())?
     }
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
@@ -1217,6 +1262,11 @@ struct Worker {
     visibility: Visibility,
     generation: u64,
     capture_dirty: bool,
+    viewport_reads: Vec<(
+        Option<u64>,
+        u16,
+        Sender<Result<Arc<RenderSnapshot>, String>>,
+    )>,
     force_capture: bool,
     /// When a capture was first withheld for the synchronized update still in
     /// progress. `None` while no update is holding the grid back.
@@ -1562,6 +1612,7 @@ impl Worker {
             visibility,
             generation: 0,
             capture_dirty: false,
+            viewport_reads: Vec::new(),
             force_capture: false,
             synchronized_since: None,
             current_size,
@@ -1905,6 +1956,24 @@ impl Worker {
     /// Returns true when shutdown was requested.
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::ReadViewport {
+                offset,
+                rows,
+                reply,
+            } => {
+                self.viewport_reads.push((offset, rows, reply));
+                if self.capture_dirty {
+                    // This explicit next-frame request grants one capture
+                    // credit. Waiting for its future ACK would deadlock.
+                    self.published
+                        .acknowledged_generation
+                        .fetch_max(self.generation, Ordering::AcqRel);
+                    self.capture_when_ready(true);
+                }
+                if !self.capture_dirty {
+                    self.finish_viewport_reads();
+                }
+            }
             Command::ApplyAgentActivity {
                 process,
                 activity,
@@ -2386,6 +2455,19 @@ impl Worker {
                 self.force_capture = false;
             }
             Err(error) => self.error("build terminal snapshot", error.to_string()),
+        }
+        self.finish_viewport_reads();
+    }
+
+    fn finish_viewport_reads(&mut self) {
+        if self.capture_dirty {
+            return;
+        }
+        let base = self.published.snapshot.load_full();
+        for (offset, rows, reply) in std::mem::take(&mut self.viewport_reads) {
+            let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
+                .map_err(|error| error.to_string());
+            let _ = reply.send(result);
         }
     }
 
@@ -4587,6 +4669,62 @@ mod tests {
         assert_eq!(worker.generation, before + 1);
         assert_eq!(published_row(&worker, 0), "new frame");
         assert_eq!(worker.synchronized_release_after(), None);
+        worker.run();
+    }
+
+    #[test]
+    fn independent_viewport_can_read_a_dirty_parser_without_ack_deadlock() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"first frame".to_vec());
+        worker.publish_snapshot(true);
+        worker.process_output(b"\rnew frame".to_vec());
+        assert!(worker.capture_dirty);
+        let (reply, receive) = crossbeam_channel::bounded(1);
+        worker.handle_command(Command::ReadViewport {
+            offset: Some(0),
+            rows: 10,
+            reply,
+        });
+        let capture = receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.generation, worker.generation);
+        let text = capture.lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(text.starts_with("new frame"));
+        worker.run();
+    }
+
+    #[test]
+    fn independent_viewport_waits_for_the_complete_synchronized_frame() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"old frame".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"\x1b[?2026h\x1b[H\x1b[2Jpartial".to_vec());
+        let (reply, receive) = crossbeam_channel::bounded(1);
+        worker.handle_command(Command::ReadViewport {
+            offset: Some(0),
+            rows: 10,
+            reply,
+        });
+        assert!(receive.try_recv().is_err());
+        worker.process_output(b" frame\x1b[?2026l".to_vec());
+        let capture = receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.generation, worker.generation);
+        let text = capture.lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(text.starts_with("partial frame"));
         worker.run();
     }
 

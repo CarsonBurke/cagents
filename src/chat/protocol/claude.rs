@@ -275,6 +275,15 @@ struct Stream {
     truncated: bool,
 }
 
+struct Submission {
+    preview: chat::QueuedMessage,
+    mode: PromptMode,
+    /// Queued input enters the transcript only when the provider consumes it.
+    deferred: Option<Vec<Item>>,
+    /// Encoded input bounds retained text and image data across the queue.
+    deferred_bytes: usize,
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -283,7 +292,7 @@ struct Claude {
     busy: bool,
     /// Only advertised for a CLI whose async input contract we have verified.
     async_input: bool,
-    submissions: HashMap<String, chat::QueuedMessage>,
+    submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
     attention_generation: u64,
@@ -468,7 +477,7 @@ impl Claude {
         }
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
-        for attachment in attachments {
+        for attachment in &attachments {
             let block = attachment_block(&self.cwd, &attachment.path)?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
@@ -494,11 +503,66 @@ impl Claude {
             }
             .into();
         }
-        if self.async_input {
-            self.submissions
-                .insert(id.clone(), chat::QueuedMessage::new(id.clone(), text));
-        }
+        let deferred_bytes = if mode != PromptMode::Send {
+            let bytes = encoded_len(&frame)?;
+            let retained: usize = self
+                .submissions
+                .values()
+                .map(|submission| submission.deferred_bytes)
+                .sum();
+            if bytes > MAX_PAYLOAD.saturating_sub(retained) {
+                return Err("Claude queued messages exceed the 30 MiB retained input limit; wait for delivery or remove a queued message".into());
+            }
+            bytes
+        } else {
+            0
+        };
         self.message(&frame, &mut step)?;
+        if self.async_input {
+            let mut preview = chat::QueuedMessage::new(id.clone(), text);
+            preview.attachments = attachments;
+            if mode == PromptMode::Steer {
+                preview.delivery = chat::QueueDelivery::NextStep;
+            }
+            let deferred = if mode != PromptMode::Send {
+                let mut items = Vec::new();
+                for event in std::mem::take(&mut step.events) {
+                    if let Event::Item(item) = event {
+                        items.push(item);
+                    } else {
+                        step.events.push(event);
+                    }
+                }
+                // "next" input precedes "later" input; preserve admission
+                // order within each priority instead of reversing steers.
+                let position = if mode == PromptMode::Steer {
+                    self.queued
+                        .iter()
+                        .position(|queued| {
+                            self.submissions
+                                .get(&queued.id)
+                                .is_some_and(|submission| submission.mode == PromptMode::Queue)
+                        })
+                        .unwrap_or(self.queued.len())
+                } else {
+                    self.queued.len()
+                };
+                self.queued.insert(position, preview.clone());
+                step.events.push(Event::QueueChanged(self.queued.clone()));
+                Some(items)
+            } else {
+                None
+            };
+            self.submissions.insert(
+                id.clone(),
+                Submission {
+                    preview,
+                    mode,
+                    deferred,
+                    deferred_bytes,
+                },
+            );
+        }
         step.writes.push(frame);
         if !self.busy && mode == PromptMode::Send {
             step.events.push(Event::TurnStarted);
@@ -869,6 +933,7 @@ impl Claude {
                     id: format!("{id}:{index}"),
                     role,
                     content,
+                    started_at: None,
                     at: None,
                 }));
             }
@@ -970,6 +1035,7 @@ impl Claude {
                                 &block["input"],
                                 &self.cwd,
                             ),
+                            started_at: None,
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
@@ -1006,6 +1072,7 @@ impl Claude {
                                 output: String::new(),
                                 status: ToolStatus::Running,
                             },
+                            started_at: None,
                             at: None,
                         });
                         apply_result(
@@ -1047,6 +1114,7 @@ impl Claude {
                                     id: format!("{}:image:{index}", item.id),
                                     role: Role::Assistant,
                                     content: image_content(attachment),
+                                    started_at: None,
                                     at: None,
                                 }));
                             }
@@ -1058,6 +1126,7 @@ impl Claude {
                         id: format!("{id}:{index}"),
                         role,
                         content: image_content(block),
+                        started_at: None,
                         at: None,
                     })),
                     "document" => step.events.push(Event::Item(Item {
@@ -1067,6 +1136,7 @@ impl Claude {
                             path: String::new(),
                             description: format!("Claude document: {}", string(block, "title")),
                         },
+                        started_at: None,
                         at: None,
                     })),
                     other => step.events.push(Event::Item(text_item(
@@ -1387,8 +1457,7 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
-            Command::UpdateQueued { .. }
-            | Command::StartQueued { .. }
+            Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches
             | Command::Branch { .. } => Err("This operation is not supported by Claude".into()),
@@ -1634,6 +1703,14 @@ impl Adapter for Claude {
                     }
                 }
                 if string(response, "subtype") == "error" {
+                    if string(&request, "subtype") == "cancel_async_message"
+                        && let Some(id) = request["message_uuid"].as_str()
+                    {
+                        step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                            id: id.into(),
+                            removed: false,
+                        }));
+                    }
                     step.events.push(Event::Error {
                         message: format!(
                             "Claude {}: {}",
@@ -1744,7 +1821,19 @@ impl Adapter for Claude {
                     }
                 }
             }
-            "assistant" | "user" => self.message(&frame, &mut step)?,
+            "assistant" | "user" => {
+                // The replay acknowledgement can precede consumption. Its
+                // stable IDs will upsert the deferred items after delivery.
+                let awaiting_delivery = string(&frame, "type") == "user"
+                    && frame["uuid"].as_str().is_some_and(|id| {
+                        self.submissions
+                            .get(id)
+                            .is_some_and(|submission| submission.deferred.is_some())
+                    });
+                if !awaiting_delivery {
+                    self.message(&frame, &mut step)?;
+                }
+            }
             "stream_event" => {
                 if let Some(id) = frame["uuid"].as_str() {
                     if self.stream_events.iter().any(|seen| seen == id) {
@@ -1907,7 +1996,7 @@ impl Adapter for Claude {
                         if let Some(message) = self.submissions.get(id)
                             && !self.queued.iter().any(|queued| queued.id == id)
                         {
-                            self.queued.push(message.clone());
+                            self.queued.push(message.preview.clone());
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
                         if state == "started" && !self.busy && self.submissions.contains_key(id) {
@@ -1915,7 +2004,21 @@ impl Adapter for Claude {
                             self.status(true, "Claude is working", &mut step);
                         }
                         self.queued.retain(|message| message.id != id);
-                        self.submissions.remove(id);
+                        if let Some(submission) = self.submissions.remove(id)
+                            && let Some(items) = submission.deferred
+                        {
+                            if matches!(state, "started" | "completed") {
+                                step.events.extend(items.into_iter().map(Event::Item));
+                            } else {
+                                // A delayed replay acknowledgement must not
+                                // resurrect a message the provider discarded.
+                                self.remember_retracted(id);
+                                step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                                    id: id.into(),
+                                    removed: true,
+                                }));
+                            }
+                        }
                     }
                     step.events.push(Event::QueueChanged(self.queued.clone()));
                 }
@@ -2665,6 +2768,7 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
             thinking,
             phase: Phase::Final,
         },
+        started_at: None,
         at: None,
     }
 }
@@ -3022,6 +3126,7 @@ impl Claude {
                             output: String::new(),
                             status: ToolStatus::Running,
                         },
+                        started_at: None,
                         at: None,
                     },
                     other => {
@@ -3240,6 +3345,7 @@ impl Claude {
                         output: String::new(),
                         status: ToolStatus::Running,
                     },
+                    started_at: None,
                     at: None,
                 });
                 let patch = if frame["patch"].is_object() {
@@ -3343,6 +3449,7 @@ impl Claude {
                             id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
                             role: Role::User,
                             content,
+                            started_at: None,
                             at: None,
                         }));
                     }
@@ -4518,6 +4625,14 @@ mod tests {
             .send_prompt("correct the approach".into(), vec![], PromptMode::Steer)
             .unwrap();
         assert_eq!(steer.writes[0]["priority"], "next");
+        assert!(
+            !steer
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        assert_eq!(adapter.queued.len(), 1);
+        let steer_id = steer.writes[0]["uuid"].clone();
         let queue = adapter
             .send_prompt("later task".into(), vec![], PromptMode::Queue)
             .unwrap();
@@ -4526,6 +4641,11 @@ mod tests {
         adapter
             .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}))
             .unwrap();
+        assert_eq!(adapter.queued.len(), 2);
+        let steered = adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":steer_id,"state":"started"}))
+            .unwrap();
+        assert!(steered.events.iter().any(|event| matches!(event, Event::Item(item) if matches!(&item.content, ItemContent::Text { text, .. } if text == "correct the approach"))));
         assert_eq!(adapter.queued.len(), 1);
         adapter
             .receive(json!({"type":"result","is_error":false}))
@@ -4545,6 +4665,280 @@ mod tests {
             .unwrap();
         assert!(adapter.submissions.is_empty());
         assert!(adapter.queued.is_empty());
+    }
+
+    #[test]
+    fn async_next_input_precedes_later_input_without_reversing_each_priority() {
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            async_input: true,
+            ..Default::default()
+        };
+        for (text, mode) in [
+            ("later one", PromptMode::Queue),
+            ("next one", PromptMode::Steer),
+            ("later two", PromptMode::Queue),
+            ("next two", PromptMode::Steer),
+        ] {
+            let submitted = adapter.send_prompt(text.into(), vec![], mode).unwrap();
+            adapter.receive(json!({"type":"command_lifecycle","command_uuid":submitted.writes[0]["uuid"],"state":"queued"})).unwrap();
+        }
+        assert_eq!(
+            adapter
+                .queued
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["next one", "next two", "later one", "later two"]
+        );
+        // Each entry says when it is delivered, and can return to a composer.
+        assert_eq!(
+            adapter
+                .queued
+                .iter()
+                .map(|message| (message.delivery, message.editable))
+                .collect::<Vec<_>>(),
+            [
+                (chat::QueueDelivery::NextStep, true),
+                (chat::QueueDelivery::NextStep, true),
+                (chat::QueueDelivery::NextTurn, true),
+                (chat::QueueDelivery::NextTurn, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_steer_waits_for_consumption_and_starts_a_turn() {
+        let mut adapter = Claude {
+            ready: true,
+            async_input: true,
+            ..Default::default()
+        };
+        let submitted = adapter
+            .send_prompt("next".into(), vec![], PromptMode::Steer)
+            .unwrap();
+        assert!(
+            !submitted
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::TurnStarted))
+        );
+        assert!(!adapter.busy);
+        let started = adapter.receive(json!({"type":"command_lifecycle","command_uuid":submitted.writes[0]["uuid"],"state":"started"})).unwrap();
+        assert!(
+            started
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnStarted))
+        );
+        assert!(
+            started
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        assert!(adapter.busy);
+        assert!(adapter.queued.is_empty());
+    }
+
+    #[test]
+    fn queued_input_is_visible_immediately_but_enters_transcript_only_on_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let attachment = directory.path().join("notes.txt");
+        std::fs::write(&attachment, "attachment content").unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            async_input: true,
+            ..Default::default()
+        };
+        // Deferred content must retain the full input, not its bounded preview.
+        let text = "x".repeat(20 * 1024);
+        let submitted = adapter
+            .send_prompt(
+                text.clone(),
+                vec![Attachment {
+                    path: attachment.clone(),
+                }],
+                PromptMode::Queue,
+            )
+            .unwrap();
+        assert!(
+            !submitted
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        // The preview names its files, and a truncated one is not offered
+        // back to a composer as though it were the whole message.
+        assert!(submitted.events.iter().any(|event| matches!(
+            event,
+            Event::QueueChanged(messages)
+                if messages.len() == 1
+                    && !messages[0].editable
+                    && messages[0].attachments == [Attachment { path: attachment.clone() }]
+        )));
+        let frame = submitted.writes[0].clone();
+        let id = frame["uuid"].clone();
+        let echo = adapter.receive(frame.clone()).unwrap();
+        assert!(
+            !echo
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}))
+            .unwrap();
+        assert_eq!(adapter.queued.len(), 1);
+        let started = adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}))
+            .unwrap();
+        let items: Vec<_> = started
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert!(
+            matches!(&items[0].content, ItemContent::Text { text: delivered, .. } if delivered == &text)
+        );
+        assert!(
+            matches!(&items[1].content, ItemContent::Image { description, .. } if description.contains("notes.txt"))
+        );
+        assert!(adapter.queued.is_empty());
+        // Replays upsert the same stable identities, and repeated lifecycle
+        // notifications cannot publish the deferred input a second time.
+        let replay = adapter.receive(frame).unwrap();
+        let replay_ids: Vec<_> = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(item) => Some(item.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replay_ids,
+            items.iter().map(|item| item.id.clone()).collect::<Vec<_>>()
+        );
+        let repeated = adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}))
+            .unwrap();
+        assert!(
+            !repeated
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+    }
+
+    #[test]
+    fn queued_inputs_share_a_bounded_retained_payload_budget() {
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            async_input: true,
+            ..Default::default()
+        };
+        let text = "x".repeat(MAX_TEXT);
+        let mut first = None;
+        let mut admitted = 0;
+        loop {
+            let mode = if admitted % 2 == 0 {
+                PromptMode::Queue
+            } else {
+                PromptMode::Steer
+            };
+            match adapter.send_prompt(text.clone(), vec![], mode) {
+                Ok(step) => {
+                    first.get_or_insert_with(|| step.writes[0]["uuid"].clone());
+                    admitted += 1;
+                    assert!(admitted < chat::QueuedMessage::LIMIT);
+                }
+                Err(message) => {
+                    assert!(message.contains("retained input limit"));
+                    break;
+                }
+            }
+        }
+        assert_eq!(adapter.queued.len(), admitted);
+        assert_eq!(adapter.submissions.len(), admitted);
+        let retained: usize = adapter
+            .submissions
+            .values()
+            .map(|submission| submission.deferred_bytes)
+            .sum();
+        assert!(retained <= MAX_PAYLOAD);
+        // Refusal must precede transcript/carrier mutation.
+        assert_eq!(adapter.carrier_items.len(), admitted);
+        adapter.receive(json!({"type":"command_lifecycle","command_uuid":first.unwrap(),"state":"cancelled"})).unwrap();
+        assert!(adapter.send_prompt(text, vec![], PromptMode::Queue).is_ok());
+        assert_eq!(adapter.queued.len(), admitted);
+    }
+
+    #[test]
+    fn cancelled_queued_input_never_enters_the_transcript() {
+        for state in ["cancelled", "discarded"] {
+            let mut adapter = Claude {
+                ready: true,
+                busy: true,
+                async_input: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt("never delivered".into(), vec![], PromptMode::Queue)
+                .unwrap();
+            let id = submitted.writes[0]["uuid"].clone();
+            let removed = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":state}))
+                .unwrap();
+            assert!(
+                !removed
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_)))
+            );
+            assert!(adapter.queued.is_empty());
+            assert!(adapter.submissions.is_empty());
+            // A client that asked for the message back is told it was let go
+            // of, which a message merely leaving the queue does not say.
+            assert!(removed.events.iter().any(|event| matches!(
+                event,
+                Event::QueueRemoval(removal) if removal.removed && id == removal.id.as_str()
+            )));
+            let replay = adapter.receive(submitted.writes[0].clone()).unwrap();
+            assert!(
+                !replay
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn completed_queued_input_is_preserved_without_a_started_notification() {
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            async_input: true,
+            ..Default::default()
+        };
+        let submitted = adapter
+            .send_prompt("delivered".into(), vec![], PromptMode::Queue)
+            .unwrap();
+        let id = submitted.writes[0]["uuid"].clone();
+        let completed = adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"completed"}))
+            .unwrap();
+        assert!(completed.events.iter().any(|event| matches!(event, Event::Item(item) if matches!(&item.content, ItemContent::Text { text, .. } if text == "delivered"))));
+        assert!(adapter.queued.is_empty());
+        assert!(adapter.submissions.is_empty());
     }
 
     #[test]

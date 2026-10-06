@@ -74,6 +74,9 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
     about = "Control cagents terminals and processes"
 )]
 pub struct Cli {
+    /// Backend device from devices.json; local is the default.
+    #[arg(long, global = true)]
+    pub device: Option<String>,
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
@@ -116,6 +119,9 @@ pub enum TopCommand {
         /// Reopen or activate a named window slot.
         #[arg(long, value_parser = parse_window_slot)]
         window: Option<String>,
+        /// Copy initial navigation from this same-device client window.
+        #[arg(long, value_parser = parse_window_slot, requires = "new_window")]
+        source: Option<String>,
     },
     /// Manage the persistent cagents daemon.
     Daemon {
@@ -172,6 +178,9 @@ fn parse_window_slot(value: &str) -> Result<String, String> {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
+    /// Forward a framed daemon connection over stdin/stdout (used by SSH).
+    #[command(hide = true)]
+    Bridge,
     /// Start the daemon if it is not already running.
     Start,
     /// Report whether the daemon is running.
@@ -424,7 +433,11 @@ impl ControlClient {
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         stream
-            .set_read_timeout(Some(IO_TIMEOUT))
+            .set_read_timeout(Some(if crate::device::is_remote() {
+                Duration::from_secs(30)
+            } else {
+                IO_TIMEOUT
+            }))
             .map_err(ControlError::Configure)?;
         stream
             .set_write_timeout(Some(IO_TIMEOUT))
@@ -434,6 +447,10 @@ impl ControlClient {
             next_request_id: 1,
         };
         let proof = client.handshake()?;
+        client
+            .stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
         Ok(Self {
             stream: client.stream,
             proof,
@@ -815,6 +832,34 @@ impl ControlClient {
             response => return Err(unexpected_response("a spawned terminal", &response)),
         };
         self.read_attachment_replay(expected)?;
+        Ok(terminal)
+    }
+
+    pub fn complete_pending_terminal(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        let response = self.request_attached(
+            ClientRequest::CompletePendingTerminal {
+                pane,
+                terminal_id,
+                options,
+            },
+            terminal_id,
+        )?;
+        let terminal = match response {
+            ServerResponse::Spawned { terminal } if terminal.session.id == terminal_id => terminal,
+            ServerResponse::Spawned { terminal } => {
+                return Err(ControlError::TerminalMismatch {
+                    expected: terminal_id,
+                    actual: terminal.session.id,
+                });
+            }
+            response => return Err(unexpected_response("a reserved terminal", &response)),
+        };
+        self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
 
@@ -1241,6 +1286,19 @@ impl ControlClient {
         }
     }
 
+    pub fn device_operation(
+        &mut self,
+        operation: crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::DeviceOperation { operation },
+            Instant::now() + Duration::from_secs(120),
+        )? {
+            ServerResponse::DeviceOperation { reply } => Ok(reply),
+            response => Err(unexpected_response("device operation", &response)),
+        }
+    }
+
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
@@ -1583,6 +1641,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
+        ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
 
@@ -1691,6 +1750,31 @@ where
         }
     };
 
+    let _device_cleanup = crate::device::Cleanup;
+    if let Err(error) = crate::device::select(cli.device.as_deref()) {
+        emit_error(cli.json, &AppError::new("device", error));
+        return ExitCode::FAILURE;
+    }
+    if matches!(
+        cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Bridge
+        }
+    ) {
+        return match crate::device::serve_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagents daemon bridge: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
+        if let Err(error) = crate::device::prepare() {
+            emit_error(cli.json, &AppError::new("device", error));
+            return ExitCode::FAILURE;
+        }
+    }
     match execute(cli.command) {
         Ok(output) => {
             emit_success(cli.json, output);
@@ -1743,7 +1827,11 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
                 human: "Daemon replacement deferred".into(),
             })
         }
-        TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
+        TopCommand::Ui {
+            new_window,
+            window,
+            source,
+        } => launch_ui(new_window, window.as_deref(), source.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
         TopCommand::Project { command } => execute_project(command),
@@ -1768,7 +1856,22 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     }
 }
 
-fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppError> {
+fn launch_ui(
+    new_window: bool,
+    slot: Option<&str>,
+    source: Option<&str>,
+) -> Result<CommandOutput, AppError> {
+    let unique_slot = uuid::Uuid::new_v4().to_string();
+    let remote_new_window = new_window && crate::device::is_remote();
+    let new_window = new_window && !remote_new_window;
+    let slot = if remote_new_window {
+        Some(unique_slot.as_str())
+    } else {
+        slot
+    };
+    let scoped_slot =
+        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?;
+    let slot = scoped_slot.as_deref();
     let activate = || match slot {
         Some(slot) => instance::activate_window(slot),
         None => instance::activate_running_ui(),
@@ -1781,9 +1884,16 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
     let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
     loop {
         let mut command = Command::new(&executable);
+        if let Some(device) = crate::device::selected() {
+            command.args(["--device", &device.name, "--device-window-scoped"]);
+        }
         if new_window {
             command.arg("--new-window");
         }
+        if let Some(source) = source {
+            command.args(["--from-window", source]);
+        }
+
         if let Some(slot) = slot {
             command.args(["--window", slot]);
         }
@@ -1816,8 +1926,14 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
-    let timeout = crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
-        + UI_LAUNCH_HANDSHAKE_TIMEOUT;
+    // Remote windows attach to an already-running device daemon. Its handoff
+    // budget is not stored on the client, whose repository filesystem is gated.
+    let timeout = if crate::device::is_remote() {
+        UI_LAUNCH_HANDSHAKE_TIMEOUT
+    } else {
+        crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
+            + UI_LAUNCH_HANDSHAKE_TIMEOUT
+    };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .stdin(Stdio::null())
@@ -2005,7 +2121,17 @@ fn printable(text: &str) -> String {
 }
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
+    if crate::device::is_remote() && matches!(command, DaemonCommand::Upgrade { .. }) {
+        return Err(AppError::new(
+            "device",
+            "run installation upgrades in a terminal on the selected device",
+        ));
+    }
     match command {
+        DaemonCommand::Bridge => Err(AppError::new(
+            "bridge",
+            "stdio bridge must run before command output",
+        )),
         DaemonCommand::Upgrade { yes, interrupt } => {
             let job = crate::update::upgrade_installed(yes, interrupt)
                 .map_err(|error| AppError::new("update", error))?;
@@ -2035,7 +2161,9 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         DaemonCommand::Status => {
             let paths = crate::daemon::RuntimePaths::discover()
                 .map_err(|error| AppError::new("socket_path", error))?;
-            let socket = &paths.socket;
+            let selected_socket =
+                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
+            let socket = &selected_socket;
             let mut daemon_version = None;
             let running = match ControlClient::connect(socket) {
                 Ok(mut client) => {
@@ -2407,7 +2535,12 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
             let cwd = absolute_working_directory(cwd)
                 .map_err(|error| AppError::new("working_directory", error))?;
             let recipe = if argv.is_empty() {
-                LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?
+                let mut recipe = LaunchRecipe::shell(cwd)
+                    .map_err(|error| AppError::new("login_shell", error))?;
+                if let Some(shell) = crate::device::shell() {
+                    recipe.program = shell.to_owned();
+                }
+                recipe
             } else {
                 LaunchRecipe {
                     unset_environment: Default::default(),
@@ -2894,6 +3027,18 @@ fn channel_line(channel: &ModelChannel) -> String {
 fn project_directory(path: Option<PathBuf>) -> Result<PathBuf, AppError> {
     let from =
         absolute_working_directory(path).map_err(|error| AppError::new("repository", error))?;
+    if crate::device::is_remote() {
+        return match crate::device_service::request(crate::device_service::Operation::Discover {
+            path: from,
+        }) {
+            Ok(crate::device_service::Reply::Project { path, .. }) => Ok(path),
+            Ok(_) => Err(AppError::new(
+                "repository",
+                "unexpected remote project response",
+            )),
+            Err(error) => Err(AppError::new("repository", error)),
+        };
+    }
     let canonical = from
         .canonicalize()
         .map_err(|error| AppError::new("repository", error))?;
@@ -2918,6 +3063,26 @@ fn resolve_project_location(
     model: Option<&WorkspaceModel>,
 ) -> Result<crate::project_location::ProjectLocation, AppError> {
     let from = project_directory(repository)?;
+    if crate::device::is_remote() {
+        if let Some(project) = model.and_then(|model| model.project(&from)) {
+            return Ok(crate::project_location::ProjectLocation {
+                key: from,
+                kind: project.kind,
+            });
+        }
+        return match crate::device_service::request(crate::device_service::Operation::Discover {
+            path: from,
+        }) {
+            Ok(crate::device_service::Reply::Project { key, kind, .. }) => {
+                Ok(crate::project_location::ProjectLocation { key, kind })
+            }
+            Ok(_) => Err(AppError::new(
+                "repository",
+                "unexpected remote project response",
+            )),
+            Err(error) => Err(AppError::new("repository", error)),
+        };
+    }
     crate::project_location::resolve(&from, model)
         .map_err(|error| AppError::new("repository", error))
 }
@@ -2993,6 +3158,20 @@ fn descriptor_line(terminal: &TerminalDescriptor) -> String {
 }
 
 fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
+    if crate::device::is_remote() {
+        return match cwd {
+            Some(path) if path.is_absolute() => Ok(path),
+            Some(_) => Err(io::Error::other(
+                "remote working directory must be absolute",
+            )),
+            None => {
+                crate::device::prepare()?;
+                crate::device::home()
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("remote HOME is unavailable"))
+            }
+        };
+    }
     let current = std::env::current_dir()?;
     Ok(match cwd {
         Some(path) if path.is_absolute() => path,
@@ -3001,7 +3180,7 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     })
 }
 
-fn sibling_executable(name: &str) -> io::Result<PathBuf> {
+pub(crate) fn sibling_executable(name: &str) -> io::Result<PathBuf> {
     let current = std::env::current_exe()?;
     let directory = current.parent().ok_or_else(|| {
         io::Error::new(
@@ -3043,6 +3222,45 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ui")]
+    #[test]
+    fn remote_ui_launch_does_not_read_a_local_daemon_handoff() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_UI_LAUNCH";
+        const TEST: &str = "control::tests::remote_ui_launch_does_not_read_a_local_daemon_handoff";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "launch-test".into(),
+            host: "fw16".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("launch-test".into())).unwrap();
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' \"$1\"",
+            "launch-test",
+            UI_LAUNCH_READY,
+        ]);
+        spawn_ui_process(&mut command).unwrap();
+    }
     use std::{os::unix::net::UnixStream, thread};
 
     use clap::CommandFactory;
@@ -3361,6 +3579,7 @@ mod tests {
                     ordinal: 4,
                 }],
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             write_frame(
@@ -3613,6 +3832,7 @@ mod tests {
                 }],
                 channels: Vec::new(),
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             write_frame(
@@ -3674,6 +3894,7 @@ mod tests {
                 projects: served,
                 channels: Vec::new(),
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             write_frame(
@@ -3796,6 +4017,7 @@ mod tests {
                         projects: Vec::new(),
                         channels: Vec::new(),
                         closed_projects: Vec::new(),
+                        views: Vec::new(),
                         agents: Vec::new(),
                     },
                 ),
@@ -3855,6 +4077,7 @@ mod tests {
                 })
                 .collect(),
             closed_projects: Vec::new(),
+            views: Vec::new(),
             agents: Vec::new(),
         }
     }

@@ -58,7 +58,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::CloseTerminalChecked { terminal_id, .. } => Access::Control(*terminal_id),
         R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
         R::Spawn { session, .. } => Access::Spawn(session),
-        R::Agent { .. }
+        R::CompletePendingTerminal { .. }
+        | R::DeviceOperation { .. }
+        | R::Agent { .. }
         | R::Automation { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }

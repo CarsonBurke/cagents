@@ -373,6 +373,7 @@ impl Omp {
                 id: format!("tool:{id}"),
                 role: Role::Assistant,
                 content,
+                started_at: None,
                 at: None,
             }];
         }
@@ -386,6 +387,7 @@ impl Omp {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                started_at: None,
                 at: None,
             }];
         }
@@ -439,6 +441,7 @@ impl Omp {
                     id,
                     role,
                     content,
+                    started_at: None,
                     at: None,
                 })
             })
@@ -596,6 +599,7 @@ impl Omp {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    started_at: None,
                     at: None,
                 }));
             }
@@ -619,6 +623,7 @@ impl Omp {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    started_at: None,
                     at: None,
                 }));
             }
@@ -731,7 +736,7 @@ impl Adapter for Omp {
                 request["mode"] = mode.into();
                 step.writes.push(request);
             }
-            Command::RemoveQueued { .. } | Command::UpdateQueued { .. } | Command::StartQueued { .. } => return Err("This OMP protocol does not support queue mutation".into()),
+            Command::RemoveQueued { .. } | Command::StartQueued { .. } => return Err("This OMP protocol does not support queue mutation".into()),
             Command::ListBranches => step.writes.push(self.request("get_branch_messages")),
             Command::Branch { id } => {
                 if self.busy { return Err("Branch requires an idle OMP conversation".into()); }
@@ -1244,6 +1249,7 @@ impl Adapter for Omp {
                     id: format!("tool:{id}"),
                     role: Role::Assistant,
                     content,
+                    started_at: None,
                     at: None,
                 }));
             }
@@ -1257,6 +1263,7 @@ impl Adapter for Omp {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    started_at: None,
                     at: None,
                 }));
             }
@@ -1270,6 +1277,7 @@ impl Adapter for Omp {
                         output: frame["update"].to_string(),
                         status: ToolStatus::Running,
                     },
+                    started_at: None,
                     at: None,
                 }));
             }

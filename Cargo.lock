@@ -1221,6 +1221,7 @@ dependencies = [
  "two-face",
  "unicode-casefold",
  "unicode-linebreak",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "uuid",
@@ -3700,8 +3701,6 @@ dependencies = [
 [[package]]
 name = "harfrust"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9da2e5ae821f6e96664977bf974d6d6a2d6682f9ccee23e62ec1d134246845f9"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",

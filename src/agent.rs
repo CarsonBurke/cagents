@@ -226,7 +226,7 @@ impl Provider {
 
     /// Authored skills and commands belong to configuration, which OMP may
     /// keep separately from its session data under XDG.
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", feature = "host"))]
     pub fn authored_content_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         if self == Self::Omp {
             omp::config_root(launch, Path::new(launch.environment.get("HOME")?))

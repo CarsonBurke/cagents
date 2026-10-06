@@ -109,7 +109,15 @@ use crate::{
 /// Version 45 lets a connection act for an agent session, which may then
 /// change only the terminals it controls.
 /// Version 47 carries native permission denials and scoped permission settings.
-pub const PROTOCOL_VERSION: u16 = 47;
+/// Version 48 adds device workspace operations.
+/// Version 49 carries host-owned account homes and fences idle account handoffs.
+/// Version 50 frames device account JSON values as strings for binary IPC.
+/// Version 51 carries native chat start timestamps and publication clock samples.
+/// Device workspace and account operations require a matched executable set.
+/// Version 52 shares durable pane views across clients with revision-fenced edits.
+/// Version 53 adds worktree view scopes and durable automatic-terminal reservations.
+/// Version 55 carries the delivery and attachments of queued chat messages.
+pub const PROTOCOL_VERSION: u16 = 55;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -124,6 +132,9 @@ pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
 
 /// Returns the current user's cagents daemon socket path.
 pub fn daemon_socket_path() -> io::Result<PathBuf> {
+    if let Some(path) = crate::device::socket_path()? {
+        return Ok(path);
+    }
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -249,6 +260,9 @@ pub enum ClientRequest {
     ChatRecoverAccount {
         source: crate::chat::Session,
         replacement: crate::chat::Session,
+        /// Automatic handoff fences the exact idle actor before replacing it.
+        #[serde(default)]
+        idle_generation: Option<u64>,
         execution_environment: ChatExecutionEnvironment,
     },
     ChatAttach {
@@ -422,6 +436,15 @@ pub enum ClientRequest {
     /// acts for the user.
     Authenticate {
         authority: crate::agent_execution::Authority,
+    },
+    DeviceOperation {
+        operation: crate::device_service::Operation,
+    },
+    /// Complete the daemon's durable intent, using its authoritative recipe.
+    CompletePendingTerminal {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        options: TerminalSpawnOptions,
     },
 }
 
@@ -718,6 +741,9 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         update: crate::chat::presentation::Presentation,
     },
+    DeviceOperation {
+        reply: crate::device_service::Reply,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +841,7 @@ pub enum ProtocolErrorCode {
     QueueFull,
     PermissionDenied,
     Internal,
+    ViewConflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

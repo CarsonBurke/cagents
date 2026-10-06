@@ -12,8 +12,9 @@ app-server 0.159.3, and Oh My Pi 18.2.9.
 | --- | --- | --- | --- |
 | Native and CLI history discovery, exact resume | Supported | Supported | Supported |
 | Send, steer, queue, interrupt | Supported | Supported | Supported |
-| Remove provider-confirmed queued message | Supported | Supported | RPC unavailable |
-| Edit plain text queue entry, start selected entry next | API unavailable | Supported | RPC unavailable |
+| Remove a queued message, or take it back into the composer to revise | Supported, with attachments | Supported, with local images | RPC unavailable |
+| Start selected queue entry next | API unavailable | Supported | RPC unavailable |
+| Queue entry shows its delivery | Next step or next turn | Next turn | Next turn |
 | Branch conversation | No native branch control | Separate conversation, optionally after a completed turn | Before a user message; restores its draft |
 | Child transcripts and lifecycle | Supported | Supported, including nested children | Supported |
 | Child approvals | Provider permission requests | Explicit, labeled child requests | Provider input dialogs |
@@ -25,9 +26,18 @@ app-server 0.159.3, and Oh My Pi 18.2.9.
 
 Claude async steering and queueing are enabled for 2.1.286 and newer. Messages
 are written to the running provider immediately with `next` or `later`
-priority. Provider lifecycle acknowledgments determine the queued preview;
-background child work does not keep the parent composer busy after its result.
-Older versions retain local follow-up delivery after the current turn.
+priority. Queued input appears immediately in a bounded list above the composer;
+provider lifecycle acknowledgments move it into the transcript only when consumed.
+Revising an entry removes it from the provider and returns it to the composer
+rather than editing it in place, on every provider that can remove one: the
+provider cannot consume a message mid-edit. The text returns only on the
+provider's own confirmation of the removal (Claude's `cancelled` or `discarded`
+lifecycle state, Codex's `thread/queue/delete` result), since an entry leaving
+the queue is also what delivery looks like. Codex's in-place
+`thread/queue/update` is therefore not used.
+Background child work does not keep the parent composer busy after its result.
+Older versions retain local follow-up delivery after the current turn: each
+follow-up is its own queue entry, and they are sent together as one prompt.
 
 Codex retains additional typed APIs without corresponding native UI controls:
 queue reordering, review, plan/collaboration modes, goals and background terminal

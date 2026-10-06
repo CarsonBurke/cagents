@@ -100,6 +100,9 @@ shortcut_defaults_revision = 4
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
 new_native_thread = ["Ctrl+T", "Ctrl+Shift+N"]
+chat_account = ["Ctrl+Shift+A"]
+chat_model = ["Ctrl+Shift+M"]
+chat_permissions = ["Ctrl+Shift+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
 close_focused_column = ["Ctrl+W"]
@@ -204,6 +207,10 @@ modifiers, joined by `+`. Names are case-insensitive.
   editor or chat transcript, and otherwise searches projects.
   File and hunk navigation also works in local diff panes. Viewed-file commands
   act only in a pull request pane. The chords reach terminals outside that scope.
+- `chat_account`, `chat_model`, and `chat_permissions` apply only to the
+  focused native chat. Account selection is available before the conversation
+  starts. Up/Down or Tab/Shift+Tab choose an account or permission mode, and
+  Enter confirms it. The model picker accepts a search followed by Enter.
 - `new_terminal`, `close_focused_column`, `search_projects`,
   `previous_column`, and `next_column` need at least one chord. The rest
   including the command palette, pane actions and the six `review_*` actions

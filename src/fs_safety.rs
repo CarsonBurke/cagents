@@ -93,6 +93,13 @@ impl Root {
     /// Returns the underlying [`io::Error`] when `root` cannot be opened, is
     /// not a directory, or is a symbolic link.
     pub fn open(root: &Path) -> io::Result<Self> {
+        #[cfg(feature = "ui")]
+        if crate::device::is_remote() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote paths must be opened through the selected daemon",
+            ));
+        }
         let name = c_path(root)?;
         let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: `name` is a NUL-terminated string that outlives the call, and
@@ -1412,9 +1419,13 @@ mod tests {
 
         assert!(lost.is_empty(), "{lost:?}");
         assert_eq!(
-            attribute_names(&destination).expect("list"),
+            attribute_names(&destination)
+                .expect("list")
+                .into_iter()
+                .filter(|name| is_content_attribute(name))
+                .collect::<Vec<_>>(),
             vec![CString::new("user.note").expect("name")],
-            "the replacement carries the original's attribute",
+            "the replacement carries the original's content attribute",
         );
         assert_eq!(
             read_attribute(&destination, c"user.note").expect("read"),

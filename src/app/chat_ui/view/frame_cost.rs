@@ -55,6 +55,7 @@ fn item(id: String, role: chat::Role, content: ItemContent) -> chat::Item {
         id,
         role,
         content,
+        started_at: None,
         at: Some(1_700_000_000_000),
     }
 }
@@ -162,6 +163,7 @@ pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>)
         TerminalId::new(),
         "/project".into(),
         &account,
+        false,
     )
     .expect("a session");
     let base = Snapshot {
@@ -191,6 +193,7 @@ fn measure(turns: usize) {
     let theme = cosmic::Theme::dark();
     let mut renderer = crate::app::tests::headless_renderer();
     let mut cache = Cache::new();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
     let (mut update, mut view, mut layout, mut draw) = (
         Stage::default(),
         Stage::default(),
@@ -221,6 +224,7 @@ fn measure(turns: usize) {
         let element = runtime.view(
             false,
             true,
+            &shortcuts,
             720.0,
             Place {
                 name: "project".into(),

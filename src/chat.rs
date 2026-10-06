@@ -17,7 +17,7 @@ pub(crate) mod native_holder;
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
 
 /// Local wall-clock time for a conversation stamp, as `14:32`.
@@ -734,6 +734,11 @@ pub struct BindingCandidate {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Daemon wall-clock milliseconds sampled for this publication. Clients
+    /// advance this with their monotonic clock instead of comparing timestamps
+    /// from two machines. Absent only in older data and synthetic snapshots.
+    #[serde(default)]
+    pub sampled_at: Option<u64>,
     pub generation: u64,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
@@ -779,6 +784,11 @@ pub struct Snapshot {
     pub ready: bool,
     #[serde(default)]
     pub queued_messages: Vec<QueuedMessage>,
+    /// How the provider answered recent requests to remove a queued message,
+    /// oldest first. A message leaving `queued_messages` does not say whether
+    /// it was removed or delivered; this does.
+    #[serde(default)]
+    pub queue_removals: Vec<QueueRemoval>,
     /// A provider history request remains in flight after its command was
     /// acknowledged. Cached pages do not enter this state.
     #[serde(default)]
@@ -791,13 +801,43 @@ pub struct Snapshot {
     pub forked: Option<String>,
 }
 
-/// A bounded preview from the provider's confirmed queue, independent of history pages.
+/// When a provider takes a message it is holding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueDelivery {
+    /// At the provider's next delivery boundary inside the running turn.
+    NextStep,
+    /// As a turn of its own, once the running one has ended.
+    #[default]
+    NextTurn,
+}
+
+/// The provider's answer to a request to remove a queued message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRemoval {
+    pub id: String,
+    /// Whether the message left the queue without being delivered.
+    pub removed: bool,
+}
+
+impl QueueRemoval {
+    /// Answers kept for a client that reads snapshots rather than events.
+    pub const LIMIT: usize = 32;
+}
+
+/// A bounded preview of pending provider input, independent of history pages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: String,
     pub text: String,
+    /// Whether `text` and `attachments` are the whole message, so that taking
+    /// it back puts in the composer exactly what was queued.
     #[serde(default)]
     pub editable: bool,
+    #[serde(default)]
+    pub delivery: QueueDelivery,
+    /// The files queued with the message, where the provider names them.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -828,14 +868,17 @@ impl QueuedMessage {
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
         const PREVIEW_BYTES: usize = 16 * 1024;
-        if text.len() > PREVIEW_BYTES {
+        let whole = text.len() <= PREVIEW_BYTES;
+        if !whole {
             text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {
             id,
             text,
-            editable: false,
+            editable: whole,
+            delivery: QueueDelivery::default(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -952,10 +995,6 @@ pub enum Command {
     /// Mutate an authoritative provider queue entry, never a transcript item.
     RemoveQueued {
         id: String,
-    },
-    UpdateQueued {
-        id: String,
-        text: String,
     },
     StartQueued {
         id: String,
@@ -1314,6 +1353,11 @@ impl ItemContent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
+    /// Unix milliseconds when this item was first observed. Unlike `at`,
+    /// this remains stable while text and tool output stream. Replayed items
+    /// without a known start retain `None`.
+    #[serde(default)]
+    pub started_at: Option<u64>,
     pub id: String,
     pub role: Role,
     pub content: ItemContent,
@@ -1426,8 +1470,6 @@ pub struct Capabilities {
     pub skill_reach: SkillReach,
     #[serde(default)]
     pub queue_remove: bool,
-    #[serde(default)]
-    pub queue_edit: bool,
     #[serde(default)]
     pub queue_start: bool,
     #[serde(default)]
@@ -1615,6 +1657,7 @@ pub enum Event {
         event: crate::agent_execution::ProviderEvent,
     },
     QueueChanged(Vec<QueuedMessage>),
+    QueueRemoval(QueueRemoval),
     /// Published until the provider has answered the asynchronous history
     /// request, independently of the command acknowledgement.
     HistoryLoading(bool),
@@ -1795,6 +1838,72 @@ mod tests {
         );
         recipe.unset_environment = ["HOME".into(), "CLAUDE_CONFIG_DIR".into()].into();
         assert_eq!(claude_configured_default_mode(&recipe), None);
+    }
+
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn managed_claude_accounts_inherit_only_an_unset_permission_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let account = homes.path(Provider::Claude, uuid::Uuid::new_v4());
+        let system = directory.path().join("system");
+        let project = directory.path().join("project");
+        for path in [&account, &system, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            system.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        )
+        .unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: ["HOME".into()].into(),
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: project.clone(),
+            environment: [("CLAUDE_CONFIG_DIR".into(), account.display().to_string())].into(),
+        };
+        let resolve = |recipe: &LaunchRecipe| {
+            claude_configured_default_mode_in(recipe, Some(&homes), Some(&system))
+        };
+        assert_eq!(resolve(&recipe).as_deref(), Some("auto"));
+        for (settings, expected) in [
+            (r#"{"theme":"dark"}"#, Some("auto")),
+            (r#"{"permissions":{"defaultMode":"plan"}}"#, Some("plan")),
+            (r#"{"permissions":{"defaultMode":"default"}}"#, None),
+            (r#"{"permissions":{"defaultMode":"unknown"}}"#, None),
+            (r#"{"permissions":{"defaultMode":null}}"#, None),
+            (r#"{"permissions":null}"#, None),
+            (r#"{"permissions":"invalid"}"#, None),
+            ("null", None),
+            ("[]", None),
+            ("malformed", None),
+        ] {
+            std::fs::write(account.join("settings.json"), settings).unwrap();
+            assert_eq!(resolve(&recipe).as_deref(), expected, "{settings}");
+        }
+        std::fs::write(account.join("settings.json"), "{}").unwrap();
+        std::fs::create_dir(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.local.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve(&recipe), None);
+        std::fs::remove_file(project.join(".claude/settings.local.json")).unwrap();
+        recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            directory.path().join("linked").display().to_string(),
+        );
+        assert_eq!(resolve(&recipe), None);
+        recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            homes
+                .path(Provider::Codex, uuid::Uuid::new_v4())
+                .display()
+                .to_string(),
+        );
+        assert_eq!(resolve(&recipe), None);
     }
 
     #[test]
@@ -1994,6 +2103,8 @@ pub(crate) fn fresh_session(
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
     if account.provider == provider
+        && !(crate::device::is_remote()
+            && matches!(account.home, crate::account::AccountHome::System))
         && let (Some(variable), Some(home)) = (
             crate::account::home_variable(provider),
             account.resolved_home(),
@@ -2049,10 +2160,35 @@ pub(crate) fn fresh_session(
 
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
-    fn setting(path: &std::path::Path) -> Option<String> {
-        let settings: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        let mode = settings["permissions"]["defaultMode"].as_str()?;
+    if crate::device::is_remote() {
+        return None;
+    }
+    let homes = crate::account::home::Homes::installation();
+    let system_home = crate::account::Account::system(Provider::Claude).resolved_home();
+    claude_configured_default_mode_in(recipe, homes.as_ref(), system_home.as_deref())
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_configured_default_mode_in(
+    recipe: &LaunchRecipe,
+    homes: Option<&crate::account::home::Homes>,
+    system_home: Option<&std::path::Path>,
+) -> Option<String> {
+    fn setting(path: &std::path::Path) -> Result<Option<String>, ()> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
+        };
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+        let settings = settings.as_object().ok_or(())?;
+        let Some(permissions) = settings.get("permissions") else {
+            return Ok(None);
+        };
+        let Some(value) = permissions.as_object().ok_or(())?.get("defaultMode") else {
+            return Ok(None);
+        };
+        let mode = value.as_str().ok_or(())?;
         matches!(
             mode,
             "default"
@@ -2063,7 +2199,8 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
                 | "dontAsk"
                 | "bypassPermissions"
         )
-        .then(|| mode.to_owned())
+        .then(|| Some(mode.to_owned()))
+        .ok_or(())
     }
 
     let environment = |name: &str| {
@@ -2096,7 +2233,10 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
     for directory in recipe.working_directory.ancestors() {
         if user_home.as_deref() == Some(directory) {
             if recipe.working_directory == directory
-                && setting(&directory.join(".claude/settings.local.json")).is_some()
+                && setting(&directory.join(".claude/settings.local.json"))
+                    .ok()
+                    .flatten()
+                    .is_some()
             {
                 // HOME itself can be a project cwd. Its local setting then
                 // belongs to that session, but never to descendant projects.
@@ -2113,7 +2253,7 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
                 {
                     return false;
                 }
-                setting(&path).is_some()
+                setting(&path).ok().flatten().is_some()
             })
         {
             // A project-specific choice belongs to Claude's own settings
@@ -2124,5 +2264,14 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
 
     // Local settings belong to a project; a settings.local.json beside the
     // account's user settings is not a user configuration layer.
-    setting(&root.join("settings.json")).filter(|mode| mode != "default")
+    let mode = setting(&root.join("settings.json")).ok()?.or_else(|| {
+        // Older managed homes predate configuration seeding. Inherit the
+        // reader's system default only when this account has no choice of
+        // its own; linked and external CLI homes remain independent.
+        homes?
+            .managed_identity(&root)
+            .filter(|(provider, _)| *provider == Provider::Claude)?;
+        setting(&system_home?.join("settings.json")).ok().flatten()
+    });
+    mode.filter(|mode| mode != "default")
 }

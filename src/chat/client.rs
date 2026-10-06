@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Native holder startup can spend 30 seconds sending its control request and
@@ -67,6 +67,46 @@ type Pending = Arc<
         >,
     >,
 >;
+/// A daemon timestamp paired with local receipt time. It survives delayed UI
+/// hydration and advances while the provider is quiet without relying on the
+/// display machine's wall clock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceClock {
+    sampled_at: u64,
+    received_at: Instant,
+}
+
+impl SourceClock {
+    fn from_sample(sampled_at: Option<u64>, received_at: Instant) -> Option<Self> {
+        sampled_at.map(|sampled_at| Self {
+            sampled_at,
+            received_at,
+        })
+    }
+
+    fn observe(clock: &mut Option<Self>, sampled_at: Option<u64>, received_at: Instant) {
+        if let Some(mut next) = Self::from_sample(sampled_at, received_at) {
+            // Network jitter and wall-clock adjustments must not make a live
+            // duration count backwards on the next publication.
+            if let Some(previous) = clock {
+                next.sampled_at = next.sampled_at.max(previous.at(received_at));
+            }
+            *clock = Some(next);
+        }
+    }
+
+    pub(crate) fn now(self) -> u64 {
+        self.at(Instant::now())
+    }
+
+    fn at(self, now: Instant) -> u64 {
+        self.sampled_at.saturating_add(
+            u64::try_from(now.saturating_duration_since(self.received_at).as_millis())
+                .unwrap_or(u64::MAX),
+        )
+    }
+}
+
 struct Inner {
     id: TerminalId,
     session: Session,
@@ -75,6 +115,7 @@ struct Inner {
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    source_clock: Arc<Mutex<Option<SourceClock>>>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
@@ -354,6 +395,10 @@ impl ClientHandle {
                     codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
                 })),
                 cancel,
+                source_clock: Arc::new(Mutex::new(SourceClock::from_sample(
+                    snapshot.sampled_at,
+                    Instant::now(),
+                ))),
                 snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
                 activity: Arc::new(Mutex::new(ActivityObservation {
                     generation: 0,
@@ -390,11 +435,7 @@ impl ClientHandle {
     /// frame, so a test can stream a transcript into a surface.
     #[cfg(test)]
     pub(crate) fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
-        *self
-            .inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Arc::new(snapshot);
+        self.install_snapshot_for_test(snapshot);
     }
 
     /// Queues a report as the reader thread would on its arrival, and says
@@ -429,11 +470,7 @@ impl ClientHandle {
 
     #[cfg(test)]
     pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
-        *self
-            .inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(snapshot);
+        self.install_snapshot_for_test(snapshot);
     }
 
     /// Read-only metadata lookup. Does not subscribe, resume, or write a turn.
@@ -584,7 +621,30 @@ impl ClientHandle {
             None,
             false,
             None,
-            Some(source),
+            Some((source, None)),
+            wake,
+        )
+    }
+
+    pub fn switch_account(
+        source: Session,
+        replacement: Session,
+        generation: u64,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !super::is_account_recovery(&source, &replacement) {
+            return Err("Account switch changed the saved conversation".into());
+        }
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        Self::connect_on(
+            stream,
+            replacement,
+            Intent::Start,
+            None,
+            false,
+            None,
+            Some((source, Some(generation))),
             wake,
         )
     }
@@ -596,7 +656,7 @@ impl ClientHandle {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         selection: Option<String>,
-        account_recovery: Option<Session>,
+        account_recovery: Option<(Session, Option<u64>)>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
@@ -642,11 +702,12 @@ impl ClientHandle {
         let id = session.id;
         let mut attach_request = 2;
         let mut upgrade_recovery = None;
-        let request = if let Some(source) = account_recovery {
+        let request = if let Some((source, idle_generation)) = account_recovery {
             let execution_environment = native_environment(&session, true);
             ClientRequest::ChatRecoverAccount {
                 source,
                 replacement: session,
+                idle_generation,
                 execution_environment,
             }
         } else if let Some(token) = selection {
@@ -766,6 +827,10 @@ impl ClientHandle {
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
         let account_usage = Arc::new(Mutex::new(early_usage));
+        let source_clock = Arc::new(Mutex::new(SourceClock::from_sample(
+            initial.sampled_at,
+            Instant::now(),
+        )));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -780,6 +845,7 @@ impl ClientHandle {
             wire: wire.clone(),
             cancel,
             snapshot: snapshot.clone(),
+            source_clock: source_clock.clone(),
             activity: activity.clone(),
             observed: observed.clone(),
             account_usage: account_usage.clone(),
@@ -908,14 +974,21 @@ impl ClientHandle {
                         read_pending = false;
                         if let Some(update) = update {
                             resync = false;
-                            *snapshot.lock().unwrap_or_else(|p| p.into_inner()) = Arc::new(update);
+                            let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                            SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), update.sampled_at, Instant::now());
+                            *state = Arc::new(update);
+                            drop(state);
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
                         }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                        let sampled_at = update.metadata.sampled_at;
                         let applied = update.apply(Arc::make_mut(&mut state));
+                        if applied.is_ok() {
+                            SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                        }
                         drop(state);
                         if applied.is_err() {
                             resync = true;
@@ -987,6 +1060,39 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+    pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
+        let snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let clock = self
+            .inner
+            .source_clock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (snapshot.clone(), *clock)
+    }
+
+    #[cfg(test)]
+    fn install_snapshot_for_test(&self, update: Snapshot) {
+        let mut state = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        SourceClock::observe(
+            &mut self
+                .inner
+                .source_clock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            update.sampled_at,
+            Instant::now(),
+        );
+        *state = Arc::new(update);
+    }
+
     /// Drains one coalesced activity edge without touching presentation state.
     pub fn take_activity(&self) -> ActivityState {
         let mut activity = self
@@ -1234,6 +1340,32 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_clock_advances_in_daemon_time_despite_delayed_hydration() {
+        let received = Instant::now();
+        // The daemon can be arbitrarily ahead of or behind the display
+        // machine. Neither its epoch nor receipt time comes from UI refresh.
+        for sampled_at in [1_000, u64::MAX - 60_000] {
+            let clock = SourceClock::from_sample(Some(sampled_at), received).unwrap();
+            assert_eq!(clock.at(received), sampled_at);
+            assert_eq!(
+                clock.at(received + Duration::from_secs(12)),
+                sampled_at + 12_000
+            );
+        }
+        assert!(SourceClock::from_sample(None, received).is_none());
+    }
+
+    #[test]
+    fn source_clock_never_rewinds_when_new_publications_arrive() {
+        let received = Instant::now();
+        let mut clock = SourceClock::from_sample(Some(10_000), received);
+        SourceClock::observe(&mut clock, Some(9_000), received + Duration::from_secs(2));
+        assert_eq!(clock.unwrap().at(received + Duration::from_secs(3)), 13_000);
+        SourceClock::observe(&mut clock, Some(14_000), received + Duration::from_secs(3));
+        assert_eq!(clock.unwrap().at(received + Duration::from_secs(4)), 15_000);
+    }
 
     fn handoff_terminal() -> crate::model::TerminalSession {
         use crate::model::{LaunchRecipe, TerminalContinuity, TerminalSession};
@@ -2312,6 +2444,7 @@ mod tests {
         let text = |id: &str, body: &str| Item {
             id: id.into(),
             role: Role::Assistant,
+            started_at: None,
             at: None,
             content: ItemContent::Text {
                 text: body.into(),

@@ -606,7 +606,15 @@ impl Cagents {
         Task::batch([leave, close])
     }
 
-    fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+    pub(super) fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.retire_channel(id, false)
+    }
+
+    pub(super) fn retire_peer_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.retire_channel(id, true)
+    }
+
+    fn retire_channel(&mut self, id: ChannelId, passive: bool) -> Task<Message> {
         let Some(index) = self
             .durable
             .channels
@@ -617,6 +625,9 @@ impl Cagents {
         };
         let was_active = self.durable.active_channel == Some(id);
         let (project_id, successor) = self.channel_successor(index);
+        let fallback = self.project_primary_worktree(project_id);
+        let focused = self.durable.channels[index].focused;
+        let mut retained_scope = None;
         let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
         // Every window loses the channel, not only this one. A deletion that
         // arrived from the registry publishes it right back, which the registry
@@ -634,18 +645,60 @@ impl Cagents {
                 freed_utility = true;
                 continue;
             }
+            if passive
+                && (self.shared_chat_has_local_work(card)
+                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
+            {
+                self.retain_local_pane(card);
+                let scope = self
+                    .durable
+                    .card_scopes
+                    .get(&card)
+                    .cloned()
+                    .or_else(|| self.worktree_owners.get(&card).cloned())
+                    .or_else(|| {
+                        self.card_state(card)
+                            .and_then(|state| self.card_worktree(state))
+                            .map(Path::to_path_buf)
+                    })
+                    .or_else(|| fallback.clone());
+                if let Some(scope) = scope {
+                    Arc::make_mut(&mut self.durable)
+                        .card_scopes
+                        .insert(card, scope.clone());
+                    self.worktree_owners.insert(card, scope.clone());
+                    if focused == Some(card) || retained_scope.is_none() {
+                        retained_scope = Some(scope.clone());
+                        self.worktree_focus.insert(scope, card);
+                    }
+                }
+                continue;
+            }
             self.retire_lsp_card(card);
             self.sidebar_state.clear_agent_activity(card);
             self.sidebar_state.acknowledge_agent_update(card);
-            self.chat_discard(card);
+            if passive {
+                self.shared_chat_detach(card);
+            } else {
+                self.chat_discard(card);
+            }
             self.cards.remove(&card);
             self.lifecycle.remove(card);
             if let Some(state) = self.card_state_mut(card) {
                 state.existence = super::project_ui::removed_existence("channel deleted by user");
             }
         }
+        if retained_scope.is_some() {
+            self.status = Some(TransientNotice::warning(
+                "A channel was deleted in another client. Your unsaved work is retained in its worktree.",
+            ));
+        }
         let select = if was_active {
-            self.land_after_channel(project_id, successor)
+            if let Some(scope) = retained_scope {
+                self.select_worktree(scope, false)
+            } else {
+                self.land_after_channel(project_id, successor)
+            }
         } else if freed_utility
             && self.durable.active_channel.is_none()
             && let Some(path) = self.active_workspace.clone()

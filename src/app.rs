@@ -9,6 +9,7 @@ mod chat_ui;
 mod chrome_ui;
 mod daemon_recovery;
 mod daemon_stop;
+mod device_ui;
 pub(crate) mod dialog_ui;
 mod file_manager;
 mod file_ui;
@@ -26,6 +27,7 @@ mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
+mod shared_views;
 mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
@@ -1442,8 +1444,11 @@ fn display_path(path: &Path) -> Cow<'_, str> {
 /// change while the process runs. The empty-workspace surface is the default
 /// first-run view and `view` re-runs on every redraw, so resolving this there
 /// cost a blocking `getcwd` plus three allocations per frame.
-static STARTING_DIRECTORY: LazyLock<PathBuf> =
-    LazyLock::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+static STARTING_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
+    crate::device::home()
+        .cloned()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
+});
 static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
     LazyLock::new(|| format!("Starting directory: {}", display_path(&STARTING_DIRECTORY)));
 
@@ -1568,7 +1573,9 @@ fn reconcile_restored_projects(
         if !project.existence.is_open() {
             return true;
         }
-        if let Ok(canonical) = project.repository.canonicalize() {
+        if !crate::device::is_remote()
+            && let Ok(canonical) = project.repository.canonicalize()
+        {
             project.repository = canonical;
         }
         match repositories.entry(project.repository.clone()) {
@@ -2683,6 +2690,9 @@ pub enum SettingsField {
     ShortcutReviewPreviousChange,
     ShortcutCommandPalette,
     ShortcutNewThread,
+    ShortcutChatPermissions,
+    ShortcutChatModel,
+    ShortcutChatAccount,
     ShortcutToggleInspector,
     ShortcutOpenSettings,
     ShortcutMovePaneLeft,
@@ -2703,7 +2713,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 34] = [
+    const SHORTCUTS: [Self; 37] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2722,6 +2732,9 @@ impl SettingsField {
         Self::ShortcutReviewPreviousChange,
         Self::ShortcutCommandPalette,
         Self::ShortcutNewThread,
+        Self::ShortcutChatPermissions,
+        Self::ShortcutChatModel,
+        Self::ShortcutChatAccount,
         Self::ShortcutToggleInspector,
         Self::ShortcutOpenSettings,
         Self::ShortcutMovePaneLeft,
@@ -2781,6 +2794,9 @@ impl SettingsField {
             Self::ShortcutRenamePane => "Rename focused pane",
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
+            Self::ShortcutChatPermissions => "Choose chat permission mode",
+            Self::ShortcutChatModel => "Choose chat model",
+            Self::ShortcutChatAccount => "Choose chat account",
             Self::ShortcutToggleInspector => "Toggle inspector",
             Self::ShortcutOpenSettings => "Open settings",
             Self::ShortcutMovePaneLeft => "Move pane left",
@@ -2875,6 +2891,9 @@ impl SettingsField {
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
+            | Self::ShortcutChatPermissions
+            | Self::ShortcutChatModel
+            | Self::ShortcutChatAccount
             | Self::ShortcutToggleInspector
             | Self::ShortcutOpenSettings
             | Self::ShortcutMovePaneLeft
@@ -2929,6 +2948,9 @@ struct ShortcutDraft {
     rename_pane: String,
     command_palette: String,
     new_native_thread: String,
+    chat_permissions: String,
+    chat_model: String,
+    chat_account: String,
     toggle_inspector: String,
     open_settings: String,
     move_pane_left: String,
@@ -2968,6 +2990,9 @@ impl ShortcutDraft {
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
+            chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
+            chat_model: settings::format_chords(&shortcuts.chat_model),
+            chat_account: settings::format_chords(&shortcuts.chat_account),
             toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
             open_settings: settings::format_chords(&shortcuts.open_settings),
             move_pane_left: settings::format_chords(&shortcuts.move_pane_left),
@@ -3189,6 +3214,11 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.command_palette = value
             }
             SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_native_thread = value,
+            SettingsField::ShortcutChatPermissions => {
+                self.keyboard_shortcuts.chat_permissions = value
+            }
+            SettingsField::ShortcutChatModel => self.keyboard_shortcuts.chat_model = value,
+            SettingsField::ShortcutChatAccount => self.keyboard_shortcuts.chat_account = value,
             SettingsField::ShortcutToggleInspector => {
                 self.keyboard_shortcuts.toggle_inspector = value
             }
@@ -3280,6 +3310,18 @@ fn settings_update(
         }
         SettingsField::ShortcutCommandPalette => {
             next.keyboard_shortcuts.command_palette = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatAccount => {
+            next.keyboard_shortcuts.chat_account = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatModel => {
+            next.keyboard_shortcuts.chat_model = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutChatPermissions => {
+            next.keyboard_shortcuts.chat_permissions = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutNewThread => {
@@ -3782,6 +3824,7 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
         collapsed: bool,
@@ -3873,6 +3916,11 @@ pub enum Message {
     },
     OpenRepository,
     RepositorySelected(Result<PathBuf, String>),
+    DeviceProjectLoaded {
+        project_id: ProjectId,
+        generation: u64,
+        result: Result<crate::device_service::Navigation, String>,
+    },
     RepositoryLoaded {
         open_cards: bool,
         project_id: ProjectId,
@@ -4543,6 +4591,7 @@ impl WorkspaceDestination {
 }
 
 pub struct Cagents {
+    device_ui: device_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
@@ -4604,6 +4653,7 @@ pub struct Cagents {
     relaunched_terminals: HashSet<TerminalId>,
     terminal_crash_notices: HashMap<CardId, crate::model::HostSessionProof>,
     /// The shared sidebar model as this window last saw it.
+    shared_views: shared_views::State,
     workspace_model: crate::workspace_model::WorkspaceModel,
     /// Repositories this window has already been asked to open on the shared
     /// model's behalf. Asking twice would mint a second project on one checkout.
@@ -4968,6 +5018,13 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            let project_id = project_id.unwrap_or_default();
+            self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
+            let generation = self.repository_load_sequence;
+            self.repository_generations.insert(project_id, generation);
+            return self.device_project_read_task(path, project_id, generation, kind);
+        }
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
@@ -5237,15 +5294,52 @@ impl Cagents {
         visible: bool,
         explicit_retry: bool,
     ) -> Task<Message> {
+        if self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
+            || (self.shared_views.attached.contains(&card)
+                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                && !explicit_retry)
+        {
+            return Task::none();
+        }
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start(card);
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
+        let shared = self.shared_views.attached.contains(&card);
+        let reserved = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let (recovered, mode) = recover_terminal(session, explicit_retry)?;
+                let (recovered, mode) = if shared && !explicit_retry {
+                    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+                    let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+                    let mut hosted = client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
+                    if hosted.is_none() && reserved {
+                        for _ in 0..100 {
+                            match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
+                                Ok(created) => { hosted=Some(created);break; }
+                                Err(crate::control::ControlError::Remote {code:crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists | crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,..}) => {
+                                    hosted=client.list().map_err(|error|error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
+                                    if hosted.is_some() {break;}
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                Err(error) => return Err(error.to_string()),
+                            }
+                        }
+                    }
+                    let hosted=hosted.ok_or("This shared terminal is disconnected; another client must restore its hosted session")?;
+                    let proof = client.proof().clone();
+                    (daemon_recovery::RecoveredTerminal { session: hosted.session,
+                        expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
+                        TerminalStartMode::Attach(proof))
+                } else { recover_terminal(session, explicit_retry)? };
                 open_terminal(card, recovered, mode, config, sender)
             })
             .await
@@ -5507,11 +5601,22 @@ impl Cagents {
                 return Task::none();
             }
         };
+        if let Some(shell) = crate::device::shell() {
+            launch.program = shell.to_owned();
+        }
         // A shell can start either provider's CLI. Give it the same default
         // homes as native conversations, and persist those choices in its
         // launch recipe so a restored terminal never silently changes login.
         for provider in Account::PROVIDERS {
             let account = self.default_account_for_directory(provider, &working_directory);
+            if crate::device::is_remote() {
+                launch
+                    .environment
+                    .extend(crate::device::environment(provider, true));
+                if matches!(account.home, account::AccountHome::System) {
+                    continue;
+                }
+            }
             launch.unset_environment.extend(
                 account
                     .credential_overrides()
@@ -5602,6 +5707,11 @@ impl Cagents {
             Residency::Hydrating { epoch: 1 },
             Instant::now(),
         );
+        if self.shared_views.creating_default {
+            self.shared_views.defaults.insert(card_id, session.clone());
+        } else if session.continuity.live_proof().is_none() {
+            self.reserve_terminal_creation(card_id);
+        }
         self.persist();
         Task::batch([
             self.start_terminal(card_id, session, true, false),
@@ -6206,6 +6316,7 @@ impl Cagents {
             {
                 workspace_widget::FocusedPane::Terminal
             }
+            Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
@@ -6708,16 +6819,38 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
+        if !self.durable.pending_terminal_creations.is_empty() {
+            let open = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| {
+                    card.existence.is_open() && matches!(card.kind, CardKind::Terminal(_))
+                })
+                .map(|card| card.id)
+                .collect::<HashSet<_>>();
+            Arc::make_mut(&mut self.durable)
+                .pending_terminal_creations
+                .retain(|id| open.contains(id));
+        }
         self.focus_save_pending = false;
         self.snapshot_workspace_scope();
+        self.publish_view_changes();
         let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
-            session.snapshot(saved);
+            let adoptions = std::mem::take(&mut self.shared_views.adoptions);
+            if adoptions.is_empty() {
+                session.snapshot(saved);
+            } else {
+                session.snapshot_terminal_adoptions(saved, adoptions);
+            }
         }
     }
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
         match self.install_chat_session(card, session) {
             Some(true) => {
+                self.snapshot_workspace_scope();
+                self.publish_view_changes();
                 let saved = self.persistent_workspace();
                 if let Some(writer) = &self.session {
                     writer.snapshot_conversion(saved);
@@ -7201,11 +7334,14 @@ impl Cagents {
             }
             showing.to_owned()
         };
-        let window_title = if header == APPLICATION_NAME {
+        let mut window_title = if header == APPLICATION_NAME {
             header.clone()
         } else {
             format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
         };
+        if let Some(device) = crate::device::selected() {
+            window_title = format!("{} · {}", device.name, window_title);
+        }
         self.set_header_title(header);
         match self.core.main_window_id() {
             Some(id) => self.set_window_title(window_title, id),
@@ -8625,7 +8761,7 @@ impl Cagents {
         // typing aimed at the dialog and write it into a shell, which runs
         // what it is given. An overlay inspector additionally hides the workspace, so
         // that shell would not even be on screen.
-        let card_focused = focused && !self.workspace_inputs_blocked();
+        let card_focused = focused && self.refresh_ui.focused && !self.workspace_inputs_blocked();
         #[cfg(not(feature = "integrated-browser"))]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {
             let address = chrome
@@ -9342,10 +9478,23 @@ impl Cagents {
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
         let focus = self.sidebar_focus();
-        if !self
+        let changed = self
             .sidebar_state
-            .sync_active_worktree(&self.sidebar_model, &focus)
-        {
+            .sync_active_worktree(&self.sidebar_model, &focus);
+        if crate::device::is_remote() {
+            if changed
+                || self.sidebar_model.source_control.is_some()
+                || self.refresh_ui.source_cancel.is_some()
+            {
+                self.cancel_source_read();
+                self.cancel_branch_changes();
+                self.history_ui.cancel();
+                self.history_ui.next_page_request();
+            }
+            self.sidebar_model.source_control = None;
+            return Task::none();
+        }
+        if !changed {
             return self.load_pending_history();
         }
         self.cancel_source_read();
@@ -9372,6 +9521,9 @@ impl Cagents {
     /// tab is showing: a page is a `git log` walk, and a view nobody opened is
     /// not worth one.
     fn load_pending_history(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         if self.active_folder_scope() {
             return Task::none();
         }
@@ -10144,6 +10296,9 @@ impl Cagents {
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
@@ -10260,6 +10415,9 @@ impl Cagents {
         head: Option<crate::repository::Oid>,
         page: u32,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
         let Some(head) = head else {
             return Task::none();
         };
@@ -10425,11 +10583,17 @@ impl Cagents {
     /// The worktree and pull request dialogs: forms, whose focused field
     /// captures the keys the dialog itself answers.
     fn form_dialog_is_open(&self) -> bool {
-        self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() || self.resume_ui.open
+        self.device_ui.open
+            || self.worktree_dialog.is_some()
+            || self.pull_request_dialog.is_some()
+            || self.resume_ui.open
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.device_ui.open {
+            return self.update_device(device_ui::Action::Close);
+        }
         if self.resume_ui.open {
             return self.update_resume(resume_ui::Action::Close);
         }
@@ -10544,7 +10708,7 @@ impl Cagents {
         if self.chrome_ui.projects_collapsed {
             SidebarMode::Compact
         } else {
-            SidebarMode::for_width(self.window_width)
+            SidebarMode::Expanded
         }
     }
 
@@ -11759,6 +11923,7 @@ impl Cagents {
             }));
         }
         if previous.show_status_bar != self.settings.show_status_bar {
+            self.device_ui.menu_open = false;
             tasks.push(self.accounts_surface_changed());
         }
         if previous.notifications != self.settings.notifications {
@@ -11953,6 +12118,7 @@ impl Application for Cagents {
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
+        let shared_views = shared_views::State::for_workspace(&durable);
         let mut app = Self {
             core,
             workspace,
@@ -11984,6 +12150,7 @@ impl Application for Cagents {
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
             terminal_crash_notices: HashMap::new(),
+            shared_views,
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx,
@@ -12030,6 +12197,7 @@ impl Application for Cagents {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
             chrome_ui: chrome_ui::State::default()
@@ -12149,19 +12317,14 @@ impl Application for Cagents {
         // window's own resize only re-derives the densities. Card widths are
         // fractions re-derived per frame, so an estimate costs nothing but is
         // enough to mount them.
-        let sidebar_width = sidebar::effective_width(
-            SidebarMode::for_width(app.window_width),
-            app.settings.sidebar_width,
-        );
-        let inspector_width = if app.context_inspector_open
-            && matches!(
-                design::ShellLayout::for_width(app.window_width).inspector,
-                InspectorLayout::Docked
-            ) {
-            app.settings.inspector_width
-        } else {
-            0.0
-        };
+        let sidebar_width =
+            sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+        let inspector_width =
+            if matches!(app.context_inspector_mount(), Some(InspectorLayout::Docked)) {
+                app.settings.inspector_width
+            } else {
+                0.0
+            };
         let _ = app
             .workspace
             .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
@@ -12209,7 +12372,6 @@ impl Application for Cagents {
             app.initialize_runtimes(),
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
-            app.update_update_ui(update_ui::Action::LoadDismissal),
             app.update_update_ui(update_ui::Action::Poll),
             app.load_accounts(),
         ];
@@ -12242,6 +12404,60 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if crate::device::is_remote() {
+            match &message {
+                Message::GitUi(_)
+                | Message::ProjectUi(
+                    project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
+                ) => return Task::none(),
+                Message::ChatUi(
+                    chat_ui::Action::Attach(_)
+                    | chat_ui::Action::Attached(..)
+                    | chat_ui::Action::Dropped(..),
+                )
+                | Message::TerminalDropped { .. } => {
+                    self.status = Some(TransientNotice::warning(
+                        "File attachments require transfer to the selected device; use files already on that device",
+                    ));
+                    return Task::none();
+                }
+                Message::OpenRepository => return self.update_device(device_ui::Action::Open),
+                Message::PreviewLocalFile(_) => return self.update_device(device_ui::Action::Open),
+                Message::ResumeConversation(_)
+                | Message::Repository(_)
+                | Message::ProjectUi(_)
+                | Message::GitUi(_)
+                | Message::SubmitWorktree => {
+                    self.status = Some(TransientNotice::warning(
+                        "Use Device files for remote files and Git operations",
+                    ));
+                    return Task::none();
+                }
+                Message::Sidebar(action)
+                    if !matches!(
+                        action,
+                        SidebarAction::ScrollProjects(_)
+                            | SidebarAction::NavigateRow { .. }
+                            | SidebarAction::OpenChannel { .. }
+                            | SidebarAction::SelectRows { .. }
+                            | SidebarAction::ClearRowSelection
+                            | SidebarAction::OpenRepository { .. }
+                            | SidebarAction::OpenWorktree { .. }
+                            | SidebarAction::Refresh
+                            | SidebarAction::RefreshProject { .. }
+                            | SidebarAction::ToggleProjects
+                            | SidebarAction::ToggleProject(_)
+                            | SidebarAction::DragWindow
+                            | SidebarAction::MaximizeWindow
+                            | SidebarAction::WindowMenu
+                            | SidebarAction::OpenSettings
+                    ) =>
+                {
+                    return self.update_device(device_ui::Action::Open);
+                }
+                _ => {}
+            }
+        }
         self.tab_history.observe(self.workspace.focused());
         if self.chrome_ui.workspace_preview.is_none() {
             self.workspace_history
@@ -12306,6 +12522,7 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
@@ -12479,6 +12696,11 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
+            Message::DeviceProjectLoaded {
+                project_id,
+                generation,
+                result,
+            } => self.device_project_loaded(project_id, generation, result),
             Message::RepositoryLoaded {
                 open_cards,
                 project_id,
@@ -14678,6 +14900,20 @@ impl Application for Cagents {
                 {
                     return task;
                 }
+                if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
+                    return self.update_device(device_ui::Action::Menu(false));
+                }
+                // The model search field captures Escape to blur itself. Close
+                // its picker in the same press, while dialogs retain priority.
+                if is_escape_press(&event)
+                    && !self.workspace_inputs_blocked()
+                    && self.dismiss_chat_picker()
+                {
+                    return self.workspace.focused().map_or_else(Task::none, |card| {
+                        iced::widget::operation::focus(card_control_id(card, "chat-composer"))
+                            .map(cosmic::Action::App)
+                    });
+                }
                 if is_escape_press(&event) && !captured {
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
@@ -14712,9 +14948,6 @@ impl Application for Cagents {
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
-                    if self.dismiss_chat_picker() {
-                        return Task::none();
-                    }
                     if let Some(card) = self.focused_repository_card_with_find() {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
@@ -14750,6 +14983,9 @@ impl Application for Cagents {
                 // is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
+                }
+                if let Some(task) = self.chat_picker_key(&event) {
+                    return task;
                 }
                 if let Some(card) = self.workspace.focused()
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
@@ -14987,7 +15223,18 @@ impl Application for Cagents {
                 let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
                     self.accounts_focus_changed(focused, regained)
                 });
-                Task::batch([preview_task, refresh, self.flush_document_tone(), accounts])
+                let shared = if self.shared_views.blocked.is_empty() {
+                    Task::none()
+                } else {
+                    self.reconcile_shared_views()
+                };
+                Task::batch([
+                    preview_task,
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -15393,6 +15640,13 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if self.device_ui.open {
+            return Some(dialog_ui::overlay(
+                self.device_dialog(),
+                (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
+                1.0,
+            ));
+        }
         if let Some(gallery) = &self.chat_ui.image_viewer {
             return Some(gallery.view());
         }
@@ -15743,35 +15997,35 @@ impl Application for Cagents {
                 .unwrap_or_else(|| "Workspace".into());
             let action_buttons = || {
                 let buttons: Vec<Element<'_, Message>> = vec![
-                    widget::button::suggested(format!(
-                        "New thread · {}",
-                        workspace_widget::shortcut_chords(
+                    crate::interaction::tooltip(
+                        widget::button::suggested("New thread")
+                            .name("New thread")
+                            .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                                chrome_ui::NewTab::Thread,
+                            ))),
+                        workspace_widget::shortcut_tooltip(
                             workspace_widget::GlobalShortcut::NewThread,
-                            &self.settings.keyboard_shortcuts
-                        )
-                    ))
-                    .name("New thread")
-                    .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                        chrome_ui::NewTab::Thread,
-                    )))
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                    )
                     .into(),
                     widget::button::standard("Resume conversation")
                         .id(widget::Id::new("empty.resume-conversation"))
                         .on_press(Message::ResumeConversation(resume_ui::Action::Open))
                         .into(),
-                    widget::button::standard(format!(
-                        "New terminal · {}",
-                        workspace_widget::shortcut_chords(
+                    crate::interaction::tooltip(
+                        widget::button::standard("New terminal")
+                            .id(widget::Id::new("empty.new-terminal"))
+                            .name("New terminal")
+                            .leading_icon(crate::ui_controls::symbolic_icon(
+                                "utilities-terminal-symbolic",
+                            ))
+                            .on_press(Message::NewTerminal),
+                        workspace_widget::shortcut_tooltip(
                             workspace_widget::GlobalShortcut::NewTerminal,
-                            &self.settings.keyboard_shortcuts
-                        )
-                    ))
-                    .id(widget::Id::new("empty.new-terminal"))
-                    .name("New terminal")
-                    .leading_icon(crate::ui_controls::symbolic_icon(
-                        "utilities-terminal-symbolic",
-                    ))
-                    .on_press(Message::NewTerminal)
+                            &self.settings.keyboard_shortcuts,
+                        ),
+                    )
                     .into(),
                     widget::button::standard(if cfg!(feature = "integrated-browser") {
                         "New browser"
@@ -16029,15 +16283,10 @@ impl Application for Cagents {
         let bar = self
             .status_bar()
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
-        let update = widget::container(
-            self.update_notice(false)
-                .unwrap_or_else(|| widget::Space::new().height(Length::Shrink).into()),
-        );
-        let surface: Element<'_, Message> =
-            widget::column::with_children(vec![update.into(), surface, bar])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+        let surface: Element<'_, Message> = widget::column::with_children(vec![surface, bar])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -16175,6 +16424,9 @@ fn load_project(
     cancellation: CancellationToken,
     kind: Option<ProjectKind>,
 ) -> Result<LoadedRepository, String> {
+    if crate::device::is_remote() {
+        return Err("Use Device files for remote browsing and Git operations".into());
+    }
     let directory = path
         .canonicalize()
         .map_err(|error| format!("could not resolve project {}: {error}", path.display()))?;
@@ -16213,6 +16465,9 @@ fn load_repository(
     project_id: Option<ProjectId>,
     cancellation: CancellationToken,
 ) -> Result<LoadedRepository, String> {
+    if crate::device::is_remote() {
+        return Err("Use Device files for remote browsing and Git operations".into());
+    }
     let service = RepositoryService::system("git");
     // Git discovery and stable worktree identities must see the real checkout,
     // not a spelling introduced by a picker symlink or a relative launch path.
@@ -17886,6 +18141,7 @@ mod tests {
                 projects: Vec::new(),
                 channels,
                 closed_projects: Vec::new(),
+                views: Vec::new(),
                 agents: Vec::new(),
             };
             match frame {
@@ -19650,6 +19906,7 @@ mod tests {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    started_at: None,
                     at: None,
                 }
                 .into(),
@@ -19662,6 +19919,7 @@ mod tests {
                         output: String::new(),
                         status: ToolStatus::Running,
                     },
+                    started_at: None,
                     at: None,
                 }
                 .into(),
@@ -19673,6 +19931,7 @@ mod tests {
                         thinking: false,
                         phase: Phase::Commentary,
                     },
+                    started_at: None,
                     at: None,
                 }
                 .into(),
@@ -22296,6 +22555,7 @@ mod tests {
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
             terminal_crash_notices: HashMap::new(),
+            shared_views: shared_views::State::default(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx: async_channel::unbounded().1,
@@ -22353,6 +22613,7 @@ mod tests {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
             active_workspace: None,

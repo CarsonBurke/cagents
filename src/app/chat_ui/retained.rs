@@ -61,6 +61,13 @@ enum Source<'a> {
     Fresh(Element<'a, Message>),
 }
 
+/// Bracket an exchange so an operation that changes descendant layout can
+/// discard its cached node, including changes made during a layout pass.
+pub(super) enum LayoutInvalidation {
+    Enter,
+    Exit { changed: bool },
+}
+
 struct Retained<'a> {
     source: Source<'a>,
     /// The tree of an element built by `state`, handed to `children`, which
@@ -204,8 +211,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
+        operation.custom(None, layout.bounds(), &mut LayoutInvalidation::Enter);
         let (element, child) = self.parts(tree);
         element.operate(child, layout, renderer, operation);
+        let mut exit = LayoutInvalidation::Exit { changed: false };
+        operation.custom(None, layout.bounds(), &mut exit);
+        if matches!(exit, LayoutInvalidation::Exit { changed: true }) {
+            tree.state.downcast_mut::<Memo>().laid_out = None;
+        }
     }
 
     fn update(

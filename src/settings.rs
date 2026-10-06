@@ -257,6 +257,9 @@ pub struct KeyboardShortcuts {
     pub review_previous_change: Vec<String>,
     pub command_palette: Vec<String>,
     pub new_native_thread: Vec<String>,
+    pub chat_permissions: Vec<String>,
+    pub chat_model: Vec<String>,
+    pub chat_account: Vec<String>,
     pub toggle_inspector: Vec<String>,
     pub open_settings: Vec<String>,
     pub move_pane_left: Vec<String>,
@@ -298,6 +301,9 @@ impl Default for KeyboardShortcuts {
             review_previous_change: vec!["Alt+K".to_owned()],
             command_palette: vec!["Ctrl+Shift+P".to_owned()],
             new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
+            chat_permissions: vec!["Ctrl+Shift+O".to_owned()],
+            chat_model: vec!["Ctrl+Shift+M".to_owned()],
+            chat_account: vec!["Ctrl+Shift+A".to_owned()],
             toggle_inspector: vec!["Ctrl+Shift+I".to_owned()],
             open_settings: vec!["Ctrl+Comma".to_owned()],
             move_pane_left: vec!["Alt+Shift+Left".to_owned()],
@@ -323,7 +329,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 34] {
+    pub fn actions(&self) -> [&Vec<String>; 37] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -343,6 +349,9 @@ impl KeyboardShortcuts {
             &self.review_previous_change,
             &self.command_palette,
             &self.new_native_thread,
+            &self.chat_permissions,
+            &self.chat_model,
+            &self.chat_account,
             &self.toggle_inspector,
             &self.open_settings,
             &self.move_pane_left,
@@ -403,7 +412,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 34] = [
+const SHORTCUT_ACTIONS: [&str; 37] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -422,6 +431,9 @@ const SHORTCUT_ACTIONS: [&str; 34] = [
     "review_previous_change",
     "command_palette",
     "new_native_thread",
+    "chat_permissions",
+    "chat_model",
+    "chat_account",
     "toggle_inspector",
     "open_settings",
     "move_pane_left",
@@ -1335,11 +1347,14 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 29] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 32] = [
     "toggle_projects",
     "rename_pane",
     "command_palette",
     "new_native_thread",
+    "chat_permissions",
+    "chat_model",
+    "chat_account",
     "toggle_inspector",
     "open_settings",
     "move_pane_left",
@@ -3477,6 +3492,26 @@ next_column = ["Alt+W", "Alt+Right"]
                 assert_eq!(load(&path).unwrap(), loaded);
             }
         }
+    }
+
+    #[test]
+    fn introduced_chat_shortcuts_preserve_existing_bindings_and_explicit_unbinding() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+        let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+        shortcuts.remove("chat_account");
+        shortcuts.remove("chat_model");
+        shortcuts.insert("chat_permissions".into(), Vec::<String>::new().into());
+        shortcuts.insert("new_terminal".into(), vec!["Ctrl+Shift+A"].into());
+        fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+A"]);
+        assert!(loaded.keyboard_shortcuts.chat_account.is_empty());
+        assert_eq!(loaded.keyboard_shortcuts.chat_model, ["Ctrl+Shift+M"]);
+        assert!(loaded.keyboard_shortcuts.chat_permissions.is_empty());
+        save(&path, &loaded).unwrap();
+        assert_eq!(load(&path).unwrap(), loaded);
     }
 
     #[test]

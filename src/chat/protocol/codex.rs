@@ -405,6 +405,9 @@ enum Pending {
     Compact,
     Other,
     QueueAdd,
+    /// Removing the named entry, whose answer says whether it left the queue
+    /// undelivered.
+    QueueDelete(String),
     QueueList,
     ChildResume(String),
     ChildRpc {
@@ -737,12 +740,21 @@ impl Codex {
                 break;
             }
             let id = string(entry, "id")?.to_owned();
+            let inputs = array(entry, "input")?;
             let mut parts = Vec::new();
-            for input in array(entry, "input")? {
+            let mut attachments = Vec::new();
+            for input in inputs {
                 parts.push(match input["type"].as_str() {
                     Some("text") => string(input, "text")?.to_owned(),
-                    Some("localImage") => format!("Image attachment: {}", string(input, "path")?),
+                    Some("localImage") => {
+                        attachments.push(chat::Attachment {
+                            path: string(input, "path")?.into(),
+                        });
+                        continue;
+                    }
                     Some("image") => "Image attachment".to_owned(),
+                    // A skill is named in the text it was queued with.
+                    Some("skill") if inputs.iter().any(|input| input["type"] == "text") => continue,
                     Some("skill" | "mention") => format!(
                         "{}: {}",
                         input["type"].as_str().unwrap(),
@@ -752,13 +764,27 @@ impl Codex {
                 });
             }
             let mut message = chat::QueuedMessage::new(id, parts.join("\n"));
-            message.editable = entry["input"].as_array().is_some_and(|input| {
-                input.len() == 1
-                    && input[0]["type"] == "text"
-                    && input[0]["text"]
-                        .as_str()
-                        .is_some_and(|text| text.len() <= 16 * 1024)
-            });
+            // Only what the composer can hold again counts as the whole
+            // message: one text, the skills that text names again when it is
+            // sent, and local images.
+            let texts = inputs
+                .iter()
+                .filter(|input| input["type"] == "text")
+                .collect::<Vec<_>>();
+            let named = texts
+                .first()
+                .and_then(|input| input["text"].as_str())
+                .map(|text| self.named_skills(text))
+                .unwrap_or_default();
+            message.editable &= texts.len() <= 1
+                && inputs.iter().all(|input| match input["type"].as_str() {
+                    Some("text" | "localImage") => true,
+                    Some("skill") => named.iter().any(|(name, path)| {
+                        input["name"].as_str() == Some(name) && input["path"].as_str() == Some(path)
+                    }),
+                    _ => false,
+                });
+            message.attachments = attachments;
             self.queue_listing.push(message);
         }
         if let Some(cursor) = result["nextCursor"].as_str() {
@@ -829,7 +855,6 @@ impl Codex {
             skill_reach: SkillReach::Anywhere,
             branch: self.direct_input,
             queue_remove: self.queue_available && self.direct_input,
-            queue_edit: self.queue_available && self.direct_input,
             queue_start: self.queue_available && self.direct_input,
             ..Capabilities::default()
         }
@@ -1392,17 +1417,12 @@ impl Adapter for Codex {
             }
             operation @ (Command::RemoveQueued { .. } | Command::StartQueued { .. }) => {
                 if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
-                let (method, id) = match operation {
-                    Command::RemoveQueued { id } => ("thread/queue/delete", id),
-                    Command::StartQueued { id } => ("thread/queue/start", id),
+                let (method, id, pending) = match operation {
+                    Command::RemoveQueued { id } => ("thread/queue/delete", id.clone(), Pending::QueueDelete(id)),
+                    Command::StartQueued { id } => ("thread/queue/start", id, Pending::QueueAdd),
                     _ => unreachable!(),
                 };
-                self.call(&mut step, method, json!({"threadId":self.thread,"queuedSubmissionId":id}), Pending::QueueAdd)?;
-            }
-            Command::UpdateQueued { id, text } => {
-                if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
-                let input = self.input(text, vec![])?;
-                self.call(&mut step, "thread/queue/update", json!({"threadId":self.thread,"queuedSubmissionId":id,"input":input}), Pending::QueueAdd)?;
+                self.call(&mut step, method, json!({"threadId":self.thread,"queuedSubmissionId":id}), pending)?;
             }
             Command::SetInterruptMode { .. } => return Err("Codex uses explicit steer and queue operations".into()),
             Command::ListBranches => self.history(&mut step, None)?,
@@ -1535,6 +1555,15 @@ impl Adapter for Codex {
                     // will be.
                     self.models = std::mem::take(&mut self.listing);
                     self.model_events(&mut step);
+                }
+                if let Pending::QueueDelete(id) = &pending {
+                    // Whatever the queue holds now, this entry was not taken
+                    // out of it by the request.
+                    step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                        id: id.clone(),
+                        removed: false,
+                    }));
+                    self.read_queue(&mut step)?;
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 let message = format!(
@@ -1880,6 +1909,13 @@ impl Adapter for Codex {
                 // happened to carry a new one.
                 Pending::Compact => self.reread(&mut step)?,
                 Pending::QueueAdd => self.read_queue(&mut step)?,
+                Pending::QueueDelete(id) => {
+                    step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                        id,
+                        removed: true,
+                    }));
+                    self.read_queue(&mut step)?;
+                }
                 Pending::Fork => {
                     let id = string(&result["thread"], "id")?;
                     if uuid::Uuid::parse_str(id).is_err() || self.thread.as_deref() == Some(id) {
@@ -2331,6 +2367,7 @@ impl Adapter for Codex {
                     output: string(params, "diff")?.into(),
                     status: ToolStatus::Succeeded,
                 },
+                started_at: None,
                 at: None,
             })),
             "turn/plan/updated" => step.events.push(Event::Plan {
@@ -2617,6 +2654,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             thinking,
             phase: Phase::Final,
         },
+        started_at: None,
         at: None,
     };
     // A non-zero exit code is deliberately not a failure here. `grep` with no
@@ -2645,6 +2683,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 output,
                 status,
             },
+            started_at: None,
             at: None,
         }]
     };
@@ -2657,6 +2696,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 thinking: false,
                 phase: message_phase(value),
             },
+            started_at: None,
             at: None,
         }],
         "userMessage" => {
@@ -2681,6 +2721,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                                 .into(),
                             description: "User attachment".into(),
                         },
+                        started_at: None,
                         at: None,
                     }),
                     // A skill or a mention part names what the text beside it
@@ -2730,6 +2771,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     duration_ms: value["durationMs"].as_u64(),
                     output: value["aggregatedOutput"].as_str().unwrap_or("").into(),
                 },
+                started_at: None,
                 at: None,
             }]
         }
@@ -2740,6 +2782,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 changes: file_changes(value)?,
                 status,
             },
+            started_at: None,
             at: None,
         }],
         "mcpToolCall" => images::tool_result(
@@ -2789,6 +2832,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     })
                     .unwrap_or_default(),
             },
+            started_at: None,
             at: None,
         }],
         "functionCallOutput" => tool(
@@ -2803,6 +2847,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 path: string(value, "path")?.into(),
                 description: "Codex image".into(),
             },
+            started_at: None,
             at: None,
         }],
         "imageGeneration" => {
@@ -2830,6 +2875,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     vec![Item {
                         id: id.into(),
                         role: Role::Assistant,
+                        started_at: None,
                         at: None,
                         content: ItemContent::Image {
                             path,
@@ -3225,7 +3271,7 @@ mod tests {
         );
         assert_eq!(page.writes[0]["params"]["cursor"], "page2");
         let last = adapter.receive(json!({"id":page.writes[0]["id"],"result":{"data":[{"id":"q2","input":[{"type":"localImage","path":"/fixture/image.png"}]}],"nextCursor":null}})).unwrap();
-        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[1].text.contains("image.png"))));
+        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into() }])));
         let changed = adapter
             .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
             .unwrap();
@@ -3504,6 +3550,35 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_removal_is_answered_as_removed_or_refused() {
+        for (answer, removed) in [
+            (json!({"result":{}}), true),
+            (
+                json!({"error":{"code":-32000,"message":"already started"}}),
+                false,
+            ),
+        ] {
+            let mut adapter = adapter();
+            let request = adapter
+                .command(Command::RemoveQueued { id: "q1".into() })
+                .unwrap();
+            let mut frame = answer;
+            frame["id"] = request.writes[0]["id"].clone();
+            let step = adapter.receive(frame).unwrap();
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::QueueRemoval(removal) if removal.id == "q1" && removal.removed == removed
+            )));
+            // Either way the listing is read again rather than assumed.
+            assert!(
+                step.writes
+                    .iter()
+                    .any(|write| write["method"] == "thread/queue/list")
+            );
+        }
+    }
+
+    #[test]
     fn queue_mutations_and_forks_use_exact_provider_identifiers() {
         let mut adapter = adapter();
         for (command, method) in [
@@ -3518,13 +3593,6 @@ mod tests {
                     id: "queue-exact".into(),
                 },
                 "thread/queue/start",
-            ),
-            (
-                Command::UpdateQueued {
-                    id: "queue-exact".into(),
-                    text: "edited".into(),
-                },
-                "thread/queue/update",
             ),
         ] {
             let request = adapter.command(command).unwrap();

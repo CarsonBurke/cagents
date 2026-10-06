@@ -87,7 +87,7 @@ pub fn validate_window_slot(slot: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn runtime_directory() -> io::Result<PathBuf> {
+pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
     let path = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -181,6 +181,15 @@ pub struct WindowLease {
 impl WindowLease {
     pub fn acquire(new_window: bool, requested: Option<&str>) -> io::Result<Self> {
         let (lease, slot) = Self::acquire_in(&runtime_directory()?, new_window, requested)?;
+        let mut identity = owned_lock(
+            &runtime_directory()?.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
+            libc::LOCK_EX,
+        )?;
+        identity.0.set_len(0)?;
+        if let Some(device) = crate::device::selected() {
+            identity.0.write_all(device.name.as_bytes())?;
+        }
+        identity.0.sync_all()?;
         WINDOW_SLOT
             .set(slot)
             .map_err(|_| io::Error::other("window slot already initialized"))?;
@@ -961,6 +970,28 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
     launch_window_at(&executable, new_window, slot, source)
 }
 
+fn window_device_identity(
+    runtime: &Path,
+    slot: &str,
+    devices: &[crate::device::Device],
+) -> io::Result<Option<String>> {
+    if !slot.starts_with("device-") {
+        return Ok(None);
+    }
+    let mut identity = owned_lock(
+        &runtime.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
+        libc::LOCK_SH,
+    )?;
+    let mut name = String::new();
+    (&mut identity.0).take(64).read_to_string(&mut name)?;
+    if !devices.iter().any(|device| device.name == name) {
+        return Err(io::Error::other(format!(
+            "device profile for window {slot} is unavailable"
+        )));
+    }
+    Ok(Some(name))
+}
+
 fn launch_window_at(
     executable: &Path,
     new_window: bool,
@@ -974,6 +1005,13 @@ fn launch_window_at(
         validate_window_slot(source)?;
     }
     let mut command = process::Command::new(executable);
+    let device_name = match slot {
+        Some(slot) => window_device_identity(&runtime_directory()?, slot, &crate::device::list()?)?,
+        None => crate::device::selected().map(|device| device.name.clone()),
+    };
+    if let Some(name) = device_name {
+        command.args(["--device", &name, "--device-window-scoped"]);
+    }
     if new_window {
         command.arg("--new-window");
     }
@@ -1770,6 +1808,36 @@ mod tests {
         // It remains open, but must no longer hold the abandoned shared lock.
         assert!(inherited.is_some());
         assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
+    fn device_window_relaunch_retains_target_and_missing_identity_fails_closed() {
+        let runtime = tempdir().unwrap();
+        let device = crate::device::Device {
+            name: "fw16".into(),
+            host: "fw16".into(),
+            executable: "cagents".into(),
+        };
+        let slot = crate::device::scoped_window_slot("fw16", "primary");
+        assert!(
+            window_device_identity(runtime.path(), &slot, std::slice::from_ref(&device)).is_err()
+        );
+        fs::write(
+            runtime
+                .path()
+                .join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
+            "fw16",
+        )
+        .unwrap();
+        assert_eq!(
+            window_device_identity(runtime.path(), &slot, std::slice::from_ref(&device)).unwrap(),
+            Some("fw16".into())
+        );
+        assert!(window_device_identity(runtime.path(), &slot, &[]).is_err());
+        assert_eq!(
+            window_device_identity(runtime.path(), "fw16-primary", &[device]).unwrap(),
+            None
+        );
     }
 
     #[test]
