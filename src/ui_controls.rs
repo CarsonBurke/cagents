@@ -799,7 +799,36 @@ pub fn activity_spinner_tone<'a, Message: Clone + 'a>(
 }
 
 fn spinner<'a, Message: Clone + 'a>(size: f32, tone: crate::design::Tone) -> Element<'a, Message> {
-    Element::new(ActivitySpinner { size, tone })
+    Element::new(ActivitySpinner {
+        size,
+        tone,
+        handle: spinner_handle(size),
+    })
+}
+
+fn spinner_handle(size: f32) -> cosmic::iced::advanced::svg::Handle {
+    use cosmic::iced::advanced::svg::Handle;
+    use std::sync::LazyLock;
+
+    // These are the shell's indicator sizes. Stable handles keep rasterized
+    // SVGs shared between rows and frames without a growing geometry cache.
+    const SIZES: [f32; 5] = [12.0, 14.0, 16.0, 20.0, 24.0];
+    static HANDLES: LazyLock<[Handle; 5]> = LazyLock::new(|| SIZES.map(spinner_svg));
+    SIZES
+        .iter()
+        .position(|candidate| *candidate == size)
+        .map_or_else(|| spinner_svg(size), |index| HANDLES[index].clone())
+}
+
+fn spinner_svg(size: f32) -> cosmic::iced::advanced::svg::Handle {
+    let stroke = (size / 12.0).max(2.0);
+    let radius = (size - stroke) / 2.0;
+    let center = size / 2.0;
+    let right = center + radius;
+    let top = center - radius;
+    cosmic::iced::advanced::svg::Handle::from_memory(format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}"><path d="M{right} {center}A{radius} {radius} 0 1 1 {center} {top}" fill="none" stroke="black" stroke-width="{stroke}" stroke-linecap="round"/></svg>"#
+    ).into_bytes())
 }
 
 /// An arc of fixed span turning at a fixed rate.
@@ -811,6 +840,7 @@ fn spinner<'a, Message: Clone + 'a>(size: f32, tone: crate::design::Tone) -> Ele
 struct ActivitySpinner {
     size: f32,
     tone: crate::design::Tone,
+    handle: cosmic::iced::advanced::svg::Handle,
 }
 
 #[derive(Default)]
@@ -887,61 +917,31 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         viewport: &cosmic::iced::Rectangle,
     ) {
         use cosmic::iced::advanced::Renderer as _;
-        use cosmic::iced::advanced::graphics::geometry::Renderer as _;
-        use cosmic::widget::canvas;
+        use cosmic::iced::advanced::svg::{Renderer as _, Svg};
 
         let bounds = layout.bounds();
-        // Offscreen columns can remain mounted. Limit geometry to the same
-        // viewport that schedules animation frames.
         let Some(clip) = bounds.intersection(viewport) else {
             return;
         };
         if bounds.width < 1.0 || bounds.height < 1.0 {
             return;
         }
-        // The stroke and radius are the pinned indicator's, so replacing the
-        // animation does not resize any indicator already on screen.
-        let bar_height = (bounds.width / 12.0).max(2.0);
-        let radius = (bounds.width - bar_height) / 2.0;
-        if radius <= 0.0 {
-            return;
-        }
-
         let state = tree.state.downcast_ref::<SpinnerState>();
-        let (start, end) = spinner_arc(state.elapsed);
-        let mut frame = canvas::Frame::new(&*renderer, bounds.size());
-        let mut builder = canvas::path::Builder::new();
-        builder.arc(canvas::path::Arc {
-            center: frame.center(),
-            radius,
-            start_angle: cosmic::iced::Radians(start),
-            end_angle: cosmic::iced::Radians(end),
-        });
-        // Canvas meshes carry their own clipping bounds. Clip the geometry as
-        // well as the renderer layer so both native rendering backends respect
-        // a partially visible indicator.
-        frame.with_clip(
-            cosmic::iced::Rectangle {
-                x: clip.x - bounds.x,
-                y: clip.y - bounds.y,
-                ..clip
-            },
-            |frame| {
-                frame.stroke(
-                    &builder.build(),
-                    canvas::Stroke::default()
-                        .with_color(self.tone.resolve(theme))
-                        .with_width(bar_height)
-                        .with_line_cap(canvas::LineCap::Round),
-                );
-            },
-        );
-        let geometry = frame.into_geometry();
-
+        let (start, _) = spinner_arc(state.elapsed);
+        let color = self.tone.resolve(theme);
+        // Rotate a stable SVG through the image pipeline. Dynamic canvas
+        // meshes in the pinned WGPU renderer retained arcs after their panes
+        // unmounted; sharing one icon per size also avoids retessellation on
+        // every animation frame. Keep the original phase, sweep and stroke.
         renderer.with_layer(clip, |renderer| {
-            renderer.with_translation(cosmic::iced::Vector::new(bounds.x, bounds.y), |renderer| {
-                renderer.draw_geometry(geometry);
-            });
+            renderer.draw_svg(
+                Svg::new(self.handle.clone())
+                    .color(cosmic::iced::Color { a: 1.0, ..color })
+                    .opacity(color.a)
+                    .rotation(cosmic::iced::Radians(start)),
+                bounds,
+                clip,
+            );
         });
     }
 }
@@ -1688,10 +1688,11 @@ mod tests {
         let theme = cosmic::Theme::default();
         let extent = Rectangle::with_size(Size::new(64.0, 64.0));
         let element: Element<'_, ()> = spinner(24.0, crate::design::Tone::Fixed(Color::WHITE));
-        let tree = Tree::new(element.as_widget());
+        let mut tree = Tree::new(element.as_widget());
         let node = layout::Node::new(Size::new(24.0, 24.0)).move_to(Point::new(8.0, 8.0));
         let size = Size::new(64, 64);
-        let mut draw = |viewport: Rectangle| {
+        let mut draw = |viewport: Rectangle, elapsed: Duration| {
+            tree.state.downcast_mut::<SpinnerState>().elapsed = elapsed;
             renderer.reset(extent);
             element.as_widget().draw(
                 &tree,
@@ -1710,18 +1711,24 @@ mod tests {
                 .filter(|pixel| pixel[..3] != [0, 0, 0])
                 .count()
         };
-        assert!(painted(&draw(extent)) > 0, "the visible spinner must paint");
+        let initial = draw(extent, Duration::ZERO);
+        assert!(painted(&initial) > 0, "the visible spinner must paint");
+        assert_ne!(
+            initial,
+            draw(extent, crate::design::SPINNER_PERIOD / 2),
+            "the visible spinner must rotate between frames"
+        );
 
         // The old pane is still mounted at its previous on-screen position,
         // but its viewport no longer includes it after navigation.
         let hidden = Rectangle::new(Point::new(40.0, 0.0), Size::new(24.0, 64.0));
         assert_eq!(
-            painted(&draw(hidden)),
+            painted(&draw(hidden, Duration::ZERO)),
             0,
             "a hidden pane leaked a frozen arc"
         );
         let clipped = Rectangle::new(Point::new(20.0, 0.0), Size::new(44.0, 64.0));
-        let pixels = draw(clipped);
+        let pixels = draw(clipped, Duration::ZERO);
         assert!(painted(&pixels) > 0, "the visible portion must still paint");
         for y in 0..64 {
             for x in 0..20 {
