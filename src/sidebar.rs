@@ -8316,19 +8316,21 @@ fn changes_footer<'a>(
         });
     }
 
-    let mut commit = button::custom(design::caption(if state.amend_commit {
+    let commit_label = if state.amend_commit {
         "Amend commit"
     } else {
         "Commit"
-    }))
-    .class(crate::ui_controls::control_style(can_commit, None))
-    .name("Commit (Ctrl+Enter)")
-    .id(chrome.commit_id.clone())
-    .padding([0, 8])
-    .height(PANEL_ROW_HEIGHT);
-    if can_commit {
-        commit = commit.on_press(commit_action);
-    }
+    };
+    let commit = crate::interaction::tooltip(
+        button::suggested(commit_label)
+            .leading_icon(crate::ui_controls::symbolic_icon("vcs-commit-symbolic"))
+            .name(format!("{commit_label} (Ctrl+Enter)"))
+            .id(chrome.commit_id.clone())
+            .padding([0, 8])
+            .height(design::PRIMARY_CONTROL_SIZE)
+            .on_press_maybe(can_commit.then_some(commit_action)),
+        format!("{commit_label} (Ctrl+Enter)"),
+    );
 
     column = column.push(commit_input);
     let amend = widget::checkbox(state.amend_commit)
@@ -8356,41 +8358,58 @@ fn changes_footer<'a>(
     buttons = buttons.push(commit);
     match (&source.branch, &source.upstream) {
         (Some(branch), Some(target)) => {
-            let push_label = match &source.tracking {
+            let counts = match &source.tracking {
                 TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
-                    format!("Push ↑{ahead} · ↓{behind}")
+                    Some(format!("↑{ahead} ↓{behind}"))
                 }
-                TrackingState::Compared { ahead, .. } if *ahead > 0 => format!("Push ↑{ahead}"),
-                _ => "Push".to_owned(),
+                TrackingState::Compared { ahead, .. } if *ahead > 0 => Some(format!("↑{ahead}")),
+                _ => None,
             };
-            let mut push = button::custom(design::caption(push_label))
-                .class(crate::ui_controls::control_style(false, None))
-                .id(chrome.push_id.clone())
-                .padding([0, 8])
-                .height(PANEL_ROW_HEIGHT);
-            if source.can_push() && !modal_open {
-                push = push.on_press(SidebarAction::Push {
+            let detail = counts
+                .as_ref()
+                .map_or_else(String::new, |counts| format!(" · {counts}"));
+            let push = crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon("vcs-push-symbolic"),
+                format!(
+                    "Push {} to {}{detail}",
+                    branch.as_str(),
+                    target
+                        .remote_side_ref()
+                        .map(|reference| format!("{}:{}", target.remote(), reference.as_str()))
+                        .unwrap_or_else(|_| target.remote().to_owned())
+                ),
+                false,
+                source.can_push() && !modal_open,
+                Some(SidebarAction::Push {
                     key: key.clone(),
                     branch: branch.clone(),
                     target: target.clone(),
-                });
+                }),
+            )
+            .id(chrome.push_id.clone());
+            let mut upload = widget::row::with_children(vec![push.into()])
+                .spacing(design::GRID_UNIT)
+                .align_y(cosmic::iced::Alignment::Center);
+            if let Some(counts) = counts {
+                upload = upload.push(design::caption(counts));
             }
-            buttons = buttons.push(push);
+            buttons = buttons.push(upload);
         }
         (Some(branch), None) if !source.upstream_reported() => {
-            let mut publish = button::custom(design::caption("Publish branch"))
-                .class(crate::ui_controls::control_style(false, None))
-                .id(chrome.push_id.clone())
-                .padding([0, 8])
-                .height(PANEL_ROW_HEIGHT);
-            if source.can_publish() && !modal_open {
-                publish = publish.on_press(SidebarAction::OpenPublish {
-                    key: key.clone(),
-                    branch: branch.clone(),
-                    remotes: source.remotes.clone(),
-                });
-            }
-            buttons = buttons.push(publish);
+            buttons = buttons.push(
+                crate::ui_controls::icon_control(
+                    crate::ui_controls::symbolic_icon("vcs-push-symbolic"),
+                    format!("Publish {}… Choose a remote and upstream", branch.as_str()),
+                    false,
+                    source.can_publish() && !modal_open,
+                    Some(SidebarAction::OpenPublish {
+                        key: key.clone(),
+                        branch: branch.clone(),
+                        remotes: source.remotes.clone(),
+                    }),
+                )
+                .id(chrome.push_id.clone()),
+            );
         }
         (Some(_), None) => {
             // `git status` reported an upstream this panel could not name, so

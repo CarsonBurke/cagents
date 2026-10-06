@@ -28,6 +28,9 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
 /// into a solid disc. Static handles retain renderer cache identity.
 fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     use std::sync::LazyLock;
+    static PUSH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 11V2M4.5 5.5 8 2l3.5 3.5M2 10v3.5h12V10"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     static BRANCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1A3.5 3.5 0 0 1 8.5 9H4"/></g></svg>"#.as_slice()).symbolic(true)
     });
@@ -209,6 +212,7 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     let icon: &LazyLock<widget::icon::Handle> = match name {
         "git-branch-symbolic" => &BRANCH,
         "vcs-commit-symbolic" => &COMMIT,
+        "vcs-push-symbolic" => &PUSH,
         "edit-find-symbolic" | "system-search-symbolic" => &SEARCH,
         "document-edit-symbolic" => &CHANGES,
         "text-editor-symbolic" => &EDIT,
