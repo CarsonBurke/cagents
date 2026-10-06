@@ -984,7 +984,7 @@ impl Cagents {
                 ),
                 widget::text_input("Directory", &state.path)
                     .on_input(|value| Message::Device(Action::Path(value)))
-                    .on_submit(Message::Device(Action::Browse))
+                    .on_submit(|_| Message::Device(Action::Browse))
                     .width(Length::Fill)
                     .into(),
                 icon(
@@ -1009,6 +1009,10 @@ impl Cagents {
         {
             rows.push(crate::interaction::tooltip(
                 design::caption(format!("Current: {}", state.directory.display()))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        EllipsizeHeightLimit::Lines(1),
+                    ))
                     .width(Length::Fill),
                 format!(
                     "File and Git operations use {} until navigation succeeds",
@@ -1031,6 +1035,7 @@ impl Cagents {
                 } else {
                     &state.output
                 })
+                .font(iced::Font::MONOSPACE)
                 .width(Length::Fill),
             )
             .height(height)
@@ -1039,7 +1044,7 @@ impl Cagents {
         };
         let body: Element<'_, Message> = match state.panel {
             Panel::Files => {
-                let files = state
+                let files: Vec<Element<'_, Message>> = state
                     .entries
                     .iter()
                     .map(|entry| {
@@ -1062,7 +1067,13 @@ impl Cagents {
                                 widget::icon(crate::ui_controls::symbolic_icon(glyph))
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
-                                design::body(&entry.name).width(Length::Fill).into(),
+                                design::body(&entry.name)
+                                    .wrapping(iced::widget::text::Wrapping::None)
+                                    .ellipsize(iced::widget::text::Ellipsize::End(
+                                        EllipsizeHeightLimit::Lines(1),
+                                    ))
+                                    .width(Length::Fill)
+                                    .into(),
                             ])
                             .spacing(8)
                             .align_y(Alignment::Center),
@@ -1694,6 +1705,36 @@ mod tests {
             matches!(&app.device_ui.pending, Some(Operation::Write { path, expected, content, .. })
             if path == &PathBuf::from("first") && expected == "original" && content == "unsaved draft")
         );
+    }
+
+    #[test]
+    fn derived_stage_path_follows_selection_but_keeps_an_explicit_path_within_its_root() {
+        let mut app = loaded_file();
+        drop(app.update_device(Action::DiscardChanges));
+        drop(app.update_device(Action::Read("second".into())));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("second content".into())),
+        }));
+        assert_eq!(app.device_ui.pathspec, "second");
+        drop(app.update_device(Action::Pathspec("explicit".into())));
+        drop(app.update_device(Action::Read("third".into())));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("third content".into())),
+        }));
+        assert_eq!(app.device_ui.pathspec, "explicit");
+        app.device_ui.path = "/another/project".into();
+        drop(app.update_device(Action::Browse));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Directory {
+                path: "/another/project".into(),
+                entries: Vec::new(),
+            }),
+        }));
+        assert!(app.device_ui.pathspec.is_empty());
+        assert!(app.device_ui.pathspec_auto);
     }
 
     #[test]

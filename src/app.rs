@@ -15995,7 +15995,7 @@ impl Application for Cagents {
                 })
                 .into(),
                 crate::interaction::tooltip(
-                    design::caption(display_path(&directory))
+                    design::caption(display_path(&directory).into_owned())
                         .wrapping(iced::widget::text::Wrapping::None)
                         .ellipsize(iced::widget::text::Ellipsize::End(
                             EllipsizeHeightLimit::Lines(1),
@@ -16025,7 +16025,7 @@ impl Application for Cagents {
                                     control
                                 })
                             })
-                            .collect(),
+                            .collect::<Vec<_>>(),
                     )
                     .spacing(12)
                     .into(),
