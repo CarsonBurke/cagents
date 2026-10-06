@@ -112,16 +112,19 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         if settings.is_empty() {
             return None;
         }
-        let mut children = vec![
-            widget::column::with_children(vec![
-                widget::text::title4(self.title).into(),
+        let mut heading: Vec<Element<'a, Message>> = vec![widget::text::title4(self.title).into()];
+        if !self.detail.is_empty() {
+            heading.push(
                 design::caption(self.detail)
                     .wrapping(iced::widget::text::Wrapping::Word)
                     .width(Length::Fill)
                     .into(),
-            ])
-            .spacing(design::GRID_UNIT)
-            .into(),
+            );
+        }
+        let mut children = vec![
+            widget::column::with_children(heading)
+                .spacing(design::GRID_UNIT)
+                .into(),
         ];
         children.append(&mut settings);
         Some(

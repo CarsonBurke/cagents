@@ -892,7 +892,7 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Use the keyboard control to record a shortcut. Conflicts appear before saving.",
+            "",
             vec![
                 shortcut_input(
                     "Toggle Projects sidebar",
