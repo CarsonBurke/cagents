@@ -8,28 +8,34 @@ impl Cagents {
         source: Option<CardId>,
         target: &str,
     ) -> Task<Message> {
-        if crate::device::is_remote()
-            && !Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-        {
-            return self.update_device(super::device_ui::Action::Open);
-        }
         if source.is_some_and(|card| self.workspace.card(card).is_none()) {
             return Task::none();
         }
-        let document = source.and_then(|card| match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime
-                .selected_path()
-                .map(|path| runtime.descriptor.worktree.join(path)),
-            Some(CardRuntime::Chat(runtime)) => Some(
-                runtime
-                    .session
-                    .launch
-                    .recipe
-                    .working_directory
-                    .join(".chat"),
-            ),
-            _ => None,
-        });
+        let document = source
+            .and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime
+                    .selected_path()
+                    .map(|path| runtime.descriptor.worktree.join(path)),
+                Some(CardRuntime::Chat(runtime)) => Some(
+                    runtime
+                        .session
+                        .launch
+                        .recipe
+                        .working_directory
+                        .join(".chat"),
+                ),
+                _ => None,
+            })
+            .or_else(|| {
+                if !crate::device::is_remote() {
+                    return None;
+                }
+                source
+                    .and_then(|card| self.card_state(card))
+                    .and_then(|card| self.card_worktree(card))
+                    .or(self.active_workspace.as_deref())
+                    .map(|directory| directory.join(".link"))
+            });
         // Chat paths use the conversation's working directory; document
         // paths use the open file's directory. Explicit file URLs work in both.
         let (target, position) = document_link::file_position(target);
@@ -43,7 +49,17 @@ impl Cagents {
         };
         match resolved {
             Ok(DocumentLink::Local { path, fragment }) => {
-                self.open_local_file(source, path, position.or(fragment))
+                if crate::device::is_remote() && path.as_os_str().as_encoded_bytes().ends_with(b"/")
+                {
+                    self.update_device(super::device_ui::Action::OpenAt(path))
+                } else if crate::device::is_remote() {
+                    self.update_device(super::device_ui::Action::OpenFile {
+                        path,
+                        fragment: position.or(fragment),
+                    })
+                } else {
+                    self.open_local_file(source, path, position.or(fragment))
+                }
             }
             Ok(DocumentLink::External(url)) => self.open_clicked_link(url),
             Err(error) => {

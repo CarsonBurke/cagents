@@ -12351,26 +12351,7 @@ impl Application for Cagents {
                     ));
                     return Task::none();
                 }
-                Message::Sidebar(action)
-                    if !matches!(
-                        action,
-                        SidebarAction::ScrollProjects(_)
-                            | SidebarAction::NavigateRow { .. }
-                            | SidebarAction::OpenChannel { .. }
-                            | SidebarAction::SelectRows { .. }
-                            | SidebarAction::ClearRowSelection
-                            | SidebarAction::OpenRepository { .. }
-                            | SidebarAction::OpenWorktree { .. }
-                            | SidebarAction::Refresh
-                            | SidebarAction::RefreshProject { .. }
-                            | SidebarAction::ToggleProjects
-                            | SidebarAction::ToggleProject(_)
-                            | SidebarAction::DragWindow
-                            | SidebarAction::MaximizeWindow
-                            | SidebarAction::WindowMenu
-                            | SidebarAction::OpenSettings
-                    ) =>
-                {
+                Message::Sidebar(action) if !device_ui::supports_sidebar_action(action) => {
                     return self.update_device(device_ui::Action::Open);
                 }
                 _ => {}
@@ -15985,9 +15966,20 @@ impl Application for Cagents {
                     .width(Length::Fill)
                     .into()
             } else {
-                widget::row::with_children(action_buttons())
-                    .spacing(spacing.space_xxs)
-                    .into()
+                // The welcome card is narrower than the window. Keep conversation
+                // and tool actions on separate rows so every action fits its card.
+                let mut conversations = action_buttons();
+                let tools = conversations.split_off(2);
+                widget::column::with_children(vec![
+                    widget::row::with_children(conversations)
+                        .spacing(spacing.space_xxs)
+                        .into(),
+                    widget::row::with_children(tools)
+                        .spacing(spacing.space_xxs)
+                        .into(),
+                ])
+                .spacing(spacing.space_xxs)
+                .into()
             };
             let surface = widget::container(
                 widget::column::with_children(vec![
