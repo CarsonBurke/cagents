@@ -133,10 +133,20 @@ enum Pending {
     Save,
     Mutate,
     History { append: bool },
+    RefreshAutomation,
     RefreshHistory,
     HistoryRun { index: usize },
     Run,
     OpenRun,
+}
+
+impl Pending {
+    fn background_read(self) -> bool {
+        matches!(
+            self,
+            Self::RefreshAutomation | Self::RefreshHistory | Self::HistoryRun { .. }
+        )
+    }
 }
 
 struct Confirmation {
@@ -548,7 +558,7 @@ impl State {
         self.sequence = self.sequence.wrapping_add(1);
         self.pending = Some((self.sequence, pending));
         self.error = None;
-        if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
+        if matches!(pending, Pending::History { .. }) {
             self.history_status = HistoryStatus::Loading;
         }
         Some(Effect::Request {
@@ -751,8 +761,13 @@ impl State {
             self.history_next = None;
             return self.request(Pending::Run, Request::ShowRun { run });
         }
-        if self.pending.is_some() {
-            return None;
+        if let Some((_, pending)) = self.pending {
+            if !pending.background_read() || matches!(action, Action::Tick) {
+                return None;
+            }
+            // User input owns the next request. Its sequence (or no pending
+            // request) fences off the superseded read's eventual response.
+            self.pending = None;
         }
         if matches!(action, Action::Tick) {
             if self.draft.is_some() || self.confirmation.is_some() {
@@ -762,7 +777,10 @@ impl State {
                 return self.request(Pending::Run, Request::ShowFiring { id: run.firing.id });
             }
             if let Some(automation) = &self.selected {
-                return self.request(Pending::Show, Request::Show { id: automation.id });
+                return self.request(
+                    Pending::RefreshAutomation,
+                    Request::Show { id: automation.id },
+                );
             }
             if self.all_history {
                 return self.request(
@@ -1102,7 +1120,9 @@ impl State {
     }
 
     fn view_layout(&self, width: f32) -> Element<'_, Action> {
-        let busy = self.pending.is_some();
+        let busy = self
+            .pending
+            .is_some_and(|(_, pending)| !pending.background_read());
         let mut listing: Vec<Element<'_, Action>> = Vec::new();
         let mut content = widget::column::with_children(vec![
             widget::text::title3("Automations").into(),
@@ -2104,6 +2124,100 @@ mod tests {
             skip: None,
             diagnostic: None,
         }
+    }
+
+    #[test]
+    fn user_navigation_supersedes_background_history_without_accepting_its_late_reply() {
+        use crate::automations::{FiringState, HistoryPage};
+        let selected = automation();
+        let old_run = history_firing(100, FiringState::Running);
+        let mut state = State {
+            selected: Some(selected.clone()),
+            history: vec![old_run.clone()],
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence: show, .. }) = state.update(Action::Tick) else {
+            panic!("background definition poll");
+        };
+        assert!(state.pending.unwrap().1.background_read());
+        assert!(
+            state.update(Action::Tick).is_none(),
+            "ticks coalesce while a read is pending"
+        );
+        let Some(Effect::Request {
+            sequence: history, ..
+        }) = state.update(Action::Received {
+            sequence: show,
+            result: std::sync::Arc::new(Ok(Response::Automation(selected))),
+        })
+        else {
+            panic!("background history poll");
+        };
+        assert_eq!(
+            state.history_status,
+            HistoryStatus::Loaded,
+            "cached history remains usable while polling"
+        );
+        let Some(Effect::Request {
+            sequence: detail, ..
+        }) = state.update(Action::Received {
+            sequence: history,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![old_run.clone()],
+                next: None,
+            }))),
+        })
+        else {
+            panic!("active row poll");
+        };
+        let next = Uuid::new_v4();
+        let Some(Effect::Request {
+            sequence: selection,
+            request,
+        }) = state.update(Action::Select(next))
+        else {
+            panic!("user selection interrupts polling");
+        };
+        assert!(matches!(request, Request::Show { id } if id == next));
+        assert!(selection > detail);
+        assert!(
+            !state.pending.unwrap().1.background_read(),
+            "foreground loads retain their guard"
+        );
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence: detail,
+                    result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                        definition: automation().definition,
+                        firing: old_run,
+                        agent: None,
+                        run: None
+                    })))
+                })
+                .is_none()
+        );
+        assert!(state.selected.is_none());
+        assert!(state.history.is_empty());
+        assert_eq!(state.pending.unwrap().0, selection);
+    }
+
+    #[test]
+    fn editing_supersedes_a_background_poll_but_not_an_in_flight_save() {
+        let mut state = State {
+            selected: Some(automation()),
+            ..Default::default()
+        };
+        state.update(Action::Tick);
+        state.update(Action::Edit);
+        assert!(state.draft.is_some());
+        assert!(state.pending.is_none());
+        let draft = state.draft.as_ref().unwrap().name.clone();
+        state.pending = Some((99, Pending::Save));
+        assert!(state.update(Action::Select(Uuid::new_v4())).is_none());
+        assert_eq!(state.draft.as_ref().unwrap().name, draft);
+        assert!(matches!(state.pending, Some((99, Pending::Save))));
     }
 
     #[test]
