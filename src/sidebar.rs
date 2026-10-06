@@ -7312,6 +7312,13 @@ fn files_section<'a>(
             (visible, hidden, notice)
         }
     };
+    let page = if flat {
+        0
+    } else {
+        state
+            .files_page
+            .min(hidden.saturating_sub(1) / MAX_VISIBLE_FILE_ROWS)
+    };
     let mut rows = widget::column::with_capacity(visible.len()).spacing(0);
     for row in visible {
         let chrome = &row.chrome;
@@ -7339,16 +7346,12 @@ fn files_section<'a>(
         );
         let identity = panel_row(
             &*chrome.accessible_name,
-            if flat || state.files_page > 0 {
-                0
-            } else {
-                row.depth
-            },
+            if flat || page > 0 { 0 } else { row.depth },
             widget::row::with_children(vec![
                 widget::container(file_icon)
                     .center_x(Length::Fixed(ROW_ICON_WIDTH))
                     .into(),
-                design::body(if flat || state.files_page > 0 {
+                design::body(if flat || page > 0 {
                     row.path.display()
                 } else {
                     Cow::Borrowed(&*chrome.label)
