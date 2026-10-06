@@ -11,6 +11,9 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
+#[cfg(test)]
+use crate::file_manager::open_system_url_with_opener;
+use crate::file_manager::{self, open_system_url};
 mod file_ui;
 mod git_ui;
 mod history_ui;
@@ -4027,6 +4030,7 @@ pub enum Message {
     PreviewLocalFile(CardId),
     OpenTerminalOutput(CardId),
     ExternalLinkOpened(Result<(), String>),
+    FileRevealed(Result<file_manager::RevealOutcome, String>),
     NewBrowser,
     ExternalUrlOpened(Result<(), String>),
     #[cfg(feature = "integrated-browser")]
@@ -4227,6 +4231,7 @@ struct PendingPanelOpen {
     card: CardId,
     /// Worktree-relative, exactly as the card's own file list names paths.
     path: PathBuf,
+    ignored: bool,
 }
 
 struct DirtyRepositoryClose {
@@ -4804,50 +4809,6 @@ pub struct Cagents {
     status: Option<TransientNotice>,
 }
 
-async fn open_system_url(url: Url) -> Result<(), String> {
-    let portal_result = async {
-        let request = ashpd::desktop::open_uri::OpenFileRequest::default()
-            .send_uri(&url)
-            .await
-            .map_err(|error| error.to_string())?;
-        request.response().map_err(|error| error.to_string())
-    }
-    .await;
-    match portal_result {
-        Ok(()) => Ok(()),
-        // Portal diagnostics are also intentionally omitted: they are an
-        // external error boundary and may include the URI supplied above.
-        Err(_) => open_system_url_with_opener(&url, tokio::process::Command::new("xdg-open")).await,
-    }
-}
-
-async fn open_system_url_with_opener(
-    url: &Url,
-    mut opener: tokio::process::Command,
-) -> Result<(), String> {
-    let presented = SanitizedLocation::from(url);
-    let result = opener
-        .arg(url.as_str())
-        .stdin(Stdio::null())
-        // An opener can echo its argument in diagnostics. The authoritative
-        // URL may contain credentials, query data, or a fragment, so neither
-        // child stream may inherit cagents' presentation or logging streams.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "desktop portal could not open {presented}; system opener exited with {status}"
-        )),
-        Err(error) => Err(format!(
-            "desktop portal could not open {presented}; system opener could not be started: {error}"
-        )),
-    }
-}
-
 impl Cagents {
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
         let mut settings_warnings = Vec::new();
@@ -5241,25 +5202,10 @@ impl Cagents {
                     );
                 }
                 CardKind::Repository(view) => {
-                    let mut runtime = self.repository_runtime(view);
-                    runtime.set_auto_save(self.settings.editor_auto_save);
-                    runtime.set_editor_font(
-                        crate::terminal::monospace_font(self.settings.editor_font_family()),
-                        self.settings.editor_font_size(),
-                    );
-                    runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                    drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-                    runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-                    repository_tasks.push(repository_task(runtime.initial_load(card.id)));
-                    self.cards
-                        .insert(card.id, CardRuntime::Repository(Box::new(runtime)));
+                    repository_tasks.push(self.attach_repository_pane(card.id, view));
                 }
                 CardKind::PullRequests(view) => {
-                    let pane = self.pull_request_pane(&view);
-                    self.cards
-                        .insert(card.id, CardRuntime::PullRequests(Box::new(pane)));
-                    repository_tasks.push(self.open_pending_pull_request(card.id));
+                    repository_tasks.push(self.attach_pull_request_pane(card.id, view));
                 }
                 kind @ (CardKind::Settings | CardKind::Accounts | CardKind::Automations) => {
                     if let Some(state) = self.card_state_mut(card.id) {
@@ -5862,28 +5808,8 @@ impl Cagents {
             CardKind::Browser(_) => self.retry_card(id),
             #[cfg(not(feature = "integrated-browser"))]
             CardKind::Browser(_) => unreachable!("browserless clones open externally"),
-            CardKind::Repository(view) => {
-                let mut runtime = self.repository_runtime(view);
-                runtime.set_auto_save(self.settings.editor_auto_save);
-                runtime.set_editor_font(
-                    crate::terminal::monospace_font(self.settings.editor_font_family()),
-                    self.settings.editor_font_size(),
-                );
-                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-                runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-                let load = repository_task(runtime.initial_load(id));
-                self.cards
-                    .insert(id, CardRuntime::Repository(Box::new(runtime)));
-                load
-            }
-            CardKind::PullRequests(view) => {
-                let pane = self.pull_request_pane(&view);
-                self.cards
-                    .insert(id, CardRuntime::PullRequests(Box::new(pane)));
-                self.open_pending_pull_request(id)
-            }
+            CardKind::Repository(view) => self.attach_repository_pane(id, view),
+            CardKind::PullRequests(view) => self.attach_pull_request_pane(id, view),
             CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes are refused before cloning")
             }
@@ -6631,8 +6557,17 @@ impl Cagents {
             .into()
     }
 
-    fn repository_runtime(&self, view: RepositoryView) -> RepositoryRuntime {
-        if self
+    /// Repository panes have no engine surface to hydrate. Start their reads
+    /// when attached, including when a shared descriptor replaces a local one.
+    fn attach_repository_pane(&mut self, card: CardId, view: RepositoryView) -> Task<Message> {
+        if crate::device::is_remote() {
+            self.cards.insert(
+                card,
+                CardRuntime::Failed("File viewing is unavailable on remote devices.".into()),
+            );
+            return Task::none();
+        }
+        let mut runtime = if self
             .sidebar_model
             .project(view.project)
             .is_some_and(|project| project.kind == ProjectKind::Folder)
@@ -6640,7 +6575,40 @@ impl Cagents {
             RepositoryRuntime::new_directory(view)
         } else {
             RepositoryRuntime::new(view)
+        };
+        runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_font(
+            crate::terminal::monospace_font(self.settings.editor_font_family()),
+            self.settings.editor_font_size(),
+        );
+        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_external_editors(self.sidebar_model.external_editors.clone());
+        let load = repository_task(runtime.initial_load(card));
+        self.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        load
+    }
+
+    fn attach_pull_request_pane(
+        &mut self,
+        card: CardId,
+        view: crate::model::PullRequestView,
+    ) -> Task<Message> {
+        if crate::device::is_remote() {
+            self.cards.insert(
+                card,
+                CardRuntime::Failed(
+                    "Pull request viewing is unavailable on remote devices.".into(),
+                ),
+            );
+            return Task::none();
         }
+        let pane = self.pull_request_pane(&view);
+        self.cards
+            .insert(card, CardRuntime::PullRequests(Box::new(pane)));
+        self.open_pending_pull_request(card)
     }
 
     fn folder_scope(&self, key: &ActiveWorktreeKey) -> bool {
@@ -6686,19 +6654,7 @@ impl Cagents {
         durable.cards.push(card);
         durable.focused = Some(card_id);
         self.register_channel_card(card_id);
-        let mut runtime = self.repository_runtime(view);
-        runtime.set_auto_save(self.settings.editor_auto_save);
-        runtime.set_editor_font(
-            crate::terminal::monospace_font(self.settings.editor_font_family()),
-            self.settings.editor_font_size(),
-        );
-        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-        drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-        runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-        let load = repository_task(runtime.initial_load(card_id));
-        self.cards
-            .insert(card_id, CardRuntime::Repository(Box::new(runtime)));
+        let load = self.attach_repository_pane(card_id, view);
         let index = self.workspace.cards().len();
         let update = self
             .workspace
@@ -7606,28 +7562,8 @@ impl Cagents {
             CardKind::Browser(_) => {
                 unreachable!("browserless retries return before mutating durable state")
             }
-            CardKind::Repository(view) => {
-                let mut runtime = self.repository_runtime(view);
-                runtime.set_auto_save(self.settings.editor_auto_save);
-                runtime.set_editor_font(
-                    crate::terminal::monospace_font(self.settings.editor_font_family()),
-                    self.settings.editor_font_size(),
-                );
-                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
-                runtime.set_external_editors(self.sidebar_model.external_editors.clone());
-                let task = repository_task(runtime.initial_load(card));
-                self.cards
-                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
-                task
-            }
-            CardKind::PullRequests(view) => {
-                let pane = self.pull_request_pane(&view);
-                self.cards
-                    .insert(card, CardRuntime::PullRequests(Box::new(pane)));
-                self.open_pending_pull_request(card)
-            }
+            CardKind::Repository(view) => self.attach_repository_pane(card, view),
+            CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
             CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
             CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes return before a retry registers them")
@@ -9613,10 +9549,25 @@ impl Cagents {
         } else {
             Task::none()
         };
+        let ignored = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key == *key)
+            .is_some_and(|source| {
+                source
+                    .files
+                    .iter()
+                    .any(|row| row.path == *path && row.ignored)
+            });
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
-                self.pending_panel_open = Some(PendingPanelOpen { card, path });
+                self.pending_panel_open = Some(PendingPanelOpen {
+                    card,
+                    path,
+                    ignored,
+                });
                 let focus = self
                     .workspace
                     .focus(card)
@@ -9639,7 +9590,11 @@ impl Cagents {
                     key.canonical_path.clone(),
                 );
                 if let Some(card) = self.repository_card_for(&key.canonical_path) {
-                    self.pending_panel_open = Some(PendingPanelOpen { card, path });
+                    self.pending_panel_open = Some(PendingPanelOpen {
+                        card,
+                        path,
+                        ignored,
+                    });
                 }
                 task
             }
@@ -10268,10 +10223,18 @@ impl Cagents {
             .pending_panel_open
             .take()
             .expect("the pending open was just matched");
-        cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
-            card,
-            path: open.path,
-        }))
+        let action = if open.ignored {
+            let Ok(path) = RepoPath::parse(&open.path) else {
+                return Task::none();
+            };
+            RepositoryAction::OpenFileFromBrowser { card, path }
+        } else {
+            RepositoryAction::OpenFile {
+                card,
+                path: open.path,
+            }
+        };
+        cosmic::task::message(Message::Repository(action))
     }
 
     /// True when this result still describes the worktree the panel is bound
@@ -10348,11 +10311,40 @@ impl Cagents {
             untracked_changes,
             untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
         };
+        let browse_files = self.context_tab == ContextTab::Files;
+        let previous_errors = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key == key)
+            .map(|source| source.ignored_directory_errors.clone())
+            .unwrap_or_default();
+        let expanded = self
+            .sidebar_state
+            .expanded_directory_paths()
+            .cloned()
+            .collect::<Vec<_>>();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
+                let service = RepositoryService::system("git");
+                let mut snapshot = service
                     .snapshot_with_options(&worktree, options, &cancellation)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                if browse_files {
+                    let ignored = service
+                        .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
+                        .map_err(|error| error.to_string())?;
+                    snapshot.files.ignored = ignored.ignored;
+                    snapshot.files.ignored_directories = ignored.ignored_directories;
+                    repository_widget::expand_ignored_directories(
+                        &worktree,
+                        &mut snapshot.files,
+                        &expanded,
+                        &previous_errors,
+                        &cancellation,
+                    )?;
+                }
+                Ok(snapshot)
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
@@ -12590,6 +12582,18 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::FileRevealed(result) => {
+                self.status = Some(match result {
+                    Ok(file_manager::RevealOutcome::Selected) => {
+                        TransientNotice::success("Revealed in file manager")
+                    }
+                    Ok(file_manager::RevealOutcome::OpenedContainingFolder) => {
+                        TransientNotice::success("Opened containing folder in file manager")
+                    }
+                    Err(error) => TransientNotice::error(error),
+                });
+                Task::none()
+            }
             Message::OpenRepository => cosmic::task::future(async {
                 let dialog = file_chooser::open::Dialog::new().title("Open project folder");
                 let result = dialog
@@ -13177,7 +13181,10 @@ impl Application for Cagents {
                 // A parked source-control navigation is answered by the very
                 // file list it is waiting on, and only after the card has taken
                 // that list.
-                let files_loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
+                let files_loaded = match &action {
+                    RepositoryAction::FilesLoaded { identity, .. } => Some(identity.clone()),
+                    _ => None,
+                };
                 let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
                 let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => runtime
@@ -13237,7 +13244,13 @@ impl Application for Cagents {
                     state.kind = CardKind::Repository(view);
                     self.persist();
                 }
-                if files_loaded {
+                // A queued refresh discards this result and advances the list
+                // generation. Keep navigation parked until its replacement
+                // lands, rather than opening a file without its Git status.
+                if files_loaded.as_ref().is_some_and(|identity| {
+                    identity.path == Path::new(".")
+                        && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.accepts_file_list(identity))
+                }) {
                     tasks.push(self.flush_pending_panel_open(card));
                 }
                 if saved
@@ -13565,6 +13578,12 @@ impl Application for Cagents {
                         Task::none()
                     }
                     SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
+                    SidebarAction::ToggleDirectory { key, path } if self.sidebar_model.source_control.as_ref().is_some_and(|source| source.files.iter().any(|row| row.path == path && row.ignored)) => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            source.ignored_directory_errors.remove(&path);
+                        }
+                        self.reload_source_control(&key)
+                    }
                     SidebarAction::ToggleDirectory { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. } if self.folder_scope(&key) => {
                         self.reload_source_control(&key)
@@ -13597,7 +13616,14 @@ impl Application for Cagents {
                             Task::none()
                         }
                     }
-                    SidebarAction::RefreshWorktree { key } => self.reload_source_control(&key),
+                    SidebarAction::RefreshWorktree { key } => {
+                        if self.source_control_is_bound(&key) {
+                            if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                                source.ignored_directory_errors.clear();
+                            }
+                        }
+                        self.reload_source_control(&key)
+                    },
                     SidebarAction::OpenFile { key, path } => {
                         self.route_panel_open(&key, &path)
                     }
@@ -13712,6 +13738,21 @@ impl Application for Cagents {
                     // commands are pure clipboard work that a worktree browser
                     // needs regardless of file management.
                     SidebarAction::FileCommand { key, path, command } => match command {
+                        sidebar::FileCommand::RevealInFileManager => {
+                            if crate::device::is_remote() {
+                                self.status = Some(TransientNotice::warning(
+                                    "Remote files cannot be revealed in the local file manager",
+                                ));
+                                return Task::none();
+                            }
+                            if !self.source_control_is_bound(&key) {
+                                return Task::none();
+                            }
+                            let path = key.canonical_path.join(path.as_path());
+                            cosmic::task::future(async move {
+                                Message::FileRevealed(file_manager::reveal(&path).await)
+                            })
+                        }
                         sidebar::FileCommand::CopyPath => iced::clipboard::write(
                             key.canonical_path.join(path.as_path()).display().to_string(),
                         )
@@ -19589,6 +19630,63 @@ mod tests {
     }
 
     #[test]
+    fn pending_browser_navigation_waits_for_the_queued_file_list_refresh() {
+        for ignored in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let card = CardId::new();
+            let worktree = PathBuf::from("/repo");
+            let mut runtime = RepositoryRuntime::file_list_fixture(
+                RepositoryView {
+                    project: ProjectId::new(),
+                    repository: worktree.clone(),
+                    worktree: worktree.clone(),
+                    selected_file: None,
+                },
+                &["tracked.rs"],
+            );
+            drop(runtime.initial_load(card));
+            drop(runtime.update(RepositoryAction::RefreshFiles { card }));
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            let pending = PendingPanelOpen {
+                card,
+                path: PathBuf::from("tracked.rs"),
+                ignored,
+            };
+            app.pending_panel_open = Some(pending.clone());
+            let completion = |generation| {
+                Message::Repository(RepositoryAction::FilesLoaded {
+                    identity: repository_widget::AsyncIdentity {
+                        card,
+                        worktree: worktree.clone(),
+                        path: PathBuf::from("."),
+                        generation,
+                    },
+                    result: Ok(vec![repository_widget::RepositoryFile {
+                        path: PathBuf::from("tracked.rs"),
+                        staged: true,
+                        ..Default::default()
+                    }]),
+                })
+            };
+            drop(app.update(completion(0)));
+            assert_eq!(app.pending_panel_open.as_ref(), Some(&pending));
+            drop(app.update(completion(1)));
+            assert_eq!(
+                app.pending_panel_open.as_ref(),
+                Some(&pending),
+                "the queued refresh must finish before browser navigation"
+            );
+            drop(app.update(completion(2)));
+            assert!(app.pending_panel_open.is_none());
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!();
+            };
+            assert!(runtime.listed_files()[0].staged);
+        }
+    }
+
+    #[test]
     fn modal_rejects_editor_input_but_accepts_async_repository_completions() {
         let card = CardId::new();
         assert!(repository_action_allowed_while_modal(
@@ -22964,14 +23062,19 @@ mod tests {
         let key = app.sidebar_model.worktree_at(&root).unwrap();
         assert!(app.sidebar_model.contains_worktree(&key));
         assert_eq!(key.project_id, project);
-        assert!(
-            app.repository_runtime(RepositoryView {
+        let card = CardId::new();
+        drop(app.attach_repository_pane(
+            card,
+            RepositoryView {
                 selected_file: None,
                 project,
                 repository: root.clone(),
                 worktree: root.clone(),
-            })
-            .is_directory_only()
+            },
+        ));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_directory_only())
         );
         drop(app.update(Message::SelectContextTab(ContextTab::Changes)));
         assert_eq!(app.context_tab, ContextTab::Files);

@@ -41,6 +41,8 @@ pub mod external_editor;
 pub mod file_drop;
 #[cfg(feature = "ui")]
 pub mod file_icon;
+#[cfg(feature = "ui")]
+pub mod file_manager;
 pub mod fs_safety;
 #[cfg(feature = "ui")]
 pub(crate) mod git_watch;
