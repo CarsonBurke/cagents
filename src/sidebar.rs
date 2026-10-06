@@ -4337,21 +4337,21 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
         match state.filter {
             SidebarFilter::All => (
                 "folder-open-symbolic",
-                "No projects yet",
+                "No projects",
                 "Open a folder to add a project.",
                 "Open folder",
                 SidebarAction::OpenRepositoryPicker,
             ),
             SidebarFilter::Attention => (
                 "emblem-ok-symbolic",
-                "No unread agent updates",
+                "No unread updates",
                 "No panes currently need your attention.",
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
             SidebarFilter::PullRequests => (
                 "pull-request-symbolic",
-                "No pull requests found",
+                "No pull requests",
                 "Open a repository or change the current filter.",
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
@@ -4367,24 +4367,28 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
         );
     }
     let spacing = cosmic::theme::spacing();
-    let action = gated(action, modal_open);
-    let action_button: Element<'static, SidebarAction> = button::standard(action_label)
-        .class(sidebar_button_style(false))
-        .id(stable_id("empty.action"))
-        .on_press_maybe(action)
-        .into();
+    let action_icon = if searching {
+        "edit-clear-symbolic"
+    } else if state.filter == SidebarFilter::All {
+        "folder-open-symbolic"
+    } else {
+        "view-list-tree-symbolic"
+    };
+    let action_button = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon(action_icon),
+        format!("{action_label} · {detail}"),
+        false,
+        !modal_open,
+        Some(action),
+    )
+    .id(stable_id("empty.action"));
     widget::container(
-        widget::column::with_children(vec![
-            widget::icon(crate::ui_controls::symbolic_icon(icon_name))
-                .size(STATUS_ICON_SIZE)
-                .into(),
-            design::heading(title).into(),
-            design::caption(detail)
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .into(),
-            action_button,
+        widget::row::with_children(vec![
+            design::caption(title).width(Length::Fill).into(),
+            action_button.into(),
         ])
-        .spacing(spacing.space_xxs),
+        .spacing(spacing.space_xxs)
+        .align_y(Alignment::Center),
     )
     .padding(spacing.space_xs)
     .width(Length::Fill)
