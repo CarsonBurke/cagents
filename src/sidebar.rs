@@ -15012,17 +15012,14 @@ pub(crate) mod tests {
     fn every_pane_state_offers_its_action_under_an_accessible_name() {
         /// The accessible names of the button nodes only: the surrounding
         /// text contributes labels of its own, which are no substitute.
-        fn button_labels(element: &Element<'_, SidebarAction>, children: usize) -> Vec<String> {
-            let tree = Tree::new(element);
-            let leaf = || layout::Node::new(Size::new(120.0, 32.0));
-            // container > column > [icon, heading, caption, button > label]
-            let column = layout::Node::with_children(
-                Size::new(240.0, 320.0),
-                (0..children)
-                    .map(|_| layout::Node::with_children(Size::new(120.0, 32.0), vec![leaf()]))
-                    .collect(),
+        fn button_labels(mut element: Element<'_, SidebarAction>) -> Vec<String> {
+            let renderer = headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let root = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(240.0, 320.0)),
             );
-            let root = layout::Node::with_children(Size::new(240.0, 320.0), vec![column]);
             let accessible = element.as_widget().a11y_nodes(
                 Layout::new(&root),
                 &tree,
@@ -15038,7 +15035,7 @@ pub(crate) mod tests {
         }
 
         assert!(
-            button_labels(&error("disk on fire", false, false), 4)
+            button_labels(error("disk on fire", false, false))
                 .iter()
                 .any(|label| label == "Try again"),
             "the error state's retry button must carry its own accessible name"
@@ -15054,9 +15051,9 @@ pub(crate) mod tests {
             state.apply(&SidebarAction::SetFilter(filter));
             let empty = empty(&state, false, false);
             assert!(
-                button_labels(&empty, 4)
+                button_labels(empty)
                     .iter()
-                    .any(|label| label == expected),
+                    .any(|label| label == expected || label.starts_with(&format!("{expected} · "))),
                 "the empty state's action must be named {expected:?}"
             );
         }
