@@ -88,16 +88,32 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
     // Explicit permission outranks arithmetic: the server says whether
     // ordinary usage is allowed, and clients are told not to infer it back
     // from percentages.
-    limited |= result["ordinaryUsageAllowed"].as_bool() == Some(false);
-    let status = status_for(&windows, limited, false);
+    let ordinary_usage_allowed = result["ordinaryUsageAllowed"].as_bool();
+    let status = permission_status(&windows, ordinary_usage_allowed, limited);
     UsageSnapshot {
         windows,
         credits,
         status,
+        ordinary_usage_allowed,
         observed_at,
         source: UsageSource::Probe,
         plan,
         detail: None,
+    }
+}
+
+fn permission_status(
+    windows: &[UsageWindow],
+    ordinary_usage_allowed: Option<bool>,
+    limited: bool,
+) -> UsageStatus {
+    match ordinary_usage_allowed {
+        Some(false) => UsageStatus::Limited,
+        Some(true) => match status_for(windows, false, false) {
+            UsageStatus::Limited => UsageStatus::Warning,
+            status => status,
+        },
+        None => status_for(windows, limited, false),
     }
 }
 
@@ -136,8 +152,16 @@ pub fn parse_update(params: &Value) -> Option<LimitsUpdate> {
 }
 
 /// Folds a rate-limit update into a snapshot: only what it names replaces
-/// what was known.
-pub fn merge_update(snapshot: &mut UsageSnapshot, update: LimitsUpdate, observed_at: u64) {
+/// what was known. Returns whether it renews account-wide eligibility evidence.
+/// Percentages cannot renew an explicit permission from an older probe.
+pub fn merge_update(snapshot: &mut UsageSnapshot, update: LimitsUpdate, observed_at: u64) -> bool {
+    let account_limits_changed = update.limited
+        || update
+            .windows
+            .iter()
+            .any(|window| window.key.starts_with("codex:"));
+    let eligibility_observed =
+        update.limited || (account_limits_changed && snapshot.ordinary_usage_allowed.is_none());
     for window in update.windows {
         match snapshot
             .windows
@@ -154,11 +178,28 @@ pub fn merge_update(snapshot: &mut UsageSnapshot, update: LimitsUpdate, observed
     if let Some(plan) = update.plan {
         snapshot.plan = Some(plan);
     }
-    snapshot.observed_at = snapshot.observed_at.max(observed_at);
+    if eligibility_observed {
+        snapshot.observed_at = snapshot.observed_at.max(observed_at);
+    }
     snapshot.source = UsageSource::Live;
     snapshot.detail = None;
-    snapshot.status = UsageStatus::Ok;
-    snapshot.refresh_status(update.limited, false);
+    if account_limits_changed {
+        if update.limited {
+            snapshot.ordinary_usage_allowed = Some(false);
+        }
+        snapshot.status = permission_status(
+            &snapshot.windows,
+            snapshot.ordinary_usage_allowed,
+            update.limited,
+        );
+    } else if snapshot.status == UsageStatus::Ok
+        && status_for(&snapshot.windows, false, false) == UsageStatus::Warning
+    {
+        // A scoped allowance can warn without changing the backend's latest
+        // permission for ordinary usage. Credits alone prove no recovery.
+        snapshot.status = UsageStatus::Warning;
+    }
+    eligibility_observed
 }
 
 /// The login an `account/updated` notification reports.
@@ -410,6 +451,21 @@ mod tests {
         assert_eq!(usage.status, UsageStatus::Limited);
     }
 
+    #[test]
+    fn backend_permission_keeps_exhausted_windows_usable() {
+        let usage = parse_rate_limits(
+            &json!({"ordinaryUsageAllowed": true, "rateLimits": {
+                "primary": {"usedPercent": 100, "windowDurationMins": 300},
+                "rateLimitReachedType": "rate_limit_reached",
+            }}),
+            1_000,
+        );
+        assert_eq!(usage.status, UsageStatus::Warning);
+        assert_eq!(usage.windows[0].used, 1.0);
+        assert!(super::super::routing::available(&usage, 1_000));
+        assert!(!super::super::routing::needs_alternate(&usage, 1_000));
+    }
+
     /// A sparse update moves only what it names: the weekly window and the
     /// other bucket keep their probed figures.
     #[test]
@@ -422,13 +478,127 @@ mod tests {
         assert!((usage.windows[1].used - 0.81).abs() < 1e-6, "weekly kept");
         assert!(usage.credits.is_some(), "credits kept");
         assert_eq!(usage.source, UsageSource::Live);
-        assert_eq!(usage.observed_at, 9);
+        assert_eq!(usage.observed_at, 3);
         assert_eq!(parse_update(&json!({"rateLimits": null})), None);
         assert_eq!(
             parse_update(&json!({"rateLimits": {"primary": null, "secondary": null}})),
             None,
             "an update naming nothing states nothing"
         );
+    }
+
+    #[test]
+    fn unrelated_updates_preserve_backend_permission_for_ordinary_usage() {
+        for (allowed, used, expected) in [
+            (false, 10, UsageStatus::Limited),
+            (true, 100, UsageStatus::Warning),
+        ] {
+            for bucket in [
+                json!({"limitId": "codex_bengalfox", "primary": {
+                    "usedPercent": 20, "windowDurationMins": 300,
+                }}),
+                json!({"credits": {"hasCredits": true, "unlimited": false, "balance": "12.50"}}),
+            ] {
+                let mut usage = parse_rate_limits(
+                    &json!({"ordinaryUsageAllowed": allowed, "rateLimits": {
+                        "primary": {"usedPercent": used, "windowDurationMins": 300},
+                    }}),
+                    1_000,
+                );
+                let update = parse_update(&json!({"rateLimits": bucket})).unwrap();
+                assert!(
+                    super::super::LiveReport::CodexLimits(update).apply(&mut usage, 1_001, 1_001)
+                );
+                assert_eq!(usage.status, expected);
+                assert_eq!(usage.observed_at, 1_000);
+                assert_eq!(
+                    super::super::routing::needs_alternate(&usage, 1_001),
+                    !allowed
+                );
+                assert_eq!(super::super::routing::available(&usage, 1_001), allowed);
+                let stale = 1_000 + super::super::schedule::DISPLAY_STALE_AFTER + 1;
+                let update = parse_update(&json!({"rateLimits": {
+                    "limitId": "codex_bengalfox",
+                    "primary": {"usedPercent": 40, "windowDurationMins": 300},
+                }}))
+                .unwrap();
+                assert!(
+                    super::super::LiveReport::CodexLimits(update).apply(&mut usage, stale, stale)
+                );
+                assert!(!super::super::routing::needs_alternate(&usage, stale));
+                assert!(!super::super::routing::available(&usage, stale));
+            }
+        }
+    }
+
+    #[test]
+    fn default_window_updates_preserve_permission_until_explicit_backend_evidence() {
+        for (allowed, used, expected) in [
+            (false, 10, UsageStatus::Limited),
+            (true, 100, UsageStatus::Warning),
+        ] {
+            let probe = parse_rate_limits(
+                &json!({"ordinaryUsageAllowed": allowed, "rateLimits": {
+                    "primary": {"usedPercent": used, "windowDurationMins": 300},
+                }}),
+                1_000,
+            );
+            // Cached/device snapshots retain permission across a JSON round trip.
+            let mut usage: UsageSnapshot =
+                serde_json::from_value(serde_json::to_value(&probe).unwrap()).unwrap();
+            let update = parse_update(&json!({"rateLimits": {
+                "primary": {"usedPercent": used, "windowDurationMins": 300},
+            }}))
+            .unwrap();
+            assert!(!merge_update(&mut usage, update, 1_001));
+            assert_eq!(usage.status, expected);
+            assert_eq!(usage.ordinary_usage_allowed, Some(allowed));
+            assert_eq!(super::super::routing::available(&usage, 1_001), allowed);
+            assert_eq!(usage.observed_at, 1_000);
+            let stale = 1_000 + super::super::schedule::DISPLAY_STALE_AFTER + 1;
+            let update = parse_update(&json!({"rateLimits": {
+                "primary": {"usedPercent": used, "windowDurationMins": 300},
+            }}))
+            .unwrap();
+            assert!(super::super::LiveReport::CodexLimits(update).apply(&mut usage, stale, stale));
+            assert_eq!(usage.observed_at, 1_000);
+            assert!(!super::super::routing::needs_alternate(&usage, stale));
+            assert!(!super::super::routing::available(&usage, stale));
+
+            let rejection = parse_update(&json!({"rateLimits": {
+                "rateLimitReachedType": "rate_limit_reached",
+            }}))
+            .unwrap();
+            assert!(merge_update(&mut usage, rejection, 1_002));
+            assert_eq!(usage.status, UsageStatus::Limited);
+            assert_eq!(usage.ordinary_usage_allowed, Some(false));
+        }
+    }
+
+    #[test]
+    fn legacy_snapshots_without_permission_still_infer_default_window_status() {
+        let mut value = serde_json::to_value(parse_rate_limits(
+            &json!({"rateLimits": {"primary": {
+                "usedPercent": 10, "windowDurationMins": 300,
+            }}}),
+            1_000,
+        ))
+        .unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("ordinary_usage_allowed")
+                .is_none()
+        );
+        let mut usage: UsageSnapshot = serde_json::from_value(value).unwrap();
+        let update = parse_update(&json!({"rateLimits": {
+            "primary": {"usedPercent": 100, "windowDurationMins": 300},
+        }}))
+        .unwrap();
+        assert!(merge_update(&mut usage, update, 1_001));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert_eq!(usage.ordinary_usage_allowed, None);
     }
 
     /// A login report is a reason to ask again only when it contradicts

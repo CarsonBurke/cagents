@@ -192,6 +192,12 @@ impl Schedule {
         self.retry_at = None;
     }
 
+    /// Keep watching a running sign-in without bypassing backoff earned by
+    /// a failed verification while its browser handoff is in progress.
+    pub fn extend_login_watch(&mut self, now: Millis) {
+        self.awaiting_login_until = Some(now.saturating_add(LOGIN_WATCH));
+    }
+
     /// The account answered as signed in, so the watch is over.
     pub fn login_settled(&mut self) {
         self.awaiting_login_until = None;
@@ -373,5 +379,18 @@ mod tests {
         schedule.await_login(T0);
         schedule.login_settled();
         assert!(!schedule.should_probe(Trigger::Focus, T0 + LOGIN_RETURN, true));
+    }
+
+    #[test]
+    fn running_sign_in_extends_polling_without_retrying_failed_verification_early() {
+        let mut schedule = Schedule::default();
+        schedule.await_login(T0);
+        schedule.start(Trigger::Tick, T0);
+        schedule.fail(T0);
+        schedule.extend_login_watch(T0 + 10_000);
+        assert!(!schedule.should_probe(Trigger::Tick, T0 + backoff(1) - 1, true));
+        assert!(schedule.should_probe(Trigger::Tick, T0 + backoff(1), true));
+        assert!(schedule.awaiting_login(T0 + LOGIN_WATCH));
+        assert!(!schedule.awaiting_login(T0 + LOGIN_WATCH + 10_000));
     }
 }

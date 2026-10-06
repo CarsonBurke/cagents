@@ -89,6 +89,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         windows,
         credits,
         status,
+        ordinary_usage_allowed: None,
         observed_at,
         source: UsageSource::Probe,
         plan,
@@ -344,8 +345,9 @@ pub struct LiveUpdate {
 ///
 /// `unifiedWindows` holds fractions of each window, which can run past one,
 /// with Unix-second resets. The event is absent for API-key, Bedrock and
-/// Vertex sessions and until the first response carrying the headers, so an
-/// event with no windows is `None`, not an empty account.
+/// Vertex sessions and until the first response carrying the headers.
+/// A rejection still carries authoritative exhaustion evidence when the
+/// optional windows are absent. An empty allowed event cannot refresh quota.
 pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
     let unified = &info["unifiedWindows"];
     let mut windows = Vec::new();
@@ -380,15 +382,54 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
             binding: false,
         });
     }
-    if windows.is_empty() {
-        return None;
-    }
     let status = match info["status"].as_str() {
         Some("rejected") => Some(UsageStatus::Limited),
         Some("allowed_warning") => Some(UsageStatus::Warning),
         Some("allowed") => Some(UsageStatus::Ok),
         _ => None,
     };
+    if windows.is_empty()
+        && let Some(used) = info["utilization"]
+            .as_f64()
+            .filter(|value| value.is_finite())
+        && let Some((key, kind, label, span_secs)) = match info["rateLimitType"].as_str() {
+            Some("five_hour") => Some((SESSION, WindowKind::Session, "Session", FIVE_HOURS)),
+            Some("seven_day") => Some((WEEKLY, WindowKind::Weekly, "Weekly", SEVEN_DAYS)),
+            Some("seven_day_overage_included") => Some((
+                "weekly_overage",
+                WindowKind::Other,
+                "Weekly incl. extra usage",
+                SEVEN_DAYS,
+            )),
+            _ => None,
+        }
+    {
+        windows.push(UsageWindow {
+            key: key.to_owned(),
+            kind,
+            label: label.to_owned(),
+            used: super::fraction(used),
+            resets_at: info["resetsAt"].as_i64(),
+            span_secs: Some(span_secs),
+            binding: true,
+        });
+    }
+    // A model-specific rejection does not exhaust the whole account. When
+    // only that scope is reported, wait for an account-wide quota report.
+    if windows.is_empty()
+        && info["rateLimitType"].as_str().is_some_and(|kind| {
+            !kind.is_empty()
+                && !matches!(
+                    kind,
+                    "five_hour" | "seven_day" | "seven_day_overage_included"
+                )
+        })
+    {
+        return None;
+    }
+    if windows.is_empty() && status != Some(UsageStatus::Limited) {
+        return None;
+    }
     Some(LiveUpdate { windows, status })
 }
 
@@ -602,6 +643,50 @@ mod tests {
         );
         assert_eq!(update.status, Some(UsageStatus::Warning));
         assert_eq!(parse_rate_limit_event(&json!({"status": "allowed"})), None);
+    }
+
+    #[test]
+    fn a_rejection_without_optional_windows_authorizes_routing() {
+        let now = 1_000;
+        let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", now);
+        let rejection = parse_rate_limit_event(&json!({"status": "rejected"})).unwrap();
+        assert!(rejection.windows.is_empty());
+        merge_live(&mut usage, rejection, now);
+        assert!(super::super::routing::needs_alternate(&usage, now));
+        assert!(!super::super::routing::available(&usage, now));
+        assert_eq!(parse_rate_limit_event(&json!({"status": "allowed"})), None);
+    }
+
+    #[test]
+    fn a_scoped_rejection_without_account_windows_does_not_exhaust_the_account() {
+        for scope in ["seven_day_opus", "seven_day_sonnet", "future_model_limit"] {
+            assert_eq!(
+                parse_rate_limit_event(&json!({
+                    "status": "rejected", "rateLimitType": scope, "utilization": 1.0,
+                })),
+                None,
+                "a rejection for {scope} cannot authorize account-wide rotation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_top_level_window_supplies_usage_and_reset_without_unified_windows() {
+        let update = parse_rate_limit_event(&json!({
+            "status": "rejected",
+            "rateLimitType": "five_hour",
+            "utilization": 1.04,
+            "resetsAt": 20,
+        }))
+        .unwrap();
+        assert_eq!(update.windows.len(), 1);
+        assert_eq!(update.windows[0].key, SESSION);
+        assert_eq!(update.windows[0].used, 1.04);
+        assert_eq!(update.windows[0].resets_at, Some(20));
+        let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", 10_000);
+        merge_live(&mut usage, update, 10_000);
+        assert!(super::super::routing::needs_alternate(&usage, 19_999));
+        assert!(!super::super::routing::needs_alternate(&usage, 20_000));
     }
 
     #[test]

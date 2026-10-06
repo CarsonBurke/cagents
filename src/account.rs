@@ -725,6 +725,10 @@ pub struct UsageSnapshot {
     pub windows: Vec<UsageWindow>,
     pub credits: Option<Credits>,
     pub status: UsageStatus,
+    /// Latest explicit backend permission for ordinary Codex usage. Sparse
+    /// window notifications do not replace this account-wide evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_usage_allowed: Option<bool>,
     /// Unix milliseconds at which these figures were observed.
     pub observed_at: u64,
     pub source: UsageSource,
@@ -741,6 +745,7 @@ impl UsageSnapshot {
             windows: Vec::new(),
             credits: None,
             status,
+            ordinary_usage_allowed: None,
             observed_at,
             source: UsageSource::Probe,
             plan: None,
@@ -814,11 +819,17 @@ impl LiveReport {
             return false;
         }
         match self {
-            Self::Claude(update) => claude::merge_live(current, update, observed_at),
-            Self::CodexLimits(update) => codex::merge_update(current, update, observed_at),
+            Self::Claude(update) => {
+                claude::merge_live(current, update, observed_at);
+                current.observed_at = observed_at;
+            }
+            Self::CodexLimits(update) => {
+                if codex::merge_update(current, update, observed_at) {
+                    current.observed_at = observed_at;
+                }
+            }
             Self::CodexLogin(_) => return false,
         }
-        current.observed_at = observed_at;
         true
     }
 }
@@ -1102,6 +1113,7 @@ mod tests {
             windows,
             credits: None,
             status: UsageStatus::Ok,
+            ordinary_usage_allowed: None,
             observed_at: 0,
             source: UsageSource::Probe,
             plan: None,
@@ -1479,6 +1491,7 @@ mod tests {
             windows: vec![window("five_hour", WindowKind::Session, 0.1, None)],
             credits: None,
             status: UsageStatus::Ok,
+            ordinary_usage_allowed: None,
             observed_at,
             source: UsageSource::Probe,
             plan: Some("max".into()),

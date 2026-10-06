@@ -1134,6 +1134,17 @@ fn menu<'a>(
             )
             .into(),
         );
+        if account.account.provider == Provider::Codex && !crate::device::is_remote() {
+            items.push(
+                crate::ui_controls::popover_item(
+                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
+                    "Sign in again with a code",
+                    "Use a one-time code to sign in to this account without a local browser callback",
+                    action(Action::SignInWithCode(id.clone())),
+                )
+                .into(),
+            );
+        }
         items.push(
             crate::ui_controls::popover_item(
                 crate::ui_controls::symbolic_icon("document-edit-symbolic"),
