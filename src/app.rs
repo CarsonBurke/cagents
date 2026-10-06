@@ -22992,14 +22992,19 @@ mod tests {
         let key = app.sidebar_model.worktree_at(&root).unwrap();
         assert!(app.sidebar_model.contains_worktree(&key));
         assert_eq!(key.project_id, project);
-        assert!(
-            app.repository_runtime(RepositoryView {
+        let card = CardId::new();
+        drop(app.attach_repository_pane(
+            card,
+            RepositoryView {
                 selected_file: None,
                 project,
                 repository: root.clone(),
                 worktree: root.clone(),
-            })
-            .is_directory_only()
+            },
+        ));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_directory_only())
         );
         drop(app.update(Message::SelectContextTab(ContextTab::Changes)));
         assert_eq!(app.context_tab, ContextTab::Files);
