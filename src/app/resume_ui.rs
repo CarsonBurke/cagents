@@ -321,7 +321,10 @@ impl iced::advanced::widget::Operation<Message> for RevealSelection {
         let y =
             resume_selection_offset(self.selected, bounds.height, content.height, translation.y);
         state.scroll_to(
-            iced::advanced::widget::operation::scrollable::AbsoluteOffset { x: None, y: Some(y) },
+            iced::advanced::widget::operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
         );
     }
 }

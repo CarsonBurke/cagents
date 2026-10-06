@@ -37,11 +37,14 @@ mod tests {
         let id = app.workspace.focused().unwrap();
         let original = app.card_state(id).unwrap().title.clone();
         for draft in ["", "   ", "\t\n"] {
-            for target in [RenameTarget::Pane(id), RenameTarget::Channel(crate::model::ChannelId::new())] {
-            app.chrome_ui.rename = Some((target, draft.into()));
-            drop(app.update_chrome(Action::RenameSubmit));
-            assert_eq!(app.chrome_ui.rename.as_ref().unwrap().1, draft);
-            assert_eq!(app.card_state(id).unwrap().title, original);
+            for target in [
+                RenameTarget::Pane(id),
+                RenameTarget::Channel(crate::model::ChannelId::new()),
+            ] {
+                app.chrome_ui.rename = Some((target, draft.into()));
+                drop(app.update_chrome(Action::RenameSubmit));
+                assert_eq!(app.chrome_ui.rename.as_ref().unwrap().1, draft);
+                assert_eq!(app.card_state(id).unwrap().title, original);
             }
         }
         app.chrome_ui.rename = Some((RenameTarget::Pane(id), original));
@@ -1495,11 +1498,17 @@ impl Cagents {
                         RenameTarget::Channel(_) => "Rename channel",
                     })
                     .into(),
-                    widget::text_input(match target { RenameTarget::Pane(_) => "Pane name", RenameTarget::Channel(_) => "Channel name" }, draft)
-                        .id(widget::Id::new("chrome.rename.input"))
-                        .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
-                        .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
-                        .into(),
+                    widget::text_input(
+                        match target {
+                            RenameTarget::Pane(_) => "Pane name",
+                            RenameTarget::Channel(_) => "Channel name",
+                        },
+                        draft,
+                    )
+                    .id(widget::Id::new("chrome.rename.input"))
+                    .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
+                    .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
+                    .into(),
                     design::caption(if normalize_card_name(draft).is_none() {
                         "Name cannot be blank."
                     } else {

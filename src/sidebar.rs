@@ -7452,12 +7452,28 @@ fn file_pager<'a>(
         )
     };
     widget::column::with_children(vec![
-        design::caption(format!("{}–{} of {total}", page * MAX_VISIBLE_FILE_ROWS + 1, ((page + 1) * MAX_VISIBLE_FILE_ROWS).min(total))).into(),
+        design::caption(format!(
+            "{}–{} of {total}",
+            page * MAX_VISIBLE_FILE_ROWS + 1,
+            ((page + 1) * MAX_VISIBLE_FILE_ROWS).min(total)
+        ))
+        .into(),
         widget::row::with_children(vec![
-            button::standard("Previous").width(Length::Fill).on_press_maybe((page > 0).then(|| action(page - 1)).flatten()).into(),
-            button::standard("Next").width(Length::Fill).on_press_maybe((page < last).then(|| action(page + 1)).flatten()).into(),
-        ]).spacing(design::GRID_UNIT).into(),
-    ]).spacing(design::GRID_UNIT).padding(design::GRID_UNIT).into()
+            button::standard("Previous")
+                .width(Length::Fill)
+                .on_press_maybe((page > 0).then(|| action(page - 1)).flatten())
+                .into(),
+            button::standard("Next")
+                .width(Length::Fill)
+                .on_press_maybe((page < last).then(|| action(page + 1)).flatten())
+                .into(),
+        ])
+        .spacing(design::GRID_UNIT)
+        .into(),
+    ])
+    .spacing(design::GRID_UNIT)
+    .padding(design::GRID_UNIT)
+    .into()
 }
 
 /// One bounded page of browsable file rows and the total visible row count.
