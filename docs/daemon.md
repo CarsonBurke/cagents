@@ -377,3 +377,5 @@ separate daemon, session store, application lease, and runtime namespace
 badged tray item with its own name, so it can run beside the installed
 production application. It does not register an autostart entry. Release builds
 without that feature are production builds.
+
+Manual sidebar order is stored by the selected device daemon and shared across windows. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
