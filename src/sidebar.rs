@@ -4015,6 +4015,10 @@ pub(crate) fn selected_project<'a>(
         .find(|project| project.id == project_id)
 }
 
+pub fn files_scroll_id(key: &ActiveWorktreeKey) -> Id {
+    entity_id("panel.files.scroll", key.worktree_id)
+}
+
 pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
     entity_id("panel.files.query", key.worktree_id)
 }
@@ -7416,6 +7420,7 @@ fn files_section<'a>(
                 ])))
                 .width(Length::Fill),
         )
+        .id(files_scroll_id(key))
         .direction(sidebar_scroll_direction())
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
