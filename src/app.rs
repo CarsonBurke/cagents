@@ -6492,34 +6492,28 @@ impl Cagents {
                     .map(Message::Repository),
             );
         } else {
-            let (title, detail) = if review.is_open() {
-                (
-                    "Choose a file",
-                    "Pick a changed file to read its diff. Alt+Down/Up move between files; Alt+J/K move between changes; Alt+V marks a file viewed.",
-                )
+            let prompt = if review.is_open() {
+                "Select a file"
             } else {
-                (
-                    "Choose a pull request",
-                    "Pick an open pull request to fetch its changes and review them here.",
-                )
+                "Select a pull request"
             };
             main.push(
                 widget::container(
                     widget::column::with_children(vec![
                         crate::ui_controls::symbolic_icon("pull-request-symbolic")
                             .icon()
-                            .size(32)
+                            .size(24)
                             .into(),
-                        widget::text::title3(title).into(),
-                        design::body(detail)
+                        design::caption(prompt)
                             .class(cosmic::theme::Text::Custom(design::muted_text))
                             .wrapping(iced::widget::text::Wrapping::Word)
                             .align_x(Alignment::Center)
+                            .width(Length::Fill)
                             .into(),
                     ])
                     .align_x(Alignment::Center)
                     .spacing(spacing.space_xs)
-                    .max_width(420),
+                    .width(Length::Fill),
                 )
                 .center(Length::Fill)
                 .padding(spacing.space_m)
@@ -18766,14 +18760,20 @@ mod tests {
         use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        let pane = app.pull_request_pane(&crate::model::PullRequestView {
+        let mut pane = app.pull_request_pane(&crate::model::PullRequestView {
             repository: PathBuf::from("/repo"),
             selected_number: None,
             file_panel_width: None,
             file_panel_collapsed: None,
         });
         let renderer = headless_renderer();
-        for (width, label) in [(500.0, "Show review files"), (900.0, "Hide review files")] {
+        for (width, collapsed, label) in [
+            (260.0, None, "Show review files"),
+            (260.0, Some(false), "Hide review files"),
+            (500.0, None, "Show review files"),
+            (900.0, None, "Hide review files"),
+        ] {
+            pane.file_panel_collapsed = collapsed;
             drop(app.workspace.resize_viewport(width));
             let mut element = app.pull_request_card_view(card, &pane);
             let mut tree = Tree::new(element.as_widget());
@@ -18787,12 +18787,20 @@ mod tests {
                 &tree,
                 mouse::Cursor::Unavailable,
             );
-            assert!(
-                nodes.root().iter().chain(nodes.children()).any(|node| {
+            let control = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
                         && node.node().label() == Some(label)
-                }),
-                "the review panel toggle must remain named at width {width}"
+                })
+                .unwrap_or_else(|| {
+                    panic!("the review panel toggle must remain named at width {width}")
+                });
+            assert!(
+                control.node().bounds().unwrap().x1 <= f64::from(width),
+                "the review panel toggle must remain visible at width {width}"
             );
         }
     }
