@@ -892,7 +892,7 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Choose Record, then press a shortcut. Click a chord to remove it, or Reset to restore that command’s defaults. Conflicts name the other command before saving. Letters, numbers, punctuation, arrows, Tab, PageUp, PageDown, and F1–F12 are supported. Prefer Ctrl+Shift combinations when you want ordinary terminal keys to remain available.",
+            "Use the keyboard control to record a shortcut. Conflicts appear before saving.",
             vec![
                 shortcut_input(
                     "Toggle Projects sidebar",
