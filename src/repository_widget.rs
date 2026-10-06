@@ -7302,6 +7302,17 @@ pub fn selected_file_toolbar_with<'a>(
     runtime: &'a RepositoryRuntime,
     trailing: Option<Element<'a, RepositoryAction>>,
 ) -> Option<Element<'a, RepositoryAction>> {
+    selected_file_toolbar_mapped_with(card, runtime, trailing, std::convert::identity)
+}
+
+/// Compose shell actions into the file header while retaining the find strip
+/// as a separate row. The shell owns its message type and its extra controls.
+pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    trailing: Option<Element<'a, M>>,
+    map: impl Fn(RepositoryAction) -> M + Clone + 'a,
+) -> Option<Element<'a, M>> {
     let selected = runtime.selected.as_ref()?;
     let editing = runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Edit;
@@ -7601,9 +7612,11 @@ pub fn selected_file_toolbar_with<'a>(
         .height(crate::design::HEADER_CONTENT_HEIGHT);
     let mut header = Vec::with_capacity(3);
     if let Some(title) = title {
-        header.push(title.into());
+        let title: Element<'a, RepositoryAction> = title.into();
+        header.push(title.map(map.clone()));
     }
-    header.push(actions.into());
+    let actions: Element<'a, RepositoryAction> = actions.into();
+    header.push(actions.map(map.clone()));
     header.extend(trailing);
     let toolbar = widget::container(
         widget::row::with_children(header)
@@ -7621,7 +7634,7 @@ pub fn selected_file_toolbar_with<'a>(
         return Some(toolbar.into());
     };
     Some(
-        widget::column::with_children(vec![toolbar.into(), find])
+        widget::column::with_children(vec![toolbar.into(), find.map(map)])
             .width(Length::Fill)
             .into(),
     )
@@ -10332,6 +10345,57 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_toolbar_actions_stay_in_the_header_when_find_is_open() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+
+        #[derive(Clone)]
+        enum ShellMessage {
+            Preview,
+            Repository(RepositoryAction),
+        }
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::dirty_fixture(card);
+        runtime.find_open = true;
+        let renderer = headless_renderer();
+        let mut toolbar = selected_file_toolbar_mapped_with(
+            card,
+            &runtime,
+            Some(
+                icon_control(
+                    crate::ui_controls::symbolic_icon("internet-web-browser-symbolic"),
+                    "Shell preview",
+                    false,
+                    true,
+                    Some(ShellMessage::Preview),
+                )
+                .into(),
+            ),
+            ShellMessage::Repository,
+        )
+        .unwrap();
+        let mut tree = Tree::new(toolbar.as_widget());
+        let node = toolbar.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(600.0, 160.0)),
+        );
+        let nodes =
+            toolbar
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let preview = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Shell preview"))
+            .expect("shell actions retain their accessible name");
+        let bounds = preview.node().bounds().unwrap();
+        assert!(bounds.y1 <= f64::from(crate::design::HEADER_CONTENT_HEIGHT));
+        assert!(node.children()[1].bounds().y >= crate::design::HEADER_CONTENT_HEIGHT);
+    }
+
     #[test]
     fn retargeted_file_panes_reject_old_reads_even_after_returning_to_the_same_path() {
         let directory = tempfile::tempdir().unwrap();
