@@ -37,7 +37,7 @@ use crate::{
         line_change_counts,
     },
     sidebar::{CheckStatus, FileListMode, WorktreePullRequestState, sidebar_button_style},
-    ui_controls::{icon_control, symbolic_icon},
+    ui_controls::{Icon, icon_control},
 };
 
 type ActionTask = iced::Task<Action>;
@@ -1623,10 +1623,10 @@ impl State {
         let pull_request = &target.pull_request;
         let state = WorktreePullRequestState::from_github(pull_request);
         let (icon, state_label) = match state {
-            Some(WorktreePullRequestState::Merged) => ("merged-pull-request-symbolic", "Merged"),
-            Some(WorktreePullRequestState::Closed) => ("closed-pull-request-symbolic", "Closed"),
-            Some(WorktreePullRequestState::Draft) => ("pull-request-symbolic", "Draft"),
-            Some(WorktreePullRequestState::Open) | None => ("pull-request-symbolic", "Open"),
+            Some(WorktreePullRequestState::Merged) => (Icon::MergedPullRequest, "Merged"),
+            Some(WorktreePullRequestState::Closed) => (Icon::ClosedPullRequest, "Closed"),
+            Some(WorktreePullRequestState::Draft) => (Icon::PullRequest, "Draft"),
+            Some(WorktreePullRequestState::Open) | None => (Icon::PullRequest, "Open"),
         };
         let tone = match state {
             Some(WorktreePullRequestState::Merged) => design::Tone::Themed(design::accent_color),
@@ -1640,7 +1640,7 @@ impl State {
         };
         let identity = crate::interaction::tooltip(
             widget::row::with_children(vec![
-                widget::icon::icon(symbolic_icon(icon))
+                widget::icon::icon(icon.handle())
                     .size(ROW_ICON_SIZE)
                     .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
                         cosmic::iced::widget::svg::Style {
@@ -1673,7 +1673,7 @@ impl State {
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
             icon_control(
-                symbolic_icon("git-branch-symbolic"),
+                Icon::Branch,
                 "Create worktree from reviewed commit",
                 false,
                 !modal_open && !busy && self.context.is_some() && self.range.is_some(),
@@ -1681,7 +1681,7 @@ impl State {
             )
             .into(),
             icon_control(
-                symbolic_icon("view-refresh-symbolic"),
+                Icon::Refresh,
                 if busy {
                     "Refreshing pull request"
                 } else {
@@ -1693,7 +1693,7 @@ impl State {
             )
             .into(),
             icon_control(
-                symbolic_icon("external-link-symbolic"),
+                Icon::PopOut,
                 "Open on GitHub",
                 false,
                 !modal_open,
@@ -1701,7 +1701,7 @@ impl State {
             )
             .into(),
             icon_control(
-                symbolic_icon("window-close-symbolic"),
+                Icon::Close,
                 "Close review",
                 false,
                 !modal_open,
@@ -1841,7 +1841,7 @@ impl State {
         };
         let dismiss = if matches!(self.load, LoadState::Failed(_)) {
             icon_control(
-                symbolic_icon("view-refresh-symbolic"),
+                Icon::Refresh,
                 "Try again",
                 false,
                 !modal_open,
@@ -1849,7 +1849,7 @@ impl State {
             )
         } else {
             icon_control(
-                symbolic_icon("window-close-symbolic"),
+                Icon::Close,
                 "Dismiss",
                 false,
                 !modal_open,
@@ -1881,16 +1881,12 @@ impl State {
         })
         .into();
         let (mode_icon, mode_label, next_mode) = match self.file_list_mode {
-            FileListMode::Tree => ("view-list-symbolic", "View as list", FileListMode::Flat),
-            FileListMode::Flat => (
-                "view-list-tree-symbolic",
-                "View as tree",
-                FileListMode::Tree,
-            ),
+            FileListMode::Tree => (Icon::List, "View as list", FileListMode::Flat),
+            FileListMode::Flat => (Icon::Tree, "View as tree", FileListMode::Tree),
         };
         let controls = crate::ui_controls::toolbar_actions(vec![
             icon_control(
-                symbolic_icon(mode_icon),
+                mode_icon,
                 mode_label,
                 false,
                 !modal_open,
@@ -1898,7 +1894,7 @@ impl State {
             )
             .into(),
             icon_control(
-                symbolic_icon("view-filter-symbolic"),
+                Icon::Filter,
                 if self.hide_viewed {
                     "Show viewed files"
                 } else {
@@ -1910,7 +1906,7 @@ impl State {
             )
             .into(),
             icon_control(
-                symbolic_icon("go-next-symbolic"),
+                Icon::ChevronRight,
                 "Next unviewed file",
                 false,
                 !modal_open && self.files.iter().any(|file| !file.viewed),
@@ -2419,7 +2415,7 @@ impl State {
                 )
                 .into(),
                 icon_control(
-                    symbolic_icon("view-refresh-symbolic"),
+                    Icon::Refresh,
                     "Refresh pull requests",
                     false,
                     !modal_open && !self.list_loading,
@@ -2489,10 +2485,10 @@ pub fn browser_row<'a>(
     let spacing = cosmic::theme::spacing();
     let state = WorktreePullRequestState::from_github(pull_request);
     let checks = CheckStatus::from_checks(&pull_request.check_summaries());
-    let icon = symbolic_icon(match state {
-        Some(WorktreePullRequestState::Merged) => "merged-pull-request-symbolic",
-        Some(WorktreePullRequestState::Closed) => "closed-pull-request-symbolic",
-        _ => "pull-request-symbolic",
+    let icon = Icon::handle(match state {
+        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
+        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
+        _ => Icon::PullRequest,
     });
     let tone: fn(&cosmic::Theme) -> iced::Color = match (state, checks) {
         (Some(WorktreePullRequestState::Merged), _) => design::accent_color,
@@ -2600,11 +2596,11 @@ fn viewed_control<'a>(
     action: Action,
 ) -> Element<'a, Action> {
     let (icon, label) = match mark {
-        Mark::Unchecked => ("checkbox-symbolic", label_when_unchecked),
-        Mark::Mixed => ("checkbox-mixed-symbolic", label_when_unchecked),
-        Mark::Checked => ("checkbox-checked-symbolic", label_when_checked),
+        Mark::Unchecked => (Icon::Checkbox, label_when_unchecked),
+        Mark::Mixed => (Icon::CheckboxMixed, label_when_unchecked),
+        Mark::Checked => (Icon::CheckboxChecked, label_when_checked),
     };
-    let control = icon_control(symbolic_icon(icon), label, false, enabled, Some(action));
+    let control = icon_control(icon, label, false, enabled, Some(action));
     match mark {
         Mark::Unchecked => control.into(),
         Mark::Mixed | Mark::Checked => control

@@ -37,6 +37,7 @@ use crate::{
         build_file_tree, build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
+    ui_controls::Icon,
 };
 use row_interaction::RowInteraction;
 
@@ -1204,10 +1205,10 @@ pub fn pull_request_visual(pr: &SidebarPullRequest) -> (widget::icon::Handle, co
 
 /// The glyph a pull request draws. No theme decides it.
 fn pull_request_icon(pr: &SidebarPullRequest) -> widget::icon::Handle {
-    crate::ui_controls::symbolic_icon(match pr.state {
-        Some(WorktreePullRequestState::Merged) => "merged-pull-request-symbolic",
-        Some(WorktreePullRequestState::Closed) => "closed-pull-request-symbolic",
-        _ => "pull-request-symbolic",
+    Icon::handle(match pr.state {
+        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
+        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
+        _ => Icon::PullRequest,
     })
 }
 
@@ -3890,7 +3891,7 @@ fn header<'a>(
     if !model.projects.is_empty() {
         let attention = state.filter == SidebarFilter::Attention;
         actions.push(crate::interaction::tooltip(
-            button::icon(crate::ui_controls::symbolic_icon("notifications-symbolic"))
+            button::icon(Icon::Attention)
                 .class(sidebar_button_style(attention))
                 .id(filter_id(SidebarFilter::Attention))
                 .name("Show projects needing attention")
@@ -3913,7 +3914,7 @@ fn header<'a>(
         ));
         let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
-            button::icon(crate::ui_controls::symbolic_icon("edit-find-symbolic"))
+            button::icon(Icon::Search)
                 .class(sidebar_button_style(selected))
                 .id(stable_id("toggle-controls"))
                 .name("Search projects")
@@ -3944,7 +3945,7 @@ fn header<'a>(
         }
     }
     actions.push(icon_action(
-        "list-add-symbolic",
+        Icon::Plus,
         "New project",
         gated(SidebarAction::OpenRepositoryPicker, modal_open),
         stable_id("open-repository"),
@@ -4064,7 +4065,7 @@ fn utilities<'a>(
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let toggle = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("view-sidebar-start-symbolic"),
+        Icon::Sidebar,
         crate::workspace_widget::shortcut_tooltip(
             crate::workspace_widget::GlobalShortcut::ToggleProjects,
             shortcuts,
@@ -4104,7 +4105,7 @@ fn utilities<'a>(
 
 fn utility_controls<'a>(modal_open: bool) -> [Element<'a, SidebarAction>; 2] {
     let settings: Element<'a, SidebarAction> = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("emblem-system-symbolic"),
+        Icon::Settings,
         "Settings",
         false,
         !modal_open,
@@ -4113,7 +4114,7 @@ fn utility_controls<'a>(modal_open: bool) -> [Element<'a, SidebarAction>; 2] {
     .id(stable_id("settings"))
     .into();
     let automations = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("alarm-symbolic"),
+        Icon::Alarm,
         "Automations",
         false,
         !modal_open,
@@ -4306,12 +4307,9 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
     if compact {
         return widget::container(
             widget::column::with_children(vec![
-                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
-                    .icon()
-                    .size(STATUS_ICON_SIZE)
-                    .into(),
+                Icon::Warning.handle().icon().size(STATUS_ICON_SIZE).into(),
                 icon_action(
-                    "view-refresh-symbolic",
+                    Icon::Refresh,
                     format!("Couldn't load projects. {message}. Try again"),
                     gated(SidebarAction::Refresh, modal_open),
                     stable_id("error.retry"),
@@ -4326,10 +4324,7 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
     }
     widget::container(
         widget::column::with_children(vec![
-            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
-                .icon()
-                .size(STATUS_ICON_SIZE)
-                .into(),
+            Icon::Warning.handle().icon().size(STATUS_ICON_SIZE).into(),
             design::heading("Couldn’t load projects").into(),
             design::caption(message)
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
@@ -4353,7 +4348,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
     let searching = (!compact || state.controls_expanded) && !state.query.trim().is_empty();
     let (icon_name, title, detail, action_label, action) = if searching {
         (
-            "edit-find-symbolic",
+            Icon::Search,
             "No matches",
             "Try a different project, branch, or path.",
             "Clear search",
@@ -4362,21 +4357,21 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
     } else {
         match state.filter {
             SidebarFilter::All => (
-                "folder-open-symbolic",
+                Icon::OpenFolder,
                 "No projects",
                 "Open a folder to add a project.",
                 "Open folder",
                 SidebarAction::OpenRepositoryPicker,
             ),
             SidebarFilter::Attention => (
-                "emblem-ok-symbolic",
+                Icon::Check,
                 "No unread updates",
                 "No panes currently need your attention.",
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
             SidebarFilter::PullRequests => (
-                "pull-request-symbolic",
+                Icon::PullRequest,
                 "No pull requests",
                 "Open a repository or change the current filter.",
                 "Show all",
@@ -4394,14 +4389,14 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
     }
     let spacing = cosmic::theme::spacing();
     let action_icon = if searching {
-        "edit-clear-symbolic"
+        Icon::Clear
     } else if state.filter == SidebarFilter::All {
-        "folder-open-symbolic"
+        Icon::OpenFolder
     } else {
-        "view-list-tree-symbolic"
+        Icon::Tree
     };
     let action_button = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon(action_icon),
+        action_icon,
         format!("{action_label} · {detail}"),
         false,
         !modal_open,
@@ -4702,7 +4697,7 @@ fn operation_rows<'a>(
         let control = crate::interaction::tooltip(control, operation.detail.to_string());
         let retry = operation.reopenable.then(|| {
             icon_action(
-                "view-refresh-symbolic",
+                Icon::Refresh,
                 format!("Retry creating {}", operation.label),
                 gated(
                     SidebarAction::RetryWorktreeOperation(operation.id),
@@ -4766,7 +4761,7 @@ fn operation_icon<'a>(
                 }))
                 .into()
         }
-        WorktreeOperationPhase::Failed => toned_icon("dialog-warning-symbolic", BadgeTone::Warning),
+        WorktreeOperationPhase::Failed => toned_icon(Icon::Warning, BadgeTone::Warning),
     }
 }
 
@@ -4806,15 +4801,9 @@ fn operation_control<'a>(
 ) -> Option<Element<'static, SidebarAction>> {
     let action = gated_operation_action(operation, modal_open)?;
     let (icon_name, label) = if operation.cancellable {
-        (
-            "process-stop-symbolic",
-            format!("Cancel creating {}", operation.label),
-        )
+        (Icon::Cancel, format!("Cancel creating {}", operation.label))
     } else {
-        (
-            "window-close-symbolic",
-            format!("Dismiss {}", operation.label),
-        )
+        (Icon::Close, format!("Dismiss {}", operation.label))
     };
     Some(icon_action(
         icon_name,
@@ -4894,7 +4883,7 @@ fn unreachable_project<'a>(
     let control = grid
         .control(
             grid.content(
-                toned_icon("dialog-warning-symbolic", BadgeTone::Warning),
+                toned_icon(Icon::Warning, BadgeTone::Warning),
                 (!compact).then(|| project_name_label(project, &state.query)),
                 None,
             ),
@@ -4997,9 +4986,9 @@ fn project_view<'a>(
     let disclosure: Element<'static, SidebarAction> = if has_children {
         project_icon_action(
             if expanded {
-                "go-down-symbolic"
+                Icon::ChevronDown
             } else {
-                "go-next-symbolic"
+                Icon::ChevronRight
             },
             if expanded {
                 chrome.collapse_name.to_string()
@@ -5016,7 +5005,7 @@ fn project_view<'a>(
             .into()
     };
     let add_worktree = project_icon_action(
-        "worktree-add-symbolic",
+        Icon::WorktreeAdd,
         chrome.new_worktree_name.to_string(),
         gated(
             SidebarAction::NewWorktree {
@@ -5028,7 +5017,7 @@ fn project_view<'a>(
         chrome.new_worktree_id.clone(),
     );
     let add_channel = project_icon_action(
-        "channel-add-symbolic",
+        Icon::ChannelAdd,
         chrome.new_channel_name.to_string(),
         gated(SidebarAction::NewChannel { project_id }, modal_open),
         chrome.new_channel_id.clone(),
@@ -5432,7 +5421,7 @@ fn agent_indicator<'a>(
 ) -> Option<Element<'static, SidebarAction>> {
     if activity == Some(crate::agent::ActivityState::Waiting) {
         return Some(status_icon(
-            "dialog-warning-symbolic",
+            Icon::Warning,
             "An agent is waiting for input",
             BadgeTone::Warning,
         ));
@@ -5448,7 +5437,7 @@ fn agent_indicator<'a>(
     }
     if unread {
         return Some(status_icon(
-            "notifications-symbolic",
+            Icon::Attention,
             "Unread agent update",
             BadgeTone::Neutral,
         ));
@@ -5472,11 +5461,7 @@ fn deleting_indicator<'a>() -> Element<'static, SidebarAction> {
 /// badge after the reserved slot and leaves live activity where it was. The
 /// rail has room for nothing after the slot, so there it takes the slot.
 fn deletion_failed_badge(reason: &str) -> Element<'static, SidebarAction> {
-    status_icon(
-        "dialog-warning-symbolic",
-        reason.to_owned(),
-        BadgeTone::Warning,
-    )
+    status_icon(Icon::Warning, reason.to_owned(), BadgeTone::Warning)
 }
 
 /// A row being deleted reads as muted as a creation's row does, glyph and
@@ -5505,7 +5490,7 @@ fn with_deletion_retry<'a>(
         .align_y(Alignment::Center)
         .push(row)
         .push(icon_action(
-            "view-refresh-symbolic",
+            Icon::Refresh,
             format!("Retry deleting {label}"),
             retry,
             id,
@@ -5540,16 +5525,13 @@ fn channel_view(
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let tone = channel_glyph_tone(channel);
-    let glyph = widget::container(
-        widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic"))
-            .size(CHILD_ROW_ICON_SIZE),
-    )
-    .class(theme::Container::custom(move |theme| {
-        cosmic::iced::widget::container::Style {
-            icon_color: Some(tone.color(theme)),
-            ..Default::default()
-        }
-    }));
+    let glyph = widget::container(widget::icon(Icon::Channel.handle()).size(CHILD_ROW_ICON_SIZE))
+        .class(theme::Container::custom(move |theme| {
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(tone.color(theme)),
+                ..Default::default()
+            }
+        }));
     let label = (!compact).then(|| {
         search_label(
             &channel.title,
@@ -5634,7 +5616,7 @@ fn row_quick_delete<'a>(
     } else {
         ICON_CONTROL_SIZE
     };
-    let control = button::icon(crate::ui_controls::symbolic_icon("edit-delete-symbolic"))
+    let control = button::icon(Icon::Delete)
         .class(sidebar_button_style(false))
         .id(id)
         .name(label.to_owned())
@@ -5806,13 +5788,9 @@ fn worktree_indicator(
         ));
     }
     if compact && show_changes_icons {
-        return indicators.dirty.map(|label| {
-            status_icon(
-                "document-edit-symbolic",
-                label.to_owned(),
-                BadgeTone::Warning,
-            )
-        });
+        return indicators
+            .dirty
+            .map(|label| status_icon(Icon::Changes, label.to_owned(), BadgeTone::Warning));
     }
     None
 }
@@ -5888,7 +5866,7 @@ fn worktree_view<'a>(
         let indicators = worktree_indicators(worktree);
         if show_changes_icons && let Some(label) = indicators.dirty {
             content = content.push(status_icon(
-                "document-edit-symbolic",
+                Icon::Changes,
                 label.to_owned(),
                 BadgeTone::Warning,
             ));
@@ -5921,21 +5899,17 @@ fn worktree_view<'a>(
         }
         if primary {
             content = content.push(status_icon(
-                "go-home-symbolic",
+                Icon::Home,
                 "Primary worktree",
                 BadgeTone::Neutral,
             ));
         }
         if worktree.detached {
-            content = content.push(status_icon(
-                "dialog-information-symbolic",
-                "Detached HEAD",
-                BadgeTone::Neutral,
-            ));
+            content = content.push(status_icon(Icon::Info, "Detached HEAD", BadgeTone::Neutral));
         }
         if worktree.locked {
             content = content.push(status_icon(
-                "changes-prevent-symbolic",
+                Icon::Lock,
                 "Locked worktree",
                 BadgeTone::Neutral,
             ));
@@ -6051,18 +6025,14 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'static, Sidebar
             .width(size)
             .height(size)
             .into(),
-        None => widget::container(
-            crate::ui_controls::symbolic_icon("folder-symbolic")
-                .icon()
-                .size(size),
-        )
-        .class(theme::Container::custom(move |theme| {
-            cosmic::iced::widget::container::Style {
-                icon_color: Some(design::muted_icon_color(theme)),
-                ..Default::default()
-            }
-        }))
-        .into(),
+        None => widget::container(Icon::Folder.handle().icon().size(size))
+            .class(theme::Container::custom(move |theme| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(design::muted_icon_color(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into(),
     }
 }
 
@@ -6276,27 +6246,19 @@ impl widget::menu::Action for FileContextCommand<'_> {
 fn file_commands(
     directory: bool,
     file_management: bool,
-) -> impl Iterator<Item = (&'static str, &'static str, FileCommand)> {
+) -> impl Iterator<Item = (&'static str, Icon, FileCommand)> {
     [
-        ("Rename…", "edit-rename-symbolic", FileCommand::Rename),
-        (
-            "Duplicate file…",
-            "edit-duplicate-symbolic",
-            FileCommand::CopyFile,
-        ),
-        (
-            "Copy path",
-            "edit-copy-path-symbolic",
-            FileCommand::CopyPath,
-        ),
+        ("Rename…", Icon::Rename, FileCommand::Rename),
+        ("Duplicate file…", Icon::Duplicate, FileCommand::CopyFile),
+        ("Copy path", Icon::CopyPath, FileCommand::CopyPath),
         (
             "Copy relative path",
-            "edit-copy-relative-path-symbolic",
+            Icon::CopyRelativePath,
             FileCommand::CopyRelativePath,
         ),
         (
             "Reveal in file manager",
-            "folder-open-symbolic",
+            Icon::OpenFolder,
             FileCommand::RevealInFileManager,
         ),
     ]
@@ -6325,7 +6287,7 @@ fn file_context_controls<'a>(
     for (label, icon, command) in file_commands(row.directory, file_management) {
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
-            Some(crate::ui_controls::symbolic_icon(icon)),
+            Some(icon.handle()),
             FileContextCommand::Manage { key, path, command },
         ));
     }
@@ -6804,7 +6766,7 @@ fn source_control_header<'a>(
         PanelView::Files => {
             header = header.push(
                 crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("system-search-symbolic"),
+                    Icon::Search,
                     if state.files_filter_open {
                         "Hide file filter"
                     } else {
@@ -7132,7 +7094,7 @@ fn worktree_panel_chrome_with_footer<'a, M: 'a>(
 /// width.
 #[derive(Debug, Clone, PartialEq)]
 struct SectionHeader {
-    icon: &'static str,
+    icon: Icon,
     title: String,
     /// The accessible name and the tooltip. Both name the action rather than
     /// the section, because the row is a control.
@@ -7151,9 +7113,9 @@ impl SectionHeader {
     ) -> Self {
         Self {
             icon: if expanded {
-                "go-down-symbolic"
+                Icon::ChevronDown
             } else {
-                "go-next-symbolic"
+                Icon::ChevronRight
             },
             title: match count {
                 Some(count) => format!("{} ({count})", section.title()),
@@ -7197,13 +7159,9 @@ fn panel_section<'a>(
     let parts = SectionHeader::new(key, section, count, expanded, modal_open);
     let row = button::custom(
         widget::row::with_children(vec![
-            widget::container(
-                crate::ui_controls::symbolic_icon(parts.icon)
-                    .icon()
-                    .size(ROW_ICON_SIZE),
-            )
-            .center_x(Length::Fixed(ROW_ICON_WIDTH))
-            .into(),
+            widget::container(parts.icon.handle().icon().size(ROW_ICON_SIZE))
+                .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                .into(),
             design::heading(parts.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -7678,15 +7636,11 @@ fn list_mode_toggle<'a>(
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let (label, icon, mode) = match current {
-        FileListMode::Tree => ("View as list", "view-list-symbolic", FileListMode::Flat),
-        FileListMode::Flat => (
-            "View as tree",
-            "view-list-tree-symbolic",
-            FileListMode::Tree,
-        ),
+        FileListMode::Tree => ("View as list", Icon::List, FileListMode::Flat),
+        FileListMode::Flat => ("View as tree", Icon::Tree, FileListMode::Tree),
     };
     crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon(icon),
+        icon,
         label,
         false,
         !modal_open,
@@ -8021,7 +7975,7 @@ fn change_row_view<'a>(
         if row.entry.conflict.is_none()
             && matches!(row.entry.kind, ChangeKind::Added | ChangeKind::Untracked)
         {
-            status_icon("document-new-symbolic", "Added file", tone)
+            status_icon(Icon::AddedFile, "Added file", tone)
         } else {
             semantic_caption(
                 if row.entry.conflict.is_some() {
@@ -8158,7 +8112,7 @@ fn semantic_caption<'a>(
 /// Derived independently of rendering so group and row mutations share the
 /// same path-scoping and modal gating rules.
 struct IconCommand<'a> {
-    icon: &'static str,
+    icon: Icon,
     name: &'a str,
     /// `None` while a dialog is on screen; see [`gated`].
     action: Option<SidebarAction>,
@@ -8190,7 +8144,7 @@ fn group_commands<'a>(
     let mut commands = Vec::with_capacity(2);
     if group.area == ChangeArea::Staged {
         commands.push(IconCommand {
-            icon: "list-remove-symbolic",
+            icon: Icon::Minus,
             name: &chrome.unstage_all_name,
             action: gated(
                 SidebarAction::ChangeGroup {
@@ -8204,7 +8158,7 @@ fn group_commands<'a>(
         });
     } else {
         commands.push(IconCommand {
-            icon: "list-add-symbolic",
+            icon: Icon::Plus,
             name: &chrome.stage_all_name,
             action: gated(
                 SidebarAction::ChangeGroup {
@@ -8219,7 +8173,7 @@ fn group_commands<'a>(
     }
     if matches!(group.area, ChangeArea::Unstaged | ChangeArea::Untracked) {
         commands.push(IconCommand {
-            icon: "edit-undo-symbolic",
+            icon: Icon::Undo,
             name: &chrome.discard_all_name,
             action: gated(
                 SidebarAction::ChangeGroup {
@@ -8290,7 +8244,7 @@ fn row_commands<'a>(
     let mut commands = Vec::with_capacity(2);
     if area == ChangeArea::Staged {
         commands.push(IconCommand {
-            icon: "list-remove-symbolic",
+            icon: Icon::Minus,
             name: &chrome.unstage_name,
             action: gated(
                 SidebarAction::Unstage {
@@ -8303,7 +8257,7 @@ fn row_commands<'a>(
         });
     } else {
         commands.push(IconCommand {
-            icon: "list-add-symbolic",
+            icon: Icon::Plus,
             name: &chrome.stage_name,
             action: gated(
                 SidebarAction::Stage {
@@ -8317,7 +8271,7 @@ fn row_commands<'a>(
     }
     if matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked) {
         commands.push(IconCommand {
-            icon: "edit-undo-symbolic",
+            icon: Icon::Undo,
             name: &chrome.discard_name,
             action: gated(
                 SidebarAction::RequestDiscard {
@@ -8540,7 +8494,7 @@ fn changes_footer<'a>(
     };
     let commit = crate::interaction::tooltip(
         button::suggested(commit_label)
-            .leading_icon(crate::ui_controls::symbolic_icon("vcs-commit-symbolic"))
+            .leading_icon(Icon::Commit)
             .name(format!("{commit_label} (Ctrl+Enter)"))
             .id(chrome.commit_id.clone())
             .padding([0, 8])
@@ -8583,7 +8537,7 @@ fn changes_footer<'a>(
                 .as_ref()
                 .map_or_else(String::new, |counts| format!(" · {counts}"));
             let push = crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon("vcs-push-symbolic"),
+                Icon::Push,
                 format!(
                     "Push {} to {}{detail}",
                     branch.as_str(),
@@ -8612,7 +8566,7 @@ fn changes_footer<'a>(
         (Some(branch), None) if !source.upstream_reported() => {
             buttons = buttons.push(
                 crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("vcs-push-symbolic"),
+                    Icon::Push,
                     format!("Publish {}… Choose a remote and upstream", branch.as_str()),
                     false,
                     source.can_publish() && !modal_open,
@@ -8752,10 +8706,7 @@ fn commit_changes_section<'a>(
         .push(
             button::custom(
                 widget::row::with_children(vec![
-                    crate::ui_controls::symbolic_icon("go-previous-symbolic")
-                        .icon()
-                        .size(ROW_ICON_SIZE)
-                        .into(),
+                    Icon::ChevronLeft.handle().icon().size(ROW_ICON_SIZE).into(),
                     design::body("History").into(),
                 ])
                 .spacing(4)
@@ -8886,13 +8837,9 @@ fn history_section<'a>(
         rows = rows.push(crate::interaction::keyboard_list_row(
             button::custom(
                 widget::row::with_children(vec![
-                    widget::container(
-                        crate::ui_controls::symbolic_icon("vcs-commit-symbolic")
-                            .icon()
-                            .size(ROW_ICON_SIZE),
-                    )
-                    .center_x(Length::Fixed(ROW_ICON_WIDTH))
-                    .into(),
+                    widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
+                        .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                        .into(),
                     widget::column::with_children(vec![
                         design::body(&*chrome.subject)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -9200,7 +9147,7 @@ fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> them
 
 /// Compact source-control commands share the row height and hover geometry.
 fn panel_icon_action<'a>(
-    icon_name: &'static str,
+    icon_name: Icon,
     label: impl Into<Cow<'a, str>>,
     action: Option<SidebarAction>,
     id: Id,
@@ -9208,10 +9155,8 @@ fn panel_icon_action<'a>(
     let label = label.into();
     crate::interaction::tooltip(
         button::custom(
-            widget::container(
-                icon::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
-            )
-            .center(Length::Fill),
+            widget::container(icon::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+                .center(Length::Fill),
         )
         .class(sidebar_button_style(false))
         .id(id)
@@ -9226,7 +9171,7 @@ fn panel_icon_action<'a>(
 
 /// One icon command.
 fn project_icon_action<'a>(
-    icon_name: &'static str,
+    icon_name: Icon,
     label: impl Into<Cow<'a, str>>,
     action: Option<SidebarAction>,
     id: Id,
@@ -9234,13 +9179,11 @@ fn project_icon_action<'a>(
     let label = label.into();
     crate::interaction::tooltip(
         button::custom(
-            widget::container(
-                widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
-            )
-            .class(theme::Container::custom(|_| {
-                cosmic::iced::widget::container::Style::default()
-            }))
-            .center(Length::Fill),
+            widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+                .class(theme::Container::custom(|_| {
+                    cosmic::iced::widget::container::Style::default()
+                }))
+                .center(Length::Fill),
         )
         .class(sidebar_button_style(false))
         .id(id)
@@ -9255,20 +9198,14 @@ fn project_icon_action<'a>(
 
 /// One icon command in shared workspace chrome.
 fn icon_action<'a>(
-    icon_name: &'static str,
+    icon_name: Icon,
     label: impl Into<Cow<'a, str>>,
     action: Option<SidebarAction>,
     id: Id,
 ) -> Element<'a, SidebarAction> {
-    crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon(icon_name),
-        label,
-        false,
-        action.is_some(),
-        action,
-    )
-    .id(id)
-    .into()
+    crate::ui_controls::icon_control(icon_name, label, false, action.is_some(), action)
+        .id(id)
+        .into()
 }
 
 /// A "new …" command that is a row of its own, on the grid of the rows it
@@ -9368,23 +9305,21 @@ fn check_description(status: CheckStatus) -> &'static str {
 /// The tone is resolved by the drawing theme rather than read from the
 /// process-global one while the view is built, so a row that carries a tone
 /// costs no theme lock per frame.
-fn toned_icon<'a, Message: 'a>(icon_name: &'static str, tone: BadgeTone) -> Element<'a, Message> {
-    widget::container(
-        widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
-    )
-    .class(theme::Container::custom(move |theme| {
-        let cosmic = theme.cosmic();
-        cosmic::iced::widget::container::Style {
-            icon_color: Some(match tone {
-                BadgeTone::Success => cosmic.success.base.into(),
-                BadgeTone::Warning => cosmic.warning.base.into(),
-                BadgeTone::Danger => cosmic.destructive.base.into(),
-                _ => design::muted_icon_color(theme),
-            }),
-            ..Default::default()
-        }
-    }))
-    .into()
+fn toned_icon<'a, Message: 'a>(icon_name: Icon, tone: BadgeTone) -> Element<'a, Message> {
+    widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+        .class(theme::Container::custom(move |theme| {
+            let cosmic = theme.cosmic();
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(match tone {
+                    BadgeTone::Success => cosmic.success.base.into(),
+                    BadgeTone::Warning => cosmic.warning.base.into(),
+                    BadgeTone::Danger => cosmic.destructive.base.into(),
+                    _ => design::muted_icon_color(theme),
+                }),
+                ..Default::default()
+            }
+        }))
+        .into()
 }
 
 /// A badge: a toned glyph that explains itself on hover.
@@ -9393,7 +9328,7 @@ fn toned_icon<'a, Message: 'a>(icon_name: &'static str, tone: BadgeTone) -> Elem
 /// same badges as the navigation rail, and two rails describing one worktree
 /// differently is the defect this shares its way out of.
 pub fn status_icon<'a, Message: Clone + 'a>(
-    icon_name: &'static str,
+    icon_name: Icon,
     label: impl Into<Cow<'a, str>> + 'a,
     tone: BadgeTone,
 ) -> Element<'a, Message> {
@@ -9412,9 +9347,9 @@ pub fn check_indicator<Message: Clone + 'static>(status: CheckStatus) -> Element
     }
     status_icon(
         match status {
-            CheckStatus::Passing => "emblem-ok-symbolic",
-            CheckStatus::Failing => "dialog-error-symbolic",
-            _ => "dialog-information-symbolic",
+            CheckStatus::Passing => Icon::Check,
+            CheckStatus::Failing => Icon::Error,
+            _ => Icon::Info,
         },
         check_description(status),
         check_tone(status),
@@ -12268,20 +12203,20 @@ pub(crate) mod tests {
             project_identity_row(&model.projects[0], false, false, false, false, ""),
             vec![
                 icon_action(
-                    "channel-add-symbolic",
+                    Icon::ChannelAdd,
                     "New channel",
                     None,
                     Id::new("test.channel"),
                 ),
                 icon_action(
-                    "worktree-add-symbolic",
+                    Icon::WorktreeAdd,
                     "New worktree",
                     None,
                     Id::new("test.worktree"),
                 ),
             ],
             project_icon_action(
-                "go-down-symbolic",
+                Icon::ChevronDown,
                 "Collapse",
                 None,
                 Id::new("test.collapse"),

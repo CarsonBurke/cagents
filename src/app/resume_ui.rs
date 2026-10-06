@@ -939,7 +939,7 @@ impl Cagents {
         if let Some(scope) = &state.scope {
             filters.push(
                 widget::button::standard(scope.label.clone())
-                    .trailing_icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
+                    .trailing_icon(Icon::Close)
                     .name("Search every provider and project")
                     .on_press(Message::ResumeConversation(Action::Unscope))
                     .into(),

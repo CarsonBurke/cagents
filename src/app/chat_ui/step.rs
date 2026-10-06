@@ -45,9 +45,9 @@ const THREAD_RAIL_OFFSET: f32 =
 /// when the frame was drawn, so it is the animated indicator the rest of the
 /// shell uses for the same state.
 fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<design::Tone>) {
-    let glyph = |name: &'static str, tone: Option<design::Tone>| {
+    let glyph = |name: Icon, tone: Option<design::Tone>| {
         (
-            widget::icon(crate::ui_controls::symbolic_icon(name))
+            widget::icon(name.handle())
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
             tone,
@@ -61,13 +61,13 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
             ),
             Some(design::Tone::Themed(design::warning_color)),
         ),
-        ToolStatus::Succeeded => glyph("emblem-ok-symbolic", None),
+        ToolStatus::Succeeded => glyph(Icon::Check, None),
         ToolStatus::Failed => glyph(
-            "dialog-error-symbolic",
+            Icon::Error,
             Some(design::Tone::Themed(design::destructive_color)),
         ),
         ToolStatus::Denied => glyph(
-            "action-unavailable-symbolic",
+            Icon::Unavailable,
             Some(design::Tone::Themed(design::muted_color)),
         ),
     }
@@ -76,24 +76,24 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
 /// The glyph that stands for what a step was doing, so a reader scanning the
 /// left edge of a strip can tell reading from running from editing without
 /// reading any text.
-fn kind_glyph(content: &ItemContent) -> &'static str {
+fn kind_glyph(content: &ItemContent) -> Icon {
     match content {
-        ItemContent::Text { .. } => "view-private-symbolic",
+        ItemContent::Text { .. } => Icon::Private,
         ItemContent::Command { action, .. } => match action {
-            chat::CommandAction::Read => "text-x-generic-symbolic",
-            chat::CommandAction::Search => "system-search-symbolic",
-            chat::CommandAction::List => "folder-symbolic",
-            chat::CommandAction::Run => "utilities-terminal-symbolic",
+            chat::CommandAction::Read => Icon::TextFile,
+            chat::CommandAction::Search => Icon::Search,
+            chat::CommandAction::List => Icon::Folder,
+            chat::CommandAction::Run => Icon::Terminal,
         },
-        ItemContent::Changes { .. } => "document-edit-symbolic",
-        ItemContent::WebSearch { .. } => "web-browser-symbolic",
-        ItemContent::Tool { .. } => "applications-utilities-symbolic",
-        ItemContent::Image { .. } => "image-x-generic-symbolic",
+        ItemContent::Changes { .. } => Icon::Changes,
+        ItemContent::WebSearch { .. } => Icon::WebBrowser,
+        ItemContent::Tool { .. } => Icon::Utilities,
+        ItemContent::Image { .. } => Icon::Image,
         ItemContent::Delivery {
             kind: chat::DeliveryKind::Notice,
             ..
-        } => "notifications-symbolic",
-        ItemContent::Delivery { .. } => "chat-bubble-text-symbolic",
+        } => Icon::Attention,
+        ItemContent::Delivery { .. } => Icon::Chat,
     }
 }
 
@@ -175,7 +175,7 @@ pub(super) fn code_frame<'a>(
     match copy {
         Some(copy) => iced::widget::hover(
             block,
-            widget::container(small_icon("edit-copy-symbolic", "Copy this block", copy))
+            widget::container(small_icon(Icon::Copy, "Copy this block", copy))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_x(Alignment::End)
@@ -318,10 +318,10 @@ impl Runtime {
             .copied()
             .unwrap_or(self.tool_groups_expanded);
         let mut line: Vec<Element<'static, Message>> = vec![
-            widget::icon(crate::ui_controls::symbolic_icon(if open {
-                "pan-down-symbolic"
+            widget::icon(Icon::handle(if open {
+                Icon::PanDown
             } else {
-                "pan-end-symbolic"
+                Icon::PanEnd
             }))
             .size(design::COMPACT_ICON_SIZE)
             .into(),
@@ -438,14 +438,14 @@ impl Runtime {
         let verb = turn::step_verb(&item.content);
         let label = turn::step_label(&item.content);
         let mut line: Vec<Element<'static, Message>> = vec![
-            widget::icon(crate::ui_controls::symbolic_icon(if open {
-                "pan-down-symbolic"
+            widget::icon(Icon::handle(if open {
+                Icon::PanDown
             } else {
-                "pan-end-symbolic"
+                Icon::PanEnd
             }))
             .size(design::COMPACT_ICON_SIZE)
             .into(),
-            widget::icon(crate::ui_controls::symbolic_icon(kind_glyph(&item.content)))
+            widget::icon(kind_glyph(&item.content).handle())
                 .size(14)
                 .into(),
         ];

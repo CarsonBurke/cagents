@@ -4486,7 +4486,7 @@ impl Cagents {
         if placement == Placement::Popover {
             items.push(
                 crate::ui_controls::compact_icon_control(
-                    crate::ui_controls::symbolic_icon("view-pop-out-symbolic"),
+                    Icon::PopOut,
                     "Open in the Accounts pane",
                     Some(Message::AccountUi(Action::OpenPane)),
                 )
@@ -4688,7 +4688,7 @@ fn refresh_control<'a>(
         "Checked moments ago"
     };
     crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+        Icon::Refresh,
         label,
         ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))),
     )

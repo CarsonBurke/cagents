@@ -48,7 +48,7 @@ use crate::{
         CancellationToken, DiffBasis, DiffContent, DiffSide, HistoryRequest, HistoryRevision,
         MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService, RepositorySnapshot, ValidatedRefName,
     },
-    ui_controls::icon_control,
+    ui_controls::{Icon, icon_control},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -7451,7 +7451,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     // still expose file information, so inspecting a binary diff is reversible.
     let file_information = !editable && !matches!(runtime.document, DocumentState::Image { .. });
     let preview = icon_control(
-        crate::ui_controls::symbolic_icon("view-reveal-symbolic"),
+        Icon::Preview,
         if file_information {
             "View file information"
         } else {
@@ -7480,7 +7480,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         preview.id(focus_restore_id(card))
     };
     let edit = icon_control(
-        crate::ui_controls::symbolic_icon("text-editor-symbolic"),
+        Icon::Edit,
         "Edit file",
         editable && editing && runtime.can_apply_markdown_mode(false),
         runtime.can_apply_markdown_mode(false),
@@ -7499,7 +7499,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             preview.into(),
             edit.into(),
             icon_control(
-                crate::ui_controls::symbolic_icon("vcs-diff-symbolic"),
+                Icon::Diff,
                 "View diff",
                 runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff(),
                 runtime.can_show_diff(),
@@ -7514,7 +7514,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     if editable {
         document_actions.push(
             icon_control(
-                crate::ui_controls::symbolic_icon("document-revert-symbolic"),
+                Icon::RevertFile,
                 "Discard unsaved edits (Ctrl+Z restores them)",
                 false,
                 runtime.can_discard_edits(),
@@ -7524,7 +7524,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         );
         controls.push(
             icon_control(
-                crate::ui_controls::symbolic_icon("document-save-symbolic"),
+                Icon::Save,
                 if runtime.is_saving() {
                     "Saving file…"
                 } else if runtime.is_dirty() {
@@ -7547,23 +7547,18 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     let subject = runtime.subject_file();
     let staged = subject.as_ref().is_some_and(|file| file.staged);
     let unstaged = subject.as_ref().is_some_and(|file| file.unstaged);
-    let staging: &[(bool, bool, &str, &str)] = if runtime.reviews_pull_request() {
+    let staging: &[(bool, bool, Icon, &str)] = if runtime.reviews_pull_request() {
         &[]
     } else {
         &[
-            (true, unstaged, "list-add-symbolic", "Stage file changes"),
-            (
-                false,
-                staged,
-                "list-remove-symbolic",
-                "Unstage file changes",
-            ),
+            (true, unstaged, Icon::Plus, "Stage file changes"),
+            (false, staged, Icon::Minus, "Unstage file changes"),
         ]
     };
     for &(stage, has_changes, icon, label) in staging {
         document_actions.push(
             icon_control(
-                crate::ui_controls::symbolic_icon(icon),
+                icon,
                 label,
                 false,
                 has_changes && !runtime.mutation_refresh_pending && !runtime.blocks_navigation(),
@@ -7655,7 +7650,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
     overflow.extend(secondary);
     let more = icon_control(
-        crate::ui_controls::symbolic_icon("view-more-symbolic"),
+        Icon::More,
         "More file actions",
         runtime.toolbar_overflow_open,
         true,
@@ -7719,7 +7714,7 @@ fn find_strip<'a>(
     let matched = runtime.find_total != 0;
     let mut row: Vec<Element<'a, RepositoryAction>> = vec![
         icon_control(
-            crate::ui_controls::symbolic_icon("edit-find-symbolic"),
+            Icon::Search,
             "Find and replace",
             runtime.replace_open,
             true,
@@ -7760,30 +7755,21 @@ fn find_strip<'a>(
     }
     for (icon, label, action) in [
         (
-            "go-up-symbolic",
+            Icon::ChevronUp,
             "Previous match",
             RepositoryAction::FindPrevious { card },
         ),
         (
-            "go-down-symbolic",
+            Icon::ChevronDown,
             "Next match",
             RepositoryAction::FindNext { card },
         ),
     ] {
-        row.push(
-            icon_control(
-                crate::ui_controls::symbolic_icon(icon),
-                label,
-                false,
-                matched,
-                Some(action),
-            )
-            .into(),
-        );
+        row.push(icon_control(icon, label, false, matched, Some(action)).into());
     }
     row.push(
         icon_control(
-            crate::ui_controls::symbolic_icon("window-close-symbolic"),
+            Icon::Close,
             "Close find",
             false,
             true,
@@ -7925,9 +7911,9 @@ fn pdf_document_view<'a>(
 ) -> Element<'a, RepositoryAction> {
     let PdfView { page, tone, zoom } = view;
     let inverted = matches!(tone, crate::editor::PdfTone::Inverted { .. });
-    let turn = |to: usize, glyph: &'static str, label: &'static str, enabled: bool| {
+    let turn = |to: usize, glyph: Icon, label: &'static str, enabled: bool| {
         icon_control(
-            crate::ui_controls::symbolic_icon(glyph),
+            glyph,
             label,
             false,
             enabled,
@@ -7940,17 +7926,17 @@ fn pdf_document_view<'a>(
         )
     };
     let mut controls: Vec<Element<'a, RepositoryAction>> = vec![
-        turn(0, "go-first-symbolic", "First page", page > 0).into(),
+        turn(0, Icon::First, "First page", page > 0).into(),
         turn(
             page.saturating_sub(1),
-            "go-previous-symbolic",
+            Icon::ChevronLeft,
             "Previous page",
             page > 0,
         )
         .into(),
         widget::text::body(format!("{} / {pages}", page + 1)).into(),
-        turn(page + 1, "go-next-symbolic", "Next page", page + 1 < pages).into(),
-        turn(pages - 1, "go-last-symbolic", "Last page", page + 1 < pages).into(),
+        turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
+        turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
     ];
     // The status sits on the flexible gap's left, so that a render starting or
     // landing cannot move the controls on its right. The zoom controls are the
@@ -7975,16 +7961,16 @@ fn pdf_document_view<'a>(
     } else {
         controls.push(iced::widget::Space::new().width(Length::Fill).into());
     }
-    let step = |to: Option<crate::editor::PdfZoom>, glyph: &'static str, label: &'static str| {
+    let step = |to: Option<crate::editor::PdfZoom>, glyph: Icon, label: &'static str| {
         icon_control(
-            crate::ui_controls::symbolic_icon(glyph),
+            glyph,
             label,
             false,
             to.is_some(),
             to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }),
         )
     };
-    controls.push(step(zoom.smaller(), "zoom-out-symbolic", "Draw the page smaller").into());
+    controls.push(step(zoom.smaller(), Icon::ZoomOut, "Draw the page smaller").into());
     controls.push(
         crate::interaction::tooltip(
             // A fixed width, because the label is between the two controls a
@@ -8004,14 +7990,14 @@ fn pdf_document_view<'a>(
         )
         .into(),
     );
-    controls.push(step(zoom.larger(), "zoom-in-symbolic", "Draw the page larger").into());
+    controls.push(step(zoom.larger(), Icon::ZoomIn, "Draw the page larger").into());
     controls.push(
         // Enabled even while fitted, because this is the mode the viewer is
         // in rather than an action: pressing it again asks for what is already
         // drawn, which the update rejects, and staying enabled is what lets
         // the selected surface say that fitting is what the size means now.
         icon_control(
-            crate::ui_controls::symbolic_icon("zoom-fit-best-symbolic"),
+            Icon::ZoomFit,
             "Fit the page to the pane",
             zoom.is_fit(),
             true,
@@ -8024,11 +8010,11 @@ fn pdf_document_view<'a>(
     );
     controls.push(
         icon_control(
-            crate::ui_controls::symbolic_icon(if inverted {
-                "display-brightness-symbolic"
+            if inverted {
+                Icon::Brightness
             } else {
-                "weather-clear-night-symbolic"
-            }),
+                Icon::Night
+            },
             if inverted {
                 "Show the document's own colors"
             } else {
@@ -8164,7 +8150,7 @@ fn editable_document_view<'a>(
         if document.conflict || document.durability_warning.is_some() {
             actions.push(
                 icon_control(
-                    crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+                    Icon::Refresh,
                     "Reload file from disk",
                     false,
                     !runtime.is_saving(),
@@ -8176,7 +8162,7 @@ fn editable_document_view<'a>(
         if document.conflict {
             actions.push(
                 icon_control(
-                    crate::ui_controls::symbolic_icon("document-save-as-symbolic"),
+                    Icon::Save,
                     "Overwrite conflicting file on disk",
                     false,
                     runtime.can_save(),
@@ -8190,7 +8176,7 @@ fn editable_document_view<'a>(
         } else if document.durability_warning.is_some() {
             actions.push(
                 icon_control(
-                    crate::ui_controls::symbolic_icon("document-save-symbolic"),
+                    Icon::Save,
                     "Retry save",
                     false,
                     runtime.can_save(),
@@ -8519,7 +8505,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
     let staged = runtime.can_select_diff_basis(&DiffBasis::HeadToIndex);
     crate::ui_controls::segmented_controls(vec![
         icon_control(
-            crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+            Icon::Changes,
             "Unstaged changes",
             unstaged && selected == Some(BasisChoice::Unstaged),
             unstaged,
@@ -8530,7 +8516,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         )
         .into(),
         icon_control(
-            crate::ui_controls::symbolic_icon("object-select-symbolic"),
+            Icon::Select,
             "Staged changes",
             staged && selected == Some(BasisChoice::Staged),
             staged,
@@ -8553,7 +8539,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         )
         .into(),
         icon_control(
-            crate::ui_controls::symbolic_icon("document-open-recent-symbolic"),
+            Icon::History,
             "Last commit changes",
             runtime.can_select_committed_basis(CommittedChoice::LastCommit)
                 && selected == Some(BasisChoice::Committed(CommittedChoice::LastCommit)),
@@ -8600,7 +8586,7 @@ fn diff_review_controls(
         ),
         crate::ui_controls::segmented_controls(vec![
             icon_control(
-                crate::ui_controls::symbolic_icon("view-list-symbolic"),
+                Icon::List,
                 "Inline diff",
                 runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Inline,
                 runtime.can_change_diff_layout(),
@@ -8608,7 +8594,7 @@ fn diff_review_controls(
             )
             .into(),
             icon_control(
-                crate::ui_controls::symbolic_icon("vcs-diff-symbolic"),
+                Icon::Diff,
                 "Side-by-side diff",
                 runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Split,
                 runtime.can_change_diff_layout(),
@@ -8619,7 +8605,7 @@ fn diff_review_controls(
         // Navigation commands are a plain cluster, distinct from mode choices.
         toolbar_group(vec![
             icon_control(
-                crate::ui_controls::symbolic_icon("go-up-symbolic"),
+                Icon::ChevronUp,
                 "Previous change",
                 false,
                 runtime.can_navigate_diff() && runtime.change_target(false).is_some(),
@@ -8644,7 +8630,7 @@ fn diff_review_controls(
                 basis_label(&runtime.diff_basis),
             ),
             icon_control(
-                crate::ui_controls::symbolic_icon("go-down-symbolic"),
+                Icon::ChevronDown,
                 "Next change",
                 false,
                 runtime.can_navigate_diff() && runtime.change_target(true).is_some(),
@@ -8656,7 +8642,7 @@ fn diff_review_controls(
     if runtime.can_retry_diff() {
         controls.push(toolbar_group(vec![
             icon_control(
-                crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+                Icon::Refresh,
                 "Retry diff",
                 false,
                 true,
@@ -9223,13 +9209,8 @@ fn diff_fold_row<'a>(
             })
     };
     let step = diff_layout::FOLD_STEP;
-    let reveal = |icon: &str, label: String, expansion| -> Element<'a, RepositoryAction> {
-        crate::ui_controls::compact_icon_control(
-            crate::ui_controls::symbolic_icon(icon),
-            label,
-            action(expansion),
-        )
-        .into()
+    let reveal = |icon: Icon, label: String, expansion| -> Element<'a, RepositoryAction> {
+        crate::ui_controls::compact_icon_control(icon, label, action(expansion)).into()
     };
     let mut controls = Vec::with_capacity(2);
     // A step that would leave too few rows to fold opens the whole run, so
@@ -9237,21 +9218,21 @@ fn diff_fold_row<'a>(
     if count >= step + diff_layout::FOLD_MIN_HIDDEN {
         if run.start > 0 {
             controls.push(reveal(
-                "diff-expand-down-symbolic",
+                Icon::ExpandDown,
                 format!("Expand down {step} lines"),
                 FoldExpansion::Down,
             ));
         }
         if run.end < model.row_count(mode) {
             controls.push(reveal(
-                "diff-expand-up-symbolic",
+                Icon::ExpandUp,
                 format!("Expand up {step} lines"),
                 FoldExpansion::Up,
             ));
         }
     } else {
         controls.push(reveal(
-            "diff-expand-all-symbolic",
+            Icon::ExpandAll,
             format!("Show {count} unchanged lines"),
             FoldExpansion::All,
         ));
@@ -10388,10 +10369,7 @@ fn information_state_height<'a>(
     widget::container(
         widget::container(
             widget::column::with_children(vec![
-                crate::ui_controls::symbolic_icon("dialog-information-symbolic")
-                    .icon()
-                    .size(28)
-                    .into(),
+                Icon::Info.handle().icon().size(28).into(),
                 widget::text::title3(title.into()).into(),
                 widget::text::body(detail.into())
                     .wrapping(iced::widget::text::Wrapping::Word)
@@ -10432,7 +10410,7 @@ mod tests {
             &runtime,
             Some(
                 icon_control(
-                    crate::ui_controls::symbolic_icon("internet-web-browser-symbolic"),
+                    Icon::Browser,
                     "Shell preview",
                     false,
                     true,

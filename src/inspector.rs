@@ -31,6 +31,7 @@ use crate::{
     },
     repository_widget::RepositoryInspectorContext,
     sidebar::{SidebarProject, SidebarWorktree},
+    ui_controls::Icon,
 };
 
 pub const RESIZE_HANDLE_NAME: &str = "Resize context inspector";
@@ -472,17 +473,13 @@ impl Section {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub label: Cow<'static, str>,
-    pub icon: &'static str,
+    pub icon: Icon,
     pub message: InspectorAction,
     pub primary: bool,
 }
 
 impl Action {
-    fn new(
-        label: impl Into<Cow<'static, str>>,
-        icon: &'static str,
-        message: InspectorAction,
-    ) -> Self {
+    fn new(label: impl Into<Cow<'static, str>>, icon: Icon, message: InspectorAction) -> Self {
         Self {
             label: label.into(),
             icon,
@@ -552,7 +549,7 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "New terminal here",
-                    "utilities-terminal-symbolic",
+                    Icon::Terminal,
                     InspectorAction::NewTerminalAt(session.launch.working_directory.clone()),
                 )
                 .primary(),
@@ -590,7 +587,7 @@ pub fn model_for_card(
             ));
             actions.push(Action::new(
                 "New terminal here",
-                "utilities-terminal-symbolic",
+                Icon::Terminal,
                 InspectorAction::NewTerminalAt(session.launch.recipe.working_directory.clone()),
             ));
         }
@@ -617,7 +614,7 @@ pub fn model_for_card(
                 actions.push(
                     Action::new(
                         "Reload",
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         InspectorAction::ReloadBrowser(card.id),
                     )
                     .primary(),
@@ -627,14 +624,14 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "Open in system browser",
-                    "internet-web-browser-symbolic",
+                    Icon::Browser,
                     InspectorAction::Retry(card.id),
                 )
                 .primary(),
             );
             actions.push(Action::new(
                 "Open URL",
-                "internet-web-browser-symbolic",
+                Icon::Browser,
                 InspectorAction::OpenBrowser(session.current_url.clone()),
             ));
         }
@@ -649,14 +646,14 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "New terminal here",
-                    "utilities-terminal-symbolic",
+                    Icon::Terminal,
                     InspectorAction::NewTerminalAt(view.worktree.clone()),
                 )
                 .primary(),
             );
             actions.push(Action::new(
                 "Refresh files",
-                "view-refresh-symbolic",
+                Icon::Refresh,
                 InspectorAction::RefreshRepository(card.id),
             ));
             if let Some(source) = repository_runtime {
@@ -710,7 +707,7 @@ pub fn model_for_card(
                 if source.can_back {
                     actions.push(Action::new(
                         "Back to files",
-                        "go-previous-symbolic",
+                        Icon::ChevronLeft,
                         InspectorAction::BackToRepositoryFiles(card.id),
                     ));
                 }
@@ -719,25 +716,25 @@ pub fn model_for_card(
                 if source.surface == "Editor" && source.can_show_diff {
                     actions.push(Action::new(
                         "Show diff",
-                        "vcs-diff-symbolic",
+                        Icon::Diff,
                         InspectorAction::ShowRepositoryDiff(card.id),
                     ));
                 } else if source.surface == "Diff" && !source.saving {
                     actions.push(Action::new(
                         "Show editor",
-                        "text-editor-symbolic",
+                        Icon::Edit,
                         InspectorAction::ShowRepositoryEditor(card.id),
                     ));
                 }
                 match source.markdown_mode {
                     Some("Edit") if !source.saving => actions.push(Action::new(
                         "Preview Markdown",
-                        "view-reveal-symbolic",
+                        Icon::Preview,
                         InspectorAction::ShowMarkdownPreview(card.id),
                     )),
                     Some("Preview") if !source.saving => actions.push(Action::new(
                         "Edit Markdown",
-                        "document-edit-symbolic",
+                        Icon::Changes,
                         InspectorAction::ShowMarkdownEdit(card.id),
                     )),
                     _ => {}
@@ -748,12 +745,12 @@ pub fn model_for_card(
                     let opposite_basis = match source.diff_basis {
                         Some("Staged") if source.can_select_unstaged_diff => Some((
                             "Show unstaged diff",
-                            "document-edit-symbolic",
+                            Icon::Changes,
                             InspectorAction::ShowUnstagedDiff(card.id),
                         )),
                         Some("Unstaged") if source.can_select_staged_diff => Some((
                             "Show staged diff",
-                            "object-select-symbolic",
+                            Icon::Select,
                             InspectorAction::ShowStagedDiff(card.id),
                         )),
                         _ => None,
@@ -765,13 +762,13 @@ pub fn model_for_card(
                         actions.push(if source.diff_mode == Some("Split") {
                             Action::new(
                                 "Show inline diff",
-                                "view-list-symbolic",
+                                Icon::List,
                                 InspectorAction::ShowInlineDiff(card.id),
                             )
                         } else {
                             Action::new(
                                 "Show split diff",
-                                "vcs-diff-symbolic",
+                                Icon::Diff,
                                 InspectorAction::ShowSplitDiff(card.id),
                             )
                         });
@@ -779,19 +776,19 @@ pub fn model_for_card(
                     if source.can_change_diff_layout && source.diff_change.is_some() {
                         actions.push(Action::new(
                             "Previous change",
-                            "go-up-symbolic",
+                            Icon::ChevronUp,
                             InspectorAction::PreviousRepositoryChange(card.id),
                         ));
                         actions.push(Action::new(
                             "Next change",
-                            "go-down-symbolic",
+                            Icon::ChevronDown,
                             InspectorAction::NextRepositoryChange(card.id),
                         ));
                     }
                     if source.can_retry_diff {
                         actions.push(Action::new(
                             "Retry diff",
-                            "view-refresh-symbolic",
+                            Icon::Refresh,
                             InspectorAction::RetryRepositoryDiff(card.id),
                         ));
                     }
@@ -799,14 +796,14 @@ pub fn model_for_card(
                 if source.can_discard {
                     actions.push(Action::new(
                         "Discard unsaved edits",
-                        "document-revert-symbolic",
+                        Icon::RevertFile,
                         InspectorAction::DiscardRepositoryEdits(card.id),
                     ));
                 }
                 if source.can_reload && !source.saving {
                     actions.push(Action::new(
                         "Reload from disk",
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         InspectorAction::ReloadRepositoryFile(card.id),
                     ));
                 }
@@ -814,7 +811,7 @@ pub fn model_for_card(
                     actions.push(
                         Action::new(
                             "Overwrite file",
-                            "document-save-symbolic",
+                            Icon::Save,
                             InspectorAction::OverwriteRepositoryFile(card.id),
                         )
                         .primary(),
@@ -823,7 +820,7 @@ pub fn model_for_card(
                     actions.push(
                         Action::new(
                             "Save file",
-                            "document-save-symbolic",
+                            Icon::Save,
                             InspectorAction::SaveRepositoryFile(card.id),
                         )
                         .primary(),
@@ -833,7 +830,7 @@ pub fn model_for_card(
             if let Some(project) = projects.iter().find(|project| project.id == view.project) {
                 actions.push(Action::new(
                     "Create PR",
-                    "pull-request-symbolic",
+                    Icon::PullRequest,
                     InspectorAction::CreatePullRequest {
                         project_id: project.id,
                         worktree: view.worktree.clone(),
@@ -856,7 +853,7 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "Search projects",
-                    "system-search-symbolic",
+                    Icon::Search,
                     InspectorAction::FocusProjectSearch,
                 )
                 .primary(),
@@ -885,17 +882,12 @@ pub fn model_for_card(
     {
         actions.insert(
             0,
-            Action::new(
-                "Retry",
-                "view-refresh-symbolic",
-                InspectorAction::Retry(card.id),
-            )
-            .primary(),
+            Action::new("Retry", Icon::Refresh, InspectorAction::Retry(card.id)).primary(),
         );
     }
     actions.push(Action::new(
         "Close card",
-        "window-close-symbolic",
+        Icon::Close,
         InspectorAction::CloseCard(card.id),
     ));
 
@@ -1147,24 +1139,24 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
         if status.can_restart() {
             actions.push(Action::new(
                 "Restart language server",
-                "view-refresh-symbolic",
+                Icon::Refresh,
                 InspectorAction::RestartLanguageServer(card),
             ));
         }
         if status.is_ready() {
             actions.push(Action::new(
                 "Describe symbol",
-                "dialog-information-symbolic",
+                Icon::Info,
                 InspectorAction::RequestLspHover(card),
             ));
             actions.push(Action::new(
                 "Go to definition",
-                "go-next-symbolic",
+                Icon::ChevronRight,
                 InspectorAction::GoToLspDefinition(card),
             ));
             actions.push(Action::new(
                 "Find references",
-                "edit-find-symbolic",
+                Icon::Search,
                 InspectorAction::FindLspReferences(card),
             ));
         }
@@ -1176,7 +1168,7 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
     {
         actions.push(Action::new(
             "Dismiss results",
-            "window-close-symbolic",
+            Icon::Close,
             InspectorAction::DismissLspResults(card),
         ));
     }
@@ -1529,7 +1521,7 @@ impl SegmentedActions {
                 // buttons by id, and their accessible names come from their
                 // labels, so the identity buys nothing and costs a crash.
                 widget::button::standard(action.label)
-                    .leading_icon(crate::ui_controls::symbolic_icon(action.icon))
+                    .leading_icon(action.icon)
                     .class(crate::sidebar::sidebar_button_style(false))
                     .width(Length::Fill)
                     .on_press(action.message)
@@ -1900,11 +1892,11 @@ pub fn view(
         sections.push(crate::design::horizontal_rule().into());
         sections.push(
             widget::button::text("Pane diagnostics")
-                .leading_icon(crate::ui_controls::symbolic_icon(if diagnostics_open {
-                    "pan-down-symbolic"
+                .leading_icon(if diagnostics_open {
+                    Icon::PanDown
                 } else {
-                    "pan-end-symbolic"
-                }))
+                    Icon::PanEnd
+                })
                 .on_press(InspectorAction::ToggleDiagnostics(model.card_id))
                 .width(Length::Fill)
                 .into(),

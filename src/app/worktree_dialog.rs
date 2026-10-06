@@ -501,11 +501,11 @@ impl Cagents {
             } else {
                 "Base branch & destination"
             })
-            .leading_icon(crate::ui_controls::symbolic_icon(if dialog.advanced {
-                "pan-down-symbolic"
+            .leading_icon(if dialog.advanced {
+                Icon::PanDown
             } else {
-                "pan-end-symbolic"
-            }))
+                Icon::PanEnd
+            })
             .id(widget::Id::new("dialog.worktree.options"))
             .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
             .into(),

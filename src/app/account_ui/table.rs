@@ -353,7 +353,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
             .collect(),
     );
     let mut add_content: Vec<Element<'a, Message>> = vec![
-        widget::icon(crate::ui_controls::symbolic_icon("list-add-symbolic"))
+        widget::icon(Icon::Plus.handle())
             .size(design::COMPACT_ICON_SIZE)
             .into(),
     ];
@@ -548,7 +548,7 @@ fn group<'a>(
     if Account::PROVIDERS.contains(&provider) && state.installed.get(&provider) != Some(&false) {
         header.push(
             crate::ui_controls::compact_icon_control(
-                crate::ui_controls::symbolic_icon("list-add-symbolic"),
+                Icon::Plus,
                 format!("Add a {} account", provider.label()),
                 Some(Message::AccountUi(Action::Add {
                     provider,
@@ -995,7 +995,7 @@ fn actions<'a>(
     let open = state.table.menu.as_ref() == Some(&account.id);
     let removing = state.removing.contains(&account.id);
     let menu_button = crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon("view-more-symbolic"),
+        Icon::More,
         "Account actions",
         (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
     );
@@ -1088,7 +1088,7 @@ fn menu<'a>(
         if !state.registry.is_default(&account.account) {
             items.push(
                 crate::ui_controls::popover_item(
-                    crate::ui_controls::symbolic_icon("emblem-ok-symbolic"),
+                    Icon::Check,
                     "Set as default",
                     "New conversations and shell terminals use this account",
                     action(Action::SetDefault(id.clone())),
@@ -1103,7 +1103,7 @@ fn menu<'a>(
             {
                 items.push(
                     crate::ui_controls::popover_item(
-                        crate::ui_controls::symbolic_icon("edit-clear-symbolic"),
+                        Icon::Clear,
                         "Use global default for this project",
                         "Remove this project's account choice",
                         action(Action::ClearProjectDefault(
@@ -1116,7 +1116,7 @@ fn menu<'a>(
             } else {
                 items.push(
                     crate::ui_controls::popover_item(
-                        crate::ui_controls::symbolic_icon("folder-symbolic"),
+                        Icon::Folder,
                         "Use for this project",
                         "New shells and conversations in every worktree of this project use this account",
                         action(Action::SetProjectDefault(project, id.clone())),
@@ -1127,7 +1127,7 @@ fn menu<'a>(
         }
         items.push(
             crate::ui_controls::popover_item(
-                crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
+                Icon::Terminal,
                 "Sign in again",
                 "Run the provider's login in a terminal",
                 action(Action::SignIn(id.clone())),
@@ -1137,7 +1137,7 @@ fn menu<'a>(
         if account.account.provider == Provider::Codex && !crate::device::is_remote() {
             items.push(
                 crate::ui_controls::popover_item(
-                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
+                    Icon::Terminal,
                     "Sign in again with a code",
                     "Use a one-time code to sign in to this account without a local browser callback",
                     action(Action::SignInWithCode(id.clone())),
@@ -1147,7 +1147,7 @@ fn menu<'a>(
         }
         items.push(
             crate::ui_controls::popover_item(
-                crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+                Icon::Changes,
                 "Rename",
                 "Give this account a name of your own",
                 action(Action::Rename(id.clone())),
@@ -1158,7 +1158,7 @@ fn menu<'a>(
             if let Some(retained) = state.duplicate_to_keep(account) {
                 items.push(
                     crate::ui_controls::popover_item(
-                        crate::ui_controls::symbolic_icon("folder-symbolic"),
+                        Icon::Folder,
                         "Archive duplicate",
                         format!("Keep {}. Preserve this home's login, files and saved sessions. Link its home to restore it.", state.display_name(retained)),
                         action(Action::ArchiveDuplicate(id.clone())),
@@ -1168,7 +1168,7 @@ fn menu<'a>(
             }
             items.push(
                 crate::ui_controls::popover_item(
-                    crate::ui_controls::symbolic_icon("list-remove-symbolic"),
+                    Icon::Minus,
                     "Remove",
                     if account.account.is_linked() {
                         "Forget this home without changing its files"
@@ -1194,7 +1194,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     };
     let account = widget::row::with_children(vec![
         if login.phase == LoginPhase::CallbackBlocked {
-            widget::icon(crate::ui_controls::symbolic_icon("dialog-warning-symbolic"))
+            widget::icon(Icon::Warning.handle())
                 .size(design::ROW_ICON_SIZE)
                 .into()
         } else {
@@ -1230,7 +1230,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
                 }))
                 .into(),
             crate::ui_controls::compact_icon_control(
-                crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                Icon::Close,
                 "Dismiss failed sign-in",
                 Some(Message::AccountUi(Action::CancelLogin(login.key))),
             )
@@ -1239,7 +1239,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
         .into()
     } else if login.phase == LoginPhase::Waiting {
         crate::ui_controls::compact_icon_control(
-            crate::ui_controls::symbolic_icon("window-close-symbolic"),
+            Icon::Close,
             "Cancel sign-in",
             Some(Message::AccountUi(Action::CancelLogin(login.key))),
         )

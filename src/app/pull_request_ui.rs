@@ -333,7 +333,7 @@ fn comment<'a>(
         },
     );
     let actions = crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon("external-link-symbolic"),
+        Icon::PopOut,
         "Open comment on GitHub",
         Some(Action::OpenUrl(comment.url.clone())),
     )
@@ -468,10 +468,10 @@ fn section_header(
 ) -> Element<'static, Action> {
     widget::button::custom(
         widget::row::with_children(vec![
-            crate::ui_controls::symbolic_icon(if open {
-                "go-down-symbolic"
+            Icon::handle(if open {
+                Icon::ChevronDown
             } else {
-                "go-next-symbolic"
+                Icon::ChevronRight
             })
             .icon()
             .size(design::ROW_ICON_SIZE)
@@ -518,10 +518,11 @@ fn comment_matches(comment: &PullRequestComment, filter: &str) -> bool {
 pub fn view(state: &State) -> Element<'_, Action> {
     let visual = state.preview.as_ref().map(sidebar::pull_request_visual);
     let header = widget::row::with_children(vec![
-        widget::icon(visual.as_ref().map_or_else(
-            || crate::ui_controls::symbolic_icon("pull-request-symbolic"),
-            |(icon, _)| icon.clone(),
-        ))
+        widget::icon(
+            visual
+                .as_ref()
+                .map_or_else(|| Icon::PullRequest.handle(), |(icon, _)| icon.clone()),
+        )
         .size(design::ROW_ICON_SIZE)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
             cosmic::iced::widget::svg::Style {
@@ -555,7 +556,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         .height(design::ROW_ICON_SIZE)
         .into(),
         crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+            Icon::Refresh,
             "Refresh pull request",
             false,
             state.target.is_some() && !state.loading,
@@ -790,15 +791,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         let (symbol, tone): (_, fn(&cosmic::Theme) -> cosmic::iced::Color) =
                             match check.bucket.0.as_str() {
                                 bucket if sidebar::is_check_failure(bucket) => {
-                                    ("dialog-error-symbolic", design::destructive_color)
+                                    (Icon::Error, design::destructive_color)
                                 }
                                 bucket if sidebar::is_check_pending(bucket) => {
-                                    ("content-loading-symbolic", design::warning_color)
+                                    (Icon::Loading, design::warning_color)
                                 }
                                 bucket if sidebar::is_check_success(bucket) => {
-                                    ("emblem-ok-symbolic", design::success_color)
+                                    (Icon::Check, design::success_color)
                                 }
-                                _ => ("dialog-information-symbolic", design::muted_color),
+                                _ => (Icon::Info, design::muted_color),
                             };
                         let mut content = widget::column::with_children(vec![
                             design::body(&check.name).width(Length::Fill).into(),
@@ -829,16 +830,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     // and the run of outcomes reads down the
                                     // panel as one column.
                                     widget::container(
-                                        crate::ui_controls::symbolic_icon(symbol)
-                                            .icon()
-                                            .size(design::ROW_ICON_SIZE),
+                                        symbol.handle().icon().size(design::ROW_ICON_SIZE),
                                     )
                                     .width(Length::Fixed(design::ROW_ICON_SIZE.into()))
                                     .align_x(Alignment::Center)
                                     .into(),
                                     content.into(),
                                     widget::container(
-                                        crate::ui_controls::symbolic_icon("external-link-symbolic")
+                                        Icon::PopOut
+                                            .handle()
                                             .icon()
                                             .size(design::COMPACT_ICON_SIZE),
                                     )

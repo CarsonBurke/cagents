@@ -2,7 +2,9 @@
 
 #[cfg(test)]
 pub(crate) mod accessibility_probe;
+mod icon;
 mod responsive;
+pub use icon::Icon;
 pub use responsive::responsive;
 
 use std::borrow::Cow;
@@ -15,270 +17,13 @@ use cosmic::{
 
 use crate::interaction::tooltip;
 
-/// Resolve a symbolic icon name, preferring the application's own drawing.
-///
-/// Every symbolic icon the interface shows goes through here. A bundled name
-/// never depends on the desktop icon theme; any other name must ship in the
-/// stock COSMIC theme chain (Cosmic, then Pop), which
-/// `tests::every_symbolic_icon_name_resolves` enforces for the whole crate.
-pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
-    bundled_symbolic_icon(name).unwrap_or_else(|| widget::icon::from_name(name).handle())
-}
-
-/// The application's own symbolic drawings, keyed by the freedesktop-style
-/// names call sites use. They keep controls legible where the desktop theme
-/// omits a name or answers it through libcosmic's prefix fallback, which
-/// retries `internet-web-browser-symbolic` as the full-color
-/// `internet-web-browser` application icon that a symbolic render flattens
-/// into a solid disc. Static handles retain renderer cache identity.
-fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
-    use std::sync::LazyLock;
-    static PUSH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 11V2M4.5 5.5 8 2l3.5 3.5M2 10v3.5h12V10"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static BRANCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1A3.5 3.5 0 0 1 8.5 9H4"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHANGES: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><path d="M3 1.75h7l3 3v9.5H3zM10 2v3h3M5.5 8h5M8 5.5v5M5.5 12h5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static TREE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3h4M4 5.5v7h3M4 8h3M9 8h4M9 12.5h4"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static PREVIEW: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8Z"/><circle cx="8" cy="8" r="2"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static SPLIT_PANEL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10 3v10"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="13" r="1.5"/><path d="M4 4.5v7M12 11.5V6a3 3 0 0 0-3-3H7m2-2L7 3l2 2"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static MERGED_PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="10" r="1.5"/><path d="M4 4.5v7M4 5a5 5 0 0 0 5 5h1.5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static CLOSED_PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="13" r="1.5"/><path d="M4 4.5v7M12 11.5V9M9 2l5 5M14 2l-5 5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHEVRON_DOWN: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHEVRON_UP: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m4 10 4-4 4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHEVRON_RIGHT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m6 4 4 4-4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    // Diff folds, after GitHub's fold-up / fold-down / unfold: the rule is the
-    // fold, and the arrows say which side of it the revealed lines come from.
-    static EXPAND_UP: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 11V2.5M4.75 5.75 8 2.5l3.25 3.25M3 13.5h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static EXPAND_DOWN: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 5v8.5M4.75 10.25 8 13.5l3.25-3.25M3 2.5h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static EXPAND_ALL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 5.5v-4M5.5 3.5 8 1l2.5 2.5M8 10.5v4M5.5 12.5 8 15l2.5-2.5M3 8h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static PLUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8M8 4v8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHANNEL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2 2.5h12v9H7l-4 3v-3H2zM5 6h6M5 8.5h4" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHANNEL_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 2.5H2v9h1v3l4-3h7V9M12 1v6M9 4h6" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static WORKTREE_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><path d="M4 4.5v7M4 9h5a3 3 0 0 0 3-3M12 1v5M9.5 3.5h5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static ATTENTION: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5h10l-1.5-2V6a3.5 3.5 0 0 0-7 0v3.5zM6.5 13.5a1.7 1.7 0 0 0 3 0M8 1v1"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static WORKING: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="4.5"/><circle cx="8" cy="8" r="1.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5 13 13M3 13l1.5-1.5M11.5 4.5 13 3"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static WAITING: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h10a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7l-4 3v-3H2V3.5a1 1 0 0 1 1-1ZM8 5v2.5"/><path d="M8 9.5h0"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static ADDED_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 1.5h6l4 4v9H3zM9 1.5v4h4M5.5 10h5M8 7.5v5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static EDIT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 12.5 6.5 6 13H3v-3zM8.5 4.5l3 3"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static RENAME: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12.5h5M9.5 3.5 12.5 6.5 7 12H4v-3z"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static DUPLICATE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="4.5" width="8" height="10" rx="1"/><path d="M10.5 4.5V3a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1H5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static COPY_PATH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h6l4 4v7H3zM9 2.5v4h4M5 9.5h6M5 12h4"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static COPY_RELATIVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5h4.5M5.5 6.5 3 8.5l2.5 2M13 7.5h-4.5M10.5 5.5 13 7.5l-2.5 2"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // A floppy disk, not the desktop theme's download-arrow tray: the save
-    // action stands alone in toolbars with only a tooltip to name it.
-    static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h7l3 3v8H3zM6 2.5V6h5V2.5M6 13.5v-3h4v3"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // A page with a return arrow distinguishes discarding edits from Undo.
-    static REVERT_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6M9.5 1.75v3.5H13M5 7 2 10l3 3M2 10h6a2.5 2.5 0 0 0 0-5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // A page plus an inward arrow makes the open action unambiguous at 16px.
-    static OPEN_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6zM9.5 1.75v3.5H13M2 8h5m-2-2 2 2-2 2"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // The arrow enters the open folder rather than relying on a filled theme glyph.
-    static OPEN_FOLDER: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5h4.25l1.5 1.75H14L12.7 13.25H3.55zM2 6h12M1 8h5m-2-2 2 2-2 2"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static SIDEBAR: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // Both gear and hub are symmetric around (8, 8). Render this vector
-    // directly at the control's icon size, without a bitmap intermediate.
-    static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"><path d="M6.52 3.43L6.65 1.64L9.35 1.64L9.48 3.43L11.21 4.43L12.83 3.65L14.18 5.99L12.70 7.00L12.70 9.00L14.18 10.01L12.83 12.35L11.21 11.57L9.48 12.57L9.35 14.36L6.65 14.36L6.52 12.57L4.79 11.57L3.17 12.35L1.82 10.01L3.30 9.00L3.30 7.00L1.82 5.99L3.17 3.65L4.79 4.43Z"/><circle cx="8" cy="8" r="2.2"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    // A clock face with its hand swept back: the log walk, not a document.
-    static HISTORY: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2 2.5v3h3M8 5v3.2l2.2 1.3"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static INFO: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.2v4.1M8 5.2h0"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static POP_OUT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 9v3.5a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1H7M10 2.5h3.5V6M13.5 2.5 8 8"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static COMMENT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.5h9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7.5l-3 2.5v-2.5h-1a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // Review marks: an empty box, a box with a check, and a box with a dash
-    // for a folder whose files are only partly viewed. Drawn here so the
-    // three read as one family whatever icon theme the desktop provides.
-    static CHECKBOX: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2.75" y="2.75" width="10.5" height="10.5" rx="2" fill="none" stroke="black" stroke-width="1.4"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHECKBOX_CHECKED: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2.75" y="2.75" width="10.5" height="10.5" rx="2" fill="none" stroke="black" stroke-width="1.4"/><path d="m5.25 8.25 1.9 1.9 3.6-4.1" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHECKBOX_MIXED: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2.75" y="2.75" width="10.5" height="10.5" rx="2" fill="none" stroke="black" stroke-width="1.4"/><path d="M5.5 8h5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static MINUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    static SEARCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.25" fill="none" stroke="black" stroke-width="1.4"/><path d="m10.25 10.25 3.25 3.25" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    // Two edges with the content closing between them. The desktop themes
-    // answer "compact" with a window-restore glyph, which is what made the
-    // one control here that rewrites a conversation look like a control that
-    // resizes a pane.
-    static COMPRESS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.5h11M2.5 13.5h11M8 4.4V7.1M5.9 5.2 8 7.3l2.1-2.1M8 11.6V8.9M5.9 10.8 8 8.7l2.1 2.1"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHEVRON_LEFT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m10 4-4 4 4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
-    });
-    // A globe and a speech bubble. Tabs, the inspector heading, launchers,
-    // and empty states name a browser or a chat with one mark.
-    static BROWSER: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.25"/><ellipse cx="8" cy="8" rx="2.75" ry="6.25"/><path d="M1.75 8h12.5M3.25 4.5h9.5M3.25 11.5h9.5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    static CHAT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" d="M3.5 2.5h9A1.5 1.5 0 0 1 14 4v6a1.5 1.5 0 0 1-1.5 1.5H7L3.5 14v-2.5A1.5 1.5 0 0 1 2 10V4a1.5 1.5 0 0 1 1.5-1.5ZM5 5.75h6M5 8.25h4"/></svg>"#.as_slice()).symbolic(true)
-    });
-    // Two panes, a removal beside an addition: a comparison. It names both
-    // the diff surface and its side-by-side layout.
-    static DIFF: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 3v10M3.75 8h2.5M9.75 8h2.5M11 6.75v2.5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // A node on the history line, with the pull-request glyphs' stroke.
-    static COMMIT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v4M8 10.5v4"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    // An outlined keyboard: a row of keys over a space bar. The themes' only
-    // match is Adwaita's legacy glyph, a filled slab that reads as a solid
-    // square at 16px.
-    static KEYBOARD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="M4.25 6.5h0M6.75 6.5h0M9.25 6.5h0M11.75 6.5h0M5.5 9.5h5"/></g></svg>"#.as_slice()).symbolic(true)
-    });
-    let icon: &LazyLock<widget::icon::Handle> = match name {
-        "git-branch-symbolic" => &BRANCH,
-        "vcs-commit-symbolic" => &COMMIT,
-        "vcs-push-symbolic" => &PUSH,
-        "edit-find-symbolic" | "system-search-symbolic" => &SEARCH,
-        "document-edit-symbolic" => &CHANGES,
-        "text-editor-symbolic" => &EDIT,
-        "edit-rename-symbolic" => &RENAME,
-        "edit-duplicate-symbolic" => &DUPLICATE,
-        "edit-copy-path-symbolic" => &COPY_PATH,
-        "edit-copy-relative-path-symbolic" => &COPY_RELATIVE,
-        "view-list-tree-symbolic" => &TREE,
-        "view-reveal-symbolic" => &PREVIEW,
-        "view-split-right-symbolic" => &SPLIT_PANEL,
-        "vcs-diff-symbolic" => &DIFF,
-        "view-sidebar-start-symbolic" => &SIDEBAR,
-        "view-compress-symbolic" => &COMPRESS,
-        "pull-request-symbolic" => &PULL_REQUEST,
-        "merged-pull-request-symbolic" => &MERGED_PULL_REQUEST,
-        "closed-pull-request-symbolic" => &CLOSED_PULL_REQUEST,
-        "go-down-symbolic" => &CHEVRON_DOWN,
-        "go-up-symbolic" => &CHEVRON_UP,
-        "go-next-symbolic" => &CHEVRON_RIGHT,
-        "go-previous-symbolic" => &CHEVRON_LEFT,
-        "diff-expand-up-symbolic" => &EXPAND_UP,
-        "diff-expand-down-symbolic" => &EXPAND_DOWN,
-        "diff-expand-all-symbolic" => &EXPAND_ALL,
-        "list-add-symbolic" => &PLUS,
-        "list-remove-symbolic" => &MINUS,
-        "checkbox-symbolic" => &CHECKBOX,
-        "checkbox-checked-symbolic" => &CHECKBOX_CHECKED,
-        "checkbox-mixed-symbolic" => &CHECKBOX_MIXED,
-        "channel-symbolic" => &CHANNEL,
-        "channel-add-symbolic" => &CHANNEL_ADD,
-        "chat-bubble-text-symbolic" => &CHAT,
-        "internet-web-browser-symbolic" => &BROWSER,
-        "worktree-add-symbolic" => &WORKTREE_ADD,
-        "notifications-symbolic" => &ATTENTION,
-        "agent-working-symbolic" => &WORKING,
-        "agent-waiting-symbolic" => &WAITING,
-        "document-new-symbolic" => &ADDED_FILE,
-        "document-open-symbolic" => &OPEN_FILE,
-        "folder-open-symbolic" => &OPEN_FOLDER,
-        "document-save-symbolic" | "document-save-as-symbolic" => &SAVE,
-        "document-revert-symbolic" => &REVERT_FILE,
-        "emblem-system-symbolic" | "preferences-system-symbolic" => &SETTINGS,
-        "preferences-desktop-keyboard-symbolic" => &KEYBOARD,
-        "insert-text-symbolic" => &INSERT_TEXT,
-        "document-open-recent-symbolic" => &HISTORY,
-        "dialog-information-symbolic" => &INFO,
-        "window-close-symbolic" => &CLOSE,
-        "comment-symbolic" => &COMMENT,
-        "view-pop-out-symbolic" | "external-link-symbolic" => &POP_OUT,
-        _ => return None,
-    };
-    Some(LazyLock::force(icon).clone())
-}
-
 /// An informative glyph with the same resting ink as an inactive navigation
 /// row. Use this outside buttons, where no control style supplies icon color.
 pub fn passive_icon<'a, Message: 'a>(
-    icon: widget::icon::Handle,
+    icon: impl Into<widget::icon::Handle>,
     size: u16,
 ) -> Element<'a, Message> {
-    widget::container(widget::icon(icon).size(size))
+    widget::container(widget::icon(icon.into()).size(size))
         .class(cosmic::theme::Container::custom(|theme| {
             iced::widget::container::Style {
                 icon_color: Some(crate::design::muted_icon_color(theme)),
@@ -329,14 +74,14 @@ pub struct IconControl<'a, Message> {
 /// A centered, fixed-size icon target with a quiet surface selected state.
 /// Native buttons retain keyboard focus, accessibility, and enabled cursors.
 pub fn icon_control<'a, Message: Clone + 'a>(
-    icon: widget::icon::Handle,
+    icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
     selected: bool,
     enabled: bool,
     on_press: Option<Message>,
 ) -> IconControl<'a, Message> {
     let label = label.into();
-    let content = widget::container(widget::icon(icon).size(crate::design::ROW_ICON_SIZE))
+    let content = widget::container(widget::icon(icon.into()).size(crate::design::ROW_ICON_SIZE))
         // COSMIC's transparent container resets inherited icon color. Keep the
         // button's semantic status tone through this alignment-only wrapper.
         .class(cosmic::theme::Container::custom(|_| {
@@ -362,16 +107,17 @@ pub fn icon_control<'a, Message: Clone + 'a>(
 /// The same target at caption scale, for controls that belong to a message
 /// rather than to a toolbar.
 pub fn compact_icon_control<'a, Message: Clone + 'a>(
-    icon: widget::icon::Handle,
+    icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
     on_press: Option<Message>,
 ) -> IconControl<'a, Message> {
     let label = label.into();
-    let content = widget::container(widget::icon(icon).size(crate::design::COMPACT_ICON_SIZE))
-        .class(cosmic::theme::Container::custom(|_| {
-            iced::widget::container::Style::default()
-        }))
-        .center(Length::Fill);
+    let content =
+        widget::container(widget::icon(icon.into()).size(crate::design::COMPACT_ICON_SIZE))
+            .class(cosmic::theme::Container::custom(|_| {
+                iced::widget::container::Style::default()
+            }))
+            .center(Length::Fill);
     IconControl {
         button: widget::button::custom(content)
             .name(label.clone())
@@ -466,14 +212,14 @@ pub fn popover<'a, Message: Clone + 'static>(
 
 /// A full-width menu action with a stable icon column and a secondary description.
 pub fn popover_item<'a, Message: Clone + 'a>(
-    icon: widget::icon::Handle,
+    icon: impl Into<widget::icon::Handle>,
     title: &'a str,
     description: impl Into<Cow<'a, str>> + 'a,
     on_press: Message,
 ) -> widget::button::Button<'a, Message> {
     widget::button::custom(
         widget::row::with_children(vec![
-            widget::container(widget::icon(icon).size(20))
+            widget::container(widget::icon(icon.into()).size(20))
                 .center_x(28)
                 .center_y(36)
                 .into(),
@@ -1179,9 +925,7 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
     use std::f32::consts::TAU;
-    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     #[test]
@@ -1230,213 +974,6 @@ mod tests {
             }
             assert_eq!(messages.len(), usize::from(!selected));
         }
-    }
-
-    /// Symbolic names the application leaves to the desktop theme. Each
-    /// ships under its exact name in the stock COSMIC chain: the Cosmic
-    /// theme, and the Pop theme that `cosmic-icon-theme` depends on and
-    /// inherits. A name outside this list and the bundled set reaches
-    /// libcosmic's prefix fallback or Adwaita's legacy glyphs, and renders as
-    /// a blank, a solid disc, or a filled slab.
-    const THEME_SYMBOLIC_ICONS: &[&str] = &[
-        "accessories-text-editor-symbolic",
-        "action-unavailable-symbolic",
-        "alarm-symbolic",
-        "applications-utilities-symbolic",
-        "avatar-default-symbolic",
-        "changes-prevent-symbolic",
-        "content-loading-symbolic",
-        "dialog-error-symbolic",
-        "dialog-warning-symbolic",
-        "display-brightness-symbolic",
-        "document-import-symbolic",
-        "edit-clear-symbolic",
-        "edit-copy-symbolic",
-        "edit-delete-symbolic",
-        "edit-undo-symbolic",
-        "emblem-ok-symbolic",
-        "folder-symbolic",
-        "go-first-symbolic",
-        "go-home-symbolic",
-        "go-jump-symbolic",
-        "go-last-symbolic",
-        "image-x-generic-symbolic",
-        "mail-attachment-symbolic",
-        "mail-send-symbolic",
-        "media-playback-stop-symbolic",
-        "object-select-symbolic",
-        "pan-down-symbolic",
-        "pan-end-symbolic",
-        "preferences-desktop-display-symbolic",
-        "preferences-system-notifications-symbolic",
-        "process-stop-symbolic",
-        "software-update-available-symbolic",
-        "system-users-symbolic",
-        "text-x-generic-symbolic",
-        "utilities-terminal-symbolic",
-        "view-filter-symbolic",
-        "view-grid-symbolic",
-        "view-list-symbolic",
-        "view-more-symbolic",
-        "view-private-symbolic",
-        "view-refresh-symbolic",
-        "weather-clear-night-symbolic",
-        "web-browser-symbolic",
-        "zoom-fit-best-symbolic",
-        "zoom-in-symbolic",
-        "zoom-out-symbolic",
-    ];
-
-    /// The crate's Rust sources, keyed by path. This module's own
-    /// list would otherwise read as a use of every name on it; the module
-    /// closes its file, so everything before it is production code.
-    fn crate_sources() -> BTreeMap<PathBuf, String> {
-        fn visit(dir: &Path, sources: &mut BTreeMap<PathBuf, String>) {
-            for entry in std::fs::read_dir(dir).expect("read a source directory") {
-                let path = entry.expect("read a source entry").path();
-                if path.is_dir() {
-                    visit(&path, sources);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    let mut source = std::fs::read_to_string(&path).expect("read a source file");
-                    if path.ends_with("src/ui_controls.rs") {
-                        let tests = source
-                            .find("\n#[cfg(test)]\nmod tests {")
-                            .expect("this module is in ui_controls.rs");
-                        source.truncate(tests);
-                    }
-                    sources.insert(path, source);
-                }
-            }
-        }
-        let mut sources = BTreeMap::new();
-        visit(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut sources,
-        );
-        sources
-    }
-
-    /// Every `"…-symbolic"` string literal in the crate's sources, with the
-    /// files that name it. Icon names reach `symbolic_icon` through tables,
-    /// models, and match arms, so the literals are the whole inventory.
-    fn symbolic_icon_names_in_source() -> BTreeMap<String, BTreeSet<PathBuf>> {
-        let mut names = BTreeMap::<String, BTreeSet<PathBuf>>::new();
-        for (path, source) in crate_sources() {
-            for (end, _) in source.match_indices("-symbolic\"") {
-                let head = &source[..end];
-                let stem = &head[head.rfind('"').map_or(0, |quote| quote + 1)..];
-                let is_name = !stem.is_empty()
-                    && stem.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    });
-                if is_name {
-                    names
-                        .entry(format!("{stem}-symbolic"))
-                        .or_default()
-                        .insert(path.clone());
-                }
-            }
-        }
-        names
-    }
-
-    /// A direct theme lookup would skip the bundled drawings. Only external
-    /// editors' application icons, named by their desktop entries, go to the
-    /// theme without passing through `symbolic_icon`.
-    #[test]
-    fn symbolic_icons_are_drawn_through_symbolic_icon() {
-        let bypasses: Vec<_> = crate_sources()
-            .into_iter()
-            .filter(|(path, _)| !path.ends_with("src/ui_controls.rs"))
-            .flat_map(|(path, source)| {
-                source
-                    .match_indices("from_name(")
-                    .filter(|(start, call)| {
-                        !source[start + call.len()..].starts_with("editor.icon")
-                    })
-                    .map(|(start, _)| {
-                        let line = source[..start].lines().count();
-                        format!("{}:{line}", path.display())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        assert!(
-            bypasses.is_empty(),
-            "icons looked up with `from_name` instead of `symbolic_icon`: {bypasses:#?}"
-        );
-    }
-
-    #[test]
-    fn every_symbolic_icon_name_resolves() {
-        let names = symbolic_icon_names_in_source();
-        assert!(
-            names.contains_key("alarm-symbolic"),
-            "the source scan found no icon names"
-        );
-        let unresolved: BTreeMap<_, _> = names
-            .iter()
-            .filter(|(name, _)| {
-                bundled_symbolic_icon(name).is_none()
-                    && !THEME_SYMBOLIC_ICONS.contains(&name.as_str())
-            })
-            .collect();
-        assert!(
-            unresolved.is_empty(),
-            "icon names neither bundled by `bundled_symbolic_icon` nor shipped by the \
-             COSMIC theme chain: {unresolved:#?}"
-        );
-        for name in THEME_SYMBOLIC_ICONS {
-            assert!(
-                bundled_symbolic_icon(name).is_none(),
-                "{name} is bundled; drop it from THEME_SYMBOLIC_ICONS"
-            );
-            assert!(
-                names.contains_key(*name),
-                "{name} is no longer used; drop it from THEME_SYMBOLIC_ICONS"
-            );
-        }
-    }
-
-    /// Where the COSMIC theme chain is installed, confirm it still carries
-    /// every name the application leaves to it.
-    #[test]
-    fn theme_supplied_icon_names_ship_in_the_installed_cosmic_theme() {
-        fn visit(dir: &Path, stems: &mut BTreeSet<String>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for path in entries.flatten().map(|entry| entry.path()) {
-                if path.is_dir() {
-                    visit(&path, stems);
-                } else if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    stems.insert(stem.to_owned());
-                }
-            }
-        }
-        let data_dirs = std::env::var_os("XDG_DATA_DIRS")
-            .filter(|dirs| !dirs.is_empty())
-            .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-        let theme_roots: Vec<PathBuf> = std::env::split_paths(&data_dirs)
-            .flat_map(|dir| ["Cosmic", "Pop"].map(|theme| dir.join("icons").join(theme)))
-            .filter(|root| root.is_dir())
-            .collect();
-        if !theme_roots.iter().any(|root| root.ends_with("Cosmic")) {
-            eprintln!("the Cosmic icon theme is not installed; skipping");
-            return;
-        }
-        let mut stems = BTreeSet::new();
-        for root in &theme_roots {
-            visit(root, &mut stems);
-        }
-        let missing: Vec<_> = THEME_SYMBOLIC_ICONS
-            .iter()
-            .filter(|name| !stems.contains(**name))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "missing from {theme_roots:?}; bundle them in `bundled_symbolic_icon`: {missing:?}"
-        );
     }
 
     #[test]

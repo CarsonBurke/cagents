@@ -829,7 +829,7 @@ impl State {
             && (drafting_here
                 || (self.can_mutate_discussion() && self.discussion.composer.is_none()));
         let control: Element<'_, Action> = crate::ui_controls::icon_control(
-            symbolic_icon("comment-symbolic"),
+            Icon::Comment,
             if drafting_here {
                 "Show the comment on this file"
             } else {

@@ -376,7 +376,7 @@ impl Cagents {
         if session.transcript_path.is_some() {
             actions.push(
                 crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("document-open-symbolic"),
+                    Icon::OpenFile,
                     "Open saved output",
                     false,
                     true,
@@ -465,10 +465,7 @@ impl Cagents {
         let saved = session.is_some_and(|session| session.transcript_path.is_some());
         let spacing = cosmic::theme::spacing();
         let mut children: Vec<Element<'a, Message>> = vec![
-            crate::ui_controls::passive_icon(
-                crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
-                design::STATUS_ICON_SIZE,
-            ),
+            crate::ui_controls::passive_icon(Icon::Terminal, design::STATUS_ICON_SIZE),
             design::heading("Output not available").into(),
             design::caption(detail)
                 .align_x(Alignment::Center)

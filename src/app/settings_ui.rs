@@ -78,7 +78,7 @@ fn setting_stepper<'a>(
     };
     let control = widget::row::with_children(vec![
         crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("list-remove-symbolic"),
+            Icon::Minus,
             format!("Decrease {label}"),
             false,
             current > min,
@@ -90,7 +90,7 @@ fn setting_stepper<'a>(
             .center_y(design::PRIMARY_CONTROL_SIZE)
             .into(),
         crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("list-add-symbolic"),
+            Icon::Plus,
             format!("Increase {label}"),
             false,
             current < max,
@@ -98,7 +98,7 @@ fn setting_stepper<'a>(
         )
         .into(),
         crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+            Icon::Undo,
             format!("Reset {label}"),
             false,
             current != default,
@@ -123,7 +123,7 @@ fn settings_choice<'a>(
         .into_iter()
         .map(|(choice, value, selected)| {
             let marker: Element<'a, Message> = if selected {
-                settings_icon("object-select-symbolic").into()
+                settings_icon(Icon::Select).into()
             } else {
                 iced::widget::Space::new().width(16).height(16).into()
             };
@@ -1158,23 +1158,23 @@ fn settings_category_controls<'a>(
     }
 }
 
-fn category_icon(category: SettingsCategory) -> &'static str {
+fn category_icon(category: SettingsCategory) -> Icon {
     match category {
-        SettingsCategory::Notifications => "preferences-system-notifications-symbolic",
-        SettingsCategory::General => "preferences-system-symbolic",
-        SettingsCategory::Appearance => "preferences-desktop-display-symbolic",
-        SettingsCategory::Terminal => "utilities-terminal-symbolic",
-        SettingsCategory::Links => "web-browser-symbolic",
-        SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
-        SettingsCategory::NativeChat => "chat-bubble-text-symbolic",
-        SettingsCategory::Editor => "accessories-text-editor-symbolic",
-        SettingsCategory::Accounts => "system-users-symbolic",
-        SettingsCategory::About => "dialog-information-symbolic",
+        SettingsCategory::Notifications => Icon::NotificationSettings,
+        SettingsCategory::General => Icon::Settings,
+        SettingsCategory::Appearance => Icon::Display,
+        SettingsCategory::Terminal => Icon::Terminal,
+        SettingsCategory::Links => Icon::WebBrowser,
+        SettingsCategory::Keyboard => Icon::Keyboard,
+        SettingsCategory::NativeChat => Icon::Chat,
+        SettingsCategory::Editor => Icon::TextEditor,
+        SettingsCategory::Accounts => Icon::Users,
+        SettingsCategory::About => Icon::Info,
     }
 }
 
-fn settings_icon(name: &'static str) -> widget::icon::Icon {
-    crate::ui_controls::symbolic_icon(name).icon().size(16)
+fn settings_icon(name: Icon) -> widget::icon::Icon {
+    name.handle().icon().size(16)
 }
 
 fn category_button<'a>(
@@ -1510,7 +1510,7 @@ fn shortcut_input<'a>(
                 widget::row::with_children(vec![
                     design::body(chord.clone()).into(),
                     crate::ui_controls::icon_control(
-                        crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                        Icon::Close,
                         format!("Remove {chord} shortcut for {label}"),
                         false,
                         true,
@@ -1534,7 +1534,7 @@ fn shortcut_input<'a>(
         })
         .collect();
     let record: Element<'a, Message> = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("preferences-desktop-keyboard-symbolic"),
+        Icon::Keyboard,
         format!("Record shortcut for {label}"),
         false,
         true,
@@ -1543,7 +1543,7 @@ fn shortcut_input<'a>(
     .into();
     let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
     let reset: Element<'a, Message> = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+        Icon::Undo,
         format!("Reset {label} shortcut"),
         false,
         value != default,

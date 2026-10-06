@@ -959,7 +959,7 @@ impl Cagents {
     fn new_tab_control(&self) -> Element<'_, Message> {
         let enabled = !self.modal_is_open() && !self.context_inspector_is_overlay();
         let control = command(
-            crate::ui_controls::symbolic_icon("list-add-symbolic"),
+            Icon::Plus,
             format!(
                 "New tab · Thread {} · Terminal {}",
                 workspace_widget::shortcut_chords(
@@ -979,15 +979,9 @@ impl Cagents {
                 .into_iter()
                 .map(|(label, description, kind, id)| {
                     let icon = match kind {
-                        NewTab::Terminal => {
-                            crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
-                        }
-                        NewTab::Thread | NewTab::Resume => {
-                            crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
-                        }
-                        NewTab::Browser => {
-                            crate::ui_controls::symbolic_icon("internet-web-browser-symbolic")
-                        }
+                        NewTab::Terminal => Icon::Terminal.handle(),
+                        NewTab::Thread | NewTab::Resume => Icon::Chat.handle(),
+                        NewTab::Browser => Icon::Browser.handle(),
                     };
                     let tooltip = match kind {
                         NewTab::Thread => workspace_widget::shortcut_tooltip(
@@ -1070,7 +1064,7 @@ impl Cagents {
         let recorded_severity = self.notices.severity().max(health_severity);
         let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
         let control = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon(severity.icon()),
+            severity.icon(),
             match severity {
                 NoticeSeverity::Success => "Application notices: success",
                 NoticeSeverity::Warning => "Application notices",
@@ -1136,7 +1130,7 @@ impl Cagents {
                     );
                 }
                 heading_children.push(command(
-                    crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                    Icon::Close,
                     "Close application notices",
                     widget::Id::new(NOTICES_CLOSE_ID),
                     Some(Message::ChromeUi(Action::Close)),
@@ -1225,7 +1219,7 @@ impl Cagents {
 
     fn sidebar_toggle(&self) -> Element<'_, Message> {
         crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
+            Icon::SplitPanel,
             workspace_widget::shortcut_tooltip(
                 workspace_widget::GlobalShortcut::ToggleInspector,
                 &self.settings.keyboard_shortcuts,
@@ -1409,7 +1403,7 @@ impl Cagents {
                 .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
                 .map_or(0, |index| index + 1);
             actions.push(command(
-                crate::ui_controls::symbolic_icon("go-previous-symbolic"),
+                Icon::ChevronLeft,
                 workspace_widget::shortcut_tooltip(
                     workspace_widget::GlobalShortcut::FocusAdjacent(
                         crate::workspace::FocusDirection::Left,
@@ -1432,7 +1426,7 @@ impl Cagents {
                     .into(),
             );
             actions.push(command(
-                crate::ui_controls::symbolic_icon("go-next-symbolic"),
+                Icon::ChevronRight,
                 workspace_widget::shortcut_tooltip(
                     workspace_widget::GlobalShortcut::FocusAdjacent(
                         crate::workspace::FocusDirection::Right,
@@ -1543,7 +1537,7 @@ impl Cagents {
     /// they run in a native chat or a terminal.
     pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
         let kind = self.card_state(id).map(|card| &card.kind);
-        let generic = || crate::ui_controls::symbolic_icon(card_kind_labels(kind).icon);
+        let generic = || card_kind_labels(kind).icon.handle();
         match kind {
             Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
             Some(CardKind::Chat(session)) => {
@@ -1636,7 +1630,8 @@ impl Cagents {
                     design::accent_color,
                 )
             } else {
-                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                Icon::Warning
+                    .handle()
                     .icon()
                     .size(design::TAB_STATUS_ICON_SIZE)
                     .into()
@@ -1645,7 +1640,8 @@ impl Cagents {
         }
         if self.sidebar_state.has_card_update(id) {
             children.push(tooltip(
-                crate::ui_controls::symbolic_icon("notifications-symbolic")
+                Icon::Attention
+                    .handle()
                     .icon()
                     .size(design::TAB_STATUS_ICON_SIZE),
                 "Needs attention",
@@ -1660,7 +1656,7 @@ impl Cagents {
                     "Working",
                 )),
                 crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
-                    "dialog-warning-symbolic",
+                    Icon::Warning,
                     "Waiting for input",
                     sidebar::BadgeTone::Warning,
                 )),
@@ -1671,13 +1667,11 @@ impl Cagents {
             let blocker = self.chat_switch_blocker(id);
             let ready = blocker.is_none();
             children.push(command(
-                crate::ui_controls::symbolic_icon(
-                    if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
-                        "utilities-terminal-symbolic"
-                    } else {
-                        "chat-bubble-text-symbolic"
-                    },
-                ),
+                if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
+                    Icon::Terminal
+                } else {
+                    Icon::Chat
+                },
                 blocker.unwrap_or_else(|| Cow::Borrowed(self.chat_switch_label(id))),
                 card_control_id(id, "switch"),
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
@@ -1685,7 +1679,7 @@ impl Cagents {
         }
         if focused || self.chrome_ui.hovered_tab == Some(id) {
             children.push(command(
-                crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                Icon::Close,
                 chrome.map_or_else(
                     || Cow::Owned(card_close_name(labels.type_label, title)),
                     |chrome| Cow::Borrowed(chrome.close_name.as_str()),
@@ -1803,10 +1797,10 @@ impl Cagents {
                     let enabled = !self.modal_is_open()
                         && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
                     let icon = match tab {
-                        ContextTab::Files => "folder-symbolic",
-                        ContextTab::Changes => "document-edit-symbolic",
-                        ContextTab::PullRequest => "pull-request-symbolic",
-                        ContextTab::Details => "dialog-information-symbolic",
+                        ContextTab::Files => Icon::Folder,
+                        ContextTab::Changes => Icon::Changes,
+                        ContextTab::PullRequest => Icon::PullRequest,
+                        ContextTab::Details => Icon::Info,
                     };
                     let visual = (tab == ContextTab::PullRequest)
                         .then_some(indicators.pull_request)
@@ -1834,10 +1828,9 @@ impl Cagents {
                         _ => {}
                     }
                     let control = crate::ui_controls::icon_control(
-                        visual.as_ref().map_or_else(
-                            || crate::ui_controls::symbolic_icon(icon),
-                            |(icon, _)| icon.clone(),
-                        ),
+                        visual
+                            .as_ref()
+                            .map_or_else(|| icon.handle(), |(icon, _)| icon.clone()),
                         name,
                         selected,
                         enabled,
@@ -1902,11 +1895,11 @@ impl Cagents {
                         } else {
                             "Open files"
                         })
-                        .leading_icon(crate::ui_controls::symbolic_icon(if changes {
-                            "vcs-diff-symbolic"
+                        .leading_icon(if changes {
+                            Icon::Diff
                         } else {
-                            "folder-open-symbolic"
-                        }))
+                            Icon::OpenFolder
+                        })
                         .name(if changes {
                             "Open device changes"
                         } else {
@@ -1949,7 +1942,7 @@ impl Cagents {
                                 .width(Length::Fill)
                                 .into(),
                             crate::ui_controls::icon_control(
-                                crate::ui_controls::symbolic_icon("folder-open-symbolic"),
+                                Icon::OpenFolder,
                                 "Browse files",
                                 false,
                                 true,

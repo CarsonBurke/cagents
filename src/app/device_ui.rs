@@ -742,9 +742,7 @@ impl Cagents {
         let control = widget::button::custom(
             widget::row::with_children(vec![
                 design::caption(label).into(),
-                widget::icon(crate::ui_controls::symbolic_icon("go-up-symbolic"))
-                    .size(12)
-                    .into(),
+                widget::icon(Icon::ChevronUp.handle()).size(12).into(),
             ])
             .spacing(design::GRID_UNIT)
             .align_y(Alignment::Center),
@@ -767,7 +765,7 @@ impl Cagents {
                     widget::row::with_children(vec![
                         design::heading("Devices").width(Length::Fill).into(),
                         crate::ui_controls::icon_control(
-                            crate::ui_controls::symbolic_icon("list-add-symbolic"),
+                            Icon::Plus,
                             "Connect to a device",
                             false,
                             enabled,
@@ -819,7 +817,7 @@ impl Cagents {
                     .padding(design::GRID_UNIT * 2.0)
                     .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
                     let open = crate::ui_controls::icon_control(
-                        crate::ui_controls::symbolic_icon("view-pop-out-symbolic"),
+                        Icon::PopOut,
                         format!("Open {label} in another window"),
                         false,
                         enabled,
@@ -862,7 +860,7 @@ impl Cagents {
                     rows.push(
                         widget::button::custom(
                             widget::row::with_children(vec![
-                                widget::icon(crate::ui_controls::symbolic_icon("folder-symbolic"))
+                                widget::icon(Icon::Folder.handle())
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
                                 design::body("Browse device files").into(),
@@ -914,13 +912,13 @@ impl Cagents {
             }
             return dialog_ui::surface(widget::column::with_children(rows).spacing(12), 600.0);
         }
-        let icon = |name: &'static str, label: &'static str, value: Action, enabled: bool| {
+        let icon = |name: Icon, label: &'static str, value: Action, enabled: bool| {
             let destructive = matches!(
                 &value,
                 Action::DiscardChanges | Action::Git(GitOperation::RemoveWorktree { .. })
             );
             let control = crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(name),
+                name,
                 label,
                 false,
                 !state.busy && enabled,
@@ -934,14 +932,14 @@ impl Cagents {
         };
         let modes = crate::ui_controls::segmented_controls(
             [
-                (Panel::Files, "folder-symbolic", "Browse files"),
-                (Panel::Changes, "vcs-diff-symbolic", "Source control"),
-                (Panel::Worktrees, "git-branch-symbolic", "Manage worktrees"),
+                (Panel::Files, Icon::Folder, "Browse files"),
+                (Panel::Changes, Icon::Diff, "Source control"),
+                (Panel::Worktrees, Icon::Branch, "Manage worktrees"),
             ]
             .into_iter()
             .map(|(panel, glyph, label)| {
                 crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon(glyph),
+                    glyph,
                     label,
                     state.panel == panel,
                     !state.busy,
@@ -959,19 +957,14 @@ impl Cagents {
                 modes,
                 design::heading(state.panel.label()).into(),
                 design::caption(device).width(Length::Fill).into(),
-                icon(
-                    "window-close-symbolic",
-                    "Close device tools",
-                    Action::Close,
-                    true,
-                ),
+                icon(Icon::Close, "Close device tools", Action::Close, true),
             ])
             .align_y(Alignment::Center)
             .spacing(12)
             .into(),
             widget::row::with_children(vec![
                 icon(
-                    "go-up-symbolic",
+                    Icon::ChevronUp,
                     "Parent directory",
                     Action::Visit(
                         state
@@ -987,14 +980,9 @@ impl Cagents {
                     .on_submit(|_| Message::Device(Action::Browse))
                     .width(Length::Fill)
                     .into(),
+                icon(Icon::Refresh, "Browse directory", Action::Browse, true),
                 icon(
-                    "view-refresh-symbolic",
-                    "Browse directory",
-                    Action::Browse,
-                    true,
-                ),
-                icon(
-                    "folder-open-symbolic",
+                    Icon::OpenFolder,
                     "Open as workspace",
                     Action::OpenProject,
                     true,
@@ -1054,9 +1042,9 @@ impl Cagents {
                             Action::Read(entry.name.clone().into())
                         };
                         let glyph = if entry.directory {
-                            "folder-symbolic"
+                            Icon::Folder
                         } else {
-                            "text-editor-symbolic"
+                            Icon::Edit
                         };
                         let selected = state
                             .file
@@ -1064,7 +1052,7 @@ impl Cagents {
                             .is_some_and(|file| file == &PathBuf::from(&entry.name));
                         widget::button::custom(
                             widget::row::with_children(vec![
-                                widget::icon(crate::ui_controls::symbolic_icon(glyph))
+                                widget::icon(glyph.handle())
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
                                 design::body(&entry.name)
@@ -1101,14 +1089,9 @@ impl Cagents {
                             } else {
                                 iced::widget::Space::new().into()
                             },
+                            icon(Icon::Save, "Save on device", Action::Save, state.dirty()),
                             icon(
-                                "document-save-symbolic",
-                                "Save on device",
-                                Action::Save,
-                                state.dirty(),
-                            ),
-                            icon(
-                                "document-revert-symbolic",
+                                Icon::RevertFile,
                                 "Discard changes",
                                 Action::DiscardChanges,
                                 state.dirty(),
@@ -1133,11 +1116,7 @@ impl Cagents {
                 } else {
                     widget::container(
                         widget::column::with_children(vec![
-                            crate::ui_controls::passive_icon(
-                                crate::ui_controls::symbolic_icon("text-editor-symbolic"),
-                                32,
-                            )
-                            .into(),
+                            crate::ui_controls::passive_icon(Icon::Edit, 32).into(),
                             design::caption("Select a file").into(),
                         ])
                         .spacing(12)
@@ -1154,19 +1133,19 @@ impl Cagents {
             Panel::Changes => widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     icon(
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         "Git status",
                         Action::Git(GitOperation::Status),
                         true,
                     ),
                     icon(
-                        "vcs-diff-symbolic",
+                        Icon::Diff,
                         "Working tree diff",
                         Action::Git(GitOperation::Diff { staged: false }),
                         true,
                     ),
                     icon(
-                        "vcs-commit-symbolic",
+                        Icon::Commit,
                         "Staged diff",
                         Action::Git(GitOperation::Diff { staged: true }),
                         true,
@@ -1176,7 +1155,7 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                     icon(
-                        "list-add-symbolic",
+                        Icon::Plus,
                         "Stage path",
                         Action::Git(GitOperation::Stage {
                             paths: vec![state.pathspec.clone().into()],
@@ -1184,7 +1163,7 @@ impl Cagents {
                         !state.pathspec.trim().is_empty(),
                     ),
                     icon(
-                        "list-remove-symbolic",
+                        Icon::Minus,
                         "Unstage path",
                         Action::Git(GitOperation::Unstage {
                             paths: vec![state.pathspec.clone().into()],
@@ -1201,7 +1180,7 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                     icon(
-                        "vcs-commit-symbolic",
+                        Icon::Commit,
                         "Commit staged changes",
                         Action::Git(GitOperation::Commit {
                             message: state.commit_message.clone(),
@@ -1219,7 +1198,7 @@ impl Cagents {
             Panel::Worktrees => widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     icon(
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         "List worktrees",
                         Action::Git(GitOperation::Worktrees),
                         true,
@@ -1233,7 +1212,7 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                     icon(
-                        "worktree-add-symbolic",
+                        Icon::WorktreeAdd,
                         "Create worktree under .worktrees",
                         Action::Git(GitOperation::CreateWorktree {
                             name: state.worktree_name.clone(),
@@ -1243,7 +1222,7 @@ impl Cagents {
                             && !state.worktree_branch.trim().is_empty(),
                     ),
                     icon(
-                        "list-remove-symbolic",
+                        Icon::Minus,
                         "Remove clean worktree",
                         Action::Git(GitOperation::RemoveWorktree {
                             name: state.worktree_name.clone(),

@@ -120,6 +120,7 @@ use crate::{
     terminal::{
         HostedTerminalHandle, TerminalConfig, TerminalEvent, TerminalSurface, TerminalWidget,
     },
+    ui_controls::Icon,
     workspace::{
         CardWidth, ViewportUpdate, VisibilityClass, VisibilityTransition, Workspace, WorkspaceCard,
         WorkspaceConfig, normalize_card_name,
@@ -234,11 +235,11 @@ enum NoticeSeverity {
 }
 
 impl NoticeSeverity {
-    fn icon(self) -> &'static str {
+    fn icon(self) -> Icon {
         match self {
-            Self::Success => "emblem-ok-symbolic",
-            Self::Warning => "dialog-warning-symbolic",
-            Self::Error => "dialog-error-symbolic",
+            Self::Success => Icon::Check,
+            Self::Warning => Icon::Warning,
+            Self::Error => Icon::Error,
         }
     }
 
@@ -506,13 +507,7 @@ fn notice_surface<'a>(
     compact: bool,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
-    let mut children = vec![
-        crate::ui_controls::symbolic_icon(severity.icon())
-            .icon()
-            .size(16)
-            .into(),
-        body,
-    ];
+    let mut children = vec![severity.icon().handle().icon().size(16).into(), body];
     if let Some(action) = action {
         children.push(action);
     }
@@ -842,7 +837,7 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             ),
             "Changes are being saved again.",
             Some(crate::interaction::tooltip(
-                widget::button::icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
+                widget::button::icon(Icon::Close)
                     .id(widget::Id::new("session-save.acknowledge-recovery"))
                     .name("Acknowledge session save recovery")
                     .width(ICON_CONTROL_SIZE)
@@ -1351,55 +1346,55 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
     match kind {
         Some(CardKind::Terminal(_)) => CardLabels {
             type_label: "Terminal",
-            icon: "utilities-terminal-symbolic",
+            icon: Icon::Terminal,
             starting: "Starting terminal…",
             unavailable: "Terminal unavailable",
         },
         Some(CardKind::Chat(_)) => CardLabels {
             type_label: "Chat",
-            icon: "chat-bubble-text-symbolic",
+            icon: Icon::Chat,
             starting: "Connecting to agent…",
             unavailable: "Agent connection unavailable",
         },
         Some(CardKind::Browser(_)) => CardLabels {
             type_label: "Browser",
-            icon: "internet-web-browser-symbolic",
+            icon: Icon::Browser,
             starting: "Restoring browser…",
             unavailable: "Browser unavailable",
         },
         Some(CardKind::Repository(_)) => CardLabels {
             type_label: "Repository",
-            icon: "folder-symbolic",
+            icon: Icon::Folder,
             starting: "Loading repository…",
             unavailable: "Repository unavailable",
         },
         Some(CardKind::PullRequests(_)) => CardLabels {
             type_label: "Pull requests",
-            icon: "pull-request-symbolic",
+            icon: Icon::PullRequest,
             starting: "Loading pull requests…",
             unavailable: "Pull requests unavailable",
         },
         Some(CardKind::Settings) => CardLabels {
             type_label: "Settings",
-            icon: "emblem-system-symbolic",
+            icon: Icon::Settings,
             starting: "Loading settings…",
             unavailable: "Settings unavailable",
         },
         Some(CardKind::Accounts) => CardLabels {
             type_label: "Accounts",
-            icon: "avatar-default-symbolic",
+            icon: Icon::Avatar,
             starting: "Loading accounts…",
             unavailable: "Accounts unavailable",
         },
         Some(CardKind::Automations) => CardLabels {
             type_label: "Automations",
-            icon: "alarm-symbolic",
+            icon: Icon::Alarm,
             starting: "Loading automations…",
             unavailable: "Automations unavailable",
         },
         None => CardLabels {
             type_label: "Pane",
-            icon: "view-grid-symbolic",
+            icon: Icon::Grid,
             starting: "Starting pane…",
             unavailable: "Pane unavailable",
         },
@@ -4431,7 +4426,7 @@ impl PullRequestPane {
 /// Static chrome strings for a card kind.
 struct CardLabels {
     type_label: &'static str,
-    icon: &'static str,
+    icon: Icon,
     starting: &'static str,
     unavailable: &'static str,
 }
@@ -6439,7 +6434,8 @@ impl Cagents {
             side.push(
                 widget::container(
                     widget::row::with_children(vec![
-                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
+                        Icon::PullRequest
+                            .handle()
                             .icon()
                             .size(design::ROW_ICON_SIZE)
                             .into(),
@@ -6476,7 +6472,7 @@ impl Cagents {
         let mut main: Vec<Element<'a, Message>> = Vec::new();
         let file_panel_toggle = || {
             crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon("view-sidebar-start-symbolic"),
+                Icon::Sidebar,
                 if collapsed {
                     "Show review files"
                 } else {
@@ -6535,10 +6531,7 @@ impl Cagents {
             main.push(
                 widget::container(
                     widget::column::with_children(vec![
-                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
-                            .icon()
-                            .size(24)
-                            .into(),
+                        Icon::PullRequest.handle().icon().size(24).into(),
                         design::caption(prompt)
                             .class(cosmic::theme::Text::Custom(design::muted_text))
                             .wrapping(iced::widget::text::Wrapping::Word)
@@ -8625,21 +8618,19 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "go-previous-symbolic",
-                        ))
-                        .id(chrome.map_or_else(
-                            || card_control_id(id, "browser.back"),
-                            |chrome| chrome.browser_back_id.clone(),
-                        ))
-                        .name("Back")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
+                        widget::button::icon(Icon::ChevronLeft)
+                            .id(chrome.map_or_else(
+                                || card_control_id(id, "browser.back"),
+                                |chrome| chrome.browser_back_id.clone(),
+                            ))
+                            .name("Back")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
                         "Back",
                     ),
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon("go-next-symbolic"))
+                        widget::button::icon(Icon::ChevronRight)
                             .id(chrome.map_or_else(
                                 || card_control_id(id, "browser.forward"),
                                 |chrome| chrome.browser_forward_id.clone(),
@@ -8651,13 +8642,11 @@ impl Cagents {
                         "Forward",
                     ),
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon(
-                            if browser_loading {
-                                "process-stop-symbolic"
-                            } else {
-                                "view-refresh-symbolic"
-                            },
-                        ))
+                        widget::button::icon(if browser_loading {
+                            Icon::Cancel
+                        } else {
+                            Icon::Refresh
+                        })
                         .id(chrome.map_or_else(
                             || card_control_id(id, "browser.reload"),
                             |chrome| chrome.browser_reload_id.clone(),
@@ -8676,14 +8665,12 @@ impl Cagents {
                     ),
                     address_input.into(),
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "document-import-symbolic",
-                        ))
-                        .id(card_control_id(id, "browser.import-logins"))
-                        .name("Import browser logins")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press(Message::BrowserImport(browser_import_ui::Action::Open)),
+                        widget::button::icon(Icon::Import)
+                            .id(card_control_id(id, "browser.import-logins"))
+                            .name("Import browser logins")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press(Message::BrowserImport(browser_import_ui::Action::Open)),
                         "Import browser logins",
                     ),
                 ])
@@ -8958,7 +8945,8 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
-                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                            Icon::Warning
+                                .handle()
                                 .icon()
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
@@ -9050,7 +9038,7 @@ impl Cagents {
                 });
             let preview = html.then(|| {
                 crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("internet-web-browser-symbolic"),
+                    Icon::Browser,
                     "Preview HTML",
                     false,
                     !self.modal_is_open(),
@@ -16088,23 +16076,15 @@ impl Application for Cagents {
                 .unwrap_or_else(|| "Workspace".into());
             let quick = |glyph, label, id, message| {
                 Element::from(
-                    crate::ui_controls::icon_control(
-                        crate::ui_controls::symbolic_icon(glyph),
-                        label,
-                        false,
-                        true,
-                        Some(message),
-                    )
-                    .id(widget::Id::new(id)),
+                    crate::ui_controls::icon_control(glyph, label, false, true, Some(message))
+                        .id(widget::Id::new(id)),
                 )
             };
             let mut actions: Vec<Element<'_, Message>> = vec![
                 crate::interaction::tooltip(
                     widget::button::suggested("New conversation")
                         .name("New conversation")
-                        .leading_icon(crate::ui_controls::symbolic_icon(
-                            "chat-bubble-text-symbolic",
-                        ))
+                        .leading_icon(Icon::Chat)
                         .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
                             chrome_ui::NewTab::Thread,
                         ))),
@@ -16114,13 +16094,13 @@ impl Application for Cagents {
                     ),
                 ),
                 quick(
-                    "document-open-recent-symbolic",
+                    Icon::History,
                     "Resume conversation".to_owned(),
                     "empty.resume-conversation",
                     Message::ResumeConversation(resume_ui::Action::Open),
                 ),
                 quick(
-                    "utilities-terminal-symbolic",
+                    Icon::Terminal,
                     workspace_widget::shortcut_tooltip(
                         workspace_widget::GlobalShortcut::NewTerminal,
                         &self.settings.keyboard_shortcuts,
@@ -16129,7 +16109,7 @@ impl Application for Cagents {
                     Message::NewTerminal,
                 ),
                 quick(
-                    "internet-web-browser-symbolic",
+                    Icon::Browser,
                     if cfg!(feature = "integrated-browser") {
                         "New browser"
                     } else {
@@ -16140,7 +16120,7 @@ impl Application for Cagents {
                     Message::NewBrowser,
                 ),
                 quick(
-                    "avatar-default-symbolic",
+                    Icon::Avatar,
                     "Agent accounts".to_owned(),
                     "empty.accounts",
                     Message::AccountUi(account_ui::Action::OpenPane),
@@ -16159,10 +16139,7 @@ impl Application for Cagents {
             ])
             .spacing(12);
             let mut content: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::passive_icon(
-                    crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic"),
-                    32,
-                ),
+                crate::ui_controls::passive_icon(Icon::Chat, 32),
                 widget::text::title2(if scoped {
                     scope_name
                 } else {

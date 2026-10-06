@@ -103,14 +103,14 @@ impl Gallery {
         let navigation = self.entries.len() > 1;
         let toolbar = widget::row::with_children(vec![
             icon(
-                "go-previous-symbolic",
+                Icon::ChevronLeft,
                 "Previous image (Left)",
                 navigation,
                 Action::ImageNext(false),
             ),
             design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
             icon(
-                "go-next-symbolic",
+                Icon::ChevronRight,
                 "Next image (Right)",
                 navigation,
                 Action::ImageNext(true),
@@ -122,12 +122,7 @@ impl Gallery {
             widget::button::standard("Open externally")
                 .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
                 .into(),
-            icon(
-                "window-close-symbolic",
-                "Close image (Esc)",
-                true,
-                Action::CloseImage,
-            ),
+            icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
         ])
         .spacing(step::GAP_S)
         .align_y(iced::Alignment::Center);

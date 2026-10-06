@@ -92,7 +92,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 design::body("Permissions").width(Length::Fill).into(),
                 small_icon(
-                    "window-close-symbolic",
+                    Icon::Close,
                     "Close permissions",
                     Action::PermissionPicker(target, false),
                 ),

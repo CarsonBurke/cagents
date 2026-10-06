@@ -351,7 +351,7 @@ impl Cagents {
         let state = &self.update_ui;
         let (icon, label, action) = if state.updating() {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 state.job.as_ref().map_or_else(
                     || "Preparing application update".to_owned(),
                     |job| format!("Updating to {}: {}", job.version, job.message),
@@ -364,20 +364,20 @@ impl Cagents {
             )
         } else if state.restarting {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 "Saving and reopening windows with the installed build".to_owned(),
                 None,
             )
         } else if state.superseded.is_some() {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 "A newer build is installed; reopen windows to use it".to_owned(),
                 Some(Message::UpdateUi(Action::Restart)),
             )
         } else if let Some(error) = &state.error {
             match &state.result {
                 Some(UpdateState::Available { release }) => (
-                    "dialog-warning-symbolic",
+                    Icon::Warning,
                     format!(
                         "Update failed: {error}. Retry update to {}",
                         release.version
@@ -385,14 +385,14 @@ impl Cagents {
                     Some(Message::UpdateUi(Action::Apply)),
                 ),
                 _ => (
-                    "dialog-warning-symbolic",
+                    Icon::Warning,
                     format!("Update failed: {error}. Check again"),
                     Some(Message::UpdateUi(Action::CheckNow)),
                 ),
             }
         } else if let Some(UpdateState::Available { release }) = &state.result {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 format!(
                     "Update to {} (saves and restarts application windows)",
                     release.version
@@ -419,7 +419,7 @@ impl Cagents {
         let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
         Some(
             crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(icon),
+                icon,
                 label,
                 true,
                 enabled,
