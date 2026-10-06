@@ -77,6 +77,15 @@ fn small_icon<'a>(
     .into()
 }
 
+/// One message waiting above the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueEntry {
+    /// Held by the provider, under the id it queued the message with.
+    Provider(String),
+    /// Held here for a provider that keeps no queue of its own.
+    Local(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Target {
     pub card: CardId,
@@ -179,10 +188,10 @@ pub enum Action {
     ImageExternal,
     CopyLiteral(String),
     Latest(Target),
-    CancelFollowup(Target),
-    EditQueue(Target, Option<String>),
-    QueueText(Target, String),
-    SaveQueue(Target),
+    /// Takes a waiting message back into the composer to be revised: the one
+    /// named, or the newest that can be taken back.
+    TakeBackQueued(Target, Option<QueueEntry>),
+    RemoveQueued(Target, QueueEntry),
     BranchPicker(Target, bool),
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
@@ -301,6 +310,8 @@ impl Action {
             | Self::Paste(target)
             | Self::Dropped(target, _)
             | Self::RemoveAttachment(target, _)
+            | Self::TakeBackQueued(target, _)
+            | Self::RemoveQueued(target, _)
             | Self::Model(target, _)
             | Self::Reasoning(target, _, _)
             | Self::PermissionMode(target, _)
@@ -1071,6 +1082,9 @@ enum HistoryNavigation {
 
 struct PendingCommand {
     followup: bool,
+    /// The provider's queued message this command asks back, which stops
+    /// being waited for if the request never reaches the provider.
+    take_back: Option<String>,
     id: u64,
     draft_revision: Option<u64>,
     request: Option<String>,
@@ -1149,6 +1163,27 @@ impl Queued {
     }
 }
 
+/// A message held for the turn after the running one, by a chat whose
+/// provider keeps no queue of its own.
+///
+/// Each stays its own entry so one can be revised or dropped without the
+/// others; they are sent together, as one prompt, when the turn ends.
+struct Followup {
+    id: u64,
+    text: String,
+    attachments: Vec<Attachment>,
+}
+
+/// A provider's queued message on its way back to the composer.
+///
+/// Removing a message races the agent starting on it, and the provider alone
+/// knows which happened, so the text returns only on its answer.
+struct Recall {
+    message: chat::QueuedMessage,
+    /// The answers about this message the provider had already given.
+    answered: usize,
+}
+
 /// Which step of sending a queued first message a command is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueuedStep {
@@ -1169,9 +1204,18 @@ pub(super) struct Runtime {
     connection: Connection,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
-    followup: Option<(String, Vec<Attachment>)>,
-    queue_edit: Option<(String, String)>,
-    queue_edit_submitted: Option<(String, String)>,
+    /// Messages held here for the next turn, oldest first.
+    followups: Vec<Followup>,
+    next_followup: u64,
+    /// Provider queue entries asked back, until the provider says whether it
+    /// let go of each.
+    recalling: Vec<Recall>,
+    /// Provider queue entries already back in the composer, hidden until the
+    /// provider's own listing drops them.
+    taken_back: Vec<String>,
+    /// How the draft was queued before it was taken back, which is how
+    /// sending it again queues it unless the reader chooses otherwise.
+    resend: Option<PromptMode>,
     branch_picker: bool,
     fork_requested: bool,
     fork_seen: Option<String>,
@@ -1461,18 +1505,142 @@ impl Runtime {
         }
     }
 
-    fn restore_followup(&mut self) {
-        let Some((text, attachments)) = self.followup.take() else {
-            return;
+    /// Puts a message that was waiting back in the composer, ahead of
+    /// whatever was typed after it, with the files it was queued with.
+    fn take_back(&mut self, text: &str, attachments: Vec<Attachment>, queued: PromptMode) {
+        let text = text.trim_end();
+        let draft = self.unsent_text();
+        let combined = match (text.is_empty(), draft.trim().is_empty()) {
+            (_, true) => text.to_owned(),
+            (true, false) => draft,
+            (false, false) => format!("{text}\n{draft}"),
         };
-        let draft = self.composer.text();
-        self.replace_draft(text_editor::Content::with_text(&format!(
-            "{}\n{draft}",
-            text.trim_end()
-        )));
+        let mut composer = text_editor::Content::with_text(&combined);
+        // The caret lands where revising the message continues from.
+        let last = text.lines().next_back().unwrap_or_default();
+        composer.move_to(text_editor::Cursor {
+            position: text_editor::Position {
+                line: text.lines().count().saturating_sub(1),
+                // A column counts bytes of its line.
+                column: last.len(),
+            },
+            selection: None,
+        });
+        self.replace_draft(composer);
+        self.resend = Some(queued);
+        // The draft a walk through sent messages set aside is in `combined`.
+        self.history_cursor = None;
+        self.history_stash = None;
         let later = std::mem::replace(&mut self.attachments, attachments);
         self.attach(later.into_iter().map(|attachment| attachment.path));
+    }
+
+    /// Returns every held follow-up to the composer, in the order written.
+    fn restore_followups(&mut self) {
+        if self.followups.is_empty() {
+            return;
+        }
+        let (text, attachments) = self.combined_followups();
+        self.followups.clear();
+        self.take_back(&text, attachments, PromptMode::Queue);
         let _ = self.present();
+    }
+
+    /// The held follow-ups as the one prompt they are sent as: their text in
+    /// order, and each file once.
+    fn combined_followups(&self) -> (String, Vec<Attachment>) {
+        let mut text = String::new();
+        let mut attachments: Vec<Attachment> = Vec::new();
+        for followup in &self.followups {
+            if !followup.text.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(followup.text.trim_end());
+            }
+            for attachment in &followup.attachments {
+                if !attachments.iter().any(|old| old.path == attachment.path) {
+                    attachments.push(attachment.clone());
+                }
+            }
+        }
+        (text, attachments)
+    }
+
+    /// Whether a command is carrying the held follow-ups to the provider.
+    fn followups_sending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.followup)
+    }
+
+    /// Whether `message`, held by the provider, can return to the composer.
+    fn provider_take_back(&self, message: &chat::QueuedMessage) -> bool {
+        self.snapshot.capabilities.queue_remove
+            && message.editable
+            && !self.taken_back.contains(&message.id)
+            && !self.is_recalling(&message.id)
+    }
+
+    fn is_recalling(&self, id: &str) -> bool {
+        self.recalling.iter().any(|recall| recall.message.id == id)
+    }
+
+    /// Settles each message asked back against what the provider now says.
+    fn settle_recalls(&mut self, snapshot: &Snapshot) {
+        for recall in std::mem::take(&mut self.recalling) {
+            let id = &recall.message.id;
+            let answer = snapshot
+                .queue_removals
+                .iter()
+                .filter(|removal| &removal.id == id)
+                .skip(recall.answered)
+                .last();
+            match answer {
+                Some(removal) if removal.removed => {
+                    let queued = match recall.message.delivery {
+                        chat::QueueDelivery::NextStep => PromptMode::Steer,
+                        chat::QueueDelivery::NextTurn => PromptMode::Queue,
+                    };
+                    self.take_back(&recall.message.text, recall.message.attachments, queued);
+                    self.taken_back.push(recall.message.id);
+                }
+                // The provider's own refusal is reported as its error.
+                Some(_) => {}
+                None if snapshot
+                    .queued_messages
+                    .iter()
+                    .any(|queued| &queued.id == id) =>
+                {
+                    self.recalling.push(recall);
+                }
+                None => {
+                    self.error = Some(
+                        "The agent had already started on that message, so it was not taken back."
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The waiting message the keyboard takes back: the newest one that can
+    /// be. Held follow-ups are sent after everything the provider holds.
+    fn newest_take_back(&self) -> Option<QueueEntry> {
+        if self.followups_sending() {
+            return None;
+        }
+        self.followups
+            .last()
+            .map(|followup| QueueEntry::Local(followup.id))
+            .or_else(|| {
+                self.snapshot
+                    .queued_messages
+                    .iter()
+                    .rev()
+                    .find(|message| self.provider_take_back(message))
+                    .map(|message| QueueEntry::Provider(message.id.clone()))
+            })
     }
 
     /// Records a message the provider accepted. The same message sent twice
@@ -1538,6 +1706,7 @@ impl Runtime {
         self.composer = composer;
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
+        self.resend = None;
     }
 
     fn new(
@@ -1559,9 +1728,11 @@ impl Runtime {
             source_clock: None,
             connection,
             queued: None,
-            followup: None,
-            queue_edit: None,
-            queue_edit_submitted: None,
+            followups: Vec::new(),
+            next_followup: 0,
+            recalling: Vec::new(),
+            taken_back: Vec::new(),
+            resend: None,
             branch_picker: false,
             fork_requested: false,
             fork_seen: None,
@@ -1741,20 +1912,13 @@ impl Runtime {
         }
         self.subagent_scroll
             .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
-        if self.queue_edit.as_ref().is_some_and(|(id, text)| {
+        self.settle_recalls(&snapshot);
+        self.taken_back.retain(|id| {
             snapshot
                 .queued_messages
                 .iter()
-                .find(|message| &message.id == id)
-                .is_none_or(|message| {
-                    !message.editable
-                        || (self.queue_edit_submitted.as_ref() == self.queue_edit.as_ref()
-                            && &message.text == text)
-                })
-        }) {
-            self.queue_edit = None;
-            self.queue_edit_submitted = None;
-        }
+                .any(|message| &message.id == id)
+        });
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
@@ -1963,7 +2127,7 @@ impl Runtime {
     fn present(&self) -> Result<(), String> {
         let visible = self.visible.load(Ordering::Relaxed)
             || self.queued.is_some()
-            || self.followup.is_some();
+            || !self.followups.is_empty();
         self.handle()
             .map_or(Ok(()), |handle| handle.set_visible(visible))
     }
@@ -2034,7 +2198,7 @@ impl Runtime {
             Some("Wait for the pending chat command to finish before leaving the chat.")
         } else if self.queued.is_some() {
             Some(QUEUED_BLOCKER)
-        } else if self.followup.is_some() {
+        } else if !self.followups.is_empty() {
             Some("Send or take back the queued follow-up before leaving the chat.")
         } else if !self.attachments.is_empty() {
             Some("Send or remove the attached files before leaving the chat.")
@@ -2058,7 +2222,7 @@ impl Runtime {
         if self.session.launch.provider == Provider::Codex {
             if self.queued.is_some() {
                 Some(QUEUED_BLOCKER)
-            } else if self.followup.is_some() {
+            } else if !self.followups.is_empty() {
                 Some("Send or take back the queued follow-up before leaving the chat.")
             } else {
                 None
@@ -3094,7 +3258,7 @@ impl Cagents {
                 || !runtime.snapshot.requests.is_empty()
                 || !runtime.snapshot.queued_messages.is_empty()
                 || runtime.pending.is_some()
-                || runtime.followup.is_some()
+                || !runtime.followups.is_empty()
                 || runtime.disconnected
                 || runtime.snapshot.exited)
         {
@@ -4575,11 +4739,11 @@ impl Cagents {
             return Task::none();
         }
         let latest = handle.snapshot();
-        if latest.ready && !latest.busy && !latest.exited && runtime.followup.is_some() {
-            let (text, attachments) = runtime.followup.as_ref().unwrap();
+        if latest.ready && !latest.busy && !latest.exited && !runtime.followups.is_empty() {
+            let (text, attachments) = runtime.combined_followups();
             // A queued message remains a prompt. Resolving it as an idle
             // slash command could discard everything combined after /compact.
-            let command = match submission(text, &latest, attachments, PromptMode::Queue) {
+            let command = match submission(&text, &latest, &attachments, PromptMode::Queue) {
                 Ok(Command::Prompt {
                     text, attachments, ..
                 }) => Command::Prompt {
@@ -4935,11 +5099,9 @@ impl Cagents {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
         };
-        if let Command::UpdateQueued { id, text } = &command {
-            runtime.queue_edit_submitted = Some((id.clone(), text.clone()));
-        }
         runtime.pending = Some(PendingCommand {
             followup: false,
+            take_back: None,
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
@@ -6194,7 +6356,7 @@ impl Cagents {
                 if runtime.is_draft() {
                     return self.start_chat_draft(target);
                 }
-                if (runtime.followup.is_some() && mode != PromptMode::Steer
+                if (!runtime.followups.is_empty() && mode != PromptMode::Steer
                     || mode == PromptMode::Queue
                         && !runtime.snapshot.capabilities.queue
                         && runtime.snapshot.busy)
@@ -6202,15 +6364,15 @@ impl Cagents {
                     && !runtime.disconnected
                     && !runtime.snapshot.exited
                 {
-                    let previous = runtime.followup.as_ref();
-                    let count = previous.map_or(0, |(_, attachments)| attachments.len())
+                    // Held follow-ups go out as one prompt, so together they
+                    // have to fit what one prompt may carry.
+                    let (_, held) = runtime.combined_followups();
+                    let count = held.len()
                         + runtime
                             .attachments
                             .iter()
                             .filter(|attachment| {
-                                previous.is_none_or(|(_, attachments)| {
-                                    !attachments.iter().any(|old| old.path == attachment.path)
-                                })
+                                !held.iter().any(|old| old.path == attachment.path)
                             })
                             .count();
                     if chat::AttachmentRules::for_provider(runtime.session.launch.provider)
@@ -6223,22 +6385,14 @@ impl Cagents {
                         );
                         return Task::none();
                     }
-                    let text = runtime.composer.text();
-                    let (combined, attachments) = runtime
-                        .followup
-                        .get_or_insert_with(|| (String::new(), Vec::new()));
-                    if !text.trim().is_empty() {
-                        if !combined.trim().is_empty() {
-                            combined.truncate(combined.trim_end().len());
-                            combined.push('\n');
-                        }
-                        combined.push_str(&text);
-                    }
-                    for attachment in std::mem::take(&mut runtime.attachments) {
-                        if !attachments.iter().any(|old| old.path == attachment.path) {
-                            attachments.push(attachment);
-                        }
-                    }
+                    let id = runtime.next_followup;
+                    runtime.next_followup += 1;
+                    let followup = Followup {
+                        id,
+                        text: runtime.composer.text().trim_end().to_owned(),
+                        attachments: std::mem::take(&mut runtime.attachments),
+                    };
+                    runtime.followups.push(followup);
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
@@ -6265,45 +6419,80 @@ impl Cagents {
                 };
                 return self.chat_send(target, command, true);
             }
-            Action::EditQueue(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.queue_edit_submitted = None;
-                    runtime.queue_edit = id.and_then(|id| {
-                        runtime
-                            .snapshot
-                            .queued_messages
-                            .iter()
-                            .find(|message| message.id == id && message.editable)
-                            .map(|message| (id, message.text.clone()))
-                    });
-                }
-            }
-            Action::QueueText(target, text) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && let Some((_, draft)) = &mut runtime.queue_edit
-                {
-                    *draft = text;
-                    runtime.queue_edit_submitted = None;
-                }
-            }
-            Action::SaveQueue(target) => {
+            Action::TakeBackQueued(target, entry) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                let Some((id, text)) = runtime.queue_edit.clone() else {
+                let Some(entry) = entry.or_else(|| runtime.newest_take_back()) else {
                     return Task::none();
                 };
-                if text.trim().is_empty()
-                    || !runtime
-                        .snapshot
-                        .queued_messages
-                        .iter()
-                        .any(|message| message.id == id && message.editable)
-                {
-                    return Task::none();
+                let focus =
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App);
+                match entry {
+                    QueueEntry::Local(id) => {
+                        if runtime.followups_sending() {
+                            return Task::none();
+                        }
+                        let Some(index) = runtime
+                            .followups
+                            .iter()
+                            .position(|followup| followup.id == id)
+                        else {
+                            return Task::none();
+                        };
+                        let followup = runtime.followups.remove(index);
+                        runtime.take_back(&followup.text, followup.attachments, PromptMode::Queue);
+                        let _ = runtime.present();
+                        return focus;
+                    }
+                    QueueEntry::Provider(id) => {
+                        let Some(message) = runtime
+                            .snapshot
+                            .queued_messages
+                            .iter()
+                            .find(|message| message.id == id)
+                            .filter(|message| runtime.provider_take_back(message))
+                            .cloned()
+                        else {
+                            return Task::none();
+                        };
+                        // The message returns to the composer only once the
+                        // provider has let go of it: one it has already begun
+                        // on stays the turn it became.
+                        let answered = runtime
+                            .snapshot
+                            .queue_removals
+                            .iter()
+                            .filter(|removal| removal.id == id)
+                            .count();
+                        let sent = runtime.next_command;
+                        let task =
+                            self.chat_send(target, Command::RemoveQueued { id: id.clone() }, false);
+                        if let Some(runtime) = self.chat_runtime_mut(target)
+                            && runtime.next_command != sent
+                            && let Some(pending) = &mut runtime.pending
+                        {
+                            pending.take_back = Some(id);
+                            runtime.recalling.push(Recall { message, answered });
+                        }
+                        return Task::batch([task, focus]);
+                    }
                 }
-                return self.chat_send(target, Command::UpdateQueued { id, text }, false);
             }
+            Action::RemoveQueued(target, entry) => match entry {
+                QueueEntry::Local(id) => {
+                    if let Some(runtime) = self.chat_runtime_mut(target)
+                        && !runtime.followups_sending()
+                    {
+                        runtime.followups.retain(|followup| followup.id != id);
+                        let _ = runtime.present();
+                    }
+                }
+                QueueEntry::Provider(id) => {
+                    return self.chat_send(target, Command::RemoveQueued { id }, false);
+                }
+            },
             Action::HistoryOlder(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.recall(true);
@@ -6482,7 +6671,7 @@ impl Cagents {
                 let first_prompt = match result {
                     Ok(()) => {
                         if pending.followup {
-                            runtime.followup = None;
+                            runtime.followups.clear();
                             let _ = runtime.present();
                         }
                         if pending.draft_revision == Some(runtime.revision) {
@@ -6526,9 +6715,11 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
-                        runtime.queue_edit_submitted = None;
                         if pending.followup {
-                            runtime.restore_followup();
+                            runtime.restore_followups();
+                        }
+                        if let Some(id) = &pending.take_back {
+                            runtime.recalling.retain(|recall| &recall.message.id != id);
                         }
                         runtime.note(error.clone());
                         runtime.fork_requested = false;
@@ -6732,16 +6923,6 @@ impl Cagents {
                     },
                 )
                 .map(cosmic::Action::App);
-            }
-            Action::CancelFollowup(target) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && !runtime
-                        .pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.followup)
-                {
-                    runtime.restore_followup();
-                }
             }
             Action::Attach(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7419,7 +7600,7 @@ mod tests {
         assert!(runtime.permission_picker);
         assert!(runtime.composer.text().trim().is_empty());
         assert_eq!(runtime.attachments[0].path, PathBuf::from("retained.png"));
-        assert!(runtime.followup.is_none());
+        assert!(runtime.followups.is_empty());
         assert!(runtime.pending.is_none());
         assert!(app.dismiss_chat_picker());
         assert!(!chat_runtime(&app, card).permission_picker);
@@ -7514,6 +7695,24 @@ mod tests {
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
     }
+    fn followup(id: u64, text: &str, paths: &[&str]) -> Followup {
+        Followup {
+            id,
+            text: text.into(),
+            attachments: paths
+                .iter()
+                .map(|path| Attachment { path: path.into() })
+                .collect(),
+        }
+    }
+
+    fn paths(attachments: &[Attachment]) -> Vec<&Path> {
+        attachments
+            .iter()
+            .map(|attachment| attachment.path.as_path())
+            .collect()
+    }
+
     #[test]
     fn a_busy_provider_without_native_queue_keeps_a_followup_editable() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -7527,24 +7726,22 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("next task"));
         let target = runtime.target;
         let _ = app.handle_chat_ui(Action::Submit(target, PromptMode::Queue));
-        assert_eq!(
-            chat_runtime(&app, card).followup.as_ref().unwrap().0.trim(),
-            "next task"
-        );
+        assert_eq!(chat_runtime(&app, card).followups[0].text, "next task");
         assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
         app.chat_runtime_mut(target)
             .unwrap()
             .replace_draft(text_editor::Content::with_text("later draft"));
-        let _ = app.handle_chat_ui(Action::CancelFollowup(target));
-        assert!(chat_runtime(&app, card).followup.is_none());
-        assert_eq!(
-            chat_runtime(&app, card).composer.text().trim(),
-            "next task\nlater draft"
-        );
+        let _ = app.handle_chat_ui(Action::TakeBackQueued(target, None));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.followups.is_empty());
+        assert_eq!(runtime.composer.text().trim(), "next task\nlater draft");
+        // The caret ends the message that came back, where revising it goes on.
+        let caret = runtime.composer.cursor().position;
+        assert_eq!((caret.line, caret.column), (0, "next task".len()));
     }
 
     #[test]
-    fn multiple_local_followups_combine_in_order_and_cancel_before_later_drafts() {
+    fn local_followups_stay_separate_and_are_taken_back_or_removed_one_at_a_time() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("followup"));
         let runtime = app
@@ -7564,13 +7761,19 @@ mod tests {
             drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
         }
         let runtime = chat_runtime(&app, card);
-        let (text, attachments) = runtime.followup.as_ref().unwrap();
-        assert_eq!(text.trim(), "first task\nsecond task");
         assert_eq!(
-            attachments
+            runtime
+                .followups
                 .iter()
-                .map(|attachment| attachment.path.as_path())
+                .map(|followup| followup.text.as_str())
                 .collect::<Vec<_>>(),
+            ["first task", "second task", ""]
+        );
+        // They go to the provider as one prompt carrying each file once.
+        let (text, attachments) = runtime.combined_followups();
+        assert_eq!(text, "first task\nsecond task");
+        assert_eq!(
+            paths(&attachments),
             [
                 Path::new("first.png"),
                 Path::new("second.png"),
@@ -7581,29 +7784,55 @@ mod tests {
         assert!(runtime.composer.text().trim().is_empty());
         assert!(runtime.transition_blocker().is_some());
         assert!(runtime.handoff_blocker().is_some());
+        let second = runtime.followups[1].id;
+        let first = runtime.followups[0].id;
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.replace_draft(text_editor::Content::with_text("later draft"));
         runtime.attach([PathBuf::from("later.png")]);
-        drop(app.handle_chat_ui(Action::CancelFollowup(target)));
+        drop(app.handle_chat_ui(Action::TakeBackQueued(
+            target,
+            Some(QueueEntry::Local(second)),
+        )));
         let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "second task\nlater draft");
         assert_eq!(
-            runtime.composer.text().trim(),
-            "first task\nsecond task\nlater draft"
-        );
-        assert_eq!(
-            runtime
-                .attachments
-                .iter()
-                .map(|attachment| attachment.path.as_path())
-                .collect::<Vec<_>>(),
+            paths(&runtime.attachments),
             [
                 Path::new("first.png"),
                 Path::new("second.png"),
-                Path::new("third.png"),
                 Path::new("later.png")
             ]
         );
-        assert!(runtime.followup.is_none());
+        assert_eq!(runtime.followups.len(), 2);
+        drop(app.handle_chat_ui(Action::RemoveQueued(target, QueueEntry::Local(first))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.followups.len(), 1);
+        assert_eq!(runtime.composer.text().trim(), "second task\nlater draft");
+        // A message of files alone brings its files back and no text.
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.followups.is_empty());
+        assert_eq!(runtime.composer.text().trim(), "second task\nlater draft");
+        assert_eq!(runtime.attachments.len(), 4);
+        assert_eq!(runtime.attachments[0].path, Path::new("third.png"));
+        assert!(runtime.transition_blocker().is_some(), "attachments remain");
+    }
+
+    #[test]
+    fn taking_a_message_back_keeps_the_draft_a_history_walk_set_aside() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.remember("sent earlier".into());
+        runtime.followups.push(followup(0, "waiting", &[]));
+        runtime.replace_draft(text_editor::Content::with_text("unsent"));
+        runtime.recall(true);
+        assert_eq!(runtime.composer.text().trim(), "sent earlier");
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "waiting\nunsent");
+        assert!(runtime.history_cursor.is_none());
     }
 
     #[test]
@@ -7638,7 +7867,7 @@ mod tests {
                 assert!(pending.followup);
                 assert_eq!(pending.sent.as_deref().unwrap().trim(), "next task");
                 settle(&mut app, card, Ok(()));
-                assert!(chat_runtime(&app, card).followup.is_none());
+                assert!(chat_runtime(&app, card).followups.is_empty());
             }
         }
     }
@@ -7669,7 +7898,7 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("later draft"));
         settle(&mut app, card, Ok(()));
         let runtime = chat_runtime(&app, card);
-        assert!(runtime.followup.is_none());
+        assert!(runtime.followups.is_empty());
         assert_eq!(runtime.composer.text().trim(), "later draft");
         assert_eq!(
             runtime.history.last().unwrap().trim(),
@@ -7683,39 +7912,37 @@ mod tests {
         let card = live_chat(&mut app, Some("followup"));
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.followup = Some((
-            "first\nsecond".into(),
-            vec![Attachment {
-                path: "first.png".into(),
-            }],
-        ));
+        runtime.followups = vec![
+            followup(0, "first", &["first.png"]),
+            followup(1, "second", &[]),
+        ];
         drop(app.dispatch_queued(target));
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.replace_draft(text_editor::Content::with_text("later"));
         runtime.attach([PathBuf::from("later.png")]);
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
-        assert_eq!(
-            chat_runtime(&app, card).followup.as_ref().unwrap().0,
-            "first\nsecond"
-        );
+        assert_eq!(chat_runtime(&app, card).followups.len(), 2);
         assert_eq!(chat_runtime(&app, card).composer.text().trim(), "later");
-        drop(app.handle_chat_ui(Action::CancelFollowup(target)));
-        assert!(
-            chat_runtime(&app, card).followup.is_some(),
-            "cannot cancel an in-flight send"
-        );
+        for action in [
+            Action::TakeBackQueued(target, Some(QueueEntry::Local(0))),
+            Action::TakeBackQueued(target, None),
+            Action::RemoveQueued(target, QueueEntry::Local(1)),
+        ] {
+            drop(app.handle_chat_ui(action));
+            assert_eq!(
+                chat_runtime(&app, card).followups.len(),
+                2,
+                "an in-flight send keeps what it is carrying"
+            );
+        }
         settle(&mut app, card, Err("fixture rejected".into()));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text().trim(), "first\nsecond\nlater");
         assert_eq!(
-            runtime
-                .attachments
-                .iter()
-                .map(|attachment| attachment.path.as_path())
-                .collect::<Vec<_>>(),
+            paths(&runtime.attachments),
             [Path::new("first.png"), Path::new("later.png")]
         );
-        assert!(runtime.followup.is_none());
+        assert!(runtime.followups.is_empty());
     }
 
     #[test]
@@ -7732,15 +7959,17 @@ mod tests {
                 path: format!("{index}.png").into(),
             })
             .collect::<Vec<_>>();
-        runtime.followup = Some(("first".into(), attachments.clone()));
+        runtime.followups = vec![Followup {
+            id: 0,
+            text: "first".into(),
+            attachments: attachments.clone(),
+        }];
         runtime.replace_draft(text_editor::Content::with_text("second"));
         runtime.attach([PathBuf::from("extra.png")]);
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
         let runtime = chat_runtime(&app, card);
-        assert_eq!(
-            runtime.followup.as_ref().unwrap(),
-            &("first".into(), attachments)
-        );
+        assert_eq!(runtime.followups.len(), 1);
+        assert_eq!(runtime.followups[0].attachments, attachments);
         assert_eq!(runtime.composer.text().trim(), "second");
         assert_eq!(
             runtime.attachments,
@@ -7757,12 +7986,12 @@ mod tests {
         let card = live_chat(&mut app, Some("followup"));
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.followup = Some(("queued task".into(), Vec::new()));
+        runtime.followups.push(followup(0, "queued task", &[]));
         runtime.replace_draft(text_editor::Content::with_text("later draft"));
         let _ = app.dispatch_queued(target);
         assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
         settle(&mut app, card, Ok(()));
-        assert!(chat_runtime(&app, card).followup.is_none());
+        assert!(chat_runtime(&app, card).followups.is_empty());
         assert_eq!(
             chat_runtime(&app, card).composer.text().trim(),
             "later draft"
@@ -7899,39 +8128,168 @@ mod tests {
         (card, target, handle)
     }
 
-    #[test]
-    fn queue_editor_survives_streaming_until_its_save_is_confirmed() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target, handle) = history_fixture(&mut app);
-        let queued = chat::QueuedMessage {
-            id: "queued".into(),
-            text: "original".into(),
-            editable: true,
-        };
+    /// A chat whose provider holds `messages` and lets them be removed.
+    fn provider_queue(
+        app: &mut Cagents,
+        messages: Vec<chat::QueuedMessage>,
+    ) -> (CardId, Target, Arc<ClientHandle>) {
+        let (card, target, handle) = history_fixture(app);
         let mut snapshot = (*handle.snapshot()).clone();
-        snapshot.queued_messages = vec![queued];
-        snapshot.generation += 1;
-        handle.publish_snapshot_for_test(snapshot.clone());
-        app.chat_runtime_mut(target).unwrap().refresh();
-        let _ = app.handle_chat_ui(Action::EditQueue(target, Some("queued".into())));
-        snapshot.generation += 1;
-        handle.publish_snapshot_for_test(snapshot.clone());
-        app.chat_runtime_mut(target).unwrap().refresh();
-        assert_eq!(
-            chat_runtime(&app, card).queue_edit.as_ref().unwrap().1,
-            "original"
-        );
-        let _ = app.handle_chat_ui(Action::QueueText(target, "edited".into()));
-        let _ = app.handle_chat_ui(Action::SaveQueue(target));
-        snapshot.generation += 1;
-        handle.publish_snapshot_for_test(snapshot.clone());
-        app.chat_runtime_mut(target).unwrap().refresh();
-        assert!(chat_runtime(&app, card).queue_edit.is_some());
-        snapshot.queued_messages[0].text = "edited".into();
+        snapshot.capabilities.queue_remove = true;
+        snapshot.queued_messages = messages;
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
-        assert!(chat_runtime(&app, card).queue_edit.is_none());
+        (card, target, handle)
+    }
+
+    fn provider_message(id: &str, text: &str) -> chat::QueuedMessage {
+        chat::QueuedMessage::new(id.into(), text.into())
+    }
+
+    /// Publishes the provider's queue with `id` gone from it and, where
+    /// `removed` says, its answer to the request to remove it.
+    fn provider_drops(
+        app: &mut Cagents,
+        target: Target,
+        handle: &ClientHandle,
+        id: &str,
+        removed: Option<bool>,
+    ) {
+        let mut snapshot = (*handle.snapshot()).clone();
+        if removed != Some(false) {
+            snapshot.queued_messages.retain(|message| message.id != id);
+        }
+        if let Some(removed) = removed {
+            snapshot.queue_removals.push(chat::QueueRemoval {
+                id: id.into(),
+                removed,
+            });
+        }
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+    }
+
+    #[test]
+    fn a_provider_queued_message_returns_to_the_composer_once_the_provider_lets_go() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut newest = provider_message("newest", "revise me");
+        newest.attachments = vec![Attachment {
+            path: "queued.png".into(),
+        }];
+        let (card, target, handle) =
+            provider_queue(&mut app, vec![provider_message("older", "stay"), newest]);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("typed since"));
+        assert_eq!(
+            runtime.newest_take_back(),
+            Some(QueueEntry::Provider("newest".into()))
+        );
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        // The command being accepted says only that the request was written.
+        settle(&mut app, card, Ok(()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_recalling("newest"));
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "typed since",
+            "nothing returns before the provider has let go of it"
+        );
+        // The next press reaches past the one already on its way back.
+        assert_eq!(
+            runtime.newest_take_back(),
+            Some(QueueEntry::Provider("older".into()))
+        );
+        provider_drops(&mut app, target, &handle, "newest", Some(true));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "revise me\ntyped since");
+        assert_eq!(paths(&runtime.attachments), [Path::new("queued.png")]);
+        assert!(runtime.recalling.is_empty() && runtime.taken_back.is_empty());
+        // Sent again, it waits for the next turn as it did before.
+        assert_eq!(runtime.resend, Some(PromptMode::Queue));
+    }
+
+    #[test]
+    fn a_message_the_agent_started_on_is_not_taken_back() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = provider_queue(
+            &mut app,
+            vec![provider_message("queued", "already running")],
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("draft"));
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        settle(&mut app, card, Ok(()));
+        // The message left the queue because it was delivered, not removed.
+        provider_drops(&mut app, target, &handle, "queued", None);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "draft");
+        assert!(runtime.recalling.is_empty());
+        assert!(runtime.error.as_ref().unwrap().contains("already started"));
+    }
+
+    #[test]
+    fn a_refused_take_back_leaves_the_message_waiting_and_the_composer_alone() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) =
+            provider_queue(&mut app, vec![provider_message("queued", "still waiting")]);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("draft"));
+        // Refused before it reached the provider.
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        settle(&mut app, card, Err("fixture refused".into()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.recalling.is_empty());
+        assert!(runtime.error.as_ref().unwrap().contains("fixture refused"));
+        // Refused by the provider: the entry is still listed, and offered.
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        settle(&mut app, card, Ok(()));
+        provider_drops(&mut app, target, &handle, "queued", Some(false));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.recalling.is_empty());
+        assert_eq!(runtime.composer.text().trim(), "draft");
+        assert_eq!(
+            runtime.newest_take_back(),
+            Some(QueueEntry::Provider("queued".into()))
+        );
+        // That earlier answer does not settle a second attempt.
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        settle(&mut app, card, Ok(()));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).is_recalling("queued"));
+        provider_drops(&mut app, target, &handle, "queued", Some(true));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "still waiting\ndraft"
+        );
+    }
+
+    #[test]
+    fn only_a_whole_removable_message_can_be_taken_back() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut partial = provider_message("partial", "preview only");
+        partial.editable = false;
+        let (card, target, handle) = provider_queue(&mut app, vec![partial]);
+        drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+        drop(app.handle_chat_ui(Action::TakeBackQueued(
+            target,
+            Some(QueueEntry::Provider("partial".into())),
+        )));
+        assert!(chat_runtime(&app, card).pending.is_none());
+        // A provider that cannot remove a message cannot give it back either.
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.capabilities.queue_remove = false;
+        snapshot.queued_messages = vec![provider_message("whole", "text")];
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert_eq!(chat_runtime(&app, card).newest_take_back(), None);
     }
 
     #[test]

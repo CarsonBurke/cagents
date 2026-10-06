@@ -1725,7 +1725,6 @@ impl Actor {
                 Command::Prompt { .. }
                 | Command::Compact
                 | Command::Slash { .. }
-                | Command::UpdateQueued { .. }
                 | Command::StartQueued { .. }
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
@@ -2140,6 +2139,14 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             );
         }
         Event::QueueChanged(messages) => state.queued_messages = messages,
+        Event::QueueRemoval(removal) => {
+            state.queue_removals.push(removal);
+            let excess = state
+                .queue_removals
+                .len()
+                .saturating_sub(crate::chat::QueueRemoval::LIMIT);
+            state.queue_removals.drain(..excess);
+        }
         Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::LatestHistoryStarted => state.history_loading = true,
         Event::HistoryError(message) => state.error = Some(message),
@@ -2152,6 +2159,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.forked = None;
             state.interrupt_mode = None;
             state.queued_messages.clear();
+            state.queue_removals.clear();
             state.items.clear();
             state.subagents.clear();
             indices.clear();

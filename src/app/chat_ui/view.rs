@@ -68,6 +68,10 @@ const PLAN_CEILING: f32 = 120.0;
 /// Waiting prompts stay within reach without taking over the conversation.
 const QUEUE_CEILING: f32 = 180.0;
 
+/// The line a waiting message's preview is set on, which its marker and
+/// controls center on.
+const QUEUE_LINE_HEIGHT: f32 = 18.0;
+
 /// The padding a status-line control is drawn with.
 ///
 /// The default dropdown padding is sized for a settings page; on a status line
@@ -204,6 +208,136 @@ fn history_key(
         keyboard::Key::Named(keyboard::key::Named::ArrowDown) if recall_newer => Some(false),
         _ => None,
     }
+}
+
+/// The lines of a waiting message its row shows.
+const QUEUE_PREVIEW_LINES: usize = 2;
+
+/// How much of a waiting message is handed to its row to be laid out. Two
+/// lines never show more, and a hundred entries of sixteen kibibytes each
+/// would otherwise be shaped on every layout to draw two lines apiece.
+const QUEUE_PREVIEW_BYTES: usize = 480;
+
+/// When a waiting message goes to the agent, as its row marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueTiming {
+    NextStep,
+    NextTurn,
+    /// On its way to the agent, or back to the composer.
+    Leaving,
+}
+
+/// One waiting message: when it goes, what it says, and what can be done
+/// with it.
+///
+/// The marker is the glyph of the submit control that queued the message, so
+/// the row reads as the result of the button that was pressed.
+fn queue_row<'a>(
+    timing: QueueTiming,
+    text: &'a str,
+    attachments: &'a [Attachment],
+    controls: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let marker = |name, label: &'static str| {
+        crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(
+                crate::ui_controls::symbolic_icon(name),
+                design::COMPACT_ICON_SIZE,
+            ),
+            label,
+        )
+    };
+    let marker: Element<'a, Message> = match timing {
+        QueueTiming::NextStep => marker("go-jump-symbolic", "Delivered at the agent's next step"),
+        QueueTiming::NextTurn => marker("list-add-symbolic", "Sent when this turn ends"),
+        QueueTiming::Leaving => crate::ui_controls::activity_spinner_tone(
+            f32::from(design::COMPACT_ICON_SIZE),
+            design::accent_color,
+        ),
+    };
+    let names = || {
+        attachments
+            .iter()
+            .map(|attachment| {
+                attachment
+                    .path
+                    .file_name()
+                    .unwrap_or(attachment.path.as_os_str())
+                    .to_string_lossy()
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // A message of files alone is named by them rather than left blank.
+    let preview: Cow<'a, str> = if text.trim().is_empty() {
+        names().into()
+    } else {
+        let text = text.trim();
+        text[..text.floor_char_boundary(QUEUE_PREVIEW_BYTES)].into()
+    };
+    let mut row: Vec<Element<'a, Message>> = vec![
+        widget::container(marker)
+            .height(QUEUE_LINE_HEIGHT)
+            .align_y(Alignment::Center)
+            .into(),
+        widget::container(
+            design::body(preview)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
+                )),
+        )
+        .width(Length::Fill)
+        .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
+        .clip(true)
+        .into(),
+    ];
+    if !attachments.is_empty() && !text.trim().is_empty() {
+        row.push(crate::interaction::tooltip(
+            widget::row::with_children(vec![
+                crate::ui_controls::passive_icon(
+                    crate::ui_controls::symbolic_icon("mail-attachment-symbolic"),
+                    design::COMPACT_ICON_SIZE,
+                ),
+                design::caption(attachments.len().to_string()).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .height(QUEUE_LINE_HEIGHT)
+            .align_y(Alignment::Center),
+            names(),
+        ));
+    }
+    row.push(
+        widget::row::with_children(controls)
+            .height(QUEUE_LINE_HEIGHT)
+            .align_y(Alignment::Center)
+            .into(),
+    );
+    widget::row::with_children(row)
+        .spacing(step::GAP_S)
+        .padding([0.0, step::GAP_XS])
+        .align_y(Alignment::Start)
+        .into()
+}
+
+/// Whether a key press takes the newest waiting message back into the
+/// composer.
+///
+/// Up in an empty composer is the key a reader already reaches for to get a
+/// message back, so what is still waiting comes before what was sent. Once
+/// there is a draft, bare Up is the caret's, and merging a waiting message
+/// into it is not something to do by accident: Alt+Up asks for that.
+fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
+    matches!(press.status, text_editor::Status::Focused { .. })
+        && matches!(
+            press.key,
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+        )
+        && !press.modifiers.shift()
+        && !press.modifiers.control()
+        && !press.modifiers.logo()
+        && (press.modifiers.alt() || empty)
 }
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
@@ -1427,15 +1561,20 @@ impl Runtime {
                 .height(Length::Fill)
                 .into(),
         ];
-        let has_draft = self
+        let has_text = self
             .composer
             .lines()
-            .any(|line| !line.text.trim().is_empty())
-            || !self.attachments.is_empty();
+            .any(|line| !line.text.trim().is_empty());
+        let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
         let modes: &[PromptMode] = if snapshot.busy {
             match snapshot.capabilities.steer {
+                // A message taken back from the queue goes back the way it
+                // was queued unless the other chord says otherwise.
+                true if self.resend == Some(PromptMode::Queue) => {
+                    &[PromptMode::Queue, PromptMode::Steer]
+                }
                 true => &[PromptMode::Steer, PromptMode::Queue],
                 false => &[PromptMode::Queue],
             }
@@ -1493,6 +1632,12 @@ impl Runtime {
             // While browsing, both arrows walk whole history entries so a
             // multiline recalled prompt cannot trap the original draft.
             let (recall_older, recall_newer) = self.history_navigation();
+            // What is still waiting comes back before what was already sent,
+            // but a walk through sent messages that has begun keeps the keys.
+            // A press while one is already on its way back is still about
+            // the queue, and is not left to fall through to that walk.
+            let take_back =
+                !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
@@ -1559,6 +1704,11 @@ impl Runtime {
                         return Some(text_editor::Binding::Custom(action(Action::Submit(
                             target, mode,
                         ))));
+                    }
+                    if take_back && queue_key(&press, !has_text) {
+                        return Some(text_editor::Binding::Custom(action(
+                            Action::TakeBackQueued(target, None),
+                        )));
                     }
                     if let Some(older) = history_key(&press, recall_older, recall_newer) {
                         return Some(text_editor::Binding::Custom(action(if older {
@@ -2537,77 +2687,167 @@ impl Runtime {
         }
     }
 
+    /// The messages waiting to be sent, docked on the composer.
+    ///
+    /// One list whoever holds a message - the provider's own queue or this
+    /// chat, for a provider without one - because a reader asks the same of
+    /// each: what is waiting, when it goes, and how to change their mind. A
+    /// row is a glance rather than the message, so the list stays a list at
+    /// a hundred entries; revising one takes it back into the composer, the
+    /// one place that edits text and files.
     fn queue_view(&self) -> Option<Element<'_, Message>> {
-        let count = self.snapshot.queued_messages.len() + usize::from(self.followup.is_some());
-        if count == 0 {
-            return None;
-        }
-        let mut rows = Vec::new();
-        for queued in &self.snapshot.queued_messages {
-            rows.push(self.provider_queue_view(queued));
-        }
-        if let Some((text, attachments)) = &self.followup {
-            let sending = self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.followup);
-            let controls = vec![
-                design::caption(if sending { "Sending…" } else { "Next turn" })
-                    .width(Length::Fill)
-                    .into(),
+        let target = self.target;
+        let caps = &self.snapshot.capabilities;
+        let sending = self.followups_sending();
+        let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
+        let control = |name, label: &'static str, enabled: bool, message: Action| {
+            crate::ui_controls::compact_icon_control(
+                crate::ui_controls::symbolic_icon(name),
+                label,
+                enabled.then(|| action(message)),
+            )
+            .icon_tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
+            .into()
+        };
+        let copy = |text: &str| {
+            (!text.trim().is_empty()).then(|| {
                 small_icon(
                     "edit-copy-symbolic",
                     "Copy queued message",
-                    Action::CopyLiteral(text.clone()),
-                ),
-                widget::button::text("Edit")
-                    .on_press_maybe((!sending).then(|| action(Action::CancelFollowup(self.target))))
-                    .into(),
-            ];
-            let mut content = vec![transcript_body(
-                if text.trim().is_empty() {
-                    "Queued attachment"
-                } else {
-                    text
-                },
-                self.target,
-            )];
-            for attachment in attachments {
-                content.push(
-                    design::caption(
-                        attachment
-                            .path
-                            .file_name()
-                            .unwrap_or(attachment.path.as_os_str())
-                            .to_string_lossy(),
-                    )
-                    .into(),
-                );
+                    Action::CopyLiteral(text.to_owned()),
+                )
+            })
+        };
+        let mut rows = Vec::new();
+        for queued in &self.snapshot.queued_messages {
+            if self.taken_back.contains(&queued.id) {
+                continue;
             }
-            content.insert(
-                0,
-                widget::row::with_children(controls)
-                    .spacing(step::GAP_S)
-                    .align_y(Alignment::Center)
-                    .into(),
-            );
-            rows.push(
-                widget::column::with_children(content)
-                    .spacing(step::GAP_XS)
-                    .into(),
-            );
+            let entry = QueueEntry::Provider(queued.id.clone());
+            let recalling = self.is_recalling(&queued.id);
+            let available = available && !recalling;
+            let mut controls: Vec<Element<'_, Message>> = copy(&queued.text).into_iter().collect();
+            if caps.queue_remove {
+                // An entry the composer cannot hold whole keeps the control,
+                // so its absence is not left to be wondered at.
+                controls.push(if queued.editable {
+                    control(
+                        "document-edit-symbolic",
+                        "Take back to edit",
+                        available,
+                        Action::TakeBackQueued(target, Some(entry.clone())),
+                    )
+                } else {
+                    control(
+                        "document-edit-symbolic",
+                        "Too large or too rich to edit here; it can still be removed",
+                        false,
+                        Action::TakeBackQueued(target, Some(entry.clone())),
+                    )
+                });
+            }
+            if caps.queue_start {
+                controls.push(control(
+                    "go-up-symbolic",
+                    "Send next, ahead of the rest",
+                    available,
+                    Action::Command(
+                        target,
+                        Command::StartQueued {
+                            id: queued.id.clone(),
+                        },
+                    ),
+                ));
+            }
+            if caps.queue_remove {
+                controls.push(control(
+                    "window-close-symbolic",
+                    "Remove from the queue",
+                    available,
+                    Action::RemoveQueued(target, entry),
+                ));
+            }
+            rows.push(queue_row(
+                match queued.delivery {
+                    _ if recalling => QueueTiming::Leaving,
+                    chat::QueueDelivery::NextStep => QueueTiming::NextStep,
+                    chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
+                },
+                &queued.text,
+                &queued.attachments,
+                controls,
+            ));
         }
+        for followup in &self.followups {
+            let entry = QueueEntry::Local(followup.id);
+            rows.push(queue_row(
+                if sending {
+                    QueueTiming::Leaving
+                } else {
+                    QueueTiming::NextTurn
+                },
+                &followup.text,
+                &followup.attachments,
+                copy(&followup.text)
+                    .into_iter()
+                    .chain([
+                        control(
+                            "document-edit-symbolic",
+                            "Take back to edit",
+                            !sending,
+                            Action::TakeBackQueued(target, Some(entry.clone())),
+                        ),
+                        control(
+                            "window-close-symbolic",
+                            "Remove from the queue",
+                            !sending,
+                            Action::RemoveQueued(target, entry),
+                        ),
+                    ])
+                    .collect(),
+            ));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        let count = rows.len();
         if self.snapshot.queued_messages.len() == chat::QueuedMessage::LIMIT {
             rows.push(design::caption("Showing the first 128 queued messages").into());
+        }
+        let mut header: Vec<Element<'_, Message>> = vec![
+            design::caption(format!("Queued · {count}"))
+                .width(Length::Fill)
+                .into(),
+        ];
+        // The one thing about the queue a reader cannot discover by looking.
+        if sending {
+            header.push(design::caption("Sending…").into());
+        } else if self.newest_take_back().is_some() {
+            // Bare Up belongs to the caret once there is a draft.
+            let empty = self
+                .composer
+                .lines()
+                .all(|line| line.text.trim().is_empty());
+            header.push(
+                design::caption(if empty {
+                    "↑ to edit"
+                } else {
+                    "Alt+↑ to edit"
+                })
+                .into(),
+            );
         }
         Some(
             widget::container(
                 widget::column::with_children(vec![
-                    design::caption(format!("Queued · {count}")).into(),
+                    widget::row::with_children(header)
+                        .spacing(step::GAP_S)
+                        .padding([0.0, step::GAP_XS])
+                        .into(),
                     widget::container(
                         widget::scrollable(
                             widget::column::with_children(rows)
-                                .spacing(step::GAP_M)
+                                .spacing(step::GAP_XS)
                                 .padding(design::with_vertical_rail(iced::Padding::ZERO)),
                         )
                         .id(card_control_id(self.target.card, "chat-queue"))
@@ -2619,7 +2859,7 @@ impl Runtime {
                     .max_height(QUEUE_CEILING)
                     .into(),
                 ])
-                .spacing(step::GAP_S),
+                .spacing(step::GAP_XS),
             )
             .width(Length::Fill)
             .padding(step::GAP_S)
@@ -2630,102 +2870,6 @@ impl Runtime {
             ))
             .into(),
         )
-    }
-
-    fn provider_queue_view<'a>(&'a self, queued: &'a chat::QueuedMessage) -> Element<'a, Message> {
-        let caps = &self.snapshot.capabilities;
-        let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
-        let mut controls: Vec<Element<'a, Message>> = vec![
-            widget::Space::new().width(Length::Fill).into(),
-            small_icon(
-                "edit-copy-symbolic",
-                "Copy queued message",
-                Action::CopyLiteral(queued.text.clone()),
-            ),
-        ];
-        if caps.queue_remove {
-            controls.push(
-                widget::button::text("Remove")
-                    .on_press_maybe(available.then(|| {
-                        action(Action::Command(
-                            self.target,
-                            Command::RemoveQueued {
-                                id: queued.id.clone(),
-                            },
-                        ))
-                    }))
-                    .into(),
-            );
-        }
-        if caps.queue_start {
-            controls.push(
-                widget::button::text("Start next")
-                    .on_press_maybe(available.then(|| {
-                        action(Action::Command(
-                            self.target,
-                            Command::StartQueued {
-                                id: queued.id.clone(),
-                            },
-                        ))
-                    }))
-                    .into(),
-            );
-        }
-        let editing = self
-            .queue_edit
-            .as_ref()
-            .is_some_and(|(id, _)| id == &queued.id);
-        if caps.queue_edit && queued.editable && !editing {
-            controls.push(
-                widget::button::text("Edit")
-                    .on_press_maybe(
-                        available.then(|| {
-                            action(Action::EditQueue(self.target, Some(queued.id.clone())))
-                        }),
-                    )
-                    .into(),
-            );
-        }
-        let mut content = widget::column::with_children(Vec::new()).spacing(step::GAP_XS);
-        if let Some((id, draft)) = &self.queue_edit
-            && id == &queued.id
-        {
-            content = content.push(
-                widget::text_input("Queued message", draft)
-                    .on_input(move |text| action(Action::QueueText(self.target, text))),
-            );
-            controls.push(
-                widget::button::text("Save")
-                    .on_press_maybe(
-                        (available && !draft.trim().is_empty())
-                            .then(|| action(Action::SaveQueue(self.target))),
-                    )
-                    .into(),
-            );
-            controls.push(
-                widget::button::text("Cancel edit")
-                    .on_press(action(Action::EditQueue(self.target, None)))
-                    .into(),
-            );
-        } else {
-            content = content.push(transcript_body(
-                if queued.text.trim().is_empty() {
-                    "Queued attachment"
-                } else {
-                    &queued.text
-                },
-                self.target,
-            ));
-        }
-        widget::column::with_children(vec![
-            widget::row::with_children(controls)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
-            content.into(),
-        ])
-        .spacing(step::GAP_XS)
-        .into()
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
@@ -4005,7 +4149,11 @@ mod tests {
             crate::settings::EditorSyntaxTheme::default(),
         );
         assert!(runtime.queue_view().is_none());
-        runtime.followup = Some(("Local follow-up".into(), Vec::new()));
+        runtime.followups.push(super::super::Followup {
+            id: 0,
+            text: "Local follow-up".into(),
+            attachments: Vec::new(),
+        });
         assert!(runtime.queue_view().is_some());
         runtime.selected_subagent = Some("child".into());
         Arc::make_mut(&mut runtime.snapshot).queued_messages = (0..chat::QueuedMessage::LIMIT)
@@ -4234,6 +4382,37 @@ mod tests {
                 .iter()
                 .all(|block| block.size().width > 0.0 && block.size().height > 0.0)
         );
+    }
+
+    #[test]
+    fn up_reaches_the_queue_from_the_first_line_and_alt_up_from_anywhere() {
+        use keyboard::Modifiers;
+        use keyboard::key::Named;
+        for (named, modifiers, first_line, expected) in [
+            (Named::ArrowUp, Modifiers::empty(), true, true),
+            (Named::ArrowUp, Modifiers::empty(), false, false),
+            (Named::ArrowUp, Modifiers::ALT, false, true),
+            (Named::ArrowUp, Modifiers::ALT, true, true),
+            // Selecting upward and jumping the caret stay the editor's.
+            (Named::ArrowUp, Modifiers::SHIFT, true, false),
+            (Named::ArrowUp, Modifiers::CTRL, true, false),
+            (
+                Named::ArrowUp,
+                Modifiers::ALT | Modifiers::SHIFT,
+                true,
+                false,
+            ),
+            (Named::ArrowDown, Modifiers::ALT, true, false),
+        ] {
+            assert_eq!(
+                queue_key(&key(named, modifiers), first_line),
+                expected,
+                "{named:?} {modifiers:?} first_line={first_line}"
+            );
+        }
+        let mut unfocused = key(Named::ArrowUp, Modifiers::empty());
+        unfocused.status = text_editor::Status::Active;
+        assert!(!queue_key(&unfocused, true));
     }
 
     fn press(modifiers: keyboard::Modifiers, focused: bool) -> text_editor::KeyPress {

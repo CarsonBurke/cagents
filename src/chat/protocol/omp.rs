@@ -736,7 +736,7 @@ impl Adapter for Omp {
                 request["mode"] = mode.into();
                 step.writes.push(request);
             }
-            Command::RemoveQueued { .. } | Command::UpdateQueued { .. } | Command::StartQueued { .. } => return Err("This OMP protocol does not support queue mutation".into()),
+            Command::RemoveQueued { .. } | Command::StartQueued { .. } => return Err("This OMP protocol does not support queue mutation".into()),
             Command::ListBranches => step.writes.push(self.request("get_branch_messages")),
             Command::Branch { id } => {
                 if self.busy { return Err("Branch requires an idle OMP conversation".into()); }
