@@ -8,15 +8,14 @@ use cosmic::iced::advanced::Renderer as _;
 use cosmic::{
     Element, Renderer, Theme,
     iced::{
-        Border, Color, Event, Length, Point, Rectangle, Shadow, Size,
+        Border, Color, Event, Length, Rectangle, Shadow, Size,
         advanced::{
-            Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
+            Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
             widget::{Operation, Tree, operation, tree},
         },
         id::Id,
         keyboard, window,
     },
-    widget,
 };
 
 /// Only the shared rule participates in layout; the pointer target overlaps it.
@@ -34,7 +33,6 @@ pub enum Edge {
 }
 
 pub struct Splitter<'a, Message> {
-    content: Element<'a, Message>,
     width: f32,
     default_width: f32,
     min: f32,
@@ -62,10 +60,6 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
     ) -> Self {
         debug_assert!(min.is_finite() && max.is_finite() && min <= max);
         Self {
-            content: widget::container(cosmic::iced::widget::Space::new())
-                .center_x(Length::Fixed(WIDTH))
-                .height(Length::Fill)
-                .into(),
             width: clamp(width, min, max),
             default_width: clamp(width, min, max),
             min,
@@ -82,14 +76,6 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
     pub fn default_width(mut self, width: f32) -> Self {
         self.default_width = clamp(width, self.min, self.max);
         self
-    }
-
-    fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
-        layout
-            .children()
-            .next()
-            .expect("splitter content layout")
-            .with_virtual_offset(layout.virtual_offset())
     }
 
     fn hit_bounds(bounds: Rectangle) -> Rectangle {
@@ -133,6 +119,9 @@ struct ResizeOrigin {
 #[derive(Debug, Default)]
 struct SplitterState {
     drag: Option<ResizeOrigin>,
+    /// Whether the pointer was over the hit target as of the last event. The
+    /// rule is repainted when this changes, not on every pointer move.
+    hovered: bool,
     is_focused: bool,
     keyboard_gesture: bool,
     last_click: Option<std::time::Instant>,
@@ -200,51 +189,29 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         tree::State::new(SplitterState::default())
     }
 
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
-    }
-
-    fn diff(&mut self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_mut(&mut self.content));
-    }
-
     fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
+        Size::new(Length::Fixed(WIDTH), Length::Fill)
     }
 
     fn layout(
         &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
+        _tree: &mut Tree,
+        _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let content = self
-            .content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-            .move_to(Point::ORIGIN);
-        layout::Node::with_children(content.size(), vec![content])
+        layout::atomic(limits, WIDTH, Length::Fill)
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
-        renderer: &Renderer,
+        _renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        let bounds = layout.bounds();
-        operation.traverse(&mut |operation| {
-            self.content.as_widget_mut().operate(
-                &mut tree.children[0],
-                Self::child_layout(layout),
-                renderer,
-                operation,
-            );
-        });
         operation.focusable(
             Some(&self.id),
-            bounds,
+            layout.bounds(),
             tree.state.downcast_mut::<SplitterState>(),
         );
     }
@@ -255,13 +222,22 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
+        _renderer: &Renderer,
+        _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
     ) {
         let bounds = Self::hit_bounds(layout.bounds());
         let state = tree.state.downcast_mut::<SplitterState>();
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft)
+        ) {
+            let hovered = cursor.is_over(bounds);
+            if std::mem::replace(&mut state.hovered, hovered) != hovered {
+                shell.request_redraw();
+            }
+        }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if !self.modal_open => {
                 state.is_focused = cursor.is_over(bounds);
@@ -283,7 +259,6 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                shell.request_redraw();
                 if let Some(width) = state.dragged_width(self.edge, position.x) {
                     state.last_click = None;
                     shell.publish(self.resize(width));
@@ -354,16 +329,6 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
             }
             _ => {}
         }
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            Self::child_layout(layout),
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
     }
 
     fn mouse_interaction(
@@ -431,23 +396,6 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         );
     }
 
-    fn overlay<'a>(
-        &'a mut self,
-        tree: &'a mut Tree,
-        layout: Layout<'a>,
-        renderer: &Renderer,
-        viewport: &Rectangle,
-        translation: cosmic::iced::Vector,
-    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            Self::child_layout(layout),
-            renderer,
-            viewport,
-            translation,
-        )
-    }
-
     fn a11y_nodes(
         &self,
         layout: Layout<'_>,
@@ -499,7 +447,7 @@ impl<'a, Message: 'a> From<Splitter<'a, Message>> for Element<'a, Message> {
 mod tests {
     use super::*;
     use cosmic::iced::{
-        Font, Pixels,
+        Font, Pixels, Point,
         advanced::{Layout, clipboard, layout, mouse, renderer::Headless, widget::Tree},
     };
     use iced_accessibility::accesskit::{Action, Role};
