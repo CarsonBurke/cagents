@@ -6366,8 +6366,14 @@ impl Cagents {
         id: CardId,
         pane: &'a PullRequestPane,
     ) -> Element<'a, Message> {
-        iced::widget::responsive(move |size| self.pull_request_card_layout(id, pane, size.width))
-            .into()
+        // The strip already tracks the rendered width, including animations.
+        // Responsive would hide the review and its controls from AccessKit.
+        let width = self
+            .workspace
+            .presentation_geometry()
+            .card(id)
+            .map_or(self.workspace.viewport_width(), |card| card.width());
+        self.pull_request_card_layout(id, pane, width)
     }
 
     fn pull_request_card_layout<'a>(
@@ -6433,70 +6439,81 @@ impl Cagents {
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
-        main.push(
-            widget::container(
-                widget::button::text(if collapsed {
-                    "Show files"
+        let file_panel_toggle = || {
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon("view-sidebar-start-symbolic"),
+                if collapsed {
+                    "Show review files"
                 } else {
-                    "Hide files"
-                })
-                .on_press_maybe((!modal_open).then_some(
-                    Message::ReviewFilePanelToggle {
-                        card: id,
-                        collapsed: !collapsed,
-                    },
-                )),
+                    "Hide review files"
+                },
+                !collapsed,
+                !modal_open,
+                Some(Message::ReviewFilePanelToggle {
+                    card: id,
+                    collapsed: !collapsed,
+                }),
             )
-            .height(design::DENSE_ROW_HEIGHT)
-            .width(Length::Fill)
-            .into(),
-        );
-        let file_comment = review
-            .file_comment_control(modal_open, pane.runtime.can_show_file_discussion())
-            .map(|control| {
-                crate::ui_controls::toolbar_actions(vec![control])
-                    .map(move |action| RepositoryAction::Review { card: id, action })
-            });
-        if let Some(toolbar) =
-            repository_widget::selected_file_toolbar_with(id, &pane.runtime, file_comment)
+        };
+        let mut review_controls = Vec::new();
+        if let Some(comment) =
+            review.file_comment_control(modal_open, pane.runtime.can_show_file_discussion())
         {
-            main.push(toolbar.map(Message::Repository));
-            main.push(design::horizontal_rule());
+            review_controls.push(comment.map(move |action| {
+                Message::Repository(RepositoryAction::Review { card: id, action })
+            }));
         }
+        review_controls.push(file_panel_toggle().into());
+        if let Some(toolbar) = repository_widget::selected_file_toolbar_mapped_with(
+            id,
+            &pane.runtime,
+            Some(crate::ui_controls::toolbar_actions(review_controls)),
+            Message::Repository,
+        ) {
+            main.push(toolbar);
+        } else {
+            main.push(
+                widget::container(
+                    widget::row::with_children(vec![
+                        design::heading("Changes").width(Length::Fill).into(),
+                        file_panel_toggle().into(),
+                    ])
+                    .align_y(Alignment::Center),
+                )
+                .padding([0.0, design::TOOLBAR_INSET])
+                .height(design::HEADER_CONTENT_HEIGHT)
+                .into(),
+            );
+        }
+        main.push(design::horizontal_rule());
         if review.selected().is_some() {
             main.push(
                 repository_widget::view_with_review(id, &pane.runtime, Some(review))
                     .map(Message::Repository),
             );
         } else {
-            let (title, detail) = if review.is_open() {
-                (
-                    "Choose a file",
-                    "Pick a changed file to read its diff. Alt+Down/Up move between files; Alt+J/K move between changes; Alt+V marks a file viewed.",
-                )
+            let prompt = if review.is_open() {
+                "Select a file"
             } else {
-                (
-                    "Choose a pull request",
-                    "Pick an open pull request to fetch its changes and review them here.",
-                )
+                "Select a pull request"
             };
             main.push(
                 widget::container(
                     widget::column::with_children(vec![
                         crate::ui_controls::symbolic_icon("pull-request-symbolic")
                             .icon()
-                            .size(32)
+                            .size(24)
                             .into(),
-                        widget::text::title3(title).into(),
-                        design::body(detail)
+                        design::caption(prompt)
                             .class(cosmic::theme::Text::Custom(design::muted_text))
                             .wrapping(iced::widget::text::Wrapping::Word)
                             .align_x(Alignment::Center)
+                            .width(Length::Fill)
                             .into(),
                     ])
                     .align_x(Alignment::Center)
                     .spacing(spacing.space_xs)
-                    .max_width(420),
+                    .width(Length::Fill),
                 )
                 .center(Length::Fill)
                 .padding(spacing.space_m)
@@ -8988,25 +9005,33 @@ impl Cagents {
         // confirms removal or reports that it must stay open.
         let closing_terminal =
             self.closed_terminal_cards.contains(&id) || self.terminal_close_pending(id);
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&id)
-            && let Some(toolbar) = repository_widget::selected_file_toolbar(id, runtime)
-        {
-            rows.push(toolbar.map(Message::Repository));
-            if runtime
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&id) {
+            let html = runtime
                 .selected_path()
                 .and_then(Path::extension)
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| {
                     extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
-                })
-            {
-                rows.push(
-                    widget::button::text("Preview HTML")
-                        .on_press(Message::PreviewLocalFile(id))
-                        .into(),
-                );
+                });
+            let preview = html.then(|| {
+                crate::ui_controls::icon_control(
+                    crate::ui_controls::symbolic_icon("internet-web-browser-symbolic"),
+                    "Preview HTML",
+                    false,
+                    !self.modal_is_open(),
+                    Some(Message::PreviewLocalFile(id)),
+                )
+                .into()
+            });
+            if let Some(toolbar) = repository_widget::selected_file_toolbar_mapped_with(
+                id,
+                runtime,
+                preview,
+                Message::Repository,
+            ) {
+                rows.push(toolbar);
+                rows.push(design::horizontal_rule());
             }
-            rows.push(design::horizontal_rule());
         }
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
@@ -18727,6 +18752,57 @@ mod tests {
                         && node.node().label() == Some("Confirm")
                 })
         );
+    }
+
+    #[test]
+    fn review_file_panel_control_remains_accessible_across_pane_widths() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let mut pane = app.pull_request_pane(&crate::model::PullRequestView {
+            repository: PathBuf::from("/repo"),
+            selected_number: None,
+            file_panel_width: None,
+            file_panel_collapsed: None,
+        });
+        let renderer = headless_renderer();
+        for (width, collapsed, label) in [
+            (260.0, None, "Show review files"),
+            (260.0, Some(false), "Hide review files"),
+            (500.0, None, "Show review files"),
+            (900.0, None, "Hide review files"),
+        ] {
+            pane.file_panel_collapsed = collapsed;
+            drop(app.workspace.resize_viewport(width));
+            let mut element = app.pull_request_card_view(card, &pane);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 600.0)),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let control = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(label)
+                })
+                .unwrap_or_else(|| {
+                    panic!("the review panel toggle must remain named at width {width}")
+                });
+            assert!(
+                control.node().bounds().unwrap().x1 <= f64::from(width),
+                "the review panel toggle must remain visible at width {width}"
+            );
+        }
     }
 
     /// The frame the runtime actually builds: libcosmic composes the header,

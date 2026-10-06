@@ -168,8 +168,19 @@ impl State {
         match self.installed.get(&provider) {
             None => "Checking provider…",
             Some(false) => "CLI not found on PATH",
-            Some(true) if self.of(provider).any(|account| account.identity.is_some()) => {
+            Some(true)
+                if self.of(provider).any(|account| {
+                    account.identity.is_some()
+                        && !account
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.status == UsageStatus::NeedsLogin)
+                }) =>
+            {
                 "Account available"
+            }
+            Some(true) if self.of(provider).any(|account| account.identity.is_some()) => {
+                "Sign in again"
             }
             Some(true) => "Installed · sign in to get started",
         }
@@ -4764,6 +4775,42 @@ mod tests {
     use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut state = State::new(None, None, None);
+            state.installed.insert(provider, true);
+            let system = Account::system(provider).id();
+            let account = state.account_mut(&system).unwrap();
+            account.identity = Some(Identity {
+                email: Some("retained@example.com".into()),
+                ..Identity::default()
+            });
+            account.snapshot = Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW));
+            assert_eq!(state.provider_status(provider), "Sign in again");
+            assert_eq!(
+                state
+                    .account(&system)
+                    .unwrap()
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .email
+                    .as_deref(),
+                Some("retained@example.com")
+            );
+
+            let managed = state.add_managed_fixture(provider, 910);
+            let account = state.account_mut(&managed).unwrap();
+            account.identity = Some(Identity::default());
+            account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+            assert_eq!(state.provider_status(provider), "Account available");
+
+            state.installed.insert(provider, false);
+            assert_eq!(state.provider_status(provider), "CLI not found on PATH");
+        }
+    }
 
     #[test]
     fn automatic_defaults_use_a_fresh_signed_in_plan_and_explicit_defaults_pin() {

@@ -4337,21 +4337,21 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
         match state.filter {
             SidebarFilter::All => (
                 "folder-open-symbolic",
-                "No projects yet",
+                "No projects",
                 "Open a folder to add a project.",
                 "Open folder",
                 SidebarAction::OpenRepositoryPicker,
             ),
             SidebarFilter::Attention => (
                 "emblem-ok-symbolic",
-                "No unread agent updates",
+                "No unread updates",
                 "No panes currently need your attention.",
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
             SidebarFilter::PullRequests => (
                 "pull-request-symbolic",
-                "No pull requests found",
+                "No pull requests",
                 "Open a repository or change the current filter.",
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
@@ -4367,24 +4367,28 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
         );
     }
     let spacing = cosmic::theme::spacing();
-    let action = gated(action, modal_open);
-    let action_button: Element<'static, SidebarAction> = button::standard(action_label)
-        .class(sidebar_button_style(false))
-        .id(stable_id("empty.action"))
-        .on_press_maybe(action)
-        .into();
+    let action_icon = if searching {
+        "edit-clear-symbolic"
+    } else if state.filter == SidebarFilter::All {
+        "folder-open-symbolic"
+    } else {
+        "view-list-tree-symbolic"
+    };
+    let action_button = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon(action_icon),
+        format!("{action_label} · {detail}"),
+        false,
+        !modal_open,
+        Some(action),
+    )
+    .id(stable_id("empty.action"));
     widget::container(
-        widget::column::with_children(vec![
-            widget::icon(crate::ui_controls::symbolic_icon(icon_name))
-                .size(STATUS_ICON_SIZE)
-                .into(),
-            design::heading(title).into(),
-            design::caption(detail)
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .into(),
-            action_button,
+        widget::row::with_children(vec![
+            design::caption(title).width(Length::Fill).into(),
+            action_button.into(),
         ])
-        .spacing(spacing.space_xxs),
+        .spacing(spacing.space_xxs)
+        .align_y(Alignment::Center),
     )
     .padding(spacing.space_xs)
     .width(Length::Fill)
@@ -15008,17 +15012,14 @@ pub(crate) mod tests {
     fn every_pane_state_offers_its_action_under_an_accessible_name() {
         /// The accessible names of the button nodes only: the surrounding
         /// text contributes labels of its own, which are no substitute.
-        fn button_labels(element: &Element<'_, SidebarAction>, children: usize) -> Vec<String> {
-            let tree = Tree::new(element);
-            let leaf = || layout::Node::new(Size::new(120.0, 32.0));
-            // container > column > [icon, heading, caption, button > label]
-            let column = layout::Node::with_children(
-                Size::new(240.0, 320.0),
-                (0..children)
-                    .map(|_| layout::Node::with_children(Size::new(120.0, 32.0), vec![leaf()]))
-                    .collect(),
+        fn button_labels(mut element: Element<'_, SidebarAction>) -> Vec<String> {
+            let renderer = headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let root = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(240.0, 320.0)),
             );
-            let root = layout::Node::with_children(Size::new(240.0, 320.0), vec![column]);
             let accessible = element.as_widget().a11y_nodes(
                 Layout::new(&root),
                 &tree,
@@ -15034,7 +15035,7 @@ pub(crate) mod tests {
         }
 
         assert!(
-            button_labels(&error("disk on fire", false, false), 4)
+            button_labels(error("disk on fire", false, false))
                 .iter()
                 .any(|label| label == "Try again"),
             "the error state's retry button must carry its own accessible name"
@@ -15050,9 +15051,9 @@ pub(crate) mod tests {
             state.apply(&SidebarAction::SetFilter(filter));
             let empty = empty(&state, false, false);
             assert!(
-                button_labels(&empty, 4)
+                button_labels(empty)
                     .iter()
-                    .any(|label| label == expected),
+                    .any(|label| label == expected || label.starts_with(&format!("{expected} · "))),
                 "the empty state's action must be named {expected:?}"
             );
         }
