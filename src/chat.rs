@@ -1808,6 +1808,72 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn managed_claude_accounts_inherit_only_an_unset_permission_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let account = homes.path(Provider::Claude, uuid::Uuid::new_v4());
+        let system = directory.path().join("system");
+        let project = directory.path().join("project");
+        for path in [&account, &system, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            system.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        )
+        .unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: ["HOME".into()].into(),
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: project.clone(),
+            environment: [("CLAUDE_CONFIG_DIR".into(), account.display().to_string())].into(),
+        };
+        let resolve = |recipe: &LaunchRecipe| {
+            claude_configured_default_mode_in(recipe, Some(&homes), Some(&system))
+        };
+        assert_eq!(resolve(&recipe).as_deref(), Some("auto"));
+        for (settings, expected) in [
+            (r#"{"theme":"dark"}"#, Some("auto")),
+            (r#"{"permissions":{"defaultMode":"plan"}}"#, Some("plan")),
+            (r#"{"permissions":{"defaultMode":"default"}}"#, None),
+            (r#"{"permissions":{"defaultMode":"unknown"}}"#, None),
+            (r#"{"permissions":{"defaultMode":null}}"#, None),
+            (r#"{"permissions":null}"#, None),
+            (r#"{"permissions":"invalid"}"#, None),
+            ("null", None),
+            ("[]", None),
+            ("malformed", None),
+        ] {
+            std::fs::write(account.join("settings.json"), settings).unwrap();
+            assert_eq!(resolve(&recipe).as_deref(), expected, "{settings}");
+        }
+        std::fs::write(account.join("settings.json"), "{}").unwrap();
+        std::fs::create_dir(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.local.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve(&recipe), None);
+        std::fs::remove_file(project.join(".claude/settings.local.json")).unwrap();
+        recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            directory.path().join("linked").display().to_string(),
+        );
+        assert_eq!(resolve(&recipe), None);
+        recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            homes
+                .path(Provider::Codex, uuid::Uuid::new_v4())
+                .display()
+                .to_string(),
+        );
+        assert_eq!(resolve(&recipe), None);
+    }
+
+    #[test]
     fn a_provider_is_offered_only_the_attachments_it_takes() {
         let directory = tempfile::tempdir().unwrap();
         let file = |name: &str, bytes: u64| {
@@ -2064,10 +2130,32 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
     if crate::device::is_remote() {
         return None;
     }
-    fn setting(path: &std::path::Path) -> Option<String> {
-        let settings: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        let mode = settings["permissions"]["defaultMode"].as_str()?;
+    let homes = crate::account::home::Homes::installation();
+    let system_home = crate::account::Account::system(Provider::Claude).resolved_home();
+    claude_configured_default_mode_in(recipe, homes.as_ref(), system_home.as_deref())
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_configured_default_mode_in(
+    recipe: &LaunchRecipe,
+    homes: Option<&crate::account::home::Homes>,
+    system_home: Option<&std::path::Path>,
+) -> Option<String> {
+    fn setting(path: &std::path::Path) -> Result<Option<String>, ()> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
+        };
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+        let settings = settings.as_object().ok_or(())?;
+        let Some(permissions) = settings.get("permissions") else {
+            return Ok(None);
+        };
+        let Some(value) = permissions.as_object().ok_or(())?.get("defaultMode") else {
+            return Ok(None);
+        };
+        let mode = value.as_str().ok_or(())?;
         matches!(
             mode,
             "default"
@@ -2078,7 +2166,8 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
                 | "dontAsk"
                 | "bypassPermissions"
         )
-        .then(|| mode.to_owned())
+        .then(|| Some(mode.to_owned()))
+        .ok_or(())
     }
 
     let environment = |name: &str| {
@@ -2111,7 +2200,10 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
     for directory in recipe.working_directory.ancestors() {
         if user_home.as_deref() == Some(directory) {
             if recipe.working_directory == directory
-                && setting(&directory.join(".claude/settings.local.json")).is_some()
+                && setting(&directory.join(".claude/settings.local.json"))
+                    .ok()
+                    .flatten()
+                    .is_some()
             {
                 // HOME itself can be a project cwd. Its local setting then
                 // belongs to that session, but never to descendant projects.
@@ -2128,7 +2220,7 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
                 {
                     return false;
                 }
-                setting(&path).is_some()
+                setting(&path).ok().flatten().is_some()
             })
         {
             // A project-specific choice belongs to Claude's own settings
@@ -2139,5 +2231,14 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
 
     // Local settings belong to a project; a settings.local.json beside the
     // account's user settings is not a user configuration layer.
-    setting(&root.join("settings.json")).filter(|mode| mode != "default")
+    let mode = setting(&root.join("settings.json")).ok()?.or_else(|| {
+        // Older managed homes predate configuration seeding. Inherit the
+        // reader's system default only when this account has no choice of
+        // its own; linked and external CLI homes remain independent.
+        homes?
+            .managed_identity(&root)
+            .filter(|(provider, _)| *provider == Provider::Claude)?;
+        setting(&system_home?.join("settings.json")).ok().flatten()
+    });
+    mode.filter(|mode| mode != "default")
 }
