@@ -8275,9 +8275,7 @@ fn changes_footer<'a>(
     let mut column = widget::column::with_capacity(5)
         .spacing(spacing.space_xxs)
         .push(subject_input);
-    if state.commit_subject.trim().is_empty() {
-        return column.into();
-    }
+    let has_subject = !state.commit_subject.trim().is_empty();
 
     let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
         .placeholder("Description (optional)")
@@ -8332,7 +8330,9 @@ fn changes_footer<'a>(
         format!("{commit_label} (Ctrl+Enter)"),
     );
 
-    column = column.push(commit_input);
+    if has_subject {
+        column = column.push(commit_input);
+    }
     let amend = widget::checkbox(state.amend_commit)
         .label("Amend")
         .size(14)
@@ -8347,7 +8347,7 @@ fn changes_footer<'a>(
                 }
             }),
         );
-    if source.staged_count == 0 && !state.amend_commit {
+    if has_subject && source.staged_count == 0 && !state.amend_commit {
         column = column.push(design::caption(
             "Stage changes to commit. Ctrl+Enter commits.",
         ));
@@ -15499,7 +15499,15 @@ pub(crate) mod tests {
     /// keyboard. Focus by id exercises the same commands as keyboard traversal.
     fn frame_enter_presses(
         renderer: &cosmic::Renderer,
+        element: Element<'_, SidebarAction>,
+    ) -> Vec<SidebarAction> {
+        frame_enter_presses_at_width(renderer, element, 1280.0)
+    }
+
+    fn frame_enter_presses_at_width(
+        renderer: &cosmic::Renderer,
         mut element: Element<'_, SidebarAction>,
+        width: f32,
     ) -> Vec<SidebarAction> {
         use cosmic::iced::advanced::{Shell, clipboard, mouse, widget::operation};
         use cosmic::iced::{Event, Rectangle, keyboard};
@@ -15512,7 +15520,7 @@ pub(crate) mod tests {
         }
 
         let mut tree = Tree::new(element.as_widget());
-        let viewport = Rectangle::with_size(Size::new(1280.0, 4_000.0));
+        let viewport = Rectangle::with_size(Size::new(width, 4_000.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
             renderer,
@@ -16228,6 +16236,68 @@ pub(crate) mod tests {
             SourceControlModel::ready(main_key(), &clean).change_count_label,
             None
         );
+    }
+
+    #[test]
+    fn uploads_do_not_require_a_commit_subject_and_keep_their_guards() {
+        let renderer = headless_renderer();
+        let state = SidebarState::default();
+        for width in [240.0, 380.0] {
+            let mut source = source_control();
+            assert!(source.can_push());
+            let actions = frame_enter_presses_at_width(
+                &renderer,
+                changes_footer(&state, &source, false),
+                width,
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Push { .. }))
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Commit { .. }))
+            );
+            assert!(
+                !frame_enter_presses_at_width(
+                    &renderer,
+                    changes_footer(&state, &source, true),
+                    width
+                )
+                .iter()
+                .any(|action| matches!(action, SidebarAction::Push { .. }))
+            );
+            source.set_mutation(Some(MutationKind::Stage));
+            assert!(
+                !frame_enter_presses_at_width(
+                    &renderer,
+                    changes_footer(&state, &source, false),
+                    width
+                )
+                .iter()
+                .any(|action| matches!(action, SidebarAction::Push { .. }))
+            );
+            source.set_mutation(None);
+            source.upstream = None;
+            source.tracking = TrackingState::NoUpstream;
+            assert!(source.can_publish());
+            let actions = frame_enter_presses_at_width(
+                &renderer,
+                changes_footer(&state, &source, false),
+                width,
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::OpenPublish { .. }))
+            );
+            assert!(!actions.iter().any(|action| matches!(
+                action,
+                SidebarAction::Push { .. } | SidebarAction::Commit { .. }
+            )));
+        }
     }
 
     /// Committing belongs to the working tree, and the working tree is one of
