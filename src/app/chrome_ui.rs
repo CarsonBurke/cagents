@@ -1834,37 +1834,55 @@ impl Cagents {
             .width(Length::Fill);
         let body = match self.context_tab {
             ContextTab::Files | ContextTab::Changes if crate::device::is_remote() => {
-                let device = crate::device::selected()
-                    .map(|device| device.name.as_str())
-                    .unwrap_or("device");
-                let action = self
-                    .active_workspace
-                    .clone()
-                    .map(device_ui::Action::OpenAt)
-                    .unwrap_or(device_ui::Action::Open);
+                let changes = self.context_tab == ContextTab::Changes;
+                let panel = if changes {
+                    device_ui::Panel::Changes
+                } else {
+                    device_ui::Panel::Files
+                };
+                let path = self.active_workspace.as_ref();
                 widget::container(
                     widget::column::with_children(vec![
-                        design::heading(format!("Files · {device}")).into(),
-                        design::caption(
-                            self.active_workspace
-                                .as_ref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| {
-                                    "Browse files and Git changes on this device.".into()
-                                }),
-                        )
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .width(Length::Fill)
-                        .into(),
-                        widget::button::text("Browse device files")
-                            .on_press_maybe(
-                                (!self.modal_is_open()).then_some(Message::Device(action)),
+                        crate::interaction::tooltip(
+                            design::caption(
+                                path.and_then(|path| path.file_name())
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "Device".into()),
                             )
-                            .into(),
+                            .width(Length::Fill),
+                            path.map(|path| path.display().to_string())
+                                .unwrap_or_else(|| {
+                                    crate::device::selected()
+                                        .map(|device| device.name.clone())
+                                        .unwrap_or_default()
+                                }),
+                        ),
+                        widget::button::standard(if changes {
+                            "Open changes"
+                        } else {
+                            "Open files"
+                        })
+                        .leading_icon(crate::ui_controls::symbolic_icon(if changes {
+                            "vcs-diff-symbolic"
+                        } else {
+                            "folder-open-symbolic"
+                        }))
+                        .name(if changes {
+                            "Open device changes"
+                        } else {
+                            "Open device files"
+                        })
+                        .on_press_maybe((!self.modal_is_open()).then_some(Message::Device(
+                            device_ui::Action::OpenIn {
+                                path: path.cloned(),
+                                panel,
+                            },
+                        )))
+                        .into(),
                     ])
-                    .spacing(8),
+                    .spacing(12),
                 )
-                .padding(12)
+                .padding(16)
                 .width(Length::Fill)
                 .into()
             }
@@ -1887,21 +1905,17 @@ impl Cagents {
                 || {
                     widget::container(
                         widget::column::with_children(vec![
-                            design::heading("No column selected").into(),
-                            design::caption(
-                                "Select a column for details, or browse files to open an editor.",
-                            )
-                            .wrapping(iced::widget::text::Wrapping::Word)
-                            .width(Length::Fill)
-                            .into(),
-                            crate::interaction::tooltip(
-                                crate::interaction::hover(
-                                    widget::button::text("Browse files")
-                                        .name("Browse files")
-                                        .on_press(Message::SelectContextTab(ContextTab::Files)),
-                                ),
+                            design::caption("No pane selected")
+                                .width(Length::Fill)
+                                .into(),
+                            crate::ui_controls::icon_control(
+                                crate::ui_controls::symbolic_icon("folder-open-symbolic"),
                                 "Browse files",
-                            ),
+                                false,
+                                true,
+                                Some(Message::SelectContextTab(ContextTab::Files)),
+                            )
+                            .into(),
                         ])
                         .spacing(8),
                     )

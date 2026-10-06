@@ -9,20 +9,6 @@ fn file_editor_id() -> widget::Id {
     widget::Id::new("device-file-editor")
 }
 
-fn dialog_controls<'a>(children: Vec<Element<'a, Message>>, narrow: bool) -> Element<'a, Message> {
-    if narrow {
-        widget::column::with_children(children)
-            .spacing(8)
-            .width(Length::Fill)
-            .into()
-    } else {
-        widget::row::with_children(children)
-            .spacing(8)
-            .width(Length::Fill)
-            .into()
-    }
-}
-
 /// Navigation presentation and device-owned row opening never need desktop Git or files.
 pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
     matches!(
@@ -65,6 +51,10 @@ pub enum Action {
     Menu(bool),
     Open,
     OpenAt(PathBuf),
+    OpenIn {
+        path: Option<PathBuf>,
+        panel: Panel,
+    },
     OpenFile {
         path: PathBuf,
         fragment: Option<String>,
@@ -77,6 +67,7 @@ pub enum Action {
     ConfigSaved(Result<(), String>),
     Close,
     BackToFile,
+    Panel(Panel),
     DiscardChanges,
     Path(String),
     Browse,
@@ -102,11 +93,23 @@ pub enum Action {
     },
 }
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum View {
+pub enum Panel {
     #[default]
-    Editor,
-    GitOutput,
+    Files,
+    Changes,
+    Worktrees,
 }
+
+impl Panel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Files => "Files",
+            Self::Changes => "Changes",
+            Self::Worktrees => "Worktrees",
+        }
+    }
+}
+
 pub(super) struct State {
     pub open: bool,
     pub menu_open: bool,
@@ -121,8 +124,10 @@ pub(super) struct State {
     original: String,
     content: text_editor::Content<cosmic::Renderer>,
     output: String,
-    view: View,
+    worktree_output: String,
+    panel: Panel,
     pathspec: String,
+    pathspec_auto: bool,
     worktree_name: String,
     worktree_branch: String,
     commit_message: String,
@@ -152,8 +157,10 @@ impl Default for State {
             original: String::new(),
             content: text_editor::Content::new(),
             output: String::new(),
-            view: View::Editor,
+            worktree_output: String::new(),
+            panel: Panel::Files,
             pathspec: String::new(),
+            pathspec_auto: true,
             worktree_name: String::new(),
             worktree_branch: String::new(),
             commit_message: String::new(),
@@ -326,6 +333,7 @@ impl Cagents {
             Action::Close
                 | Action::Open
                 | Action::OpenAt(_)
+                | Action::OpenIn { .. }
                 | Action::OpenFile { .. }
                 | Action::Configure
                 | Action::Browse
@@ -477,6 +485,7 @@ impl Cagents {
                     ));
                     return Task::none();
                 };
+                self.device_ui.panel = Panel::Files;
                 self.device_ui.linked_file = Some(file.into());
                 self.device_ui.linked_fragment = fragment;
                 self.device_ui.path = directory.display().to_string();
@@ -485,6 +494,13 @@ impl Cagents {
                 Some(Operation::List {
                     path: directory.to_owned(),
                 })
+            }
+            Action::OpenIn { path, panel } => {
+                if let Some(path) = path {
+                    self.device_ui.path = path.display().to_string();
+                }
+                self.device_ui.panel = panel;
+                return self.update_device(Action::Open);
             }
             Action::OpenAt(path) => {
                 self.device_ui.path = path.display().to_string();
@@ -504,8 +520,25 @@ impl Cagents {
                     path: self.device_ui.path.clone().into(),
                 })
             }
+            Action::Panel(panel) => {
+                if panel == Panel::Changes && self.device_ui.pathspec_auto {
+                    if let Some(file) = &self.device_ui.file {
+                        self.device_ui.pathspec = file.display().to_string();
+                    }
+                }
+                self.device_ui.panel = panel;
+                match panel {
+                    Panel::Files => return Task::none(),
+                    Panel::Changes => {
+                        return self.update_device(Action::Git(GitOperation::Status));
+                    }
+                    Panel::Worktrees => {
+                        return self.update_device(Action::Git(GitOperation::Worktrees));
+                    }
+                }
+            }
             Action::BackToFile => {
-                self.device_ui.view = View::Editor;
+                self.device_ui.panel = Panel::Files;
                 return Task::none();
             }
             Action::DiscardChanges => {
@@ -532,6 +565,7 @@ impl Cagents {
                 return Task::none();
             }
             Action::Pathspec(value) => {
+                self.device_ui.pathspec_auto = false;
                 self.device_ui.pathspec = value;
                 return Task::none();
             }
@@ -580,18 +614,28 @@ impl Cagents {
                     }
                     Ok(Reply::Directory { path, entries }) => {
                         self.device_ui.path = path.display().to_string();
+                        if self.device_ui.directory != path {
+                            self.device_ui.pathspec.clear();
+                            self.device_ui.pathspec_auto = true;
+                        }
                         self.device_ui.directory = path;
                         self.device_ui.entries = entries;
                         self.device_ui.file = None;
                         self.device_ui.output.clear();
-                        self.device_ui.view = View::Editor;
+                        self.device_ui.worktree_output.clear();
                         if let Some(file) = self.device_ui.linked_file.clone() {
                             return self.update_device(Action::Read(file));
+                        }
+                        if self.device_ui.panel != Panel::Files {
+                            return self.update_device(Action::Panel(self.device_ui.panel));
                         }
                     }
                     Ok(Reply::Text(text)) if matches!(&pending, Some(Operation::Read { .. })) => {
                         if let Some(Operation::Read { root, path }) = pending {
                             self.device_ui.directory = root;
+                            if self.device_ui.pathspec_auto {
+                                self.device_ui.pathspec = path.display().to_string();
+                            }
                             self.device_ui.file = Some(path);
                         }
                         self.device_ui.original = text.clone();
@@ -600,13 +644,27 @@ impl Cagents {
                         if let Some(fragment) = self.device_ui.linked_fragment.take() {
                             self.device_ui.jump_to_fragment(&fragment);
                         }
-                        self.device_ui.view = View::Editor;
+                        self.device_ui.panel = Panel::Files;
                         if linked {
                             return iced::widget::operation::focus(file_editor_id())
                                 .map(cosmic::Action::App);
                         }
                     }
-                    Ok(Reply::Text(text)) => self.device_ui.output = text,
+                    Ok(Reply::Text(text)) => {
+                        if matches!(
+                            pending,
+                            Some(Operation::Git {
+                                operation: GitOperation::Worktrees
+                                    | GitOperation::CreateWorktree { .. }
+                                    | GitOperation::RemoveWorktree { .. },
+                                ..
+                            })
+                        ) {
+                            self.device_ui.worktree_output = text;
+                        } else {
+                            self.device_ui.output = text;
+                        }
+                    }
                     Ok(Reply::Saved) => {
                         self.device_ui.original = self.device_ui.content.text();
                         self.device_ui.notice = Some("Saved on device".into());
@@ -616,11 +674,14 @@ impl Cagents {
                         self.device_ui.notice =
                             Some(format!("Project opened on device: {}", path.display()));
                         self.device_ui.directory = path.clone();
+                        self.device_ui.pathspec.clear();
+                        self.device_ui.pathspec_auto = true;
                         self.active_workspace = Some(path.clone());
                         self.device_ui.file = None;
                         self.device_ui.entries.clear();
                         self.device_ui.output.clear();
-                        self.device_ui.view = View::Editor;
+                        self.device_ui.worktree_output.clear();
+                        self.device_ui.panel = Panel::Files;
                         let edit = crate::workspace_model::ModelEdit::ReopenProject {
                             repository: key,
                             name: path
@@ -644,8 +705,13 @@ impl Cagents {
         if self.device_ui.busy {
             return Task::none();
         }
-        if matches!(operation, Operation::Git { .. }) {
-            self.device_ui.view = View::GitOutput;
+        if let Operation::Git { operation, .. } = &operation {
+            self.device_ui.panel = match operation {
+                GitOperation::Worktrees
+                | GitOperation::CreateWorktree { .. }
+                | GitOperation::RemoveWorktree { .. } => Panel::Worktrees,
+                _ => Panel::Changes,
+            };
         }
         self.device_ui.busy = true;
         self.device_ui.pending = Some(operation.clone());
@@ -833,7 +899,6 @@ impl Cagents {
     fn device_dialog_layout(&self, size: iced::Size) -> Element<'_, Message> {
         let state = &self.device_ui;
         let narrow = size.width < 900.0;
-        let controls = |children| dialog_controls(children, narrow);
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
             let mut button = widget::button::standard(label.to_owned());
@@ -849,168 +914,352 @@ impl Cagents {
             }
             return dialog_ui::surface(widget::column::with_children(rows).spacing(12), 600.0);
         }
-        let mut rows = vec![
+        let icon = |name: &'static str, label: &'static str, value: Action, enabled: bool| {
+            let destructive = matches!(
+                &value,
+                Action::DiscardChanges | Action::Git(GitOperation::RemoveWorktree { .. })
+            );
+            let control = crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon(name),
+                label,
+                false,
+                !state.busy && enabled,
+                Some(action(value)),
+            );
+            Element::from(if destructive {
+                control.icon_tone(design::Tone::Themed(design::destructive_color))
+            } else {
+                control
+            })
+        };
+        let modes = crate::ui_controls::segmented_controls(
+            [
+                (Panel::Files, "folder-symbolic", "Browse files"),
+                (Panel::Changes, "vcs-diff-symbolic", "Source control"),
+                (Panel::Worktrees, "git-branch-symbolic", "Manage worktrees"),
+            ]
+            .into_iter()
+            .map(|(panel, glyph, label)| {
+                crate::ui_controls::icon_control(
+                    crate::ui_controls::symbolic_icon(glyph),
+                    label,
+                    state.panel == panel,
+                    !state.busy,
+                    Some(action(Action::Panel(panel))),
+                )
+                .into()
+            })
+            .collect(),
+        );
+        let device = crate::device::selected()
+            .map(|device| device.name.as_str())
+            .unwrap_or("local");
+        let mut rows: Vec<Element<'_, Message>> = vec![
             widget::row::with_children(vec![
-                widget::text::title3(format!(
-                    "Files · {}",
-                    crate::device::selected()
-                        .map(|device| device.name.as_str())
-                        .unwrap_or("local")
-                ))
-                .width(Length::Fill)
-                .into(),
-                button("Close", Action::Close),
+                modes,
+                design::heading(state.panel.label()).into(),
+                design::caption(device).width(Length::Fill).into(),
+                icon(
+                    "window-close-symbolic",
+                    "Close device tools",
+                    Action::Close,
+                    true,
+                ),
             ])
-            .spacing(8)
+            .align_y(Alignment::Center)
+            .spacing(12)
             .into(),
-            controls(vec![
-                widget::text_input("Absolute directory on device", &state.path)
+            widget::row::with_children(vec![
+                icon(
+                    "go-up-symbolic",
+                    "Parent directory",
+                    Action::Visit(
+                        state
+                            .directory
+                            .parent()
+                            .unwrap_or(&state.directory)
+                            .to_owned(),
+                    ),
+                    state.directory.parent().is_some(),
+                ),
+                widget::text_input("Directory", &state.path)
                     .on_input(|value| Message::Device(Action::Path(value)))
+                    .on_submit(|_| Message::Device(Action::Browse))
                     .width(Length::Fill)
                     .into(),
-                button("Browse", Action::Browse),
-                button("Use directory", Action::OpenProject),
-            ]),
+                icon(
+                    "view-refresh-symbolic",
+                    "Browse directory",
+                    Action::Browse,
+                    true,
+                ),
+                icon(
+                    "folder-open-symbolic",
+                    "Open as workspace",
+                    Action::OpenProject,
+                    true,
+                ),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(4)
+            .into(),
         ];
+        if state.path != state.directory.display().to_string()
+            && !state.directory.as_os_str().is_empty()
+        {
+            rows.push(crate::interaction::tooltip(
+                design::caption(format!("Current: {}", state.directory.display()))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill),
+                format!(
+                    "File and Git operations use {} until navigation succeeds",
+                    state.directory.display()
+                ),
+            ));
+        }
         if let Some(notice) = &state.notice {
-            rows.push(widget::text::body(notice).into());
+            rows.push(design::caption(notice).into());
         }
         if state.busy {
-            rows.push(widget::text::body("Waiting for device…").into());
+            rows.push(design::caption("Connecting…").into());
         }
-        let mut files = Vec::new();
-        if let Some(parent) = state.directory.parent() {
-            files.push(button("../", Action::Visit(parent.to_owned())));
-        }
-        for entry in &state.entries {
-            let label = format!(
-                "{}{}",
-                entry.name,
-                if entry.directory {
-                    "/"
-                } else if entry.symlink {
-                    " →"
+        rows.push(design::horizontal_rule());
+        let height = (size.height - 164.0).clamp(200.0, 620.0);
+        let output = |height| {
+            widget::scrollable(
+                design::body(if state.panel == Panel::Worktrees {
+                    &state.worktree_output
                 } else {
-                    ""
-                }
-            );
-            let value = if entry.directory {
-                Action::Visit(state.directory.join(&entry.name))
-            } else {
-                Action::Read(entry.name.clone().into())
-            };
-            let mut item = widget::button::text(label).width(Length::Fill);
-            if !state.busy && !entry.symlink {
-                item = item.on_press(action(value));
-            }
-            files.push(item.into());
-        }
-        let preview: Element<'_, Message> = if let Some(file) = &state.file
-            && state.view == View::Editor
-        {
-            widget::column::with_children(vec![
-                controls(vec![
-                    widget::text::body(file.display().to_string())
-                        .width(Length::Fill)
-                        .into(),
-                    button("Save on device", Action::Save),
-                    button("Discard changes", Action::DiscardChanges),
-                ]),
-                iced::widget::text_editor(&state.content)
-                    .id(file_editor_id())
-                    .on_action(|value| Message::Device(Action::Edit(value)))
-                    .height(if narrow { 300 } else { 420 })
-                    .into(),
-            ])
-            .spacing(8)
+                    &state.output
+                })
+                .font(iced::Font::MONOSPACE)
+                .width(Length::Fill),
+            )
+            .height(height)
             .width(Length::Fill)
             .into()
-        } else {
-            let mut output = Vec::new();
-            if state.file.is_some() {
-                let mut controls = vec![button("Back to file", Action::BackToFile)];
-                if state.dirty() {
-                    controls.push(button("Discard changes", Action::DiscardChanges));
-                }
-                output.push(widget::row::with_children(controls).spacing(8).into());
-            }
-            output.push(
-                widget::scrollable(widget::text::body(&state.output))
-                    .height(if narrow { 300 } else { 420 })
-                    .width(Length::Fill)
-                    .into(),
-            );
-            widget::column::with_children(output)
-                .spacing(8)
-                .width(Length::Fill)
-                .into()
         };
-        let files = widget::scrollable(widget::column::with_children(files))
-            .width(if narrow {
-                Length::Fill
-            } else {
-                Length::Fixed(260.0)
-            })
-            .height(if narrow { 160 } else { 460 });
-        rows.push(controls(vec![files.into(), preview]));
-        rows.push(design::caption(format!("Git directory: {}", state.directory.display())).into());
-        rows.push(controls(vec![
-            button("Git status", Action::Git(GitOperation::Status)),
-            button("Diff", Action::Git(GitOperation::Diff { staged: false })),
-            button(
-                "Staged diff",
-                Action::Git(GitOperation::Diff { staged: true }),
-            ),
-            widget::text_input("Relative file path", &state.pathspec)
-                .on_input(|value| Message::Device(Action::Pathspec(value)))
+        let body: Element<'_, Message> = match state.panel {
+            Panel::Files => {
+                let files: Vec<Element<'_, Message>> = state
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let value = if entry.directory {
+                            Action::Visit(state.directory.join(&entry.name))
+                        } else {
+                            Action::Read(entry.name.clone().into())
+                        };
+                        let glyph = if entry.directory {
+                            "folder-symbolic"
+                        } else {
+                            "text-editor-symbolic"
+                        };
+                        let selected = state
+                            .file
+                            .as_ref()
+                            .is_some_and(|file| file == &PathBuf::from(&entry.name));
+                        widget::button::custom(
+                            widget::row::with_children(vec![
+                                widget::icon(crate::ui_controls::symbolic_icon(glyph))
+                                    .size(design::ROW_ICON_SIZE)
+                                    .into(),
+                                design::body(&entry.name)
+                                    .wrapping(iced::widget::text::Wrapping::None)
+                                    .ellipsize(iced::widget::text::Ellipsize::End(
+                                        EllipsizeHeightLimit::Lines(1),
+                                    ))
+                                    .width(Length::Fill)
+                                    .into(),
+                            ])
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        )
+                        .name(entry.name.clone())
+                        .selected(selected)
+                        .class(crate::ui_controls::control_style(selected, None))
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .on_press_maybe((!state.busy && !entry.symlink).then_some(action(value)))
+                        .into()
+                    })
+                    .collect();
+                let file_list = widget::scrollable(widget::column::with_children(files).spacing(2))
+                    .width(if narrow { 176 } else { 224 })
+                    .height(height);
+                let editor: Element<'_, Message> = if let Some(file) = &state.file {
+                    widget::column::with_children(vec![
+                        widget::row::with_children(vec![
+                            design::body(file.display().to_string())
+                                .width(Length::Fill)
+                                .into(),
+                            if state.dirty() {
+                                design::caption("Modified").into()
+                            } else {
+                                iced::widget::Space::new().into()
+                            },
+                            icon(
+                                "document-save-symbolic",
+                                "Save on device",
+                                Action::Save,
+                                state.dirty(),
+                            ),
+                            icon(
+                                "document-revert-symbolic",
+                                "Discard changes",
+                                Action::DiscardChanges,
+                                state.dirty(),
+                            ),
+                        ])
+                        .align_y(Alignment::Center)
+                        .spacing(4)
+                        .into(),
+                        iced::widget::text_editor(&state.content)
+                            .font(crate::terminal::monospace_font(
+                                self.settings.editor_font_family(),
+                            ))
+                            .size(self.settings.editor_font_size())
+                            .id(file_editor_id())
+                            .on_action(|value| Message::Device(Action::Edit(value)))
+                            .height((height - 38.0).max(120.0))
+                            .into(),
+                    ])
+                    .spacing(8)
+                    .width(Length::Fill)
+                    .into()
+                } else {
+                    widget::container(
+                        widget::column::with_children(vec![
+                            crate::ui_controls::passive_icon(
+                                crate::ui_controls::symbolic_icon("text-editor-symbolic"),
+                                32,
+                            )
+                            .into(),
+                            design::caption("Select a file").into(),
+                        ])
+                        .spacing(12)
+                        .align_x(Alignment::Center),
+                    )
+                    .center(Length::Fill)
+                    .height(height)
+                    .into()
+                };
+                widget::row::with_children(vec![file_list.into(), editor])
+                    .spacing(16)
+                    .into()
+            }
+            Panel::Changes => widget::column::with_children(vec![
+                widget::row::with_children(vec![
+                    icon(
+                        "view-refresh-symbolic",
+                        "Git status",
+                        Action::Git(GitOperation::Status),
+                        true,
+                    ),
+                    icon(
+                        "vcs-diff-symbolic",
+                        "Working tree diff",
+                        Action::Git(GitOperation::Diff { staged: false }),
+                        true,
+                    ),
+                    icon(
+                        "vcs-commit-symbolic",
+                        "Staged diff",
+                        Action::Git(GitOperation::Diff { staged: true }),
+                        true,
+                    ),
+                    widget::text_input("File path", &state.pathspec)
+                        .on_input(|value| Message::Device(Action::Pathspec(value)))
+                        .width(Length::Fill)
+                        .into(),
+                    icon(
+                        "list-add-symbolic",
+                        "Stage path",
+                        Action::Git(GitOperation::Stage {
+                            paths: vec![state.pathspec.clone().into()],
+                        }),
+                        !state.pathspec.trim().is_empty(),
+                    ),
+                    icon(
+                        "list-remove-symbolic",
+                        "Unstage path",
+                        Action::Git(GitOperation::Unstage {
+                            paths: vec![state.pathspec.clone().into()],
+                        }),
+                        !state.pathspec.trim().is_empty(),
+                    ),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(4)
                 .into(),
-            button(
-                "Stage",
-                Action::Git(GitOperation::Stage {
-                    paths: vec![state.pathspec.clone().into()],
-                }),
-            ),
-            button(
-                "Unstage",
-                Action::Git(GitOperation::Unstage {
-                    paths: vec![state.pathspec.clone().into()],
-                }),
-            ),
-        ]));
-        rows.push(controls(vec![
-            widget::text_input("Commit message", &state.commit_message)
-                .on_input(|value| Message::Device(Action::CommitMessage(value)))
-                .width(Length::Fill)
+                widget::row::with_children(vec![
+                    widget::text_input("Commit message", &state.commit_message)
+                        .on_input(|value| Message::Device(Action::CommitMessage(value)))
+                        .width(Length::Fill)
+                        .into(),
+                    icon(
+                        "vcs-commit-symbolic",
+                        "Commit staged changes",
+                        Action::Git(GitOperation::Commit {
+                            message: state.commit_message.clone(),
+                        }),
+                        !state.commit_message.trim().is_empty(),
+                    ),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(4)
                 .into(),
-            button(
-                "Commit staged changes",
-                Action::Git(GitOperation::Commit {
-                    message: state.commit_message.clone(),
-                }),
-            ),
-        ]));
-        rows.push(controls(vec![
-            button("List worktrees", Action::Git(GitOperation::Worktrees)),
-            widget::text_input("Worktree name under .worktrees/", &state.worktree_name)
-                .on_input(|value| Message::Device(Action::WorktreeName(value)))
+                output((height - 92.0).max(120.0)),
+            ])
+            .spacing(12)
+            .into(),
+            Panel::Worktrees => widget::column::with_children(vec![
+                widget::row::with_children(vec![
+                    icon(
+                        "view-refresh-symbolic",
+                        "List worktrees",
+                        Action::Git(GitOperation::Worktrees),
+                        true,
+                    ),
+                    widget::text_input("Worktree name", &state.worktree_name)
+                        .on_input(|value| Message::Device(Action::WorktreeName(value)))
+                        .width(Length::Fill)
+                        .into(),
+                    widget::text_input("New branch", &state.worktree_branch)
+                        .on_input(|value| Message::Device(Action::WorktreeBranch(value)))
+                        .width(Length::Fill)
+                        .into(),
+                    icon(
+                        "worktree-add-symbolic",
+                        "Create worktree under .worktrees",
+                        Action::Git(GitOperation::CreateWorktree {
+                            name: state.worktree_name.clone(),
+                            branch: state.worktree_branch.clone(),
+                        }),
+                        !state.worktree_name.trim().is_empty()
+                            && !state.worktree_branch.trim().is_empty(),
+                    ),
+                    icon(
+                        "list-remove-symbolic",
+                        "Remove clean worktree",
+                        Action::Git(GitOperation::RemoveWorktree {
+                            name: state.worktree_name.clone(),
+                        }),
+                        !state.worktree_name.trim().is_empty(),
+                    ),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(4)
                 .into(),
-            widget::text_input("New branch", &state.worktree_branch)
-                .on_input(|value| Message::Device(Action::WorktreeBranch(value)))
-                .into(),
-            button(
-                "Create worktree",
-                Action::Git(GitOperation::CreateWorktree {
-                    name: state.worktree_name.clone(),
-                    branch: state.worktree_branch.clone(),
-                }),
-            ),
-            button(
-                "Remove clean worktree",
-                Action::Git(GitOperation::RemoveWorktree {
-                    name: state.worktree_name.clone(),
-                }),
-            ),
-        ]));
+                output((height - 52.0).max(120.0)),
+            ])
+            .spacing(12)
+            .into(),
+        };
+        rows.push(body);
         let content = widget::scrollable(widget::column::with_children(rows).spacing(12))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
@@ -1443,14 +1692,14 @@ mod tests {
     fn git_output_and_back_preserve_the_loaded_file_and_unsaved_draft() {
         let mut app = loaded_file();
         drop(app.update_device(Action::Git(GitOperation::Status)));
-        assert_eq!(app.device_ui.view, View::GitOutput);
+        assert_eq!(app.device_ui.panel, Panel::Changes);
         drop(app.update_device(Action::Loaded {
             generation: app.device_ui.generation,
             result: Ok(Reply::Text("git status output".into())),
         }));
         assert_eq!(app.device_ui.output, "git status output");
         drop(app.update_device(Action::BackToFile));
-        assert_eq!(app.device_ui.view, View::Editor);
+        assert_eq!(app.device_ui.panel, Panel::Files);
         assert_eq!(app.device_ui.file, Some("first".into()));
         assert_eq!(app.device_ui.directory, PathBuf::from("/remote/project"));
         assert_eq!(app.device_ui.original, "original");
@@ -1463,6 +1712,106 @@ mod tests {
     }
 
     #[test]
+    fn derived_stage_path_follows_selection_but_keeps_an_explicit_path_within_its_root() {
+        let mut app = loaded_file();
+        drop(app.update_device(Action::DiscardChanges));
+        drop(app.update_device(Action::Read("second".into())));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("second content".into())),
+        }));
+        assert_eq!(app.device_ui.pathspec, "second");
+        drop(app.update_device(Action::Pathspec("explicit".into())));
+        drop(app.update_device(Action::Read("third".into())));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("third content".into())),
+        }));
+        assert_eq!(app.device_ui.pathspec, "explicit");
+        app.device_ui.path = "/another/project".into();
+        drop(app.update_device(Action::Browse));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Directory {
+                path: "/another/project".into(),
+                entries: Vec::new(),
+            }),
+        }));
+        assert!(app.device_ui.pathspec.is_empty());
+        assert!(app.device_ui.pathspec_auto);
+    }
+
+    #[test]
+    fn opening_source_control_browses_the_requested_root_before_loading_status() {
+        for (panel, expected) in [
+            (Panel::Changes, GitOperation::Status),
+            (Panel::Worktrees, GitOperation::Worktrees),
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            drop(app.update_device(Action::OpenIn {
+                path: Some("/remote/project".into()),
+                panel,
+            }));
+            assert!(
+                matches!(&app.device_ui.pending, Some(Operation::List { path }) if path == &PathBuf::from("/remote/project"))
+            );
+            drop(app.update_device(Action::Loaded {
+                generation: app.device_ui.generation,
+                result: Ok(Reply::Directory {
+                    path: "/remote/project".into(),
+                    entries: Vec::new(),
+                }),
+            }));
+            assert_eq!(app.device_ui.panel, panel);
+            assert!(
+                matches!(&app.device_ui.pending, Some(Operation::Git { root, operation }) if root == &PathBuf::from("/remote/project") && operation == &expected)
+            );
+        }
+    }
+
+    #[test]
+    fn tool_modes_request_their_context_without_losing_an_unsaved_editor() {
+        let mut app = loaded_file();
+        app.device_ui.output = "Old output".into();
+        drop(app.update_device(Action::Panel(Panel::Changes)));
+        assert_eq!(app.device_ui.panel, Panel::Changes);
+        assert_eq!(app.device_ui.pathspec, "first");
+        assert_eq!(app.device_ui.output, "Old output");
+        assert!(matches!(
+            app.device_ui.pending,
+            Some(Operation::Git {
+                operation: GitOperation::Status,
+                ..
+            })
+        ));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("Git status".into())),
+        }));
+        drop(app.update_device(Action::Panel(Panel::Worktrees)));
+        assert_eq!(app.device_ui.panel, Panel::Worktrees);
+        assert_eq!(app.device_ui.output, "Git status");
+        assert!(app.device_ui.worktree_output.is_empty());
+        assert!(matches!(
+            app.device_ui.pending,
+            Some(Operation::Git {
+                operation: GitOperation::Worktrees,
+                ..
+            })
+        ));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Text("Worktrees".into())),
+        }));
+        drop(app.update_device(Action::Panel(Panel::Files)));
+        assert_eq!(app.device_ui.panel, Panel::Files);
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+        assert_eq!(app.device_ui.output, "Git status");
+        assert_eq!(app.device_ui.worktree_output, "Worktrees");
+        assert!(app.device_ui.pending.is_none());
+    }
+
+    #[test]
     fn unsaved_file_blocks_navigation_and_close_until_explicit_save_or_discard() {
         for action in [
             Action::Close,
@@ -1470,6 +1819,10 @@ mod tests {
             Action::OpenFile {
                 path: "/other/file.rs".into(),
                 fragment: Some("L2".into()),
+            },
+            Action::OpenIn {
+                path: Some("/other".into()),
+                panel: Panel::Changes,
             },
             Action::Configure,
             Action::Browse,
