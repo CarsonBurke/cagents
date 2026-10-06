@@ -8338,9 +8338,7 @@ fn changes_footer<'a>(
     let mut column = widget::column::with_capacity(5)
         .spacing(spacing.space_xxs)
         .push(subject_input);
-    if state.commit_subject.trim().is_empty() {
-        return column.into();
-    }
+    let has_subject = !state.commit_subject.trim().is_empty();
 
     let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
         .placeholder("Description (optional)")
@@ -8379,21 +8377,36 @@ fn changes_footer<'a>(
         });
     }
 
-    let mut commit = button::custom(design::caption(if state.amend_commit {
+    let commit_label = if state.amend_commit {
         "Amend commit"
     } else {
         "Commit"
-    }))
-    .class(crate::ui_controls::control_style(can_commit, None))
-    .name("Commit (Ctrl+Enter)")
-    .id(chrome.commit_id.clone())
-    .padding([0, 8])
-    .height(PANEL_ROW_HEIGHT);
-    if can_commit {
-        commit = commit.on_press(commit_action);
-    }
+    };
+    let commit_hint = if !has_subject {
+        "Enter a commit summary"
+    } else if source.busy() {
+        "Git operation in progress"
+    } else if source.staged_count == 0 && !state.amend_commit {
+        "Stage changes to commit"
+    } else if !can_commit && state.amend_commit && source.head_oid.is_none() {
+        "No commit to amend"
+    } else {
+        commit_label
+    };
+    let commit = crate::interaction::tooltip(
+        button::suggested(commit_label)
+            .leading_icon(crate::ui_controls::symbolic_icon("vcs-commit-symbolic"))
+            .name(format!("{commit_label} (Ctrl+Enter)"))
+            .id(chrome.commit_id.clone())
+            .padding([0, 8])
+            .height(design::PRIMARY_CONTROL_SIZE)
+            .on_press_maybe(can_commit.then_some(commit_action)),
+        format!("{commit_hint} (Ctrl+Enter)"),
+    );
 
-    column = column.push(commit_input);
+    if has_subject {
+        column = column.push(commit_input);
+    }
     let amend = widget::checkbox(state.amend_commit)
         .label("Amend")
         .size(14)
@@ -8408,52 +8421,64 @@ fn changes_footer<'a>(
                 }
             }),
         );
-    if source.staged_count == 0 && !state.amend_commit {
-        column = column.push(design::caption(
-            "Stage changes to commit. Ctrl+Enter commits.",
-        ));
-    }
     let mut buttons = widget::row::with_capacity(4)
         .spacing(spacing.space_xxs)
         .align_y(cosmic::iced::Alignment::Center);
     buttons = buttons.push(commit);
     match (&source.branch, &source.upstream) {
         (Some(branch), Some(target)) => {
-            let push_label = match &source.tracking {
+            let counts = match &source.tracking {
                 TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
-                    format!("Push ↑{ahead} · ↓{behind}")
+                    Some(format!("↑{ahead} ↓{behind}"))
                 }
-                TrackingState::Compared { ahead, .. } if *ahead > 0 => format!("Push ↑{ahead}"),
-                _ => "Push".to_owned(),
+                TrackingState::Compared { ahead, .. } if *ahead > 0 => Some(format!("↑{ahead}")),
+                _ => None,
             };
-            let mut push = button::custom(design::caption(push_label))
-                .class(crate::ui_controls::control_style(false, None))
-                .id(chrome.push_id.clone())
-                .padding([0, 8])
-                .height(PANEL_ROW_HEIGHT);
-            if source.can_push() && !modal_open {
-                push = push.on_press(SidebarAction::Push {
+            let detail = counts
+                .as_ref()
+                .map_or_else(String::new, |counts| format!(" · {counts}"));
+            let push = crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon("vcs-push-symbolic"),
+                format!(
+                    "Push {} to {}{detail}",
+                    branch.as_str(),
+                    target
+                        .remote_side_ref()
+                        .map(|reference| format!("{}:{}", target.remote(), reference.as_str()))
+                        .unwrap_or_else(|_| target.remote().to_owned())
+                ),
+                false,
+                source.can_push() && !modal_open,
+                Some(SidebarAction::Push {
                     key: key.clone(),
                     branch: branch.clone(),
                     target: target.clone(),
-                });
+                }),
+            )
+            .id(chrome.push_id.clone());
+            let mut upload = widget::row::with_children(vec![push.into()])
+                .spacing(design::GRID_UNIT)
+                .align_y(cosmic::iced::Alignment::Center);
+            if let Some(counts) = counts {
+                upload = upload.push(design::caption(counts));
             }
-            buttons = buttons.push(push);
+            buttons = buttons.push(upload);
         }
         (Some(branch), None) if !source.upstream_reported() => {
-            let mut publish = button::custom(design::caption("Publish branch"))
-                .class(crate::ui_controls::control_style(false, None))
-                .id(chrome.push_id.clone())
-                .padding([0, 8])
-                .height(PANEL_ROW_HEIGHT);
-            if source.can_publish() && !modal_open {
-                publish = publish.on_press(SidebarAction::OpenPublish {
-                    key: key.clone(),
-                    branch: branch.clone(),
-                    remotes: source.remotes.clone(),
-                });
-            }
-            buttons = buttons.push(publish);
+            buttons = buttons.push(
+                crate::ui_controls::icon_control(
+                    crate::ui_controls::symbolic_icon("vcs-push-symbolic"),
+                    format!("Publish {}… Choose a remote and upstream", branch.as_str()),
+                    false,
+                    source.can_publish() && !modal_open,
+                    Some(SidebarAction::OpenPublish {
+                        key: key.clone(),
+                        branch: branch.clone(),
+                        remotes: source.remotes.clone(),
+                    }),
+                )
+                .id(chrome.push_id.clone()),
+            );
         }
         (Some(_), None) => {
             // `git status` reported an upstream this panel could not name, so
@@ -15618,7 +15643,15 @@ pub(crate) mod tests {
     /// keyboard. Focus by id exercises the same commands as keyboard traversal.
     fn frame_enter_presses(
         renderer: &cosmic::Renderer,
+        element: Element<'_, SidebarAction>,
+    ) -> Vec<SidebarAction> {
+        frame_enter_presses_at_width(renderer, element, 1280.0)
+    }
+
+    fn frame_enter_presses_at_width(
+        renderer: &cosmic::Renderer,
         mut element: Element<'_, SidebarAction>,
+        width: f32,
     ) -> Vec<SidebarAction> {
         use cosmic::iced::advanced::{Shell, clipboard, mouse, widget::operation};
         use cosmic::iced::{Event, Rectangle, keyboard};
@@ -15631,7 +15664,7 @@ pub(crate) mod tests {
         }
 
         let mut tree = Tree::new(element.as_widget());
-        let viewport = Rectangle::with_size(Size::new(1280.0, 4_000.0));
+        let viewport = Rectangle::with_size(Size::new(width, 4_000.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
             renderer,
@@ -16347,6 +16380,68 @@ pub(crate) mod tests {
             SourceControlModel::ready(main_key(), &clean).change_count_label,
             None
         );
+    }
+
+    #[test]
+    fn uploads_do_not_require_a_commit_subject_and_keep_their_guards() {
+        let renderer = headless_renderer();
+        let state = SidebarState::default();
+        for width in [240.0, 380.0] {
+            let mut source = source_control();
+            assert!(source.can_push());
+            let actions = frame_enter_presses_at_width(
+                &renderer,
+                changes_footer(&state, &source, false),
+                width,
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Push { .. }))
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Commit { .. }))
+            );
+            assert!(
+                !frame_enter_presses_at_width(
+                    &renderer,
+                    changes_footer(&state, &source, true),
+                    width
+                )
+                .iter()
+                .any(|action| matches!(action, SidebarAction::Push { .. }))
+            );
+            source.set_mutation(Some(MutationKind::Stage));
+            assert!(
+                !frame_enter_presses_at_width(
+                    &renderer,
+                    changes_footer(&state, &source, false),
+                    width
+                )
+                .iter()
+                .any(|action| matches!(action, SidebarAction::Push { .. }))
+            );
+            source.set_mutation(None);
+            source.upstream = None;
+            source.tracking = TrackingState::NoUpstream;
+            assert!(source.can_publish());
+            let actions = frame_enter_presses_at_width(
+                &renderer,
+                changes_footer(&state, &source, false),
+                width,
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::OpenPublish { .. }))
+            );
+            assert!(!actions.iter().any(|action| matches!(
+                action,
+                SidebarAction::Push { .. } | SidebarAction::Commit { .. }
+            )));
+        }
     }
 
     /// Committing belongs to the working tree, and the working tree is one of

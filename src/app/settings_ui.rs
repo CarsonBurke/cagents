@@ -892,7 +892,7 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Choose Record, then press a shortcut. Click a chord to remove it, or Reset to restore that command’s defaults. Conflicts name the other command before saving. Letters, numbers, punctuation, arrows, Tab, PageUp, PageDown, and F1–F12 are supported. Prefer Ctrl+Shift combinations when you want ordinary terminal keys to remain available.",
+            "",
             vec![
                 shortcut_input(
                     "Toggle Projects sidebar",
@@ -1506,25 +1506,56 @@ fn shortcut_input<'a>(
         .map(|(index, chord)| {
             let mut remaining = chords.clone();
             remaining.remove(index);
-            widget::button::standard(format!("{chord} ×"))
-                .on_press(Message::SettingsDraftChanged {
-                    field,
-                    value: settings::format_chords(&remaining),
-                })
-                .into()
+            widget::container(
+                widget::row::with_children(vec![
+                    design::body(chord.clone()).into(),
+                    crate::ui_controls::icon_control(
+                        crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                        format!("Remove {chord} shortcut for {label}"),
+                        false,
+                        true,
+                        Some(Message::SettingsDraftChanged {
+                            field,
+                            value: settings::format_chords(&remaining),
+                        }),
+                    )
+                    .into(),
+                ])
+                .spacing(design::GRID_UNIT)
+                .align_y(Alignment::Center),
+            )
+            .padding([0.0, design::GRID_UNIT])
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_S; 4],
+                false,
+            ))
+            .into()
         })
         .collect();
+    let record: Element<'a, Message> = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon("preferences-desktop-keyboard-symbolic"),
+        format!("Record shortcut for {label}"),
+        false,
+        true,
+        Some(Message::Palette(palette_ui::Action::Record(field))),
+    )
+    .into();
+    let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+    let reset: Element<'a, Message> = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+        format!("Reset {label} shortcut"),
+        false,
+        value != default,
+        Some(Message::SettingsDraftChanged {
+            field,
+            value: default,
+        }),
+    )
+    .into();
     controls.push(
-        widget::button::standard("Record…")
-            .on_press(Message::Palette(palette_ui::Action::Record(field)))
-            .into(),
-    );
-    controls.push(
-        widget::button::text("Reset")
-            .on_press(Message::SettingsDraftChanged {
-                field,
-                value: workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default()),
-            })
+        widget::row::with_children(vec![record, reset])
+            .spacing(design::GRID_UNIT)
             .into(),
     );
     let mut message = None;
@@ -1554,9 +1585,9 @@ fn shortcut_input<'a>(
         }
     }
     let mut children = vec![
-        widget::row::with_children(controls)
-            .spacing(4)
-            .align_y(Alignment::Center)
+        widget::flex_row(controls)
+            .spacing(design::GRID_UNIT as u16)
+            .align_items(Alignment::Center)
             .into(),
     ];
     if let Some(message) = message {
