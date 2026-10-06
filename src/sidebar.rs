@@ -5053,6 +5053,7 @@ fn project_view<'a>(
         None,
         modal_open,
         entity.kind == ProjectKind::Git,
+        true,
         entity.github_ready,
         project.editors,
         project
@@ -5194,6 +5195,7 @@ fn compact_project<'a>(
         None,
         modal_open,
         entity.kind == ProjectKind::Git,
+        true,
         entity.github_ready,
         project.editors,
         project
@@ -5976,6 +5978,7 @@ fn worktree_view<'a>(
             Some(worktree.id),
             inert,
             true,
+            worktree.branch.is_some(),
             github_ready,
             editors,
             selection_count,
@@ -6078,6 +6081,7 @@ fn context_controls<'a>(
     worktree_id: Option<WorktreeId>,
     modal_open: bool,
     git: bool,
+    has_branch: bool,
     github_ready: bool,
     editors: &[SidebarEditor],
     selection_count: Option<usize>,
@@ -6158,8 +6162,30 @@ fn context_controls<'a>(
         let entries = commands
             .iter()
             .map(|(label, icon, command)| {
-                Item::Button(
-                    label.clone(),
+                let item = if !has_branch
+                    && matches!(
+                        command,
+                        ProjectCommand::CopyBranch
+                            | ProjectCommand::NewWorktreeFromBranch
+                            | ProjectCommand::PullRequest
+                    ) {
+                    Item::ButtonDisabled
+                } else {
+                    Item::Button
+                };
+                item(
+                    if !has_branch
+                        && matches!(
+                            command,
+                            ProjectCommand::CopyBranch
+                                | ProjectCommand::NewWorktreeFromBranch
+                                | ProjectCommand::PullRequest
+                        )
+                    {
+                        format!("{label} (detached HEAD)")
+                    } else {
+                        label.clone()
+                    },
                     icon.clone(),
                     ContextCommand(
                         project_id,
@@ -12766,6 +12792,7 @@ pub(crate) mod tests {
             None,
             false,
             true,
+            true,
             false,
             &[],
             Some(1),
@@ -13916,6 +13943,7 @@ pub(crate) mod tests {
                 project_id(1),
                 Some(WorktreeId::from_uuid(Uuid::from_u128(2))),
                 modal,
+                true,
                 true,
                 true,
                 &[],
