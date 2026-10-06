@@ -13793,6 +13793,12 @@ impl Application for Cagents {
                     // needs regardless of file management.
                     SidebarAction::FileCommand { key, path, command } => match command {
                         sidebar::FileCommand::RevealInFileViewer => {
+                            if crate::device::is_remote() {
+                                self.status = Some(TransientNotice::warning(
+                                    "Remote files cannot be revealed in the local file viewer",
+                                ));
+                                return Task::none();
+                            }
                             if !self.source_control_is_bound(&key) {
                                 return Task::none();
                             }
