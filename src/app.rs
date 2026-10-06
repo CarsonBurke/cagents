@@ -4273,6 +4273,14 @@ impl BrowserAddress {
         }
     }
 
+    /// Page navigation updates the persisted location independently of an
+    /// unsubmitted address draft, including after the field loses focus.
+    fn report_location(&mut self, url: &Url) {
+        if matches!(self, Self::Location { .. }) {
+            *self = Self::location(url);
+        }
+    }
+
     fn user_input(value: String) -> Self {
         Self::UserInput(value)
     }
@@ -8371,7 +8379,7 @@ impl Cagents {
         match event {
             BrowserEvent::UrlChanged(url) => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&id) {
-                    browser.address = BrowserAddress::location(&url);
+                    browser.address.report_location(&url);
                 }
                 if let Some(card) = self.card_state_mut(id)
                     && let CardKind::Browser(session) = &mut card.kind
@@ -17493,6 +17501,19 @@ mod tests {
         ] {
             assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
         }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn reported_navigation_preserves_draft_until_submission() {
+        let current = Url::parse("https://example.test/redirect").unwrap();
+        let destination = Url::parse("https://destination.test/next").unwrap();
+        let mut address = BrowserAddress::user_input(destination.to_string());
+        address.report_location(&current);
+        assert_eq!(address.as_str(), destination.as_str());
+        assert_eq!(address.submit(), Ok(destination));
+        address.report_location(&current);
+        assert_eq!(address.submit(), Ok(current));
     }
 
     #[cfg(feature = "integrated-browser")]
