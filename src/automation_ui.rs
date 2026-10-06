@@ -133,6 +133,8 @@ enum Pending {
     Save,
     Mutate,
     History { append: bool },
+    RefreshHistory,
+    HistoryRun { index: usize },
     Run,
     OpenRun,
 }
@@ -484,6 +486,15 @@ impl Draft {
     }
 }
 
+#[derive(Default, Debug, PartialEq, Eq)]
+enum HistoryStatus {
+    #[default]
+    Unrequested,
+    Loading,
+    Loaded,
+    Failed,
+}
+
 #[derive(Default)]
 pub struct State {
     manual_requests: std::collections::BTreeMap<Uuid, (u64, Uuid)>,
@@ -497,6 +508,7 @@ pub struct State {
     draft: Option<Draft>,
     confirmation: Option<Confirmation>,
     history: Vec<Firing>,
+    history_status: HistoryStatus,
     history_next: Option<HistoryCursor>,
     all_history: bool,
     run: Option<RunDetail>,
@@ -536,11 +548,25 @@ impl State {
         self.sequence = self.sequence.wrapping_add(1);
         self.pending = Some((self.sequence, pending));
         self.error = None;
+        if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
+            self.history_status = HistoryStatus::Loading;
+        }
         Some(Effect::Request {
             sequence: self.sequence,
             request,
         })
     }
+    fn refresh_history_runs(&mut self, from: usize) -> Option<Effect> {
+        let index =
+            (from..self.history.len()).find(|&index| self.history[index].state.is_active())?;
+        self.request(
+            Pending::HistoryRun { index },
+            Request::ShowFiring {
+                id: self.history[index].id,
+            },
+        )
+    }
+
     pub fn update(&mut self, action: Action) -> Option<Effect> {
         if matches!(
             &action,
@@ -570,7 +596,12 @@ impl State {
             let result =
                 std::sync::Arc::try_unwrap(result).unwrap_or_else(|result| (*result).clone());
             match result {
-                Err(error) => self.error = Some(error),
+                Err(error) => {
+                    if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
+                        self.history_status = HistoryStatus::Failed;
+                    }
+                    self.error = Some(error);
+                }
                 Ok(Response::Listed(rows)) => {
                     self.more = rows.len() == PAGE;
                     self.after = rows.last().map(|row| row.id);
@@ -600,20 +631,77 @@ impl State {
                         self.draft = None;
                         self.all_history = false;
                         self.history.clear();
+                        self.history_status = HistoryStatus::Unrequested;
                         self.history_next = None;
                         self.notice = Some(
                             "Saved. Review the launch settings before enabling or running.".into(),
                         );
                     }
+                    return self.request(
+                        if self.history_status == HistoryStatus::Unrequested {
+                            Pending::History { append: false }
+                        } else {
+                            Pending::RefreshHistory
+                        },
+                        Request::History {
+                            id: Some(id),
+                            before: None,
+                            limit: PAGE,
+                        },
+                    );
                 }
                 Ok(Response::History(page)) => {
+                    self.history_status = HistoryStatus::Loaded;
+                    if matches!(pending, Pending::RefreshHistory) {
+                        // Refresh the newest page without dropping older pages or
+                        // moving the cursor used by Older runs.
+                        let had_history = !self.history.is_empty();
+                        let ids = page
+                            .firings
+                            .iter()
+                            .map(|firing| firing.id)
+                            .collect::<Vec<_>>();
+                        let overlaps = self.history.iter().any(|firing| ids.contains(&firing.id));
+                        // More than a page of new runs can arrive between ticks.
+                        // Keep the loaded rows, but allow paging across that gap.
+                        let has_gap = had_history && !ids.is_empty() && !overlaps;
+                        self.history.retain(|firing| !ids.contains(&firing.id));
+                        self.history.splice(0..0, page.firings);
+                        if !had_history || has_gap {
+                            self.history_next = page.next;
+                        }
+                        return self.refresh_history_runs(0);
+                    }
                     if !matches!(pending, Pending::History { append: true }) {
                         self.history.clear();
                     }
-                    self.history.extend(page.firings);
+                    for firing in page.firings {
+                        if let Some(current) = self
+                            .history
+                            .iter_mut()
+                            .find(|current| current.id == firing.id)
+                        {
+                            *current = firing;
+                        } else {
+                            self.history.push(firing);
+                        }
+                    }
+                    self.history.sort_unstable_by_key(|firing| {
+                        std::cmp::Reverse((firing.created_ms, firing.id))
+                    });
                     self.history_next = page.next;
                 }
                 Ok(Response::Detail(detail)) => {
+                    if let Pending::HistoryRun { index } = pending {
+                        if let Some(firing) = self
+                            .history
+                            .iter_mut()
+                            .find(|firing| firing.id == detail.firing.id)
+                        {
+                            *firing = detail.firing;
+                        }
+                        return self.refresh_history_runs(index + 1);
+                    }
                     if matches!(pending, Pending::OpenRun) {
                         self.run = Some(detail.clone());
                         return Some(Effect::OpenRun(detail));
@@ -677,8 +765,14 @@ impl State {
                 return self.request(Pending::Show, Request::Show { id: automation.id });
             }
             if self.all_history {
-                // Keep paged history stable until an explicit refresh.
-                return None;
+                return self.request(
+                    Pending::RefreshHistory,
+                    Request::History {
+                        id: None,
+                        before: None,
+                        limit: PAGE,
+                    },
+                );
             }
             if self.rows.len() <= PAGE {
                 return self.request(
@@ -764,7 +858,9 @@ impl State {
             Action::Select(id) => {
                 self.draft = None;
                 self.all_history = false;
+                self.selected = None;
                 self.history.clear();
+                self.history_status = HistoryStatus::Unrequested;
                 self.history_next = None;
                 self.run = None;
                 return self.request(Pending::Show, Request::Show { id });
@@ -956,6 +1052,9 @@ impl State {
             Action::History | Action::MoreHistory | Action::AllHistory => {
                 if matches!(action, Action::AllHistory) {
                     self.all_history = true;
+                    self.history.clear();
+                    self.history_next = None;
+                    self.history_status = HistoryStatus::Unrequested;
                     self.selected = None;
                     self.run = None;
                 }
@@ -1209,8 +1308,19 @@ impl State {
                 }
                 if self.selected.is_some() || self.all_history {
                     content = content.push(button("Refresh history", Action::History, !busy));
-                    if self.history.is_empty() && !busy {
-                        content = content.push(widget::text::body("No runs in this history page."));
+                    let history_notice = match self.history_status {
+                        HistoryStatus::Unrequested => Some("History has not been loaded."),
+                        HistoryStatus::Loading => Some("Loading run history…"),
+                        HistoryStatus::Failed => {
+                            Some("Could not refresh history. Try Refresh history.")
+                        }
+                        HistoryStatus::Loaded if self.history.is_empty() => {
+                            Some("No runs in this history page.")
+                        }
+                        HistoryStatus::Loaded => None,
+                    };
+                    if let Some(notice) = history_notice {
+                        content = content.push(widget::text::body(notice));
                     }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
@@ -1974,6 +2084,174 @@ mod tests {
         assert_eq!(state.draft.as_ref().unwrap().name, "New launch");
     }
 
+    fn history_firing(created_ms: u64, state: crate::automations::FiringState) -> Firing {
+        Firing {
+            id: Uuid::new_v4(),
+            automation: Uuid::new_v4(),
+            name: "Example".into(),
+            revision: 1,
+            trigger: crate::automations::Trigger::Manual {
+                request: Uuid::new_v4(),
+            },
+            state,
+            release_pending: false,
+            cancel_requested: false,
+            created_ms,
+            started_ms: None,
+            finished_ms: None,
+            agent: None,
+            run: None,
+            skip: None,
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn background_history_refresh_preserves_older_pages_and_updates_active_rows() {
+        use crate::automations::{FiringState, HistoryPage};
+        let newest = history_firing(100, FiringState::Running);
+        let older = history_firing(1, FiringState::Running);
+        let cursor = HistoryCursor {
+            created_ms: 1,
+            id: older.id,
+        };
+        let mut state = State {
+            all_history: true,
+            history: vec![newest.clone(), older.clone()],
+            history_next: Some(cursor.clone()),
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!("history poll expected");
+        };
+        let mut completed = newest.clone();
+        completed.state = FiringState::Succeeded;
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![completed],
+                next: None,
+            }))),
+        }) else {
+            panic!("active older firing poll expected");
+        };
+        assert!(matches!(request, Request::ShowFiring { id } if id == older.id));
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history_next, Some(cursor));
+        let mut completed = older;
+        completed.state = FiringState::Succeeded;
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                definition: automation().definition,
+                firing: completed,
+                agent: None,
+                run: None,
+            }))),
+        });
+        assert!(
+            state
+                .history
+                .iter()
+                .all(|firing| firing.state == FiringState::Succeeded)
+        );
+        assert!(
+            state.run.is_none(),
+            "background polling must not open run detail"
+        );
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn history_poll_keeps_a_gap_pageable_without_duplicating_loaded_runs() {
+        use crate::automations::{FiringState, HistoryPage};
+        let older = history_firing(1, FiringState::Succeeded);
+        let newest = history_firing(100, FiringState::Succeeded);
+        let cursor = HistoryCursor {
+            created_ms: 100,
+            id: newest.id,
+        };
+        let mut state = State {
+            all_history: true,
+            history: vec![older.clone()],
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!("history poll expected");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![newest],
+                next: Some(cursor.clone()),
+            }))),
+        });
+        assert_eq!(state.history_next, Some(cursor.clone()));
+        assert_eq!(state.history.len(), 2);
+        let Some(Effect::Request { sequence, request }) = state.update(Action::MoreHistory) else {
+            panic!("gap page request expected");
+        };
+        assert!(
+            matches!(request, Request::History { before: Some(before), .. } if before == cursor)
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![history_firing(50, FiringState::Succeeded), older],
+                next: None,
+            }))),
+        });
+        assert_eq!(state.history.len(), 3);
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .map(|firing| firing.created_ms)
+                .collect::<Vec<_>>(),
+            vec![100, 50, 1]
+        );
+    }
+
+    #[test]
+    fn selecting_an_automation_loads_history_and_distinguishes_failure_from_empty() {
+        let mut state = State::default();
+        let automation = automation();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Select(automation.id))
+        else {
+            panic!("definition request expected");
+        };
+        assert!(state.selected.is_none());
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(automation.clone()))),
+        }) else {
+            panic!("history request expected after selection");
+        };
+        assert!(
+            matches!(request, Request::History { id: Some(id), before: None, .. } if id == automation.id)
+        );
+        assert_eq!(state.history_status, HistoryStatus::Loading);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("offline".into())),
+        });
+        assert_eq!(state.history_status, HistoryStatus::Failed);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
+            panic!("history retry expected");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(crate::automations::HistoryPage {
+                firings: Vec::new(),
+                next: None,
+            }))),
+        });
+        assert_eq!(state.history_status, HistoryStatus::Loaded);
+        assert!(state.history.is_empty());
+    }
+
     #[test]
     fn all_automation_history_is_independent_of_current_definition_selection() {
         let mut state = State {
@@ -1995,7 +2273,18 @@ mod tests {
         assert!(state.selected.is_none());
         assert!(state.all_history);
         state.pending = None;
-        assert!(state.update(Action::Tick).is_none());
+        assert!(matches!(
+            state.update(Action::Tick),
+            Some(Effect::Request {
+                request: Request::History {
+                    id: None,
+                    before: None,
+                    ..
+                },
+                ..
+            })
+        ));
+        state.pending = None;
         assert!(matches!(
             state.update(Action::Refresh),
             Some(Effect::Request {
