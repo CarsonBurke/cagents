@@ -7,10 +7,11 @@ use std::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, TryLockError},
     thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +41,22 @@ static REMOTE_SHELL: OnceLock<String> = OnceLock::new();
 static SELECTED: OnceLock<Device> = OnceLock::new();
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static BRIDGE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static MASTERS: Mutex<Vec<Master>> = Mutex::new(Vec::new());
+/// sshd admits `MaxSessions` (10 by default) streams per connection; a refused
+/// one reconnects in full, so each master carries fewer and the next takes over.
+const STREAMS_PER_MASTER: usize = 8;
+/// Bridges the gaps between one process's connections, and bounds how long an
+/// authenticated transport outlives a process that died without `Cleanup`.
+const MASTER_PERSIST_SECONDS: u32 = 60;
+/// Exceeds `ConnectTimeout`. A stream still connected then without a master
+/// either cannot multiplex here or is authenticating unusually slowly, so later
+/// streams stop waiting on one for `MULTIPLEX_RETRY`.
+const MASTER_START_TIMEOUT: Duration = Duration::from_secs(20);
+const MULTIPLEX_RETRY: Duration = Duration::from_secs(300);
+static MULTIPLEX_PAUSED: Mutex<Option<Instant>> = Mutex::new(None);
+/// `ssh -O exit` answers a healthy master in milliseconds. One that does not
+/// answer would hold process exit for `ConnectTimeout` and then log in afresh.
+const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn selected() -> Option<&'static Device> {
     SELECTED.get()
@@ -170,6 +187,31 @@ impl Drop for Cleanup {
         {
             let _ = fs::remove_file(&path);
             if let Some(directory) = path.parent() {
+                let masters = MASTERS
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .len();
+                for control in (0..masters).filter_map(|master| control_path(directory, master)) {
+                    if let Some(device) = selected().filter(|_| Path::new(&control).exists())
+                        && let Ok(mut exit) = ssh(Some(&control))
+                            .args(["-O", "exit", "--", &device.host])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                    {
+                        let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
+                        while matches!(exit.try_wait(), Ok(None)) {
+                            if Instant::now() >= deadline {
+                                let _ = exit.kill();
+                                let _ = exit.wait();
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    let _ = fs::remove_file(control);
+                }
                 let _ = fs::remove_dir(directory);
             }
         }
@@ -179,7 +221,13 @@ impl Drop for Cleanup {
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-fn ssh_command(device: &Device) -> Command {
+/// Streams share an authenticated transport through OpenSSH multiplexing.
+/// These options deliberately override the user's own ControlMaster settings:
+/// a master cagents starts carries its keepalives, is counted against
+/// `STREAMS_PER_MASTER`, and is one `Cleanup` may stop. Masters are private to
+/// this process rather than shared between cagents processes, so closing the
+/// window or finishing a command leaves no usable transport behind.
+fn ssh(control: Option<&str>) -> Command {
     let mut command = Command::new("ssh");
     command.args([
         "-T",
@@ -191,14 +239,71 @@ fn ssh_command(device: &Device) -> Command {
         "ServerAliveInterval=15",
         "-o",
         "ServerAliveCountMax=3",
-        "--",
-        &device.host,
     ]);
+    if let Some(control) = control {
+        command.args([
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            &format!("ControlPath={control}"),
+            "-o",
+            &format!("ControlPersist={MASTER_PERSIST_SECONDS}"),
+        ]);
+    }
+    command
+}
+fn bridge_command(device: &Device, control: Option<&str>) -> Command {
+    let mut command = ssh(control);
+    command.args(["--", &device.host]);
     command.arg(format!("{} daemon bridge", quote(&device.executable)));
     command
 }
+/// The control socket of one master, or `None` where SSH could not use it:
+/// OpenSSH binds a 17-byte temporary suffix within the socket address limit and
+/// reads the option as a configuration line with its own quoting and `%` tokens.
+fn control_path(directory: &Path, master: usize) -> Option<String> {
+    let path = directory.join(format!("ssh-{master}")).to_str()?.to_owned();
+    // SAFETY: sockaddr_un is plain data for which all-zero bytes are valid.
+    let limit = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    (path.len() + 17 < limit
+        && path
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)))
+    .then_some(path)
+}
+#[derive(Default)]
+struct Master {
+    streams: usize,
+    /// Held while the first stream authenticates, so a burst shares its handshake.
+    starting: Arc<Mutex<()>>,
+}
+/// One stream's place on the least-numbered master with room for it.
+struct Slot(usize);
+impl Slot {
+    fn acquire() -> (Self, Arc<Mutex<()>>) {
+        let mut masters = MASTERS.lock().unwrap_or_else(|poison| poison.into_inner());
+        let index = masters
+            .iter()
+            .position(|master| master.streams < STREAMS_PER_MASTER)
+            .unwrap_or_else(|| {
+                masters.push(Master::default());
+                masters.len() - 1
+            });
+        masters[index].streams += 1;
+        (Self(index), masters[index].starting.clone())
+    }
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        MASTERS.lock().unwrap_or_else(|poison| poison.into_inner())[self.0].streams -= 1;
+    }
+}
 /// Each process owns its private local proxy; reconnecting a client establishes
-/// a fresh SSH stream. No exported socket is trusted by UID alone across hosts.
+/// a fresh SSH stream. No exported socket is trusted by UID alone across hosts:
+/// the control sockets beside the proxy stay on this host in the same private
+/// directory, and grant only the SSH access their owner already has.
 pub fn socket_path() -> io::Result<Option<PathBuf>> {
     let Some(device) = selected() else {
         return Ok(None);
@@ -221,20 +326,74 @@ pub fn socket_path() -> io::Result<Option<PathBuf>> {
             let Ok(stream) = incoming else { break; };
 
             let device = device.clone();
+            let directory = directory.clone();
             let _ = thread::Builder::new().name("cagents-device-connection".into()).spawn(move || {
-                if let Err(error) = forward(&device, stream) { tracing::warn!(device = device.name, %error, "remote daemon connection ended; verify SSH access and matching cagents installation"); }
+                if let Err(error) = forward(&device, &directory, stream) { tracing::warn!(device = device.name, %error, "remote daemon connection ended; verify SSH access and matching cagents installation"); }
             });
         }
     })?;
     *bridge = Some(path.clone());
     Ok(Some(path))
 }
-fn forward(device: &Device, stream: UnixStream) -> io::Result<()> {
-    let mut child = ssh_command(device)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+/// Spawn one stream. When its master is not listening this stream becomes it
+/// (`ControlMaster=auto`, which also reconnects alone past a stale, unresponsive
+/// or full master); later streams wait for that socket instead of racing it.
+/// Killing a stream never stops the master, which OpenSSH detaches. Connecting
+/// to the control socket and hanging up is how liveness is read without a
+/// process per stream; the master discards such a client.
+fn spawn_stream(
+    device: &Device,
+    control: Option<&str>,
+    starting: &Mutex<()>,
+) -> io::Result<std::process::Child> {
+    let spawn = || {
+        bridge_command(device, control)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let Some(control) = control else {
+        return spawn();
+    };
+    let (_starting, waited) = match starting.try_lock() {
+        Ok(guard) => (guard, false),
+        Err(TryLockError::Poisoned(poison)) => (poison.into_inner(), false),
+        Err(TryLockError::WouldBlock) => (
+            starting.lock().unwrap_or_else(|poison| poison.into_inner()),
+            true,
+        ),
+    };
+    let listening = || UnixStream::connect(control).is_ok();
+    let cold = !listening();
+    let mut child = spawn()?;
+    // A stream that waited through a failed start must not make the rest queue
+    // behind its own attempt; they fail or connect in parallel as before.
+    let deadline = Instant::now() + MASTER_START_TIMEOUT;
+    while cold && !waited && !listening() && matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                device = device.name,
+                "SSH did not share a connection in time; connecting separately for now"
+            );
+            *MULTIPLEX_PAUSED
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                Some(Instant::now() + MULTIPLEX_RETRY);
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(child)
+}
+fn forward(device: &Device, directory: &Path, stream: UnixStream) -> io::Result<()> {
+    let (slot, starting) = Slot::acquire();
+    let paused = MULTIPLEX_PAUSED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .is_some_and(|until| Instant::now() < until);
+    let control = control_path(directory, slot.0).filter(|_| !paused);
+    let mut child = spawn_stream(device, control.as_deref(), &starting)?;
     let stderr = child
         .stderr
         .take()
@@ -265,11 +424,16 @@ fn forward(device: &Device, stream: UnixStream) -> io::Result<()> {
     let mut writer = stream;
     let upstream = thread::spawn(move || copy_flushed(&mut reader, &mut input));
     let result = copy_flushed(&mut output, &mut writer);
-    if result.is_err() {
-        let _ = child.kill();
-    }
+    let killed = result.is_err() && child.kill().is_ok();
     let status = child.wait()?;
-    let detail = diagnostics.join().unwrap_or_default();
+    // A multiplexed stream hands its stderr to the master, which keeps it open
+    // until the remote command ends. Only a stream that ended by itself has
+    // diagnostics that are complete, and worth waiting for.
+    let detail = if killed {
+        String::new()
+    } else {
+        diagnostics.join().unwrap_or_default()
+    };
     if !status.success() {
         *LAST_ERROR
             .lock()
@@ -452,6 +616,59 @@ mod tests {
             "a-very-long-but-valid-window-name",
         ))
         .unwrap();
+    }
+    #[test]
+    fn streams_multiplex_over_a_private_master_and_spill_to_the_next() {
+        let device = Device {
+            name: "fw16".into(),
+            host: "marvin@fw16".into(),
+            executable: "/home/a b/cagents".into(),
+        };
+        let arguments = |control| {
+            bridge_command(&device, control)
+                .get_args()
+                .map(|argument| argument.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let plain = arguments(None);
+        assert!(!plain.iter().any(|argument| argument.contains("Control")));
+        assert_eq!(
+            plain[plain.len() - 3..],
+            ["--", "marvin@fw16", "'/home/a b/cagents' daemon bridge"]
+        );
+        let directory = Path::new("/run/user/1000/cagents/device-0123456789ab");
+        let control = control_path(directory, 0).unwrap();
+        assert_eq!(control, "/run/user/1000/cagents/device-0123456789ab/ssh-0");
+        let multiplexed = arguments(Some(&control));
+        // Options precede `--`, so the host can never be read as one.
+        assert_eq!(
+            multiplexed[multiplexed.len() - 3..],
+            plain[plain.len() - 3..]
+        );
+        assert_eq!(
+            multiplexed[plain.len() - 3..multiplexed.len() - 3],
+            [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/user/1000/cagents/device-0123456789ab/ssh-0",
+                "-o",
+                "ControlPersist=60"
+            ]
+        );
+        // Unusable control paths fall back to one connection per stream.
+        let long = Path::new("/run").join("x".repeat(90));
+        assert_eq!(control_path(&long, 0), None);
+        assert_eq!(control_path(Path::new("/run/user/a b"), 0), None);
+        assert_eq!(control_path(Path::new("/run/user/%h"), 0), None);
+
+        let mut slots = (0..=STREAMS_PER_MASTER)
+            .map(|_| Slot::acquire().0)
+            .collect::<Vec<_>>();
+        assert_eq!(slots.pop().unwrap().0, 1);
+        assert!(slots.iter().all(|slot| slot.0 == 0));
+        slots.pop();
+        assert_eq!(Slot::acquire().0.0, 0);
     }
     #[test]
     fn remote_command_quotes_executable_and_rejects_options() {

@@ -71,6 +71,18 @@ On Linux, an SSH login without `XDG_RUNTIME_DIR` uses the existing
 host without that login runtime directory must configure an owned private
 `XDG_RUNTIME_DIR` for its daemon and SSH bridge command.
 
+The connections of one window or command share authenticated SSH transports
+through OpenSSH connection multiplexing, so only the first pays the SSH
+handshake. cagents keeps these control sockets in its private runtime directory
+and sets `ControlMaster`, `ControlPath`, and `ControlPersist` itself for those
+connections, over any in your SSH configuration; your own SSH sessions and
+control sockets are untouched. It stops the transports when the window or
+command exits, and one left behind by a crash ends a minute after its last
+stream. Each transport carries eight streams, below sshd's default
+`MaxSessions` of 10; a lower server limit still works, with the refused streams
+connecting separately. Where SSH cannot share a connection, each stream
+connects separately under your own configuration, as before.
+
 Closing the window detaches its SSH streams; daemon-hosted jobs continue. SSH
 keepalives detect lost connections, and the normal terminal/chat reconnect paths
 establish new streams. Startup failures identify the selected device and include
