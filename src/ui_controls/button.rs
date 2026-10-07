@@ -139,6 +139,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         .name(name.unwrap_or(label))
         .class(style(weight))
         .padding([0.0, space::M])
+        .width(width)
         .height(design::DENSE_ROW_HEIGHT)
         .on_press_maybe(on_press);
         if let Some(id) = id {

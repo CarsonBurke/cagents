@@ -29,7 +29,7 @@ macro_rules! icons {
         }
 
         impl Icon {
-            /// Every glyph, in declaration order: the order of [`HANDLES`].
+            /// Every glyph, in declaration order: the order of [`BUNDLED`].
             const ALL: &'static [Self] = &[$(Self::$bundled,)* $(Self::$themed,)*];
 
             const fn source(self) -> Source {
@@ -163,22 +163,28 @@ icons! {
     }
 }
 
-/// One handle per glyph for the life of the process. A stable handle keeps
-/// its rasterization in the renderer's cache instead of re-keying it on every
-/// view.
-static HANDLES: LazyLock<Vec<Handle>> = LazyLock::new(|| {
+/// One handle per bundled glyph for the life of the process. A stable handle
+/// keeps its rasterization in the renderer's cache instead of re-keying it on
+/// every view. Themed glyphs have no entry: their name is resolved against
+/// the icon theme each time, so a theme changed at runtime takes effect.
+static BUNDLED: LazyLock<Vec<Option<Handle>>> = LazyLock::new(|| {
     Icon::ALL
         .iter()
         .map(|icon| match icon.source() {
-            Source::Bundled(svg) => icon::from_svg_bytes(svg).symbolic(true),
-            Source::Theme(name) => icon::from_name(name).handle(),
+            Source::Bundled(svg) => Some(icon::from_svg_bytes(svg).symbolic(true)),
+            Source::Theme(_) => None,
         })
         .collect()
 });
 
 impl Icon {
     pub fn handle(self) -> Handle {
-        HANDLES[self as usize].clone()
+        match self.source() {
+            Source::Bundled(_) => BUNDLED[self as usize]
+                .clone()
+                .expect("a bundled glyph has a cached handle"),
+            Source::Theme(name) => icon::from_name(name).handle(),
+        }
     }
 }
 
@@ -243,7 +249,7 @@ mod tests {
         for (index, icon) in Icon::ALL.iter().enumerate() {
             assert_eq!(*icon as usize, index, "{icon:?}");
         }
-        assert_eq!(HANDLES.len(), Icon::ALL.len());
+        assert_eq!(BUNDLED.len(), Icon::ALL.len());
     }
 
     #[test]

@@ -136,7 +136,7 @@ mod tests {
         }
 
         let mut renderer = headless_renderer();
-        // The popup covers x=40..152, y=40..112. Probe its padding,
+        // The popup covers x=40..148, y=40..108. Probe its padding,
         // disabled control and empty area, then the exposed background.
         for (point, covered) in [
             (Point::new(42.0, 42.0), true),

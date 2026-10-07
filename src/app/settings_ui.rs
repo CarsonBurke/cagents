@@ -1288,7 +1288,9 @@ fn settings_layout<'a>(
         .on_input(Message::SettingsSearchChanged)
         .width(Length::Fill);
     if !query.is_empty() {
-        search = search.on_clear(Message::SettingsSearchChanged(String::new()));
+        search = search.trailing_icon(crate::ui_controls::field::clear(
+            Message::SettingsSearchChanged(String::new()),
+        ));
     }
     let navigation: Element<'a, Message> = if narrow {
         let mut rows: Vec<Element<'a, Message>> = vec![search.into()];

@@ -97,6 +97,109 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
         }
     }
 
+    /// Applies one event to the resize gesture, keyboard focus and
+    /// accessibility actions.
+    fn handle(
+        &self,
+        state: &mut SplitterState,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if !self.modal_open => {
+                state.is_focused = cursor.is_over(bounds);
+                if let Some(position) = cursor.position().filter(|_| state.is_focused) {
+                    let now = std::time::Instant::now();
+                    if state.last_click.take().is_some_and(|previous| {
+                        now.duration_since(previous) <= std::time::Duration::from_millis(400)
+                    }) {
+                        state.drag = None;
+                        shell.publish(self.resize(self.default_width));
+                        shell.publish((self.on_finish)());
+                        shell.capture_event();
+                        return;
+                    }
+                    state.last_click = Some(now);
+                    state.begin_drag(position.x, self.width);
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if let Some(width) = state.dragged_width(self.edge, position.x) {
+                    state.last_click = None;
+                    shell.publish(self.resize(width));
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.finish_drag() {
+                    shell.publish((self.on_finish)());
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Window(window::Event::Unfocused) => {
+                let dragging = state.finish_drag();
+                let keyboard_gesture = state.finish_keyboard_gesture(true);
+                if dragging || keyboard_gesture {
+                    shell.publish((self.on_finish)());
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) if state.drag.is_some() => {
+                let origin = state.drag.take().expect("active resize gesture");
+                shell.publish(self.resize(origin.width));
+                shell.publish((self.on_finish)());
+                shell.capture_event();
+                return;
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat: _,
+                ..
+            }) if state.is_focused && !self.modal_open && !chorded(*modifiers) => {
+                if let Some(delta) = state.keyboard_resize(self.keyboard_delta(key)) {
+                    shell.publish(self.resize(self.width + delta));
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.keyboard_gesture => {
+                if state.finish_keyboard_gesture(self.keyboard_delta(key).is_some()) {
+                    shell.publish((self.on_finish)());
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::A11y(id, request) if *id == self.id => {
+                use iced_accessibility::accesskit::Action;
+                match request.action {
+                    Action::Focus => state.is_focused = true,
+                    Action::Blur => state.is_focused = false,
+                    Action::Increment if !self.modal_open => {
+                        shell.publish(self.resize(self.width + KEYBOARD_STEP));
+                        shell.publish((self.on_finish)());
+                    }
+                    Action::Decrement if !self.modal_open => {
+                        shell.publish(self.resize(self.width - KEYBOARD_STEP));
+                        shell.publish((self.on_finish)());
+                    }
+                    _ => {}
+                }
+                shell.capture_event();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     fn keyboard_delta(&self, key: &keyboard::Key) -> Option<f32> {
         let physical = match key {
             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => -KEYBOARD_STEP,
@@ -229,105 +332,25 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
     ) {
         let bounds = Self::hit_bounds(layout.bounds());
         let state = tree.state.downcast_mut::<SplitterState>();
-        if matches!(
-            event,
-            Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft)
-        ) {
-            let hovered = cursor.is_over(bounds);
-            if std::mem::replace(&mut state.hovered, hovered) != hovered {
-                shell.request_redraw();
-            }
-        }
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if !self.modal_open => {
-                state.is_focused = cursor.is_over(bounds);
-                if let Some(position) = cursor.position().filter(|_| state.is_focused) {
-                    let now = std::time::Instant::now();
-                    if state.last_click.take().is_some_and(|previous| {
-                        now.duration_since(previous) <= std::time::Duration::from_millis(400)
-                    }) {
-                        state.drag = None;
-                        shell.publish(self.resize(self.default_width));
-                        shell.publish((self.on_finish)());
-                        shell.capture_event();
-                        return;
-                    }
-                    state.last_click = Some(now);
-                    state.begin_drag(position.x, self.width);
-                    shell.capture_event();
-                    return;
+            Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) => {
+                let hovered = cursor.is_over(bounds);
+                if std::mem::replace(&mut state.hovered, hovered) != hovered {
+                    shell.request_redraw();
                 }
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if let Some(width) = state.dragged_width(self.edge, position.x) {
-                    state.last_click = None;
-                    shell.publish(self.resize(width));
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.finish_drag() {
-                    shell.publish((self.on_finish)());
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Window(window::Event::Unfocused) => {
-                let dragging = state.finish_drag();
-                let keyboard_gesture = state.finish_keyboard_gesture(true);
-                if dragging || keyboard_gesture {
-                    shell.publish((self.on_finish)());
-                }
-            }
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                ..
-            }) if state.drag.is_some() => {
-                let origin = state.drag.take().expect("active resize gesture");
-                shell.publish(self.resize(origin.width));
-                shell.publish((self.on_finish)());
-                shell.capture_event();
-                return;
-            }
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                modifiers,
-                repeat: _,
-                ..
-            }) if state.is_focused && !self.modal_open && !chorded(*modifiers) => {
-                if let Some(delta) = state.keyboard_resize(self.keyboard_delta(key)) {
-                    shell.publish(self.resize(self.width + delta));
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.keyboard_gesture => {
-                if state.finish_keyboard_gesture(self.keyboard_delta(key).is_some()) {
-                    shell.publish((self.on_finish)());
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::A11y(id, request) if *id == self.id => {
-                use iced_accessibility::accesskit::Action;
-                match request.action {
-                    Action::Focus => state.is_focused = true,
-                    Action::Blur => state.is_focused = false,
-                    Action::Increment if !self.modal_open => {
-                        shell.publish(self.resize(self.width + KEYBOARD_STEP));
-                        shell.publish((self.on_finish)());
-                    }
-                    Action::Decrement if !self.modal_open => {
-                        shell.publish(self.resize(self.width - KEYBOARD_STEP));
-                        shell.publish((self.on_finish)());
-                    }
-                    _ => {}
-                }
-                shell.capture_event();
-                return;
+            // The frame about to be drawn paints from the cursor, so record
+            // what it will show: a splitter that moved under a still pointer
+            // is then repainted when the pointer leaves it.
+            Event::Window(window::Event::RedrawRequested(_)) => {
+                state.hovered = cursor.is_over(bounds);
             }
             _ => {}
+        }
+        let was_focused = state.is_focused;
+        self.handle(state, event, bounds, cursor, shell);
+        if state.is_focused != was_focused {
+            shell.request_redraw();
         }
     }
 

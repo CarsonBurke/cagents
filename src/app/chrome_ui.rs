@@ -1245,7 +1245,10 @@ impl Cagents {
                 + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
                 + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
             count as f32 * design::WINDOW_CONTROL_SIZE
-                + count.saturating_sub(1) as f32 * space::S
+                // libcosmic's header bar lays the controls out on the
+                // desktop's density, so this gap has to follow it too.
+                + count.saturating_sub(1) as f32
+                    * f32::from(cosmic::theme::spacing().space_xxs)
                 + design::PRIMARY_CONTROL_SIZE
                 + 12.0
         };

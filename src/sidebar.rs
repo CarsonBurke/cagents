@@ -4144,7 +4144,9 @@ fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarA
             .on_input(SidebarAction::SearchChanged)
             .on_submit(|_| SidebarAction::OpenFirstSearchResult);
         if !state.query.is_empty() {
-            input = input.on_clear(SidebarAction::SearchChanged(String::new()));
+            input = input.trailing_icon(crate::ui_controls::field::clear(
+                SidebarAction::SearchChanged(String::new()),
+            ));
         }
     }
     RowInteraction::search(input.id(search_focus_id()).into(), !modal_open)

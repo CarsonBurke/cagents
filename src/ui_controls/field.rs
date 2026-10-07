@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use cosmic::{
+    Element,
     iced::{self, Length},
     widget,
 };
@@ -48,6 +49,26 @@ pub fn search<'a, Message: Clone + 'static>(
             .center_x(Length::Fixed(design::DENSE_ROW_HEIGHT - space::XS))
             .into(),
         )
+}
+
+/// The trailing control that empties a field, for `.trailing_icon(..)`.
+///
+/// COSMIC's own `on_clear` button is taller than a dense row and a field
+/// grows to fit its trailing icon, so attaching it made a search field jump
+/// in height on the first keystroke. This one fits inside the line box.
+pub fn clear<'a, Message: Clone + 'a>(on_clear: Message) -> Element<'a, Message> {
+    widget::button::custom(
+        widget::container(widget::icon(Icon::Clear.handle()).size(design::COMPACT_ICON_SIZE))
+            .class(design::transparent())
+            .center(Length::Fill),
+    )
+    .name("Clear")
+    .class(super::control_style(false, None))
+    .width(LINE_HEIGHT)
+    .height(LINE_HEIGHT)
+    .padding(0)
+    .on_press(on_clear)
+    .into()
 }
 
 /// A choice among a few named options, at the shell's type size.
@@ -132,5 +153,32 @@ fn style() -> cosmic::theme::TextInput {
         hovered: Box::new(move |theme| appearance(Status::Hovered, theme)),
         focused: Box::new(move |theme| appearance(Status::Focused, theme)),
         disabled: Box::new(move |theme| appearance(Status::Disabled, theme)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_search_field_stays_one_dense_row_high_with_its_clear_control() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for query in ["", "query"] {
+            let mut field = search::<()>("Search", query);
+            if !query.is_empty() {
+                field = field.trailing_icon(clear(()));
+            }
+            let mut element: Element<'_, ()> = field.into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(240.0, 200.0)),
+            );
+            assert_eq!(node.size().height, design::DENSE_ROW_HEIGHT, "{query:?}");
+        }
     }
 }
