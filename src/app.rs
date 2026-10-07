@@ -7701,7 +7701,6 @@ impl Cagents {
         }
     }
 
-    /// Where keyboard focus for `card` lands.
     /// Whether `card` is where the keyboard belongs: the focused pane, in the
     /// widget tree, with nothing over the workspace taking input instead.
     ///
@@ -7718,6 +7717,7 @@ impl Cagents {
             && !self.workspace_inputs_blocked()
     }
 
+    /// Where keyboard focus for `card` lands.
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_)) => self
@@ -7820,8 +7820,13 @@ impl Cagents {
         // Runtime objects and focus never move out of their ID-indexed maps.
         let viewport = self.apply_viewport(update, true, true);
         // Focus did not change, so nothing above follows the active tab to
-        // wherever the new order put it.
-        Task::batch([viewport, self.reveal_active_tab()])
+        // wherever the new order put it. Dragging some other tab leaves the
+        // strip where the drag has it.
+        if self.workspace.focused() == Some(card) {
+            Task::batch([viewport, self.reveal_active_tab()])
+        } else {
+            viewport
+        }
     }
 
     fn apply_viewport(
@@ -20252,11 +20257,16 @@ mod tests {
         app.workspace.resize_viewport(600.0);
         app.workspace.native_scroll(0.0, 600.0);
         // The last frame of whatever animated before, two idle seconds ago.
-        let navigated = Instant::now();
-        let previous_frame = navigated - Duration::from_secs(2);
+        let previous_frame = Instant::now() - Duration::from_secs(2);
         app.frame_clock.start(previous_frame);
 
         let _ = app.update(Message::FocusCard(target));
+        // Read back rather than taken before the update, which a stalled
+        // thread would put a frame or more behind the clock's own start.
+        let navigated = app
+            .frame_clock
+            .frame()
+            .expect("navigation starts the clock");
         // The first frame already moves the camera, by the time since the
         // navigation and not since that earlier frame.
         let _ = app.update(Message::Frame(navigated + Duration::from_millis(16)));

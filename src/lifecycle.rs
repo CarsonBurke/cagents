@@ -139,13 +139,12 @@ impl LifecycleManager {
                 return true;
             }
             if let Some(runtime) = self.cards.get_mut(card) {
-                if runtime.exposure == Exposure::Visible {
-                    // The grace runs from the card's departure. Sweeps only
-                    // happen on transitions, so the stamp of the last one that
-                    // saw it visible can be as old as the pane's stay on
-                    // screen, and would evict it the moment it left.
-                    runtime.last_visible = now;
-                }
+                // The grace runs from the card's departure, whether it left
+                // from the screen or from the band kept warm beside it. Sweeps
+                // only happen on transitions, so the stamp of the last one
+                // that saw it visible can be as old as its stay, and would
+                // evict it the moment it left.
+                runtime.last_visible = now;
                 runtime.exposure = Exposure::Offscreen;
                 actions.push(LifecycleAction::SetExposure {
                     card: *card,
@@ -184,9 +183,7 @@ impl LifecycleManager {
             .map(|card| (card, true))
             .chain(prefetch.iter().map(|card| (card, false)))
         {
-            if !self.cards.get(card).is_some_and(|runtime| {
-                matches!(runtime.residency, Residency::Cold | Residency::Hibernated)
-            }) {
+            if !self.is_cold(card) {
                 continue;
             }
             if self.hot.len() >= self.budget.max_hot_cards {
@@ -202,16 +199,7 @@ impl LifecycleManager {
                 };
                 self.evict(evicted, &mut actions);
             }
-            let runtime = self.cards.get_mut(card).expect("candidate exists");
-            runtime.epoch = runtime.epoch.wrapping_add(1);
-            runtime.residency = Residency::Hydrating {
-                epoch: runtime.epoch,
-            };
-            actions.push(LifecycleAction::Hydrate {
-                card: *card,
-                epoch: runtime.epoch,
-            });
-            self.hot.insert(*card);
+            self.hydrate(*card, &mut actions);
         }
 
         let mut eviction_candidates: Vec<_> = self
@@ -235,7 +223,38 @@ impl LifecycleManager {
             self.evict(card, &mut actions);
         }
 
+        // Slots the grace just freed go to whoever was turned away above.
+        // Nothing else would come back for them: the next sweep is the next
+        // change of exposure.
+        for card in visible.iter().chain(prefetch) {
+            if self.hot.len() >= self.budget.max_hot_cards {
+                break;
+            }
+            if self.is_cold(card) {
+                self.hydrate(*card, &mut actions);
+            }
+        }
+
         actions
+    }
+
+    fn is_cold(&self, card: &CardId) -> bool {
+        self.cards.get(card).is_some_and(|runtime| {
+            matches!(runtime.residency, Residency::Cold | Residency::Hibernated)
+        })
+    }
+
+    fn hydrate(&mut self, card: CardId, actions: &mut Vec<LifecycleAction>) {
+        let runtime = self.cards.get_mut(&card).expect("candidate exists");
+        runtime.epoch = runtime.epoch.wrapping_add(1);
+        runtime.residency = Residency::Hydrating {
+            epoch: runtime.epoch,
+        };
+        actions.push(LifecycleAction::Hydrate {
+            card,
+            epoch: runtime.epoch,
+        });
+        self.hot.insert(card);
     }
 
     /// The hot cards a visible one may take a slot from, in the order they

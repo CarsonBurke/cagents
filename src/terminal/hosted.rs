@@ -460,7 +460,13 @@ impl HostedPublishedState {
         // frame arrived keeps the picture it already had.
         let last = self.snapshot.load_full();
         if !last.detached && last.rows > 0 {
-            self.retained.store(Some(last));
+            self.retained.store(Some(Arc::clone(&last)));
+            // A failed attach replaces the grid and then drops the picture.
+            // If it did the first before the store above, it did the second
+            // before it too, and the picture must not outlive it.
+            if !Arc::ptr_eq(&last, &self.snapshot.load_full()) {
+                self.retained.store(None);
+            }
         }
         self.snapshot
             .store(Arc::new(RenderSnapshot::detached(generation)));
