@@ -649,13 +649,13 @@ impl Cagents {
             return None;
         }
         let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3(if intent.detail.is_some() {
+            crate::design::title(if intent.detail.is_some() {
                 "Terminal kept open"
             } else {
                 "Close active processes?"
             })
             .into(),
-            widget::text::body(intent.detail.as_deref().unwrap_or(if intent.pending {
+            crate::design::body(intent.detail.as_deref().unwrap_or(if intent.pending {
                 "Checking terminal identity and closing…"
             } else {
                 "This terminal or its paired conversation still owns running processes. Closing stops them."
@@ -686,18 +686,18 @@ impl Cagents {
         // the cancel id so focus traversal stays one rule for both shapes.
         let buttons = if intent.detail.is_some() {
             vec![
-                widget::button::suggested("Dismiss")
+                crate::ui_controls::button::primary("Dismiss")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
                     .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
                     .into(),
             ]
         } else {
             vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
                     .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
                     .into(),
-                widget::button::destructive("Close")
+                crate::ui_controls::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe(
                         (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),

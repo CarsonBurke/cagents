@@ -595,7 +595,8 @@ fn command<'a>(
     id: widget::Id,
     action: Option<Message>,
 ) -> Element<'a, Message> {
-    crate::ui_controls::icon_control(icon.into(), label, false, action.is_some(), action)
+    crate::ui_controls::icon_button(icon.into(), label)
+        .on_press_maybe(action)
         .id(id)
         .into()
 }
@@ -1063,23 +1064,22 @@ impl Cagents {
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
         let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
-        let control = crate::ui_controls::icon_control(
+        let control = crate::ui_controls::icon_button(
             severity.icon(),
             match severity {
                 NoticeSeverity::Success => "Application notices: success",
                 NoticeSeverity::Warning => "Application notices",
                 NoticeSeverity::Error => "Application errors",
             },
-            self.chrome_ui.popup == Some(Popup::Notices),
-            !self.modal_is_open(),
-            (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)),
         )
+        .selected(self.chrome_ui.popup == Some(Popup::Notices))
+        .on_press_maybe((!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)))
         .id(widget::Id::new("chrome.notices"))
-        .icon_color(match severity {
-            NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
-            NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
-            NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
-        });
+        .tone(design::Tone::Themed(match severity {
+            NoticeSeverity::Success => design::success_color,
+            NoticeSeverity::Warning => design::warning_color,
+            NoticeSeverity::Error => design::destructive_color,
+        }));
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
@@ -1218,16 +1218,14 @@ impl Cagents {
     }
 
     fn sidebar_toggle(&self) -> Element<'_, Message> {
-        crate::ui_controls::icon_control(
+        crate::ui_controls::icon_button(
             Icon::SplitPanel,
             workspace_widget::shortcut_tooltip(
                 workspace_widget::GlobalShortcut::ToggleInspector,
                 &self.settings.keyboard_shortcuts,
             ),
-            false,
-            !self.modal_is_open(),
-            (!self.modal_is_open()).then_some(Message::ToggleContextInspector),
         )
+        .on_press_maybe((!self.modal_is_open()).then_some(Message::ToggleContextInspector))
         .id(context_inspector_toggle_id())
         .into()
     }
@@ -1492,7 +1490,7 @@ impl Cagents {
                         RenameTarget::Channel(_) => "Rename channel",
                     })
                     .into(),
-                    widget::text_input(
+                    crate::ui_controls::field::text(
                         match target {
                             RenameTarget::Pane(_) => "Pane name",
                             RenameTarget::Channel(_) => "Channel name",
@@ -1510,10 +1508,10 @@ impl Cagents {
                     })
                     .into(),
                     widget::row::with_children(vec![
-                        widget::button::standard("Cancel")
+                        crate::ui_controls::button::secondary("Cancel")
                             .on_press(Message::ChromeUi(Action::RenameCancel))
                             .into(),
-                        widget::button::suggested("Rename")
+                        crate::ui_controls::button::primary("Rename")
                             .on_press_maybe(
                                 normalize_card_name(draft)
                                     .map(|_| Message::ChromeUi(Action::RenameSubmit)),
@@ -1625,7 +1623,7 @@ impl Cagents {
         };
         if let Some((label, busy)) = status {
             let indicator: Element<'_, Message> = if busy {
-                crate::ui_controls::activity_spinner_tone(
+                crate::ui_controls::activity_spinner(
                     design::TAB_STATUS_ICON_SIZE as f32,
                     design::accent_color,
                 )
@@ -1649,7 +1647,7 @@ impl Cagents {
         } else if let Some(activity) = self.sidebar_state.card_activity(id) {
             match activity.state {
                 crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner_tone(
+                    crate::ui_controls::activity_spinner(
                         design::TAB_STATUS_ICON_SIZE as f32,
                         design::warning_color,
                     ),
@@ -1827,19 +1825,18 @@ impl Cagents {
                         }
                         _ => {}
                     }
-                    let control = crate::ui_controls::icon_control(
+                    let control = crate::ui_controls::icon_button(
                         visual
                             .as_ref()
                             .map_or_else(|| icon.handle(), |(icon, _)| icon.clone()),
                         name,
-                        selected,
-                        enabled,
-                        enabled.then_some(Message::SelectContextTab(tab)),
-                    );
+                    )
+                    .selected(selected)
+                    .on_press_maybe(enabled.then_some(Message::SelectContextTab(tab)));
                     match (&visual, dirty) {
-                        (Some((_, color)), _) => control.icon_color(*color).into(),
+                        (Some((_, color)), _) => control.tone(*color).into(),
                         (None, Some(_)) => control
-                            .icon_tone(design::Tone::Themed(design::warning_color))
+                            .tone(design::Tone::Themed(design::warning_color))
                             .into(),
                         (None, None) => control.into(),
                     }
@@ -1941,14 +1938,9 @@ impl Cagents {
                             design::caption("No pane selected")
                                 .width(Length::Fill)
                                 .into(),
-                            crate::ui_controls::icon_control(
-                                Icon::OpenFolder,
-                                "Browse files",
-                                false,
-                                true,
-                                Some(Message::SelectContextTab(ContextTab::Files)),
-                            )
-                            .into(),
+                            crate::ui_controls::icon_button(Icon::OpenFolder, "Browse files")
+                                .on_press(Message::SelectContextTab(ContextTab::Files))
+                                .into(),
                         ])
                         .spacing(8),
                     )

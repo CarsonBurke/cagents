@@ -258,7 +258,7 @@ impl Cagents {
     pub(super) fn palette_surface(&self) -> Option<Element<'_, Message>> {
         if self.palette.recording.is_some() {
             return Some(
-                widget::container(widget::text::body("Press a shortcut · Escape cancels"))
+                widget::container(design::body("Press a shortcut · Escape cancels"))
                     .class(cosmic::theme::Container::Card)
                     .padding(20)
                     .width(400)
@@ -266,16 +266,17 @@ impl Cagents {
             );
         }
         let query = self.palette.query.as_ref()?;
-        let input = widget::text_input("Search commands, panes and workspaces", query)
-            .id(widget::Id::new("palette.query"))
-            .on_input(|query| Message::Palette(Action::Query(query)));
+        let input =
+            crate::ui_controls::field::search("Search commands, panes and workspaces", query)
+                .id(widget::Id::new("palette.query"))
+                .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
             .map(|(index, (label, chord, message))| {
                 let row = widget::row::with_children(vec![
-                    widget::text::body(label).width(Length::Fill).into(),
+                    design::body(label).width(Length::Fill).into(),
                     design::caption(chord).into(),
                 ])
                 .spacing(12)

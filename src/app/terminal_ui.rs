@@ -310,7 +310,7 @@ impl Cagents {
     pub(super) fn terminal_find_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let find = self.terminal_find.get(&card).filter(|find| find.open)?;
         let message = |action| Message::TerminalFind(action);
-        let input = widget::text_input("Find in terminal scrollback", &find.query)
+        let input = crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
             .id(input_id(card))
             .on_input(move |query| Message::TerminalFind(Action::Query(card, query)))
             .on_focus(message(Action::Focus(card, true)))
@@ -332,16 +332,20 @@ impl Cagents {
             widget::row::with_children(vec![
                 input.into(),
                 widget::text(count).into(),
-                widget::button::text(if find.case_sensitive { "Aa ✓" } else { "Aa" })
-                    .on_press(message(Action::Case(card)))
-                    .into(),
-                widget::button::text("↑")
+                crate::ui_controls::button::quiet(if find.case_sensitive {
+                    "Aa ✓"
+                } else {
+                    "Aa"
+                })
+                .on_press(message(Action::Case(card)))
+                .into(),
+                crate::ui_controls::button::quiet("↑")
                     .on_press(message(Action::Next(card, true)))
                     .into(),
-                widget::button::text("↓")
+                crate::ui_controls::button::quiet("↓")
                     .on_press(message(Action::Next(card, false)))
                     .into(),
-                widget::button::text("×")
+                crate::ui_controls::button::quiet("×")
                     .on_press(message(Action::Close(card)))
                     .into(),
             ])
@@ -402,13 +406,13 @@ impl Cagents {
         let (card, text) = self.terminal_paste.as_ref()?;
         let card = *card;
         Some(dialog_ui::overlay(dialog_ui::surface(widget::column::with_children(vec![
-            widget::text::title3("Paste multiple lines?").into(),
+            crate::design::title("Paste multiple lines?").into(),
             notice_body("This program does not use bracketed paste. Each newline may run a command immediately."),
             widget::text(format!("{} lines · {} characters", text.lines().count(), text.chars().count())).into(),
             widget::row::with_children(vec![
-                widget::button::standard("Cancel").id(widget::Id::from("terminal-paste-cancel"))
+                crate::ui_controls::button::secondary("Cancel").id(widget::Id::from("terminal-paste-cancel"))
                     .on_press(Message::TerminalFind(Action::ConfirmPaste(card, false))).into(),
-                widget::button::suggested("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
+                crate::ui_controls::button::primary("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
             ]).spacing(8).into(),
         ]).spacing(12), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
     }

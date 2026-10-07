@@ -453,7 +453,7 @@ impl Cagents {
                 .map(|error| error.message.as_str())
         };
         let input = |field: WorktreeField, placeholder, value, on_input: fn(String) -> Message| {
-            let mut input = widget::text_input(placeholder, value)
+            let mut input = crate::ui_controls::field::text(placeholder, value)
                 .id(field.focus_id())
                 .on_submit(|_| Message::SubmitWorktree);
             if editable {
@@ -478,7 +478,7 @@ impl Cagents {
             });
         let mut rows: Vec<Element<'_, Message>> = vec![
             widget::column::with_children(vec![
-                widget::text::title3(format!("New worktree in {project}")).into(),
+                design::title(format!("New worktree in {project}")).into(),
                 design::caption(
                     "Create a branch, check out an existing one, or start from a Linear issue ID or URL.",
                 )
@@ -496,12 +496,12 @@ impl Cagents {
                 ),
                 branch_note,
             ),
-            widget::button::text(if dialog.advanced {
+            crate::ui_controls::button::quiet(if dialog.advanced {
                 "Hide options"
             } else {
                 "Base branch & destination"
             })
-            .leading_icon(if dialog.advanced {
+            .icon(if dialog.advanced {
                 Icon::PanDown
             } else {
                 Icon::PanEnd
@@ -553,7 +553,7 @@ impl Cagents {
         }
         let status: Element<'_, Message> = if dialog.resolving.is_some() {
             widget::row::with_children(vec![
-                crate::ui_controls::activity_spinner_tone(14.0, design::muted_icon_color),
+                crate::ui_controls::activity_spinner(14.0, design::muted_icon_color),
                 design::caption("Checking the branch and destination…").into(),
             ])
             .spacing(spacing.space_xxs)
@@ -566,11 +566,11 @@ impl Cagents {
         rows.push(
             widget::row::with_children(vec![
                 status,
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("dialog.worktree.cancel"))
                     .on_press(Message::CancelDialog)
                     .into(),
-                widget::button::suggested(if dialog.resolving.is_some() {
+                crate::ui_controls::button::primary(if dialog.resolving.is_some() {
                     "Creating…"
                 } else {
                     "Create worktree"

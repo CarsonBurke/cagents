@@ -55,7 +55,7 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
     };
     match status {
         ToolStatus::Running => (
-            crate::ui_controls::activity_spinner_tone(
+            crate::ui_controls::activity_spinner(
                 f32::from(design::COMPACT_ICON_SIZE),
                 design::warning_color,
             ),
@@ -198,8 +198,7 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
             design::caption(change_verb(&change.kind)).into(),
-            widget::text::body(change.path.as_str())
-                .size(design::TEXT_BODY)
+            design::body(change.path.as_str())
                 .font(iced::Font::MONOSPACE)
                 .width(Length::Fill)
                 .into(),

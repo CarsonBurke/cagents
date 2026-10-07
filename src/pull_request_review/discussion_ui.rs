@@ -704,9 +704,9 @@ impl State {
                 );
             }
             rows.push(popup_actions(
-                button::text("Back")
+                crate::ui_controls::button::secondary("Back")
                     .on_press_maybe((!self.discussion.busy).then_some(Action::CancelSubmit)),
-                button::suggested(if self.discussion.busy {
+                crate::ui_controls::button::primary(if self.discussion.busy {
                     "Submitting…"
                 } else {
                     "Submit review"
@@ -780,8 +780,8 @@ impl State {
                 );
             }
             rows.push(popup_actions(
-                button::text("Cancel").on_press(Action::CloseReview),
-                button::suggested(if self.discussion.busy {
+                crate::ui_controls::button::secondary("Cancel").on_press(Action::CloseReview),
+                crate::ui_controls::button::primary(if self.discussion.busy {
                     "Saving…"
                 } else {
                     "Submit review"
@@ -828,17 +828,16 @@ impl State {
             && self.authority().is_some()
             && (drafting_here
                 || (self.can_mutate_discussion() && self.discussion.composer.is_none()));
-        let control: Element<'_, Action> = crate::ui_controls::icon_control(
+        let control: Element<'_, Action> = crate::ui_controls::icon_button(
             Icon::Comment,
             if drafting_here {
                 "Show the comment on this file"
             } else {
                 "Comment on this file"
             },
-            drafting_here,
-            enabled,
-            Some(Action::BeginFile(path)),
         )
+        .selected(drafting_here)
+        .on_press_maybe(enabled.then_some(Action::BeginFile(path)))
         .into();
         Some(control.map(|action| self.review_action(action)))
     }
@@ -863,7 +862,7 @@ impl State {
             .wrapping(iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
             .into(),
-            button::text("I checked GitHub; continue")
+            crate::ui_controls::button::quiet("I checked GitHub; continue")
                 .on_press_maybe(
                     (!modal_open && !self.discussion.busy).then_some(Action::AcknowledgeUnknown),
                 )
@@ -1217,7 +1216,7 @@ impl State {
                 };
             }
             rows.push(
-                button::text(label)
+                crate::ui_controls::button::quiet(label)
                     .on_press(Action::ToggleThread(thread.id.clone()))
                     .into(),
             );
@@ -1241,7 +1240,7 @@ impl State {
                 } else {
                     cosmic::iced::widget::Space::new().into()
                 };
-                rows.push(design::comment_card(
+                rows.push(crate::ui_controls::comment_card(
                     comment
                         .author
                         .as_ref()
@@ -1256,13 +1255,13 @@ impl State {
                 {
                     rows.push(
                         widget::row::with_children(vec![
-                            button::text("Edit")
+                            crate::ui_controls::button::quiet("Edit")
                                 .on_press_maybe(
                                     (enabled && comment.viewer_can_update)
                                         .then_some(Action::Edit(id.clone())),
                                 )
                                 .into(),
-                            button::text("Delete draft")
+                            crate::ui_controls::button::quiet("Delete draft")
                                 .on_press_maybe(
                                     (enabled && comment.viewer_can_delete)
                                         .then_some(Action::Delete(id.clone())),
@@ -1281,15 +1280,19 @@ impl State {
             };
             rows.push(
                 widget::row::with_children(vec![
-                    button::text("Reply")
+                    crate::ui_controls::button::quiet("Reply")
                         .on_press_maybe(enabled.then_some(Action::Reply(thread.id.clone())))
                         .into(),
-                    button::text(if thread.resolved { "Reopen" } else { "Resolve" })
-                        .on_press_maybe((enabled && can_resolve).then_some(Action::Resolve {
-                            thread: thread.id.clone(),
-                            resolved: !thread.resolved,
-                        }))
-                        .into(),
+                    crate::ui_controls::button::quiet(if thread.resolved {
+                        "Reopen"
+                    } else {
+                        "Resolve"
+                    })
+                    .on_press_maybe((enabled && can_resolve).then_some(Action::Resolve {
+                        thread: thread.id.clone(),
+                        resolved: !thread.resolved,
+                    }))
+                    .into(),
                 ])
                 .spacing(8)
                 .into(),
@@ -1333,7 +1336,7 @@ impl State {
             }
             rows.push(
                 widget::row::with_children(vec![
-                    button::suggested("Save pending comment")
+                    crate::ui_controls::button::primary("Save pending comment")
                         .on_press_maybe(
                             (enabled && !composer.content.text().trim().is_empty())
                                 .then_some(Action::Save),
@@ -1341,10 +1344,14 @@ impl State {
                         .into(),
                     // Local to the draft, so live through a background
                     // refresh, as typing is; only a write in flight holds them.
-                    button::text(if composer.preview { "Write" } else { "Preview" })
-                        .on_press_maybe((!self.discussion.busy).then_some(Action::Preview))
-                        .into(),
-                    button::text("Cancel")
+                    crate::ui_controls::button::quiet(if composer.preview {
+                        "Write"
+                    } else {
+                        "Preview"
+                    })
+                    .on_press_maybe((!self.discussion.busy).then_some(Action::Preview))
+                    .into(),
+                    crate::ui_controls::button::secondary("Cancel")
                         .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
                         .into(),
                 ])

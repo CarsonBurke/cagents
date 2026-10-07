@@ -908,7 +908,7 @@ impl Cagents {
         }
         if state.visible.len() > state.limit {
             rows.push(
-                widget::button::standard("Show more conversations")
+                crate::ui_controls::button::secondary("Show more conversations")
                     .on_press(Message::ResumeConversation(Action::More))
                     .into(),
             );
@@ -948,16 +948,19 @@ impl Cagents {
         filters.push(iced::widget::Space::new().width(Length::Fill).into());
         filters.push(design::caption(progress).into());
         let mut content = widget::column::with_children(vec![
-            widget::text::title3("Resume conversation").into(),
+            design::title("Resume conversation").into(),
             design::caption(
                 "Return to a saved conversation with its original project and account.",
             )
             .into(),
-            widget::text_input("Search conversations, projects, or accounts…", &state.query)
-                .id(focus_id())
-                .on_input(|query| Message::ResumeConversation(Action::Query(query)))
-                .on_submit(|_| Message::ResumeConversation(Action::Submit))
-                .into(),
+            crate::ui_controls::field::search(
+                "Search conversations, projects, or accounts…",
+                &state.query,
+            )
+            .id(focus_id())
+            .on_input(|query| Message::ResumeConversation(Action::Query(query)))
+            .on_submit(|_| Message::ResumeConversation(Action::Submit))
+            .into(),
             widget::row::with_children(filters)
                 .align_y(Alignment::Center)
                 .spacing(8)
@@ -976,7 +979,7 @@ impl Cagents {
             content = content.push(design::caption(error));
         }
         content = content.push(
-            widget::button::standard("Cancel")
+            crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("conversation-resume.cancel"))
                 .on_press(Message::ResumeConversation(Action::Close)),
         );

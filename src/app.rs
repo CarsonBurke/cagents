@@ -6471,20 +6471,19 @@ impl Cagents {
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
         let file_panel_toggle = || {
-            crate::ui_controls::icon_control(
+            crate::ui_controls::icon_button(
                 Icon::Sidebar,
                 if collapsed {
                     "Show review files"
                 } else {
                     "Hide review files"
                 },
-                !collapsed,
-                !modal_open,
-                Some(Message::ReviewFilePanelToggle {
-                    card: id,
-                    collapsed: !collapsed,
-                }),
             )
+            .selected(!collapsed)
+            .on_press_maybe((!modal_open).then(|| Message::ReviewFilePanelToggle {
+                card: id,
+                collapsed: !collapsed,
+            }))
         };
         let mut review_controls = Vec::new();
         if let Some(comment) =
@@ -8596,7 +8595,7 @@ impl Cagents {
             let can_go_back = active && session.history_index > 0;
             let can_go_forward =
                 active && session.history_index.saturating_add(1) < session.history.len();
-            let mut address_input = widget::text_input("URL", address)
+            let mut address_input = crate::ui_controls::field::text("URL", address)
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -8739,7 +8738,7 @@ impl Cagents {
             let address = chrome
                 .map(|chrome| chrome.caption.as_str())
                 .unwrap_or(SanitizedLocation::INVALID);
-            let address = widget::text_input("Saved URL", address)
+            let address = crate::ui_controls::field::text("Saved URL", address)
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -8748,7 +8747,7 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     address.into(),
-                    widget::button::suggested("Open in system browser")
+                    crate::ui_controls::button::primary("Open in system browser")
                         .on_press(Message::RetryCard(id))
                         .into(),
                 ])
@@ -8950,7 +8949,7 @@ impl Cagents {
                                 .icon()
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
-                            widget::text::title3(labels.unavailable).into(),
+                            design::title(labels.unavailable).into(),
                         ])
                         .align_y(Alignment::Center)
                         .spacing(spacing.space_xxs)
@@ -9004,8 +9003,8 @@ impl Cagents {
             Some(CardRuntime::Loading) | None => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
-                        crate::ui_controls::activity_spinner_tone(24.0, design::accent_color),
-                        widget::text::title3(labels.starting).into(),
+                        crate::ui_controls::activity_spinner(24.0, design::accent_color),
+                        design::title(labels.starting).into(),
                         design::caption("Preparing this workspace pane…")
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .into(),
@@ -9037,14 +9036,11 @@ impl Cagents {
                     extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
                 });
             let preview = html.then(|| {
-                crate::ui_controls::icon_control(
-                    Icon::Browser,
-                    "Preview HTML",
-                    false,
-                    !self.modal_is_open(),
-                    Some(Message::PreviewLocalFile(id)),
-                )
-                .into()
+                crate::ui_controls::icon_button(Icon::Browser, "Preview HTML")
+                    .on_press_maybe(
+                        (!self.modal_is_open()).then_some(Message::PreviewLocalFile(id)),
+                    )
+                    .into()
             });
             if let Some(toolbar) = repository_widget::selected_file_toolbar_mapped_with(
                 id,
@@ -15683,14 +15679,14 @@ impl Application for Cagents {
     fn dialog(&self) -> Option<Element<'_, Message>> {
         if self.transient_work_close.is_some() {
             let mut controls: Vec<Element<'_, Message>> = vec![
-                widget::button::standard("Cancel close")
+                crate::ui_controls::button::secondary("Cancel close")
                     .id(widget::Id::new("dialog.transient-close.cancel"))
                     .on_press(Message::CancelTransientWorkClose)
                     .into(),
             ];
             if self.device_ui.dirty() {
                 controls.push(
-                    widget::button::suggested("Return to file")
+                    crate::ui_controls::button::primary("Return to file")
                         .on_press(Message::ReturnToDeviceBeforeClose)
                         .into(),
                 );
@@ -15698,7 +15694,7 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
-                        widget::text::title3("Keep unsaved work before closing").into(),
+                        design::title("Keep unsaved work before closing").into(),
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
@@ -15752,7 +15748,7 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
-                        widget::text::title3("Reset all settings?").into(),
+                        design::title("Reset all settings?").into(),
                         notice_body(
                             "Every customization returns to its default: keyboard shortcuts, \
                              terminal font and theme, editor syntax theme, interface scale, \
@@ -15761,11 +15757,11 @@ impl Application for Cagents {
                         notice_detail("This cannot be undone."),
                         widget::row::with_children(vec![
                             iced::widget::Space::new().width(Length::Fill).into(),
-                            widget::button::standard("Cancel")
+                            crate::ui_controls::button::secondary("Cancel")
                                 .id(widget::Id::new("dialog.reset-settings.cancel"))
                                 .on_press(Message::CancelResetSettings)
                                 .into(),
-                            widget::button::destructive("Reset settings")
+                            crate::ui_controls::button::destructive("Reset settings")
                                 .id(widget::Id::new("dialog.reset-settings.confirm"))
                                 .on_press(Message::ConfirmResetSettings)
                                 .into(),
@@ -15799,13 +15795,13 @@ impl Application for Cagents {
                 .card_state(card)
                 .map_or("Repository".into(), |state| state.title.clone());
             let mut rows: Vec<Element<'_, Message>> = vec![
-                widget::text::title3(if runtime.has_durability_warning() {
+                design::title(if runtime.has_durability_warning() {
                     format!("Confirm the save to {title} before closing")
                 } else {
                     format!("Save changes to {title}?")
                 })
                 .into(),
-                widget::text::body(if runtime.has_durability_warning() {
+                design::body(if runtime.has_durability_warning() {
                     "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
                 } else {
                     "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
@@ -15815,7 +15811,7 @@ impl Application for Cagents {
             ];
             if let Some(error) = runtime.save_error() {
                 rows.push(
-                    widget::text::body(error.to_owned())
+                    design::body(error.to_owned())
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                 );
@@ -15828,7 +15824,7 @@ impl Application for Cagents {
                     Message::SaveAndCloseRepository(card)
                 });
             let mut controls: Vec<Element<'_, Message>> = vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
                     .on_press_maybe(
                         (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
@@ -15837,14 +15833,14 @@ impl Application for Cagents {
             ];
             if runtime.can_abandon_unsaved_changes() {
                 controls.push(
-                    widget::button::destructive("Discard")
+                    crate::ui_controls::button::destructive("Discard")
                         .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
                         .on_press(Message::DiscardAndCloseRepository(card))
                         .into(),
                 );
             }
             controls.push(
-                widget::button::suggested(if runtime.has_save_conflict() {
+                crate::ui_controls::button::primary(if runtime.has_save_conflict() {
                     "Overwrite and close"
                 } else if runtime.has_durability_warning() {
                     "Retry save and close"
@@ -15917,11 +15913,11 @@ impl Application for Cagents {
             None => route,
         };
         let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3("Create pull request").into(),
+            design::title("Create pull request").into(),
             design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
             widget::column::with_children(vec![
                 design::caption("Title").into(),
-                widget::text_input("Title", &dialog.title)
+                crate::ui_controls::field::text("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
                     .into(),
@@ -15930,7 +15926,7 @@ impl Application for Cagents {
             .into(),
             widget::column::with_children(vec![
                 design::caption("Head branch").into(),
-                widget::text_input("Head branch", &dialog.head)
+                crate::ui_controls::field::text("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
                     .into(),
@@ -15939,7 +15935,7 @@ impl Application for Cagents {
             .into(),
             widget::column::with_children(vec![
                 design::caption("Base branch").into(),
-                widget::text_input("Base branch", &dialog.base)
+                crate::ui_controls::field::text("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
                     .into(),
@@ -15963,7 +15959,7 @@ impl Application for Cagents {
         ];
         if let Some(confirmed) = dialog.retry_confirmation {
             rows.push(
-                widget::text::body(
+                design::body(
                     "GitHub may have created this pull request. Check GitHub before retrying to avoid creating a duplicate.",
                 )
                 .into(),
@@ -15977,10 +15973,10 @@ impl Application for Cagents {
         }
         rows.push(
             widget::row::with_children(vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .on_press(Message::CancelDialog)
                     .into(),
-                widget::button::suggested("Create")
+                crate::ui_controls::button::primary("Create")
                     .on_press_maybe(
                         (!head.is_empty()
                             && !base.is_empty()
@@ -16076,15 +16072,15 @@ impl Application for Cagents {
                 .unwrap_or_else(|| "Workspace".into());
             let quick = |glyph, label, id, message| {
                 Element::from(
-                    crate::ui_controls::icon_control(glyph, label, false, true, Some(message))
+                    crate::ui_controls::icon_button(glyph, label)
+                        .on_press(message)
                         .id(widget::Id::new(id)),
                 )
             };
             let mut actions: Vec<Element<'_, Message>> = vec![
                 crate::interaction::tooltip(
-                    widget::button::suggested("New conversation")
-                        .name("New conversation")
-                        .leading_icon(Icon::Chat)
+                    crate::ui_controls::button::primary("New conversation")
+                        .icon(Icon::Chat)
                         .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
                             chrome_ui::NewTab::Thread,
                         ))),
@@ -16140,7 +16136,7 @@ impl Application for Cagents {
             .spacing(12);
             let mut content: Vec<Element<'_, Message>> = vec![
                 crate::ui_controls::passive_icon(Icon::Chat, 32),
-                widget::text::title2(if scoped {
+                design::display(if scoped {
                     scope_name
                 } else {
                     "Workspace".into()
@@ -16164,15 +16160,13 @@ impl Application for Cagents {
                             .into_iter()
                             .map(|provider| {
                                 let status = self.account_ui.provider_status(provider);
-                                let control = crate::ui_controls::icon_control(
+                                let control = crate::ui_controls::icon_button(
                                     crate::ui_controls::provider_icon(provider),
                                     format!("{} · {status} · Manage accounts", provider.label()),
-                                    false,
-                                    true,
-                                    Some(Message::AccountUi(account_ui::Action::OpenPane)),
-                                );
+                                )
+                                .on_press(Message::AccountUi(account_ui::Action::OpenPane));
                                 Element::from(if status == "Account available" {
-                                    control.icon_tone(design::Tone::Themed(design::success_color))
+                                    control.tone(design::Tone::Themed(design::success_color))
                                 } else {
                                     control
                                 })
@@ -18866,7 +18860,7 @@ mod tests {
         let renderer = headless_renderer();
         let mut element = dialog_ui::overlay(
             dialog_ui::surface(
-                widget::button::text("Confirm").on_press(Message::CancelDialog),
+                crate::ui_controls::button::quiet("Confirm").on_press(Message::CancelDialog),
                 320.0,
             ),
             Some(Message::CancelDialog),

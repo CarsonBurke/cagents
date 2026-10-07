@@ -332,13 +332,11 @@ fn comment<'a>(
                 .map(|uri| Action::OpenMarkdownLink(uri.to_string()))
         },
     );
-    let actions = crate::ui_controls::compact_icon_control(
-        Icon::PopOut,
-        "Open comment on GitHub",
-        Some(Action::OpenUrl(comment.url.clone())),
-    )
-    .into();
-    widget::container(design::comment_card(
+    let actions = crate::ui_controls::icon_button(Icon::PopOut, "Open comment on GitHub")
+        .compact()
+        .on_press(Action::OpenUrl(comment.url.clone()))
+        .into();
+    widget::container(crate::ui_controls::comment_card(
         author,
         &comment.created_at,
         body,
@@ -366,7 +364,7 @@ fn state_badge<'a>(pr: &PullRequest) -> Element<'a, Action> {
         "" => ("Unknown".to_owned(), design::muted_color),
         other => (readable_state(other), design::muted_color),
     };
-    design::badge(label, design::Tone::Themed(tone))
+    crate::ui_controls::badge(label, design::Tone::Themed(tone))
 }
 
 /// The `owner/name` a pull request URL points at, for the rare frame where the
@@ -545,7 +543,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         .width(Length::Fill)
         .into(),
         widget::container(if state.loading {
-            crate::ui_controls::activity_spinner_tone(
+            crate::ui_controls::activity_spinner(
                 f32::from(design::ROW_ICON_SIZE),
                 design::warning_color,
             )
@@ -555,14 +553,9 @@ pub fn view(state: &State) -> Element<'_, Action> {
         .width(design::ROW_ICON_SIZE)
         .height(design::ROW_ICON_SIZE)
         .into(),
-        crate::ui_controls::icon_control(
-            Icon::Refresh,
-            "Refresh pull request",
-            false,
-            state.target.is_some() && !state.loading,
-            Some(Action::Refresh),
-        )
-        .into(),
+        crate::ui_controls::icon_button(Icon::Refresh, "Refresh pull request")
+            .on_press_maybe((state.target.is_some() && !state.loading).then_some(Action::Refresh))
+            .into(),
     ])
     .spacing(4)
     .align_y(Alignment::Center)
@@ -664,7 +657,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         {
             identity.push(
                 widget::row::with_children(vec![
-                    design::badge("Out of sync", design::Tone::Themed(design::warning_color)),
+                    crate::ui_controls::badge("Out of sync", design::Tone::Themed(design::warning_color)),
                     design::caption(
                         "Local HEAD differs from the pull request head; checks describe the remote commit.",
                     )
@@ -713,14 +706,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
         metadata.push(meta_row(
             "Review",
             match decision {
-                Some("APPROVED") => {
-                    design::badge("Approved", design::Tone::Themed(design::success_color))
-                }
-                Some("CHANGES_REQUESTED") => design::badge(
+                Some("APPROVED") => crate::ui_controls::badge(
+                    "Approved",
+                    design::Tone::Themed(design::success_color),
+                ),
+                Some("CHANGES_REQUESTED") => crate::ui_controls::badge(
                     "Changes requested",
                     design::Tone::Themed(design::destructive_color),
                 ),
-                Some(other) => design::badge(
+                Some(other) => crate::ui_controls::badge(
                     readable_state(other),
                     design::Tone::Themed(design::muted_color),
                 ),
@@ -753,7 +747,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
             };
             metadata.push(meta_row(
                 "Checks",
-                design::badge(summary, design::Tone::Themed(tone)),
+                crate::ui_controls::badge(summary, design::Tone::Themed(tone)),
             ));
         }
         children.push(block(metadata));
@@ -892,10 +886,13 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     // row rather than stacking as two more full-width entries.
                     children.push(
                         widget::row::with_children(vec![
-                            widget::text_input("Filter author, text, or file", &state.filter)
-                                .on_input(Action::Filter)
-                                .width(Length::Fill)
-                                .into(),
+                            crate::ui_controls::field::search(
+                                "Filter author, text, or file",
+                                &state.filter,
+                            )
+                            .on_input(Action::Filter)
+                            .width(Length::Fill)
+                            .into(),
                             widget::button::custom(design::caption(if state.hide_resolved {
                                 "Show resolved"
                             } else {
@@ -935,18 +932,18 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                         .into(),
                                 ];
                                 if thread.outdated {
-                                    head.push(design::badge(
+                                    head.push(crate::ui_controls::badge(
                                         "Outdated",
                                         design::Tone::Themed(design::muted_color),
                                     ));
                                 }
                                 head.push(if thread.resolved {
-                                    design::badge(
+                                    crate::ui_controls::badge(
                                         "Resolved",
                                         design::Tone::Themed(design::success_color),
                                     )
                                 } else {
-                                    design::badge(
+                                    crate::ui_controls::badge(
                                         "Unresolved",
                                         design::Tone::Themed(design::warning_color),
                                     )
@@ -984,7 +981,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     _ => design::muted_color,
                                 };
                             children.push(block(vec![
-                                design::badge(
+                                crate::ui_controls::badge(
                                     readable_state(&review.state.0),
                                     design::Tone::Themed(tone),
                                 ),

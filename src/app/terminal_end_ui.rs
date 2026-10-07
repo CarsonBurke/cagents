@@ -355,7 +355,7 @@ impl Cagents {
         let spacing = cosmic::theme::spacing();
 
         let mut summary: Vec<Element<'a, Message>> = vec![
-            design::badge(report.status, report.outcome.tone()),
+            crate::ui_controls::badge(report.status, report.outcome.tone()),
             design::heading(report.headline)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .into(),
@@ -375,15 +375,10 @@ impl Cagents {
         let mut actions: Vec<Element<'a, Message>> = Vec::with_capacity(3);
         if session.transcript_path.is_some() {
             actions.push(
-                crate::ui_controls::icon_control(
-                    Icon::OpenFile,
-                    "Open saved output",
-                    false,
-                    true,
-                    Some(Message::OpenTerminalOutput(card)),
-                )
-                .id(card_control_id(card, "ended.output"))
-                .into(),
+                crate::ui_controls::icon_button(Icon::OpenFile, "Open saved output")
+                    .on_press(Message::OpenTerminalOutput(card))
+                    .id(card_control_id(card, "ended.output"))
+                    .into(),
             );
         }
         actions.push(
@@ -474,7 +469,7 @@ impl Cagents {
         ];
         if saved {
             children.push(
-                widget::button::text("Open saved output")
+                crate::ui_controls::button::quiet("Open saved output")
                     .on_press_maybe(session.map(|_| Message::OpenTerminalOutput(card)))
                     .into(),
             );

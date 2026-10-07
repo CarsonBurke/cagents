@@ -48,7 +48,7 @@ use crate::{
         CancellationToken, DiffBasis, DiffContent, DiffSide, HistoryRequest, HistoryRevision,
         MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService, RepositorySnapshot, ValidatedRefName,
     },
-    ui_controls::{Icon, icon_control},
+    ui_controls::{Icon, icon_button},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -7192,7 +7192,7 @@ pub fn view_with_review<'a>(
             FileListState::Failed(error) => widget::container(
                 widget::column::with_children(vec![
                     information_state("Could not list files", error.clone()).into(),
-                    widget::button::standard("Retry loading files")
+                    crate::ui_controls::button::secondary("Retry loading files")
                         .on_press_maybe(
                             (!runtime.file_list_loading)
                                 .then_some(RepositoryAction::RefreshFiles { card }),
@@ -7410,7 +7410,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             // The name gives way to the caption only when there is one; on
             // its own it fills the slot as it always has.
             label.push(
-                one_line(widget::text::body(
+                one_line(crate::design::body(
                     selected.path.to_string_lossy().into_owned(),
                 ))
                 .width(if linked.is_some() {
@@ -7450,27 +7450,33 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     // Noneditable load/error states
     // still expose file information, so inspecting a binary diff is reversible.
     let file_information = !editable && !matches!(runtime.document, DocumentState::Image { .. });
-    let preview = icon_control(
+    let preview = icon_button(
         Icon::Preview,
         if file_information {
             "View file information"
         } else {
             "Preview file"
         },
+    )
+    .selected(
         runtime.source_surface == SourceSurface::Editor
             && (!editable || !editing)
             && (file_information || runtime.can_apply_markdown_mode(true)),
-        if file_information {
+    )
+    .on_press_maybe(
+        (if file_information {
             !runtime.is_saving()
         } else {
             runtime.can_apply_markdown_mode(true)
-        },
-        Some(if file_information {
-            RepositoryAction::ApplySourceSurface { card, diff: false }
-        } else {
-            RepositoryAction::ApplyMarkdownMode {
-                card,
-                preview: true,
+        })
+        .then(|| {
+            if file_information {
+                RepositoryAction::ApplySourceSurface { card, diff: false }
+            } else {
+                RepositoryAction::ApplyMarkdownMode {
+                    card,
+                    preview: true,
+                }
             }
         }),
     );
@@ -7479,16 +7485,14 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     } else {
         preview.id(focus_restore_id(card))
     };
-    let edit = icon_control(
-        Icon::Edit,
-        "Edit file",
-        editable && editing && runtime.can_apply_markdown_mode(false),
-        runtime.can_apply_markdown_mode(false),
-        Some(RepositoryAction::ApplyMarkdownMode {
-            card,
-            preview: false,
-        }),
-    );
+    let edit = icon_button(Icon::Edit, "Edit file")
+        .selected(editable && editing && runtime.can_apply_markdown_mode(false))
+        .on_press_maybe(runtime.can_apply_markdown_mode(false).then(|| {
+            RepositoryAction::ApplyMarkdownMode {
+                card,
+                preview: false,
+            }
+        }));
     let edit = if editable {
         edit.id(focus_restore_id(card))
     } else {
@@ -7498,14 +7502,14 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         vec![crate::ui_controls::segmented_controls(vec![
             preview.into(),
             edit.into(),
-            icon_control(
-                Icon::Diff,
-                "View diff",
-                runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff(),
-                runtime.can_show_diff(),
-                Some(RepositoryAction::ApplySourceSurface { card, diff: true }),
-            )
-            .into(),
+            icon_button(Icon::Diff, "View diff")
+                .selected(runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff())
+                .on_press_maybe(
+                    runtime
+                        .can_show_diff()
+                        .then(|| RepositoryAction::ApplySourceSurface { card, diff: true }),
+                )
+                .into(),
         ])];
     // File actions stay mounted whether or not they can run: an inactive
     // icon renders muted but keeps its tooltip, so the toolbar never jumps
@@ -7513,17 +7517,19 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     let mut document_actions = Vec::new();
     if editable {
         document_actions.push(
-            icon_control(
+            icon_button(
                 Icon::RevertFile,
                 "Discard unsaved edits (Ctrl+Z restores them)",
-                false,
-                runtime.can_discard_edits(),
-                Some(RepositoryAction::DiscardEdits { card }),
+            )
+            .on_press_maybe(
+                runtime
+                    .can_discard_edits()
+                    .then(|| RepositoryAction::DiscardEdits { card }),
             )
             .into(),
         );
         controls.push(
-            icon_control(
+            icon_button(
                 Icon::Save,
                 if runtime.is_saving() {
                     "Saving file…"
@@ -7532,13 +7538,12 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 } else {
                     "Save file"
                 },
-                runtime.is_dirty(),
-                runtime.can_save(),
-                Some(RepositoryAction::Save {
-                    card,
-                    overwrite: false,
-                }),
             )
+            .selected(runtime.is_dirty())
+            .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
+                card,
+                overwrite: false,
+            }))
             .into(),
         );
     }
@@ -7557,14 +7562,14 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     };
     for &(stage, has_changes, icon, label) in staging {
         document_actions.push(
-            icon_control(
-                icon,
-                label,
-                false,
-                has_changes && !runtime.mutation_refresh_pending && !runtime.blocks_navigation(),
-                Some(RepositoryAction::StageSelected { card, stage }),
-            )
-            .into(),
+            icon_button(icon, label)
+                .on_press_maybe(
+                    (has_changes
+                        && !runtime.mutation_refresh_pending
+                        && !runtime.blocks_navigation())
+                    .then(|| RepositoryAction::StageSelected { card, stage }),
+                )
+                .into(),
         );
     }
     if !document_actions.is_empty() {
@@ -7614,16 +7619,16 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 widget::icon::from_name(editor.icon.clone()).handle()
             }
         };
-        let button = icon_control(
+        let button = icon_button(
             icon(editor),
             format!("Open in {} · right-click for other editors", editor.name),
-            false,
-            runtime.can_open_external(),
-            Some(RepositoryAction::OpenExternal {
+        )
+        .on_press_maybe(runtime.can_open_external().then(|| {
+            RepositoryAction::OpenExternal {
                 card,
                 editor_id: editor.id.clone(),
-            }),
-        );
+            }
+        }));
         if runtime.is_saving() {
             secondary.push(button.into());
         } else {
@@ -7649,13 +7654,9 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     let primary_count = if editable { 2 } else { 1 };
     let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
     overflow.extend(secondary);
-    let more = icon_control(
-        Icon::More,
-        "More file actions",
-        runtime.toolbar_overflow_open,
-        true,
-        Some(RepositoryAction::ToggleToolbarOverflow { card }),
-    );
+    let more = icon_button(Icon::More, "More file actions")
+        .selected(runtime.toolbar_overflow_open)
+        .on_press(RepositoryAction::ToggleToolbarOverflow { card });
     controls.push(crate::ui_controls::popover(
         more,
         runtime.toolbar_overflow_open.then(|| {
@@ -7713,15 +7714,11 @@ fn find_strip<'a>(
     }
     let matched = runtime.find_total != 0;
     let mut row: Vec<Element<'a, RepositoryAction>> = vec![
-        icon_control(
-            Icon::Search,
-            "Find and replace",
-            runtime.replace_open,
-            true,
-            Some(RepositoryAction::ToggleReplace { card }),
-        )
-        .into(),
-        widget::text_input("Find in file", &runtime.find_query)
+        icon_button(Icon::Search, "Find and replace")
+            .selected(runtime.replace_open)
+            .on_press(RepositoryAction::ToggleReplace { card })
+            .into(),
+        crate::ui_controls::field::search("Find in file", &runtime.find_query)
             .id(find_focus_id(card))
             .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
             .on_focus(RepositoryAction::FindInputFocus {
@@ -7732,8 +7729,6 @@ fn find_strip<'a>(
                 card,
                 focused: false,
             })
-            .size(crate::design::TEXT_BODY)
-            .padding([0.0, crate::design::GRID_UNIT * 2.0])
             .width(Length::Fill)
             .into(),
     ];
@@ -7765,17 +7760,16 @@ fn find_strip<'a>(
             RepositoryAction::FindNext { card },
         ),
     ] {
-        row.push(icon_control(icon, label, false, matched, Some(action)).into());
+        row.push(
+            icon_button(icon, label)
+                .on_press_maybe(matched.then_some(action))
+                .into(),
+        );
     }
     row.push(
-        icon_control(
-            Icon::Close,
-            "Close find",
-            false,
-            true,
-            Some(RepositoryAction::CloseFind { card }),
-        )
-        .into(),
+        icon_button(Icon::Close, "Close find")
+            .on_press(RepositoryAction::CloseFind { card })
+            .into(),
     );
     let find = widget::row::with_children(row)
         .spacing(crate::design::GRID_UNIT * 2.0)
@@ -7785,17 +7779,17 @@ fn find_strip<'a>(
     if runtime.replace_open {
         strips.push(
             widget::row::with_children(vec![
-                widget::text_input("Replace with", &runtime.replace_query)
+                crate::ui_controls::field::text("Replace with", &runtime.replace_query)
                     .on_input(move |query| RepositoryAction::ReplaceQueryChanged { card, query })
                     .width(Length::Fill)
                     .into(),
-                widget::button::standard("Replace")
+                crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
                         (matched && !runtime.is_saving())
                             .then_some(RepositoryAction::ReplaceMatch { card, all: false }),
                     )
                     .into(),
-                widget::button::standard("Replace all")
+                crate::ui_controls::button::secondary("Replace all")
                     .on_press_maybe(
                         (matched && !runtime.is_saving())
                             .then_some(RepositoryAction::ReplaceMatch { card, all: true }),
@@ -7912,18 +7906,12 @@ fn pdf_document_view<'a>(
     let PdfView { page, tone, zoom } = view;
     let inverted = matches!(tone, crate::editor::PdfTone::Inverted { .. });
     let turn = |to: usize, glyph: Icon, label: &'static str, enabled: bool| {
-        icon_control(
-            glyph,
-            label,
-            false,
-            enabled,
-            Some(RepositoryAction::PdfPage {
-                card,
-                page: to,
-                tone,
-                zoom,
-            }),
-        )
+        icon_button(glyph, label).on_press_maybe(enabled.then(|| RepositoryAction::PdfPage {
+            card,
+            page: to,
+            tone,
+            zoom,
+        }))
     };
     let mut controls: Vec<Element<'a, RepositoryAction>> = vec![
         turn(0, Icon::First, "First page", page > 0).into(),
@@ -7934,7 +7922,7 @@ fn pdf_document_view<'a>(
             page > 0,
         )
         .into(),
-        widget::text::body(format!("{} / {pages}", page + 1)).into(),
+        crate::design::body(format!("{} / {pages}", page + 1)).into(),
         turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
         turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
     ];
@@ -7949,10 +7937,9 @@ fn pdf_document_view<'a>(
     // failure message sized to its text would leave the controls after it
     // nothing and collapse them to nothing at all.
     let caption = |text: String| {
-        widget::text::caption(text)
+        crate::design::caption(text)
             .width(Length::Fill)
             .wrapping(iced::widget::text::Wrapping::None)
-            .class(cosmic::theme::Text::Custom(crate::design::muted_text))
     };
     if let Some(message) = message {
         controls.push(caption(message.clone()).into());
@@ -7962,13 +7949,8 @@ fn pdf_document_view<'a>(
         controls.push(iced::widget::Space::new().width(Length::Fill).into());
     }
     let step = |to: Option<crate::editor::PdfZoom>, glyph: Icon, label: &'static str| {
-        icon_control(
-            glyph,
-            label,
-            false,
-            to.is_some(),
-            to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }),
-        )
+        icon_button(glyph, label)
+            .on_press_maybe(to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }))
     };
     controls.push(step(zoom.smaller(), Icon::ZoomOut, "Draw the page smaller").into());
     controls.push(
@@ -7978,7 +7960,7 @@ fn pdf_document_view<'a>(
             // different widths. The text fills that width so that it is the
             // label rather than the box that is centred on.
             widget::container(
-                widget::text::body(
+                crate::design::body(
                     zoom.percent()
                         .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
                 )
@@ -7996,20 +7978,16 @@ fn pdf_document_view<'a>(
         // in rather than an action: pressing it again asks for what is already
         // drawn, which the update rejects, and staying enabled is what lets
         // the selected surface say that fitting is what the size means now.
-        icon_control(
-            Icon::ZoomFit,
-            "Fit the page to the pane",
-            zoom.is_fit(),
-            true,
-            Some(RepositoryAction::PdfZoom {
+        icon_button(Icon::ZoomFit, "Fit the page to the pane")
+            .selected(zoom.is_fit())
+            .on_press(RepositoryAction::PdfZoom {
                 card,
                 zoom: crate::editor::PdfZoom::Fit,
-            }),
-        )
-        .into(),
+            })
+            .into(),
     );
     controls.push(
-        icon_control(
+        icon_button(
             if inverted {
                 Icon::Brightness
             } else {
@@ -8020,19 +7998,18 @@ fn pdf_document_view<'a>(
             } else {
                 "Adapt the document to a dark surface"
             },
-            inverted,
-            true,
-            Some(RepositoryAction::PdfTone {
-                card,
-                tone: if inverted {
-                    crate::editor::PdfTone::Original
-                } else {
-                    // Deliberately re-read rather than remembered: the reader
-                    // may have changed their theme since the page was opened.
-                    pdf_tone_inverted(&cosmic::theme::active())
-                },
-            }),
         )
+        .selected(inverted)
+        .on_press(RepositoryAction::PdfTone {
+            card,
+            tone: if inverted {
+                crate::editor::PdfTone::Original
+            } else {
+                // Deliberately re-read rather than remembered: the reader
+                // may have changed their theme since the page was opened.
+                pdf_tone_inverted(&cosmic::theme::active())
+            },
+        })
         .into(),
     );
     widget::column::with_children(vec![
@@ -8146,46 +8123,33 @@ fn editable_document_view<'a>(
         .or(document.durability_warning.as_ref())
     {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
-            vec![widget::text::body(error).width(Length::Fill).into()];
+            vec![crate::design::body(error).width(Length::Fill).into()];
         if document.conflict || document.durability_warning.is_some() {
             actions.push(
-                icon_control(
-                    Icon::Refresh,
-                    "Reload file from disk",
-                    false,
-                    !runtime.is_saving(),
-                    Some(RepositoryAction::Reload { card }),
-                )
-                .into(),
+                icon_button(Icon::Refresh, "Reload file from disk")
+                    .on_press_maybe(
+                        (!runtime.is_saving()).then(|| RepositoryAction::Reload { card }),
+                    )
+                    .into(),
             );
         }
         if document.conflict {
             actions.push(
-                icon_control(
-                    Icon::Save,
-                    "Overwrite conflicting file on disk",
-                    false,
-                    runtime.can_save(),
-                    Some(RepositoryAction::Save {
+                icon_button(Icon::Save, "Overwrite conflicting file on disk")
+                    .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
                         card,
                         overwrite: true,
-                    }),
-                )
-                .into(),
+                    }))
+                    .into(),
             );
         } else if document.durability_warning.is_some() {
             actions.push(
-                icon_control(
-                    Icon::Save,
-                    "Retry save",
-                    false,
-                    runtime.can_save(),
-                    Some(RepositoryAction::Save {
+                icon_button(Icon::Save, "Retry save")
+                    .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
                         card,
                         overwrite: false,
-                    }),
-                )
-                .into(),
+                    }))
+                    .into(),
             );
         }
         error_rows.push(
@@ -8504,52 +8468,48 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
     let unstaged = runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree);
     let staged = runtime.can_select_diff_basis(&DiffBasis::HeadToIndex);
     crate::ui_controls::segmented_controls(vec![
-        icon_control(
-            Icon::Changes,
-            "Unstaged changes",
-            unstaged && selected == Some(BasisChoice::Unstaged),
-            unstaged,
-            Some(RepositoryAction::ApplyDiffBasis {
+        icon_button(Icon::Changes, "Unstaged changes")
+            .selected(unstaged && selected == Some(BasisChoice::Unstaged))
+            .on_press_maybe(unstaged.then(|| RepositoryAction::ApplyDiffBasis {
                 card,
                 basis: DiffBasis::IndexToWorktree,
-            }),
-        )
-        .into(),
-        icon_control(
-            Icon::Select,
-            "Staged changes",
-            staged && selected == Some(BasisChoice::Staged),
-            staged,
-            Some(RepositoryAction::ApplyDiffBasis {
+            }))
+            .into(),
+        icon_button(Icon::Select, "Staged changes")
+            .selected(staged && selected == Some(BasisChoice::Staged))
+            .on_press_maybe(staged.then(|| RepositoryAction::ApplyDiffBasis {
                 card,
                 basis: DiffBasis::HeadToIndex,
-            }),
-        )
-        .into(),
-        icon_control(
-            branch_comparison_icon(),
-            "Compare branch with base",
-            runtime.can_select_committed_basis(CommittedChoice::Branch)
-                && selected == Some(BasisChoice::Committed(CommittedChoice::Branch)),
-            runtime.can_select_committed_basis(CommittedChoice::Branch),
-            Some(RepositoryAction::SelectCommittedBasis {
-                card,
-                choice: CommittedChoice::Branch,
-            }),
-        )
-        .into(),
-        icon_control(
-            Icon::History,
-            "Last commit changes",
-            runtime.can_select_committed_basis(CommittedChoice::LastCommit)
-                && selected == Some(BasisChoice::Committed(CommittedChoice::LastCommit)),
-            runtime.can_select_committed_basis(CommittedChoice::LastCommit),
-            Some(RepositoryAction::SelectCommittedBasis {
-                card,
-                choice: CommittedChoice::LastCommit,
-            }),
-        )
-        .into(),
+            }))
+            .into(),
+        icon_button(branch_comparison_icon(), "Compare branch with base")
+            .selected(
+                runtime.can_select_committed_basis(CommittedChoice::Branch)
+                    && selected == Some(BasisChoice::Committed(CommittedChoice::Branch)),
+            )
+            .on_press_maybe(
+                runtime
+                    .can_select_committed_basis(CommittedChoice::Branch)
+                    .then(|| RepositoryAction::SelectCommittedBasis {
+                        card,
+                        choice: CommittedChoice::Branch,
+                    }),
+            )
+            .into(),
+        icon_button(Icon::History, "Last commit changes")
+            .selected(
+                runtime.can_select_committed_basis(CommittedChoice::LastCommit)
+                    && selected == Some(BasisChoice::Committed(CommittedChoice::LastCommit)),
+            )
+            .on_press_maybe(
+                runtime
+                    .can_select_committed_basis(CommittedChoice::LastCommit)
+                    .then(|| RepositoryAction::SelectCommittedBasis {
+                        card,
+                        choice: CommittedChoice::LastCommit,
+                    }),
+            )
+            .into(),
     ])
 }
 
@@ -8572,7 +8532,7 @@ fn diff_review_controls(
                             Some(DiffState::Loading { .. })
                         ))
                 {
-                    crate::ui_controls::activity_spinner_tone(
+                    crate::ui_controls::activity_spinner(
                         f32::from(crate::design::ROW_ICON_SIZE),
                         crate::design::warning_color,
                     )
@@ -8585,33 +8545,31 @@ fn diff_review_controls(
             "Refreshing diff",
         ),
         crate::ui_controls::segmented_controls(vec![
-            icon_control(
-                Icon::List,
-                "Inline diff",
-                runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Inline,
-                runtime.can_change_diff_layout(),
-                Some(RepositoryAction::ApplyDiffMode { card, split: false }),
-            )
-            .into(),
-            icon_control(
-                Icon::Diff,
-                "Side-by-side diff",
-                runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Split,
-                runtime.can_change_diff_layout(),
-                Some(RepositoryAction::ApplyDiffMode { card, split: true }),
-            )
-            .into(),
+            icon_button(Icon::List, "Inline diff")
+                .selected(runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Inline)
+                .on_press_maybe(
+                    runtime
+                        .can_change_diff_layout()
+                        .then(|| RepositoryAction::ApplyDiffMode { card, split: false }),
+                )
+                .into(),
+            icon_button(Icon::Diff, "Side-by-side diff")
+                .selected(runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Split)
+                .on_press_maybe(
+                    runtime
+                        .can_change_diff_layout()
+                        .then(|| RepositoryAction::ApplyDiffMode { card, split: true }),
+                )
+                .into(),
         ]),
         // Navigation commands are a plain cluster, distinct from mode choices.
         toolbar_group(vec![
-            icon_control(
-                Icon::ChevronUp,
-                "Previous change",
-                false,
-                runtime.can_navigate_diff() && runtime.change_target(false).is_some(),
-                Some(RepositoryAction::PreviousChange { card }),
-            )
-            .into(),
+            icon_button(Icon::ChevronUp, "Previous change")
+                .on_press_maybe(
+                    (runtime.can_navigate_diff() && runtime.change_target(false).is_some())
+                        .then(|| RepositoryAction::PreviousChange { card }),
+                )
+                .into(),
             crate::interaction::tooltip(
                 // A fixed width, because this label sits between the two
                 // controls a reader presses repeatedly and "1/4" and "12/128"
@@ -8629,26 +8587,19 @@ fn diff_review_controls(
                 .width(Length::Fixed(crate::design::STEPPER_LABEL_WIDTH)),
                 basis_label(&runtime.diff_basis),
             ),
-            icon_control(
-                Icon::ChevronDown,
-                "Next change",
-                false,
-                runtime.can_navigate_diff() && runtime.change_target(true).is_some(),
-                Some(RepositoryAction::NextChange { card }),
-            )
-            .into(),
+            icon_button(Icon::ChevronDown, "Next change")
+                .on_press_maybe(
+                    (runtime.can_navigate_diff() && runtime.change_target(true).is_some())
+                        .then(|| RepositoryAction::NextChange { card }),
+                )
+                .into(),
         ]),
     ];
     if runtime.can_retry_diff() {
         controls.push(toolbar_group(vec![
-            icon_control(
-                Icon::Refresh,
-                "Retry diff",
-                false,
-                true,
-                Some(RepositoryAction::RetryDiff { card }),
-            )
-            .into(),
+            icon_button(Icon::Refresh, "Retry diff")
+                .on_press(RepositoryAction::RetryDiff { card })
+                .into(),
         ]));
     }
     if let Some(model) = model
@@ -8659,7 +8610,7 @@ fn diff_review_controls(
         && !counts.is_empty()
     {
         controls.push(crate::interaction::tooltip(
-            crate::design::change_counts(&counts),
+            crate::ui_controls::change_counts(&counts),
             match runtime.diff_state(&runtime.diff_basis) {
                 Some(DiffState::Ready(
                     RenderedDiff::Text {
@@ -8821,8 +8772,8 @@ fn base_choice_view(
 ) -> Element<'static, RepositoryAction> {
     let spacing = cosmic::theme::spacing();
     let mut rows: Vec<Element<'static, RepositoryAction>> = vec![
-        widget::text::title3("Choose a branch comparison base").into(),
-        widget::text::body(
+        crate::design::title("Choose a branch comparison base").into(),
+        crate::design::body(
             "This repository has no remote HEAD to take a default base from, so there is no branch to compare against yet.",
         )
         .wrapping(iced::widget::text::Wrapping::Word)
@@ -8830,7 +8781,7 @@ fn base_choice_view(
     ];
     if candidates.is_empty() {
         rows.push(
-            widget::text::body(
+            crate::design::body(
                 "It also has no other ref to offer. Fetch a remote, or point refs/remotes/<remote>/HEAD at its default branch.",
             )
             .wrapping(iced::widget::text::Wrapping::Word)
@@ -9210,7 +9161,10 @@ fn diff_fold_row<'a>(
     };
     let step = diff_layout::FOLD_STEP;
     let reveal = |icon: Icon, label: String, expansion| -> Element<'a, RepositoryAction> {
-        crate::ui_controls::compact_icon_control(icon, label, action(expansion)).into()
+        crate::ui_controls::icon_button(icon, label)
+            .compact()
+            .on_press_maybe(action(expansion))
+            .into()
     };
     let mut controls = Vec::with_capacity(2);
     // A step that would leave too few rows to fold opens the whole run, so
@@ -10346,7 +10300,7 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
 /// flashes up and is replaced before it can be read is a flicker rather than
 /// a state; the spinner alone says the card is alive and about to fill.
 fn loading() -> Element<'static, RepositoryAction> {
-    widget::container(crate::ui_controls::activity_spinner_tone(
+    widget::container(crate::ui_controls::activity_spinner(
         24.0,
         crate::design::accent_color,
     ))
@@ -10370,8 +10324,8 @@ fn information_state_height<'a>(
         widget::container(
             widget::column::with_children(vec![
                 Icon::Info.handle().icon().size(28).into(),
-                widget::text::title3(title.into()).into(),
-                widget::text::body(detail.into())
+                crate::design::title(title.into()).into(),
+                crate::design::body(detail.into())
                     .wrapping(iced::widget::text::Wrapping::Word)
                     .into(),
             ])
@@ -10409,14 +10363,9 @@ mod tests {
             card,
             &runtime,
             Some(
-                icon_control(
-                    Icon::Browser,
-                    "Shell preview",
-                    false,
-                    true,
-                    Some(ShellMessage::Preview),
-                )
-                .into(),
+                icon_button(Icon::Browser, "Shell preview")
+                    .on_press(ShellMessage::Preview)
+                    .into(),
             ),
             ShellMessage::Repository,
         )

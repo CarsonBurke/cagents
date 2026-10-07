@@ -764,14 +764,9 @@ impl Cagents {
                 let mut rows: Vec<Element<'_, Message>> = vec![
                     widget::row::with_children(vec![
                         design::heading("Devices").width(Length::Fill).into(),
-                        crate::ui_controls::icon_control(
-                            Icon::Plus,
-                            "Connect to a device",
-                            false,
-                            enabled,
-                            Some(Message::Device(Action::Configure)),
-                        )
-                        .into(),
+                        crate::ui_controls::icon_button(Icon::Plus, "Connect to a device")
+                            .on_press_maybe(enabled.then_some(Message::Device(Action::Configure)))
+                            .into(),
                     ])
                     .align_y(Alignment::Center)
                     .padding(Padding::from([0.0, design::GRID_UNIT * 2.0]))
@@ -816,12 +811,12 @@ impl Cagents {
                     .width(Length::Fill)
                     .padding(design::GRID_UNIT * 2.0)
                     .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
-                    let open = crate::ui_controls::icon_control(
+                    let open = crate::ui_controls::icon_button(
                         Icon::PopOut,
                         format!("Open {label} in another window"),
-                        false,
-                        enabled,
-                        Some(Message::Device(Action::OpenDeviceWindow(index))),
+                    )
+                    .on_press_maybe(
+                        enabled.then(|| Message::Device(Action::OpenDeviceWindow(index))),
                     );
                     choices.push(
                         widget::row::with_children(vec![
@@ -899,16 +894,16 @@ impl Cagents {
         let narrow = size.width < 900.0;
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
-            let mut button = widget::button::standard(label.to_owned());
+            let mut button = crate::ui_controls::button::secondary(label.to_owned());
             if !state.busy {
                 button = button.on_press(action(value));
             }
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(8).into()];
+            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(8).into()];
             if let Some(notice) = &state.notice {
-                rows.push(widget::text::body(notice).into());
+                rows.push(design::body(notice).into());
             }
             return dialog_ui::surface(widget::column::with_children(rows).spacing(12), 600.0);
         }
@@ -917,15 +912,10 @@ impl Cagents {
                 &value,
                 Action::DiscardChanges | Action::Git(GitOperation::RemoveWorktree { .. })
             );
-            let control = crate::ui_controls::icon_control(
-                name,
-                label,
-                false,
-                !state.busy && enabled,
-                Some(action(value)),
-            );
+            let control = crate::ui_controls::icon_button(name, label)
+                .on_press_maybe((!state.busy && enabled).then_some(action(value)));
             Element::from(if destructive {
-                control.icon_tone(design::Tone::Themed(design::destructive_color))
+                control.tone(design::Tone::Themed(design::destructive_color))
             } else {
                 control
             })
@@ -938,14 +928,10 @@ impl Cagents {
             ]
             .into_iter()
             .map(|(panel, glyph, label)| {
-                crate::ui_controls::icon_control(
-                    glyph,
-                    label,
-                    state.panel == panel,
-                    !state.busy,
-                    Some(action(Action::Panel(panel))),
-                )
-                .into()
+                crate::ui_controls::icon_button(glyph, label)
+                    .selected(state.panel == panel)
+                    .on_press_maybe((!state.busy).then(|| action(Action::Panel(panel))))
+                    .into()
             })
             .collect(),
         );
@@ -975,7 +961,7 @@ impl Cagents {
                     ),
                     state.directory.parent().is_some(),
                 ),
-                widget::text_input("Directory", &state.path)
+                crate::ui_controls::field::text("Directory", &state.path)
                     .on_input(|value| Message::Device(Action::Path(value)))
                     .on_submit(|_| Message::Device(Action::Browse))
                     .width(Length::Fill)
@@ -1150,7 +1136,7 @@ impl Cagents {
                         Action::Git(GitOperation::Diff { staged: true }),
                         true,
                     ),
-                    widget::text_input("File path", &state.pathspec)
+                    crate::ui_controls::field::text("File path", &state.pathspec)
                         .on_input(|value| Message::Device(Action::Pathspec(value)))
                         .width(Length::Fill)
                         .into(),
@@ -1175,7 +1161,7 @@ impl Cagents {
                 .spacing(4)
                 .into(),
                 widget::row::with_children(vec![
-                    widget::text_input("Commit message", &state.commit_message)
+                    crate::ui_controls::field::text("Commit message", &state.commit_message)
                         .on_input(|value| Message::Device(Action::CommitMessage(value)))
                         .width(Length::Fill)
                         .into(),
@@ -1203,11 +1189,11 @@ impl Cagents {
                         Action::Git(GitOperation::Worktrees),
                         true,
                     ),
-                    widget::text_input("Worktree name", &state.worktree_name)
+                    crate::ui_controls::field::text("Worktree name", &state.worktree_name)
                         .on_input(|value| Message::Device(Action::WorktreeName(value)))
                         .width(Length::Fill)
                         .into(),
-                    widget::text_input("New branch", &state.worktree_branch)
+                    crate::ui_controls::field::text("New branch", &state.worktree_branch)
                         .on_input(|value| Message::Device(Action::WorktreeBranch(value)))
                         .width(Length::Fill)
                         .into(),

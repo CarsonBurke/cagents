@@ -4366,7 +4366,7 @@ impl Cagents {
                         .into(),
                     );
                     rows.push(
-                        widget::button::suggested("Sign in")
+                        crate::ui_controls::button::primary("Sign in")
                             .on_press(Message::AccountUi(Action::SignIn(account.id.clone())))
                             .into(),
                     );
@@ -4474,7 +4474,7 @@ impl Cagents {
                 .into(),
         ];
         if let Some(plan) = account.plan() {
-            items.push(design::badge(
+            items.push(crate::ui_controls::badge(
                 plan,
                 design::Tone::Themed(design::accent_color),
             ));
@@ -4485,12 +4485,10 @@ impl Cagents {
         }
         if placement == Placement::Popover {
             items.push(
-                crate::ui_controls::compact_icon_control(
-                    Icon::PopOut,
-                    "Open in the Accounts pane",
-                    Some(Message::AccountUi(Action::OpenPane)),
-                )
-                .into(),
+                crate::ui_controls::icon_button(Icon::PopOut, "Open in the Accounts pane")
+                    .compact()
+                    .on_press(Message::AccountUi(Action::OpenPane))
+                    .into(),
             );
         }
         widget::row::with_children(items)
@@ -4677,7 +4675,7 @@ enum Placement {
 fn refresh_control<'a>(
     account: &AccountState,
     now: Millis,
-) -> crate::ui_controls::IconControl<'a, Message> {
+) -> crate::ui_controls::IconButton<'a, Message> {
     let refreshing = account.schedule.in_flight(now) || account.queued.is_some();
     let ready = !refreshing && account.schedule.manual_ready(now);
     let label = if refreshing {
@@ -4687,11 +4685,9 @@ fn refresh_control<'a>(
     } else {
         "Checked moments ago"
     };
-    crate::ui_controls::compact_icon_control(
-        Icon::Refresh,
-        label,
-        ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))),
-    )
+    crate::ui_controls::icon_button(Icon::Refresh, label)
+        .compact()
+        .on_press_maybe(ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))))
 }
 
 fn identity_line(identity: &Identity) -> Option<String> {

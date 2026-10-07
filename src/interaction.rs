@@ -17,6 +17,13 @@ use serde::Deserialize;
 
 mod context_menu;
 
+use crate::design::space;
+
+/// How far a tooltip sits from the control it names, and how wide it may
+/// grow before its label wraps.
+const TIP_GAP: f32 = space::XS;
+const TIP_MAX_WIDTH: f32 = 320.0;
+
 /// Let a focused field answer Escape before its native blur handler runs.
 pub fn focused_escape<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -368,22 +375,13 @@ fn tooltip_positioned<'a, Message: 'a>(
     label: impl Into<Cow<'a, str>>,
     prefer_above: bool,
 ) -> Element<'a, Message> {
-    let label = label.into();
-    // The shell's type scale owns this size. Tooltip text is the whole content
-    // of its surface rather than secondary metadata beside something else, so
-    // it takes the body role; `design::caption` also mutes its color, which an
-    // overlay with its own background must not do.
-    let tip = cosmic::widget::container(crate::design::body(label))
-        .class(cosmic::theme::Container::custom(|_| Default::default()))
-        .padding(8)
-        .max_width(320)
-        .into();
     Effect {
         content: content.into(),
         kind: Kind::Tooltip,
         tip: Some(Tip {
-            content: tip,
+            label: label.into(),
             prefer_above,
+            content: None,
         }),
         on_escape: None,
     }
@@ -408,7 +406,8 @@ pub fn context_menu<'a, Message: Clone + 'static>(
     .into()
 }
 
-/// Blocks click-through without hiding the child's accessibility tree.
+/// [`context_menu`] whose entries are built only when the menu opens, for
+/// rows whose menu would otherwise be assembled on every view.
 pub fn context_menu_lazy<'a, Message: Clone + 'static>(
     content: impl Into<Element<'a, Message>>,
     builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
@@ -849,7 +848,11 @@ struct OverflowProbe {
 
 impl<T> Operation<T> for OverflowProbe {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
-        operate(self);
+        // The strip is found near the root; every tab beneath it would
+        // otherwise be walked on each event and layout for nothing.
+        if !self.found {
+            operate(self);
+        }
     }
 
     fn scrollable(
@@ -1139,8 +1142,29 @@ struct Effect<'a, Message> {
 }
 
 struct Tip<'a, Message> {
-    content: Element<'a, Message>,
+    label: Cow<'a, str>,
     prefer_above: bool,
+    /// The tip's surface, built when it first opens. A view names a tooltip
+    /// for nearly every control and shows at most one of them, so the text,
+    /// its container and their widget state are not built until then.
+    content: Option<Element<'a, Message>>,
+}
+
+impl<'a, Message: 'a> Tip<'a, Message> {
+    fn content(&mut self) -> &mut Element<'a, Message> {
+        self.content.get_or_insert_with(|| {
+            // The shell's type scale owns this size. Tooltip text is the
+            // whole content of its surface rather than secondary metadata
+            // beside something else, so it takes the body role;
+            // `design::caption` also mutes its color, which an overlay with
+            // its own background must not do.
+            cosmic::widget::container(crate::design::body(self.label.clone()))
+                .class(crate::design::transparent())
+                .padding([space::XS, space::S])
+                .max_width(TIP_MAX_WIDTH)
+                .into()
+        })
+    }
 }
 
 // Distinct tags prevent a positional diff from reusing a tooltip's clock as a
@@ -1197,7 +1221,7 @@ impl Default for State {
     }
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
+impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
@@ -1217,19 +1241,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         tree::State::new(State::default())
     }
     fn children(&self) -> Vec<Tree> {
-        let mut children = vec![Tree::new(&self.content)];
-        if let Some(tip) = &self.tip {
-            children.push(Tree::new(&tip.content));
-        }
-        children
+        vec![Tree::new(&self.content)]
     }
     fn diff(&mut self, tree: &mut Tree) {
         let identity = control_identity(&tree.children[0]).cloned();
-        if let Some(tip) = &mut self.tip {
-            tree.diff_children(&mut [self.content.as_widget_mut(), tip.content.as_widget_mut()]);
-        } else {
-            tree.diff_children(std::slice::from_mut(&mut self.content));
-        }
+        // An open tip's state sits after the content's and is rebuilt by
+        // `overlay`; a new view starts from the content alone.
+        tree.diff_children(std::slice::from_mut(&mut self.content));
         let changed_control = identity.as_ref() != control_identity(&tree.children[0]);
         let state = tree.state.downcast_mut::<State>();
         state.inspect_control = true;
@@ -1635,7 +1653,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
                             renderer::Quad {
                                 bounds: layout.bounds(),
                                 border: cosmic::iced::Border {
-                                    radius: theme.cosmic().corner_radii.radius_s.into(),
+                                    radius: crate::design::RADIUS_S.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -1647,16 +1665,22 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
             }
         }
     }
-    fn overlay<'a>(
-        &'a mut self,
-        tree: &'a mut Tree,
-        layout: Layout<'a>,
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         if matches!(self.kind, Kind::RevealWidth { progress, .. } if progress < 1.0) {
             return None;
+        }
+        let tip_open = tree.state.downcast_ref::<State>().tip_open;
+        if let Some(tip) = self.tip.as_mut().filter(|_| tip_open) {
+            if tree.children.len() < 2 {
+                tree.children.push(Tree::new(&*tip.content()));
+            }
         }
         let (content_state, tip_state) = tree.children.split_at_mut(1);
         let child = self.content.as_widget_mut().overlay(
@@ -1669,12 +1693,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         let state = tree.state.downcast_ref::<State>();
         if state.tip_open {
             if let Some(tip) = &mut self.tip {
+                let prefer_above = tip.prefer_above;
                 let tip = overlay::Element::new(Box::new(TipOverlay {
-                    content: &mut tip.content,
+                    content: tip.content(),
                     tree: &mut tip_state[0],
                     anchor: layout.bounds() + translation,
                     progress: state.tooltip.interpolate(0.0, 1.0, state.now),
-                    prefer_above: tip.prefer_above,
+                    prefer_above,
                 }));
                 return Some(if let Some(child) = child {
                     overlay::Group::with_children(vec![child, tip]).overlay()
@@ -1792,7 +1817,7 @@ mod tests {
             .unwrap();
         let id = Id::from("escape.find");
         let mut element = focused_escape(
-            widget::text_input("Find", "needle")
+            crate::ui_controls::field::search("Find", "needle")
                 .id(id.clone())
                 .on_input(|_| 0_u8)
                 .on_unfocus(2_u8),
@@ -1877,11 +1902,15 @@ mod tests {
         let mut element = keyboard_list(
             widget::column::with_children(vec![
                 keyboard_list_row(
-                    widget::button::text("First")
+                    crate::ui_controls::button::quiet("First")
                         .id(first.clone())
                         .on_press(1_u8),
                 ),
-                keyboard_list_row(widget::button::text("Second").id(second).on_press(2_u8)),
+                keyboard_list_row(
+                    crate::ui_controls::button::quiet("Second")
+                        .id(second)
+                        .on_press(2_u8),
+                ),
             ]),
             true,
         );
@@ -2028,7 +2057,7 @@ mod tests {
                     // Exercise named descendants beneath both a named parent
                     // and unnamed decorators, as in cached project rows.
                     let content: Element<'static, Act> = widget::container(hover(
-                        widget::button::standard("Cached action")
+                        crate::ui_controls::button::secondary("Cached action")
                             .id(Id::new("test.cached.named-button"))
                             .on_press(Act::Item(7)),
                     ))
@@ -2422,11 +2451,11 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, 
         let size = node.size();
         let x = (self.anchor.center_x() - size.width / 2.0)
             .clamp(0.0, (bounds.width - size.width).max(0.0));
-        let below = self.anchor.y + self.anchor.height + 4.0;
+        let below = self.anchor.y + self.anchor.height + TIP_GAP;
         let y = if !self.prefer_above && below + size.height <= bounds.height {
             below
         } else {
-            self.anchor.y - size.height - 4.0
+            self.anchor.y - size.height - TIP_GAP
         };
         node.move_to(Point::new(
             x,
@@ -2444,24 +2473,28 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, 
         if self.progress <= 0.0 {
             return;
         }
-        let mut background: Color = theme.cosmic().palette.neutral_2.into();
-        background.a *= self.progress;
+        // The same surface as every other floating element
+        // (`design::elevated`), faded as two primitives rather than by
+        // deriving and serializing an entire theme per frame.
+        let component = &theme.current_container().component;
+        let fade = |color: Color| Color {
+            a: color.a * self.progress,
+            ..color
+        };
         let mut style = *style;
-        style.text_color = theme.current_container().component.on.into();
-        style.text_color.a *= self.progress;
-        // The tooltip is known text plus padding: fade these two primitives
-        // directly instead of deriving/serializing an entire theme per frame.
+        style.text_color = fade(component.on.into());
         renderer.with_layer(layout.bounds(), |renderer| {
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: layout.bounds(),
                     border: cosmic::iced::Border {
-                        radius: theme.cosmic().corner_radii.radius_l.into(),
-                        ..Default::default()
+                        color: fade(crate::design::component_rule(theme)),
+                        width: crate::design::BORDER_WIDTH,
+                        radius: crate::design::RADIUS_S.into(),
                     },
                     ..Default::default()
                 },
-                background,
+                fade(component.base.into()),
             );
             self.content.as_widget().draw(
                 self.tree,

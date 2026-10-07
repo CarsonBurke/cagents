@@ -46,7 +46,9 @@ fn icon<'a>(
     enabled: bool,
     message: Action,
 ) -> Element<'a, Message> {
-    crate::ui_controls::icon_control(name, label, false, enabled, Some(action(message))).into()
+    crate::ui_controls::icon_button(name, label)
+        .on_press_maybe(enabled.then_some(action(message)))
+        .into()
 }
 
 /// A message's own control, at caption scale.
@@ -59,10 +61,12 @@ fn small_icon<'a>(
     label: impl Into<Cow<'a, str>>,
     message: Action,
 ) -> Element<'a, Message> {
-    crate::ui_controls::compact_icon_control(name, label, Some(action(message)))
+    crate::ui_controls::icon_button(name, label)
+        .compact()
+        .on_press(action(message))
         // Muted at rest: these sit at the foot of every answer, and drawn in the
         // text color they competed with the answer for attention.
-        .icon_tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
+        .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
         .into()
 }
 
@@ -3400,7 +3404,7 @@ impl Cagents {
         }
         for choice in choices {
             content.push(
-                widget::button::standard(format!(
+                crate::ui_controls::button::secondary(format!(
                     "{}{}",
                     choice.label,
                     if choice.detail.is_empty() {
@@ -3416,7 +3420,7 @@ impl Cagents {
             );
         }
         content.push(
-            widget::button::standard("Open Accounts")
+            crate::ui_controls::button::secondary("Open Accounts")
                 .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                 .into(),
         );

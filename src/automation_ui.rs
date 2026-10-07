@@ -1141,8 +1141,8 @@ impl State {
             .is_some_and(|(_, pending)| !pending.background_read());
         let mut listing: Vec<Element<'_, Action>> = Vec::new();
         let mut content = widget::column::with_children(vec![
-            widget::text::title3("Automations").into(),
-            widget::text::body("Recurring agent work continues while this window is closed.")
+            crate::design::title("Automations").into(),
+            crate::design::body("Recurring agent work continues while this window is closed.")
                 .into(),
         ])
         .spacing(3.0 * crate::design::GRID_UNIT)
@@ -1161,20 +1161,20 @@ impl State {
             );
         }
         if let Some(notice) = &self.notice {
-            content = content.push(widget::text::body(notice));
+            content = content.push(crate::design::body(notice));
         }
         if busy {
-            content = content.push(widget::text::body("Updating…"));
+            content = content.push(crate::design::body("Updating…"));
         }
         if let Some(confirmation) = &self.confirmation {
             content =
                 content
-                    .push(widget::text::title4(confirmation.title))
+                    .push(crate::design::title(confirmation.title))
                     .push(launch_description(
                         &confirmation.automation,
                         self.accounts.iter().chain(&self.archived_accounts),
                     ));
-            content = content.push(widget::text::body(if matches!(confirmation.request, Request::Remove { .. }) {
+            content = content.push(crate::design::body(if matches!(confirmation.request, Request::Remove { .. }) {
                 "Past runs remain in history. Active or uncertain work must be closed before removal."
             } else {
                 "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
@@ -1183,7 +1183,7 @@ impl State {
                 widget::row::with_children(vec![
                     button("Cancel", Action::CancelConfirmation, !busy),
                     if matches!(confirmation.request, Request::Remove { .. }) {
-                        widget::button::destructive("Remove automation")
+                        crate::ui_controls::button::destructive("Remove automation")
                             .on_press_maybe(
                                 (!busy).then_some(Action::Confirm(confirmation.generation)),
                             )
@@ -1215,9 +1215,12 @@ impl State {
             if self.run.is_none() {
                 if !self.all_history {
                     listing.push(
-                        widget::text_input("Search loaded automations", &self.search)
-                            .on_input(Action::Search)
-                            .into(),
+                        crate::ui_controls::field::search(
+                            "Search loaded automations",
+                            &self.search,
+                        )
+                        .on_input(Action::Search)
+                        .into(),
                     );
                     let query = self.search.to_lowercase();
                     for row in self.rows.iter().filter(|row| {
@@ -1272,7 +1275,7 @@ impl State {
                         }
                     }
                     if self.rows.is_empty() {
-                        content = content.push(widget::text::body(
+                        content = content.push(crate::design::body(
                             "Create an automation to schedule work in an open project.",
                         ));
                     }
@@ -1282,12 +1285,12 @@ impl State {
                     }
                     if let Some(selected) = &self.selected {
                         content = content
-                            .push(widget::text::title4(selected.definition.name.as_str()))
+                            .push(crate::design::title(selected.definition.name.as_str()))
                             .push(launch_description(
                                 selected,
                                 self.accounts.iter().chain(&self.archived_accounts),
                             ))
-                            .push(widget::text::body(format!(
+                            .push(crate::design::body(format!(
                                 "{} · Next: {} ({})",
                                 if selected.enabled {
                                     "Enabled"
@@ -1302,7 +1305,7 @@ impl State {
                                 selected.definition.schedule.timezone
                             )));
                         if let Some(blocked) = &selected.blocked {
-                            content = content.push(widget::text::body(blocked));
+                            content = content.push(crate::design::body(blocked));
                         }
                         content = content.push(
                             widget::row::with_children(vec![
@@ -1345,7 +1348,7 @@ impl State {
                 if self.selected.is_some() || self.all_history {
                     content = content.push(button("Refresh history", Action::History, !busy));
                     if self.history_newer {
-                        content = content.push(widget::text::body(
+                        content = content.push(crate::design::body(
                             "Newer runs are available. Refresh history to show the latest page.",
                         ));
                     }
@@ -1361,7 +1364,7 @@ impl State {
                         HistoryStatus::Loaded => None,
                     };
                     if let Some(notice) = history_notice {
-                        content = content.push(widget::text::body(notice));
+                        content = content.push(crate::design::body(notice));
                     }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
@@ -1389,32 +1392,32 @@ impl State {
             }
             if let Some(run) = &self.run {
                 content = content
-                    .push(widget::text::title4(format!(
+                    .push(crate::design::title(format!(
                         "{} · {}",
                         run.definition.name,
                         state_label(run.firing.state)
                     )))
-                    .push(widget::text::body(format!(
+                    .push(crate::design::body(format!(
                         "Started: {}\nTarget: {}",
                         timestamp(run.firing.created_ms),
                         run.definition.agent.target.directory.display()
                     )));
                 if let Some(finished) = run.firing.finished_ms {
-                    content = content.push(widget::text::body(format!(
+                    content = content.push(crate::design::body(format!(
                         "Finished: {}",
                         timestamp(finished)
                     )));
                 }
                 if let Some(diagnostic) = &run.firing.diagnostic {
-                    content = content.push(widget::text::body(diagnostic));
+                    content = content.push(crate::design::body(diagnostic));
                 }
                 if let Some(result) = run.run.as_ref().map(|run| &run.result) {
-                    content = content.push(widget::text::body(result.text.as_str()));
+                    content = content.push(crate::design::body(result.text.as_str()));
                     if let Some(diagnostic) = &result.diagnostic {
-                        content = content.push(widget::text::body(diagnostic));
+                        content = content.push(crate::design::body(diagnostic));
                     }
                     if result.truncated {
-                        content = content.push(widget::text::body(
+                        content = content.push(crate::design::body(
                             "This result was shortened to keep history bounded.",
                         ));
                     }
@@ -1640,7 +1643,7 @@ impl Draft {
         let fields = fields.push(
             widget::row::with_children(vec![
                 button("Cancel", Action::CancelEdit, !busy),
-                widget::button::suggested("Save automation")
+                crate::ui_controls::button::primary("Save automation")
                     .on_press_maybe((!busy).then_some(Action::Save))
                     .into(),
             ])
@@ -1682,15 +1685,15 @@ impl Draft {
     /// The timezone is typed to search the system's zones; a match fills it.
     fn timezone_picker(&self) -> Element<'_, Action> {
         let mut column = widget::column::with_children(vec![
-            widget::text::body("Timezone").into(),
-            widget::text_input("Search timezones, e.g. Vancouver", &self.timezone)
+            crate::design::body("Timezone").into(),
+            crate::ui_controls::field::search("Search timezones, e.g. Vancouver", &self.timezone)
                 .on_input(|value| Action::Field(Field::Timezone, value))
                 .into(),
         ])
         .spacing(crate::design::GRID_UNIT);
         if let Some(matches) = &self.timezone_matches {
             if matches.is_empty() {
-                column = column.push(widget::text::caption(if self.timezone.trim().is_empty() {
+                column = column.push(crate::design::caption(if self.timezone.trim().is_empty() {
                     "Type a city or region to find its timezone."
                 } else {
                     "No timezone matches this search."
@@ -1698,7 +1701,7 @@ impl Draft {
             }
             for name in matches.iter().copied() {
                 column = column.push(
-                    widget::button::custom(widget::text::body(name))
+                    widget::button::custom(crate::design::body(name))
                         .class(crate::ui_controls::control_style(false, None))
                         .width(Length::Fill)
                         .on_press(Action::Field(Field::Timezone, name.to_owned())),
@@ -1723,7 +1726,7 @@ impl Draft {
                 )
             })
             .map_or_else(|error| error, |next| format!("Next run: {next}"));
-        widget::text::caption(text).into()
+        crate::design::caption(text).into()
     }
 
     /// The provider's listed models, as the composer offers them, or a typed
@@ -1758,7 +1761,7 @@ impl Draft {
             .map(|model| model.id.clone())
             .collect::<Vec<_>>();
         let mut column = widget::column::with_children(vec![
-            widget::text::body("Model").into(),
+            crate::design::body("Model").into(),
             widget::dropdown(labels, Some(selected), move |index| {
                 Action::Model(match index {
                     0 => ModelChoice::Default,
@@ -1773,7 +1776,7 @@ impl Draft {
         .spacing(crate::design::GRID_UNIT);
         if custom {
             column = column.push(
-                widget::text_input("Model ID", &self.model)
+                crate::ui_controls::field::text("Model ID", &self.model)
                     .on_input(|value| Action::Field(Field::Model, value)),
             );
         }
@@ -1786,8 +1789,8 @@ impl Draft {
         let efforts = self.efforts(models);
         if efforts.is_empty() {
             return widget::column::with_children(vec![
-                widget::text::body("Reasoning effort").into(),
-                widget::text::caption(if self.listed(models).is_some() {
+                crate::design::body("Reasoning effort").into(),
+                crate::design::caption(if self.listed(models).is_some() {
                     "Provider default. This model does not offer a choice."
                 } else {
                     "Provider default. Choose a listed model to pick an effort."
@@ -1806,7 +1809,7 @@ impl Draft {
             .chain(efforts.iter().cloned())
             .collect::<Vec<_>>();
         widget::column::with_children(vec![
-            widget::text::body("Reasoning effort").into(),
+            crate::design::body("Reasoning effort").into(),
             widget::dropdown(labels, Some(selected), move |index| {
                 Action::Effort(
                     index
@@ -1865,12 +1868,12 @@ fn launch_description<'a>(
         automation.revision
     );
     let mut column = widget::column::with_children(vec![
-        widget::text::body(description).into(),
-        widget::text::body(definition.prompt.as_str()).into(),
+        crate::design::body(description).into(),
+        crate::design::body(definition.prompt.as_str()).into(),
     ])
     .spacing(2.0 * crate::design::GRID_UNIT);
     if let Some(precheck) = &definition.precheck {
-        column = column.push(widget::text::body(format!(
+        column = column.push(crate::design::body(format!(
             "Shell precheck ({} seconds):\n{}",
             precheck.timeout_seconds, precheck.command
         )));
@@ -1878,7 +1881,7 @@ fn launch_description<'a>(
     column.into()
 }
 fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static, Action> {
-    let mut button = widget::button::standard(label);
+    let mut button = crate::ui_controls::button::secondary(label);
     if enabled {
         button = button.on_press(action);
     }
@@ -1887,7 +1890,7 @@ fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static
 fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static, Action> {
     // List and history entries can span several lines. Standard buttons reserve
     // a single-line height, hiding target and scheduling details.
-    let mut button = widget::button::custom(widget::text::body(label.clone()))
+    let mut button = widget::button::custom(crate::design::body(label.clone()))
         .name(label)
         .padding(3.0 * crate::design::GRID_UNIT)
         .class(crate::sidebar::sidebar_button_style(false))
@@ -1900,7 +1903,7 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
 fn input<'a>(label: &'static str, value: &'a str, field: Field) -> Element<'a, Action> {
     widget::column::with_children(vec![
         crate::design::caption(label).into(),
-        widget::text_input(label, value)
+        crate::ui_controls::field::text(label, value)
             .on_input(move |value| Action::Field(field, value))
             .into(),
     ])

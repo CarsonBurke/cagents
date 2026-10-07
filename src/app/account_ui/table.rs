@@ -495,17 +495,17 @@ fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element
             design::caption("Choose the provider's home directory. Its login and session history stay where they are; removing this link will leave its files untouched.")
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            widget::text_input("Absolute path to the provider home", path)
+            crate::ui_controls::field::text("Absolute path to the provider home", path)
                 .id(link_id())
                 .on_input(|value| Message::AccountUi(Action::LinkInput(value)))
                 .on_submit(|_| Message::AccountUi(Action::LinkCommit))
                 .width(Length::Fill)
                 .into(),
             widget::row::with_children(vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .on_press_maybe((!state.table.linking).then_some(Message::AccountUi(Action::LinkCancel)))
                     .into(),
-                widget::button::suggested(if state.table.linking { "Adding…" } else { "Use home" })
+                crate::ui_controls::button::primary(if state.table.linking { "Adding…" } else { "Use home" })
                     .on_press_maybe((!state.table.linking && !path.trim().is_empty()).then_some(Message::AccountUi(Action::LinkCommit)))
                     .into(),
             ])
@@ -547,14 +547,15 @@ fn group<'a>(
     ];
     if Account::PROVIDERS.contains(&provider) && state.installed.get(&provider) != Some(&false) {
         header.push(
-            crate::ui_controls::compact_icon_control(
+            crate::ui_controls::icon_button(
                 Icon::Plus,
                 format!("Add a {} account", provider.label()),
-                Some(Message::AccountUi(Action::Add {
-                    provider,
-                    device: false,
-                })),
             )
+            .compact()
+            .on_press(Message::AccountUi(Action::Add {
+                provider,
+                device: false,
+            }))
             .into(),
         );
     }
@@ -599,7 +600,7 @@ fn group<'a>(
         );
         if state.installed.get(&provider) == Some(&false) {
             lines.push(
-                widget::button::suggested(format!("Install {}", provider.label()))
+                crate::ui_controls::button::primary(format!("Install {}", provider.label()))
                     .on_press(Message::AccountUi(Action::Install(provider)))
                     .into(),
             );
@@ -703,7 +704,7 @@ fn row<'a>(
         .map(|column| {
             let cell = match column {
                 Column::Plan => account.plan().map_or_else(dash, |plan| {
-                    design::badge(plan, design::Tone::Themed(design::accent_color))
+                    crate::ui_controls::badge(plan, design::Tone::Themed(design::accent_color))
                 }),
                 Column::Session => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Session)),
@@ -805,13 +806,14 @@ fn account_cell<'a>(
         .as_ref()
         .filter(|(id, _)| id == &account.id);
     let name: Element<'a, Message> = match renaming {
-        Some((_, draft)) => widget::text_input(state.display_name(account), draft.as_str())
-            .id(rename_id())
-            .size(design::TEXT_BODY)
-            .on_input(|text| Message::AccountUi(Action::RenameInput(text)))
-            .on_submit(|_| Message::AccountUi(Action::RenameCommit))
-            .width(Length::Fill)
-            .into(),
+        Some((_, draft)) => {
+            crate::ui_controls::field::text(state.display_name(account), draft.as_str())
+                .id(rename_id())
+                .on_input(|text| Message::AccountUi(Action::RenameInput(text)))
+                .on_submit(|_| Message::AccountUi(Action::RenameCommit))
+                .width(Length::Fill)
+                .into()
+        }
         // Filling the cell is what lets a long name give way to the badge
         // after it instead of running under the row's actions.
         None => design::body(state.display_name(account))
@@ -829,7 +831,7 @@ fn account_cell<'a>(
         .count()
         > 1;
     if several && state.registry.is_default(&account.account) && renaming.is_none() {
-        title.push(design::badge(
+        title.push(crate::ui_controls::badge(
             "Default",
             design::Tone::Themed(design::muted_color),
         ));
@@ -840,7 +842,7 @@ fn account_cell<'a>(
             .is_project_default(repository, &account.account)
         && renaming.is_none()
     {
-        title.push(design::badge(
+        title.push(crate::ui_controls::badge(
             "This project",
             design::Tone::Themed(design::accent_color),
         ));
@@ -855,7 +857,7 @@ fn account_cell<'a>(
             }
         };
         title.push(crate::interaction::tooltip(
-            design::badge(conflict.label(), design::Tone::Themed(tone)),
+            crate::ui_controls::badge(conflict.label(), design::Tone::Themed(tone)),
             conflict.detail(),
         ));
     }
@@ -970,7 +972,7 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
     let (label, tone) = status(account);
-    let badge = design::badge(label, design::Tone::Themed(tone));
+    let badge = crate::ui_controls::badge(label, design::Tone::Themed(tone));
     match (&account.failure, &account.snapshot) {
         (Some(failure), _) => {
             crate::interaction::tooltip(badge, format!("Last check failed: {failure}"))
@@ -994,11 +996,11 @@ fn actions<'a>(
     let state = &app.account_ui;
     let open = state.table.menu.as_ref() == Some(&account.id);
     let removing = state.removing.contains(&account.id);
-    let menu_button = crate::ui_controls::compact_icon_control(
-        Icon::More,
-        "Account actions",
-        (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
-    );
+    let menu_button = crate::ui_controls::icon_button(Icon::More, "Account actions")
+        .compact()
+        .on_press_maybe(
+            (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
+        );
     // Omp names, signs in to and forgets its accounts itself, which leaves
     // nothing to do with one here but read it again. The space keeps its
     // refresh control in line with the other rows'.
@@ -1070,10 +1072,10 @@ fn menu<'a>(
             in_use_warning(state.table.confirm_in_use, account.account.is_linked()),
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .on_press(action(Action::RemoveCancel))
                     .into(),
-                widget::button::destructive("Remove")
+                crate::ui_controls::button::destructive("Remove")
                     .on_press(action(Action::RemoveConfirm(id.clone())))
                     .into(),
             ])
@@ -1198,7 +1200,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
                 .size(design::ROW_ICON_SIZE)
                 .into()
         } else {
-            crate::ui_controls::activity_spinner_tone(
+            crate::ui_controls::activity_spinner(
                 f32::from(design::ROW_ICON_SIZE),
                 design::accent_color,
             )
@@ -1223,27 +1225,23 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     .into();
     let cancel: Element<'a, Message> = if login.phase == LoginPhase::CallbackBlocked {
         widget::row::with_children(vec![
-            widget::button::text("Use code")
+            crate::ui_controls::button::quiet("Use code")
                 .on_press(Message::AccountUi(Action::Add {
                     provider: Provider::Codex,
                     device: true,
                 }))
                 .into(),
-            crate::ui_controls::compact_icon_control(
-                Icon::Close,
-                "Dismiss failed sign-in",
-                Some(Message::AccountUi(Action::CancelLogin(login.key))),
-            )
-            .into(),
+            crate::ui_controls::icon_button(Icon::Close, "Dismiss failed sign-in")
+                .compact()
+                .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
+                .into(),
         ])
         .into()
     } else if login.phase == LoginPhase::Waiting {
-        crate::ui_controls::compact_icon_control(
-            Icon::Close,
-            "Cancel sign-in",
-            Some(Message::AccountUi(Action::CancelLogin(login.key))),
-        )
-        .into()
+        crate::ui_controls::icon_button(Icon::Close, "Cancel sign-in")
+            .compact()
+            .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
+            .into()
     } else {
         iced::widget::Space::new().into()
     };

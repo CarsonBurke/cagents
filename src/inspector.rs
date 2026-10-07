@@ -1795,7 +1795,7 @@ fn markdown_item(
                     (0..width)
                         .map(|column| {
                             row.cells.get(column).map_or_else(
-                                || widget::text::body("").width(Length::Fill).into(),
+                                || design::body("").width(Length::Fill).into(),
                                 |cells| markdown_items(cells, settings, depth + 1),
                             )
                         })

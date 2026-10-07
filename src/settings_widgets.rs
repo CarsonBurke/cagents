@@ -36,7 +36,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     fn view(self) -> Element<'a, Message> {
         let mut children = Vec::new();
         if !self.label_in_control {
-            children.push(widget::text::caption_heading(self.label).into());
+            children.push(design::heading(self.label).into());
         }
         children.push(self.control);
         if let Some(error) = self.error {
@@ -112,7 +112,7 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         if settings.is_empty() {
             return None;
         }
-        let mut heading: Vec<Element<'a, Message>> = vec![widget::text::title4(self.title).into()];
+        let mut heading: Vec<Element<'a, Message>> = vec![design::title(self.title).into()];
         if !self.detail.is_empty() {
             heading.push(
                 design::caption(self.detail)

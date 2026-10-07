@@ -37,7 +37,7 @@ use crate::{
         line_change_counts,
     },
     sidebar::{CheckStatus, FileListMode, WorktreePullRequestState, sidebar_button_style},
-    ui_controls::{Icon, icon_control},
+    ui_controls::{Icon, icon_button},
 };
 
 type ActionTask = iced::Task<Action>;
@@ -1665,49 +1665,35 @@ impl State {
         // controls after it by an index, and iced reconciles named children
         // by the index their name held last frame.
         let activity: Element<'_, Action> = widget::container(if busy {
-            crate::ui_controls::activity_spinner_tone(14.0, design::muted_icon_color)
+            crate::ui_controls::activity_spinner(14.0, design::muted_icon_color)
         } else {
             widget::Space::new().into()
         })
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
-            icon_control(
-                Icon::Branch,
-                "Create worktree from reviewed commit",
-                false,
-                !modal_open && !busy && self.context.is_some() && self.range.is_some(),
-                Some(self.fenced(Action::Checkout)),
-            )
-            .into(),
-            icon_control(
+            icon_button(Icon::Branch, "Create worktree from reviewed commit")
+                .on_press_maybe(
+                    (!modal_open && !busy && self.context.is_some() && self.range.is_some())
+                        .then(|| self.fenced(Action::Checkout)),
+                )
+                .into(),
+            icon_button(
                 Icon::Refresh,
                 if busy {
                     "Refreshing pull request"
                 } else {
                     "Refresh pull request"
                 },
-                false,
-                !modal_open && !busy,
-                Some(Action::Refresh),
             )
+            .on_press_maybe((!modal_open && !busy).then_some(Action::Refresh))
             .into(),
-            icon_control(
-                Icon::PopOut,
-                "Open on GitHub",
-                false,
-                !modal_open,
-                Some(Action::OpenUrl(pull_request.url.clone())),
-            )
-            .into(),
-            icon_control(
-                Icon::Close,
-                "Close review",
-                false,
-                !modal_open,
-                Some(Action::Close),
-            )
-            .into(),
+            icon_button(Icon::PopOut, "Open on GitHub")
+                .on_press_maybe((!modal_open).then(|| Action::OpenUrl(pull_request.url.clone())))
+                .into(),
+            icon_button(Icon::Close, "Close review")
+                .on_press_maybe((!modal_open).then_some(Action::Close))
+                .into(),
         ]);
         widget::row::with_children(vec![
             identity,
@@ -1840,21 +1826,11 @@ impl State {
             }
         };
         let dismiss = if matches!(self.load, LoadState::Failed(_)) {
-            icon_control(
-                Icon::Refresh,
-                "Try again",
-                false,
-                !modal_open,
-                Some(Action::Refresh),
-            )
+            icon_button(Icon::Refresh, "Try again")
+                .on_press_maybe((!modal_open).then_some(Action::Refresh))
         } else {
-            icon_control(
-                Icon::Close,
-                "Dismiss",
-                false,
-                !modal_open,
-                Some(Action::DismissNotice),
-            )
+            icon_button(Icon::Close, "Dismiss")
+                .on_press_maybe((!modal_open).then_some(Action::DismissNotice))
         };
         widget::container(
             widget::row::with_children(vec![
@@ -1885,34 +1861,26 @@ impl State {
             FileListMode::Flat => (Icon::Tree, "View as tree", FileListMode::Tree),
         };
         let controls = crate::ui_controls::toolbar_actions(vec![
-            icon_control(
-                mode_icon,
-                mode_label,
-                false,
-                !modal_open,
-                Some(Action::SetFileListMode(next_mode)),
-            )
-            .into(),
-            icon_control(
+            icon_button(mode_icon, mode_label)
+                .on_press_maybe((!modal_open).then_some(Action::SetFileListMode(next_mode)))
+                .into(),
+            icon_button(
                 Icon::Filter,
                 if self.hide_viewed {
                     "Show viewed files"
                 } else {
                     "Hide viewed files"
                 },
-                self.hide_viewed,
-                !modal_open,
-                Some(Action::ToggleHideViewed),
             )
+            .selected(self.hide_viewed)
+            .on_press_maybe((!modal_open).then_some(Action::ToggleHideViewed))
             .into(),
-            icon_control(
-                Icon::ChevronRight,
-                "Next unviewed file",
-                false,
-                !modal_open && self.files.iter().any(|file| !file.viewed),
-                Some(Action::NextUnviewed),
-            )
-            .into(),
+            icon_button(Icon::ChevronRight, "Next unviewed file")
+                .on_press_maybe(
+                    (!modal_open && self.files.iter().any(|file| !file.viewed))
+                        .then_some(Action::NextUnviewed),
+                )
+                .into(),
         ]);
         let viewed = self.files.iter().filter(|file| file.viewed).count();
         let toolbar = widget::row::with_children(vec![
@@ -1939,7 +1907,7 @@ impl State {
         }
         if self.pages.cursor.is_some() {
             status.push(
-                widget::button::text(if self.pages.loading {
+                crate::ui_controls::button::quiet(if self.pages.loading {
                     "Loading viewed states…"
                 } else if self.pages.error.is_some() {
                     "Retry viewed states"
@@ -2082,7 +2050,7 @@ impl State {
             );
         }
         if !counts.is_empty() {
-            trailing.push(design::change_counts(&counts));
+            trailing.push(crate::ui_controls::change_counts(&counts));
         }
         let (comments, unresolved) = self.discussion_counts(&row.path.display());
         if comments > 0 {
@@ -2258,7 +2226,7 @@ impl State {
                         design::caption(format!("Couldn’t list pull requests. {message}"))
                             .wrapping(iced::widget::text::Wrapping::Word)
                             .into(),
-                        button::standard("Try again")
+                        crate::ui_controls::button::secondary("Try again")
                             .on_press_maybe((!modal_open).then_some(Action::LoadList))
                             .into(),
                     ])
@@ -2401,7 +2369,7 @@ impl State {
         .height(Length::Fill)
         .into();
         let controls = widget::column::with_children(vec![
-            widget::text_input(
+            crate::ui_controls::field::search(
                 "Search loaded PRs by title, # or @author",
                 &self.browser_query,
             )
@@ -2414,14 +2382,9 @@ impl State {
                     Action::BrowserFilterIndex,
                 )
                 .into(),
-                icon_control(
-                    Icon::Refresh,
-                    "Refresh pull requests",
-                    false,
-                    !modal_open && !self.list_loading,
-                    Some(Action::LoadList),
-                )
-                .into(),
+                icon_button(Icon::Refresh, "Refresh pull requests")
+                    .on_press_maybe((!modal_open && !self.list_loading).then_some(Action::LoadList))
+                    .into(),
             ])
             .spacing(spacing.space_xxs)
             .into(),
@@ -2448,12 +2411,14 @@ impl State {
         if let Ok(number) = query.trim_start_matches('#').parse::<u64>()
             && number > 0
         {
-            column = column.push(button::standard(format!("Open #{number}")).on_press_maybe(
-                (!modal_open).then_some(Action::BrowserFenced {
-                    generation: self.list_generation,
-                    action: Box::new(Action::OpenNumber(number)),
-                }),
-            ));
+            column = column.push(
+                crate::ui_controls::button::secondary(format!("Open #{number}")).on_press_maybe(
+                    (!modal_open).then_some(Action::BrowserFenced {
+                        generation: self.list_generation,
+                        action: Box::new(Action::OpenNumber(number)),
+                    }),
+                ),
+            );
         }
         let mut column = column.push(list);
         if let Some(error) = &self.list_error {
@@ -2462,7 +2427,7 @@ impl State {
         }
         if self.list_cursor.is_some() {
             column = column.push(
-                button::standard(if self.list_loading {
+                crate::ui_controls::button::secondary(if self.list_loading {
                     "Loading…"
                 } else {
                     "Load more pull requests"
@@ -2600,11 +2565,11 @@ fn viewed_control<'a>(
         Mark::Mixed => (Icon::CheckboxMixed, label_when_unchecked),
         Mark::Checked => (Icon::CheckboxChecked, label_when_checked),
     };
-    let control = icon_control(icon, label, false, enabled, Some(action));
+    let control = icon_button(icon, label).on_press_maybe(enabled.then_some(action));
     match mark {
         Mark::Unchecked => control.into(),
         Mark::Mixed | Mark::Checked => control
-            .icon_tone(design::Tone::Themed(design::accent_color))
+            .tone(design::Tone::Themed(design::accent_color))
             .into(),
     }
 }

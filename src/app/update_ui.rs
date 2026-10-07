@@ -120,7 +120,7 @@ pub enum Action {
 
 /// Opens a release's notes in the system browser.
 pub(super) fn release_notes_button<'a>(url: &str) -> Element<'a, Message> {
-    widget::button::text("Release notes")
+    crate::ui_controls::button::quiet("Release notes")
         .on_press(Message::UpdateUi(Action::OpenReleaseNotes(url.to_owned())))
         .into()
 }
@@ -168,7 +168,7 @@ impl Cagents {
         let confirmation = self.update_ui.confirmation.as_ref()?;
         let preview = &confirmation.preview;
         let title: Element<'_, Message> =
-            widget::text::title3(format!("Update to {}?", preview.candidate.version))
+            crate::design::title(format!("Update to {}?", preview.candidate.version))
                 .width(Length::Fill)
                 .into();
         // Read what changes before every window restarts for it.
@@ -229,7 +229,7 @@ impl Cagents {
                     ("Wait for idle instead", Policy::WhenIdle)
                 };
                 body.push(
-                    widget::button::standard(label)
+                    crate::ui_controls::button::secondary(label)
                         .on_press(Message::UpdateUi(Action::ChoosePolicy(policy)))
                         .into(),
                 );
@@ -238,11 +238,11 @@ impl Cagents {
         body.push(
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("update.cancel"))
                     .on_press(Message::UpdateUi(Action::CancelApply))
                     .into(),
-                widget::button::suggested(
+                crate::ui_controls::button::primary(
                     if preview.daemon.as_ref().is_some_and(|daemon| {
                         daemon
                             .sessions
@@ -418,15 +418,11 @@ impl Cagents {
         };
         let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
         Some(
-            crate::ui_controls::icon_control(
-                icon,
-                label,
-                true,
-                enabled,
-                enabled.then_some(action).flatten(),
-            )
-            .id(widget::Id::new("application-update"))
-            .into(),
+            crate::ui_controls::icon_button(icon, label)
+                .selected(true)
+                .on_press_maybe(enabled.then_some(action).flatten())
+                .id(widget::Id::new("application-update"))
+                .into(),
         )
     }
 

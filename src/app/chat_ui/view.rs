@@ -239,7 +239,7 @@ fn queue_row<'a>(
     let marker: Element<'a, Message> = match timing {
         QueueTiming::NextStep => marker(Icon::Jump, "Delivered at the agent's next step"),
         QueueTiming::NextTurn => marker(Icon::Plus, "Sent when this turn ends"),
-        QueueTiming::Leaving => crate::ui_controls::activity_spinner_tone(
+        QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
         ),
@@ -863,7 +863,7 @@ impl Cagents {
                 }
             }
             _ => widget::row::with_children(vec![
-                crate::ui_controls::activity_spinner_tone(
+                crate::ui_controls::activity_spinner(
                     f32::from(design::ROW_ICON_SIZE),
                     design::accent_color,
                 ),
@@ -1092,7 +1092,7 @@ impl Runtime {
             );
             if codex {
                 choices.push(
-                    widget::button::text("Fork entire conversation")
+                    crate::ui_controls::button::quiet("Fork entire conversation")
                         .on_press_maybe(
                             (!snapshot.busy && self.pending.is_none()).then(|| {
                                 action(Action::Command(target, Command::Branch { id: None }))
@@ -1103,7 +1103,7 @@ impl Runtime {
             }
             for point in &snapshot.branch_points {
                 choices.push(
-                    widget::button::text(&point.label)
+                    crate::ui_controls::button::quiet(&point.label)
                         .on_press_maybe((!snapshot.busy && self.pending.is_none()).then(|| {
                             action(Action::Command(
                                 target,
@@ -1116,7 +1116,7 @@ impl Runtime {
                 );
             }
             choices.push(
-                widget::button::text("Close")
+                crate::ui_controls::button::quiet("Close")
                     .on_press(action(Action::BranchPicker(target, false)))
                     .into(),
             );
@@ -1144,12 +1144,15 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        widget::text_input("Find in conversation (case sensitive)", query)
-                            .id(card_control_id(target.card, "chat-find"))
-                            .on_input(move |query| action(Action::Find(target, query)))
-                            .on_focus(action(Action::FindFocused(target, true)))
-                            .on_unfocus(action(Action::FindFocused(target, false)))
-                            .width(Length::Fill),
+                        crate::ui_controls::field::search(
+                            "Find in conversation (case sensitive)",
+                            query,
+                        )
+                        .id(card_control_id(target.card, "chat-find"))
+                        .on_input(move |query| action(Action::Find(target, query)))
+                        .on_focus(action(Action::FindFocused(target, true)))
+                        .on_unfocus(action(Action::FindFocused(target, false)))
+                        .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -1339,7 +1342,7 @@ impl Runtime {
                     agent.description.clone()
                 };
                 let marker = if agent.status == chat::ToolStatus::Running {
-                    crate::ui_controls::activity_spinner_tone(
+                    crate::ui_controls::activity_spinner(
                         f32::from(design::COMPACT_ICON_SIZE),
                         design::accent_color,
                     )
@@ -1719,7 +1722,7 @@ impl Runtime {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
             let next = if mode == "wait" { "immediate" } else { "wait" };
             actions.push(
-                widget::button::text(if mode == "wait" {
+                crate::ui_controls::button::quiet(if mode == "wait" {
                     "Steering: after turn"
                 } else {
                     "Steering: after tools"
@@ -1856,7 +1859,7 @@ impl Runtime {
         if let Some(glyph) = glyph {
             status.push(
                 if glyph == Icon::AgentWorking || glyph == Icon::AgentWaiting {
-                    crate::ui_controls::activity_spinner_tone(
+                    crate::ui_controls::activity_spinner(
                         f32::from(design::ROW_ICON_SIZE),
                         design::accent_color,
                     )
@@ -2050,7 +2053,7 @@ impl Runtime {
             // shell uses for work in flight, so a reader can tell where the
             // agent is without reading the plan at all.
             let marker: Element<'_, Message> = match entry.status {
-                chat::PlanState::Active => crate::ui_controls::activity_spinner_tone(
+                chat::PlanState::Active => crate::ui_controls::activity_spinner(
                     f32::from(design::COMPACT_ICON_SIZE),
                     design::accent_color,
                 ),
@@ -2671,8 +2674,10 @@ impl Runtime {
         let sending = self.followups_sending();
         let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
         let control = |name, label: &'static str, enabled: bool, message: Action| {
-            crate::ui_controls::compact_icon_control(name, label, enabled.then(|| action(message)))
-                .icon_tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
+            crate::ui_controls::icon_button(name, label)
+                .compact()
+                .on_press_maybe(enabled.then(|| action(message)))
+                .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
                 .into()
         };
         let copy = |text: &str| {
@@ -2903,7 +2908,7 @@ impl Runtime {
         }
         rows.push(
             widget::row::with_children(vec![
-                crate::ui_controls::activity_spinner_tone(
+                crate::ui_controls::activity_spinner(
                     f32::from(design::COMPACT_ICON_SIZE),
                     design::accent_color,
                 ),
@@ -2915,12 +2920,10 @@ impl Runtime {
                     "Copy queued message",
                     Action::CopyLiteral(queued.text.clone()),
                 ),
-                crate::ui_controls::compact_icon_control(
-                    Icon::Undo,
-                    "Take the message back to edit it",
-                    (!sending).then(|| action(Action::CancelQueued(self.target))),
-                )
-                .into(),
+                crate::ui_controls::icon_button(Icon::Undo, "Take the message back to edit it")
+                    .compact()
+                    .on_press_maybe((!sending).then(|| action(Action::CancelQueued(self.target))))
+                    .into(),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
@@ -3366,7 +3369,7 @@ fn paging_view(
 ) -> Element<'static, Message> {
     let mut row: Vec<Element<'_, Message>> = Vec::new();
     if loading {
-        row.push(crate::ui_controls::activity_spinner_tone(
+        row.push(crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::muted_color,
         ));
@@ -3661,11 +3664,11 @@ fn answers_view<'a>(
                     choice.id.clone(),
                 )));
                 let control: Element<'a, Message> = if primary == Some(&choice.id) {
-                    widget::button::suggested(choice.label.as_str())
+                    crate::ui_controls::button::primary(choice.label.as_str())
                         .on_press_maybe(message)
                         .into()
                 } else {
-                    widget::button::standard(choice.label.as_str())
+                    crate::ui_controls::button::secondary(choice.label.as_str())
                         .on_press_maybe(message)
                         .into()
                 };
@@ -3897,7 +3900,7 @@ fn model_list<'a>(
         }
     }
     widget::column::with_children(vec![
-        widget::search_input(
+        crate::ui_controls::field::search(
             if headed {
                 "Search models and providers"
             } else {
@@ -3906,7 +3909,6 @@ fn model_list<'a>(
             query,
         )
         .id(card_control_id(target.card, "chat-model-search"))
-        .size(design::TEXT_BODY)
         .width(Length::Fill)
         .on_input(move |query| action(Action::ModelQuery(target, query)))
         // Enter takes the top match, which is what makes three keystrokes

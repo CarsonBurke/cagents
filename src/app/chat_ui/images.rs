@@ -116,10 +116,10 @@ impl Gallery {
                 Action::ImageNext(true),
             ),
             iced::widget::Space::new().width(Length::Fill).into(),
-            widget::button::standard("Fit")
+            crate::ui_controls::button::secondary("Fit")
                 .on_press(action(Action::ImageFit))
                 .into(),
-            widget::button::standard("Open externally")
+            crate::ui_controls::button::secondary("Open externally")
                 .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
                 .into(),
             icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),

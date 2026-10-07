@@ -640,7 +640,7 @@ impl Cagents {
         .spacing(spacing.space_xxs);
         let (cascade, note) = self.group_cascade(dialog);
         let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3(title).into(),
+            design::title(title).into(),
             widget::container(widget::scrollable(members))
                 .max_height(240)
                 .into(),
@@ -667,10 +667,10 @@ impl Cagents {
             rows.push(super::notice_body(error.as_str()));
         }
         rows.push(super::dialog_ui::confirmation_actions(
-            widget::button::standard("Cancel")
+            crate::ui_controls::button::secondary("Cancel")
                 .id(close_focus_id())
                 .on_press(Message::SidebarSelection(Action::Dismiss)),
-            widget::button::destructive(kind.deletion_label(count))
+            crate::ui_controls::button::destructive(kind.deletion_label(count))
                 .id(focus_id())
                 .on_press_maybe(
                     (blocked == 0).then_some(Message::SidebarSelection(Action::Confirm)),

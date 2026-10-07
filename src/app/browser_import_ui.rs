@@ -469,9 +469,9 @@ impl Cagents {
             return None;
         }
         let mut content: Vec<Element<'_, Message>> =
-            vec![widget::text::title3("Import browser logins").into()];
+            vec![crate::design::title("Import browser logins").into()];
         let button = |label: &'static str, action| {
-            widget::button::standard(label)
+            crate::ui_controls::button::secondary(label)
                 .on_press(message(action))
                 .into()
         };
@@ -521,7 +521,7 @@ impl Cagents {
                     }
                     content.push(notice_body("Choose sites to import. If profiles overlap, the first selected profile wins. Only SameSite=None cookies are supported; restricted, container, and partitioned cookies are skipped. Some logins may still need signing in."));
                     content.push(
-                        widget::text_input("Filter sites or profiles", &state.query)
+                        crate::ui_controls::field::search("Filter sites or profiles", &state.query)
                             .on_input(|query| message(Action::Filter(query)))
                             .into(),
                     );
@@ -554,7 +554,7 @@ impl Cagents {
                             }
                             SelectionRow::Error(index) => {
                                 if let Some(error) = &state.found[index].error {
-                                    rows.push(widget::text::body(error.clone()).into());
+                                    rows.push(crate::design::body(error.clone()).into());
                                 }
                             }
                             SelectionRow::Site(index, site) => {
@@ -581,14 +581,14 @@ impl Cagents {
                     let pages = state.rows.len().div_ceil(PAGE_ROWS).max(1);
                     content.push(
                         widget::row::with_children(vec![
-                            widget::button::standard("Previous")
+                            crate::ui_controls::button::secondary("Previous")
                                 .on_press_maybe(
                                     (state.page > 0).then(|| message(Action::Page(state.page - 1))),
                                 )
                                 .into(),
-                            widget::text::body(format!("Page {} of {}", state.page + 1, pages))
+                            crate::design::body(format!("Page {} of {}", state.page + 1, pages))
                                 .into(),
-                            widget::button::standard("Next")
+                            crate::ui_controls::button::secondary("Next")
                                 .on_press_maybe(
                                     (state.page + 1 < pages)
                                         .then(|| message(Action::Page(state.page + 1))),
@@ -616,7 +616,7 @@ impl Cagents {
                 Phase::Finished(detail) => {
                     content.push(notice_body(detail.clone()));
                     for error in &state.errors {
-                        content.push(widget::text::body(error.clone()).into());
+                        content.push(crate::design::body(error.clone()).into());
                     }
                     content.push(
                         widget::row::with_children(vec![

@@ -7,7 +7,13 @@
 
 use std::sync::LazyLock;
 
-use cosmic::widget::icon::{self, Handle};
+use cosmic::{
+    Element,
+    widget::{
+        self,
+        icon::{self, Handle},
+    },
+};
 
 /// Declares [`Icon`] from two tables: the application's own drawings, named by
 /// their file under `src/icons/`, and the names left to the desktop theme.
@@ -179,6 +185,50 @@ impl Icon {
 impl From<Icon> for Handle {
     fn from(icon: Icon) -> Self {
         icon.handle()
+    }
+}
+
+/// An informative glyph with the same resting ink as an inactive navigation
+/// row. Use this outside buttons, where no control style supplies icon color.
+pub fn passive_icon<'a, Message: 'a>(icon: impl Into<Handle>, size: u16) -> Element<'a, Message> {
+    widget::container(widget::icon(icon.into()).size(size))
+        .class(cosmic::theme::Container::custom(|theme| {
+            widget::container::Style {
+                icon_color: Some(crate::design::muted_icon_color(theme)),
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
+/// Embedded application artwork does not depend on the installed icon theme.
+pub fn ceditor_icon() -> Handle {
+    static ICON: LazyLock<Handle> = LazyLock::new(|| {
+        icon::from_svg_bytes(
+            include_bytes!("../../packaging/io.github.cagents.ceditor.svg").as_slice(),
+        )
+        .symbolic(false)
+    });
+    ICON.clone()
+}
+
+/// Provider identity is shared by terminal and native-chat tab presentations.
+pub fn provider_icon(provider: crate::agent::Provider) -> Handle {
+    use crate::agent::Provider;
+
+    static OMP: LazyLock<Handle> = LazyLock::new(|| {
+        icon::from_svg_bytes(include_bytes!("../icons/omp.svg").as_slice()).symbolic(false)
+    });
+    static CLAUDE: LazyLock<Handle> = LazyLock::new(|| {
+        icon::from_svg_bytes(include_bytes!("../icons/claude.svg").as_slice()).symbolic(false)
+    });
+    static CODEX: LazyLock<Handle> = LazyLock::new(|| {
+        icon::from_svg_bytes(include_bytes!("../icons/codex.svg").as_slice()).symbolic(true)
+    });
+    match provider {
+        Provider::Omp => OMP.clone(),
+        Provider::Claude => CLAUDE.clone(),
+        Provider::Codex => CODEX.clone(),
     }
 }
 

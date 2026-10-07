@@ -51,7 +51,7 @@ fn setting_input<'a>(
 ) -> Setting<'a, Message> {
     let label = field.label();
     let error = invalid.get(&field).map(String::as_str);
-    let mut input = widget::text_input(label, value)
+    let mut input = crate::ui_controls::field::text(label, value)
         .on_input(move |value| Message::SettingsDraftChanged { field, value })
         .width(Length::Fill);
     if let Some(error) = error {
@@ -77,34 +77,19 @@ fn setting_stepper<'a>(
         value: format!("{:.3}", next.clamp(min, max)),
     };
     let control = widget::row::with_children(vec![
-        crate::ui_controls::icon_control(
-            Icon::Minus,
-            format!("Decrease {label}"),
-            false,
-            current > min,
-            (current > min).then(|| change(current - step)),
-        )
-        .into(),
-        widget::container(widget::text::body(format!("{}{}", current, unit)))
+        crate::ui_controls::icon_button(Icon::Minus, format!("Decrease {label}"))
+            .on_press_maybe((current > min).then(|| change(current - step)))
+            .into(),
+        widget::container(design::body(format!("{}{}", current, unit)))
             .center_x(72)
             .center_y(design::PRIMARY_CONTROL_SIZE)
             .into(),
-        crate::ui_controls::icon_control(
-            Icon::Plus,
-            format!("Increase {label}"),
-            false,
-            current < max,
-            (current < max).then(|| change(current + step)),
-        )
-        .into(),
-        crate::ui_controls::icon_control(
-            Icon::Undo,
-            format!("Reset {label}"),
-            false,
-            current != default,
-            (current != default).then(|| change(default)),
-        )
-        .into(),
+        crate::ui_controls::icon_button(Icon::Plus, format!("Increase {label}"))
+            .on_press_maybe((current < max).then(|| change(current + step)))
+            .into(),
+        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label}"))
+            .on_press_maybe((current != default).then(|| change(default)))
+            .into(),
     ])
     .spacing(design::GRID_UNIT)
     .align_y(Alignment::Center)
@@ -129,7 +114,7 @@ fn settings_choice<'a>(
             };
             crate::interaction::hover(
                 widget::button::custom(
-                    widget::row::with_children(vec![marker, widget::text::body(choice).into()])
+                    widget::row::with_children(vec![marker, design::body(choice).into()])
                         .spacing(2.0 * design::GRID_UNIT)
                         .align_y(Alignment::Center),
                 )
@@ -273,7 +258,7 @@ fn settings_category_controls<'a>(
             controls.push(setting_field(
                 "Test notification",
                 "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
-                widget::button::standard(if testing_notification {
+                crate::ui_controls::button::secondary(if testing_notification {
                     "Sending test notification…"
                 } else {
                     "Send test notification"
@@ -313,7 +298,7 @@ fn settings_category_controls<'a>(
                 update_row.push(
                     // `Apply` is refused while this window is blocked, so the
                     // button is disabled and the reason shown below it.
-                    widget::button::suggested("Review update")
+                    crate::ui_controls::button::primary("Review update")
                         .on_press_maybe(
                             updates
                                 .apply_blocker
@@ -324,7 +309,7 @@ fn settings_category_controls<'a>(
                 );
             } else {
                 update_row.push(
-                    widget::button::standard(if updates.checking {
+                    crate::ui_controls::button::secondary(if updates.checking {
                         "Checking…"
                     } else {
                         "Check for updates"
@@ -384,7 +369,7 @@ fn settings_category_controls<'a>(
             settings.push(setting_field(
                 "Manage accounts",
                 "Add, rename, sign in to or remove accounts, and compare what each has left.",
-                widget::button::standard("Open Accounts")
+                crate::ui_controls::button::secondary("Open Accounts")
                     .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                     .into(),
             ));
@@ -399,7 +384,7 @@ fn settings_category_controls<'a>(
                 setting_field(
                     "Reset all settings",
                     "Restore default preferences; saved conversations and tabs are preserved.",
-                    widget::button::destructive("Reset all settings")
+                    crate::ui_controls::button::destructive("Reset all settings")
                         .id(widget::Id::new("settings.reset"))
                         .on_press(Message::ResetSettings)
                         .into(),
@@ -833,7 +818,7 @@ fn settings_category_controls<'a>(
                 setting_field(
                     "Browser logins",
                     "Choose sites from local browser profiles to import into this app session.",
-                    widget::button::standard("Import browser logins")
+                    crate::ui_controls::button::secondary("Import browser logins")
                         .on_press(Message::BrowserImport(browser_import_ui::Action::Open))
                         .into(),
                 ),
@@ -1186,7 +1171,7 @@ fn category_button<'a>(
         settings_icon(category_icon(item)).into(),
         // One line, cut short in a pane too narrow for the full
         // label; the button's accessible name keeps all of it.
-        widget::text::body(item.label())
+        design::body(item.label())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -1292,7 +1277,7 @@ fn settings_layout<'a>(
     let searching = !query.trim().is_empty();
     let gutter = if narrow { 3.0 } else { 5.0 } * design::GRID_UNIT;
 
-    let mut search = widget::text_input::search_input("Search settings", query)
+    let mut search = crate::ui_controls::field::search("Search settings", query)
         .id(crate::settings_widgets::search_id())
         .on_input(Message::SettingsSearchChanged)
         .width(Length::Fill);
@@ -1509,16 +1494,14 @@ fn shortcut_input<'a>(
             widget::container(
                 widget::row::with_children(vec![
                     design::body(chord.clone()).into(),
-                    crate::ui_controls::icon_control(
+                    crate::ui_controls::icon_button(
                         Icon::Close,
                         format!("Remove {chord} shortcut for {label}"),
-                        false,
-                        true,
-                        Some(Message::SettingsDraftChanged {
-                            field,
-                            value: settings::format_chords(&remaining),
-                        }),
                     )
+                    .on_press(Message::SettingsDraftChanged {
+                        field,
+                        value: settings::format_chords(&remaining),
+                    })
                     .into(),
                 ])
                 .spacing(design::GRID_UNIT)
@@ -1533,26 +1516,18 @@ fn shortcut_input<'a>(
             .into()
         })
         .collect();
-    let record: Element<'a, Message> = crate::ui_controls::icon_control(
-        Icon::Keyboard,
-        format!("Record shortcut for {label}"),
-        false,
-        true,
-        Some(Message::Palette(palette_ui::Action::Record(field))),
-    )
-    .into();
+    let record: Element<'a, Message> =
+        crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
+            .on_press(Message::Palette(palette_ui::Action::Record(field)))
+            .into();
     let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
-    let reset: Element<'a, Message> = crate::ui_controls::icon_control(
-        Icon::Undo,
-        format!("Reset {label} shortcut"),
-        false,
-        value != default,
-        Some(Message::SettingsDraftChanged {
-            field,
-            value: default,
-        }),
-    )
-    .into();
+    let reset: Element<'a, Message> =
+        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+            .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                field,
+                value: default,
+            }))
+            .into();
     controls.push(
         widget::row::with_children(vec![record, reset])
             .spacing(design::GRID_UNIT)
