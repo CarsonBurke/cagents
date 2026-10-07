@@ -7869,7 +7869,13 @@ impl Cagents {
                 _ => {}
             }
             match transition.to {
-                VisibilityClass::Offscreen => schedule_delayed_sweep = true,
+                VisibilityClass::Offscreen => {
+                    schedule_delayed_sweep = true;
+                    // A card's grace runs from the sweep that sees it leave
+                    // the screen, so one that left without passing through
+                    // the overscan is shown to a sweep now.
+                    reconcile_now |= transition.from == VisibilityClass::Visible;
+                }
                 VisibilityClass::Overscan if browser_card => {
                     reconcile_now = true;
                     schedule_delayed_sweep = true;

@@ -31,6 +31,8 @@ pub enum LifecycleAction {
 struct RuntimeCard {
     exposure: Exposure,
     residency: Residency,
+    /// When the card was last known to be on screen: stamped by every sweep
+    /// that finds it there, and once more by the sweep that sees it leave.
     last_visible: Instant,
     epoch: u64,
 }
@@ -137,6 +139,13 @@ impl LifecycleManager {
                 return true;
             }
             if let Some(runtime) = self.cards.get_mut(card) {
+                if runtime.exposure == Exposure::Visible {
+                    // The grace runs from the card's departure. Sweeps only
+                    // happen on transitions, so the stamp of the last one that
+                    // saw it visible can be as old as the pane's stay on
+                    // screen, and would evict it the moment it left.
+                    runtime.last_visible = now;
+                }
                 runtime.exposure = Exposure::Offscreen;
                 actions.push(LifecycleAction::SetExposure {
                     card: *card,
@@ -155,6 +164,9 @@ impl LifecycleManager {
                 continue;
             };
             self.exposed.insert(card);
+            if next_exposure == Exposure::Visible || runtime.exposure == Exposure::Visible {
+                runtime.last_visible = now;
+            }
             if runtime.exposure != next_exposure {
                 runtime.exposure = next_exposure;
                 actions.push(LifecycleAction::SetExposure {
@@ -162,23 +174,35 @@ impl LifecycleManager {
                     exposure: next_exposure,
                 });
             }
-            if next_exposure == Exposure::Visible {
-                runtime.last_visible = now;
-            }
         }
 
         // Visible work always wins the budget. Iterating the two bands in
         // priority order avoids allocating and sorting hydration candidates.
-        for card in visible.iter().chain(prefetch.iter()) {
+        let mut preemptible = None;
+        for (card, on_screen) in visible
+            .iter()
+            .map(|card| (card, true))
+            .chain(prefetch.iter().map(|card| (card, false)))
+        {
+            if !self.cards.get(card).is_some_and(|runtime| {
+                matches!(runtime.residency, Residency::Cold | Residency::Hibernated)
+            }) {
+                continue;
+            }
             if self.hot.len() >= self.budget.max_hot_cards {
-                break;
+                // A pane the user is looking at does not wait out the grace of
+                // one they are not. Warming a neighbour is never worth a slot
+                // somebody else holds, and neither band comes after it.
+                if !on_screen {
+                    break;
+                }
+                let Some(evicted) = preemptible.get_or_insert_with(|| self.preemptible()).next()
+                else {
+                    break;
+                };
+                self.evict(evicted, &mut actions);
             }
-            let Some(runtime) = self.cards.get_mut(card) else {
-                continue;
-            };
-            if !matches!(runtime.residency, Residency::Cold | Residency::Hibernated) {
-                continue;
-            }
+            let runtime = self.cards.get_mut(card).expect("candidate exists");
             runtime.epoch = runtime.epoch.wrapping_add(1);
             runtime.residency = Residency::Hydrating {
                 epoch: runtime.epoch,
@@ -208,19 +232,50 @@ impl LifecycleManager {
             if !grace_elapsed && self.hot.len() <= self.budget.max_hot_cards {
                 continue;
             }
-            let runtime = self.cards.get_mut(&card).expect("candidate exists");
-            runtime.epoch = runtime.epoch.wrapping_add(1);
-            runtime.residency = Residency::Evicting {
-                epoch: runtime.epoch,
-            };
-            actions.push(LifecycleAction::Hibernate {
-                card,
-                epoch: runtime.epoch,
-            });
-            self.hot.remove(&card);
+            self.evict(card, &mut actions);
         }
 
         actions
+    }
+
+    /// The hot cards a visible one may take a slot from, in the order they
+    /// give theirs up: those off screen before those only kept warm beside
+    /// it, and among each the one seen longest ago.
+    fn preemptible(&self) -> std::vec::IntoIter<CardId> {
+        let mut candidates: Vec<_> = self
+            .hot
+            .iter()
+            .filter_map(|card| self.cards.get(card).map(|runtime| (*card, runtime)))
+            .filter(|(_, runtime)| {
+                runtime.exposure != Exposure::Visible && matches!(runtime.residency, Residency::Hot)
+            })
+            .map(|(card, runtime)| {
+                (
+                    runtime.exposure == Exposure::Prefetch,
+                    runtime.last_visible,
+                    card,
+                )
+            })
+            .collect();
+        candidates.sort_by_key(|(warm, last_visible, _)| (*warm, *last_visible));
+        candidates
+            .into_iter()
+            .map(|(.., card)| card)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn evict(&mut self, card: CardId, actions: &mut Vec<LifecycleAction>) {
+        let runtime = self.cards.get_mut(&card).expect("candidate exists");
+        runtime.epoch = runtime.epoch.wrapping_add(1);
+        runtime.residency = Residency::Evicting {
+            epoch: runtime.epoch,
+        };
+        actions.push(LifecycleAction::Hibernate {
+            card,
+            epoch: runtime.epoch,
+        });
+        self.hot.remove(&card);
     }
 
     pub fn hydration_finished(
@@ -425,6 +480,171 @@ mod tests {
             manager.next_offscreen_sweep_delay(swept),
             Some(Duration::from_secs(20))
         );
+    }
+
+    fn hibernated(actions: &[LifecycleAction]) -> Vec<CardId> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                LifecycleAction::Hibernate { card, .. } => Some(*card),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hydrated(actions: &[LifecycleAction]) -> Vec<CardId> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                LifecycleAction::Hydrate { card, .. } => Some(*card),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_visible_card_takes_the_slot_of_the_hidden_card_seen_longest_ago() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(30);
+        let older = CardId::new();
+        let newer = CardId::new();
+        let arriving = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 2,
+            offscreen_grace: grace,
+        });
+        manager.register(older, Exposure::Offscreen, Residency::Hot, now);
+        manager.register(
+            newer,
+            Exposure::Offscreen,
+            Residency::Hot,
+            now + Duration::from_secs(1),
+        );
+        manager.register(arriving, Exposure::Offscreen, Residency::Hibernated, now);
+
+        // Both slots are held by cards still inside their grace. Waiting it
+        // out would leave the pane on screen empty for up to that long.
+        let sweep = now + Duration::from_secs(2);
+        let actions = manager.reconcile(&HashSet::from([arriving]), &HashSet::new(), sweep);
+        assert_eq!(hibernated(&actions), [older]);
+        assert_eq!(hydrated(&actions), [arriving]);
+        assert_eq!(manager.state(newer).unwrap().1, &Residency::Hot);
+        // The slot is released before it is taken again.
+        let released = actions
+            .iter()
+            .position(|action| matches!(action, LifecycleAction::Hibernate { .. }));
+        let taken = actions
+            .iter()
+            .position(|action| matches!(action, LifecycleAction::Hydrate { .. }));
+        assert!(released < taken);
+    }
+
+    #[test]
+    fn a_visible_card_takes_a_warm_slot_only_when_no_hidden_card_holds_one() {
+        let now = Instant::now();
+        let warm = CardId::new();
+        let hidden = CardId::new();
+        let shown = CardId::new();
+        let first = CardId::new();
+        let second = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 3,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        // The warm card was seen longer ago than the hidden one, and still
+        // outranks it: it is the next pane a scroll would reveal.
+        manager.register(warm, Exposure::Prefetch, Residency::Hot, now);
+        manager.register(
+            hidden,
+            Exposure::Offscreen,
+            Residency::Hot,
+            now + Duration::from_secs(1),
+        );
+        manager.register(shown, Exposure::Visible, Residency::Hot, now);
+        manager.register(first, Exposure::Offscreen, Residency::Hibernated, now);
+        manager.register(second, Exposure::Offscreen, Residency::Hibernated, now);
+        let sweep = now + Duration::from_secs(2);
+
+        let actions = manager.reconcile(
+            &HashSet::from([shown, first]),
+            &HashSet::from([warm]),
+            sweep,
+        );
+        assert_eq!(hibernated(&actions), [hidden]);
+        assert_eq!(hydrated(&actions), [first]);
+
+        let actions = manager.reconcile(
+            &HashSet::from([shown, first, second]),
+            &HashSet::from([warm]),
+            sweep,
+        );
+        assert_eq!(hibernated(&actions), [warm]);
+        assert_eq!(hydrated(&actions), [second]);
+
+        // A card on screen is never displaced, and one that lost its slot to
+        // the screen does not take one back to stay warm.
+        let third = CardId::new();
+        manager.register(third, Exposure::Offscreen, Residency::Hibernated, now);
+        let actions = manager.reconcile(
+            &HashSet::from([shown, first, second, third]),
+            &HashSet::from([warm]),
+            sweep,
+        );
+        assert_eq!(hibernated(&actions), []);
+        assert_eq!(hydrated(&actions), []);
+        assert_eq!(
+            manager.state(warm).unwrap().1,
+            &Residency::Evicting { epoch: 1 }
+        );
+    }
+
+    #[test]
+    fn a_warm_card_waits_for_a_slot_instead_of_taking_one() {
+        let now = Instant::now();
+        let hidden = CardId::new();
+        let warm = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 1,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        manager.register(hidden, Exposure::Offscreen, Residency::Hot, now);
+        manager.register(warm, Exposure::Offscreen, Residency::Hibernated, now);
+
+        let actions = manager.reconcile(&HashSet::new(), &HashSet::from([warm]), now);
+        assert_eq!(hibernated(&actions), []);
+        assert_eq!(hydrated(&actions), []);
+    }
+
+    #[test]
+    fn the_grace_runs_from_when_a_card_left_the_screen() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(30);
+        let leaving = CardId::new();
+        let staying = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 6,
+            offscreen_grace: grace,
+        });
+        manager.register(leaving, Exposure::Visible, Residency::Hot, now);
+        manager.register(staying, Exposure::Visible, Residency::Hot, now);
+
+        // Nothing sweeps while a pane simply stays on screen, so the sweep
+        // that sees it leave is long after the last one that saw it there.
+        let left = now + Duration::from_secs(600);
+        let actions = manager.reconcile(&HashSet::from([staying]), &HashSet::from([leaving]), left);
+        assert_eq!(hibernated(&actions), []);
+        let actions = manager.reconcile(&HashSet::from([staying]), &HashSet::new(), left);
+        assert_eq!(hibernated(&actions), []);
+        assert_eq!(manager.next_offscreen_sweep_delay(left), Some(grace));
+
+        let actions = manager.reconcile(
+            &HashSet::from([staying]),
+            &HashSet::new(),
+            left + grace - Duration::from_secs(1),
+        );
+        assert_eq!(hibernated(&actions), []);
+        let actions = manager.reconcile(&HashSet::from([staying]), &HashSet::new(), left + grace);
+        assert_eq!(hibernated(&actions), [leaving]);
     }
 
     #[test]
