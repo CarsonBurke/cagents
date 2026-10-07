@@ -972,7 +972,16 @@ impl Workspace {
             FocusDirection::Left => current.saturating_sub(1),
             FocusDirection::Right => (current + 1).min(self.cards.len() - 1),
         };
-        self.focus(self.cards[next].id)
+        let id = self.cards[next].id;
+        if self.focused == Some(id) {
+            // There is no neighbour past an end of the strip. The pane is
+            // still brought back into view, as any navigation would, but the
+            // keyboard stays where it is: asking for it again would pull it
+            // out of a find bar and back to the pane's default control.
+            self.reveal_focused();
+            return Ok(self.refresh_visibility(false));
+        }
+        self.focus(id)
     }
 
     pub fn take_widget_focus_request(&mut self) -> Option<CardId> {
@@ -2260,6 +2269,40 @@ mod tests {
         assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
         assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
         assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    #[test]
+    fn navigating_past_an_end_of_the_strip_leaves_the_keyboard_where_it_is() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        for (end, direction) in [
+            (ids[0], FocusDirection::Left),
+            (ids[3], FocusDirection::Right),
+        ] {
+            workspace.focus(end).unwrap();
+            while workspace.is_animating() {
+                workspace.tick(Duration::from_millis(16));
+            }
+            assert_eq!(workspace.take_widget_focus_request(), Some(end));
+
+            assert_eq!(
+                workspace.focus_adjacent(direction).unwrap(),
+                ViewportUpdate::unchanged()
+            );
+            assert_eq!(workspace.focused(), Some(end));
+            assert_eq!(workspace.take_widget_focus_request(), None);
+            assert!(!workspace.is_animating());
+        }
+
+        // A pane the user scrolled away from is still brought back.
+        workspace.native_scroll(0.0, 1_000.0);
+        workspace.focus_adjacent(FocusDirection::Right).unwrap();
+        assert_eq!(workspace.camera().target(), 1_000.0);
+        assert_eq!(workspace.take_widget_focus_request(), None);
+
+        // Anywhere else the neighbour takes the keyboard as before.
+        workspace.focus_adjacent(FocusDirection::Left).unwrap();
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[2]));
     }
 
     #[test]
