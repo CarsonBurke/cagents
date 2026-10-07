@@ -312,7 +312,11 @@ fn notify_archived(notice: impl FnOnce() + Send + 'static) {
             .name("terminal-archive-notify".into())
             .spawn(move || {
                 for notice in pending {
-                    notice();
+                    // This thread serves every completed terminal for the life
+                    // of the process. A subscriber that panics has already
+                    // been reported by the panic hook; it must not take the
+                    // redraws and search results of all the others with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
                 }
             })
         {
@@ -320,8 +324,8 @@ fn notify_archived(notice: impl FnOnce() + Send + 'static) {
         }
         notices
     });
-    // Sending fails only once that thread is gone: it never started, which is
-    // reported above, or a callback panicked, which the panic hook reports.
+    // Sending fails only when that thread never started, which is reported
+    // above.
     let _ = notifier.send(Box::new(notice));
 }
 
@@ -3933,6 +3937,20 @@ mod tests {
                 .any(|event| matches!(event, TerminalEvent::SearchResults { request: 1, .. }))
         );
         handle.shutdown().unwrap();
+    }
+
+    /// One notifier thread outlives every completed terminal, so a subscriber
+    /// that panics must cost only its own notice.
+    #[test]
+    fn a_panicking_archived_notice_does_not_silence_later_ones() {
+        notify_archived(|| panic!("fixture subscriber failure"));
+        let (delivered, later) = crossbeam_channel::bounded(1);
+        notify_archived(move || {
+            let _ = delivered.send(());
+        });
+        later
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the notifier stopped after one subscriber panicked");
     }
 
     #[test]
