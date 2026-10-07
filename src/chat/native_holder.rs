@@ -240,20 +240,26 @@ impl Recovery {
 /// during a long command, a yielded-command poll, and a pending approval.
 /// This is deliberately an allowlist: a 0.x version increment is not a promise
 /// that an app-server preserves all three boundaries without a client.
-const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1"];
+///
+/// `tests/codex_continuity_qualification.rs` is that verification, run against
+/// the real executable through a killed daemon. A version belongs here only
+/// after it passes; a server of any other version ends with its daemon.
+pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1"];
 
 /// Codex's initialize response includes its own version in a user agent whose
 /// prefix is the client name supplied by this application. Use that response
 /// from the actual owned server, rather than a separate executable probe that
 /// could race an installation update.
-pub(crate) fn verified_codex_version(user_agent: &str) -> Option<&str> {
-    let version = user_agent
+pub(crate) fn codex_version(user_agent: &str) -> Option<&str> {
+    user_agent
         .strip_prefix("cagents/")?
         .split_whitespace()
-        .next()?;
-    VERIFIED_CODEX_VERSIONS
-        .contains(&version)
-        .then_some(version)
+        .next()
+}
+
+/// The server's version, when it is one whose continuity was verified.
+pub(crate) fn verified_codex_version(user_agent: &str) -> Option<&str> {
+    codex_version(user_agent).filter(|version| VERIFIED_CODEX_VERSIONS.contains(version))
 }
 
 #[cfg(test)]
@@ -361,6 +367,14 @@ mod tests {
             verified_codex_version("cagents/0.157.1 (Linux; x86_64) terminal (cagents; 0.1.3)"),
             Some("0.157.1")
         );
+        assert_eq!(
+            verified_codex_version("cagents/0.160.1 (Linux; x86_64) unknown (cagents; 0.1.3)"),
+            Some("0.160.1")
+        );
+        // An unverified server still reports which version it is, so the
+        // conversation it leaves without durability can be named.
+        assert_eq!(codex_version("cagents/0.158.0 (Linux)"), Some("0.158.0"));
+        assert_eq!(codex_version("another-client/0.157.1 (Linux)"), None);
         for user_agent in [
             "cagents/0.153.0 (Linux)",
             "cagents/0.157.2 (Linux)",

@@ -333,6 +333,7 @@ impl Handle {
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
+                    reconnect_only_reported: false,
                     expected_native_peer,
                     native_peer: None,
                     preserve_native: preserve_native.clone(),
@@ -1275,6 +1276,8 @@ struct Actor {
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
+    /// Whether this conversation's lack of durable continuity was logged.
+    reconnect_only_reported: bool,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
     preserve_native: Arc<AtomicBool>,
@@ -1773,6 +1776,26 @@ impl Actor {
             Event::Reset { .. } => Some(None),
             _ => None,
         });
+        if let Some(Some(thread)) = &identity
+            && self.native_holder.is_some()
+            && let Some(identity) = self.adapter.server_identity()
+            && super::native_holder::verified_codex_version(&identity.user_agent).is_none()
+            && !std::mem::replace(&mut self.reconnect_only_reported, true)
+        {
+            // The holder of an unconfirmed server ends it when the daemon
+            // connection is lost, so say which conversation that leaves
+            // without the continuity the holder otherwise provides.
+            tracing::warn!(
+                %thread,
+                version = super::native_holder::codex_version(&identity.user_agent)
+                    .unwrap_or("unrecognized"),
+                user_agent = %identity.user_agent,
+                verified = ?super::native_holder::VERIFIED_CODEX_VERSIONS,
+                "Codex version is not verified for durable continuity; this conversation's \
+                 server ends if the daemon exits or restarts, and the conversation then \
+                 resumes from disk without its running turn"
+            );
+        }
         if let Some(Some(thread)) = &identity
             && let Some(holder) = &mut self.native_holder
             && let Some(identity) = self.adapter.server_identity()
