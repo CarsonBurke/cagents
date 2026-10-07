@@ -390,41 +390,7 @@ impl Handle {
                             inode,
                         } => actor.run_websocket(initial, &socket, device, inode),
                         TransportSpec::OwnedUnixWebSocket { socket } => {
-                            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                            let started = Instant::now();
-                            let metadata = loop {
-                                if let Ok(metadata) = std::fs::metadata(&socket)
-                                    && metadata.file_type().is_socket()
-                                {
-                                    break Ok(metadata);
-                                }
-                                if actor.stop.load(Ordering::Acquire) {
-                                    break Err("Provider startup cancelled".to_owned());
-                                }
-                                if actor.child.as_mut().is_some_and(|child| {
-                                    child.0.try_wait().ok().flatten().is_some()
-                                }) {
-                                    break Err(
-                                        "Codex server exited before opening its local socket"
-                                            .to_owned(),
-                                    );
-                                }
-                                if started.elapsed() >= Duration::from_secs(15) {
-                                    break Err(
-                                    "Codex server did not open its local socket within 15 seconds"
-                                        .to_owned(),
-                                );
-                                }
-                                thread::sleep(Duration::from_millis(20));
-                            };
-                            metadata.and_then(|metadata| {
-                                actor.run_websocket(
-                                    initial,
-                                    &socket,
-                                    metadata.dev(),
-                                    metadata.ino(),
-                                )
-                            })
+                            actor.run_launched_websocket(initial, &socket)
                         }
                     }
                 }))
