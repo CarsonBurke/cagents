@@ -11,7 +11,7 @@ use cosmic::{
     widget::text::Text,
 };
 
-use super::{GRID_UNIT, RADIUS_XS, accent_color, muted_text, raised};
+use super::{GRID_UNIT, RADIUS_XS, accent_color, muted_text, raised, space};
 
 /// The size of nearly everything in the shell: rows, controls, labels.
 pub const TEXT_BODY: f32 = 13.0;
@@ -104,7 +104,7 @@ pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::
         h5_size: size.into(),
         h6_size: size.into(),
         code_size: size.into(),
-        spacing: (GRID_UNIT * 2.0).into(),
+        spacing: space::S.into(),
         ..markdown::Settings::with_text_size(size, style)
     }
 }

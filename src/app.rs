@@ -76,7 +76,7 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout},
+    design::{self, DockLayout, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
         ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
@@ -506,7 +506,6 @@ fn notice_surface<'a>(
     action: Option<Element<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
     let mut children = vec![severity.icon().handle().icon().size(16).into(), body];
     if let Some(action) = action {
         children.push(action);
@@ -514,7 +513,7 @@ fn notice_surface<'a>(
     let mut surface = widget::container(
         widget::row::with_children(children)
             .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs),
+            .spacing(space::S),
     )
     .class(cosmic::theme::Container::custom(move |theme| {
         let component = severity.component(theme.cosmic());
@@ -531,9 +530,9 @@ fn notice_surface<'a>(
         }
     }))
     .padding(if compact {
-        Padding::from([0, spacing.space_xs])
+        Padding::from([0.0, space::M])
     } else {
-        Padding::from(spacing.space_xs)
+        Padding::from(space::M)
     })
     .width(Length::Fill);
     if compact {
@@ -756,7 +755,6 @@ fn save_quarantine_view<'a>(
             }),
         )
     };
-    let spacing = cosmic::theme::spacing();
     Some(notice_surface(
         NoticeSeverity::Error,
         widget::column::with_children(vec![
@@ -764,7 +762,7 @@ fn save_quarantine_view<'a>(
             notice_surface_detail(NoticeSeverity::Error, detail.join("\n")),
             notice_surface_detail(NoticeSeverity::Error, guidance),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .width(Length::Fill)
         .into(),
         action,
@@ -855,7 +853,6 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             None,
         ),
     };
-    let spacing = cosmic::theme::spacing();
     Some(notice_surface(
         severity,
         widget::column::with_children(vec![
@@ -863,7 +860,7 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             notice_surface_detail(severity, detail),
             notice_surface_detail(severity, guidance),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .width(Length::Fill)
         .into(),
         action,
@@ -6412,7 +6409,6 @@ impl Cagents {
         pane: &'a PullRequestPane,
         width: f32,
     ) -> Element<'a, Message> {
-        let spacing = cosmic::theme::spacing();
         let collapsed = pane.file_panel_collapsed.unwrap_or(width < 640.0);
         let max_width = (width - 320.0).clamp(120.0, 600.0);
         let panel_width = pane.file_panel_width.clamp(120.0, max_width);
@@ -6447,11 +6443,11 @@ impl Cagents {
                             .width(Length::Fill)
                             .into(),
                     ])
-                    .spacing(spacing.space_xxs)
+                    .spacing(space::S)
                     .align_y(Alignment::Center),
                 )
                 .height(Length::Fixed(design::HEADER_CONTENT_HEIGHT))
-                .padding([0, spacing.space_xs])
+                .padding([0.0, space::M])
                 .align_y(Alignment::Center)
                 .width(Length::Fill)
                 .into(),
@@ -6459,14 +6455,11 @@ impl Cagents {
             side.push(design::horizontal_rule());
             side.push(review.browser(modal_open));
         }
-        let side: Element<'a, pull_request_review::Action> = widget::container(
-            widget::column::with_children(side)
-                .spacing(0)
-                .height(Length::Fill),
-        )
-        .width(Length::Fixed(panel_width))
-        .height(Length::Fill)
-        .into();
+        let side: Element<'a, pull_request_review::Action> =
+            widget::container(widget::column::with_children(side).height(Length::Fill))
+                .width(Length::Fixed(panel_width))
+                .height(Length::Fill)
+                .into();
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
@@ -6539,16 +6532,15 @@ impl Cagents {
                             .into(),
                     ])
                     .align_x(Alignment::Center)
-                    .spacing(spacing.space_xs)
+                    .spacing(space::M)
                     .width(Length::Fill),
                 )
                 .center(Length::Fill)
-                .padding(spacing.space_m)
+                .padding(space::XL)
                 .into(),
             );
         }
         let main = widget::column::with_children(main)
-            .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -6572,7 +6564,6 @@ impl Cagents {
         }
         children.push(main);
         widget::row::with_children(children)
-            .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -8565,7 +8556,6 @@ impl Cagents {
         focused: bool,
         show_resize_splitter: bool,
     ) -> Element<'a, Message> {
-        let spacing = cosmic::theme::spacing();
         let card = self.card_state(id);
         let attention = self.sidebar_state.has_card_update(id) && !focused;
         let labels = card_kind_labels(card.map(|card| &card.kind));
@@ -8674,11 +8664,11 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(spacing.space_xxxs)
+                .spacing(space::XS)
                 .width(Length::Fill),
             )
             .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
-            .padding([0, spacing.space_xxs])
+            .padding([0.0, space::S])
             .class(cosmic::theme::Container::Background);
             let browser_loading = match self.cards.get(&id) {
                 Some(CardRuntime::Browser(browser)) => {
@@ -8725,7 +8715,7 @@ impl Cagents {
                     .into(),
                 );
             }
-            widget::column::with_children(rows).spacing(0).into()
+            widget::column::with_children(rows).into()
         });
 
         // A card that kept model focus under an open dialog would take the
@@ -8752,14 +8742,13 @@ impl Cagents {
                         .into(),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(spacing.space_xxxs)
+                .spacing(space::XS)
                 .width(Length::Fill),
             )
             .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
-            .padding([0, spacing.space_xxs])
+            .padding([0.0, space::S])
             .class(cosmic::theme::Container::Background);
             widget::column::with_children(vec![toolbar.into(), crate::design::horizontal_rule()])
-                .spacing(0)
                 .into()
         });
 
@@ -8952,7 +8941,7 @@ impl Cagents {
                             design::title(labels.unavailable).into(),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .into(),
                         widget::selectable_text(message)
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
@@ -8962,7 +8951,7 @@ impl Cagents {
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
                             let mut controls = vec![
-                                widget::button::suggested(retry_label)
+                                crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
                                     .on_press(Message::RetryCard(id))
@@ -8973,15 +8962,17 @@ impl Cagents {
                             // be the one who asks for it.
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
-                                    widget::button::standard("Start a new conversation here")
-                                        .id(card_control_id(id, "chat.fresh"))
-                                        .name("Start a new conversation in the same directory")
-                                        .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
-                                        .into(),
+                                    crate::ui_controls::button::secondary(
+                                        "Start a new conversation here",
+                                    )
+                                    .id(card_control_id(id, "chat.fresh"))
+                                    .name("Start a new conversation in the same directory")
+                                    .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
+                                    .into(),
                                 );
                             }
                             controls.push(
-                                widget::button::standard("Close")
+                                crate::ui_controls::button::secondary("Close")
                                     .id(card_control_id(id, "failed.close"))
                                     .name(format!("Close {}", labels.type_label))
                                     .on_press(Message::CloseCard(id))
@@ -8989,14 +8980,14 @@ impl Cagents {
                             );
                             controls
                         })
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .into(),
                     ])
-                    .spacing(spacing.space_s),
+                    .spacing(space::L),
                 )
                 .class(cosmic::theme::Container::Secondary)
                 .max_width(520)
-                .padding(spacing.space_m),
+                .padding(space::XL),
             )
             .center(Length::Fill)
             .into(),
@@ -9010,14 +9001,14 @@ impl Cagents {
                             .into(),
                     ])
                     .align_x(Alignment::Center)
-                    .spacing(spacing.space_xs),
+                    .spacing(space::M),
                 )
                 .class(cosmic::theme::Container::Card)
                 .max_width(STATUS_SURFACE_MAX_WIDTH)
-                .padding(spacing.space_m),
+                .padding(space::XL),
             )
             .center(Length::Fill)
-            .padding(spacing.space_m)
+            .padding(space::XL)
             .into(),
         };
 
@@ -9061,25 +9052,22 @@ impl Cagents {
             // the output stops: the last lines it printed stay in view.
             rows.push(self.ended_terminal_footer(id, session));
         }
-        let surface: Element<'a, Message> = widget::container(
-            widget::column::with_children(rows)
-                .spacing(0)
-                .height(Length::Fill),
-        )
-        .class(cosmic::theme::Container::custom(move |theme| {
-            iced::widget::container::Style {
-                background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
-                border: iced::Border {
-                    color: design::warning_color(theme),
-                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
+        let surface: Element<'a, Message> =
+            widget::container(widget::column::with_children(rows).height(Length::Fill))
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
+                        border: iced::Border {
+                            color: design::warning_color(theme),
+                            width: if attention { design::BORDER_WIDTH } else { 0.0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                }))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         let edge: Element<'a, Message> = if card.is_some() {
             if show_resize_splitter {
                 let limits = self.workspace.card_resize_limits(id);
@@ -9359,9 +9347,9 @@ impl Cagents {
                         design::body(title).into(),
                         design::caption(detail).into(),
                     ])
-                    .spacing(design::GRID_UNIT),
+                    .spacing(space::XS),
                 )
-                .padding(2.0 * design::GRID_UNIT)
+                .padding(space::S)
                 .width(Length::Fill)
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
@@ -9383,11 +9371,11 @@ impl Cagents {
         rows.push(design::caption("Release the modifier to open · Escape to cancel").into());
         Some(
             widget::container(
-                widget::scrollable(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
                     .height(Length::Shrink),
             )
             .class(cosmic::theme::Container::Card)
-            .padding(3.0 * design::GRID_UNIT)
+            .padding(space::M)
             .width(440)
             .max_height(400)
             .into(),
@@ -15699,10 +15687,10 @@ impl Application for Cagents {
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
                         widget::row::with_children(controls)
-                            .spacing(cosmic::theme::spacing().space_xxs)
+                            .spacing(space::S)
                             .into(),
                     ])
-                    .spacing(3.0 * design::GRID_UNIT),
+                    .spacing(space::M),
                     480.0,
                 ),
                 Some(Message::CancelTransientWorkClose),
@@ -15740,7 +15728,6 @@ impl Application for Cagents {
                 )
             });
         }
-        let spacing = cosmic::theme::spacing();
         // Above the settings surface it is raised from, because it is about to
         // discard every shortcut, font, theme and language-server entry the
         // user configured, with no undo.
@@ -15766,10 +15753,10 @@ impl Application for Cagents {
                                 .on_press(Message::ConfirmResetSettings)
                                 .into(),
                         ])
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .into(),
                     ])
-                    .spacing(3.0 * design::GRID_UNIT),
+                    .spacing(space::M),
                     480.0,
                 ),
                 Some(Message::CancelResetSettings),
@@ -15853,15 +15840,13 @@ impl Application for Cagents {
             );
             rows.push(
                 widget::row::with_children(controls)
-                    .spacing(spacing.space_xxs)
+                    .spacing(space::S)
                     .into(),
             );
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
-                    widget::container(
-                        widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                    )
-                    .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    widget::container(widget::column::with_children(rows).spacing(space::M))
+                        .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
                     560.0,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
@@ -15922,7 +15907,7 @@ impl Application for Cagents {
                     .on_input(Message::PullRequestTitleChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             widget::column::with_children(vec![
                 design::caption("Head branch").into(),
@@ -15931,7 +15916,7 @@ impl Application for Cagents {
                     .on_input(Message::PullRequestHeadChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             widget::column::with_children(vec![
                 design::caption("Base branch").into(),
@@ -15940,7 +15925,7 @@ impl Application for Cagents {
                     .on_input(Message::PullRequestBaseChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             widget::column::with_children(vec![
                 design::caption("Description").into(),
@@ -15950,9 +15935,9 @@ impl Application for Cagents {
                     .on_action(Message::PullRequestBodyChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
-            widget::checkbox(dialog.draft)
+            crate::ui_controls::field::checkbox(dialog.draft)
                 .label("Create as draft")
                 .on_toggle(Message::PullRequestDraftChanged)
                 .into(),
@@ -15965,7 +15950,7 @@ impl Application for Cagents {
                 .into(),
             );
             rows.push(
-                widget::checkbox(confirmed)
+                crate::ui_controls::field::checkbox(confirmed)
                     .label("I checked GitHub; no pull request was created")
                     .on_toggle(Message::PullRequestRetryConfirmed)
                     .into(),
@@ -15991,17 +15976,14 @@ impl Application for Cagents {
                     )
                     .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .into(),
         );
         Some(dialog_ui::overlay(
             dialog_ui::surface(
-                widget::scrollable(
-                    widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                )
-                .height(Length::Fixed(
-                    (self.window_height - 112.0).clamp(120.0, 620.0),
-                )),
+                widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(
+                    Length::Fixed((self.window_height - 112.0).clamp(120.0, 620.0)),
+                ),
                 620.0,
             ),
             Some(Message::CancelDialog),
@@ -16017,7 +15999,6 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -16130,10 +16111,10 @@ impl Application for Cagents {
                 primary,
                 widget::row::with_children(actions)
                     .align_y(Alignment::Center)
-                    .spacing(8)
+                    .spacing(space::S)
                     .into(),
             ])
-            .spacing(12);
+            .spacing(space::M);
             let mut content: Vec<Element<'_, Message>> = vec![
                 crate::ui_controls::passive_icon(Icon::Chat, 32),
                 design::display(if scoped {
@@ -16173,17 +16154,18 @@ impl Application for Cagents {
                             })
                             .collect::<Vec<_>>(),
                     )
-                    .spacing(12)
+                    .spacing(space::M)
                     .into(),
                 );
             }
-            let surface = widget::container(widget::column::with_children(content).spacing(16))
-                .padding(24)
-                .width(Length::Fill)
-                .max_width(440);
+            let surface =
+                widget::container(widget::column::with_children(content).spacing(space::L))
+                    .padding(space::XL)
+                    .width(Length::Fill)
+                    .max_width(440);
             widget::container(surface)
                 .center(Length::Fill)
-                .padding(spacing.space_m)
+                .padding(space::XL)
                 .into()
         } else {
             workspace_widget::view(
@@ -16276,7 +16258,6 @@ impl Application for Cagents {
                 InspectorLayout::Docked => {
                     let content: Element<'_, Message> =
                         widget::row::with_children(vec![sidebar, main_content, pane])
-                            .spacing(0)
                             .width(Length::Fill)
                             .height(Length::Fill)
                             .into();
@@ -16300,7 +16281,6 @@ impl Application for Cagents {
                             .into(),
                     );
                     let background = widget::row::with_children(vec![sidebar, main_content])
-                        .spacing(0)
                         .width(Length::Fill)
                         .height(Length::Fill);
                     let dismiss = crate::interaction::opaque(

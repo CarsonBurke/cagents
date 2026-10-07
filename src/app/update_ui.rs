@@ -175,7 +175,7 @@ impl Cagents {
         let heading = match self.release_notes_for(&preview.candidate.version) {
             Some(url) => widget::row::with_children(vec![title, release_notes_button(url)])
                 .align_y(Alignment::Center)
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             None => title,
         };
@@ -259,11 +259,11 @@ impl Cagents {
                 ))))
                 .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .into(),
         );
         Some(dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(body).spacing(16), 600.0),
+            dialog_ui::surface(widget::column::with_children(body).spacing(space::L), 600.0),
             Some(Message::UpdateUi(Action::CancelApply)),
             1.0,
         ))

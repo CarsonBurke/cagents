@@ -25,7 +25,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    design::{self, ROW_ICON_SIZE},
+    design::{self, ROW_ICON_SIZE, space},
     github::{
         FileViewedState, GitHubRepoKey, GitHubReviewApi, PullRequest, PullRequestFiles,
         PullRequestKey, PullRequestPage, ReviewContext, ReviewMutationOutcome,
@@ -1616,7 +1616,6 @@ impl State {
     /// in [`Self::summary`] beneath it instead of being elided to a few
     /// letters between the controls.
     pub fn header<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let Some(target) = &self.target else {
             return widget::Space::new().into();
         };
@@ -1652,7 +1651,7 @@ impl State {
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .align_y(Alignment::Center),
             format!(
                 "{state_label} pull request #{} in {}/{}",
@@ -1701,9 +1700,9 @@ impl State {
             activity,
             controls,
         ])
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .align_y(Alignment::Center)
-        .padding(Padding::from([0, spacing.space_xs]))
+        .padding(Padding::from([0.0, space::M]))
         .height(design::HEADER_CONTENT_HEIGHT)
         .width(Length::Fill)
         .into()
@@ -1712,7 +1711,6 @@ impl State {
     /// What is under review, in full: the title given the room to wrap, who
     /// proposes merging which branch into which, and the review entry point.
     pub fn summary<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let Some(target) = &self.target else {
             return widget::Space::new().into();
         };
@@ -1765,17 +1763,17 @@ impl State {
                     .into(),
                 self.review_control(modal_open),
             ])
-            .spacing(spacing.space_xs)
+            .spacing(space::M)
             .align_y(Alignment::Center)
             .padding(Padding {
-                top: spacing.space_xxs.into(),
+                top: space::S,
                 ..Padding::ZERO
             })
             .into(),
         );
         widget::column::with_children(rows)
-            .spacing(spacing.space_xxxs)
-            .padding(Padding::from([spacing.space_xs, spacing.space_xs]))
+            .spacing(space::XS)
+            .padding(Padding::from([space::M, space::M]))
             .width(Length::Fill)
             .into()
     }
@@ -1813,7 +1811,6 @@ impl State {
     }
 
     fn pane_notice(&self, modal_open: bool) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let message = match (&self.load, &self.notice) {
             (LoadState::Failed(message), _) => {
                 Cow::Owned(format!("Couldn’t load this pull request. {message}"))
@@ -1841,8 +1838,8 @@ impl State {
                 dismiss.into(),
             ])
             .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs)
-            .padding(Padding::from([spacing.space_xxxs, spacing.space_xs])),
+            .spacing(space::S)
+            .padding(Padding::from([space::XS, space::M])),
         )
         .width(Length::Fill)
         .into()
@@ -1851,7 +1848,6 @@ impl State {
     /// The file tree with a viewed mark per file and a tri-state mark per
     /// directory. Folders start open and may be folded independently.
     pub fn file_list(&self, modal_open: bool) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let list: Element<'_, Action> = crate::ui_controls::responsive(move |size| {
             self.file_scrollable(modal_open, size.height)
         })
@@ -1890,7 +1886,7 @@ impl State {
             controls,
         ])
         .align_y(Alignment::Center)
-        .padding([0, spacing.space_xs]);
+        .padding([0.0, space::M]);
         let unknown = self
             .files
             .iter()
@@ -1945,7 +1941,6 @@ impl State {
     }
 
     fn file_scrollable(&self, modal_open: bool, height: f32) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let tallies = directory_tallies(&self.rows, &self.files);
         let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> = Vec::new();
         let displayed = self.displayed_file_rows(&tallies);
@@ -2004,7 +1999,7 @@ impl State {
                     depth: 0,
                     directory: false,
                     element: widget::container(design::caption(message))
-                        .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                        .padding(Padding::from([space::S, space::M]))
                         .into(),
                 });
             }
@@ -2012,8 +2007,8 @@ impl State {
         widget::scrollable(
             widget::container(crate::sticky_tree::rows(rows, design::DENSE_ROW_HEIGHT))
                 .padding(design::with_vertical_rail(Padding::from([
-                    spacing.space_xxxs,
-                    spacing.space_xxs,
+                    space::XS,
+                    space::S,
                 ])))
                 .width(Length::Fill),
         )
@@ -2036,7 +2031,6 @@ impl State {
         file: &'a ReviewFile,
         modal_open: bool,
     ) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let selected = self.selected.as_ref() == Some(&row.path);
         let counts = line_change_counts(file.entry.added_lines, file.entry.removed_lines);
         let mut trailing: Vec<Element<'a, Action>> = Vec::with_capacity(3);
@@ -2107,11 +2101,11 @@ impl State {
                 .into(),
             name,
             widget::row::with_children(trailing)
-                .spacing(spacing.space_xxs)
+                .spacing(space::S)
                 .align_y(Alignment::Center)
                 .into(),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .height(Length::Fill);
         crate::interaction::hover(
@@ -2119,7 +2113,7 @@ impl State {
                 .class(sidebar_button_style(selected))
                 .name(format!("Review {}", row.path.display()))
                 .selected(selected)
-                .padding([0, spacing.space_xxxs])
+                .padding([0.0, space::XS])
                 .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
                 .width(Length::Fill)
                 .on_press_maybe((!modal_open).then(|| Action::SelectFile(row.path.clone()))),
@@ -2134,7 +2128,6 @@ impl State {
         unknown: usize,
         modal_open: bool,
     ) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let mark = if unknown > 0 {
             Mark::Mixed
         } else {
@@ -2160,7 +2153,7 @@ impl State {
                 .width(Length::Fill)
                 .into(),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .height(Length::Fill);
         let folder = button::custom(content)
@@ -2171,7 +2164,7 @@ impl State {
                 row.path.display()
             ))
             .on_press_maybe((!modal_open).then(|| Action::ToggleDirectory(row.path.clone())))
-            .padding([0, spacing.space_xxxs])
+            .padding([0.0, space::XS])
             .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
             .width(Length::Fill);
         widget::row::with_children(vec![
@@ -2201,7 +2194,6 @@ impl State {
     }
 
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         if self.source.is_none() {
             return widget::container(
                 design::caption(
@@ -2211,7 +2203,7 @@ impl State {
                 )
                 .wrapping(iced::widget::text::Wrapping::Word),
             )
-            .padding(spacing.space_xs)
+            .padding(space::M)
             .into();
         }
         let query = self.browser_query.trim().to_lowercase();
@@ -2230,14 +2222,14 @@ impl State {
                             .on_press_maybe((!modal_open).then_some(Action::LoadList))
                             .into(),
                     ])
-                    .spacing(spacing.space_xxs),
+                    .spacing(space::S),
                 )
-                .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                .padding(Padding::from([space::S, space::M]))
                 .into(),
             ],
             ListState::Ready(pull_requests) if pull_requests.is_empty() => vec![
                 widget::container(design::caption("No open pull requests."))
-                    .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                    .padding(Padding::from([space::S, space::M]))
                     .into(),
             ],
             ListState::Ready(pull_requests) => {
@@ -2338,7 +2330,7 @@ impl State {
                     ]))
                     .class(sidebar_button_style(false))
                     .width(Length::Fill)
-                    .padding([spacing.space_xxxs, spacing.space_xxs])
+                    .padding([space::XS, space::S])
                     .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
                         generation: self.list_generation,
                         action: Box::new(Action::OpenNumber(entry.number)),
@@ -2352,10 +2344,10 @@ impl State {
             _ => 0,
         };
         let list: Element<'a, Action> = widget::scrollable(
-            widget::container(widget::column::with_children(rows).spacing(0))
+            widget::container(widget::column::with_children(rows))
                 .padding(design::with_vertical_rail(Padding::from([
-                    spacing.space_xxxs,
-                    spacing.space_xxs,
+                    space::XS,
+                    space::S,
                 ])))
                 .width(Length::Fill),
         )
@@ -2376,7 +2368,7 @@ impl State {
             .on_input(Action::BrowserQuery)
             .into(),
             widget::row::with_children(vec![
-                widget::dropdown(
+                crate::ui_controls::field::select(
                     &BrowserFilter::ALL,
                     Some(self.browser_filter as usize),
                     Action::BrowserFilterIndex,
@@ -2386,7 +2378,7 @@ impl State {
                     .on_press_maybe((!modal_open && !self.list_loading).then_some(Action::LoadList))
                     .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .into(),
             design::caption(format!(
                 "{count} matching · {} loaded",
@@ -2405,9 +2397,9 @@ impl State {
             ))
             .into(),
         ])
-        .spacing(spacing.space_xxs)
-        .padding(spacing.space_xs);
-        let mut column = widget::column::with_children(vec![controls.into()]).spacing(0);
+        .spacing(space::S)
+        .padding(space::M);
+        let mut column = widget::column::with_children(vec![controls.into()]);
         if let Ok(number) = query.trim_start_matches('#').parse::<u64>()
             && number > 0
         {
@@ -2447,7 +2439,6 @@ pub fn browser_row<'a>(
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, Action> {
-    let spacing = cosmic::theme::spacing();
     let state = WorktreePullRequestState::from_github(pull_request);
     let checks = CheckStatus::from_checks(&pull_request.check_summaries());
     let icon = Icon::handle(match state {
@@ -2502,11 +2493,10 @@ pub fn browser_row<'a>(
             one_line(design::body(pull_request.title.as_str())).into(),
             one_line(design::caption(detail.join(" · "))).into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
     ])
-    .spacing(spacing.space_xxs)
+    .spacing(space::S)
     .align_y(Alignment::Center);
     crate::interaction::hover(
         button::custom(content)
@@ -2516,7 +2506,7 @@ pub fn browser_row<'a>(
                 pull_request.number, pull_request.title
             ))
             .selected(selected)
-            .padding([spacing.space_xxxs, spacing.space_xxs])
+            .padding([space::XS, space::S])
             .width(Length::Fill)
             .on_press_maybe((!modal_open).then_some(Action::Select(pull_request.number))),
     )

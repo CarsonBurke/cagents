@@ -116,8 +116,8 @@ enum Column {
     Updated,
 }
 
-const GUTTER: f32 = design::GRID_UNIT * 4.0;
-const COLUMN_SPACING: f32 = design::GRID_UNIT * 3.0;
+const GUTTER: f32 = space::L;
+const COLUMN_SPACING: f32 = space::M;
 const ACCOUNT_MIN_WIDTH: f32 = 180.0;
 const ACTIONS_WIDTH: f32 = design::COMPACT_CONTROL_SIZE * 2.0 + design::GRID_UNIT;
 const USAGE_WIDTH: f32 = 128.0;
@@ -316,10 +316,10 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     widget::scrollable(
         widget::container(
             widget::column::with_children(sections)
-                .spacing(design::GRID_UNIT * 6.0)
+                .spacing(space::XL)
                 .max_width(MAX_WIDTH),
         )
-        .padding(Padding::from([design::GRID_UNIT * 4.0, GUTTER]))
+        .padding(Padding::from([space::L, GUTTER]))
         .center_x(Length::Fill),
     )
     .direction(iced::widget::scrollable::Direction::Vertical(
@@ -345,7 +345,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                     .name(sort.description())
                     .selected(selected)
                     .class(crate::ui_controls::control_style(selected, None))
-                    .padding([2.0, design::GRID_UNIT * 2.0])
+                    .padding([space::XXS, space::S])
                     .on_press(action(Action::Sort(sort))),
                     sort.description(),
                 )
@@ -373,7 +373,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     .name("Add account")
     .selected(state.table.add_menu)
     .class(cosmic::theme::Button::Suggested)
-    .padding([design::GRID_UNIT, design::GRID_UNIT * 3.0])
+    .padding([space::XS, space::M])
     .on_press(action(Action::AddMenu(!state.table.add_menu)));
     let add_button: Element<'a, Message> = if layout.stacked {
         crate::interaction::tooltip(add_button, "Add account")
@@ -441,14 +441,14 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                     )
                     .into(),
                     design::horizontal_rule(),
-                    widget::checkbox(state.table.own_codex_config)
+                    crate::ui_controls::field::checkbox(state.table.own_codex_config)
                         .label("Keep a separate Codex configuration")
                         .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
                         .into(),
                     design::caption("Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.")
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
                 ])
-                .spacing(2),
+                .spacing(space::XXS),
             )
             .width(300)
             .into()
@@ -464,7 +464,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
         .into(),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .width(Length::Fill);
     if layout.compact_toolbar {
         return widget::column::with_children(vec![
@@ -474,15 +474,15 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                 iced::widget::Space::new().width(Length::Fill).into(),
                 add,
             ])
-            .spacing(design::GRID_UNIT * 3.0)
+            .spacing(space::M)
             .align_y(Alignment::Center)
             .into(),
         ])
-        .spacing(design::GRID_UNIT * 3.0)
+        .spacing(space::M)
         .into();
     }
     widget::row::with_children(vec![description.into(), sort, add])
-        .spacing(design::GRID_UNIT * 3.0)
+        .spacing(space::M)
         .align_y(Alignment::Center)
         .into()
 }
@@ -509,12 +509,12 @@ fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element
                     .on_press_maybe((!state.table.linking && !path.trim().is_empty()).then_some(Message::AccountUi(Action::LinkCommit)))
                     .into(),
             ])
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .into(),
         ])
-        .spacing(design::GRID_UNIT * 2.0),
+        .spacing(space::S),
     )
-    .padding(design::GRID_UNIT * 3.0)
+    .padding(space::M)
     .class(design::surface(Some(design::raised), [design::RADIUS_M; 4], true))
     .into()
 }
@@ -560,7 +560,7 @@ fn group<'a>(
         );
     }
     let header = widget::row::with_children(header)
-        .spacing(design::GRID_UNIT * 2.0)
+        .spacing(space::S)
         .align_y(Alignment::Center);
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
@@ -595,7 +595,7 @@ fn group<'a>(
             widget::container(
                 design::caption(empty).wrapping(cosmic::iced::widget::text::Wrapping::Word),
             )
-            .padding([design::GRID_UNIT * 3.0, design::GRID_UNIT * 3.0])
+            .padding([space::M, space::M])
             .into(),
         );
         if state.installed.get(&provider) == Some(&false) {
@@ -607,9 +607,7 @@ fn group<'a>(
         }
     }
     widget::column::with_children(vec![
-        widget::container(header)
-            .padding([0.0, design::GRID_UNIT])
-            .into(),
+        widget::container(header).padding([0.0, space::XS]).into(),
         widget::container(widget::column::with_children(lines))
             .width(Length::Fill)
             .class(design::surface(
@@ -619,7 +617,7 @@ fn group<'a>(
             ))
             .into(),
     ])
-    .spacing(design::GRID_UNIT * 2.0)
+    .spacing(space::S)
     .into()
 }
 
@@ -655,7 +653,7 @@ fn line<'a>(
             .spacing(COLUMN_SPACING)
             .height(height),
     )
-    .padding([0.0, design::GRID_UNIT * 3.0])
+    .padding([0.0, space::M])
     .into()
 }
 
@@ -774,7 +772,7 @@ fn stacked_row<'a>(
 ) -> Element<'a, Message> {
     let figures = cells.into_iter().map(|(column, (_, cell))| {
         widget::column::with_children(vec![design::caption(column.title()).into(), cell])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     });
@@ -785,9 +783,9 @@ fn stacked_row<'a>(
         )
         .padding(Padding {
             top: 0.0,
-            right: design::GRID_UNIT * 3.0,
-            bottom: design::GRID_UNIT * 3.0,
-            left: design::GRID_UNIT * 3.0,
+            right: space::M,
+            bottom: space::M,
+            left: space::M,
         })
         .into(),
     ])
@@ -888,7 +886,7 @@ fn account_cell<'a>(
     }
     let mut lines: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(title)
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .into(),
     ];
@@ -943,11 +941,11 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
     }
     widget::column::with_children(vec![
         widget::row::with_children(figures)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .into(),
         crate::ui_controls::budget_bar(window.left(), tone),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .width(Length::Fill)
     .into()
 }
@@ -1023,7 +1021,7 @@ fn actions<'a>(
         refresh_control(account, now).into()
     };
     widget::row::with_children(vec![first, menu])
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .into()
 }
@@ -1079,11 +1077,11 @@ fn menu<'a>(
                     .on_press(action(Action::RemoveConfirm(id.clone())))
                     .into(),
             ])
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .into(),
         ])
-        .spacing(design::GRID_UNIT * 2.0)
-        .padding(design::GRID_UNIT * 2.0)
+        .spacing(space::S)
+        .padding(space::S)
         .into()
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
@@ -1182,7 +1180,9 @@ fn menu<'a>(
                 .into(),
             );
         }
-        widget::column::with_children(items).spacing(2).into()
+        widget::column::with_children(items)
+            .spacing(space::XXS)
+            .into()
     };
     widget::container(content).width(300).into()
 }

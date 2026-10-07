@@ -1553,7 +1553,7 @@ impl Cagents {
                             .on_press(Message::ProjectUi(Action::ConfirmRemove)),
                     ),
                 ])
-                .spacing(3.0 * design::GRID_UNIT),
+                .spacing(space::M),
                 500.0,
             ));
         }
@@ -1598,7 +1598,7 @@ impl Cagents {
             .on_press_maybe(confirm),
         ));
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))
     }

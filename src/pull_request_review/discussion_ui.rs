@@ -654,7 +654,6 @@ impl State {
     }
 
     fn review_popup(&self) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let enabled = self.can_mutate_discussion();
         let pending = self.pending_count();
         let mut rows: Vec<Element<'_, Action>> = Vec::new();
@@ -687,7 +686,7 @@ impl State {
                         design::body(request.body.as_str())
                             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                     )
-                    .padding([spacing.space_xxs, spacing.space_xs])
+                    .padding([space::S, space::M])
                     .width(Length::Fill)
                     .max_height(160)
                     .class(cosmic::theme::Container::custom(|theme| {
@@ -730,7 +729,7 @@ impl State {
             }
             let mut editor = text_editor::TextEditor::new(&self.discussion.summary)
                 .placeholder("Leave a comment on the pull request (optional)")
-                .padding(spacing.space_xs)
+                .padding(space::M)
                 .height(96);
             if !self.discussion.busy {
                 editor = editor.on_action(Action::Summary);
@@ -769,7 +768,11 @@ impl State {
                     .into(),
                 );
             }
-            rows.push(widget::column::with_children(choices).spacing(2).into());
+            rows.push(
+                widget::column::with_children(choices)
+                    .spacing(space::XXS)
+                    .into(),
+            );
             let drafting = self.discussion.composer.is_some();
             if drafting {
                 rows.push(
@@ -799,8 +802,8 @@ impl State {
                     .into(),
             );
         }
-        widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
-            .padding(spacing.space_xxs)
+        widget::container(widget::column::with_children(rows).spacing(space::M))
+            .padding(space::S)
             .width(Length::Fixed(REVIEW_POPUP_WIDTH))
             .into()
     }
@@ -853,7 +856,6 @@ impl State {
     /// pane's notices rather than inside a surface that may be closed.
     pub(super) fn discussion_notice(&self, modal_open: bool) -> Option<Element<'_, super::Action>> {
         let message = self.discussion.unknown.as_ref()?;
-        let spacing = cosmic::theme::spacing();
         let element: Element<'_, Action> = widget::column::with_children(vec![
             design::caption(format!(
                 "GitHub may have received the last review change. Check the discussion before continuing. {message}"
@@ -868,8 +870,8 @@ impl State {
                 )
                 .into(),
         ])
-        .spacing(spacing.space_xxxs)
-        .padding(Padding::from([spacing.space_xxxs, spacing.space_xs]))
+        .spacing(space::XS)
+        .padding(Padding::from([space::XS, space::M]))
         .into();
         Some(element.map(|action| self.review_action(action)))
     }
@@ -950,7 +952,7 @@ fn event_choice<'a>(
     let content = widget::row::with_children(vec![
         widget::container(mark)
             .padding(Padding {
-                top: 2.0,
+                top: space::XXS,
                 ..Padding::ZERO
             })
             .into(),
@@ -965,13 +967,13 @@ fn event_choice<'a>(
         // An unavailable verdict is plain, dimmed text rather than a
         // disabled button, whose own palette would override the dimming.
         return widget::container(content)
-            .padding([5, 8])
+            .padding([5.0, space::S])
             .width(Length::Fill)
             .into();
     }
     button::custom(content)
         .class(crate::ui_controls::control_style(false, None))
-        .padding([5, 8])
+        .padding([5.0, space::S])
         .width(Length::Fill)
         .on_press(Action::Event(event))
         .into()
@@ -997,7 +999,7 @@ fn popup_actions<'a>(
         dismiss.into(),
         commit.into(),
     ])
-    .spacing(8)
+    .spacing(space::S)
     .align_y(Alignment::Center)
     .into()
 }
@@ -1268,7 +1270,7 @@ impl State {
                                 )
                                 .into(),
                         ])
-                        .spacing(8)
+                        .spacing(space::S)
                         .into(),
                     );
                 }
@@ -1294,7 +1296,7 @@ impl State {
                     }))
                     .into(),
                 ])
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             );
             if thread.truncated {
@@ -1355,13 +1357,13 @@ impl State {
                         .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
                         .into(),
                 ])
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             );
         }
         let element: Element<'_, Action> =
-            widget::container(widget::column::with_children(rows).spacing(8))
-                .padding(12)
+            widget::container(widget::column::with_children(rows).spacing(space::S))
+                .padding(space::M)
                 .width(Length::Fill)
                 .into();
         element.map(|action| self.review_action(action))

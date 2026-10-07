@@ -482,7 +482,7 @@ impl Cagents {
                     button("Keep going", Action::KeepWorking),
                     button("Stop import", Action::ConfirmCancel),
                 ])
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             );
         } else {
@@ -495,7 +495,7 @@ impl Cagents {
                             button("Skip", Action::Cancel),
                             button("Scan local profiles", Action::Consent),
                         ])
-                        .spacing(8)
+                        .spacing(space::S)
                         .into(),
                     );
                 }
@@ -536,7 +536,7 @@ impl Cagents {
                             SelectionRow::Profile(index) => {
                                 let found = &state.found[index];
                                 rows.push(
-                                    widget::checkbox(
+                                    crate::ui_controls::field::checkbox(
                                         !found.sites.is_empty()
                                             && found.selected.len() == found.sites.len(),
                                     )
@@ -563,14 +563,15 @@ impl Cagents {
                                 let host = site.host.clone();
                                 rows.push(
                                     widget::container(
-                                        widget::checkbox(found.selected.contains(&site.host))
-                                            .label(format!(
-                                                "{} · {} cookies",
-                                                site.host, site.cookies
-                                            ))
-                                            .on_toggle(move |selected| {
+                                        crate::ui_controls::field::checkbox(
+                                            found.selected.contains(&site.host),
+                                        )
+                                        .label(format!("{} · {} cookies", site.host, site.cookies))
+                                        .on_toggle(
+                                            move |selected| {
                                                 message(Action::Site(index, host.clone(), selected))
-                                            }),
+                                            },
+                                        ),
                                     )
                                     .padding([0, 20])
                                     .into(),
@@ -595,11 +596,11 @@ impl Cagents {
                                 )
                                 .into(),
                         ])
-                        .spacing(8)
+                        .spacing(space::S)
                         .into(),
                     );
                     content.push(
-                        widget::scrollable(widget::column::with_children(rows).spacing(8))
+                        widget::scrollable(widget::column::with_children(rows).spacing(space::S))
                             .height(Length::Fixed(360.0))
                             .into(),
                     );
@@ -609,7 +610,7 @@ impl Cagents {
                             button("Scan again", Action::Consent),
                             button("Import selected", Action::Import),
                         ])
-                        .spacing(8)
+                        .spacing(space::S)
                         .into(),
                     );
                 }
@@ -623,7 +624,7 @@ impl Cagents {
                             button("Done", Action::Cancel),
                             button("Retry", Action::Consent),
                         ])
-                        .spacing(8)
+                        .spacing(space::S)
                         .into(),
                     );
                 }
@@ -631,7 +632,10 @@ impl Cagents {
             }
         }
         Some(dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(content).spacing(16), 620.0),
+            dialog_ui::surface(
+                widget::column::with_children(content).spacing(space::L),
+                620.0,
+            ),
             Some(message(Action::Cancel)),
             1.0,
         ))

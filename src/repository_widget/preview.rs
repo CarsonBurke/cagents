@@ -10,6 +10,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use crate::design::space;
+
 const MAX_DIAGRAMS: usize = 24;
 const MAX_SOURCE_BYTES: usize = 32 * 1024;
 const MAX_ELEMENTS: usize = 256;
@@ -268,7 +270,7 @@ pub fn diagram_view<'a, Message: Clone + 'static>(
                 .font(iced::Font::MONOSPACE)
                 .into(),
         ])
-        .spacing(8)
+        .spacing(space::S)
         .into(),
     }
 }

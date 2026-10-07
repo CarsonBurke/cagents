@@ -22,7 +22,7 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
-const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
+const COMPOSER_PADDING: f32 = space::S;
 
 /// The widest a user's message is drawn.
 ///
@@ -89,7 +89,7 @@ const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
 const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
 
 /// The completion list's inset from its own edge.
-const COMPLETION_INSET: f32 = design::GRID_UNIT;
+const COMPLETION_INSET: f32 = space::XS;
 
 /// The completion list's scrollable, named so the keyboard can scroll it.
 const COMPLETION_LIST: &str = "chat-completion";
@@ -1035,7 +1035,7 @@ impl Runtime {
                             .class(cosmic::theme::Text::Custom(design::muted_text)),
                     )
                     .center_x(Length::Fill)
-                    .padding(design::GRID_UNIT * 8.0)
+                    .padding(space::XXL)
                     .into(),
                 );
             }
@@ -1265,7 +1265,7 @@ impl Runtime {
             }
             content.push(
                 widget::row::with_children(controls)
-                    .spacing(8)
+                    .spacing(space::S)
                     .align_y(Alignment::Center)
                     .into(),
             );
@@ -1539,7 +1539,7 @@ impl Runtime {
         // finds named siblings but does not move their trees to new indices.
         let mut content = vec![
             widget::column::with_children(content)
-                .spacing(8)
+                .spacing(space::S)
                 .height(Length::Fill)
                 .into(),
         ];
@@ -2385,7 +2385,7 @@ impl Runtime {
                     ))
                     .collect::<Vec<_>>(),
             )
-            .spacing(2)
+            .spacing(space::XXS)
             .width(design::MODEL_POPUP_WIDTH)
             .into()
         });

@@ -20,9 +20,9 @@ use crate::chat::{ChangeKind, FileChange, SearchResult, ToolStatus};
 /// block of its own" at `GAP_M`, and "a different exchange" at `GAP_L`. That
 /// progression is what makes structure legible without drawing a box around
 /// every group.
-pub(super) const GAP_XS: f32 = design::GRID_UNIT;
-pub(super) const GAP_S: f32 = design::GRID_UNIT * 2.0;
-pub(super) const GAP_M: f32 = design::GRID_UNIT * 3.0;
+pub(super) const GAP_XS: f32 = space::XS;
+pub(super) const GAP_S: f32 = space::S;
+pub(super) const GAP_M: f32 = space::M;
 pub(super) const GAP_L: f32 = design::GRID_UNIT * 7.0;
 
 /// The rail a turn's steps hang from, and the space between it and them.
@@ -30,7 +30,7 @@ pub(super) const GAP_L: f32 = design::GRID_UNIT * 7.0;
 /// A continuous hairline down the left of the strip is what turns a list of
 /// rows into one sequence of work. It is drawn as the container's left edge
 /// rather than per row, so it cannot break between rows.
-const RAIL_INSET: f32 = design::GRID_UNIT * 3.0;
+const RAIL_INSET: f32 = space::M;
 
 /// Where a group's thread line hangs: under the centre of the header's
 /// disclosure chevron, which sits one control inset from the header's edge.
@@ -259,7 +259,7 @@ fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Mess
         ));
     }
     widget::column::with_children(rows)
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .width(Length::Fill)
         .into()
 }
@@ -668,7 +668,7 @@ impl Runtime {
         // output, a tool's input - each carry their own control on the surface
         // that holds them.
         widget::column::with_children(rows)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }

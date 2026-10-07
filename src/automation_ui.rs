@@ -10,6 +10,7 @@ use crate::{
         SchedulePattern, SessionMode, Summary,
     },
     chat::Model,
+    design::space,
 };
 use cosmic::{
     Element,
@@ -1145,8 +1146,8 @@ impl State {
             crate::design::body("Recurring agent work continues while this window is closed.")
                 .into(),
         ])
-        .spacing(3.0 * crate::design::GRID_UNIT)
-        .padding(4.0 * crate::design::GRID_UNIT)
+        .spacing(space::M)
+        .padding(space::L)
         .width(Length::Fill);
         if let Some(error) = &self.error
             && self.draft.is_none()
@@ -1192,7 +1193,7 @@ impl State {
                         button("Confirm", Action::Confirm(confirmation.generation), !busy)
                     },
                 ])
-                .spacing(2.0 * crate::design::GRID_UNIT)
+                .spacing(space::S)
                 .wrap(),
             );
         } else if let Some(draft) = &self.draft {
@@ -1209,7 +1210,7 @@ impl State {
                     button("Refresh", Action::Refresh, !busy),
                     button("All run history", Action::AllHistory, !busy),
                 ])
-                .spacing(2.0 * crate::design::GRID_UNIT)
+                .spacing(space::S)
                 .wrap(),
             );
             if self.run.is_none() {
@@ -1259,12 +1260,12 @@ impl State {
                                     ))
                                     .into(),
                                 ])
-                                .spacing(crate::design::GRID_UNIT),
+                                .spacing(space::XS),
                             )
                             .name(format!("Select automation {}", row.name))
                             .class(crate::sidebar::sidebar_button_style(selected))
                             .selected(selected)
-                            .padding(2.0 * crate::design::GRID_UNIT)
+                            .padding(space::S)
                             .height(Length::Shrink)
                             .width(Length::Fill)
                             .on_press_maybe((!busy).then_some(Action::Select(row.id)))
@@ -1340,7 +1341,7 @@ impl State {
                                         && selected.blocked.is_none(),
                                 ),
                             ])
-                            .spacing(2.0 * crate::design::GRID_UNIT)
+                            .spacing(space::S)
                             .wrap(),
                         );
                     }
@@ -1440,7 +1441,7 @@ impl State {
                                     .is_some_and(|agent| !agent.closed && agent.session.is_some()),
                         ),
                     ])
-                    .spacing(2.0 * crate::design::GRID_UNIT)
+                    .spacing(space::S)
                     .wrap(),
                 );
             }
@@ -1454,8 +1455,8 @@ impl State {
         }
         let list = widget::scrollable(
             widget::column::with_children(listing)
-                .spacing(crate::design::GRID_UNIT)
-                .padding(2.0 * crate::design::GRID_UNIT),
+                .spacing(space::XS)
+                .padding(space::S),
         );
         if width >= 700.0 {
             widget::row::with_children(vec![
@@ -1494,7 +1495,7 @@ impl Draft {
         let work = widget::column::with_children(vec![
             input("Name", &self.name, Field::Name),
             crate::design::caption("Project / working directory").into(),
-            widget::dropdown(
+            crate::ui_controls::field::select(
                 self.targets
                     .iter()
                     .map(|target| target.label.clone())
@@ -1504,9 +1505,14 @@ impl Draft {
             )
             .into(),
             crate::design::caption("Provider").into(),
-            widget::dropdown(PROVIDERS.to_vec(), Some(self.provider), Action::Provider).into(),
+            crate::ui_controls::field::select(
+                PROVIDERS.to_vec(),
+                Some(self.provider),
+                Action::Provider,
+            )
+            .into(),
             crate::design::caption("Account").into(),
-            widget::dropdown(
+            crate::ui_controls::field::select(
                 provider_accounts
                     .iter()
                     .map(|(_, account)| account.label.clone())
@@ -1525,13 +1531,18 @@ impl Draft {
                 .height(220)
                 .into(),
         ])
-        .spacing(2.0 * crate::design::GRID_UNIT)
+        .spacing(space::S)
         .width(Length::Fill);
         let mut schedule = widget::column::with_children(vec![
             crate::design::caption("Repeat").into(),
-            widget::dropdown(SCHEDULES.to_vec(), Some(self.schedule), Action::Schedule).into(),
+            crate::ui_controls::field::select(
+                SCHEDULES.to_vec(),
+                Some(self.schedule),
+                Action::Schedule,
+            )
+            .into(),
         ])
-        .spacing(2.0 * crate::design::GRID_UNIT)
+        .spacing(space::S)
         .width(Length::Fill);
         if self.schedule == 4 {
             schedule = schedule.push(input("Five-field cron", &self.cron, Field::Cron));
@@ -1541,9 +1552,9 @@ impl Draft {
                 time.push(input("Hour (0–23)", &self.hour, Field::Hour));
             }
             time.push(input("Minute (0–59)", &self.minute, Field::Minute));
-            schedule = schedule.push(widget::row::with_children(time).spacing(8));
+            schedule = schedule.push(widget::row::with_children(time).spacing(space::S));
             if self.schedule == 3 {
-                schedule = schedule.push(widget::dropdown(
+                schedule = schedule.push(crate::ui_controls::field::select(
                     WEEKDAYS.to_vec(),
                     Some(self.weekday),
                     Action::Weekday,
@@ -1555,7 +1566,7 @@ impl Draft {
             .push(self.next_run())
             .push(crate::design::horizontal_rule())
             .push(
-                widget::checkbox(self.reuse)
+                crate::ui_controls::field::checkbox(self.reuse)
                     .label("Continue in the same agent")
                     .on_toggle(Action::Reuse),
             )
@@ -1571,11 +1582,11 @@ impl Draft {
                     .width(Length::FillPortion(1))
                     .into(),
             ])
-            .spacing(16)
+            .spacing(space::L)
             .into()
         } else {
             widget::column::with_children(vec![work, schedule])
-                .spacing(16)
+                .spacing(space::L)
                 .into()
         };
         let mut fields = widget::column::with_children(vec![
@@ -1595,18 +1606,18 @@ impl Draft {
             .on_press(Action::ToggleAdvanced)
             .into(),
         ])
-        .spacing(16)
+        .spacing(space::L)
         .width(Length::Fill);
         if self.advanced {
             let mut advanced = widget::column::with_children(vec![
                 input("Permission mode", &self.permission, Field::Permission),
                 crate::design::caption("Leave blank to use the provider default.").into(),
-                widget::checkbox(self.precheck)
+                crate::ui_controls::field::checkbox(self.precheck)
                     .label("Run a shell precheck")
                     .on_toggle(Action::Precheck)
                     .into(),
             ])
-            .spacing(8);
+            .spacing(space::S);
             if self.precheck {
                 advanced = advanced
                     .push(crate::design::caption(
@@ -1647,7 +1658,7 @@ impl Draft {
                     .on_press_maybe((!busy).then_some(Action::Save))
                     .into(),
             ])
-            .spacing(2.0 * crate::design::GRID_UNIT)
+            .spacing(space::S)
             .wrap(),
         );
         widget::container(fields)
@@ -1669,9 +1680,9 @@ fn form_section<'a>(
             crate::design::horizontal_rule(),
             content,
         ])
-        .spacing(12),
+        .spacing(space::M),
     )
-    .padding(16)
+    .padding(space::L)
     .width(Length::Fill)
     .class(crate::design::surface(
         Some(crate::design::raised),
@@ -1690,7 +1701,7 @@ impl Draft {
                 .on_input(|value| Action::Field(Field::Timezone, value))
                 .into(),
         ])
-        .spacing(crate::design::GRID_UNIT);
+        .spacing(space::XS);
         if let Some(matches) = &self.timezone_matches {
             if matches.is_empty() {
                 column = column.push(crate::design::caption(if self.timezone.trim().is_empty() {
@@ -1762,7 +1773,7 @@ impl Draft {
             .collect::<Vec<_>>();
         let mut column = widget::column::with_children(vec![
             crate::design::body("Model").into(),
-            widget::dropdown(labels, Some(selected), move |index| {
+            crate::ui_controls::field::select(labels, Some(selected), move |index| {
                 Action::Model(match index {
                     0 => ModelChoice::Default,
                     index => ids
@@ -1773,7 +1784,7 @@ impl Draft {
             })
             .into(),
         ])
-        .spacing(crate::design::GRID_UNIT);
+        .spacing(space::XS);
         if custom {
             column = column.push(
                 crate::ui_controls::field::text("Model ID", &self.model)
@@ -1797,7 +1808,7 @@ impl Draft {
                 })
                 .into(),
             ])
-            .spacing(crate::design::GRID_UNIT)
+            .spacing(space::XS)
             .into();
         }
         let selected = self
@@ -1810,7 +1821,7 @@ impl Draft {
             .collect::<Vec<_>>();
         widget::column::with_children(vec![
             crate::design::body("Reasoning effort").into(),
-            widget::dropdown(labels, Some(selected), move |index| {
+            crate::ui_controls::field::select(labels, Some(selected), move |index| {
                 Action::Effort(
                     index
                         .checked_sub(1)
@@ -1819,7 +1830,7 @@ impl Draft {
             })
             .into(),
         ])
-        .spacing(crate::design::GRID_UNIT)
+        .spacing(space::XS)
         .into()
     }
 }
@@ -1871,7 +1882,7 @@ fn launch_description<'a>(
         crate::design::body(description).into(),
         crate::design::body(definition.prompt.as_str()).into(),
     ])
-    .spacing(2.0 * crate::design::GRID_UNIT);
+    .spacing(space::S);
     if let Some(precheck) = &definition.precheck {
         column = column.push(crate::design::body(format!(
             "Shell precheck ({} seconds):\n{}",
@@ -1892,7 +1903,7 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
     // a single-line height, hiding target and scheduling details.
     let mut button = widget::button::custom(crate::design::body(label.clone()))
         .name(label)
-        .padding(3.0 * crate::design::GRID_UNIT)
+        .padding(space::M)
         .class(crate::sidebar::sidebar_button_style(false))
         .height(Length::Shrink);
     if enabled {
@@ -1907,7 +1918,7 @@ fn input<'a>(label: &'static str, value: &'a str, field: Field) -> Element<'a, A
             .on_input(move |value| Action::Field(field, value))
             .into(),
     ])
-    .spacing(crate::design::GRID_UNIT)
+    .spacing(space::XS)
     .into()
 }
 fn timestamp(milliseconds: u64) -> String {

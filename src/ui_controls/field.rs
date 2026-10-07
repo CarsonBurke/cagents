@@ -50,6 +50,39 @@ pub fn search<'a, Message: Clone + 'static>(
         )
 }
 
+/// A choice among a few named options, at the shell's type size.
+pub fn select<'a, S, Message>(
+    options: impl Into<Cow<'a, [S]>>,
+    selected: Option<usize>,
+    on_select: impl Fn(usize) -> Message + Send + Sync + 'static,
+) -> widget::Dropdown<'a, S, Message, Message>
+where
+    S: AsRef<str> + Clone + Send + Sync + 'static,
+    [S]: ToOwned,
+    Message: Clone + 'static,
+{
+    widget::dropdown(options, selected, on_select)
+        .text_size(design::TEXT_BODY)
+        .padding([INSET_Y, space::S])
+}
+
+/// A labelled yes/no choice. Add the label with `.label(..)`.
+pub fn checkbox<'a, Message>(checked: bool) -> widget::Checkbox<'a, Message, cosmic::Theme> {
+    widget::checkbox(checked)
+        .size(design::ROW_ICON_SIZE)
+        .text_size(design::TEXT_BODY)
+        .spacing(space::S)
+}
+
+/// A setting that is on or off and takes effect at once. Add the label with
+/// `.label(..)`.
+pub fn toggle<'a, Message>(on: bool) -> widget::Toggler<'a, Message> {
+    widget::toggler(on)
+        .size(design::STATUS_ICON_SIZE)
+        .text_size(design::TEXT_BODY)
+        .spacing(space::M)
+}
+
 fn style() -> cosmic::theme::TextInput {
     use cosmic::widget::text_input::Appearance;
 

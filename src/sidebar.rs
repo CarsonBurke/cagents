@@ -26,7 +26,7 @@ use unicode_casefold::UnicodeCaseFold;
 use url::Url;
 
 use crate::{
-    design::{self, NavigationLayout, STATUS_ICON_SIZE},
+    design::{self, NavigationLayout, STATUS_ICON_SIZE, space},
     github::{PullRequest, PullRequestCheck},
     model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
@@ -73,10 +73,10 @@ const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
 // Controls and status indicators retain the shared workspace chrome sizes.
 
 /// Horizontal step between one row slot and the next, and the unit the rest of
-/// the grid is built from. A compile-time number rather than the theme's
-/// `space_xxxs`, because `row_interaction`'s pointer regions and the rail's
+/// the grid is built from. A compile-time number rather than a theme's
+/// spacing, because `row_interaction`'s pointer regions and the rail's
 /// row width are derived from it and neither of those can ask a theme.
-const ROW_GUTTER: f32 = design::GRID_UNIT;
+const ROW_GUTTER: f32 = space::XS;
 /// The live-indicator slot, reserved whether or not the row has an indicator
 /// this frame. A spinner, an attention badge and a chat count all land here,
 /// so a label cannot reflow when an agent starts working or a chat opens.
@@ -3807,27 +3807,25 @@ fn view_inner<'a>(
     cache: Option<&'a NavigationCache>,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
     let loading = matches!(&model.data_state, SidebarDataState::Loading);
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(utilities(compact, modal_open, shortcuts))
-                .padding([0, spacing.space_xxxs]),
+            widget::container(utilities(compact, modal_open, shortcuts)).padding([0.0, space::XS]),
         )
         .push(design::horizontal_rule())
         .push(
             widget::container(header(model, state, compact, header_loading, modal_open))
-                .padding([0, spacing.space_xxxs]),
+                .padding([0.0, space::XS]),
         );
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
             widget::container(controls(state, modal_open))
                 .class(theme::Container::Primary)
-                .padding(spacing.space_xxs),
+                .padding(space::S),
         );
     }
 
@@ -3849,7 +3847,7 @@ fn view_inner<'a>(
         .width(Length::Fill)
         .height(Length::Fill),
     );
-    content = content.spacing(0).width(Length::Fill).height(Length::Fill);
+    content = content.width(Length::Fill).height(Length::Fill);
 
     widget::container(crate::interaction::layer(
         widget::container(content)
@@ -3886,7 +3884,6 @@ fn header<'a>(
     loading: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(4);
     if !model.projects.is_empty() {
         let attention = state.filter == SidebarFilter::Attention;
@@ -3954,8 +3951,8 @@ fn header<'a>(
         return window_gestures(
             widget::column::with_children(actions)
                 .align_x(Alignment::Center)
-                .padding([spacing.space_xxxs, 0])
-                .spacing(spacing.space_xxxs)
+                .padding([space::XS, 0.0])
+                .spacing(space::XS)
                 .width(Length::Fill),
         );
     }
@@ -3977,8 +3974,8 @@ fn header<'a>(
 
     let header = widget::row::with_children(children)
         .align_y(Alignment::Center)
-        .spacing(design::GRID_UNIT / 2.0)
-        .padding([0.0, design::GRID_UNIT])
+        .spacing(space::XXS)
+        .padding([0.0, space::XS])
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill);
     window_gestures(header)
@@ -4038,7 +4035,6 @@ pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
 }
 
 fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
     actions.push(filters(state.filter, modal_open));
     actions.push(
@@ -4050,10 +4046,10 @@ fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, Sideba
         search(state, modal_open),
         widget::row::with_children(actions)
             .align_y(Alignment::Center)
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
     ])
-    .spacing(spacing.space_xxxs)
+    .spacing(space::XS)
     .width(Length::Fill)
     .into()
 }
@@ -4063,7 +4059,6 @@ fn utilities<'a>(
     modal_open: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let toggle = crate::ui_controls::icon_button(
         Icon::Sidebar,
         crate::workspace_widget::shortcut_tooltip(
@@ -4079,8 +4074,8 @@ fn utilities<'a>(
         let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations];
         return widget::column::with_children(children)
             .align_x(Alignment::Center)
-            .spacing(spacing.space_xxxs)
-            .padding(spacing.space_xxxs)
+            .spacing(space::XS)
+            .padding(space::XS)
             .width(Length::Fill)
             .into();
     }
@@ -4094,8 +4089,8 @@ fn utilities<'a>(
             toggle,
         ])
         .align_y(Alignment::Center)
-        .spacing(design::GRID_UNIT / 2.0)
-        .padding([0.0, design::GRID_UNIT])
+        .spacing(space::XXS)
+        .padding([0.0, space::XS])
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill),
     )
@@ -4117,18 +4112,17 @@ fn utility_controls<'a>(modal_open: bool) -> [Element<'a, SidebarAction>; 2] {
 // The standalone editor still mounts its utility controls below its file pane.
 fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
     let [settings, automations] = utility_controls(modal_open);
-    let spacing = cosmic::theme::spacing();
     if compact {
         widget::column::with_children(vec![automations, settings])
             .align_x(Alignment::Center)
-            .spacing(spacing.space_xxxs)
-            .padding(spacing.space_xxxs)
+            .spacing(space::XS)
+            .padding(space::XS)
             .width(Length::Fill)
             .into()
     } else {
         widget::row::with_children(vec![automations, settings])
             .align_y(Alignment::Center)
-            .padding(spacing.space_xxxs)
+            .padding(space::XS)
             .width(Length::Fill)
             .into()
     }
@@ -4168,9 +4162,8 @@ const FILTER_CHOICES: [(SidebarFilter, &str, &str); 2] = [
 ];
 
 fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let mut row = widget::row::with_capacity(FILTER_CHOICES.len())
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .align_y(Alignment::Center);
     for (value, visible_label, accessible_label) in FILTER_CHOICES {
         row = row.push(
@@ -4225,12 +4218,11 @@ fn project_list<'a>(
             worktree_id: key.worktree_id,
         })
         .or(state.selection);
-    let spacing = cosmic::theme::spacing();
     let sticky_viewport = row_interaction::StickyViewport::default();
     let mut column = widget::column::with_capacity(projects.len()).spacing(if compact {
-        spacing.space_xxxs
+        space::XS
     } else {
-        spacing.space_xxs
+        space::S
     });
     for project in &projects {
         let project_id = project.project.id;
@@ -4276,23 +4268,21 @@ fn project_scroll(
 }
 
 fn loading() -> Element<'static, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let content = widget::column::with_children(vec![crate::ui_controls::activity_spinner(
         f32::from(STATUS_ICON_SIZE),
         design::accent_color,
     )])
     .align_x(Alignment::Center)
-    .spacing(spacing.space_xxs);
+    .spacing(space::S);
     widget::container(content)
         .center(Length::Fill)
-        .padding(spacing.space_xs)
+        .padding(space::M)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
 fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     if compact {
         return widget::container(
             widget::column::with_children(vec![
@@ -4304,7 +4294,7 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
                     stable_id("error.retry"),
                 ),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .align_x(Alignment::Center),
         )
         .center(Length::Fill)
@@ -4324,10 +4314,10 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
                 .into(),
         ])
         .align_x(Alignment::Center)
-        .spacing(spacing.space_xxs),
+        .spacing(space::S),
     )
     .center(Length::Fill)
-    .padding(spacing.space_s)
+    .padding(space::L)
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -4376,7 +4366,6 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
             stable_id("empty.action"),
         );
     }
-    let spacing = cosmic::theme::spacing();
     let action_icon = if searching {
         Icon::Clear
     } else if state.filter == SidebarFilter::All {
@@ -4393,10 +4382,10 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
             design::caption(title).width(Length::Fill).into(),
             action_button.into(),
         ])
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .align_y(Alignment::Center),
     )
-    .padding(spacing.space_xs)
+    .padding(space::M)
     .width(Length::Fill)
     .into()
 }
@@ -4463,9 +4452,8 @@ impl RowGrid {
     /// The rail belongs to the content inside the viewport rather than to a
     /// container around the scrollable: an outer gutter moves the thumb along
     /// with the content and leaves the two touching exactly as before. The
-    /// rail's inset is the grid's own gutter rather than the theme's, so a
-    /// denser spacing preset cannot squeeze `COMPACT_ROW_WIDTH` out of the
-    /// rail.
+    /// rail's inset is the grid's own gutter, so nothing can squeeze
+    /// `COMPACT_ROW_WIDTH` out of the rail.
     fn list_padding(compact: bool) -> Padding {
         design::with_vertical_rail(if compact {
             Padding {
@@ -4475,7 +4463,7 @@ impl RowGrid {
                 left: ROW_GUTTER,
             }
         } else {
-            Padding::from(cosmic::theme::spacing().space_xxxs)
+            Padding::from(space::XS)
         })
     }
 
@@ -4559,7 +4547,6 @@ fn project_header_row<'a>(
         widget::container(
             widget::row::with_children(commands)
                 .align_y(Alignment::Center)
-                .spacing(0)
                 .height(PROJECT_HEADER_HEIGHT),
         )
         .align_right(Length::Fill)
@@ -4882,7 +4869,6 @@ fn unreachable_project<'a>(
         state,
         !modal_open,
     );
-    let spacing = cosmic::theme::spacing();
     if compact {
         // The compact rail has no room for the reason, which the tooltip and
         // the accessible name carry instead, but a running operation's cancel
@@ -4894,12 +4880,12 @@ fn unreachable_project<'a>(
             column = column.push(row);
         }
         return widget::container(column)
-            .padding([spacing.space_xxxs, 0])
+            .padding([space::XS, 0.0])
             .width(Length::Fill)
             .into();
     }
     let mut details = widget::column::with_capacity(project.operations.len() + 2)
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .push(
             design::caption(format!("Couldn’t read this project: {reason}"))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word),
@@ -4910,7 +4896,7 @@ fn unreachable_project<'a>(
     // The retry is named after its project, because two unreadable projects
     // would otherwise offer a reader two controls announced identically.
     details = details.push(
-        button::standard(if project.reloading {
+        crate::ui_controls::button::secondary(if project.reloading {
             "Trying again…"
         } else {
             "Try again"
@@ -5066,7 +5052,7 @@ fn project_view<'a>(
         project.state,
         !modal_open,
     );
-    let mut column = widget::column::with_capacity(worktree_count + 2).spacing(0);
+    let mut column = widget::column::with_capacity(worktree_count + 2);
     for row in operation_rows(entity, modal_open) {
         column = column.push(row);
     }
@@ -5133,7 +5119,6 @@ fn project_view<'a>(
         let ids = members.iter().map(|(_, row, _)| *row).collect();
         let content =
             widget::column::with_children(members.into_iter().map(|(_, _, element)| element))
-                .spacing(0)
                 .width(Length::Fill);
         let disabled = entity
             .channels
@@ -5291,7 +5276,7 @@ fn compact_project<'a>(
         column.into(),
         sticky_viewport,
     ))
-    .padding([cosmic::theme::spacing().space_xxxs, 0])
+    .padding([space::XS, 0.0])
     .width(Length::Fill)
     .into()
 }
@@ -6330,9 +6315,7 @@ fn worktree_status_icon(
         })),
     );
     crate::interaction::tooltip(
-        widget::row::with_children(vec![glyph.into(), dot.into()])
-            .align_y(Alignment::Center)
-            .spacing(0),
+        widget::row::with_children(vec![glyph.into(), dot.into()]).align_y(Alignment::Center),
         if update {
             "Unread agent update"
         } else if let Some(pr) = &worktree.chrome.pull_request {
@@ -6668,10 +6651,10 @@ fn worktree_panel<'a>(
                     .on_press_maybe(gated(SidebarAction::OpenRepositoryPicker, modal_open))
                     .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .width(Length::Fill),
         )
-        .padding(12)
+        .padding(space::M)
         .width(Length::Fill)
         .into(),
     };
@@ -6718,7 +6701,6 @@ fn source_control_header<'a>(
     modal_open: bool,
     view: PanelView,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
     let key = &source.key;
     let mut header = widget::row::with_children(vec![
@@ -6771,7 +6753,7 @@ fn source_control_header<'a>(
     }
     header
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .height(design::HEADER_CONTENT_HEIGHT)
         .width(Length::Fill)
         .into()
@@ -6788,20 +6770,19 @@ fn source_control_header<'a>(
 fn source_control_notices<'a>(
     source: &'a SourceControlModel,
 ) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
-    let spacing = cosmic::theme::spacing();
     let mut notices: cosmic::iced::widget::Column<
         'a,
         SidebarAction,
         cosmic::Theme,
         cosmic::Renderer,
-    > = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    > = widget::column::with_capacity(4).spacing(space::XS);
     notices = notices.push(slot(source.progress_label().map(|label| {
         widget::row::with_children(vec![
             crate::ui_controls::activity_spinner(14.0, design::warning_color),
             design::caption(label).into(),
         ])
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .into()
     })));
     notices.push(slot(source.error.as_deref().map(|error| {
@@ -6823,7 +6804,6 @@ fn source_control_panel<'a>(
     navigation: PanelNavigation,
     width: f32,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
     let key = &source.key;
     let view = PanelView::new(panel, navigation, state);
@@ -6888,7 +6868,7 @@ fn source_control_panel<'a>(
     // working-tree view carries it.
     let footer = matches!(tab, ChangesTab::Changes).then(|| {
         widget::container(changes_footer(state, source, modal_open))
-            .padding(Padding::from([spacing.space_xxs, spacing.space_xxs]))
+            .padding(Padding::from([space::S, space::S]))
             .width(Length::Fill)
             .into()
     });
@@ -6900,10 +6880,7 @@ fn source_control_panel<'a>(
         Some(crate::interaction::keyboard_list(
             widget::scrollable(
                 widget::container(body)
-                    .padding(design::with_vertical_rail(Padding::from([
-                        0,
-                        spacing.space_xxs,
-                    ])))
+                    .padding(design::with_vertical_rail(Padding::from([0.0, space::S])))
                     .width(Length::Fill),
             )
             .direction(sidebar_scroll_direction())
@@ -6987,13 +6964,12 @@ fn panel_navigation<'a>(
                 .collect()
         }
     };
-    let spacing = cosmic::theme::spacing();
     Some(
         widget::container(crate::ui_controls::view_tabs(
             tabs,
             width < FULL_PANEL_LABELS_MIN_WIDTH,
         ))
-        .padding(Padding::from([spacing.space_xxxs, spacing.space_xxs]))
+        .padding(Padding::from([space::XS, space::S]))
         .width(Length::Fill)
         .into(),
     )
@@ -7024,13 +7000,12 @@ fn worktree_panel_chrome_with_footer<'a, M: 'a>(
     body: Option<Element<'a, M>>,
     footer: Option<Element<'a, M>>,
 ) -> Element<'a, M> {
-    let spacing = cosmic::theme::spacing();
     // The divider is the header's bottom edge; spacing would move it below
     // the tab strip's matching rule.
-    let mut chrome = widget::column::with_capacity(4).spacing(0);
+    let mut chrome = widget::column::with_capacity(4);
     chrome = chrome.push(
         widget::container(header)
-            .padding([0, spacing.space_xxs])
+            .padding([0.0, space::S])
             .width(Length::Fill),
     );
     chrome = chrome.push(crate::design::horizontal_rule());
@@ -7039,15 +7014,12 @@ fn worktree_panel_chrome_with_footer<'a, M: 'a>(
     chrome = chrome.push(widget::column::with_children(tabs).width(Length::Fill));
     chrome = chrome.push(
         widget::container(notices)
-            .padding([0, spacing.space_xxs])
+            .padding([0.0, space::S])
             .width(Length::Fill),
     );
     match body {
         Some(body) => {
-            let mut column = widget::column::with_capacity(4)
-                .spacing(0)
-                .push(chrome)
-                .push(body);
+            let mut column = widget::column::with_capacity(4).push(chrome).push(body);
             if let Some(footer) = footer {
                 column = column.push(crate::design::horizontal_rule()).push(footer);
             }
@@ -7129,7 +7101,6 @@ fn panel_section<'a>(
     actions: Option<Element<'a, SidebarAction>>,
     body: impl FnOnce() -> Element<'a, SidebarAction>,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let parts = SectionHeader::new(key, section, count, expanded, modal_open);
     let row = button::custom(
         widget::row::with_children(vec![
@@ -7145,13 +7116,13 @@ fn panel_section<'a>(
                 .into(),
         ])
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .height(Length::Fill),
     )
     .class(sidebar_button_style(false))
     .id(id)
     .name(parts.action_name.clone())
-    .padding([0, spacing.space_xxxs])
+    .padding([0.0, space::XS])
     .height(Length::Fixed(PANEL_ROW_HEIGHT))
     .width(Length::Fill)
     .on_press_maybe(parts.toggle);
@@ -7161,9 +7132,9 @@ fn panel_section<'a>(
     } else {
         header.into()
     };
-    let mut column = widget::column::with_capacity(2).spacing(0).push(header);
+    let mut column = widget::column::with_capacity(2).push(header);
     if expanded {
-        column = column.push(widget::container(body()).padding([0, 0, spacing.space_xxs, 0]));
+        column = column.push(widget::container(body()).padding([0.0, 0.0, space::S, 0.0]));
     }
     column.into()
 }
@@ -7186,7 +7157,6 @@ fn files_section<'a>(
     editors: &'a [SidebarEditor],
     file_management: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let key = &source.key;
     let filter_key = key.clone();
     // A text input with no `on_input` is disabled, which is what standing the
@@ -7266,7 +7236,7 @@ fn files_section<'a>(
             .files_page
             .min(hidden.saturating_sub(1) / MAX_VISIBLE_FILE_ROWS)
     };
-    let mut rows = widget::column::with_capacity(visible.len()).spacing(0);
+    let mut rows = widget::column::with_capacity(visible.len());
     for row in visible {
         let chrome = &row.chrome;
         let action = if row.directory {
@@ -7316,7 +7286,7 @@ fn files_section<'a>(
                 .into(),
             ])
             .align_y(Alignment::Center)
-            .spacing(spacing.space_xxxs),
+            .spacing(space::XS),
             Some(action),
             selected,
             modal_open,
@@ -7338,7 +7308,7 @@ fn files_section<'a>(
                     ))
                     .wrapping(cosmic::iced::widget::text::Wrapping::Word),
                 )
-                .padding([0, spacing.space_xxs])
+                .padding([0.0, space::S])
                 .width(Length::Fill),
             );
         }
@@ -7357,16 +7327,16 @@ fn files_section<'a>(
                 slot(state.files_filter_open.then(|| filter.into())),
                 slot(notice.map(|notice| design::caption(notice).into())),
             ])
-            .spacing(spacing.space_xxxs),
+            .spacing(space::XS),
         )
-        .padding([0, spacing.space_xxs])
+        .padding([0.0, space::S])
         .width(Length::Fill)
         .into(),
         widget::scrollable(
             widget::container(list)
                 .padding(design::with_vertical_rail(Padding::from([
-                    spacing.space_xxxs,
-                    spacing.space_xxs,
+                    space::XS,
+                    space::S,
                 ])))
                 .width(Length::Fill),
         )
@@ -7423,11 +7393,11 @@ fn file_pager<'a>(
                 .on_press_maybe((page < last).then(|| action(page + 1)).flatten())
                 .into(),
         ])
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .into(),
     ])
-    .spacing(design::GRID_UNIT)
-    .padding(design::GRID_UNIT)
+    .spacing(space::XS)
+    .padding(space::XS)
     .into()
 }
 
@@ -7595,7 +7565,7 @@ fn change_pager<'a>(
             .on_press_maybe((page < last).then(|| action(page + 1)).flatten())
             .into(),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .align_y(Alignment::Center)
     .into()
 }
@@ -7630,9 +7600,7 @@ fn changes_section<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    let mut column =
-        widget::column::with_capacity(source.groups().len() + 1).spacing(spacing.space_xxxs);
+    let mut column = widget::column::with_capacity(source.groups().len() + 1).spacing(space::XS);
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(design::caption(if source.reloading {
             "Loading changes…"
@@ -7713,8 +7681,7 @@ fn branch_changes_section<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    let mut column = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    let mut column = widget::column::with_capacity(4).spacing(space::XS);
     let branch = match &source.branch_changes {
         BranchChanges::Ready(branch) => branch,
         other => {
@@ -7727,7 +7694,7 @@ fn branch_changes_section<'a>(
                             design::caption(format!("Comparing with {}…", base_ref.short_name()))
                                 .into(),
                         ])
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .align_y(Alignment::Center),
                     )
                     .into(),
@@ -7789,7 +7756,7 @@ fn branch_changes_section<'a>(
                         crate::file_icon::folder(!folded).into(),
                         design::body(&*file.chrome.label).into(),
                     ])
-                    .spacing(4)
+                    .spacing(space::XS)
                     .align_y(Alignment::Center),
                     Some(SidebarAction::ToggleChangeDirectory {
                         key: source.key.clone(),
@@ -7826,7 +7793,7 @@ fn branch_changes_section<'a>(
                     .width(Length::Fill).into(),
                 semantic_caption(&*row.status, tone),
                 design::caption(&*row.counts).into(),
-            ]).spacing(spacing.space_xxxs).align_y(Alignment::Center),
+            ]).spacing(space::XS).align_y(Alignment::Center),
             Some(SidebarAction::OpenBranchFile {
                 key: source.key.clone(),
                 path: row.entry.path.clone(),
@@ -7880,7 +7847,7 @@ fn change_group_view<'a>(
                         crate::file_icon::folder(!folded).into(),
                         design::body(&*file.chrome.label).into(),
                     ])
-                    .spacing(4)
+                    .spacing(space::XS)
                     .align_y(Alignment::Center),
                     Some(SidebarAction::ToggleChangeDirectory {
                         key: source.key.clone(),
@@ -7908,8 +7875,7 @@ fn change_group_view<'a>(
         }
     }
     let mut column =
-        widget::column::with_children(vec![crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT)])
-            .spacing(0);
+        widget::column::with_children(vec![crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT)]);
     column = column.push(change_pager(state, &source.key, scope, total, modal_open));
     column.into()
 }
@@ -7923,7 +7889,6 @@ fn change_row_view<'a>(
     depth: usize,
     tree: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let chrome = &row.chrome;
     let selected = matches!(
         state.panel_selection.as_ref(),
@@ -7941,7 +7906,7 @@ fn change_row_view<'a>(
     };
     let mut status = widget::row::with_capacity(3)
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxxs);
+        .spacing(space::XS);
     status = status.push(
         if row.entry.conflict.is_none()
             && matches!(row.entry.kind, ChangeKind::Added | ChangeKind::Untracked)
@@ -8004,7 +7969,7 @@ fn change_row_view<'a>(
                 .into(),
         ])
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxxs),
+        .spacing(space::XS),
         Some(SidebarAction::OpenChange {
             key: source.key.clone(),
             path: row.entry.path.clone(),
@@ -8019,8 +7984,7 @@ fn change_row_view<'a>(
     }
     let actions = widget::container(
         widget::row::with_children(commands.into_iter().map(IconCommand::into_element))
-            .align_y(Alignment::Center)
-            .spacing(0),
+            .align_y(Alignment::Center),
     )
     .align_right(CHANGE_STATUS_WIDTH)
     .height(PANEL_ROW_HEIGHT)
@@ -8041,7 +8005,7 @@ fn change_row_view<'a>(
     RowInteraction::actions(
         identity,
         widget::container(actions)
-            .padding([0, spacing.space_xxxs])
+            .padding([0.0, space::XS])
             .align_right(Length::Fill)
             .into(),
         0.0,
@@ -8350,7 +8314,6 @@ fn changes_footer<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let key = &source.key;
     let chrome = &source.chrome;
     let message = state.commit_message();
@@ -8373,7 +8336,7 @@ fn changes_footer<'a>(
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
         .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
         .size(design::TEXT_BODY)
-        .padding([8, 10])
+        .padding([space::S, 10.0])
         .style(commit_description_style)
         .key_binding(move |press| {
             if !matches!(
@@ -8406,7 +8369,7 @@ fn changes_footer<'a>(
             });
     }
     let mut column = widget::column::with_capacity(5)
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .push(subject_input);
     let has_subject = !state.commit_subject.trim().is_empty();
 
@@ -8420,7 +8383,7 @@ fn changes_footer<'a>(
         .font(cosmic::iced::Font::DEFAULT)
         .style(commit_description_style)
         .size(design::TEXT_BODY)
-        .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+        .padding([space::XS, space::S])
         .key_binding(move |press| {
             if !matches!(
                 press.status,
@@ -8464,12 +8427,10 @@ fn changes_footer<'a>(
         commit_label
     };
     let commit = crate::interaction::tooltip(
-        button::suggested(commit_label)
-            .leading_icon(Icon::Commit)
+        crate::ui_controls::button::primary(commit_label)
+            .icon(Icon::Commit)
             .name(format!("{commit_label} (Ctrl+Enter)"))
             .id(chrome.commit_id.clone())
-            .padding([0, 8])
-            .height(design::PRIMARY_CONTROL_SIZE)
             .on_press_maybe(can_commit.then_some(commit_action)),
         format!("{commit_hint} (Ctrl+Enter)"),
     );
@@ -8477,7 +8438,7 @@ fn changes_footer<'a>(
     if has_subject {
         column = column.push(commit_input);
     }
-    let amend = widget::checkbox(state.amend_commit)
+    let amend = crate::ui_controls::field::checkbox(state.amend_commit)
         .label("Amend")
         .size(14)
         .text_size(design::TEXT_CAPTION)
@@ -8492,7 +8453,7 @@ fn changes_footer<'a>(
             }),
         );
     let mut buttons = widget::row::with_capacity(4)
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .align_y(cosmic::iced::Alignment::Center);
     buttons = buttons.push(commit);
     match (&source.branch, &source.upstream) {
@@ -8527,7 +8488,7 @@ fn changes_footer<'a>(
             )
             .id(chrome.push_id.clone());
             let mut upload = widget::row::with_children(vec![push.into()])
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .align_y(cosmic::iced::Alignment::Center);
             if let Some(counts) = counts {
                 upload = upload.push(design::caption(counts));
@@ -8584,10 +8545,9 @@ fn publish_picker<'a>(
     publish: &'a PublishDraft,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
     let key = &publish.key;
-    let mut remotes = widget::row::with_capacity(source.remotes.len()).spacing(spacing.space_xxxs);
+    let mut remotes = widget::row::with_capacity(source.remotes.len()).spacing(space::XS);
     for (index, remote) in source.remotes.iter().enumerate() {
         let id = chrome
             .publish_remote_ids
@@ -8651,10 +8611,10 @@ fn publish_picker<'a>(
                 .into(),
             confirm.into(),
         ])
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .into(),
     ])
-    .spacing(spacing.space_xxxs)
+    .spacing(space::XS)
     .into()
 }
 
@@ -8672,14 +8632,14 @@ fn commit_changes_section<'a>(
     let key = &source.key;
     let commit = &changes.commit;
     let mut column = widget::column::with_capacity(5)
-        .spacing(4)
+        .spacing(space::XS)
         .push(
             button::custom(
                 widget::row::with_children(vec![
                     Icon::ChevronLeft.handle().icon().size(ROW_ICON_SIZE).into(),
                     design::body("History").into(),
                 ])
-                .spacing(4)
+                .spacing(space::XS)
                 .align_y(Alignment::Center),
             )
             .class(sidebar_button_style(false))
@@ -8743,7 +8703,7 @@ fn commit_changes_section<'a>(
                         ))
                         .into(),
                     ])
-                    .spacing(4)
+                    .spacing(space::XS)
                     .align_y(Alignment::Center),
                     Some(SidebarAction::OpenCommitFile {
                         key: key.clone(),
@@ -8780,7 +8740,6 @@ fn history_section<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let key = &source.key;
     if let Some(changes) = &source.commit_changes {
         return commit_changes_section(state, source, changes, modal_open);
@@ -8789,7 +8748,7 @@ fn history_section<'a>(
     // slots because both come and go — the notice the moment the first page
     // lands, the pager when the walk runs out — and the pager is a named
     // button.
-    let mut column = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
+    let mut column = widget::column::with_capacity(3).spacing(space::XS);
     column = column.push(slot(
         source
             .history_error
@@ -8801,7 +8760,7 @@ fn history_section<'a>(
                     .into()
             }),
     ));
-    let mut rows = widget::column::with_capacity(source.history.len()).spacing(0);
+    let mut rows = widget::column::with_capacity(source.history.len());
     for row in &source.history {
         let chrome = &row.chrome;
         rows = rows.push(crate::interaction::keyboard_list_row(
@@ -8826,14 +8785,13 @@ fn history_section<'a>(
                             .width(Length::Fill)
                             .into(),
                     ])
-                    .spacing(0)
                     .width(Length::Fill)
                     .into(),
                 ])
-                .spacing(spacing.space_xxxs)
+                .spacing(space::XS)
                 .align_y(Alignment::Center),
             )
-            .padding([spacing.space_xxxs, spacing.space_xxxs])
+            .padding([space::XS, space::XS])
             .class(sidebar_button_style(false))
             .on_press_maybe(gated(
                 SidebarAction::OpenCommit {
@@ -8855,7 +8813,7 @@ fn history_section<'a>(
             format!("Load {HISTORY_PAGE_SIZE} more commits")
         }))
         .class(sidebar_button_style(false))
-        .padding([0, spacing.space_xxxs])
+        .padding([0.0, space::XS])
         .height(PANEL_ROW_HEIGHT)
         .id(source.chrome.more_history_id.clone())
         .on_press_maybe(gated(
@@ -8919,7 +8877,6 @@ fn panel_row<'a>(
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let indent = u16::try_from(depth).unwrap_or(u16::MAX).saturating_mul(12);
     crate::interaction::keyboard_list_row(crate::interaction::hover(
         button::custom(
@@ -8930,13 +8887,12 @@ fn panel_row<'a>(
                 content.into(),
             ])
             .align_y(Alignment::Center)
-            .spacing(0)
             .height(Length::Fill),
         )
         .class(sidebar_button_style(selected))
         .name(name)
         .selected(selected)
-        .padding([0, spacing.space_xxxs])
+        .padding([0.0, space::XS])
         .height(Length::Fixed(PANEL_ROW_HEIGHT))
         .width(Length::Fill)
         .on_press_maybe(action.and_then(|action| gated(action, modal_open))),
@@ -8949,7 +8905,6 @@ fn panel_row<'a>(
 /// come from the surface that raised the intent; `app.rs` only decides where
 /// to put it.
 pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
     let tracked = pending.tracked_count();
     let untracked = pending.untracked_count();
     let mut detail = Vec::with_capacity(2);
@@ -8982,10 +8937,10 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
                     .on_press(pending.confirm_action())
                     .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .into(),
         ])
-        .spacing(spacing.space_xs),
+        .spacing(space::M),
         520.0,
     )
 }
@@ -9013,7 +8968,7 @@ fn slot<'a>(
     children: impl IntoIterator<Item = Element<'a, SidebarAction>>,
 ) -> Element<'a, SidebarAction> {
     widget::column::with_children(children)
-        .spacing(cosmic::theme::spacing().space_xxxs)
+        .spacing(space::XS)
         .into()
 }
 

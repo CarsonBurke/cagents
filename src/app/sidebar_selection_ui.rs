@@ -599,7 +599,6 @@ impl Cagents {
         let dialog = self.sidebar_selection_ui.dialog.as_ref()?;
         let kind = dialog.kind();
         let count = dialog.targets.len();
-        let spacing = cosmic::theme::spacing();
         let title = match kind {
             SelectionRow::Project(_) => format!("Remove {count} projects from cagents?"),
             _ => format!("{}?", kind.deletion_label(count)),
@@ -637,7 +636,7 @@ impl Cagents {
                 })
                 .collect::<Vec<_>>(),
         )
-        .spacing(spacing.space_xxs);
+        .spacing(space::S);
         let (cascade, note) = self.group_cascade(dialog);
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title(title).into(),
@@ -677,7 +676,7 @@ impl Cagents {
                 ),
         ));
         Some(dialog_ui::surface(
-            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            widget::column::with_children(rows).spacing(space::M),
             500.0,
         ))
     }

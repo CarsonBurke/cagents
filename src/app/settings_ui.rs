@@ -35,9 +35,11 @@ fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a,
     setting_field(
         "Installed monospace fonts",
         "Choose a fixed-pitch font installed on this computer.",
-        widget::dropdown(labels, selected, move |index| Message::SettingsChanged {
-            field,
-            value: values[index].clone(),
+        crate::ui_controls::field::select(labels, selected, move |index| {
+            Message::SettingsChanged {
+                field,
+                value: values[index].clone(),
+            }
         })
         .into(),
     )
@@ -91,7 +93,7 @@ fn setting_stepper<'a>(
             .on_press_maybe((current != default).then(|| change(default)))
             .into(),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
@@ -115,13 +117,13 @@ fn settings_choice<'a>(
             crate::interaction::hover(
                 widget::button::custom(
                     widget::row::with_children(vec![marker, design::body(choice).into()])
-                        .spacing(2.0 * design::GRID_UNIT)
+                        .spacing(space::S)
                         .align_y(Alignment::Center),
                 )
                 .name(choice)
                 .class(crate::sidebar::sidebar_button_style(selected))
                 .selected(selected)
-                .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+                .padding([space::XS, space::S])
                 .height(design::ROW_HEIGHT)
                 .width(Length::Fill)
                 .on_press(Message::SettingsChanged {
@@ -135,7 +137,7 @@ fn settings_choice<'a>(
         label,
         detail,
         widget::column::with_children(buttons)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into(),
     )
@@ -173,7 +175,7 @@ fn default_account_choice<'a>(
     setting_field(
         label,
         detail,
-        widget::dropdown(labels, selected, move |index| {
+        crate::ui_controls::field::select(labels, selected, move |index| {
             Message::AccountUi(match &ids[index] {
                 Some(id) => account_ui::Action::SetDefault(id.clone()),
                 None => account_ui::Action::SetAutomatic(provider),
@@ -340,7 +342,7 @@ fn settings_category_controls<'a>(
                         },
                         widget::row::with_children(update_row)
                             .align_y(Alignment::Center)
-                            .spacing(2.0 * design::GRID_UNIT)
+                            .spacing(space::S)
                             .width(Length::Fill)
                             .into(),
                     ),
@@ -581,7 +583,7 @@ fn settings_category_controls<'a>(
                     setting_field(
                         "App theme",
                         "Colors for the entire application. Terminal and syntax palettes are independent.",
-                        widget::dropdown(
+                        crate::ui_controls::field::select(
                             AppTheme::ALL
                                 .iter()
                                 .map(|theme| theme.label().to_owned())
@@ -1187,7 +1189,7 @@ fn category_button<'a>(
         widget::button::custom(
             widget::row::with_children(row)
                 .align_y(Alignment::Center)
-                .spacing(2.0 * design::GRID_UNIT),
+                .spacing(space::S),
         )
         .name(if refused {
             Cow::Owned(format!(
@@ -1200,7 +1202,7 @@ fn category_button<'a>(
         .class(crate::sidebar::sidebar_button_style(item == selected))
         .selected(item == selected)
         .on_press(Message::SelectSettingsCategory(item))
-        .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+        .padding([space::XS, space::S])
         .height(design::ROW_HEIGHT)
         .width(Length::Fill),
     )
@@ -1275,7 +1277,11 @@ fn settings_layout<'a>(
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
-    let gutter = if narrow { 3.0 } else { 5.0 } * design::GRID_UNIT;
+    let gutter = if narrow {
+        space::M
+    } else {
+        5.0 * design::GRID_UNIT
+    };
 
     let mut search = crate::ui_controls::field::search("Search settings", query)
         .id(crate::settings_widgets::search_id())
@@ -1294,7 +1300,7 @@ fn settings_layout<'a>(
                 .iter()
                 .position(|item| *item == category);
             rows.push(
-                widget::dropdown(labels, selected, |index| {
+                crate::ui_controls::field::select(labels, selected, |index| {
                     Message::SelectSettingsCategory(SettingsCategory::ALL[index])
                 })
                 .width(Length::Fill)
@@ -1303,10 +1309,10 @@ fn settings_layout<'a>(
         }
         widget::container(
             widget::column::with_children(rows)
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .width(Length::Fill),
         )
-        .padding([2.0 * design::GRID_UNIT, gutter])
+        .padding([space::S, gutter])
         .width(Length::Fill)
         .into()
     } else {
@@ -1317,12 +1323,10 @@ fn settings_layout<'a>(
                         .into_iter()
                         .map(|item| category_button(item, category, refused(item))),
                 )
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .width(Length::Fill),
             )
-            .padding(design::with_vertical_rail(
-                [design::GRID_UNIT, 2.0 * design::GRID_UNIT].into(),
-            ))
+            .padding(design::with_vertical_rail([space::XS, space::S].into()))
             .width(Length::Fill),
         )
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1334,15 +1338,15 @@ fn settings_layout<'a>(
         widget::column::with_children(vec![
             widget::container(search)
                 .padding(iced::Padding {
-                    top: 3.0 * design::GRID_UNIT,
-                    right: 2.0 * design::GRID_UNIT,
+                    top: space::M,
+                    right: space::S,
                     bottom: 0.0,
-                    left: 2.0 * design::GRID_UNIT,
+                    left: space::S,
                 })
                 .into(),
             categories.into(),
         ])
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .width(Length::Fixed(RAIL_WIDTH))
         .height(Length::Fill)
         .into()
@@ -1395,13 +1399,13 @@ fn settings_layout<'a>(
         widget::container(
             widget::row::with_children(header)
                 .align_y(Alignment::Center)
-                .spacing(2.0 * design::GRID_UNIT)
+                .spacing(space::S)
                 .width(Length::Fill),
         )
         .max_width(CONTENT_MAX_WIDTH),
     )
     .padding(iced::Padding {
-        top: 3.0 * design::GRID_UNIT,
+        top: space::M,
         right: gutter,
         bottom: 0.0,
         left: gutter,
@@ -1414,7 +1418,7 @@ fn settings_layout<'a>(
                 .width(Length::Fill)
                 .max_width(CONTENT_MAX_WIDTH),
         )
-        .padding([3.0 * design::GRID_UNIT, gutter])
+        .padding([space::M, gutter])
         .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1466,7 +1470,7 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
     setting_field(
         "Color theme",
         "Live terminal colors. Add a custom_terminal_theme table to settings.toml to create your own; application color overrides remain intact.",
-        widget::dropdown(labels, index, move |index| Message::SettingsChanged {
+        crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged {
             field: SettingsField::TerminalTheme,
             value: choices[index].1.to_owned(),
         })
@@ -1504,10 +1508,10 @@ fn shortcut_input<'a>(
                     })
                     .into(),
                 ])
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .align_y(Alignment::Center),
             )
-            .padding([0.0, design::GRID_UNIT])
+            .padding([0.0, space::XS])
             .class(design::surface(
                 Some(design::raised),
                 [design::RADIUS_S; 4],
@@ -1530,7 +1534,7 @@ fn shortcut_input<'a>(
             .into();
     controls.push(
         widget::row::with_children(vec![record, reset])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .into(),
     );
     let mut message = None;
@@ -1561,7 +1565,7 @@ fn shortcut_input<'a>(
     }
     let mut children = vec![
         widget::flex_row(controls)
-            .spacing(design::GRID_UNIT as u16)
+            .spacing(space::XS as u16)
             .align_items(Alignment::Center)
             .into(),
     ];
@@ -1577,6 +1581,8 @@ fn shortcut_input<'a>(
     setting_field(
         label,
         detail,
-        widget::column::with_children(children).spacing(4).into(),
+        widget::column::with_children(children)
+            .spacing(space::XS)
+            .into(),
     )
 }

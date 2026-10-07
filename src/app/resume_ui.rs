@@ -891,7 +891,7 @@ impl Cagents {
                     .width(Length::Fill)
                     .into(),
             ])
-            .spacing(4);
+            .spacing(space::XS);
             rows.push(
                 widget::button::custom(contents)
                     .name(format!("Resume {}", row.title))
@@ -963,7 +963,7 @@ impl Cagents {
             .into(),
             widget::row::with_children(filters)
                 .align_y(Alignment::Center)
-                .spacing(8)
+                .spacing(space::S)
                 // As tall as the scope it may hold, so widening the search
                 // does not move the list.
                 .height(Length::Fixed(32.0))
@@ -973,7 +973,7 @@ impl Cagents {
                 .height(Length::Fill)
                 .into(),
         ])
-        .spacing(12)
+        .spacing(space::M)
         .height(Length::Fill);
         if let Some(error) = &state.error {
             content = content.push(design::caption(error));

@@ -174,12 +174,12 @@ impl Application for DaemonStop {
                         )
                         .into(),
                 ])
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             ])
-            .spacing(16),
+            .spacing(space::L),
         )
-        .padding(24)
+        .padding(space::XL)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

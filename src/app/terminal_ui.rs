@@ -349,9 +349,9 @@ impl Cagents {
                     .on_press(message(Action::Close(card)))
                     .into(),
             ])
-            .spacing(4)
+            .spacing(space::XS)
             .align_y(Alignment::Center)
-            .padding(4)
+            .padding(space::XS)
             .into(),
         )
     }
@@ -413,7 +413,7 @@ impl Cagents {
                 crate::ui_controls::button::secondary("Cancel").id(widget::Id::from("terminal-paste-cancel"))
                     .on_press(Message::TerminalFind(Action::ConfirmPaste(card, false))).into(),
                 crate::ui_controls::button::primary("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
-            ]).spacing(8).into(),
-        ]).spacing(12), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
+            ]).spacing(space::S).into(),
+        ]).spacing(space::M), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
     }
 }

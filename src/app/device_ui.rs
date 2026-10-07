@@ -744,7 +744,7 @@ impl Cagents {
                 design::caption(label).into(),
                 widget::icon(Icon::ChevronUp.handle()).size(12).into(),
             ])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .align_y(Alignment::Center),
         )
         .name(format!("Device: {label}. Open device connections"))
@@ -769,7 +769,7 @@ impl Cagents {
                             .into(),
                     ])
                     .align_y(Alignment::Center)
-                    .padding(Padding::from([0.0, design::GRID_UNIT * 2.0]))
+                    .padding(Padding::from([0.0, space::S]))
                     .into(),
                 ];
                 let mut choices = Vec::new();
@@ -802,14 +802,14 @@ impl Cagents {
                     }
                     let switch = widget::button::custom(
                         widget::row::with_children(contents)
-                            .spacing(design::GRID_UNIT * 2.0)
+                            .spacing(space::S)
                             .align_y(Alignment::Center),
                     )
                     .name(format!("Switch to {label}"))
                     .selected(current)
                     .class(crate::ui_controls::control_style(current, None))
                     .width(Length::Fill)
-                    .padding(design::GRID_UNIT * 2.0)
+                    .padding(space::S)
                     .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
                     let open = crate::ui_controls::icon_button(
                         Icon::PopOut,
@@ -832,7 +832,7 @@ impl Cagents {
                             open.into(),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(design::GRID_UNIT)
+                        .spacing(space::XS)
                         .into(),
                     );
                 }
@@ -860,18 +860,18 @@ impl Cagents {
                                     .into(),
                                 design::body("Browse device files").into(),
                             ])
-                            .spacing(design::GRID_UNIT * 2.0)
+                            .spacing(space::S)
                             .align_y(Alignment::Center),
                         )
                         .name("Browse device files")
                         .class(crate::ui_controls::control_style(false, None))
                         .width(Length::Fill)
-                        .padding(design::GRID_UNIT * 2.0)
+                        .padding(space::S)
                         .on_press_maybe(enabled.then_some(Message::Device(Action::Open)))
                         .into(),
                     );
                 }
-                widget::container(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                widget::container(widget::column::with_children(rows).spacing(space::XS))
                     .width(304)
                     .into()
             }),
@@ -882,7 +882,7 @@ impl Cagents {
 
     pub(super) fn device_dialog(&self) -> Element<'_, Message> {
         // Use the tracked window geometry: Responsive hides its descendants from AccessKit.
-        let padding = 8.0 * design::GRID_UNIT;
+        let padding = space::XXL;
         self.device_dialog_layout(iced::Size::new(
             (self.window_width - padding).max(1.0),
             (self.window_height - padding).max(1.0),
@@ -901,11 +901,14 @@ impl Cagents {
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(8).into()];
+            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(space::S).into()];
             if let Some(notice) = &state.notice {
                 rows.push(design::body(notice).into());
             }
-            return dialog_ui::surface(widget::column::with_children(rows).spacing(12), 600.0);
+            return dialog_ui::surface(
+                widget::column::with_children(rows).spacing(space::M),
+                600.0,
+            );
         }
         let icon = |name: Icon, label: &'static str, value: Action, enabled: bool| {
             let destructive = matches!(
@@ -946,7 +949,7 @@ impl Cagents {
                 icon(Icon::Close, "Close device tools", Action::Close, true),
             ])
             .align_y(Alignment::Center)
-            .spacing(12)
+            .spacing(space::M)
             .into(),
             widget::row::with_children(vec![
                 icon(
@@ -975,7 +978,7 @@ impl Cagents {
                 ),
             ])
             .align_y(Alignment::Center)
-            .spacing(4)
+            .spacing(space::XS)
             .into(),
         ];
         if state.path != state.directory.display().to_string()
@@ -1049,21 +1052,22 @@ impl Cagents {
                                     .width(Length::Fill)
                                     .into(),
                             ])
-                            .spacing(8)
+                            .spacing(space::S)
                             .align_y(Alignment::Center),
                         )
                         .name(entry.name.clone())
                         .selected(selected)
                         .class(crate::ui_controls::control_style(selected, None))
-                        .padding([6, 8])
+                        .padding([6.0, space::S])
                         .width(Length::Fill)
                         .on_press_maybe((!state.busy && !entry.symlink).then_some(action(value)))
                         .into()
                     })
                     .collect();
-                let file_list = widget::scrollable(widget::column::with_children(files).spacing(2))
-                    .width(if narrow { 176 } else { 224 })
-                    .height(height);
+                let file_list =
+                    widget::scrollable(widget::column::with_children(files).spacing(space::XXS))
+                        .width(if narrow { 176 } else { 224 })
+                        .height(height);
                 let editor: Element<'_, Message> = if let Some(file) = &state.file {
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
@@ -1084,7 +1088,7 @@ impl Cagents {
                             ),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(4)
+                        .spacing(space::XS)
                         .into(),
                         iced::widget::text_editor(&state.content)
                             .font(crate::terminal::monospace_font(
@@ -1096,7 +1100,7 @@ impl Cagents {
                             .height((height - 38.0).max(120.0))
                             .into(),
                     ])
-                    .spacing(8)
+                    .spacing(space::S)
                     .width(Length::Fill)
                     .into()
                 } else {
@@ -1105,7 +1109,7 @@ impl Cagents {
                             crate::ui_controls::passive_icon(Icon::Edit, 32).into(),
                             design::caption("Select a file").into(),
                         ])
-                        .spacing(12)
+                        .spacing(space::M)
                         .align_x(Alignment::Center),
                     )
                     .center(Length::Fill)
@@ -1113,7 +1117,7 @@ impl Cagents {
                     .into()
                 };
                 widget::row::with_children(vec![file_list.into(), editor])
-                    .spacing(16)
+                    .spacing(space::L)
                     .into()
             }
             Panel::Changes => widget::column::with_children(vec![
@@ -1158,7 +1162,7 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(4)
+                .spacing(space::XS)
                 .into(),
                 widget::row::with_children(vec![
                     crate::ui_controls::field::text("Commit message", &state.commit_message)
@@ -1175,11 +1179,11 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(4)
+                .spacing(space::XS)
                 .into(),
                 output((height - 92.0).max(120.0)),
             ])
-            .spacing(12)
+            .spacing(space::M)
             .into(),
             Panel::Worktrees => widget::column::with_children(vec![
                 widget::row::with_children(vec![
@@ -1217,15 +1221,15 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(4)
+                .spacing(space::XS)
                 .into(),
                 output((height - 52.0).max(120.0)),
             ])
-            .spacing(12)
+            .spacing(space::M)
             .into(),
         };
         rows.push(body);
-        let content = widget::scrollable(widget::column::with_children(rows).spacing(12))
+        let content = widget::scrollable(widget::column::with_children(rows).spacing(space::M))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))

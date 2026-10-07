@@ -1010,10 +1010,12 @@ impl Cagents {
                 });
             widget::column::with_children(vec![
                 widget::container(design::heading("New tab"))
-                    .padding([6, 8])
+                    .padding([6.0, space::S])
                     .into(),
                 crate::design::horizontal_rule().into(),
-                widget::column::with_children(items).spacing(2).into(),
+                widget::column::with_children(items)
+                    .spacing(space::XXS)
+                    .into(),
             ])
             .spacing(6)
             .width(design::COMMAND_POPOVER_WIDTH)
@@ -1092,7 +1094,7 @@ impl Cagents {
                                 format!("Repeated {} times", entry.repeats),
                             ),
                         ])
-                        .spacing(design::GRID_UNIT)
+                        .spacing(space::XS)
                         .into()
                     } else {
                         super::notice_body(&entry.notice.message)
@@ -1122,7 +1124,7 @@ impl Cagents {
                 ];
                 if !self.notices.is_empty() {
                     heading_children.push(
-                        widget::button::text("Dismiss all")
+                        crate::ui_controls::button::quiet("Dismiss all")
                             .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
                             .name("Dismiss every application notice")
                             .on_press(Message::DismissAllNotices)
@@ -1137,13 +1139,13 @@ impl Cagents {
                 ));
                 let heading = widget::row::with_children(heading_children)
                     .align_y(Alignment::Center)
-                    .spacing(8);
+                    .spacing(space::S);
                 widget::container(
                     widget::column::with_children(vec![
                         heading.into(),
                         widget::scrollable(
                             widget::column::with_children(notices)
-                                .spacing(12)
+                                .spacing(space::M)
                                 // Each notice ends in a Dismiss control on its
                                 // right edge, which the floating thumb would
                                 // otherwise cover.
@@ -1155,7 +1157,7 @@ impl Cagents {
                         .height(Length::Shrink)
                         .into(),
                     ])
-                    .spacing(8),
+                    .spacing(space::S),
                 )
                 .padding(6)
                 .width(design::NOTICE_POPOVER_WIDTH)
@@ -1243,7 +1245,7 @@ impl Cagents {
                 + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
                 + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
             count as f32 * design::WINDOW_CONTROL_SIZE
-                + count.saturating_sub(1) as f32 * cosmic::theme::spacing().space_xxs as f32
+                + count.saturating_sub(1) as f32 * space::S
                 + design::PRIMARY_CONTROL_SIZE
                 + 12.0
         };
@@ -1370,7 +1372,7 @@ impl Cagents {
             },
         );
         let actions = widget::row::with_children(self.workflow_header())
-            .spacing(2)
+            .spacing(space::XXS)
             .align_y(Alignment::Center);
         let header = self.native_header(
             tabs.into(),
@@ -1382,7 +1384,6 @@ impl Cagents {
             crate::design::horizontal_rule().into(),
             content,
         ])
-        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -1458,7 +1459,7 @@ impl Cagents {
         let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
             widget::row::with_children(actions)
-                .spacing(2)
+                .spacing(space::XXS)
                 .align_y(Alignment::Center)
                 .into(),
             widget::row::with_children(
@@ -1518,12 +1519,12 @@ impl Cagents {
                             )
                             .into(),
                     ])
-                    .spacing(design::GRID_UNIT)
+                    .spacing(space::XS)
                     .into(),
                 ])
-                .spacing(2.0 * design::GRID_UNIT),
+                .spacing(space::S),
             )
-            .padding(3.0 * design::GRID_UNIT)
+            .padding(space::M)
             .width(400)
             .class(cosmic::theme::Container::Card)
             .into(),
@@ -1574,7 +1575,7 @@ impl Cagents {
                     .width(Length::Fill)
                     .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .height(Length::Fill),
         )
@@ -1591,7 +1592,7 @@ impl Cagents {
             |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
         ))
         .class(column_title_style())
-        .padding([0, 4])
+        .padding([0.0, space::XS])
         .width(Length::Fill)
         .height(Length::Fill)
         .on_press(Message::FocusCard(id));
@@ -1694,10 +1695,10 @@ impl Cagents {
                 widget::row::with_children(children)
                     .align_y(Alignment::Center)
                     .height(Length::Fill)
-                    .spacing(2)
+                    .spacing(space::XXS)
                     .width(Length::Fill),
             )
-            .padding([0, 4])
+            .padding([0.0, space::XS])
             .height(design::PRIMARY_CONTROL_SIZE)
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
@@ -1842,7 +1843,7 @@ impl Cagents {
                     }
                 }),
         )
-        .spacing(2)
+        .spacing(space::XXS)
         .align_y(Alignment::Center);
         // Keep named controls in fixed slots as notices and updates come and go.
         // Alerts and updates remain beside the window controls; the toggle
@@ -1854,12 +1855,12 @@ impl Cagents {
             widget::row::with_children(self.notice_control()).into(),
             widget::row::with_children(self.update_control()).into(),
         ])
-        .spacing(2)
+        .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
         let tabs = widget::container(tabs)
-            .padding([0, 8])
+            .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill);
         let body = match self.context_tab {
@@ -1887,12 +1888,12 @@ impl Cagents {
                                         .unwrap_or_default()
                                 }),
                         ),
-                        widget::button::standard(if changes {
+                        crate::ui_controls::button::secondary(if changes {
                             "Open changes"
                         } else {
                             "Open files"
                         })
-                        .leading_icon(if changes {
+                        .icon(if changes {
                             Icon::Diff
                         } else {
                             Icon::OpenFolder
@@ -1910,9 +1911,9 @@ impl Cagents {
                         )))
                         .into(),
                     ])
-                    .spacing(12),
+                    .spacing(space::M),
                 )
-                .padding(16)
+                .padding(space::L)
                 .width(Length::Fill)
                 .into()
             }
@@ -1942,9 +1943,9 @@ impl Cagents {
                                 .on_press(Message::SelectContextTab(ContextTab::Files))
                                 .into(),
                         ])
-                        .spacing(8),
+                        .spacing(space::S),
                     )
-                    .padding(12)
+                    .padding(space::M)
                     .width(Length::Fill)
                     .into()
                 },
@@ -1964,7 +1965,6 @@ impl Cagents {
                 crate::design::horizontal_rule().into(),
                 body,
             ])
-            .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill),
         )

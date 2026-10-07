@@ -195,7 +195,7 @@ pub const MODEL_POPUP_CEILING: f32 = 280.0;
 /// the window edge is the same measure as the gap between two groups, so one
 /// number describes both. Naming it here is what stops an embedding shell from
 /// adding a second, different inset of its own on top of the toolbar's.
-pub const TOOLBAR_INSET: f32 = GRID_UNIT * 3.0;
+pub const TOOLBAR_INSET: f32 = space::M;
 pub const TOOLBAR_GROUP_SPACING: f32 = TOOLBAR_INSET;
 
 /// Room for the widest label a counter wedged between two step controls can

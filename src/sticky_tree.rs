@@ -43,9 +43,7 @@ pub(crate) fn rows<'a, Message: 'a>(
     let mut folders: Vec<Frame<'a, Message>> = Vec::new();
     let close = |folders: &mut Vec<Frame<'a, Message>>, root: &mut Vec<Element<'a, Message>>| {
         let frame = folders.pop().expect("open folder");
-        let descendants = widget::column::with_children(frame.children)
-            .spacing(0)
-            .into();
+        let descendants = widget::column::with_children(frame.children).into();
         let group = group(
             frame.header,
             descendants,
@@ -81,10 +79,7 @@ pub(crate) fn rows<'a, Message: 'a>(
     while !folders.is_empty() {
         close(&mut folders, &mut root);
     }
-    viewport(
-        widget::column::with_children(root).spacing(0).into(),
-        position,
-    )
+    viewport(widget::column::with_children(root).into(), position)
 }
 
 pub(crate) fn viewport<'a, Message: 'a>(

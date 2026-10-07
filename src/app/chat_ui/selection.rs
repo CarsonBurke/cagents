@@ -1687,7 +1687,7 @@ mod tests {
                 .into(),
             prose("following paragraph"),
         ])
-        .spacing(12)
+        .spacing(space::M)
         .into();
         let mut tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(

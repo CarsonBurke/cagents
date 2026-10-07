@@ -443,7 +443,6 @@ impl Cagents {
     /// while a resolution is running, so a stray click cannot throw it away.
     pub(super) fn worktree_dialog_view(&self) -> Option<(Element<'_, Message>, Option<Message>)> {
         let dialog = self.worktree_dialog.as_ref()?;
-        let spacing = cosmic::theme::spacing();
         let editable = dialog.resolving.is_none();
         let field_error = |field| {
             dialog
@@ -484,7 +483,7 @@ impl Cagents {
                 )
                 .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             field(
                 "Branch or Linear issue",
@@ -556,7 +555,7 @@ impl Cagents {
                 crate::ui_controls::activity_spinner(14.0, design::muted_icon_color),
                 design::caption("Checking the branch and destination…").into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into()
@@ -579,15 +578,12 @@ impl Cagents {
                 .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
                 .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .into(),
         );
         Some((
-            dialog_ui::surface(
-                widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                520.0,
-            ),
+            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 520.0),
             editable.then_some(Message::CancelDialog),
         ))
     }
@@ -603,7 +599,7 @@ fn field<'a>(
         .push(design::caption(label))
         .push(input)
         .push_maybe(note)
-        .spacing(cosmic::theme::spacing().space_xxxs)
+        .spacing(space::XS)
         .into()
 }
 

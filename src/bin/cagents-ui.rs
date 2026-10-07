@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 
+use cagents::design::space;
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
 const PRODUCT: &str = "cagents-ui";
@@ -419,11 +420,11 @@ impl cosmic::Application for StartupError {
                     .on_press(StartupErrorMessage::Close)
                     .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .into(),
         );
-        cosmic::widget::container(cosmic::widget::column::with_children(rows).spacing(16))
-            .padding(24)
+        cosmic::widget::container(cosmic::widget::column::with_children(rows).spacing(space::L))
+            .padding(space::XL)
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
             .into()

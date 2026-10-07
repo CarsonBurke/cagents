@@ -279,7 +279,7 @@ impl Cagents {
                     design::body(label).width(Length::Fill).into(),
                     design::caption(chord).into(),
                 ])
-                .spacing(12)
+                .spacing(space::M)
                 .align_y(Alignment::Center);
                 let button = if index == self.palette.selected {
                     widget::button::custom(row).class(cosmic::theme::Button::Suggested)
@@ -303,7 +303,7 @@ impl Cagents {
                 widget::column::with_children(vec![
                     input.into(),
                     widget::container(
-                        widget::scrollable(rows.spacing(2))
+                        widget::scrollable(rows.spacing(space::XXS))
                             .id(widget::Id::new("palette.commands"))
                             .height(Length::Shrink),
                     )
@@ -311,9 +311,9 @@ impl Cagents {
                     .into(),
                     design::caption("↑ ↓ choose · Enter run · Escape close").into(),
                 ])
-                .spacing(8),
+                .spacing(space::S),
             )
-            .padding(12)
+            .padding(space::M)
             .width(560)
             .class(cosmic::theme::Container::Card)
             .into(),

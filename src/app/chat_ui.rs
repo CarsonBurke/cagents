@@ -3430,7 +3430,7 @@ impl Cagents {
                     .height(Length::Shrink),
             )
             .max_height(180)
-            .padding(8)
+            .padding(space::S)
             .into(),
         )
     }

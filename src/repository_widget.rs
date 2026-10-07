@@ -30,6 +30,7 @@ use cosmic::{
 };
 
 use crate::{
+    design::space,
     diff_view::{
         DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
         InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, build_document_diff,
@@ -7200,7 +7201,7 @@ pub fn view_with_review<'a>(
                         .into(),
                 ])
                 .align_x(Alignment::Center)
-                .spacing(cosmic::theme::spacing().space_s),
+                .spacing(space::L),
             )
             .center(Length::Fill)
             .into(),
@@ -7439,7 +7440,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         };
         widget::container(crate::interaction::tooltip(
             widget::row::with_children(label)
-                .spacing(8)
+                .spacing(space::S)
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
             tooltip,
@@ -7772,7 +7773,7 @@ fn find_strip<'a>(
             .into(),
     );
     let find = widget::row::with_children(row)
-        .spacing(crate::design::GRID_UNIT * 2.0)
+        .spacing(space::S)
         .align_y(Alignment::Center)
         .width(Length::Fill);
     let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
@@ -7796,14 +7797,14 @@ fn find_strip<'a>(
                     )
                     .into(),
             ])
-            .spacing(crate::design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .into(),
         );
     }
     Some(
         widget::container(widget::column::with_children(strips))
-            .padding([0.0, crate::design::GRID_UNIT * 3.0])
+            .padding([0.0, space::M])
             .width(Length::Fill)
             .into(),
     )
@@ -7844,7 +7845,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
                     .width(Length::Fill)
                     .height(Length::Fill),
             )
-            .padding(12)
+            .padding(space::M)
             .width(Length::Fill)
             .height(Length::Fill),
             format!("{width} × {height} pixels"),
@@ -8015,11 +8016,11 @@ fn pdf_document_view<'a>(
     widget::column::with_children(vec![
         widget::container(
             widget::row::with_children(controls)
-                .spacing(crate::design::GRID_UNIT)
+                .spacing(space::XS)
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
-        .padding([0.0, crate::design::GRID_UNIT * 3.0])
+        .padding([0.0, space::M])
         .height(crate::design::DENSE_ROW_HEIGHT)
         .width(Length::Fill)
         .into(),
@@ -8031,7 +8032,7 @@ fn pdf_document_view<'a>(
                 width,
                 height,
             ))
-            .padding(crate::design::GRID_UNIT * 3.0)
+            .padding(space::M)
             .width(Length::Fill)
             .height(Length::Fill),
             format!("Page {} of {pages}, {width} × {height} pixels", page + 1),
@@ -8115,7 +8116,6 @@ fn editable_document_view<'a>(
     runtime: &'a RepositoryRuntime,
     document: &'a EditorDocument,
 ) -> Element<'a, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
     let mut error_rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
     if let Some(error) = document
         .error
@@ -8153,9 +8153,9 @@ fn editable_document_view<'a>(
             );
         }
         error_rows.push(
-            widget::container(widget::row::with_children(actions).spacing(spacing.space_xxs))
+            widget::container(widget::row::with_children(actions).spacing(space::S))
                 .class(cosmic::theme::Container::Secondary)
-                .padding(spacing.space_xs)
+                .padding(space::M)
                 .into(),
         );
     }
@@ -8211,7 +8211,7 @@ fn editable_document_view<'a>(
                 )
                 .into()
             })
-            .padding(spacing.space_m)
+            .padding(space::XL)
             .max_width(900),
         )
         .id(runtime.preview_scroll_id.clone())
@@ -8266,7 +8266,7 @@ fn editable_document_view<'a>(
             Some(
                 widget::container(
                     widget::column::with_children(choices)
-                        .spacing(crate::design::GRID_UNIT)
+                        .spacing(space::XS)
                         .width(360),
                 )
                 .class(crate::design::surface(
@@ -8274,7 +8274,7 @@ fn editable_document_view<'a>(
                     [crate::design::RADIUS_S; 4],
                     true,
                 ))
-                .padding(spacing.space_xs)
+                .padding(space::M)
                 .into(),
             )
         } else if !runtime.language.hover.is_empty() {
@@ -8302,7 +8302,7 @@ fn editable_document_view<'a>(
                                 })
                                 .collect::<Vec<_>>(),
                         )
-                        .spacing(spacing.space_xs),
+                        .spacing(space::M),
                     )
                     .height(Length::Shrink),
                 )
@@ -8313,7 +8313,7 @@ fn editable_document_view<'a>(
                     [crate::design::RADIUS_S; 4],
                     true,
                 ))
-                .padding(spacing.space_xs)
+                .padding(space::M)
                 .into(),
             )
         } else {
@@ -8373,7 +8373,7 @@ fn editable_document_view<'a>(
             } else {
                 iced::advanced::text::Wrapping::None
             })
-            .padding(spacing.space_xs)
+            .padding(space::M)
             .height(Length::Fill)
             .style(|theme, status| {
                 use iced::widget::text_editor::Catalog;
@@ -8770,7 +8770,6 @@ fn base_choice_view(
     card: CardId,
     candidates: &[ValidatedRefName],
 ) -> Element<'static, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
     let mut rows: Vec<Element<'static, RepositoryAction>> = vec![
         crate::design::title("Choose a branch comparison base").into(),
         crate::design::body(
@@ -8794,7 +8793,7 @@ fn base_choice_view(
             .collect();
         let refs = candidates.to_vec();
         rows.push(
-            widget::dropdown(labels, None, move |index| {
+            crate::ui_controls::field::select(labels, None, move |index| {
                 // The dropdown reports an index into the very list it was given.
                 RepositoryAction::SelectBranchBase {
                     card,
@@ -8808,10 +8807,10 @@ fn base_choice_view(
         widget::container(
             widget::column::with_children(rows)
                 .align_x(Alignment::Center)
-                .spacing(spacing.space_xs),
+                .spacing(space::M),
         )
         .class(cosmic::theme::Container::Card)
-        .padding(spacing.space_m)
+        .padding(space::XL)
         .max_width(620),
     )
     .center(Length::Fill)
@@ -8941,7 +8940,6 @@ fn diff_model_view<'a>(
                     slots.push((children.len(), Some(index)));
                     children.push(
                         widget::column::with_children([code, ctx.annotation(old, new, false)])
-                            .spacing(0)
                             .width(Length::Fill)
                             .into(),
                     );
@@ -8968,7 +8966,6 @@ fn diff_model_view<'a>(
                     .into(),
             );
             let column = widget::column::with_children(children)
-                .spacing(0)
                 .width(viewport_width)
                 .into();
             let content = if let Some(ctx) = context {
@@ -9226,7 +9223,7 @@ fn diff_fold_row<'a>(
             )
             .name(format!("Show all {count} unchanged lines"))
             .class(crate::ui_controls::control_style(false, None))
-            .padding([2, 8])
+            .padding([space::XXS, space::S])
             .on_press_maybe(action(FoldExpansion::All)),
         ),
         format!("Show all {count} lines"),
@@ -9235,11 +9232,11 @@ fn diff_fold_row<'a>(
         widget::row::with_children([
             widget::container(
                 widget::row::with_children(controls)
-                    .spacing(2)
+                    .spacing(space::XXS)
                     .align_y(Alignment::Center),
             )
             .align_x(Alignment::End)
-            .padding([0, 4])
+            .padding([0.0, space::XS])
             .width(gutter_width)
             .into(),
             expand_all,
@@ -9450,7 +9447,6 @@ fn split_diff_row_with_review<'a>(
             new_action,
         ),
     ])
-    .spacing(0)
     .height(DIFF_ROW_HEIGHT)
     .into()
 }
@@ -9514,7 +9510,7 @@ fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryActi
                 }
             })),
     )
-    .padding([0, 8])
+    .padding([0.0, space::S])
     .width(width)
     .into()
 }
@@ -10320,27 +10316,11 @@ fn information_state_height<'a>(
     detail: impl Into<String>,
     height: Length,
 ) -> Element<'a, RepositoryAction> {
-    widget::container(
-        widget::container(
-            widget::column::with_children(vec![
-                Icon::Info.handle().icon().size(28).into(),
-                crate::design::title(title.into()).into(),
-                crate::design::body(detail.into())
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .into(),
-            ])
-            .align_x(Alignment::Center)
-            .spacing(cosmic::theme::spacing().space_xs),
-        )
-        .class(cosmic::theme::Container::Card)
-        .padding(cosmic::theme::spacing().space_m)
-        .max_width(620),
-    )
-    .width(Length::Fill)
-    .height(height)
-    .align_x(Alignment::Center)
-    .align_y(Alignment::Center)
-    .into()
+    crate::ui_controls::placeholder(title.into())
+        .icon(Icon::Info)
+        .detail(detail.into())
+        .height(height)
+        .into()
 }
 
 #[cfg(test)]
@@ -11691,9 +11671,9 @@ mod tests {
         );
         assert!(scroll_viewports(&toolbar).is_empty());
 
-        // Vertical only: the Markdown preview, whose inset comes from the
-        // theme's medium spacing. That is wider than the rail today, and this
-        // is what notices if a density preset ever makes it narrower.
+        // Vertical only: the Markdown preview, whose inset is `space::XL`.
+        // That is wider than the rail today, and this is what notices if the
+        // inset ever becomes narrower.
         let (mut preview, identity) = RepositoryRuntime::selection_fixture(card, "notes.md");
         let text = "# Notes\n\nA paragraph long enough to wrap inside the preview.\n".repeat(24);
         drop(preview.update(RepositoryAction::FileLoaded {
@@ -13253,10 +13233,8 @@ mod tests {
                     .on_press(RepositoryAction::NextChange { card })
                     .into(),
             ])
-            .spacing(0)
             .into(),
         ])
-        .spacing(0)
         .width(300.0)
         .into();
         let mut element = Element::new(DiffAnnotationMeasure {

@@ -19,7 +19,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    design::{self, InspectorLayout},
+    design::{self, InspectorLayout, space},
     location::SanitizedLocation,
     lsp::{
         LocationKind, LspCompletionItem, LspCompletionKind, LspCoordinates, LspDiagnostic,
@@ -1481,12 +1481,11 @@ impl<'a, Message: 'a> InspectorSection<'a, Message> {
     }
 
     pub fn view(self) -> Element<'a, Message> {
-        let spacing = cosmic::theme::spacing();
         let mut children = Vec::with_capacity(self.content.len() + 1);
         children.push(design::heading(self.title).into());
         children.extend(self.content);
         widget::column::with_children(children)
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .width(Length::Fill)
             .into()
     }
@@ -1503,7 +1502,6 @@ impl SegmentedActions {
     }
 
     pub fn view(self) -> Element<'static, InspectorAction> {
-        let spacing = cosmic::theme::spacing();
         let buttons: Vec<Element<'static, InspectorAction>> = self
             .actions
             .into_iter()
@@ -1529,7 +1527,7 @@ impl SegmentedActions {
             })
             .collect();
         widget::column::with_children(buttons)
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }
@@ -1542,10 +1540,7 @@ impl SegmentedActions {
 /// pressable text row, the same control the sidebar uses for its own rows,
 /// because the editor offers no gutter or overlay to host a language server's
 /// results.
-fn fact_element(
-    fact: Fact,
-    spacing: cosmic::cosmic_theme::Spacing,
-) -> Element<'static, InspectorAction> {
+fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
     match fact.action {
         Some(action) => {
             let name = format!("{}: {}", fact.label, fact.value);
@@ -1554,12 +1549,11 @@ fn fact_element(
                     design::caption(fact.label).into(),
                     fact_body(fact.value, fact.markdown, false),
                 ])
-                .spacing(0)
                 .width(Length::Fill),
             )
             .class(crate::sidebar::sidebar_button_style(false))
             .name(name)
-            .padding([0, spacing.space_xxxs])
+            .padding([0.0, space::XS])
             .width(Length::Fill)
             .on_press(action)
             .into()
@@ -1568,7 +1562,6 @@ fn fact_element(
             design::caption(fact.label).into(),
             fact_body(fact.value, fact.markdown, true),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
     }
@@ -1764,7 +1757,6 @@ fn markdown_item(
             })
             .into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
         Item::Quote(quote) => widget::row::with_children(vec![
@@ -1836,7 +1828,6 @@ pub fn view(
     width: f32,
     diagnostics_open: bool,
 ) -> Element<'static, InspectorAction> {
-    let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
         widget::icon(icon).size(design::ROW_ICON_SIZE).into(),
         widget::column::with_children(vec![
@@ -1849,12 +1840,11 @@ pub fn view(
                 .into(),
             design::caption(model.kind).into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
     ])
     .align_y(Alignment::Center)
-    .spacing(spacing.space_xxs);
+    .spacing(space::S);
 
     // Commands stay within reach, before potentially long source and LSP results.
     let mut sections = vec![SegmentedActions::new(model.actions).view()];
@@ -1867,10 +1857,7 @@ pub fn view(
             sections.push(
                 InspectorSection::new(
                     section.title.clone(),
-                    visible
-                        .into_iter()
-                        .map(|fact| fact_element(fact, spacing))
-                        .collect(),
+                    visible.into_iter().map(fact_element).collect(),
                 )
                 .view(),
             );
@@ -1879,10 +1866,7 @@ pub fn view(
             diagnostics.push(
                 InspectorSection::new(
                     section.title,
-                    internal
-                        .into_iter()
-                        .map(|fact| fact_element(fact, spacing))
-                        .collect(),
+                    internal.into_iter().map(fact_element).collect(),
                 )
                 .view(),
             );
@@ -1908,10 +1892,10 @@ pub fn view(
     let content = widget::scrollable(
         widget::container(
             widget::column::with_children(sections)
-                .spacing(spacing.space_s)
+                .spacing(space::L)
                 .width(Length::Fill),
         )
-        .padding(12)
+        .padding(space::M)
         .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1923,13 +1907,12 @@ pub fn view(
     widget::container(
         widget::column::with_children(vec![
             widget::container(heading)
-                .padding(12)
+                .padding(space::M)
                 .width(Length::Fill)
                 .into(),
             crate::design::horizontal_rule().into(),
             content.into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill),
     )
@@ -2944,7 +2927,7 @@ mod tests {
         assert!(fact.markdown, "hover was not marked as Markdown: {fact:?}");
         assert_eq!(fact.action, None);
 
-        let rendered = Tree::new(&fact_element(fact.clone(), cosmic::theme::spacing()));
+        let rendered = Tree::new(&fact_element(fact.clone()));
         let markdown = Tree::new(&markdown_body(&fact.value));
         assert_eq!(
             tree_shape(&rendered.children[1]),

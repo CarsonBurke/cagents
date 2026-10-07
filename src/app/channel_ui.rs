@@ -816,7 +816,7 @@ impl Cagents {
             .on_press(Message::ChannelUi(Action::ConfirmDelete)),
         ));
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))
     }

@@ -310,7 +310,7 @@ fn verify_local_head(target: &Target, cancellation: &CancellationToken) -> Resul
 fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
     widget::button::custom(design::caption(label))
         .class(crate::ui_controls::control_style(false, None))
-        .padding([4, 8])
+        .padding([space::XS, space::S])
         .on_press(Action::OpenUrl(url.clone()))
         .into()
 }
@@ -430,7 +430,7 @@ fn meta_row<'a>(label: &'a str, value: Element<'a, Action>) -> Element<'a, Actio
             .into(),
         value,
     ])
-    .spacing(design::GRID_UNIT * 2.0)
+    .spacing(space::S)
     .align_y(Alignment::Start)
     .width(Length::Fill)
     .into()
@@ -446,10 +446,10 @@ const META_LABEL_WIDTH: f32 = 80.0;
 fn block<'a>(children: Vec<Element<'a, Action>>) -> Element<'a, Action> {
     widget::container(
         widget::column::with_children(children)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill),
     )
-    .padding(design::GRID_UNIT * 2.0)
+    .padding(space::S)
     .width(Length::Fill)
     .class(design::surface(
         Some(design::raised),
@@ -476,12 +476,12 @@ fn section_header(
             .into(),
             design::heading(label.into()).width(Length::Fill).into(),
         ])
-        .spacing(4)
+        .spacing(space::XS)
         .align_y(Alignment::Center),
     )
     .class(crate::ui_controls::control_style(false, None))
     .height(design::DENSE_ROW_HEIGHT)
-    .padding([0, 4])
+    .padding([0.0, space::XS])
     .width(Length::Fill)
     .on_press(Action::ToggleSection(section))
     .into()
@@ -557,7 +557,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
             .on_press_maybe((state.target.is_some() && !state.loading).then_some(Action::Refresh))
             .into(),
     ])
-    .spacing(4)
+    .spacing(space::XS)
     .align_y(Alignment::Center)
     .height(design::HEADER_CONTENT_HEIGHT);
     let mut children: Vec<Element<'_, Action>> = Vec::new();
@@ -621,7 +621,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     .into(),
                 link("Open on GitHub", &pr.url),
             ])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into(),
@@ -638,7 +638,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     .width(Length::Fill)
                     .into(),
             ])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into(),
@@ -665,7 +665,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     .width(Length::Fill)
                     .into(),
                 ])
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .align_y(Alignment::Start)
                 .width(Length::Fill)
                 .into(),
@@ -810,7 +810,6 @@ pub fn view(state: &State) -> Element<'_, Action> {
                             .width(Length::Fill)
                             .into(),
                         ])
-                        .spacing(0)
                         .width(Length::Fill);
                         if !check.description.is_empty() {
                             content = content
@@ -840,14 +839,14 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     .align_x(Alignment::Center)
                                     .into(),
                                 ])
-                                .spacing(design::GRID_UNIT * 2.0)
+                                .spacing(space::S)
                                 .align_y(Alignment::Center),
                             )
                             .class(crate::ui_controls::control_style(
                                 false,
                                 Some(design::Tone::Themed(tone)),
                             ))
-                            .padding([4, 8])
+                            .padding([space::XS, space::S])
                             .width(Length::Fill)
                             .on_press(Action::OpenUrl(check.link.clone()))
                             .into(),
@@ -903,7 +902,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                             .on_press(Action::ToggleResolved)
                             .into(),
                         ])
-                        .spacing(design::GRID_UNIT)
+                        .spacing(space::XS)
                         .align_y(Alignment::Center)
                         .width(Length::Fill)
                         .into(),
@@ -950,7 +949,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                 });
                                 head
                             })
-                            .spacing(design::GRID_UNIT)
+                            .spacing(space::XS)
                             .align_y(Alignment::Center)
                             .width(Length::Fill)
                             .into(),
@@ -1025,9 +1024,10 @@ pub fn view(state: &State) -> Element<'_, Action> {
     }
     let body = widget::scrollable(
         widget::column::with_children(children)
-            .spacing(8)
+            .spacing(space::S)
             .padding(design::with_vertical_rail(cosmic::iced::Padding::from([
-                4, 8,
+                space::XS,
+                space::S,
             ])))
             .width(Length::Fill),
     )
@@ -1038,7 +1038,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     .width(Length::Fill);
     widget::column::with_children(vec![
         widget::container(header)
-            .padding([0, 8])
+            .padding([0.0, space::S])
             .width(Length::Fill)
             .into(),
         crate::design::horizontal_rule().into(),

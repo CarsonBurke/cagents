@@ -665,7 +665,7 @@ impl Cagents {
         if intent.active && intent.detail.is_none() {
             rows.push(
                 widget::button::custom(
-                    widget::checkbox(intent.dont_ask_again)
+                    crate::ui_controls::field::checkbox(intent.dont_ask_again)
                         .label("Don't ask me again")
                         .on_toggle_maybe(
                             (!intent.pending).then_some(Message::TerminalCloseDontAskChanged),
@@ -705,9 +705,9 @@ impl Cagents {
                     .into(),
             ]
         };
-        rows.push(widget::row::with_children(buttons).spacing(8).into());
+        rows.push(widget::row::with_children(buttons).spacing(space::S).into());
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(12),
+            widget::column::with_children(rows).spacing(space::M),
             560.0,
         ))
     }
