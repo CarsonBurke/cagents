@@ -2817,24 +2817,20 @@ fn tool_content(name: &str, input: &Value, cwd: &Path) -> ItemContent {
             session(),
             CommandAction::Run,
         ),
-        "Read" if !file.is_empty() => command_content(
-            format!("Read {file}"),
-            file.into(),
-            session(),
-            CommandAction::Read,
-        ),
+        // What a read, a search or a listing acted on is its label; the view
+        // supplies the verb, from the action.
+        "Read" if !file.is_empty() => {
+            command_content(file.into(), file.into(), session(), CommandAction::Read)
+        }
         "Grep" if !pattern.is_empty() => command_content(
-            format!("Search {pattern}"),
+            pattern.into(),
             pattern.into(),
             scope(),
             CommandAction::Search,
         ),
-        "Glob" if !pattern.is_empty() => command_content(
-            format!("List {pattern}"),
-            pattern.into(),
-            scope(),
-            CommandAction::List,
-        ),
+        "Glob" if !pattern.is_empty() => {
+            command_content(pattern.into(), pattern.into(), scope(), CommandAction::List)
+        }
         _ => ItemContent::Tool {
             name: name.into(),
             input: input.to_string(),
@@ -5749,17 +5745,17 @@ mod tests {
             mapped,
             vec![
                 (
-                    "Read src/app.rs".to_owned(),
+                    "src/app.rs".to_owned(),
                     "/workspace".to_owned(),
                     Some(CommandAction::Read)
                 ),
                 (
-                    "Search TODO".to_owned(),
+                    "TODO".to_owned(),
                     "src".to_owned(),
                     Some(CommandAction::Search)
                 ),
                 (
-                    "List **/*.rs".to_owned(),
+                    "**/*.rs".to_owned(),
                     "/workspace".to_owned(),
                     Some(CommandAction::List)
                 ),

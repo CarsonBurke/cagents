@@ -394,11 +394,16 @@ fn slot_of(item: &Item) -> Slot {
 pub(super) fn step_label(content: &ItemContent) -> &str {
     match content {
         ItemContent::Text { .. } => "Thinking",
-        ItemContent::Command { label, command, .. } => {
+        ItemContent::Command {
+            label,
+            command,
+            action,
+            ..
+        } => {
             if label.is_empty() {
                 first_line(command)
             } else {
-                label.as_str()
+                target(*action, label)
             }
         }
         ItemContent::Changes { changes, .. } => match changes.as_slice() {
@@ -423,6 +428,26 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
                 sender.get(..8).unwrap_or(sender)
             }
         }
+    }
+}
+
+/// A command's label without the verb transcripts once stored in it.
+///
+/// Adapters used to write `Read src/app.rs` and `Search TODO`, which the verb
+/// in front of every step turned into "Read Read src/app.rs". They write the
+/// target alone now, and a transcript stored before that still holds the old
+/// form, so the word is taken off here. A file that is itself named `Read …`
+/// loses the word too, which is the cost of telling the two apart by text.
+fn target(action: chat::CommandAction, label: &str) -> &str {
+    let stored = match action {
+        chat::CommandAction::Read => "Read ",
+        chat::CommandAction::Search => "Search ",
+        chat::CommandAction::List => "List ",
+        chat::CommandAction::Run => return label,
+    };
+    match label.strip_prefix(stored) {
+        Some(target) if !target.is_empty() => target,
+        _ => label,
     }
 }
 
@@ -1069,6 +1094,52 @@ mod tests {
         };
         assert_eq!(step_label(&content), "git add -A \\");
         assert_eq!(step_verb(&content), "Ran");
+    }
+
+    /// A read, a search and a listing say what they did once, whether the
+    /// label is the target an adapter writes now or the verb and target a
+    /// transcript stored earlier.
+    #[test]
+    fn a_classified_command_states_its_verb_once() {
+        let command = |action, label: &str| ItemContent::Command {
+            label: label.into(),
+            command: "sed -n 1,20p src/app.rs".into(),
+            working_directory: String::new(),
+            action,
+            status: ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        };
+        for (action, label, row) in [
+            (CommandAction::Read, "src/app.rs", "Read src/app.rs"),
+            (CommandAction::Read, "Read src/app.rs", "Read src/app.rs"),
+            (CommandAction::Search, "TODO in src", "Searched TODO in src"),
+            (CommandAction::Search, "Search TODO", "Searched TODO"),
+            (CommandAction::List, "**/*.rs", "Listed **/*.rs"),
+            (CommandAction::List, "List src", "Listed src"),
+            // A shell command's label is the provider's own description.
+            (CommandAction::Run, "Read the logs", "Ran Read the logs"),
+            // Only the stored verb is taken off, and never the whole label.
+            (CommandAction::Read, "Search.md", "Read Search.md"),
+            (CommandAction::Read, "Read ", "Read Read "),
+        ] {
+            let content = command(action, label);
+            assert_eq!(
+                format!("{} {}", step_verb(&content), step_label(&content)),
+                row,
+                "{action:?} {label:?}"
+            );
+            // A group of one step is summarized as that step's row.
+            let items = [Item {
+                id: "step".into(),
+                role: Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            }];
+            assert_eq!(group(&items, &unasked())[0].summary, row);
+        }
     }
 
     #[test]

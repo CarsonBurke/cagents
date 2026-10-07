@@ -2568,7 +2568,8 @@ fn message_phase(value: &Value) -> Phase {
 /// Codex's own best-effort parse of a shell command, which may decompose into
 /// several actions because a command can be a pipeline. The first classified
 /// action is what the invocation was for; `unknown` entries carry nothing the
-/// view cannot already read off the command itself.
+/// view cannot already read off the command itself. The label is what the
+/// action was applied to; the view supplies the verb, from the action.
 fn command_intent(actions: &Value) -> (CommandAction, String) {
     let Some(actions) = actions.as_array() else {
         return (CommandAction::Run, String::new());
@@ -2579,16 +2580,16 @@ fn command_intent(actions: &Value) -> (CommandAction, String) {
             Some("read") => {
                 return (
                     CommandAction::Read,
-                    path.map(|path| format!("Read {path}")).unwrap_or_default(),
+                    path.map(str::to_owned).unwrap_or_default(),
                 );
             }
             Some("search") => {
                 return (
                     CommandAction::Search,
                     match (action["query"].as_str(), path) {
-                        (Some(query), Some(path)) => format!("Search {query} in {path}"),
-                        (Some(query), None) => format!("Search {query}"),
-                        (None, Some(path)) => format!("Search {path}"),
+                        (Some(query), Some(path)) => format!("{query} in {path}"),
+                        (Some(query), None) => query.to_owned(),
+                        (None, Some(path)) => path.to_owned(),
                         (None, None) => String::new(),
                     },
                 );
@@ -2596,7 +2597,7 @@ fn command_intent(actions: &Value) -> (CommandAction, String) {
             Some("listFiles") => {
                 return (
                     CommandAction::List,
-                    path.map(|path| format!("List {path}")).unwrap_or_default(),
+                    path.map(str::to_owned).unwrap_or_default(),
                 );
             }
             _ => {}
@@ -4549,7 +4550,7 @@ mod tests {
             panic!("A Codex commandExecution must map to a command");
         };
         assert_eq!(*action, CommandAction::Read);
-        assert_eq!(label, "Read src/app.rs");
+        assert_eq!(label, "src/app.rs");
         assert_eq!(command, "sed -n '1,20p' src/app.rs");
         assert_eq!(working_directory, "/repo");
         assert_eq!(*exit_code, Some(0));
