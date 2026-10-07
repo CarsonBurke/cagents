@@ -1266,30 +1266,23 @@ impl Workspace {
     pub fn projection(&self, viewport_width: f32) -> ViewportProjection {
         let viewport_width = finite_nonnegative(viewport_width);
         let rebuilt_geometry;
-        let geometry = if (viewport_width - self.viewport_width).abs() <= f32::EPSILON {
-            self.presentation_geometry()
+        let (geometry, target) = if (viewport_width - self.viewport_width).abs() <= f32::EPSILON {
+            (self.presentation_geometry(), &self.geometry)
         } else {
             rebuilt_geometry = StripGeometry::build(&self.cards, viewport_width, self.config);
-            &rebuilt_geometry
+            (&rebuilt_geometry, &rebuilt_geometry)
         };
         let offset = self
             .camera
             .offset()
             .clamp(0.0, geometry.max_offset(viewport_width));
-        let bands = visibility_bands(geometry, offset, viewport_width, self.config.overscan);
-        let arriving = self.arriving();
+        let bands = self.bands(geometry, target, offset, viewport_width);
         let mounted = bands
-            .mounted
-            .clone()
+            .mounted()
             .filter_map(|index| {
                 let card = geometry.card_at(index)?;
                 let opening = self.opening.contains(&card.id);
-                let visibility =
-                    if bands.visible.contains(&index) || (opening && arriving.contains(&index)) {
-                        VisibilityClass::Visible
-                    } else {
-                        VisibilityClass::Overscan
-                    };
+                let visibility = bands.class(index);
                 let width = card.width_within_boundaries();
                 let content_width = if opening {
                     self.geometry
@@ -1477,28 +1470,25 @@ impl Workspace {
         } else {
             self.opening.retain(|id| self.card_indices.contains_key(id));
         }
-        let bands = visibility_bands(
+        let bands = self.bands(
             self.presentation_geometry(),
+            &self.geometry,
             self.camera.offset(),
             self.viewport_width,
-            self.config.overscan,
         );
-        // What an opening pane is classed as also follows the camera's target,
-        // so the bands alone cannot say that nothing changed.
-        if self.opening.is_empty() && self.visibility_bands.as_ref() == Some(&bands) {
+        if self.visibility_bands.as_ref() == Some(&bands) {
             return ViewportUpdate {
                 offset_changed,
                 transitions: Vec::new(),
             };
         }
 
-        let arriving = self.arriving();
         let mut transitions = Vec::new();
         self.visibility.retain(|id, class| {
             let mounted = self
                 .card_indices
                 .get(id)
-                .is_some_and(|index| bands.mounted.contains(index));
+                .is_some_and(|index| bands.is_mounted(*index));
             if !mounted {
                 transitions.push(VisibilityTransition {
                     id: *id,
@@ -1508,15 +1498,9 @@ impl Workspace {
             }
             mounted
         });
-        for index in bands.mounted.clone() {
+        for index in bands.mounted() {
             let id = self.geometry.cards[index].id;
-            let class = if bands.visible.contains(&index)
-                || (arriving.contains(&index) && self.opening.contains(&id))
-            {
-                VisibilityClass::Visible
-            } else {
-                VisibilityClass::Overscan
-            };
+            let class = bands.class(index);
             let previous = self
                 .visibility
                 .insert(id, class)
@@ -1535,29 +1519,45 @@ impl Workspace {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        self.visibility_bands = self.opening.is_empty().then_some(bands);
+        self.visibility_bands = Some(bands);
         ViewportUpdate {
             offset_changed,
             transitions,
         }
     }
 
-    /// The cards that will be on screen once the camera reaches its target.
+    /// Which cards are mounted, and as what, with the camera at `offset` over
+    /// `geometry`.
     ///
-    /// A pane opened past the viewport's edge is scrolled to at once. Classing
-    /// it by where it is going lets it hydrate while the camera travels,
-    /// instead of starting when it arrives.
-    fn arriving(&self) -> std::ops::Range<usize> {
-        if self.opening.is_empty() {
-            return 0..0;
+    /// The cards that will be on screen once the camera reaches its target
+    /// count as on screen already. Navigation scrolls to its destination at
+    /// once, so classing a pane by where the camera is going lets it mount,
+    /// hydrate and take the keyboard while the camera travels, instead of
+    /// starting when it arrives. The destination is read from `target`, the
+    /// geometry a layout transition is moving the presentation towards.
+    fn bands(
+        &self,
+        geometry: &StripGeometry,
+        target: &StripGeometry,
+        offset: f32,
+        viewport_width: f32,
+    ) -> VisibilityBands {
+        let viewport_width = finite_nonnegative(viewport_width);
+        let viewport_start = finite_nonnegative(offset);
+        let viewport_end = viewport_start + viewport_width;
+        let overscan = finite_nonnegative(self.config.overscan);
+        let destination = self
+            .camera
+            .target()
+            .clamp(0.0, target.max_offset(viewport_width));
+        VisibilityBands {
+            visible: geometry.intersecting_range(viewport_start, viewport_end),
+            arriving: target.intersecting_range(destination, destination + viewport_width),
+            overscan: geometry.intersecting_range(
+                (viewport_start - overscan).max(0.0),
+                viewport_end + overscan,
+            ),
         }
-        visibility_bands(
-            &self.geometry,
-            self.camera.target(),
-            self.viewport_width,
-            self.config.overscan,
-        )
-        .visible
     }
 }
 
@@ -1616,24 +1616,34 @@ impl std::error::Error for WorkspaceError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VisibilityBands {
+    /// On screen now.
     visible: std::ops::Range<usize>,
-    mounted: std::ops::Range<usize>,
+    /// On screen once the camera reaches its target.
+    arriving: std::ops::Range<usize>,
+    /// Around what is on screen now, kept mounted so scrolling reveals
+    /// finished panes.
+    overscan: std::ops::Range<usize>,
 }
 
-fn visibility_bands(
-    geometry: &StripGeometry,
-    offset: f32,
-    viewport_width: f32,
-    overscan: f32,
-) -> VisibilityBands {
-    let viewport_start = finite_nonnegative(offset);
-    let viewport_end = viewport_start + finite_nonnegative(viewport_width);
-    let overscan = finite_nonnegative(overscan);
-    let overscan_start = (viewport_start - overscan).max(0.0);
-    let overscan_end = viewport_end + overscan;
-    VisibilityBands {
-        visible: geometry.intersecting_range(viewport_start, viewport_end),
-        mounted: geometry.intersecting_range(overscan_start, overscan_end),
+impl VisibilityBands {
+    fn is_mounted(&self, index: usize) -> bool {
+        self.overscan.contains(&index) || self.arriving.contains(&index)
+    }
+
+    /// The mounted cards in strip order. A far destination is not adjacent to
+    /// the overscan band, so the cards between the two stay unmounted.
+    fn mounted(&self) -> impl Iterator<Item = usize> + use<> {
+        let before = self.arriving.start..self.arriving.end.min(self.overscan.start);
+        let after = self.arriving.start.max(self.overscan.end)..self.arriving.end;
+        before.chain(self.overscan.clone()).chain(after)
+    }
+
+    fn class(&self, index: usize) -> VisibilityClass {
+        if self.visible.contains(&index) || self.arriving.contains(&index) {
+            VisibilityClass::Visible
+        } else {
+            VisibilityClass::Overscan
+        }
     }
 }
 
@@ -2250,6 +2260,145 @@ mod tests {
         assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
         assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
         assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    #[test]
+    fn a_far_destination_mounts_and_takes_the_keyboard_before_the_camera_arrives() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 12], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.take_widget_focus_request();
+        let mounted = |workspace: &Workspace| -> Vec<usize> {
+            workspace
+                .projection(1_000.0)
+                .mounted_ids()
+                .map(|id| ids.iter().position(|candidate| *candidate == id).unwrap())
+                .collect()
+        };
+        // Two panes fill the viewport and the overscan reaches one more.
+        assert_eq!(mounted(&workspace), [0, 1, 2]);
+
+        let update = workspace.focus(ids[9]).unwrap();
+        // The camera has not moved, yet the destination is already what the
+        // strip mounts, reveals and hands the keyboard to. The panes it will
+        // pass on the way are not mounted for it.
+        assert_eq!(workspace.camera().offset(), 0.0);
+        assert_eq!(workspace.camera().target(), 4_000.0);
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[9]));
+        assert_eq!(mounted(&workspace), [0, 1, 2, 8, 9]);
+        for index in [0, 1, 8, 9] {
+            assert_eq!(
+                workspace.visibility(ids[index]),
+                Some(VisibilityClass::Visible)
+            );
+        }
+        assert_eq!(
+            workspace.visibility(ids[2]),
+            Some(VisibilityClass::Overscan)
+        );
+        assert_eq!(
+            update.transitions,
+            [8, 9].map(|index| VisibilityTransition {
+                id: ids[index],
+                from: VisibilityClass::Offscreen,
+                to: VisibilityClass::Visible,
+            })
+        );
+        let projection = workspace.projection(1_000.0);
+        assert!(projection.mounted_are_disjoint());
+        assert_eq!(
+            projection
+                .mounted
+                .iter()
+                .map(|card| card.visibility)
+                .collect::<Vec<_>>(),
+            [
+                VisibilityClass::Visible,
+                VisibilityClass::Visible,
+                VisibilityClass::Overscan,
+                VisibilityClass::Visible,
+                VisibilityClass::Visible,
+            ]
+        );
+
+        // Arriving changes nothing about the destination: it never leaves the
+        // mounted set or drops out of the visible class on the way.
+        while workspace.is_animating() {
+            let update = workspace.tick(Duration::from_millis(16));
+            assert!(
+                update
+                    .transitions
+                    .iter()
+                    .all(|transition| ![ids[8], ids[9]].contains(&transition.id))
+            );
+            assert!(workspace.projection(1_000.0).mounted_are_disjoint());
+        }
+        assert_eq!(mounted(&workspace), [7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn a_destination_is_released_when_navigation_retargets_or_the_user_scrolls_away() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 12], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.focus(ids[9]).unwrap();
+        assert_eq!(workspace.visibility(ids[9]), Some(VisibilityClass::Visible));
+
+        // Held navigation moves the destination on; the one it skipped holds
+        // nothing.
+        let update = workspace.focus(ids[5]).unwrap();
+        assert_eq!(
+            workspace.visibility(ids[9]),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert_eq!(workspace.visibility(ids[5]), Some(VisibilityClass::Visible));
+        assert!(update.transitions.contains(&VisibilityTransition {
+            id: ids[9],
+            from: VisibilityClass::Visible,
+            to: VisibilityClass::Offscreen,
+        }));
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[5]));
+
+        // A scroll of the user's own cancels the journey, and with it the
+        // claim of a destination the camera will no longer reach.
+        workspace.tick(Duration::from_millis(16));
+        let update = workspace.native_scroll(40.0, 1_000.0);
+        assert!(!workspace.is_animating());
+        assert_eq!(
+            workspace.visibility(ids[5]),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(update.transitions.contains(&VisibilityTransition {
+            id: ids[5],
+            from: VisibilityClass::Visible,
+            to: VisibilityClass::Offscreen,
+        }));
+        assert_eq!(
+            workspace
+                .projection(1_000.0)
+                .mounted_ids()
+                .collect::<Vec<_>>(),
+            ids[..3]
+        );
+    }
+
+    #[test]
+    fn a_destination_is_not_mounted_before_the_viewport_is_measured() {
+        let mut workspace = Workspace::default();
+        for index in 0..12 {
+            workspace
+                .add_card(card(CardWidth::Fixed(500.0)), index, index == 0)
+                .unwrap();
+        }
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.focus(ids[9]).unwrap();
+        // Nothing is on screen in a viewport with no width, so the keyboard
+        // waits for the measurement rather than going to an unmounted pane.
+        assert_eq!(
+            workspace.visibility(ids[9]),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), None);
+        workspace.resize_viewport(1_000.0);
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[9]));
     }
 
     #[test]
