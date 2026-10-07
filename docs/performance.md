@@ -1,6 +1,7 @@
 # Performance measurements
 
 - [Redraw scheduling](#redraw-scheduling)
+- [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
 - [Reference results](#reference-results)
@@ -46,6 +47,35 @@ non-gating until a named reference baseline is accepted.
 in-process terminal scroll workload (no compositor, daemon, or release build).
 It reports what one viewport scroll command costs, and so what applying one
 coalesced move per frame saves over applying every wheel notch.
+
+## Pane open
+
+```sh
+RUST_LOG=cagents::pane_open=trace scripts/run-development --browserless
+```
+
+The `cagents::pane_open` target timestamps one pane's way onto the screen in
+the UI's diagnostic log, keyed by card: `requested` when the card is created,
+`start_dispatched` when its terminal start is handed to the daemon,
+`recovered` and `attached` on the blocking start, `started` when the UI holds
+the terminal surface, and `visibility` for each change of mounting class.
+`wake` (trace level) marks every terminal frame the UI drains, so the first one
+after `started` is the first content and the last one is the settled prompt.
+
+A new pane mounts in the update that creates it, at its final width, and is
+revealed through its animating slot; nothing waits for the layout transition.
+Local reference on a Ryzen 7 7840HS under a headless niri with software
+rendering, `dev-runtime` build, 16 terminal opens per side in a project
+worktree, alternating baseline and change:
+
+| Milestone | Before | After |
+| --- | --- | --- |
+| Pane contents mounted | 249–340 ms | 2–4 ms |
+| Terminal surface in the UI | 46–124 ms | 54–85 ms |
+| First terminal frame the UI drains | 49–135 ms, into an unmounted pane | 57–89 ms |
+| Last frame of the opening prompt | 397–549 ms | 100–231 ms |
+
+These are scheduling timestamps from one process, not presentation times.
 
 ## Terminal pipeline
 

@@ -5283,6 +5283,7 @@ impl Cagents {
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start(card);
+        tracing::debug!(target: "cagents::pane_open", stage = "start_dispatched", ?card);
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
@@ -5295,14 +5296,19 @@ impl Cagents {
             .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                let mut created = false;
                 let (recovered, mode) = if shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
                     let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                    let mut hosted = client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
-                    if hosted.is_none() && reserved {
+                    // A reserved start has nothing to find yet, and completing
+                    // it attaches to the terminal another client got to first.
+                    let mut hosted = if reserved { None } else {
+                        client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id)
+                    };
+                    if reserved {
                         for _ in 0..100 {
                             match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
-                                Ok(created) => { hosted=Some(created);break; }
+                                Ok(terminal) => { hosted=Some(terminal);created=true;break; }
                                 Err(crate::control::ControlError::Remote {code:crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists | crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,..}) => {
                                     hosted=client.list().map_err(|error|error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
                                     if hosted.is_some() {break;}
@@ -5318,7 +5324,10 @@ impl Cagents {
                         expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
                         TerminalStartMode::Attach(proof))
                 } else { recover_terminal(session, explicit_retry)? };
-                open_terminal(card, recovered, mode, config, sender)
+                tracing::debug!(target: "cagents::pane_open", stage = "recovered", ?card, shared);
+                let started = open_terminal(card, recovered, mode, config, sender, created);
+                tracing::debug!(target: "cagents::pane_open", stage = "attached", ?card);
+                started
             })
             .await
             .map_err(|error| format!("terminal worker join failed: {error}"))
@@ -5346,7 +5355,7 @@ impl Cagents {
                 if matches!(mode, TerminalStartMode::Spawn(_)) {
                     return Ok(None);
                 }
-                open_terminal(card, recovered, mode, config, sender).map(Some)
+                open_terminal(card, recovered, mode, config, sender, false).map(Some)
             })
             .await
             .map_err(|error| format!("terminal worker join failed: {error}"))
@@ -5402,6 +5411,7 @@ impl Cagents {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     ) -> Task<Message> {
+        tracing::debug!(target: "cagents::pane_open", stage = "started", ?card, ok = result.is_ok());
         let accept = can_accept_terminal_start(
             self.durable.cards.iter().find(|state| state.id == card),
             self.lifecycle.state(card).is_some(),
@@ -5641,6 +5651,7 @@ impl Cagents {
         }
         let working_directory = session.launch.working_directory.clone();
         let card_id = CardId::new();
+        tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "terminal");
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -7809,19 +7820,6 @@ impl Cagents {
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         tasks.push(self.acknowledge_active_pane());
-        if focused.is_some_and(|id| self.workspace.is_opening(id))
-            && (focus_changed
-                || update.transitions.iter().any(|transition| {
-                    Some(transition.id) == focused && transition.to == VisibilityClass::Offscreen
-                }))
-        {
-            // Do not leave keyboard input in the previous pane while the new
-            // one is still reserving its space. Its own focus request waits.
-            tasks.push(
-                iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
-                    .map(cosmic::Action::App),
-            );
-        }
         if self.chrome_ui.tabs_focus != focused {
             self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
@@ -7833,6 +7831,7 @@ impl Cagents {
         let mut reconcile_now = false;
         let surfaces_visible = self.workspace_surfaces_visible();
         for transition in update.transitions {
+            tracing::debug!(target: "cagents::pane_open", stage = "visibility", card = ?transition.id, to = ?transition.to);
             let browser_card = self
                 .durable
                 .cards
@@ -8804,6 +8803,7 @@ impl Cagents {
                                 .get(&id)
                                 .map_or(0, |find| find.select_all_request),
                         )
+                        .width_settled(self.workspace.width_is_settled(id))
                         .on_context(move |point, selection, link| {
                             Message::TerminalFind(terminal_ui::Action::Context(
                                 id, point, selection, link,
@@ -12585,6 +12585,7 @@ impl Application for Cagents {
                 }
             }
             Message::TerminalWake { card, generation } => {
+                tracing::trace!(target: "cagents::pane_open", stage = "wake", ?card, generation);
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
@@ -16729,6 +16730,7 @@ fn open_terminal(
     mode: TerminalStartMode,
     config: TerminalConfig,
     sender: async_channel::Sender<TerminalWakeup>,
+    created: bool,
 ) -> Result<StartedTerminal, String> {
     let recovery_lease = recovered.recovery_lease;
     let session = recovered.session;
@@ -16758,7 +16760,10 @@ fn open_terminal(
     // Spawned. Keep the handle alive through that reply and a reconnect grace.
     handle.wait_until_attached(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(10))?;
     drop(recovery_lease);
-    let surface = TerminalSurface::from(handle);
+    let mut surface = TerminalSurface::from(handle);
+    if spawned || created {
+        surface = surface.spawned();
+    }
     Ok(StartedTerminal {
         handle: surface,
         session,

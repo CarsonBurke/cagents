@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crossbeam_channel::Receiver;
 
@@ -14,52 +17,68 @@ use super::{
 /// Terminal emulation and PTY ownership live exclusively in `cagentsd`; the UI
 /// never links the host implementation.
 #[derive(Clone, Debug)]
-pub struct TerminalSurface(HostedTerminalHandle);
+pub struct TerminalSurface {
+    handle: HostedTerminalHandle,
+    /// Set while a terminal this client just started still has the size it
+    /// was spawned with, which nobody chose.
+    unsized_spawn: Arc<AtomicBool>,
+}
 
 impl TerminalSurface {
+    /// Marks a terminal this client just started, so its first layout sizes
+    /// the PTY at once rather than as a resize that waits to settle.
+    pub fn spawned(self) -> Self {
+        self.unsized_spawn.store(true, Ordering::Relaxed);
+        self
+    }
+
+    pub fn is_unsized_spawn(&self) -> bool {
+        self.unsized_spawn.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
-        self.0.snapshot()
+        self.handle.snapshot()
     }
 
     pub fn activity(&self) -> Option<crate::model::TerminalOutputActivity> {
-        self.0.activity()
+        self.handle.activity()
     }
 
     pub fn agent_activity(&self) -> Option<crate::agent::Activity> {
-        self.0.agent_activity()
+        self.handle.agent_activity()
     }
 
     #[cfg(test)]
     pub(crate) fn visibility(&self) -> crate::terminal_ipc::TerminalVisibility {
-        self.0.visibility()
+        self.handle.visibility()
     }
 
     pub fn generation(&self) -> u64 {
-        self.0.generation()
+        self.handle.generation()
     }
 
     pub fn host_proof(&self) -> Option<HostSessionProof> {
-        self.0.proof()
+        self.handle.proof()
     }
 
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
-        self.0.acknowledge_redraw(observed_generation);
+        self.handle.acknowledge_redraw(observed_generation);
     }
 
     pub fn take_observed_output(&self) -> bool {
-        self.0.take_observed_output()
+        self.handle.take_observed_output()
     }
 
     pub fn acknowledge_updates(&self) -> Result<(), TerminalSendError> {
-        self.0.acknowledge_updates()
+        self.handle.acknowledge_updates()
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {
-        self.0.events()
+        self.handle.events()
     }
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
-        self.0.input(bytes)
+        self.handle.input(bytes)
     }
 
     /// Pastes text the way a terminal does: framed as a bracketed paste when
@@ -70,53 +89,55 @@ impl TerminalSurface {
         text: impl Into<String>,
         origin: PasteOrigin,
     ) -> Result<(), TerminalSendError> {
-        self.0.paste(text, origin)
+        self.handle.paste(text, origin)
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
-        self.0.key(key)
+        self.handle.key(key)
     }
 
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
-        self.0.mouse(mouse)
+        self.handle.mouse(mouse)
     }
 
     pub fn focus(&self, focused: bool) -> Result<(), TerminalSendError> {
-        self.0.focus(focused)
+        self.handle.focus(focused)
     }
 
     pub fn resize(&self, size: TerminalSize) -> Result<(), TerminalSendError> {
-        self.0.resize(size)
+        self.handle.resize(size)?;
+        self.unsized_spawn.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn scroll_lines(&self, delta: isize) -> Result<(), TerminalSendError> {
-        self.0.scroll_lines(delta)
+        self.handle.scroll_lines(delta)
     }
 
     pub fn scroll_to_top(&self) -> Result<(), TerminalSendError> {
-        self.0.scroll_to_top()
+        self.handle.scroll_to_top()
     }
 
     pub fn scroll_to_bottom(&self) -> Result<(), TerminalSendError> {
-        self.0.scroll_to_bottom()
+        self.handle.scroll_to_bottom()
     }
 
     pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
-        self.0.scroll_to_row(row)
+        self.handle.scroll_to_row(row)
     }
     pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
-        self.0.clear_scrollback()
+        self.handle.clear_scrollback()
     }
     pub fn copy_selection(
         &self,
         request: uuid::Uuid,
         selection: super::SearchMatch,
     ) -> Result<(), TerminalSendError> {
-        self.0.copy_selection(request, selection)
+        self.handle.copy_selection(request, selection)
     }
 
     pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
-        self.0.set_theme(theme)
+        self.handle.set_theme(theme)
     }
 
     pub fn search(
@@ -125,27 +146,27 @@ impl TerminalSurface {
         query: String,
         case_sensitive: bool,
     ) -> Result<(), TerminalSendError> {
-        self.0.search(request, query, case_sensitive)
+        self.handle.search(request, query, case_sensitive)
     }
 
     pub fn hide(&self) -> Result<(), TerminalSendError> {
-        self.0.hide()
+        self.handle.hide()
     }
 
     pub fn reveal(&self) -> Result<(), TerminalSendError> {
-        self.0.reveal()
+        self.handle.reveal()
     }
 
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
-        self.0.hibernate()
+        self.handle.hibernate()
     }
 
     pub fn restore(&self, visible: bool) -> Result<(), TerminalSendError> {
-        self.0.restore(visible)
+        self.handle.restore(visible)
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        self.0.shutdown()
+        self.handle.shutdown()
     }
 
     /// Drop this client's attachment without stopping the daemon-owned PTY.
@@ -160,6 +181,9 @@ impl TerminalSurface {
 
 impl From<HostedTerminalHandle> for TerminalSurface {
     fn from(handle: HostedTerminalHandle) -> Self {
-        Self(handle)
+        Self {
+            handle,
+            unsized_spawn: Arc::default(),
+        }
     }
 }

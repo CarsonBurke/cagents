@@ -353,7 +353,12 @@ pub struct VisibilityTransition {
 pub struct MountedCard {
     pub id: CardId,
     pub start: f32,
+    /// The slot the card occupies in the strip right now.
     pub width: f32,
+    /// The width its contents are laid out at. A pane that is still opening
+    /// has its final width here while `width` grows towards it, so the strip
+    /// reveals finished contents instead of reflowing cramped ones.
+    pub content_width: f32,
     pub visibility: VisibilityClass,
 }
 
@@ -605,8 +610,9 @@ pub struct Workspace {
     viewport_width: f32,
     geometry: StripGeometry,
     layout_transition: Option<LayoutTransition>,
-    /// New panes reserve animated space before mounting their contents. This
-    /// survives retargeting so rapid insertions never expose a partial slot.
+    /// New panes whose slot is still growing. Their contents mount at once at
+    /// the final width and are revealed through the slot. This survives
+    /// retargeting so rapid insertions never lay contents out in a partial one.
     opening: HashSet<CardId>,
     camera: Camera,
     scroll_sync: Option<ScrollSync>,
@@ -689,8 +695,10 @@ impl Workspace {
         self.camera.is_animating() || self.layout_transition.is_some()
     }
 
-    pub fn is_opening(&self, id: CardId) -> bool {
-        self.opening.contains(&id)
+    /// Whether the card's contents are laid out at the width they will keep.
+    /// An opening card's are, while its slot is still growing.
+    pub fn width_is_settled(&self, id: CardId) -> bool {
+        self.layout_transition.is_none() || self.opening.contains(&id)
     }
 
     pub fn presentation_geometry(&self) -> &StripGeometry {
@@ -833,20 +841,7 @@ impl Workspace {
         if focus {
             self.reveal_focused();
         }
-        let mut update = self.refresh_visibility(false);
-        if self.opening.contains(&id) {
-            // New app cards start with visible durable exposure. Report the
-            // reserved slot as offscreen before their runtime can hydrate.
-            update.transitions.push(VisibilityTransition {
-                id,
-                from: VisibilityClass::Visible,
-                to: VisibilityClass::Offscreen,
-            });
-            update
-                .transitions
-                .sort_unstable_by_key(|transition| self.card_indices.get(&transition.id).copied());
-        }
-        Ok(update)
+        Ok(self.refresh_visibility(false))
     }
 
     pub fn set_card_width(
@@ -1282,23 +1277,32 @@ impl Workspace {
             .offset()
             .clamp(0.0, geometry.max_offset(viewport_width));
         let bands = visibility_bands(geometry, offset, viewport_width, self.config.overscan);
+        let arriving = self.arriving();
         let mounted = bands
             .mounted
             .clone()
             .filter_map(|index| {
                 let card = geometry.card_at(index)?;
-                if self.opening.contains(&card.id) {
-                    return None;
-                }
-                let visibility = if bands.visible.contains(&index) {
-                    VisibilityClass::Visible
+                let opening = self.opening.contains(&card.id);
+                let visibility =
+                    if bands.visible.contains(&index) || (opening && arriving.contains(&index)) {
+                        VisibilityClass::Visible
+                    } else {
+                        VisibilityClass::Overscan
+                    };
+                let width = card.width_within_boundaries();
+                let content_width = if opening {
+                    self.geometry
+                        .card_at(index)
+                        .map_or(width, |target| target.width_within_boundaries().max(width))
                 } else {
-                    VisibilityClass::Overscan
+                    width
                 };
                 Some(MountedCard {
                     id: card.id,
                     start: card.start,
-                    width: card.width_within_boundaries(),
+                    width,
+                    content_width,
                     visibility,
                 })
             })
@@ -1468,14 +1472,10 @@ impl Workspace {
     }
 
     fn refresh_visibility(&mut self, offset_changed: bool) -> ViewportUpdate {
-        let previous_opening = self.opening.len();
         if self.layout_transition.is_none() {
             self.opening.clear();
         } else {
             self.opening.retain(|id| self.card_indices.contains_key(id));
-        }
-        if self.opening.len() != previous_opening {
-            self.visibility_bands = None;
         }
         let bands = visibility_bands(
             self.presentation_geometry(),
@@ -1483,20 +1483,22 @@ impl Workspace {
             self.viewport_width,
             self.config.overscan,
         );
-        if self.visibility_bands.as_ref() == Some(&bands) {
+        // What an opening pane is classed as also follows the camera's target,
+        // so the bands alone cannot say that nothing changed.
+        if self.opening.is_empty() && self.visibility_bands.as_ref() == Some(&bands) {
             return ViewportUpdate {
                 offset_changed,
                 transitions: Vec::new(),
             };
         }
 
+        let arriving = self.arriving();
         let mut transitions = Vec::new();
         self.visibility.retain(|id, class| {
             let mounted = self
                 .card_indices
                 .get(id)
-                .is_some_and(|index| bands.mounted.contains(index))
-                && !self.opening.contains(id);
+                .is_some_and(|index| bands.mounted.contains(index));
             if !mounted {
                 transitions.push(VisibilityTransition {
                     id: *id,
@@ -1508,10 +1510,9 @@ impl Workspace {
         });
         for index in bands.mounted.clone() {
             let id = self.geometry.cards[index].id;
-            if self.opening.contains(&id) {
-                continue;
-            }
-            let class = if bands.visible.contains(&index) {
+            let class = if bands.visible.contains(&index)
+                || (arriving.contains(&index) && self.opening.contains(&id))
+            {
                 VisibilityClass::Visible
             } else {
                 VisibilityClass::Overscan
@@ -1534,11 +1535,29 @@ impl Workspace {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        self.visibility_bands = Some(bands);
+        self.visibility_bands = self.opening.is_empty().then_some(bands);
         ViewportUpdate {
             offset_changed,
             transitions,
         }
+    }
+
+    /// The cards that will be on screen once the camera reaches its target.
+    ///
+    /// A pane opened past the viewport's edge is scrolled to at once. Classing
+    /// it by where it is going lets it hydrate while the camera travels,
+    /// instead of starting when it arrives.
+    fn arriving(&self) -> std::ops::Range<usize> {
+        if self.opening.is_empty() {
+            return 0..0;
+        }
+        visibility_bands(
+            &self.geometry,
+            self.camera.target(),
+            self.viewport_width,
+            self.config.overscan,
+        )
+        .visible
     }
 }
 
@@ -1797,8 +1816,8 @@ mod tests {
         let update = workspace.add_card(inserted, 1, true).unwrap();
         assert!(update.transitions.contains(&VisibilityTransition {
             id: inserted_id,
-            from: VisibilityClass::Visible,
-            to: VisibilityClass::Offscreen,
+            from: VisibilityClass::Offscreen,
+            to: VisibilityClass::Visible,
         }));
         let initial = workspace
             .presentation_geometry()
@@ -1808,17 +1827,30 @@ mod tests {
         let target = workspace.geometry().card(second).unwrap().start;
         assert!(initial < target);
         assert_eq!(workspace.focused(), Some(inserted_id));
-        assert_eq!(workspace.take_widget_focus_request(), None);
+        assert_eq!(workspace.take_widget_focus_request(), Some(inserted_id));
+        // Only the opening pane is at a width it will keep; its neighbour is
+        // still being moved by the same transition.
+        assert!(workspace.width_is_settled(inserted_id));
+        assert!(!workspace.width_is_settled(second));
         assert_eq!(
             workspace.visibility(inserted_id),
-            Some(VisibilityClass::Offscreen)
+            Some(VisibilityClass::Visible)
         );
-        assert!(
-            !workspace
+        let final_width = workspace
+            .geometry()
+            .card(inserted_id)
+            .unwrap()
+            .width_within_boundaries();
+        let opening = |workspace: &Workspace| {
+            workspace
                 .projection(900.0)
-                .mounted_ids()
-                .any(|id| id == inserted_id)
-        );
+                .mounted
+                .into_iter()
+                .find(|pane| pane.id == inserted_id)
+                .unwrap()
+        };
+        assert!(opening(&workspace).width < final_width);
+        assert_eq!(opening(&workspace).content_width, final_width);
         workspace.tick(Duration::from_millis(80));
         let intermediate = workspace
             .presentation_geometry()
@@ -1827,30 +1859,13 @@ mod tests {
             .start;
         assert!(intermediate > initial && intermediate < target);
         assert!(workspace.projection(900.0).mounted_are_disjoint());
-        assert!(
-            !workspace
-                .projection(900.0)
-                .mounted_ids()
-                .any(|id| id == inserted_id)
-        );
-        assert_eq!(workspace.take_widget_focus_request(), None);
+        assert!(opening(&workspace).width < final_width);
+        assert_eq!(opening(&workspace).content_width, final_width);
         workspace.tick(LAYOUT_DURATION);
-        let revealed = workspace.projection(900.0);
-        let pane = revealed
-            .mounted
-            .iter()
-            .find(|pane| pane.id == inserted_id)
-            .unwrap();
-        assert_eq!(
-            pane.width,
-            workspace
-                .geometry()
-                .card(inserted_id)
-                .unwrap()
-                .width_within_boundaries()
-        );
-        assert_eq!(workspace.take_widget_focus_request(), Some(inserted_id));
+        assert_eq!(opening(&workspace).width, final_width);
+        assert_eq!(opening(&workspace).content_width, final_width);
         assert_eq!(workspace.take_widget_focus_request(), None);
+        assert!(workspace.width_is_settled(second));
         assert_eq!(
             workspace
                 .presentation_geometry()
@@ -1871,46 +1886,92 @@ mod tests {
     }
 
     #[test]
-    fn opening_panes_stay_unmounted_across_rapid_insertions_and_width_retargets() {
+    fn opening_panes_mount_at_their_final_width_across_rapid_insertions_and_width_retargets() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0)], 1200.0);
         let first = card(CardWidth::Fixed(300.0));
         let first_id = first.id;
-        workspace.add_card(first, 1, true).unwrap();
+        let update = workspace.add_card(first, 1, true).unwrap();
+        assert!(
+            update
+                .transitions
+                .iter()
+                .any(|transition| transition.id == first_id && transition.to.is_mounted())
+        );
+        assert_eq!(workspace.take_widget_focus_request(), Some(first_id));
         workspace.tick(Duration::from_millis(80));
         let second = card(CardWidth::Fixed(300.0));
         let second_id = second.id;
         workspace.add_card(second, 2, true).unwrap();
+        assert_eq!(workspace.take_widget_focus_request(), Some(second_id));
         workspace.tick(Duration::from_millis(80));
         workspace
             .animate_card_width(first_id, CardWidth::Fixed(350.0))
             .unwrap();
+        let mounted = |workspace: &Workspace, id| {
+            workspace
+                .projection(1200.0)
+                .mounted
+                .into_iter()
+                .find(|card| card.id == id)
+                .expect("an opening pane is mounted")
+        };
+        let target = |workspace: &Workspace, id| {
+            workspace
+                .geometry()
+                .card(id)
+                .unwrap()
+                .width_within_boundaries()
+        };
         for _ in 0..13 {
-            workspace.tick(Duration::from_millis(16));
-            let projection = workspace.projection(1200.0);
-            assert!(projection.mounted_are_disjoint());
-            assert!(
-                !projection
-                    .mounted_ids()
-                    .any(|id| id == first_id || id == second_id)
-            );
-            assert_eq!(workspace.take_widget_focus_request(), None);
+            let update = workspace.tick(Duration::from_millis(16));
+            assert!(workspace.projection(1200.0).mounted_are_disjoint());
+            // Contents never reflow through the widths the slot passes.
+            for id in [first_id, second_id] {
+                let card = mounted(&workspace, id);
+                assert!(card.width < target(&workspace, id));
+                assert_eq!(card.content_width, target(&workspace, id));
+            }
+            assert!(update.transitions.is_empty());
         }
-        let update = workspace.tick(Duration::from_millis(12));
+        workspace.tick(Duration::from_millis(12));
         for id in [first_id, second_id] {
+            let card = mounted(&workspace, id);
+            assert_eq!(card.width, target(&workspace, id));
+            assert_eq!(card.content_width, target(&workspace, id));
+        }
+    }
+
+    #[test]
+    fn a_pane_opened_past_the_viewport_edge_is_visible_while_the_camera_travels() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 2], 800.0);
+        let opened = card(CardWidth::Fraction(0.5));
+        let id = opened.id;
+        let update = workspace.add_card(opened, 2, true).unwrap();
+        assert!(update.transitions.contains(&VisibilityTransition {
+            id,
+            from: VisibilityClass::Offscreen,
+            to: VisibilityClass::Visible,
+        }));
+        let pane = workspace
+            .projection(800.0)
+            .mounted
+            .into_iter()
+            .find(|pane| pane.id == id)
+            .unwrap();
+        // Its slot has not been scrolled to yet.
+        assert!(pane.start >= workspace.camera.offset() + 800.0);
+        assert_eq!(pane.visibility, VisibilityClass::Visible);
+        for _ in 0..40 {
+            let update = workspace.tick(Duration::from_millis(16));
             assert!(
-                workspace
-                    .projection(1200.0)
-                    .mounted_ids()
-                    .any(|mounted| mounted == id)
-            );
-            assert!(
-                update
+                !update
                     .transitions
                     .iter()
-                    .any(|transition| transition.id == id && transition.to.is_mounted())
+                    .any(|transition| transition.id == id)
             );
         }
-        assert_eq!(workspace.take_widget_focus_request(), Some(second_id));
+        assert!(!workspace.is_animating());
+        assert_eq!(workspace.visibility(id), Some(VisibilityClass::Visible));
     }
 
     #[test]
