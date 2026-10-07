@@ -167,7 +167,7 @@ case "$*" in
     if [ "$1" = coordinate-install ] && [ "$2" != --help ]; then
       printf '%s\n' "$CLI" >> "$FIXTURE_COORDINATOR_USED"
     fi
-    if [ "$1" = record-deferred-install ] && [ "$FIXTURE_PRE_CAS_CHANGE" = true ]; then
+    if [ "$1" = record-deferred-install ] && [ "$2" != --help ] && [ "$FIXTURE_PRE_CAS_CHANGE" = true ]; then
       "$FIXTURE_REAL_CLI" "$@" || exit "$?"
       /usr/bin/ln -snf versions/9.9.9 "$FIXTURE_PREFIX/current"
       exit 0
@@ -503,7 +503,7 @@ esac
     assert_eq!(
         output.status.success(),
         success,
-        "{}",
+        "coordinator={coordinator} stage={stage_only} failure={publish_failure:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let retained_candidate = success
