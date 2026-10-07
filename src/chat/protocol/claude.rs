@@ -729,11 +729,13 @@ impl Claude {
         } else {
             vec![]
         };
-        let description = format!(
-            "{}\n{}\n{}",
-            string(request, "description"),
-            clean_permission_text(string(request, "decision_reason")),
-            request["input"]
+        let description = permission_description(
+            name,
+            &request["input"],
+            &[
+                string(request, "description"),
+                &clean_permission_text(string(request, "decision_reason")),
+            ],
         );
         let mut actions = vec![choice("allow", "Allow once")];
         if name != "AskUserQuestion"
@@ -2156,6 +2158,55 @@ fn session_permission_suggestions(request: &Value) -> Option<Value> {
 }
 
 /// SDK permission reasons can carry ANSI escapes. Keep them plain on every surface.
+/// What a permission request asks, as the surface sets it: the sentences
+/// Claude Code gave, then what would be done as a fenced block.
+///
+/// The surface sets what precedes the first fence as prose and the block as
+/// literal text, so the block is where a command or a patch can be read as
+/// what it is. The input used to follow the sentences as one line of JSON,
+/// which the surface could only set as more of the sentence. A command is
+/// shown as the command, an edit as the patch it would make, and anything
+/// else as its input with one argument to a line.
+fn permission_description(name: &str, input: &Value, sentences: &[&str]) -> String {
+    let mut question: Vec<&str> = sentences
+        .iter()
+        .map(|sentence| sentence.trim())
+        .filter(|sentence| !sentence.is_empty())
+        .collect();
+    let changes = super::claude_edits::changes(name, input);
+    let (language, payload) = match (&changes, name) {
+        (Some(changes), _) => {
+            // A patch does not say which file it is for.
+            question.extend(changes.iter().map(|change| change.path.as_str()));
+            (
+                "diff",
+                changes
+                    .iter()
+                    .map(|change| change.diff.as_str())
+                    .collect::<String>(),
+            )
+        }
+        (None, "Bash") if !string(input, "command").is_empty() => {
+            // Claude's own account of the command, where it gave one.
+            question.push(string(input, "description").trim());
+            question.retain(|sentence| !sentence.is_empty());
+            ("sh", string(input, "command").to_owned())
+        }
+        _ => (
+            "json",
+            serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
+        ),
+    };
+    // The surface reads the block as running from the first fence to the
+    // last, so a fence inside the payload is part of it and needs no longer
+    // fence around it.
+    format!(
+        "{}\n\n```{language}\n{}\n```",
+        question.join("\n"),
+        payload.trim_end_matches('\n')
+    )
+}
+
 fn clean_permission_text(value: &str) -> String {
     let mut chars = value.chars().peekable();
     let mut plain = String::new();
@@ -4587,6 +4638,60 @@ mod tests {
     fn approval(id: &str, tool: &str, input: Value) -> Value {
         json!({"type":"control_request", "request_id":id, "request":{"subtype":"can_use_tool", "tool_name":tool, "tool_use_id":"tool-1", "input":input}})
     }
+    /// A permission request shows what would be done as a block the surface
+    /// sets as literal text: the command, the patch, or the input a line to
+    /// an argument, after a blank line and never as part of the sentence.
+    #[test]
+    fn a_permission_request_shows_what_it_asks_to_do_as_a_block() {
+        let asked = |tool: &str, input: Value, reason: &str| {
+            let mut request = approval("p", tool, input);
+            request["request"]["description"] = json!("Claude wants to use a tool");
+            request["request"]["decision_reason"] = json!(reason);
+            let step = Claude::default().receive(request).unwrap();
+            match &step.events[0] {
+                Event::Request(request) => request.description.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            asked(
+                "Bash",
+                json!({"command":"git push --force\n","description":"Publish the branch","timeout":1000}),
+                "\u{1b}[31mNot in the allow list\u{1b}[0m"
+            ),
+            "Claude wants to use a tool\nNot in the allow list\nPublish the branch\n\n```sh\ngit push --force\n```"
+        );
+        assert_eq!(
+            asked(
+                "Edit",
+                json!({"file_path":"src/app.rs","old_string":"let a = 1;","new_string":"let a = 2;"}),
+                ""
+            ),
+            "Claude wants to use a tool\nsrc/app.rs\n\n```diff\n@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n```"
+        );
+        assert_eq!(
+            asked(
+                "Write",
+                json!({"file_path":"notes.md","content":"# Notes\n"}),
+                ""
+            ),
+            "Claude wants to use a tool\nnotes.md\n\n```diff\n@@ -0,0 +1,1 @@\n+# Notes\n```"
+        );
+        // Any other tool, and a command or an edit that is not whole.
+        assert_eq!(
+            asked("WebFetch", json!({"url":"https://example.com"}), ""),
+            "Claude wants to use a tool\n\n```json\n{\n  \"url\": \"https://example.com\"\n}\n```"
+        );
+        assert_eq!(
+            asked("Bash", json!({}), ""),
+            "Claude wants to use a tool\n\n```json\n{}\n```"
+        );
+        assert!(
+            asked("Edit", json!({"file_path":"src/app.rs"}), "")
+                .ends_with("\n\n```json\n{\n  \"file_path\": \"src/app.rs\"\n}\n```")
+        );
+    }
+
     #[test]
     fn permission_denials_preserve_exact_input_and_advisory_reason() {
         let mut adapter = Claude::default();
