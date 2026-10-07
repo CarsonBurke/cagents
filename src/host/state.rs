@@ -5777,6 +5777,7 @@ for line in sys.stdin:
                 .unwrap();
         }
         handle.search_for(Some(2), 9, "hit".into(), true).unwrap();
+        crate::terminal::flush_archived_notices();
         for (delivery, expected) in [(first, 0), (second, 1)] {
             delivery.close_after_drain();
             let mut results = 0;
