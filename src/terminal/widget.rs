@@ -48,10 +48,10 @@ const BLINK_PHASE: Duration = Duration::from_millis(530);
 /// Every PTY resize is a SIGWINCH, and a full-screen program answers each one
 /// by repainting at the new size: Codex reflows its whole transcript. A card
 /// animating to a new width crosses a column boundary on nearly every frame,
-/// and a new card grows from a sliver, so following each frame would make the
-/// program repaint a dozen times for one gesture, starting from one column.
-/// Until the grid settles the widget keeps drawing the frame it has, clipped
-/// or padded to its bounds. Kitty debounces resizes by the same interval.
+/// so following each frame would make the program repaint a dozen times for
+/// one gesture. Until the grid settles the widget keeps drawing the frame it
+/// has, clipped or padded to its bounds. Kitty debounces resizes by the same
+/// interval.
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
 /// Opacity multiplier for the cursor of a terminal that does not hold the
@@ -944,10 +944,17 @@ struct PtySize {
 }
 
 impl PtySize {
-    fn observe(&mut self, size: TerminalSize, now: Instant) -> SizeSync {
+    /// `unsized_spawn` names a terminal that still has the size it was
+    /// started with, laid out at a width its card will keep. Nobody chose the
+    /// size it has, so giving it one is not a resize: waiting would only show
+    /// its first prompt at the wrong width.
+    fn observe(&mut self, size: TerminalSize, now: Instant, unsized_spawn: bool) -> SizeSync {
         if self.applied == Some(size) {
             self.pending = None;
             return SizeSync::Current;
+        }
+        if unsized_spawn {
+            return SizeSync::Apply(size);
         }
         let since = match self.pending {
             Some((pending, since)) if pending == size => since,
@@ -1508,6 +1515,7 @@ pub struct TerminalWidget<Message> {
     find_matches: Option<(Arc<[super::SearchMatch]>, usize)>,
     select_all_request: u64,
     selection_reset: u64,
+    width_settled: bool,
     _message: PhantomData<fn() -> Message>,
 }
 
@@ -1552,6 +1560,7 @@ impl<Message> TerminalWidget<Message> {
             find_matches: None,
             select_all_request: 0,
             selection_reset: 0,
+            width_settled: true,
             _message: PhantomData,
         }
     }
@@ -1567,6 +1576,12 @@ impl<Message> TerminalWidget<Message> {
     }
     pub fn select_all_request(mut self, request: u64) -> Self {
         self.select_all_request = request;
+        self
+    }
+    /// Whether the card is laid out at the width it will keep, rather than
+    /// one a layout transition is still moving.
+    pub fn width_settled(mut self, settled: bool) -> Self {
+        self.width_settled = settled;
         self
     }
     pub fn on_context(
@@ -1807,10 +1822,11 @@ impl<Message> TerminalWidget<Message> {
         geometry: TerminalGeometry,
         shell: &mut Shell<'_, Message>,
     ) {
-        match state
-            .pty_size
-            .observe(geometry.terminal_size(), Instant::now())
-        {
+        match state.pty_size.observe(
+            geometry.terminal_size(),
+            Instant::now(),
+            self.width_settled && self.handle.is_unsized_spawn(),
+        ) {
             SizeSync::Current => {}
             // No event may arrive once layout stops moving, so ask for the
             // frame that finishes the wait.
@@ -4055,7 +4071,7 @@ mod tests {
             };
             let geometry =
                 TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.0, "", LINE_HEIGHT_RATIO, 8.0);
-            match pty.observe(geometry.terminal_size(), start + elapsed) {
+            match pty.observe(geometry.terminal_size(), start + elapsed, false) {
                 SizeSync::Apply(size) => {
                     pty.applied(size);
                     applied.push(size);
@@ -4083,14 +4099,6 @@ mod tests {
         for (from, to) in [(540.0, 1080.0), (1080.0, 540.0)] {
             let start = Instant::now();
             let mut pty = PtySize::default();
-            assert_eq!(
-                pty.observe(settled_size(from), start - RESIZE_SETTLE),
-                SizeSync::Settle(start)
-            );
-            assert_eq!(
-                pty.observe(settled_size(from), start),
-                SizeSync::Apply(settled_size(from))
-            );
             pty.applied(settled_size(from));
 
             // Each frame of the animation crosses a column boundary; the child
@@ -4104,10 +4112,25 @@ mod tests {
     }
 
     #[test]
-    fn a_new_card_growing_from_a_sliver_never_sends_its_first_frame() {
+    fn a_spawned_terminal_takes_its_first_size_without_waiting() {
+        let start = Instant::now();
         let mut pty = PtySize::default();
-        let applied = animate_card(1.0, 800.0, &mut pty, Instant::now());
-        assert_eq!(applied, vec![settled_size(800.0)]);
+        assert_eq!(
+            pty.observe(pty_size(120), start, true),
+            SizeSync::Apply(pty_size(120))
+        );
+        pty.applied(pty_size(120));
+        assert_eq!(pty.observe(pty_size(120), start, false), SizeSync::Current);
+        assert_eq!(
+            pty.observe(pty_size(95), start, false),
+            SizeSync::Settle(start + RESIZE_SETTLE)
+        );
+        // A terminal that already has a size settles like any other resize,
+        // including through the first layouts of a card that is remounted.
+        assert_eq!(
+            PtySize::default().observe(pty_size(120), start, false),
+            SizeSync::Settle(start + RESIZE_SETTLE)
+        );
     }
 
     #[test]
@@ -4116,29 +4139,29 @@ mod tests {
         let mut pty = PtySize::default();
         pty.applied(pty_size(80));
 
-        assert_eq!(pty.observe(pty_size(80), start), SizeSync::Current);
+        assert_eq!(pty.observe(pty_size(80), start, false), SizeSync::Current);
         assert_eq!(
-            pty.observe(pty_size(90), start),
+            pty.observe(pty_size(90), start, false),
             SizeSync::Settle(start + RESIZE_SETTLE)
         );
         // Seeing the same size again does not restart its wait.
         let later = start + RESIZE_SETTLE / 2;
         assert_eq!(
-            pty.observe(pty_size(90), later),
+            pty.observe(pty_size(90), later, false),
             SizeSync::Settle(start + RESIZE_SETTLE)
         );
         // A different size does.
         assert_eq!(
-            pty.observe(pty_size(95), later),
+            pty.observe(pty_size(95), later, false),
             SizeSync::Settle(later + RESIZE_SETTLE)
         );
         assert_eq!(
-            pty.observe(pty_size(95), later + RESIZE_SETTLE),
+            pty.observe(pty_size(95), later + RESIZE_SETTLE, false),
             SizeSync::Apply(pty_size(95))
         );
         pty.applied(pty_size(95));
         assert_eq!(
-            pty.observe(pty_size(95), later + RESIZE_SETTLE),
+            pty.observe(pty_size(95), later + RESIZE_SETTLE, false),
             SizeSync::Current
         );
     }
@@ -4149,17 +4172,17 @@ mod tests {
         let mut pty = PtySize::default();
         pty.applied(pty_size(80));
         assert!(matches!(
-            pty.observe(pty_size(60), start),
+            pty.observe(pty_size(60), start, false),
             SizeSync::Settle(_)
         ));
         assert_eq!(
-            pty.observe(pty_size(80), start + Duration::from_millis(10)),
+            pty.observe(pty_size(80), start + Duration::from_millis(10), false),
             SizeSync::Current
         );
         // The abandoned size gets a fresh wait if layout produces it again.
         let again = start + RESIZE_SETTLE * 2;
         assert_eq!(
-            pty.observe(pty_size(60), again),
+            pty.observe(pty_size(60), again, false),
             SizeSync::Settle(again + RESIZE_SETTLE)
         );
     }
@@ -4168,15 +4191,15 @@ mod tests {
     fn a_failed_resize_is_retried_without_another_wait() {
         let start = Instant::now();
         let mut pty = PtySize::default();
-        pty.observe(pty_size(80), start);
+        pty.observe(pty_size(80), start, false);
         let due = start + RESIZE_SETTLE;
         assert_eq!(
-            pty.observe(pty_size(80), due),
+            pty.observe(pty_size(80), due, false),
             SizeSync::Apply(pty_size(80))
         );
         // The send failed, so nothing was recorded as applied.
         assert_eq!(
-            pty.observe(pty_size(80), due + Duration::from_millis(1)),
+            pty.observe(pty_size(80), due + Duration::from_millis(1), false),
             SizeSync::Apply(pty_size(80))
         );
     }
