@@ -17,6 +17,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+// These fixtures copy executables and fork with pre_exec hooks. A sibling fork
+// can briefly inherit a copy's writable FD before CLOEXEC, causing ETXTBSY in
+// another fixture. Serialize the complete OS fixture, not product execution.
+static OS_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn verify(runtime: &Path, lease: Option<&File>) -> Output {
     verify_mode(runtime, lease, false)
 }
@@ -50,6 +55,7 @@ fn verify_mode(runtime: &Path, lease: Option<&File>, stage_only: bool) -> Output
 
 #[test]
 fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
     for status in ["0", "7", "cancel", "deferred", "complete"] {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
@@ -218,6 +224,7 @@ fn file(path: &Path) -> File {
 
 #[test]
 fn inherited_fence_requires_exact_locked_description_and_closed_windows() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let name = if cfg!(any(debug_assertions, feature = "development")) {
@@ -285,6 +292,7 @@ fn inherited_fence_requires_exact_locked_description_and_closed_windows() {
 
 #[test]
 fn staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
     for status in ["0", "7", "cancel"] {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
@@ -342,7 +350,9 @@ esac
             .arg("--installer")
             .arg(&script)
             .env("XDG_RUNTIME_DIR", &runtime)
-            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
             .env("TEST_CLI", env!("CARGO_BIN_EXE_cagents"))
             .env("TEST_PREFIX", &prefix)
             .env("TEST_READY", &ready)
@@ -394,6 +404,7 @@ esac
 
 #[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
     let root = tempfile::tempdir().unwrap();
     let prefix = root.path().join("install");
     let old = prefix.join("versions/old/bin");
@@ -455,7 +466,9 @@ fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() 
     ] {
         let output = Command::new(new.join("cagents"))
             .args(&args)
-            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
             .env("XDG_RUNTIME_DIR", &runtime)
             .output()
             .unwrap();
@@ -567,6 +580,7 @@ fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() 
 
 #[test]
 fn staged_native_ui_owner_fixture() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
     let Some(expected) = std::env::var_os("CAGENTS_TEST_STAGED_NATIVE_OWNER") else {
         return;
     };
@@ -588,6 +602,7 @@ fn staged_native_ui_owner_fixture() {
 
 #[test]
 fn sealed_anonymous_update_probe_does_not_require_installed_routing() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
     use std::os::fd::FromRawFd;
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
