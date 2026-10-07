@@ -457,20 +457,26 @@ impl Runtime {
         // A long command wraps onto the next line rather than running under
         // the outcome beside it: a pane is often narrow, and a row whose end
         // is hidden is a row the reader cannot check.
+        // What the step is comes first and stays: the tool's name and
+        // input, or the command. What it last printed follows on a muted
+        // line of its own, so a running build can be followed without the
+        // row forgetting what is being built.
+        let mut preview: Vec<Element<'static, Message>> = Vec::new();
         if matches!(item.content, ItemContent::Tool { .. }) {
-            let mut preview = vec![design::body(label.to_owned()).into()];
+            preview.push(design::body(label.to_owned()).into());
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
-            line.push(
-                widget::column::with_children(preview)
-                    .spacing(GAP_XS)
-                    .width(Length::Fill)
-                    .into(),
-            );
         } else {
-            line.push(cached.preview.view());
+            preview.push(cached.preview.view());
         }
+        preview.extend(cached.preview.tail_view());
+        line.push(
+            widget::column::with_children(preview)
+                .spacing(GAP_XS)
+                .width(Length::Fill)
+                .into(),
+        );
         if let Some(detail) = &cached.detail {
             line.push(design::caption(detail.clone()).into());
         }
