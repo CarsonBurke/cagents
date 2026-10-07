@@ -9,10 +9,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc, Mutex, OnceLock, TryLockError,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, TryLockError},
     thread,
     time::{Duration, Instant},
 };
@@ -51,10 +48,15 @@ const STREAMS_PER_MASTER: usize = 8;
 /// Bridges the gaps between one process's connections, and bounds how long an
 /// authenticated transport outlives a process that died without `Cleanup`.
 const MASTER_PERSIST_SECONDS: u32 = 60;
-/// Exceeds `ConnectTimeout`. A stream still connected then without a master has
-/// an SSH that cannot multiplex here, and no later stream waits for one again.
+/// Exceeds `ConnectTimeout`. A stream still connected then without a master
+/// either cannot multiplex here or is authenticating unusually slowly, so later
+/// streams stop waiting on one for `MULTIPLEX_RETRY`.
 const MASTER_START_TIMEOUT: Duration = Duration::from_secs(20);
-static MULTIPLEX: AtomicBool = AtomicBool::new(true);
+const MULTIPLEX_RETRY: Duration = Duration::from_secs(300);
+static MULTIPLEX_PAUSED: Mutex<Option<Instant>> = Mutex::new(None);
+/// `ssh -O exit` answers a healthy master in milliseconds. One that does not
+/// answer would hold process exit for `ConnectTimeout` and then log in afresh.
+const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn selected() -> Option<&'static Device> {
     SELECTED.get()
@@ -190,13 +192,23 @@ impl Drop for Cleanup {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .len();
                 for control in (0..masters).filter_map(|master| control_path(directory, master)) {
-                    if let Some(device) = selected().filter(|_| Path::new(&control).exists()) {
-                        let _ = ssh(Some(&control))
+                    if let Some(device) = selected().filter(|_| Path::new(&control).exists())
+                        && let Ok(mut exit) = ssh(Some(&control))
                             .args(["-O", "exit", "--", &device.host])
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
-                            .status();
+                            .spawn()
+                    {
+                        let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
+                        while matches!(exit.try_wait(), Ok(None)) {
+                            if Instant::now() >= deadline {
+                                let _ = exit.kill();
+                                let _ = exit.wait();
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
                     }
                     let _ = fs::remove_file(control);
                 }
@@ -360,7 +372,14 @@ fn spawn_stream(
     let deadline = Instant::now() + MASTER_START_TIMEOUT;
     while cold && !waited && !listening() && matches!(child.try_wait(), Ok(None)) {
         if Instant::now() >= deadline {
-            MULTIPLEX.store(false, Ordering::Relaxed);
+            tracing::warn!(
+                device = device.name,
+                "SSH did not share a connection in time; connecting separately for now"
+            );
+            *MULTIPLEX_PAUSED
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                Some(Instant::now() + MULTIPLEX_RETRY);
             break;
         }
         thread::sleep(Duration::from_millis(5));
@@ -369,7 +388,11 @@ fn spawn_stream(
 }
 fn forward(device: &Device, directory: &Path, stream: UnixStream) -> io::Result<()> {
     let (slot, starting) = Slot::acquire();
-    let control = control_path(directory, slot.0).filter(|_| MULTIPLEX.load(Ordering::Relaxed));
+    let paused = MULTIPLEX_PAUSED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .is_some_and(|until| Instant::now() < until);
+    let control = control_path(directory, slot.0).filter(|_| !paused);
     let mut child = spawn_stream(device, control.as_deref(), &starting)?;
     let stderr = child
         .stderr
@@ -401,11 +424,16 @@ fn forward(device: &Device, directory: &Path, stream: UnixStream) -> io::Result<
     let mut writer = stream;
     let upstream = thread::spawn(move || copy_flushed(&mut reader, &mut input));
     let result = copy_flushed(&mut output, &mut writer);
-    if result.is_err() {
-        let _ = child.kill();
-    }
+    let killed = result.is_err() && child.kill().is_ok();
     let status = child.wait()?;
-    let detail = diagnostics.join().unwrap_or_default();
+    // A multiplexed stream hands its stderr to the master, which keeps it open
+    // until the remote command ends. Only a stream that ended by itself has
+    // diagnostics that are complete, and worth waiting for.
+    let detail = if killed {
+        String::new()
+    } else {
+        diagnostics.join().unwrap_or_default()
+    };
     if !status.success() {
         *LAST_ERROR
             .lock()
