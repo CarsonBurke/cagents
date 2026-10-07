@@ -209,6 +209,29 @@ impl WriteSubject {
     pub fn is_window_state(&self) -> bool {
         matches!(self, Self::Workspace { .. } | Self::CardIdentity { .. })
     }
+
+    /// The subject as a refused barrier names it: what kind of write it was
+    /// and the identifier the log and the save notice know it by. It carries
+    /// no title, name or path, so it can leave the window - an updater prints
+    /// it - where the notice's own wording, which does name them, cannot.
+    fn summary(&self) -> String {
+        match self {
+            Self::Workspace { card: None } => "the window's layout and panes".to_owned(),
+            Self::Workspace { card: Some(card) } => {
+                format!("the window's layout and panes, at pane {card}")
+            }
+            Self::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Terminal,
+            } => format!("the relaunched terminal in pane {card}"),
+            Self::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Chat,
+            } => format!("the new conversation in pane {card}"),
+            Self::Project { id, .. } => format!("project {id}"),
+            Self::Worktree { id, .. } => format!("worktree {id}"),
+        }
+    }
 }
 
 /// A write storage refused by construction. It is never retried on its own;
@@ -923,6 +946,10 @@ struct PendingWrites {
 struct Refusal {
     category: SaveFailureCategory,
     at_unix_ms: i64,
+    /// Tells one cause from another without keeping the store error, which
+    /// stays on this thread. A subject refused again for a new reason is a new
+    /// thing to explain; one refused again for the same reason is not.
+    cause: u64,
 }
 
 /// Writes storage refused by construction, one per subject.
@@ -948,9 +975,14 @@ struct Quarantine {
 
 impl Refusal {
     fn new(error: &StoreError) -> Self {
+        use std::hash::{Hash, Hasher};
+
+        let mut cause = std::collections::hash_map::DefaultHasher::new();
+        error.to_string().hash(&mut cause);
         Self {
             category: save_failure_category(error),
             at_unix_ms: unix_millis(),
+            cause: cause.finish(),
         }
     }
 }
@@ -991,7 +1023,20 @@ fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &Stor
             refusal
         }
         Some(first) => {
-            tracing::debug!(?subject, %error, "storage refused a newer write of a refused subject");
+            // A subject stays refused for as long as every newer write of it
+            // is refused too, and only the first refusal was ever logged above
+            // debug: a window that went on to be refused for some other reason
+            // left a log that still named the first, long since resolved.
+            if first.cause == refusal.cause {
+                tracing::debug!(?subject, %error, "storage refused a newer write of a refused subject");
+            } else {
+                tracing::warn!(
+                    ?subject,
+                    %error,
+                    category = refusal.category.label(),
+                    "storage refused a newer write of a refused subject, for a different reason"
+                );
+            }
             Refusal {
                 at_unix_ms: first.at_unix_ms,
                 ..refusal
@@ -2136,7 +2181,9 @@ fn persistence_loop(
                 // releases the daemon's replay evidence on the strength of it -
                 // so a refused snapshot fails it. A refused catalog row does
                 // not: waiting cannot save it, and the window state is whole.
-                Err(window_state_refusal(category))
+                let refusal = window_state_refusal(category, &writes.quarantined());
+                tracing::warn!(%refusal, "a save barrier was refused");
+                Err(refusal)
             } else {
                 Ok(())
             };
@@ -2327,9 +2374,21 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
 }
 
 /// Why a barrier cannot vouch for a window whose state storage refused.
-fn window_state_refusal(category: SaveFailureCategory) -> String {
+///
+/// It names each refused part of that state. The guidance asks the reader to
+/// change or close "the item", and whoever reads this is often not looking at
+/// the window - an updater relays it to a terminal - so without the names
+/// there is nothing to act on.
+fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWrite]) -> String {
+    let subjects = refused
+        .iter()
+        .filter(|write| write.subject.is_window_state())
+        .map(|write| write.subject.summary())
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
-        "workspace could not be saved: storage refused part of the window's own state ({}). {}",
+        "workspace could not be saved: storage refused part of the window's own state ({}): \
+         {subjects}. {}",
         category.label(),
         QUARANTINE_GUIDANCE
     )
@@ -4340,6 +4399,12 @@ mod tests {
             .flush(timeout)
             .expect_err("a barrier cannot vouch for a window storage refused");
         assert!(refusal.contains("refused part of the window"), "{refusal}");
+        assert!(
+            refusal.contains(&format!(
+                "the window's layout and panes, at pane {resurrected}"
+            )),
+            "a refused barrier names what the reader has to change: {refusal}"
+        );
         assert!(refusal.contains(QUARANTINE_GUIDANCE), "{refusal}");
         let refused = latest_health(&health);
         assert_eq!(refused.health, SessionSaveHealth::Healthy);
@@ -4401,6 +4466,63 @@ mod tests {
 
         let store = StateStore::open(&path, boot).unwrap();
         assert!(!store.recovery_report().dirty_shutdown);
+    }
+
+    /// A barrier refuses for what is unsaved now, not for what was once
+    /// refused: the refused snapshot is the whole window, so the first later
+    /// one storage accepts is everything the barrier vouches for. An update is
+    /// such a barrier, and one it blocks for good cannot deliver the fix.
+    #[test]
+    fn a_barrier_passes_once_the_window_saves_after_a_refused_focus() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("refused-focus.sqlite3");
+        let boot = BootId::new("boot-refused-focus");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        state.focused = Some(state.cards[0].id);
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+
+        // Storage refuses a window that focuses a pane it holds closed.
+        state.cards[0].existence = closed();
+        runtime.snapshot(Arc::new(state.clone()));
+        let refusal = runtime.flush(timeout).unwrap_err();
+        assert!(
+            refusal.contains("(saved state is invalid): the window's layout and panes."),
+            "{refusal}"
+        );
+        // Asking again changes nothing: the same window is still unsaved.
+        runtime.flush(timeout).unwrap_err();
+
+        state.focused = None;
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.flush(timeout).unwrap();
+        runtime.shutdown();
+
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+    }
+
+    /// A subject refused again keeps the time of its first refusal, and the
+    /// lane can still tell that the reason it is refused for has changed.
+    #[test]
+    fn a_refusal_for_a_new_reason_is_told_apart_from_a_repeated_one() {
+        let refused = |reason: &str| StoreError::InvalidState(reason.to_owned());
+        let mut quarantine = Quarantine::default();
+        quarantine.refuse_workspace(Arc::new(workspace()), &refused("first"));
+        let (_, _, first) = quarantine.workspace.clone().unwrap();
+        quarantine.refuse_workspace(Arc::new(workspace()), &refused("first"));
+        let (_, _, repeated) = quarantine.workspace.clone().unwrap();
+        quarantine.refuse_workspace(Arc::new(workspace()), &refused("second"));
+        let (_, _, changed) = quarantine.workspace.clone().unwrap();
+
+        assert_eq!(repeated.cause, first.cause);
+        assert_ne!(changed.cause, first.cause);
+        assert_eq!(changed.at_unix_ms, first.at_unix_ms);
     }
 
     /// A relaunch storage refused leaves the stored identity where it was, and

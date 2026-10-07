@@ -3853,7 +3853,8 @@ fn replace_terminal_identity_transaction(
     Ok(())
 }
 
-fn validate_workspace(state: &WorkspaceState) -> Result<()> {
+/// What every workspace snapshot has to satisfy before any of it is written.
+pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     let mut ids = BTreeSet::new();
     for card in &state.cards {
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {

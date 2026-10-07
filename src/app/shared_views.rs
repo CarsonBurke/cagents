@@ -843,6 +843,9 @@ impl Cagents {
         if let Some(card) = self.card_state_mut(id) {
             card.existence = super::project_ui::removed_existence("pane closed in another client");
         }
+        // The strip handed this pane's focus to a neighbour above, with no
+        // viewport update to tell the saved state.
+        self.settle_focus();
         self.sidebar_state.clear_agent_activity(id);
     }
 
@@ -1213,6 +1216,44 @@ mod tests {
             assert!(!app.card_state(pane.id).unwrap().existence.is_open());
         }
     }
+
+    /// A peer closing the pane this window has focused hands the strip's focus
+    /// to a neighbour, and nothing else about the strip changes, so no
+    /// viewport update carries the handoff into the saved state. Storage
+    /// refuses a workspace that focuses a closed pane, and a refused workspace
+    /// fails every save barrier until a later one lands.
+    #[test]
+    fn a_peer_closing_the_focused_pane_leaves_a_focus_storage_accepts() {
+        let (mut app, a, _, first) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(a);
+        let mut second = first.clone();
+        second.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut second.kind {
+            browser.id = BrowserId::new();
+        }
+        let mut view = View::empty(a);
+        view.panes = vec![first.clone(), second.clone()];
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        let update = app.workspace.focus(second.id).unwrap();
+        drop(app.apply_viewport(update, false, false));
+        assert_eq!(app.durable.focused, Some(second.id));
+        crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
+
+        view.panes = vec![first.clone()];
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert!(!app.card_state(second.id).unwrap().existence.is_open());
+        assert_eq!(app.workspace.focused(), Some(first.id));
+        crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
+        assert_eq!(
+            app.durable.focused,
+            Some(first.id),
+            "the saved focus follows the strip to the pane that took it"
+        );
+    }
+
     #[test]
     fn transfer_preserves_runtime_when_destination_is_projected_first() {
         let (mut app, a, b, pane) = fixture();
