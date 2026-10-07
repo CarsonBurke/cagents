@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::ChannelId;
 use crate::update::{UpdateJob, UpdatePhase, UpdateState};
 
 #[derive(Default)]
@@ -16,6 +17,10 @@ pub(super) struct State {
     restarting: bool,
     pub(super) confirmation: Option<crate::update::UpdateConfirmation>,
     submitted_confirmation: Option<String>,
+    /// The job whose review was set aside to go and deal with a session that
+    /// blocks it. Its dialog stays away until nothing blocks any more, or
+    /// until the update control asks for it again.
+    set_aside: Option<String>,
     /// When a check last reached the release server.
     last_checked: Option<std::time::SystemTime>,
     /// Background checks that failed in a row, which spaces out the next.
@@ -108,6 +113,9 @@ pub enum Action {
     },
     ConfirmApply(String),
     ReviewJob,
+    /// Leave the review to look at a session it names, keeping the update.
+    ShowSession(crate::model::TerminalId),
+    CopyDetails,
     CancelApply,
     StartApply,
     Applied(Result<UpdateJob, String>),
@@ -123,6 +131,95 @@ pub(super) fn release_notes_button<'a>(url: &str) -> Element<'a, Message> {
     crate::ui_controls::button::quiet("Release notes")
         .on_press(Message::UpdateUi(Action::OpenReleaseNotes(url.to_owned())))
         .into()
+}
+
+/// What the update does to the application as a whole.
+fn preview_summary(preview: &crate::update::impact::Preview) -> &'static str {
+    if preview.replaces_daemon {
+        "The terminal service will be replaced. Your windows and tabs will reopen automatically."
+    } else {
+        "Your windows will reopen with the new build. The terminal service and its sessions stay running."
+    }
+}
+
+/// Why the update cannot be confirmed yet, counted so the reader knows how
+/// much stands in the way before reading any of it.
+fn attention_summary(daemon: &crate::update::impact::DaemonImpact) -> Option<String> {
+    use crate::update::impact::Disposition;
+    let sessions = daemon
+        .sessions
+        .iter()
+        .filter(|session| session.disposition == Disposition::Blocked)
+        .count();
+    let subject = match (sessions, daemon.blockers.is_empty()) {
+        (0, true) => return None,
+        (0, false) => "The terminal service is".to_owned(),
+        (1, _) => "1 session is".to_owned(),
+        (count, _) => format!("{count} sessions are"),
+    };
+    // The worker observes the daemon again twice a second, so resolving
+    // these is all there is to do: there is nothing to retry.
+    Some(format!(
+        "{subject} holding this update back. This list updates as soon as that changes."
+    ))
+}
+
+fn disposition_tone(disposition: crate::update::impact::Disposition) -> design::Tone {
+    use crate::update::impact::Disposition;
+    let tone: fn(&cosmic::Theme) -> iced::Color = match disposition {
+        Disposition::Continues => design::success_color,
+        Disposition::Resumes | Disposition::ResumePicker => design::muted_color,
+        Disposition::WaitsForIdle | Disposition::Blocked => design::warning_color,
+        Disposition::Interrupted => design::destructive_color,
+    };
+    tone.into()
+}
+
+/// The other way to treat conversations that are mid-turn, when any are.
+fn policy_choice(
+    daemon: &crate::update::impact::DaemonImpact,
+) -> Option<(&'static str, crate::update::impact::Policy)> {
+    use crate::update::impact::{Disposition, Policy};
+    daemon
+        .sessions
+        .iter()
+        .any(|session| {
+            matches!(
+                session.disposition,
+                Disposition::WaitsForIdle | Disposition::Interrupted
+            )
+        })
+        .then(|| {
+            if daemon.policy == Policy::WhenIdle {
+                ("Review interruption instead", Policy::Interrupt)
+            } else {
+                ("Wait for idle instead", Policy::WhenIdle)
+            }
+        })
+}
+
+/// The whole preview as text, for a report or a search: a drag selects
+/// within one line of the dialog, never across its rows.
+fn preview_details(preview: &crate::update::impact::Preview) -> String {
+    let mut details = format!(
+        "Update to {}\n{}\n",
+        preview.candidate.version,
+        preview_summary(preview)
+    );
+    if let Some(daemon) = &preview.daemon {
+        for session in &daemon.sessions {
+            details.push_str(&format!(
+                "\n{} — {}\n{}\n",
+                session.title,
+                session.disposition.label(),
+                session.reason
+            ));
+        }
+        for blocker in &daemon.blockers {
+            details.push_str(&format!("\n{blocker}\n"));
+        }
+    }
+    details
 }
 
 impl State {
@@ -164,11 +261,16 @@ impl Cagents {
     }
 
     pub(super) fn update_dialog(&self) -> Option<Element<'_, Message>> {
-        use crate::update::impact::{Disposition, Policy};
+        use crate::update::impact::Disposition;
         let confirmation = self.update_ui.confirmation.as_ref()?;
         let preview = &confirmation.preview;
         let title: Element<'_, Message> =
-            crate::design::title(format!("Update to {}?", preview.candidate.version))
+            widget::selectable_text(format!("Update to {}?", preview.candidate.version))
+                .size(design::TEXT_TITLE)
+                .line_height(iced::widget::text::LineHeight::Absolute(
+                    design::LINE_TITLE.into(),
+                ))
+                .font(design::title_font())
                 .width(Length::Fill)
                 .into();
         // Read what changes before every window restarts for it.
@@ -179,55 +281,45 @@ impl Cagents {
                 .into(),
             None => title,
         };
-        let mut body = vec![
-            heading,
-            notice_body(if preview.replaces_daemon {
-                "The terminal service will be replaced. Your windows and tabs will reopen automatically. Review what happens to each session below."
-            } else {
-                "Your windows will reopen with the new build. The terminal service and its sessions stay running."
-            }),
-        ];
-        let mut blocked = false;
+        let blocked = preview
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| daemon.blocked());
+        let mut body = vec![heading, notice_body(preview_summary(preview))];
         if let Some(daemon) = &preview.daemon {
-            let mut rows = daemon
+            if let Some(attention) = attention_summary(daemon) {
+                body.push(
+                    widget::selectable_text(attention)
+                        .size(design::TEXT_BODY)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .into(),
+                );
+            }
+            // What stands in the way leads; what merely happens follows.
+            let (attention, settled): (Vec<_>, Vec<_>) = daemon
                 .sessions
                 .iter()
-                .map(|session| {
-                    let label = match session.disposition {
-                        Disposition::Continues => "Continues",
-                        Disposition::Resumes => "Resumes",
-                        Disposition::WaitsForIdle => "Waits for idle",
-                        Disposition::Interrupted => "Interrupted",
-                        Disposition::ResumePicker => "Choose a conversation",
-                        Disposition::Blocked => "Needs attention",
-                    };
-                    notice_body(format!("{} · {label}\n{}", session.title, session.reason))
-                })
+                .partition(|session| session.disposition == Disposition::Blocked);
+            let mut rows = attention
+                .into_iter()
+                .chain(settled)
+                .map(|session| self.update_session_row(session))
                 .collect::<Vec<_>>();
             rows.extend(daemon.blockers.iter().map(notice_body));
-            body.push(
-                widget::container(widget::scrollable(
-                    widget::column::with_children(rows).spacing(10),
-                ))
-                .max_height(320)
-                .into(),
-            );
-            blocked = !daemon.blockers.is_empty()
-                || daemon
-                    .sessions
-                    .iter()
-                    .any(|session| session.disposition == Disposition::Blocked);
-            if daemon.sessions.iter().any(|session| {
-                matches!(
-                    session.disposition,
-                    Disposition::WaitsForIdle | Disposition::Interrupted
-                )
-            }) {
-                let (label, policy) = if daemon.policy == Policy::WhenIdle {
-                    ("Review interruption instead", Policy::Interrupt)
-                } else {
-                    ("Wait for idle instead", Policy::WhenIdle)
-                };
+            if !rows.is_empty() {
+                body.push(
+                    widget::container(widget::scrollable(
+                        widget::column::with_children(rows)
+                            .spacing(space::M)
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                    ))
+                    .max_height(320)
+                    .into(),
+                );
+            }
+            if let Some((label, policy)) = policy_choice(daemon) {
                 body.push(
                     crate::ui_controls::button::secondary(label)
                         .on_press(Message::UpdateUi(Action::ChoosePolicy(policy)))
@@ -237,6 +329,10 @@ impl Cagents {
         }
         body.push(
             widget::row::with_children(vec![
+                crate::ui_controls::button::quiet("Copy details")
+                    .id(widget::Id::new("update.copy"))
+                    .on_press(Message::UpdateUi(Action::CopyDetails))
+                    .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
                 crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("update.cancel"))
@@ -254,11 +350,13 @@ impl Cagents {
                         "Update and reopen"
                     },
                 )
+                .id(widget::Id::new("update.confirm"))
                 .on_press_maybe((!blocked).then_some(Message::UpdateUi(Action::ConfirmApply(
                     confirmation.nonce.clone(),
                 ))))
                 .into(),
             ])
+            .align_y(Alignment::Center)
             .spacing(space::S)
             .into(),
         );
@@ -267,6 +365,70 @@ impl Cagents {
             Some(Message::UpdateUi(Action::CancelApply)),
             1.0,
         ))
+    }
+
+    /// One session of the preview: what it is, what becomes of it, and why.
+    /// A session that blocks the update offers the way to it, when this
+    /// window is the one holding its tab.
+    fn update_session_row<'a>(
+        &self,
+        session: &'a crate::update::impact::SessionImpact,
+    ) -> Element<'a, Message> {
+        use crate::update::impact::Disposition;
+        let mut header = vec![
+            widget::selectable_text(session.title.as_str())
+                .size(design::TEXT_HEADING)
+                .font(design::heading_font())
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into(),
+            crate::ui_controls::badge(
+                session.disposition.label(),
+                disposition_tone(session.disposition),
+            ),
+        ];
+        if session.disposition == Disposition::Blocked && self.session_card(session.id).is_some() {
+            header.push(
+                crate::ui_controls::button::secondary("Show")
+                    .name(format!("Show {}", session.title))
+                    .on_press(Message::UpdateUi(Action::ShowSession(session.id)))
+                    .into(),
+            );
+        }
+        widget::column::with_children(vec![
+            widget::row::with_children(header)
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .into(),
+            notice_detail(session.reason.as_str()),
+        ])
+        .spacing(space::XXS)
+        .into()
+    }
+
+    /// The open tab in this window that shows a daemon session, and the
+    /// channel it belongs to.
+    fn session_card(&self, id: crate::model::TerminalId) -> Option<(CardId, Option<ChannelId>)> {
+        let card = self
+            .durable
+            .cards
+            .iter()
+            .find(|card| {
+                card.existence.is_open()
+                    && match &card.kind {
+                        CardKind::Terminal(session) => session.id == id,
+                        CardKind::Chat(session) => session.id == id,
+                        _ => false,
+                    }
+            })?
+            .id;
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .map(|channel| channel.id);
+        (channel.is_some() || self.workspace.card(card).is_some()).then_some((card, channel))
     }
 
     /// The release notes of the available release, when it is `version`.
@@ -580,7 +742,27 @@ impl Cagents {
             Action::ChoosePolicy(policy) => {
                 self.decide_update(crate::update::UpdateChoice::Policy(policy))
             }
+            Action::ShowSession(id) => {
+                let Some((card, channel)) = self.session_card(id) else {
+                    return Task::none();
+                };
+                // Cancelling would throw away a verified download to look at
+                // one tab. The job keeps waiting; only its dialog steps aside.
+                self.update_ui.set_aside = self.update_ui.job.as_ref().map(|job| job.id.clone());
+                self.update_ui.confirmation = None;
+                let selected =
+                    channel.map_or_else(Task::none, |channel| self.select_channel(channel));
+                Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
+            }
+            Action::CopyDetails => self
+                .update_ui
+                .confirmation
+                .as_ref()
+                .map_or_else(Task::none, |confirmation| {
+                    iced::clipboard::write(preview_details(&confirmation.preview))
+                }),
             Action::ReviewJob => {
+                self.update_ui.set_aside = None;
                 if !self.other_modal_is_open() {
                     self.update_ui.confirmation = self
                         .update_ui
@@ -686,6 +868,19 @@ impl Cagents {
                             self.update_ui.error = Some(job.message.clone());
                             self.status = Some(TransientNotice::error(job.message.clone()));
                         }
+                        // A review set aside returns by itself once nothing
+                        // blocks the update, and never outlives its job.
+                        if self.update_ui.set_aside.as_ref() != Some(&job.id)
+                            || job.active_confirmation().is_none_or(|confirmation| {
+                                !confirmation
+                                    .preview
+                                    .daemon
+                                    .as_ref()
+                                    .is_some_and(|daemon| daemon.blocked())
+                            })
+                        {
+                            self.update_ui.set_aside = None;
+                        }
                         self.update_ui.confirmation =
                             job.confirmation.clone().filter(|confirmation| {
                                 matches!(
@@ -693,6 +888,7 @@ impl Cagents {
                                     UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
                                 ) && self.update_ui.submitted_confirmation.as_ref()
                                     != Some(&confirmation.nonce)
+                                    && self.update_ui.set_aside.is_none()
                                     && !self.other_modal_is_open()
                             });
                         self.update_ui.job = Some(job);
@@ -1043,6 +1239,150 @@ mod tests {
         assert!(app.update_ui.confirmation.is_none());
         assert!(!app.modal_is_open());
         assert_eq!(app.update_ui.error.as_deref(), Some("Helper exited"));
+    }
+
+    fn daemon_preview(
+        sessions: Vec<crate::update::impact::SessionImpact>,
+    ) -> crate::update::UpdateConfirmation {
+        use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
+        crate::update::UpdateConfirmation {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            preview: crate::update::impact::Preview {
+                candidate: crate::update::impact::Candidate {
+                    version: "9.8.7".into(),
+                    protocol: 32,
+                    digest: "verified".into(),
+                },
+                replaces_daemon: true,
+                daemon: Some(crate::update::impact::DaemonImpact {
+                    capability: crate::terminal_ipc::ShutdownCapability {
+                        proof: HostSessionProof {
+                            host_session_id: HostSessionId::new("host"),
+                            boot_id: BootId::new("boot"),
+                            host_incarnation: HostIncarnation::new("daemon"),
+                        },
+                        token: "token".into(),
+                        inventory_generation: 1,
+                        live_terminals: sessions.len() as u64,
+                        expires_at_unix_ms: i64::MAX,
+                    },
+                    policy: crate::update::impact::Policy::WhenIdle,
+                    sessions,
+                    blockers: Vec::new(),
+                }),
+            },
+            expires_at_unix_ms: u64::MAX,
+        }
+    }
+
+    fn session(
+        title: &str,
+        disposition: crate::update::impact::Disposition,
+    ) -> crate::update::impact::SessionImpact {
+        crate::update::impact::SessionImpact {
+            id: crate::model::TerminalId::new(),
+            kind: crate::update::impact::SessionKind::NativeChat,
+            title: title.into(),
+            identity: title.into(),
+            disposition,
+            reason: format!("Why {title} is {}", disposition.label()),
+        }
+    }
+
+    fn awaiting(confirmation: &crate::update::UpdateConfirmation) -> UpdateJob {
+        UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "9.8.7".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Ready".into(),
+            log_path: "/fixture/update.log".into(),
+            confirmation: Some(confirmation.clone()),
+        }
+    }
+
+    /// Looking at the session that blocks an update must not cost the
+    /// verified download, and the review must come back unprompted.
+    #[test]
+    fn a_review_set_aside_for_a_blocking_session_returns_once_nothing_blocks() {
+        use crate::update::impact::Disposition;
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.durable.cards[0].clone();
+        let CardKind::Terminal(terminal) = &card.kind else {
+            panic!("the fixture opens on a terminal");
+        };
+        let mut blocking = session("Codex · project", Disposition::Blocked);
+        blocking.id = terminal.id;
+        let blocked = daemon_preview(vec![
+            session("Claude Code · project", Disposition::Resumes),
+            blocking.clone(),
+        ]);
+        let job = awaiting(&blocked);
+        app.update_ui.job = Some(job.clone());
+        app.update_ui.confirmation = Some(blocked.clone());
+        assert!(app.session_card(blocking.id).is_some());
+        assert!(
+            app.session_card(crate::model::TerminalId::new()).is_none(),
+            "a session held by another window offers no way to it here"
+        );
+        let ids = custom_widget_ids(&mut app.update_dialog().expect("the review is open"));
+        assert!(
+            ids.iter().any(|id| id == "update.copy"),
+            "the whole preview can be copied: {ids:?}"
+        );
+
+        drop(app.update_update_ui(Action::ShowSession(blocking.id)));
+        assert!(!app.modal_is_open());
+        assert!(app.update_ui.updating(), "the update is still pending");
+        // The worker republishes the same blocked preview twice a second.
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job.clone())))));
+        assert!(!app.modal_is_open());
+
+        // The update control asks for the review back.
+        drop(app.update_update_ui(Action::ReviewJob));
+        assert!(app.modal_is_open());
+        drop(app.update_update_ui(Action::ShowSession(blocking.id)));
+
+        // Closing the session changes the preview, and with it the nonce.
+        let mut resolved = job.clone();
+        resolved.confirmation = Some(daemon_preview(vec![session(
+            "Claude Code · project",
+            Disposition::Resumes,
+        )]));
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(resolved)))));
+        assert!(app.modal_is_open());
+        assert!(app.update_ui.set_aside.is_none());
+    }
+
+    #[test]
+    fn the_preview_counts_what_blocks_it_and_copies_as_one_text() {
+        use crate::update::impact::Disposition;
+        let mut confirmation = daemon_preview(vec![
+            session("Shell · project", Disposition::Continues),
+            session("Codex · project", Disposition::Blocked),
+        ]);
+        let daemon = confirmation.preview.daemon.as_mut().unwrap();
+        assert_eq!(
+            attention_summary(daemon).unwrap(),
+            "1 session is holding this update back. This list updates as soon as that changes."
+        );
+        assert!(policy_choice(daemon).is_none());
+        daemon.sessions[1].disposition = Disposition::WaitsForIdle;
+        assert!(attention_summary(daemon).is_none());
+        assert!(policy_choice(daemon).is_some());
+        daemon
+            .blockers
+            .push("Wait for starting sessions to finish opening.".into());
+        assert!(
+            attention_summary(daemon)
+                .unwrap()
+                .starts_with("The terminal service is")
+        );
+        let details = preview_details(&confirmation.preview);
+        assert!(details.starts_with("Update to 9.8.7\n"));
+        assert!(
+            details.contains("Shell · project — Continues\nWhy Shell · project is Continues\n")
+        );
+        assert!(details.ends_with("Wait for starting sessions to finish opening.\n"));
     }
 
     /// The restart saves and closes every window, so it must lose to anything
