@@ -2884,6 +2884,17 @@ fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
         ToolStatus::Succeeded
     };
     match content {
+        // Only a shell command's result is what a terminal was written to: a
+        // file that was read is shown as the bytes it holds.
+        ItemContent::Command {
+            output,
+            status,
+            action: CommandAction::Run,
+            ..
+        } => {
+            *output = super::terminal_output::display(text);
+            *status = result;
+        }
         ItemContent::Command { output, status, .. } | ItemContent::Tool { output, status, .. } => {
             *output = text;
             *status = result;
@@ -5173,6 +5184,35 @@ mod tests {
                 duration_ms: None,
                 output: "3 passed".into(),
             }]
+        );
+    }
+
+    /// A shell command's result is shown without the escapes it wrote for a
+    /// terminal; a file that was read is not a terminal's output.
+    #[test]
+    fn a_bash_result_loses_its_terminal_escapes_and_a_read_file_does_not() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
+            {"type":"tool_use","id":"bash","name":"Bash","input":{"command":"cargo test"}},
+            {"type":"tool_use","id":"read","name":"Read","input":{"file_path":"palette.txt"}}
+        ]}})).unwrap();
+        let settled = adapter.receive(json!({"type":"user","uuid":"u1","message":{"id":"msg-2","content":[
+            {"type":"tool_result","tool_use_id":"bash","is_error":true,"content":"\u{1b}[1m\u{1b}[31merror\u{1b}[0m: 1 failed\n 1/2\r 2/2\n"},
+            {"type":"tool_result","tool_use_id":"read","content":"red = \u{1b}[31m\n"}
+        ]}})).unwrap();
+        let outputs = items(&settled)
+            .into_iter()
+            .map(|content| match content {
+                ItemContent::Command { output, status, .. } => (output, status),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                ("error: 1 failed\n 2/2\n".to_owned(), ToolStatus::Failed),
+                ("red = \u{1b}[31m\n".to_owned(), ToolStatus::Succeeded),
+            ]
         );
     }
 

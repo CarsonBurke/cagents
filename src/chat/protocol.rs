@@ -7,6 +7,7 @@ pub mod claude;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
+mod terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
