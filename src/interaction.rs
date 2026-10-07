@@ -1423,7 +1423,18 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 return;
             }
         }
-        if matches!(self.kind, Kind::KeyboardModal) && matches!(event, Event::Keyboard(_)) {
+        // Modifier state is not a key press: widgets beneath keep their own
+        // copy of it for the clicks and drags that follow, and would be left
+        // believing a modifier is still held.
+        if matches!(self.kind, Kind::KeyboardModal)
+            && matches!(
+                event,
+                Event::Keyboard(
+                    cosmic::iced::keyboard::Event::KeyPressed { .. }
+                        | cosmic::iced::keyboard::Event::KeyReleased { .. }
+                )
+            )
+        {
             shell.capture_event();
             return;
         }

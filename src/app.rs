@@ -4057,6 +4057,9 @@ pub enum Message {
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
+    /// The modifier holding the workspace switcher open since this instant
+    /// was released.
+    WorkspaceSwitcherReleased(Instant),
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
@@ -9324,9 +9327,6 @@ impl Cagents {
     fn workspace_switcher_key(&mut self, event: &keyboard::Event) -> Task<Message> {
         use keyboard::key::Named;
         let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
-            if let keyboard::Event::ModifiersChanged(modifiers) = event {
-                self.keyboard_modifiers = *modifiers;
-            }
             return Task::none();
         };
         match key {
@@ -9517,26 +9517,31 @@ impl Cagents {
             })
             .collect::<Vec<Element<'_, Message>>>();
         Some(crate::interaction::keyboard_modal(
-            widget::container(
-                widget::column::with_children(vec![
-                    design::heading("Switch workspace").into(),
-                    widget::container(
-                        widget::scrollable(
-                            widget::column::with_children(rows).spacing(WORKSPACE_SWITCHER_ROW_GAP),
+            crate::interaction::opaque(
+                widget::container(
+                    widget::column::with_children(vec![
+                        design::heading("Switch workspace").into(),
+                        widget::container(
+                            widget::scrollable(
+                                widget::column::with_children(rows)
+                                    .spacing(WORKSPACE_SWITCHER_ROW_GAP),
+                            )
+                            .id(widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID))
+                            .height(Length::Shrink),
                         )
-                        .id(widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID))
-                        .height(Length::Shrink),
-                    )
-                    .max_height(WORKSPACE_SWITCHER_LIST_HEIGHT)
-                    .into(),
-                    design::caption("Tab or arrows to choose · Release to open · Escape to cancel")
+                        .max_height(WORKSPACE_SWITCHER_LIST_HEIGHT)
                         .into(),
-                ])
-                .spacing(space::S),
-            )
-            .class(cosmic::theme::Container::Card)
-            .padding(space::M)
-            .width(440),
+                        design::caption(
+                            "Tab or arrows to choose · Release to open · Escape to cancel",
+                        )
+                        .into(),
+                    ])
+                    .spacing(space::S),
+                )
+                .class(cosmic::theme::Container::Card)
+                .padding(space::M)
+                .width(440),
+            ),
         ))
     }
 
@@ -12578,9 +12583,14 @@ impl Application for Cagents {
         }
         self.tab_history.observe(self.workspace.focused());
         // A workspace opened some other way while the switcher is held, by a
-        // click on one of its rows or in the sidebar, is the choice.
+        // click on one of its rows or in the sidebar, is the choice. Anything
+        // that takes the keyboard from the switcher ends it too: the release
+        // that would have closed it may never be delivered.
         if self.chrome_ui.workspace_preview.is_some()
-            && matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
+            && (matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
+                || self.update_prepared
+                || self.workspace_inputs_blocked()
+                || self.chat_ui.image_viewer.is_some())
         {
             self.cancel_workspace_preview();
         }
@@ -14494,6 +14504,13 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::WorkspaceSwitcherReleased(since) => {
+                if self.chrome_ui.workspace_preview_since == Some(since) {
+                    self.commit_workspace_preview()
+                } else {
+                    Task::none()
+                }
+            }
             Message::WorkspaceSwitcherDue(since) => {
                 if self.chrome_ui.workspace_preview_since != Some(since)
                     || self.chrome_ui.workspace_switcher_shown
@@ -14983,6 +15000,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                    self.keyboard_modifiers = *modifiers;
+                }
                 if self.chat_ui.image_viewer.is_some() {
                     if let keyboard::Event::KeyPressed { key, .. } = &event {
                         match key {
@@ -15031,10 +15051,14 @@ impl Application for Cagents {
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
-                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers) {
-                    if self.chrome_ui.workspace_preview.is_some() {
-                        return self.commit_workspace_preview();
-                    }
+                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers)
+                    && let Some(since) = self.chrome_ui.workspace_preview_since
+                {
+                    // A window losing focus is told its modifiers are released
+                    // just before it is told about the focus. Deciding one
+                    // message later lets that cancel instead of commit.
+                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                    return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
                 }
                 if self.chrome_ui.workspace_preview.is_some() {
                     return self.workspace_switcher_key(&event);
@@ -15058,9 +15082,6 @@ impl Application for Cagents {
                         return self.apply_viewport(update, true, false);
                     }
                     return Task::none();
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
                 }
                 if let Some(task) = self.palette_key_event(&event) {
                     return task;
@@ -21454,9 +21475,17 @@ mod tests {
             captured: true,
         };
         let next = |modifiers| key(Named::Tab, Code::Tab, modifiers);
-        let release = || Message::KeyEvent {
+        let released = || Message::KeyEvent {
             event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
             captured: false,
+        };
+        // The release is decided one message after it is seen.
+        let release = |app: &mut Cagents| {
+            let since = app.chrome_ui.workspace_preview_since;
+            drop(app.update(released()));
+            if let Some(since) = since {
+                drop(app.update(Message::WorkspaceSwitcherReleased(since)));
+            }
         };
         let preview = |app: &Cagents| {
             app.chrome_ui
@@ -21489,10 +21518,7 @@ mod tests {
         }));
         drop(app.update(next(alt | keyboard::Modifiers::SHIFT)));
         assert_eq!(app.active_workspace_destination(), Some(root));
-        drop(app.update(Message::KeyEvent {
-            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
-            captured: false,
-        }));
+        release(&mut app);
         assert_eq!(app.active_workspace_destination(), Some(channel));
         // Intermediate feature preview did not become more recent than root.
         drop(app.update(next(alt)));
@@ -21506,12 +21532,16 @@ mod tests {
         );
         drop(app.update(next(alt)));
         assert_eq!(preview(&app), Some(feature));
-        // Losing the window is not a choice of workspace.
+        // Losing the window is not a choice of workspace, although the seat
+        // reports the modifiers released on the way out.
         app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let since = app.chrome_ui.workspace_preview_since.unwrap();
+        drop(app.update(released()));
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
             window::Id::RESERVED,
             false,
         ))));
+        drop(app.update(Message::WorkspaceSwitcherReleased(since)));
         assert_eq!(preview(&app), None);
         assert_eq!(app.active_workspace_destination(), Some(channel));
         // Nor is Escape, and neither disturbed the visit order.
@@ -21535,7 +21565,7 @@ mod tests {
         drop(app.update(next(alt)));
         drop(app.update(next(alt)));
         assert_eq!(preview(&app), Some(feature));
-        drop(app.update(release()));
+        release(&mut app);
         assert_eq!(preview(&app), None);
         assert_eq!(app.active_workspace_destination(), Some(feature));
         // A workspace opened by a click during the hold is the choice, and the
@@ -21545,7 +21575,7 @@ mod tests {
         drop(app.update(Message::Sidebar(destinations[1].clone())));
         assert_eq!(preview(&app), None);
         assert_eq!(app.active_workspace_destination(), Some(root));
-        drop(app.update(release()));
+        release(&mut app);
         assert_eq!(app.active_workspace_destination(), Some(root));
         app.settings_reset_confirm = true;
         drop(app.update(next(alt)));
