@@ -585,3 +585,86 @@ fn staged_native_ui_owner_fixture() {
         );
     }
 }
+
+#[test]
+fn sealed_anonymous_update_probe_does_not_require_installed_routing() {
+    use std::os::fd::FromRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    for sealed in [false, true] {
+        let anonymous = if sealed {
+            let fd = unsafe {
+                libc::memfd_create(
+                    c"cagents-update-probe".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            assert_ne!(fd, -1);
+            unsafe { File::from_raw_fd(fd) }
+        } else {
+            let path = root.path().join("unlinked-update-probe");
+            let file = file(&path);
+            fs::remove_file(path).unwrap();
+            file
+        };
+        let mut source = File::open(env!("CARGO_BIN_EXE_cagents")).unwrap();
+        std::io::copy(&mut source, &mut &anonymous).unwrap();
+        fs::set_permissions(
+            format!("/proc/self/fd/{}", anonymous.as_raw_fd()),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        if sealed {
+            assert_eq!(
+                unsafe {
+                    libc::fcntl(
+                        anonymous.as_raw_fd(),
+                        libc::F_ADD_SEALS,
+                        libc::F_SEAL_WRITE
+                            | libc::F_SEAL_SHRINK
+                            | libc::F_SEAL_GROW
+                            | libc::F_SEAL_SEAL,
+                    )
+                },
+                0
+            );
+        }
+        // A regular executable cannot remain open for writing during exec.
+        // Preserve its unlinked inode through a read-only descriptor instead.
+        let anonymous = if sealed {
+            anonymous
+        } else {
+            let readable = File::open(format!("/proc/self/fd/{}", anonymous.as_raw_fd())).unwrap();
+            drop(anonymous);
+            readable
+        };
+        let fd = anonymous.as_raw_fd();
+        let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+        command
+            .args(["--json", "daemon", "status"])
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_RUNTIME_DIR", &runtime);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "anonymous probe sealed={sealed}: {output:?}"
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["command"], "daemon.status");
+        assert_eq!(response["data"]["running"], false);
+    }
+}

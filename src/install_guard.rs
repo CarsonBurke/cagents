@@ -367,12 +367,21 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
 /// to stop a daemon, close windows or replace an installation.
 pub(crate) fn staged_owner_bin(executable: &Path) -> io::Result<Option<std::path::PathBuf>> {
     use std::os::unix::fs::OpenOptionsExt;
-    let Some(version_root) = executable
-        .canonicalize()?
+    // Sealed update probes execute from anonymous FDs. Their kernel exe path
+    // has no filesystem entry to canonicalize and carries no install routing.
+    // Only an installed version shape can have our private ownership marker;
+    // locate() authenticates that tree after a marker has actually been found.
+    let Some(bin) = executable
         .parent()
-        .and_then(Path::parent)
-        .map(Path::to_owned)
+        .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))
     else {
+        return Ok(None);
+    };
+    let Some(version_root) = bin.parent().filter(|root| {
+        root.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "versions")
+    }) else {
         return Ok(None);
     };
     let marker = version_root.join(STAGED_OWNER);
