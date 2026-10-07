@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::state::{ClientId, HostState, SharedHost};
+use super::state::{ClientId, HostLock, SharedHost};
 use crate::{
     model::TerminalId,
     notifications::{Event, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
@@ -252,7 +252,7 @@ impl Drop for Broker {
     }
 }
 
-fn publish(shared: &Weak<Shared>, host: &Weak<Mutex<HostState>>, snapshot: Snapshot) {
+fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
     if let Some(shared) = shared.upgrade() {
         let mut current = shared.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         if *current == snapshot {
@@ -1003,7 +1003,7 @@ mod tests {
 
 async fn run(
     shared: Weak<Shared>,
-    host: Weak<Mutex<HostState>>,
+    host: Weak<HostLock>,
     mut receiver: mpsc::Receiver<()>,
     application: crate::notifications::Application,
 ) {

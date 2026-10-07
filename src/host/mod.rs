@@ -5,6 +5,7 @@ mod chat;
 mod client;
 mod delivery;
 pub(crate) mod descriptor_limit;
+mod lock;
 mod model;
 mod notifications;
 mod state;
@@ -15,7 +16,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -183,7 +184,7 @@ pub fn run() -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
-    let host: SharedHost = Arc::new(Mutex::new(HostState::new(proof)));
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .enable_holder_recovery();
@@ -250,6 +251,16 @@ pub fn run() -> Result<(), HostError> {
         Ok(courier) => Some(courier),
         Err(error) => {
             tracing::warn!(%error, "messages between sessions are unavailable");
+            None
+        }
+    };
+
+    // Restoring a checkpoint above may hold the host for as long as its
+    // inventory takes; from here on a hold that long is a deadlock.
+    let stall_watch = match host.watch(lock::STALL_LIMIT) {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            tracing::warn!(%error, "a wedged host mutex will not be detected");
             None
         }
     };
@@ -334,6 +345,8 @@ pub fn run() -> Result<(), HostError> {
     }
 
     tracing::info!("cagents daemon is shutting down");
+    // Shutdown waits on providers and holders by design.
+    drop(stall_watch);
     // Stop deadline acceptance before snapshotting/tearing down provider
     // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
     drop(automation_broker);
@@ -432,11 +445,13 @@ mod tests {
     #[test]
     fn a_refused_client_reads_a_capacity_error_before_the_socket_closes() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let host: SharedHost = Arc::new(Mutex::new(HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("session"),
-            boot_id: crate::model::BootId::new("boot"),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        })));
+        let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("session"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+        )));
         let capacity = ClientCapacity::new(1);
         let _permit = capacity.try_acquire().unwrap();
         assert!(capacity.try_acquire().is_none());

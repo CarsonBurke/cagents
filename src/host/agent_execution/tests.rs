@@ -836,7 +836,11 @@ fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
         prompt: "Read the owned fixture".into(),
         idempotency_key: "first".into(),
     };
-    (Arc::new(Mutex::new(state)), request, path)
+    (
+        Arc::new(crate::host::state::HostLock::new(state)),
+        request,
+        path,
+    )
 }
 
 fn settled(host: &SharedHost, run: RunId) -> Run {

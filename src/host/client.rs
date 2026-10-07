@@ -1283,7 +1283,6 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
-    use std::sync::Mutex;
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {
@@ -1295,7 +1294,9 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("incarnation"),
         };
-        let host = Arc::new(Mutex::new(super::super::state::HostState::new(proof)));
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof),
+        ));
         let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
         recipe.program = "/bin/cat".into();
         recipe.arguments.clear();
@@ -1413,9 +1414,9 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("incarnation"),
         };
-        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
-            proof.clone(),
-        )));
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof.clone()),
+        ));
         let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
         recipe.program = "/bin/true".into();
         recipe.arguments.clear();
@@ -1590,9 +1591,9 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("incarnation"),
         };
-        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
-            proof.clone(),
-        )));
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof.clone()),
+        ));
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),
             program: "/bin/cat".into(),
@@ -1840,9 +1841,9 @@ mod tests {
             boot_id: crate::model::BootId::new("slow-probe"),
             host_incarnation: crate::model::HostIncarnation::new("slow-probe"),
         };
-        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
-            proof.clone(),
-        )));
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof.clone()),
+        ));
         let (mut stream, server_stream) = UnixStream::pair().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -2060,9 +2061,9 @@ mod tests {
             boot_id: crate::model::BootId::new("test"),
             host_incarnation: crate::model::HostIncarnation::new("test"),
         };
-        let host = Arc::new(std::sync::Mutex::new(super::super::state::HostState::new(
-            proof,
-        )));
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof),
+        ));
         let error = process_request(
             &host,
             1,
@@ -2122,13 +2123,13 @@ mod tests {
             },
         };
         let terminal_id = session.id;
-        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
-            HostSessionProof {
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
                 host_session_id: HostSessionId::new("announce-session"),
                 boot_id: BootId::new("boot"),
                 host_incarnation: HostIncarnation::new("incarnation"),
-            },
-        )));
+            }),
+        ));
         let (creator, observer, unsubscribed) = {
             let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let creator = state.register_client(1);
@@ -2200,13 +2201,13 @@ mod tests {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
 
         let directory = tempfile::tempdir().unwrap();
-        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
-            HostSessionProof {
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
                 host_session_id: HostSessionId::new("model-session"),
                 boot_id: BootId::new("boot"),
                 host_incarnation: HostIncarnation::new("incarnation"),
-            },
-        )));
+            }),
+        ));
         let (editor, watcher, unsubscribed) = {
             let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.install_model(

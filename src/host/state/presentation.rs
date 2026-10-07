@@ -350,7 +350,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.snapshot().scroll.total >= 101);
-        (Arc::new(Mutex::new(state)), handle, id, directory)
+        (
+            Arc::new(crate::host::state::HostLock::new(state)),
+            handle,
+            id,
+            directory,
+        )
     }
     #[test]
     fn scrolling_one_client_does_not_move_another_or_the_parser_viewport() {
