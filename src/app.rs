@@ -6843,6 +6843,29 @@ impl Cagents {
         cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
     }
 
+    /// Keeps the saved focus on a pane the window still holds open.
+    ///
+    /// The saved focus mirrors the strip's, and [`Self::apply_viewport`] is
+    /// what carries one to the other. A pane can stop being open with no
+    /// viewport update to carry the handoff - another client closes it, its
+    /// project is removed - and storage refuses a workspace that focuses a
+    /// pane it does not hold open, which sets the whole window aside. So every
+    /// snapshot is settled here before it is taken. The strip is asked again
+    /// rather than trusted: it can still show a pane whose close it could not
+    /// take, and that pane is no more open for being on screen.
+    fn settle_focus(&mut self) {
+        if self.durable.focused.is_none() || self.durable.focused_index().is_some() {
+            return;
+        }
+        let focused = self.workspace.focused().filter(|id| {
+            self.durable
+                .cards
+                .iter()
+                .any(|card| card.id == *id && card.existence.is_open())
+        });
+        Arc::make_mut(&mut self.durable).focused = focused;
+    }
+
     fn persist(&mut self) {
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -23470,6 +23493,45 @@ mod tests {
         assert!(app.focus_save_pending);
         let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
         assert!(!app.focus_save_pending);
+    }
+
+    /// Every snapshot handed to the session writer is one storage accepts,
+    /// whichever path stopped a pane being open and whatever it left the strip
+    /// showing.
+    #[test]
+    fn a_snapshot_never_focuses_a_pane_the_window_no_longer_holds_open() {
+        let closed = || Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed fixture".into()),
+            },
+        };
+        let mut app = context_inspector_test_app(true);
+        let first_id = app.durable.focused.unwrap();
+        let second = terminal_card_state();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        let update = app.workspace.focus(second_id).unwrap();
+        let _ = app.apply_viewport(update, false, false);
+        assert_eq!(app.durable.focused, Some(second_id));
+
+        // The strip closes the focused pane and its update goes unapplied.
+        app.workspace.request_close(second_id).unwrap();
+        app.workspace.commit_close(second_id).unwrap();
+        Arc::make_mut(&mut app.durable).cards[1].existence = closed();
+        let saved = app.persistent_workspace();
+        crate::persistence::validate_workspace(&saved).unwrap();
+        assert_eq!(saved.focused, Some(first_id));
+        assert_eq!(app.durable.focused, Some(first_id));
+
+        // The strip still shows a pane the window no longer holds open.
+        Arc::make_mut(&mut app.durable).cards[0].existence = closed();
+        assert_eq!(app.workspace.focused(), Some(first_id));
+        let saved = app.persistent_workspace();
+        crate::persistence::validate_workspace(&saved).unwrap();
+        assert_eq!(saved.focused, None);
     }
 
     #[test]
