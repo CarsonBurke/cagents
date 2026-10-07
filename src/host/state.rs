@@ -1789,14 +1789,19 @@ fn prepare_upgrade_with_carry_policy(
             .collect::<Result<Vec<_>, ProtocolError>>()?;
         let mut chats = Vec::new();
         let mut paired_codex = BTreeMap::new();
-        for record in state
+        for (&id, record) in state
             .chats
-            .values()
-            .filter(|record| record.handle.owns_work())
+            .iter()
+            .filter(|(_, record)| record.handle.owns_work())
         {
+            // Nothing of an ended provider is left to checkpoint: its window
+            // restarts the saved conversation, as after any daemon restart.
+            if state.provider_ended(id, record) {
+                continue;
+            }
             if record.handle.is_completed() {
                 return Err(upgrade_error(
-                    "A native provider has unconfirmed work after a failed close; resolve that provider before upgrading",
+                    "A native provider stopped but may still hold unconfirmed work; close its conversation before upgrading",
                 ));
             }
             let mut source = record.session.clone();
@@ -4493,6 +4498,162 @@ mod tests {
             handle.close_checked(true),
             crate::terminal_ipc::TerminalCloseResult::Closed
         );
+    }
+
+    /// The real CLI names its session only on the frames of a turn, and a
+    /// provider can stop on its own. Neither an idle resumed conversation nor
+    /// one that already ended may hold an update hostage.
+    #[test]
+    fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
+        use crate::{
+            agent::Provider,
+            chat::{Command, Launch, Session},
+            model::LaunchRecipe,
+            terminal_ipc::ClientRequest,
+            update::impact::{Disposition, Policy},
+            upgrade::handoff::Store,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        const IDLE: &str = "12345678-1234-4234-8234-123456789abc";
+        const ENDED: &str = "98765432-1234-4234-8234-123456789abc";
+        const OTHER: &str = "aaaaaaaa-1234-4234-8234-123456789abc";
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let executable = cwd.join("claude");
+        // Silent until asked, like the CLI. An interrupt makes it claim a
+        // different conversation, which the adapter refuses as a failure.
+        fs::write(&executable, r#"#!/usr/bin/env python3
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["request"]["subtype"] == "interrupt":
+        print(json.dumps({"type": "system", "subtype": "init", "session_id": os.environ["OTHER_SESSION"]}), flush=True)
+    print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"], "response": {}}}), flush=True)
+"#).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = cwd.join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history = config.join("projects").join(project);
+        fs::create_dir_all(&history).unwrap();
+        for id in [IDLE, ENDED] {
+            fs::write(history.join(format!("{id}.jsonl")), "").unwrap();
+        }
+        let host = Arc::new(Mutex::new(test_host()));
+        let start = |id: &str| {
+            let session = Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: TerminalId::new(),
+                launch: Launch {
+                    provider: Provider::Claude,
+                    recipe: LaunchRecipe {
+                        unset_environment: Default::default(),
+                        program: executable.to_string_lossy().into_owned(),
+                        arguments: vec!["--resume".into(), id.into()],
+                        working_directory: cwd.clone(),
+                        environment: BTreeMap::from([
+                            (
+                                "CLAUDE_CONFIG_DIR".into(),
+                                config.to_string_lossy().into_owned(),
+                            ),
+                            ("OTHER_SESSION".into(), OTHER.into()),
+                        ]),
+                    },
+                    session_id: Some(id.into()),
+                },
+                proof: Some(
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .proof()
+                        .clone(),
+                ),
+                terminal: None,
+            };
+            super::super::chat::process(
+                &host,
+                1,
+                ClientRequest::ChatStart {
+                    session: session.clone(),
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                },
+            )
+            .unwrap();
+            let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&session.id]
+                .handle
+                .clone();
+            (session, handle)
+        };
+        let wait = |condition: &dyn Fn() -> bool, failure: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < deadline, "{failure}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let (idle, idle_handle) = start(IDLE);
+        let (ended, ended_handle) = start(ENDED);
+        for (handle, id) in [(&idle_handle, IDLE), (&ended_handle, ENDED)] {
+            wait(
+                &|| handle.confirmed_session_id().as_deref() == Some(id),
+                "an idle resumed conversation was never confirmed",
+            );
+        }
+        ended_handle.command(Command::Interrupt).unwrap();
+        wait(
+            &|| ended_handle.is_completed() && ended_handle.failure().is_some(),
+            "the provider did not end with a failure",
+        );
+        assert!(ended_handle.owns_work());
+
+        let impact = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upgrade_impact(Policy::WhenIdle)
+            .unwrap();
+        for session in &impact.sessions {
+            assert_eq!(
+                session.disposition,
+                Disposition::Resumes,
+                "{}",
+                session.reason
+            );
+        }
+        assert_eq!(impact.sessions.len(), 2);
+        assert!(impact.ready());
+        // The confirmed path fences live actors; one that stopped has none.
+        assert!(
+            update::inspect(&host, Policy::WhenIdle, true)
+                .unwrap()
+                .ready()
+        );
+
+        let store = Store::open(&cwd.join("checkpoint")).unwrap();
+        prepare_upgrade_with(&host, impact.capability, || Ok(store)).unwrap();
+        finish_upgrade(&host).unwrap();
+        let store = Store::open(&cwd.join("checkpoint")).unwrap();
+        let saved = store.load().unwrap().unwrap();
+        saved.require_ready().unwrap();
+        // Only the live conversation is the successor's to restart; the
+        // window reopens the ended one from its saved descriptor.
+        assert_eq!(saved.chats.len(), 1);
+        assert_eq!(saved.chats[0].source, idle);
+        let empty_proc = cwd.join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        let replacement = Arc::new(Mutex::new(test_host_with_incarnation(
+            "replacement-incarnation",
+        )));
+        // Restoring waits for the provider's confirmation, with no prompt.
+        restore_upgrade_from(&replacement, store, &empty_proc, None).unwrap();
+        let restored = super::super::chat::resolve_upgrade(&replacement, &idle).unwrap();
+        assert_eq!(restored.launch.session_id.as_deref(), Some(IDLE));
+        assert!(super::super::chat::resolve_upgrade(&replacement, &ended).is_err());
     }
 
     #[test]

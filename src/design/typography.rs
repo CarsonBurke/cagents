@@ -65,15 +65,28 @@ pub fn caption<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
 
 /// Body text at medium weight: a pane's heading, a row's name, a button's label.
 pub fn heading<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
-    body(text).size(TEXT_HEADING).font(weighted(Weight::Medium))
+    body(text).size(TEXT_HEADING).font(heading_font())
+}
+
+/// The face of [`heading`], for a widget that cannot be built from it.
+pub fn heading_font() -> Font {
+    weighted(Weight::Medium)
 }
 
 /// The name of a dialog, a form or a section of a page.
 pub fn title<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
         .size(TEXT_TITLE)
-        .line_height(LineHeight::Absolute(22.0.into()))
-        .font(weighted(Weight::Bold))
+        .line_height(LineHeight::Absolute(LINE_TITLE.into()))
+        .font(title_font())
+}
+
+/// The line box title-sized text sits in.
+pub const LINE_TITLE: f32 = 22.0;
+
+/// The face of [`title`], for a widget that cannot be built from it.
+pub fn title_font() -> Font {
+    weighted(Weight::Bold)
 }
 
 /// The name of a whole page or an otherwise empty pane.

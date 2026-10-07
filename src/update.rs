@@ -533,14 +533,14 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                 );
                 if let Some(daemon) = &confirmation.preview.daemon {
                     for session in &daemon.sessions {
-                        eprintln!("  {}: {}", session.title, session.reason);
+                        eprintln!(
+                            "  {} ({}): {}",
+                            session.title,
+                            session.disposition.label(),
+                            session.reason
+                        );
                     }
-                    if !daemon.blockers.is_empty()
-                        || daemon
-                            .sessions
-                            .iter()
-                            .any(|session| session.disposition == impact::Disposition::Blocked)
-                    {
+                    if daemon.blocked() {
                         for blocker in &daemon.blockers {
                             eprintln!("  {blocker}");
                         }
