@@ -12257,6 +12257,10 @@ impl Application for Cagents {
             settings_warnings,
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
+        let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
+        if let Some(session) = &session {
+            session.save_worktrees(retired);
+        }
         let window_view = startup.window_view;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
@@ -12279,9 +12283,7 @@ impl Application for Cagents {
                     worktrees
                         .iter()
                         .filter(|worktree| {
-                            worktree.project_id == project.id
-                                && worktree.existence.is_open()
-                                && worktree_ui::worktree_directory_available(&worktree.path)
+                            worktree.project_id == project.id && worktree.existence.is_open()
                         })
                         .map(|worktree| {
                             SidebarWorktree::from_durable(
@@ -13057,19 +13059,11 @@ impl Application for Cagents {
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
                             session.save_worktrees(loaded.worktrees.iter().map(|(record, _)| {
-                                WorktreeState {
-                                    id: record.id,
-                                    project_id: loaded.project.id,
-                                    generation: 0,
-                                    path: record.path.clone(),
-                                    branch: record.branch.as_deref().map(|branch| {
-                                        branch
-                                            .strip_prefix("refs/heads/")
-                                            .unwrap_or(branch)
-                                            .to_owned()
-                                    }),
-                                    existence: Existence::Open,
-                                }
+                                worktree_ui::worktree_state(
+                                    loaded.project.id,
+                                    record,
+                                    Existence::Open,
+                                )
                             }));
                         }
                         let worktrees = loaded

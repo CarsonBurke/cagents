@@ -62,6 +62,17 @@ impl State {
         self.configure();
     }
 
+    /// Take a worktree the application deleted out of the last listing, so its
+    /// absence from the next one is not read as a removal made elsewhere.
+    pub(super) fn forget_worktree(&mut self, project: ProjectId, worktree: WorktreeId) {
+        if let Some(entry) = self.entries.get_mut(&project) {
+            entry
+                .snapshot
+                .worktrees
+                .retain(|(record, _)| record.id != worktree);
+        }
+    }
+
     fn configure(&self) {
         if let Some(monitor) = &self.monitor {
             monitor.configure(
@@ -129,10 +140,19 @@ impl Cagents {
         };
         let project = loaded.project.id;
         let state = &mut self.refresh_ui.git;
-        if let Some(old) = state.entries.remove(&project)
-            && let Some(cancel) = old.cancellation
-        {
-            cancel.cancel();
+        if let Some(old) = state.entries.remove(&project) {
+            if let Some(cancel) = &old.cancellation {
+                cancel.cancel();
+            }
+            // A reload replaces the listing wholesale, so what it dropped is
+            // settled here rather than by the read that follows it.
+            if let Some(session) = &self.session {
+                session.save_worktrees(records_removed_outside(
+                    project,
+                    &old.snapshot,
+                    &loaded.worktrees,
+                ));
+            }
         }
         let failure = if state.monitor.is_none() {
             match git_watch::Monitor::start() {
@@ -351,7 +371,9 @@ impl Cagents {
                         if entry.read_full_scan {
                             entry.read_failure = None;
                         }
-                        entry.snapshot = snapshot.clone();
+                        let previous = std::mem::replace(&mut entry.snapshot, snapshot.clone());
+                        let removed =
+                            records_removed_outside(project, &previous, &snapshot.worktrees);
                         let reconfigure = plan.is_some();
                         let archived = entry.archived.clone();
                         if let Some(plan) = plan {
@@ -384,21 +406,11 @@ impl Cagents {
                             );
                         }
                         if let Some(session) = &self.session {
-                            session.save_worktrees(snapshot.worktrees.iter().map(|(record, _)| {
-                                WorktreeState {
-                                    id: record.id,
-                                    project_id: project,
-                                    generation: 0,
-                                    path: record.path.clone(),
-                                    branch: record.branch.as_deref().map(|branch| {
-                                        branch
-                                            .strip_prefix("refs/heads/")
-                                            .unwrap_or(branch)
-                                            .to_owned()
-                                    }),
-                                    existence: Existence::Open,
-                                }
-                            }));
+                            session.save_worktrees(removed.into_iter().chain(
+                                snapshot.worktrees.iter().map(|(record, _)| {
+                                    worktree_ui::worktree_state(project, record, Existence::Open)
+                                }),
+                            ));
                         }
                         if reconfigure {
                             self.refresh_ui.git.configure();
@@ -494,7 +506,7 @@ fn read_local_with_plan(
             .list_worktrees(&snapshot.repository.common_dir, &cancellation)
             .map_err(|error| error.to_string())?
             .into_iter()
-            .filter(|record| record.bare || record.path.is_dir())
+            .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
             .map(|record| (record, None))
             .collect();
     }
@@ -579,6 +591,24 @@ fn checkout_removed(root: &Path) -> bool {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
         )
     })
+}
+
+/// The records to close for worktrees Git listed in `previous` and no longer
+/// does. One the application deleted has already left the snapshot, so its own
+/// tombstone stands.
+fn records_removed_outside(
+    project: ProjectId,
+    previous: &Snapshot,
+    listed: &[(WorktreeRecord, Option<StatusSnapshot>)],
+) -> Vec<WorktreeState> {
+    previous
+        .worktrees
+        .iter()
+        .filter(|(old, _)| !listed.iter().any(|(new, _)| new.id == old.id))
+        .map(|(record, _)| {
+            worktree_ui::worktree_state(project, record, worktree_ui::removed_outside())
+        })
+        .collect()
 }
 
 fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
@@ -870,6 +900,71 @@ mod tests {
             Some(sidebar::RowDeletion::Deleting)
         );
         assert_eq!(project.worktrees[0].branch.as_deref(), Some("changed"));
+    }
+
+    #[test]
+    fn a_worktree_gone_from_the_listing_is_closed_unless_the_application_deleted_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let snapshot = fixture(&first);
+        for name in ["outside", "inside"] {
+            let path = directory.path().join(name);
+            git(
+                &first,
+                &["worktree", "add", "-b", name, path.to_str().unwrap()],
+            );
+        }
+        let project = ProjectId::new();
+        let read = |snapshot| {
+            read_local(
+                project,
+                snapshot,
+                git_watch::Change {
+                    topology: true,
+                    ..Default::default()
+                },
+                CancellationToken::default(),
+            )
+            .unwrap()
+            .0
+        };
+        let previous = read(snapshot);
+        let inside = previous
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path.ends_with("inside"))
+            .unwrap()
+            .0
+            .id;
+        let mut state = State::default();
+        state.entries.insert(
+            project,
+            Entry {
+                snapshot: previous.clone(),
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                read_failure: None,
+                read_full_scan: false,
+                pending: Default::default(),
+                fallback: None,
+                last_full_scan: Instant::now(),
+            },
+        );
+        for name in ["outside", "inside"] {
+            git(&first, &["worktree", "remove", "--force", name]);
+        }
+        state.forget_worktree(project, inside);
+        let listed = read(previous).worktrees;
+        assert_eq!(listed.len(), 1);
+        let closed = records_removed_outside(project, &state.entries[&project].snapshot, &listed);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].project_id, project);
+        assert_eq!(closed[0].path, directory.path().join("outside"));
+        assert_eq!(closed[0].branch.as_deref(), Some("outside"));
+        assert!(!closed[0].existence.is_open());
     }
 
     #[test]
