@@ -172,6 +172,8 @@ impl Blocks {
         // Outside a fence the white space ending a line means nothing until
         // something follows it, and what follows decides what the line is.
         let text = if complete { text } else { text.trim_end() };
+        // The quote's own marker may have ended with the space just set aside.
+        let quoted = quoted.min(text.len());
         if text.trim().is_empty() {
             if !complete {
                 return;
@@ -612,6 +614,7 @@ mod tests {
         "1. One\n\n   ```sh\n   echo <x>\n   ```\n\n       not fenced\n\n2. Two <kbd>k</kbd>\n\nλ → <é>\r\n---\r\ntext\r\n",
         "<details>\n<summary>S</summary>\n\nbody\n</details>\n\ntrailing <br",
         "a `code <x>\nstill` b <y>\n\n  \n   \n    late\n",
+        "> quoted <b>\n> \n> - item <c>\n>\n> ```\n> <code>\n> ```\n> \n\nafter <d>\n",
     ];
 
     /// However an answer is cut into deltas, the parser ends up holding the
