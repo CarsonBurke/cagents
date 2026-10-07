@@ -349,9 +349,8 @@ mod tests {
             app.card_state(editor).unwrap().width_fraction,
             app.settings.default_native_pane_fraction
         );
-        assert_ne!(
-            app.workspace.visibility(editor),
-            Some(VisibilityClass::Visible),
+        assert!(
+            app.workspace.is_animating(),
             "exercise reuse before the focused editor's reveal animation finishes"
         );
 

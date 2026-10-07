@@ -797,6 +797,7 @@ where
                         id: card.id,
                         x: mounted.start,
                         width: mounted.width,
+                        content_width: mounted.content_width,
                         content: CardSurface::new(content)
                             .traced_by(input)
                             .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
@@ -1196,7 +1197,35 @@ struct VirtualCard<'a, Message> {
     id: CardId,
     x: f32,
     width: f32,
+    content_width: f32,
     content: Element<'a, Message>,
+}
+
+impl<Message> VirtualCard<'_, Message> {
+    /// The part of `viewport` this card may draw in and take pointer input
+    /// from. An opening card is laid out wider than its slot, and what lies
+    /// past the slot's edge belongs to its neighbour.
+    fn viewport(&self, bounds: Rectangle, viewport: &Rectangle) -> Rectangle {
+        if self.content_width <= self.width {
+            return *viewport;
+        }
+        let slot = Rectangle {
+            width: self.width,
+            ..bounds
+        };
+        slot.intersection(viewport)
+            .unwrap_or(Rectangle::new(slot.position(), Size::ZERO))
+    }
+
+    /// The pointer as this card may see it. Widgets test the pointer against
+    /// their own bounds, which for an opening card reach under its neighbour.
+    fn cursor(&self, viewport: &Rectangle, cursor: mouse::Cursor) -> mouse::Cursor {
+        if self.content_width <= self.width || cursor.is_over(*viewport) {
+            cursor
+        } else {
+            mouse::Cursor::Unavailable
+        }
+    }
 }
 
 struct VirtualStrip<'a, Message> {
@@ -1330,7 +1359,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             .iter_mut()
             .zip(&mut tree.children)
             .map(|(card, state)| {
-                let child_size = Size::new(card.width, size.height);
+                let child_size = Size::new(card.content_width, size.height);
                 let child_limits = layout::Limits::new(child_size, child_size);
                 card.content
                     .as_widget_mut()
@@ -1383,6 +1412,8 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             .zip(&mut tree.children)
             .zip(layout.children())
         {
+            let viewport = &card.viewport(child_layout.bounds(), viewport);
+            let cursor = card.cursor(viewport, cursor);
             if child_layout.bounds().intersects(viewport)
                 || matches!(
                     event,
@@ -1428,20 +1459,21 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             .iter()
             .zip(&tree.children)
             .zip(layout.children())
-            .filter(|(_, child_layout)| {
+            .filter_map(|((card, state), child_layout)| {
+                let viewport = card.viewport(child_layout.bounds(), viewport);
                 child_layout
                     .bounds()
-                    .intersection(viewport)
+                    .intersection(&viewport)
                     .is_some_and(|visible| cursor.is_over(visible))
-            })
-            .map(|((card, state), child_layout)| {
-                card.content.as_widget().mouse_interaction(
-                    state,
-                    child_layout.with_virtual_offset(layout.virtual_offset()),
-                    cursor,
-                    viewport,
-                    renderer,
-                )
+                    .then(|| {
+                        card.content.as_widget().mouse_interaction(
+                            state,
+                            child_layout.with_virtual_offset(layout.virtual_offset()),
+                            cursor,
+                            &viewport,
+                            renderer,
+                        )
+                    })
             })
             .max()
             .unwrap_or_default()
@@ -1460,13 +1492,13 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         let Some(clipped_viewport) = layout.bounds().intersection(viewport) else {
             return;
         };
-        for ((card, state), child_layout) in self
-            .cards
-            .iter()
-            .zip(&tree.children)
-            .zip(layout.children())
-            .filter(|(_, child_layout)| child_layout.bounds().intersects(&clipped_viewport))
+        for ((card, state), child_layout) in
+            self.cards.iter().zip(&tree.children).zip(layout.children())
         {
+            let viewport = card.viewport(child_layout.bounds(), &clipped_viewport);
+            if !child_layout.bounds().intersects(&viewport) {
+                continue;
+            }
             card.content.as_widget().draw(
                 state,
                 renderer,
@@ -1474,7 +1506,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
                 style,
                 child_layout.with_virtual_offset(layout.virtual_offset()),
                 cursor,
-                &clipped_viewport,
+                &viewport,
             );
         }
     }
@@ -2348,6 +2380,7 @@ mod tests {
                     id: ids[index],
                     x: 0.0,
                     width: 320.0,
+                    content_width: 320.0,
                     content: cosmic::widget::id_container(
                         child,
                         widget::Id::new(format!("parked-card-{index}")),
@@ -2420,6 +2453,50 @@ mod tests {
                 .all(|mounted| mounted.visibility.is_mounted())
         );
     }
+    #[test]
+    fn an_opening_card_draws_and_takes_the_pointer_only_inside_its_slot() {
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(900.0, 600.0));
+        let card = |width, content_width| VirtualCard::<()> {
+            id: CardId::new(),
+            x: 300.0,
+            width,
+            content_width,
+            content: widget::Space::new().into(),
+        };
+        let bounds = |card: &VirtualCard<'_, ()>| {
+            Rectangle::new(
+                Point::new(card.x, 0.0),
+                Size::new(card.content_width, 600.0),
+            )
+        };
+        let inside = mouse::Cursor::Available(Point::new(320.0, 50.0));
+        let beside = mouse::Cursor::Available(Point::new(420.0, 50.0));
+
+        let opening = card(60.0, 300.0);
+        let slot = opening.viewport(bounds(&opening), &viewport);
+        assert_eq!(
+            slot,
+            Rectangle::new(Point::new(300.0, 0.0), Size::new(60.0, 600.0))
+        );
+        assert_eq!(opening.cursor(&slot, inside), inside);
+        // Its contents reach under the neighbour there, which owns the pointer.
+        assert!(beside.is_over(bounds(&opening)));
+        assert_eq!(opening.cursor(&slot, beside), mouse::Cursor::Unavailable);
+
+        // A slot past the viewport's edge shows and receives nothing.
+        let hidden = Rectangle::new(Point::ORIGIN, Size::new(250.0, 600.0));
+        let slot = opening.viewport(bounds(&opening), &hidden);
+        assert!(!bounds(&opening).intersects(&slot));
+        assert_eq!(opening.cursor(&slot, inside), mouse::Cursor::Unavailable);
+
+        // A settled card keeps the strip's viewport and every pointer event,
+        // including the moves and releases that end a drag outside it.
+        let settled = card(300.0, 300.0);
+        assert_eq!(settled.viewport(bounds(&settled), &viewport), viewport);
+        let outside = mouse::Cursor::Available(Point::new(10.0, 50.0));
+        assert_eq!(settled.cursor(&viewport, outside), outside);
+    }
+
     #[test]
     fn mounted_column_layout_and_clips_are_pairwise_disjoint() {
         let mut workspace = Workspace::default();
@@ -3371,6 +3448,7 @@ mod tests {
                 id,
                 x: 0.0,
                 width: 100.0,
+                content_width: 100.0,
                 content: Element::new(AccessibleProbe {
                     node,
                     expected_virtual_offset: Vector::ZERO,
@@ -3439,6 +3517,7 @@ mod tests {
                     id,
                     x: index as f32 * 100.0,
                     width: 100.0,
+                    content_width: 100.0,
                     content: CardSurface::new(Element::new(AccessibleProbe {
                         node: index as u64 + 1,
                         expected_virtual_offset: Vector::new(32.0, 0.0),
@@ -3479,7 +3558,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_card_contents_are_not_built_until_their_space_is_ready() {
+    fn opening_card_contents_are_built_before_their_space_is_ready() {
         let mut workspace = Workspace::default();
         workspace.resize_viewport(900.0);
         let first = CardId::new();
@@ -3520,10 +3599,8 @@ mod tests {
             drop(element);
             built.take()
         };
-        assert_eq!(render(&workspace), [first]);
-        workspace.tick(Duration::from_millis(219));
-        assert_eq!(render(&workspace), [first]);
-        workspace.tick(Duration::from_millis(1));
+        assert_eq!(render(&workspace), [first, opening]);
+        workspace.tick(Duration::from_millis(220));
         assert_eq!(render(&workspace), [first, opening]);
     }
 

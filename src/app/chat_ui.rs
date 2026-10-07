@@ -3839,6 +3839,7 @@ impl Cagents {
             Some((source, (index + 1, durable + 1)))
         });
         let card_id = CardId::new();
+        tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
         if let Some(source) = draft_from
