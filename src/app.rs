@@ -8092,6 +8092,7 @@ impl Cagents {
                     }
                 }
                 LifecycleAction::Hydrate { card, epoch } => {
+                    tracing::debug!(target: "cagents::lifecycle", action = "hydrate", ?card);
                     if let Some(state) = self.card_state_mut(card) {
                         state.residency = Residency::Hydrating { epoch };
                     }
@@ -8196,6 +8197,7 @@ impl Cagents {
                     }
                 }
                 LifecycleAction::Hibernate { card, epoch } => {
+                    tracing::debug!(target: "cagents::lifecycle", action = "hibernate", ?card);
                     let result = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
                             handle.hibernate().map_err(|error| error.to_string())

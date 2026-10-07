@@ -34,8 +34,9 @@ struct RuntimeCard {
     /// When the card was last known to be on screen: stamped by every sweep
     /// that finds it there, and once more by the sweep that sees it leave.
     last_visible: Instant,
-    /// On screen or beside it only because the camera crossed it on its way
-    /// somewhere else, which is not a use of it and leaves `last_visible` be.
+    /// Came on screen or beside it while the camera was on its way somewhere
+    /// else and has not been stopped at since, which is not a use of it and
+    /// leaves `last_visible` be.
     crossed: bool,
     epoch: u64,
 }
@@ -184,11 +185,12 @@ impl LifecycleManager {
                 continue;
             };
             self.exposed.insert(card);
-            if next_exposure == Exposure::Visible && passing.contains(&card) {
-                runtime.crossed |= runtime.exposure != Exposure::Visible;
-            } else if next_exposure == Exposure::Visible || passing.is_empty() {
-                // The camera stopped on it or beside it.
+            let arrived = next_exposure == Exposure::Visible && !passing.contains(&card);
+            if arrived || passing.is_empty() {
+                // The camera is heading for it, or stopped on it or beside it.
                 runtime.crossed = false;
+            } else if runtime.exposure == Exposure::Offscreen {
+                runtime.crossed = true;
             }
             if !runtime.crossed
                 && (next_exposure == Exposure::Visible || runtime.exposure == Exposure::Visible)
@@ -650,6 +652,34 @@ mod tests {
         );
         assert_eq!(hibernated(&actions), [crossed]);
         assert_eq!(hydrated(&actions), [crossed_cold]);
+    }
+
+    #[test]
+    fn a_card_kept_warm_beside_the_one_left_keeps_its_grace_when_crossed() {
+        let now = Instant::now();
+        let left = CardId::new();
+        let beside = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 2,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        manager.register(left, Exposure::Visible, Residency::Hot, now);
+        manager.register(beside, Exposure::Prefetch, Residency::Hot, now);
+
+        let departed = now + Duration::from_secs(60);
+        let both = HashSet::from([left, beside]);
+        let actions = manager.reconcile_in_flight(&both, &both, &HashSet::new(), departed);
+        assert!(hibernated(&actions).is_empty());
+        let gone = departed + Duration::from_secs(1);
+        let actions = manager.reconcile(&HashSet::new(), &HashSet::new(), gone);
+        assert!(hibernated(&actions).is_empty());
+
+        let actions = manager.reconcile(
+            &HashSet::new(),
+            &HashSet::new(),
+            gone + Duration::from_secs(30),
+        );
+        assert_eq!(hibernated(&actions).len(), 2);
     }
 
     #[test]
