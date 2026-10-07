@@ -1537,7 +1537,7 @@ impl Cagents {
             };
             return Some(super::dialog_ui::surface(
                 widget::column::with_children(vec![
-                    widget::text::title3("Remove project from cagents?").into(),
+                    design::title("Remove project from cagents?").into(),
                     super::notice_body(&removal.name),
                     super::notice_detail(removal.repository.display().to_string()),
                     super::notice_body(detail),
@@ -1546,21 +1546,21 @@ impl Cagents {
                         ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
                     }),
                     super::dialog_ui::confirmation_actions(
-                        widget::button::standard("Cancel")
+                        crate::ui_controls::button::secondary("Cancel")
                             .on_press(Message::ProjectUi(Action::Dismiss)),
-                        widget::button::destructive("Remove project")
+                        crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
                             .on_press(Message::ProjectUi(Action::ConfirmRemove)),
                     ),
                 ])
-                .spacing(3.0 * design::GRID_UNIT),
+                .spacing(space::M),
                 500.0,
             ));
         }
         let dialog = self.project_ui.dialog.as_ref()?;
         let target = &dialog.target;
         let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3("Delete worktree?").into(),
+            design::title("Delete worktree?").into(),
             super::notice_body(&target.label),
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
@@ -1586,10 +1586,10 @@ impl Cagents {
             .is_none()
             .then_some(Message::ProjectUi(Action::ConfirmDelete));
         rows.push(super::dialog_ui::confirmation_actions(
-            widget::button::standard("Cancel")
+            crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
                 .on_press(Message::ProjectUi(Action::Dismiss)),
-            widget::button::destructive(if dialog.failure.is_some() {
+            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
                 "Retry delete"
             } else {
                 "Delete worktree"
@@ -1598,7 +1598,7 @@ impl Cagents {
             .on_press_maybe(confirm),
         ));
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))
     }

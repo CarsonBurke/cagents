@@ -120,7 +120,7 @@ pub enum Action {
 
 /// Opens a release's notes in the system browser.
 pub(super) fn release_notes_button<'a>(url: &str) -> Element<'a, Message> {
-    widget::button::text("Release notes")
+    crate::ui_controls::button::quiet("Release notes")
         .on_press(Message::UpdateUi(Action::OpenReleaseNotes(url.to_owned())))
         .into()
 }
@@ -168,14 +168,14 @@ impl Cagents {
         let confirmation = self.update_ui.confirmation.as_ref()?;
         let preview = &confirmation.preview;
         let title: Element<'_, Message> =
-            widget::text::title3(format!("Update to {}?", preview.candidate.version))
+            crate::design::title(format!("Update to {}?", preview.candidate.version))
                 .width(Length::Fill)
                 .into();
         // Read what changes before every window restarts for it.
         let heading = match self.release_notes_for(&preview.candidate.version) {
             Some(url) => widget::row::with_children(vec![title, release_notes_button(url)])
                 .align_y(Alignment::Center)
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             None => title,
         };
@@ -229,7 +229,7 @@ impl Cagents {
                     ("Wait for idle instead", Policy::WhenIdle)
                 };
                 body.push(
-                    widget::button::standard(label)
+                    crate::ui_controls::button::secondary(label)
                         .on_press(Message::UpdateUi(Action::ChoosePolicy(policy)))
                         .into(),
                 );
@@ -238,11 +238,11 @@ impl Cagents {
         body.push(
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("update.cancel"))
                     .on_press(Message::UpdateUi(Action::CancelApply))
                     .into(),
-                widget::button::suggested(
+                crate::ui_controls::button::primary(
                     if preview.daemon.as_ref().is_some_and(|daemon| {
                         daemon
                             .sessions
@@ -259,11 +259,11 @@ impl Cagents {
                 ))))
                 .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .into(),
         );
         Some(dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(body).spacing(16), 600.0),
+            dialog_ui::surface(widget::column::with_children(body).spacing(space::L), 600.0),
             Some(Message::UpdateUi(Action::CancelApply)),
             1.0,
         ))
@@ -351,7 +351,7 @@ impl Cagents {
         let state = &self.update_ui;
         let (icon, label, action) = if state.updating() {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 state.job.as_ref().map_or_else(
                     || "Preparing application update".to_owned(),
                     |job| format!("Updating to {}: {}", job.version, job.message),
@@ -364,20 +364,20 @@ impl Cagents {
             )
         } else if state.restarting {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 "Saving and reopening windows with the installed build".to_owned(),
                 None,
             )
         } else if state.superseded.is_some() {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 "A newer build is installed; reopen windows to use it".to_owned(),
                 Some(Message::UpdateUi(Action::Restart)),
             )
         } else if let Some(error) = &state.error {
             match &state.result {
                 Some(UpdateState::Available { release }) => (
-                    "dialog-warning-symbolic",
+                    Icon::Warning,
                     format!(
                         "Update failed: {error}. Retry update to {}",
                         release.version
@@ -385,14 +385,14 @@ impl Cagents {
                     Some(Message::UpdateUi(Action::Apply)),
                 ),
                 _ => (
-                    "dialog-warning-symbolic",
+                    Icon::Warning,
                     format!("Update failed: {error}. Check again"),
                     Some(Message::UpdateUi(Action::CheckNow)),
                 ),
             }
         } else if let Some(UpdateState::Available { release }) = &state.result {
             (
-                "software-update-available-symbolic",
+                Icon::Update,
                 format!(
                     "Update to {} (saves and restarts application windows)",
                     release.version
@@ -418,15 +418,11 @@ impl Cagents {
         };
         let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
         Some(
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(icon),
-                label,
-                true,
-                enabled,
-                enabled.then_some(action).flatten(),
-            )
-            .id(widget::Id::new("application-update"))
-            .into(),
+            crate::ui_controls::icon_button(icon, label)
+                .selected(true)
+                .on_press_maybe(enabled.then_some(action).flatten())
+                .id(widget::Id::new("application-update"))
+                .into(),
         )
     }
 

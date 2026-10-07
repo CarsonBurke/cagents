@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 
+use cagents::design::space;
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
 const PRODUCT: &str = "cagents-ui";
@@ -396,34 +397,34 @@ impl cosmic::Application for StartupError {
 
     fn view(&self) -> cosmic::Element<'_, StartupErrorMessage> {
         let mut rows = vec![
-            cosmic::widget::text::title3("cagents could not start").into(),
-            cosmic::widget::text::body(&self.message).into(),
-            cosmic::widget::text::body(
+            cagents::design::title("cagents could not start").into(),
+            cagents::design::body(&self.message).into(),
+            cagents::design::body(
                 "This may be temporary. Retry starts cagents again; Close leaves no window open.",
             )
             .into(),
-            cosmic::widget::text::body(format!(
+            cagents::design::body(format!(
                 "The report is in {PRODUCT}-crash.log in the cagents data directory."
             ))
             .into(),
         ];
         if let Some(failure) = &self.retry_failure {
-            rows.push(cosmic::widget::text::body(format!("Retry failed: {failure}")).into());
+            rows.push(cagents::design::body(format!("Retry failed: {failure}")).into());
         }
         rows.push(
             cosmic::widget::row::with_children(vec![
-                cosmic::widget::button::suggested("Retry")
+                cagents::ui_controls::button::primary("Retry")
                     .on_press(StartupErrorMessage::Retry)
                     .into(),
-                cosmic::widget::button::standard("Close")
+                cagents::ui_controls::button::secondary("Close")
                     .on_press(StartupErrorMessage::Close)
                     .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .into(),
         );
-        cosmic::widget::container(cosmic::widget::column::with_children(rows).spacing(16))
-            .padding(24)
+        cosmic::widget::container(cosmic::widget::column::with_children(rows).spacing(space::L))
+            .padding(space::XL)
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
             .into()

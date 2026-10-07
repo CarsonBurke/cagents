@@ -19,7 +19,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    design::{self, InspectorLayout},
+    design::{self, InspectorLayout, space},
     location::SanitizedLocation,
     lsp::{
         LocationKind, LspCompletionItem, LspCompletionKind, LspCoordinates, LspDiagnostic,
@@ -31,6 +31,7 @@ use crate::{
     },
     repository_widget::RepositoryInspectorContext,
     sidebar::{SidebarProject, SidebarWorktree},
+    ui_controls::Icon,
 };
 
 pub const RESIZE_HANDLE_NAME: &str = "Resize context inspector";
@@ -472,17 +473,13 @@ impl Section {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub label: Cow<'static, str>,
-    pub icon: &'static str,
+    pub icon: Icon,
     pub message: InspectorAction,
     pub primary: bool,
 }
 
 impl Action {
-    fn new(
-        label: impl Into<Cow<'static, str>>,
-        icon: &'static str,
-        message: InspectorAction,
-    ) -> Self {
+    fn new(label: impl Into<Cow<'static, str>>, icon: Icon, message: InspectorAction) -> Self {
         Self {
             label: label.into(),
             icon,
@@ -552,7 +549,7 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "New terminal here",
-                    "utilities-terminal-symbolic",
+                    Icon::Terminal,
                     InspectorAction::NewTerminalAt(session.launch.working_directory.clone()),
                 )
                 .primary(),
@@ -590,7 +587,7 @@ pub fn model_for_card(
             ));
             actions.push(Action::new(
                 "New terminal here",
-                "utilities-terminal-symbolic",
+                Icon::Terminal,
                 InspectorAction::NewTerminalAt(session.launch.recipe.working_directory.clone()),
             ));
         }
@@ -617,7 +614,7 @@ pub fn model_for_card(
                 actions.push(
                     Action::new(
                         "Reload",
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         InspectorAction::ReloadBrowser(card.id),
                     )
                     .primary(),
@@ -627,14 +624,14 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "Open in system browser",
-                    "internet-web-browser-symbolic",
+                    Icon::Browser,
                     InspectorAction::Retry(card.id),
                 )
                 .primary(),
             );
             actions.push(Action::new(
                 "Open URL",
-                "internet-web-browser-symbolic",
+                Icon::Browser,
                 InspectorAction::OpenBrowser(session.current_url.clone()),
             ));
         }
@@ -649,14 +646,14 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "New terminal here",
-                    "utilities-terminal-symbolic",
+                    Icon::Terminal,
                     InspectorAction::NewTerminalAt(view.worktree.clone()),
                 )
                 .primary(),
             );
             actions.push(Action::new(
                 "Refresh files",
-                "view-refresh-symbolic",
+                Icon::Refresh,
                 InspectorAction::RefreshRepository(card.id),
             ));
             if let Some(source) = repository_runtime {
@@ -710,7 +707,7 @@ pub fn model_for_card(
                 if source.can_back {
                     actions.push(Action::new(
                         "Back to files",
-                        "go-previous-symbolic",
+                        Icon::ChevronLeft,
                         InspectorAction::BackToRepositoryFiles(card.id),
                     ));
                 }
@@ -719,25 +716,25 @@ pub fn model_for_card(
                 if source.surface == "Editor" && source.can_show_diff {
                     actions.push(Action::new(
                         "Show diff",
-                        "vcs-diff-symbolic",
+                        Icon::Diff,
                         InspectorAction::ShowRepositoryDiff(card.id),
                     ));
                 } else if source.surface == "Diff" && !source.saving {
                     actions.push(Action::new(
                         "Show editor",
-                        "text-editor-symbolic",
+                        Icon::Edit,
                         InspectorAction::ShowRepositoryEditor(card.id),
                     ));
                 }
                 match source.markdown_mode {
                     Some("Edit") if !source.saving => actions.push(Action::new(
                         "Preview Markdown",
-                        "view-reveal-symbolic",
+                        Icon::Preview,
                         InspectorAction::ShowMarkdownPreview(card.id),
                     )),
                     Some("Preview") if !source.saving => actions.push(Action::new(
                         "Edit Markdown",
-                        "document-edit-symbolic",
+                        Icon::Changes,
                         InspectorAction::ShowMarkdownEdit(card.id),
                     )),
                     _ => {}
@@ -748,12 +745,12 @@ pub fn model_for_card(
                     let opposite_basis = match source.diff_basis {
                         Some("Staged") if source.can_select_unstaged_diff => Some((
                             "Show unstaged diff",
-                            "document-edit-symbolic",
+                            Icon::Changes,
                             InspectorAction::ShowUnstagedDiff(card.id),
                         )),
                         Some("Unstaged") if source.can_select_staged_diff => Some((
                             "Show staged diff",
-                            "object-select-symbolic",
+                            Icon::Select,
                             InspectorAction::ShowStagedDiff(card.id),
                         )),
                         _ => None,
@@ -765,13 +762,13 @@ pub fn model_for_card(
                         actions.push(if source.diff_mode == Some("Split") {
                             Action::new(
                                 "Show inline diff",
-                                "view-list-symbolic",
+                                Icon::List,
                                 InspectorAction::ShowInlineDiff(card.id),
                             )
                         } else {
                             Action::new(
                                 "Show split diff",
-                                "vcs-diff-symbolic",
+                                Icon::Diff,
                                 InspectorAction::ShowSplitDiff(card.id),
                             )
                         });
@@ -779,19 +776,19 @@ pub fn model_for_card(
                     if source.can_change_diff_layout && source.diff_change.is_some() {
                         actions.push(Action::new(
                             "Previous change",
-                            "go-up-symbolic",
+                            Icon::ChevronUp,
                             InspectorAction::PreviousRepositoryChange(card.id),
                         ));
                         actions.push(Action::new(
                             "Next change",
-                            "go-down-symbolic",
+                            Icon::ChevronDown,
                             InspectorAction::NextRepositoryChange(card.id),
                         ));
                     }
                     if source.can_retry_diff {
                         actions.push(Action::new(
                             "Retry diff",
-                            "view-refresh-symbolic",
+                            Icon::Refresh,
                             InspectorAction::RetryRepositoryDiff(card.id),
                         ));
                     }
@@ -799,14 +796,14 @@ pub fn model_for_card(
                 if source.can_discard {
                     actions.push(Action::new(
                         "Discard unsaved edits",
-                        "document-revert-symbolic",
+                        Icon::RevertFile,
                         InspectorAction::DiscardRepositoryEdits(card.id),
                     ));
                 }
                 if source.can_reload && !source.saving {
                     actions.push(Action::new(
                         "Reload from disk",
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         InspectorAction::ReloadRepositoryFile(card.id),
                     ));
                 }
@@ -814,7 +811,7 @@ pub fn model_for_card(
                     actions.push(
                         Action::new(
                             "Overwrite file",
-                            "document-save-symbolic",
+                            Icon::Save,
                             InspectorAction::OverwriteRepositoryFile(card.id),
                         )
                         .primary(),
@@ -823,7 +820,7 @@ pub fn model_for_card(
                     actions.push(
                         Action::new(
                             "Save file",
-                            "document-save-symbolic",
+                            Icon::Save,
                             InspectorAction::SaveRepositoryFile(card.id),
                         )
                         .primary(),
@@ -833,7 +830,7 @@ pub fn model_for_card(
             if let Some(project) = projects.iter().find(|project| project.id == view.project) {
                 actions.push(Action::new(
                     "Create PR",
-                    "pull-request-symbolic",
+                    Icon::PullRequest,
                     InspectorAction::CreatePullRequest {
                         project_id: project.id,
                         worktree: view.worktree.clone(),
@@ -856,7 +853,7 @@ pub fn model_for_card(
             actions.push(
                 Action::new(
                     "Search projects",
-                    "system-search-symbolic",
+                    Icon::Search,
                     InspectorAction::FocusProjectSearch,
                 )
                 .primary(),
@@ -885,17 +882,12 @@ pub fn model_for_card(
     {
         actions.insert(
             0,
-            Action::new(
-                "Retry",
-                "view-refresh-symbolic",
-                InspectorAction::Retry(card.id),
-            )
-            .primary(),
+            Action::new("Retry", Icon::Refresh, InspectorAction::Retry(card.id)).primary(),
         );
     }
     actions.push(Action::new(
         "Close card",
-        "window-close-symbolic",
+        Icon::Close,
         InspectorAction::CloseCard(card.id),
     ));
 
@@ -1147,24 +1139,24 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
         if status.can_restart() {
             actions.push(Action::new(
                 "Restart language server",
-                "view-refresh-symbolic",
+                Icon::Refresh,
                 InspectorAction::RestartLanguageServer(card),
             ));
         }
         if status.is_ready() {
             actions.push(Action::new(
                 "Describe symbol",
-                "dialog-information-symbolic",
+                Icon::Info,
                 InspectorAction::RequestLspHover(card),
             ));
             actions.push(Action::new(
                 "Go to definition",
-                "go-next-symbolic",
+                Icon::ChevronRight,
                 InspectorAction::GoToLspDefinition(card),
             ));
             actions.push(Action::new(
                 "Find references",
-                "edit-find-symbolic",
+                Icon::Search,
                 InspectorAction::FindLspReferences(card),
             ));
         }
@@ -1176,7 +1168,7 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
     {
         actions.push(Action::new(
             "Dismiss results",
-            "window-close-symbolic",
+            Icon::Close,
             InspectorAction::DismissLspResults(card),
         ));
     }
@@ -1489,12 +1481,11 @@ impl<'a, Message: 'a> InspectorSection<'a, Message> {
     }
 
     pub fn view(self) -> Element<'a, Message> {
-        let spacing = cosmic::theme::spacing();
         let mut children = Vec::with_capacity(self.content.len() + 1);
         children.push(design::heading(self.title).into());
         children.extend(self.content);
         widget::column::with_children(children)
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .width(Length::Fill)
             .into()
     }
@@ -1511,7 +1502,6 @@ impl SegmentedActions {
     }
 
     pub fn view(self) -> Element<'static, InspectorAction> {
-        let spacing = cosmic::theme::spacing();
         let buttons: Vec<Element<'static, InspectorAction>> = self
             .actions
             .into_iter()
@@ -1529,7 +1519,7 @@ impl SegmentedActions {
                 // buttons by id, and their accessible names come from their
                 // labels, so the identity buys nothing and costs a crash.
                 widget::button::standard(action.label)
-                    .leading_icon(crate::ui_controls::symbolic_icon(action.icon))
+                    .leading_icon(action.icon)
                     .class(crate::sidebar::sidebar_button_style(false))
                     .width(Length::Fill)
                     .on_press(action.message)
@@ -1537,7 +1527,7 @@ impl SegmentedActions {
             })
             .collect();
         widget::column::with_children(buttons)
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }
@@ -1550,10 +1540,7 @@ impl SegmentedActions {
 /// pressable text row, the same control the sidebar uses for its own rows,
 /// because the editor offers no gutter or overlay to host a language server's
 /// results.
-fn fact_element(
-    fact: Fact,
-    spacing: cosmic::cosmic_theme::Spacing,
-) -> Element<'static, InspectorAction> {
+fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
     match fact.action {
         Some(action) => {
             let name = format!("{}: {}", fact.label, fact.value);
@@ -1562,12 +1549,11 @@ fn fact_element(
                     design::caption(fact.label).into(),
                     fact_body(fact.value, fact.markdown, false),
                 ])
-                .spacing(0)
                 .width(Length::Fill),
             )
             .class(crate::sidebar::sidebar_button_style(false))
             .name(name)
-            .padding([0, spacing.space_xxxs])
+            .padding([0.0, space::XS])
             .width(Length::Fill)
             .on_press(action)
             .into()
@@ -1576,7 +1562,6 @@ fn fact_element(
             design::caption(fact.label).into(),
             fact_body(fact.value, fact.markdown, true),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
     }
@@ -1772,7 +1757,6 @@ fn markdown_item(
             })
             .into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
         Item::Quote(quote) => widget::row::with_children(vec![
@@ -1803,7 +1787,7 @@ fn markdown_item(
                     (0..width)
                         .map(|column| {
                             row.cells.get(column).map_or_else(
-                                || widget::text::body("").width(Length::Fill).into(),
+                                || design::body("").width(Length::Fill).into(),
                                 |cells| markdown_items(cells, settings, depth + 1),
                             )
                         })
@@ -1844,7 +1828,6 @@ pub fn view(
     width: f32,
     diagnostics_open: bool,
 ) -> Element<'static, InspectorAction> {
-    let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
         widget::icon(icon).size(design::ROW_ICON_SIZE).into(),
         widget::column::with_children(vec![
@@ -1857,12 +1840,11 @@ pub fn view(
                 .into(),
             design::caption(model.kind).into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
     ])
     .align_y(Alignment::Center)
-    .spacing(spacing.space_xxs);
+    .spacing(space::S);
 
     // Commands stay within reach, before potentially long source and LSP results.
     let mut sections = vec![SegmentedActions::new(model.actions).view()];
@@ -1875,10 +1857,7 @@ pub fn view(
             sections.push(
                 InspectorSection::new(
                     section.title.clone(),
-                    visible
-                        .into_iter()
-                        .map(|fact| fact_element(fact, spacing))
-                        .collect(),
+                    visible.into_iter().map(fact_element).collect(),
                 )
                 .view(),
             );
@@ -1887,10 +1866,7 @@ pub fn view(
             diagnostics.push(
                 InspectorSection::new(
                     section.title,
-                    internal
-                        .into_iter()
-                        .map(|fact| fact_element(fact, spacing))
-                        .collect(),
+                    internal.into_iter().map(fact_element).collect(),
                 )
                 .view(),
             );
@@ -1900,11 +1876,11 @@ pub fn view(
         sections.push(crate::design::horizontal_rule().into());
         sections.push(
             widget::button::text("Pane diagnostics")
-                .leading_icon(crate::ui_controls::symbolic_icon(if diagnostics_open {
-                    "pan-down-symbolic"
+                .leading_icon(if diagnostics_open {
+                    Icon::PanDown
                 } else {
-                    "pan-end-symbolic"
-                }))
+                    Icon::PanEnd
+                })
                 .on_press(InspectorAction::ToggleDiagnostics(model.card_id))
                 .width(Length::Fill)
                 .into(),
@@ -1916,10 +1892,10 @@ pub fn view(
     let content = widget::scrollable(
         widget::container(
             widget::column::with_children(sections)
-                .spacing(spacing.space_s)
+                .spacing(space::L)
                 .width(Length::Fill),
         )
-        .padding(12)
+        .padding(space::M)
         .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1931,13 +1907,12 @@ pub fn view(
     widget::container(
         widget::column::with_children(vec![
             widget::container(heading)
-                .padding(12)
+                .padding(space::M)
                 .width(Length::Fill)
                 .into(),
             crate::design::horizontal_rule().into(),
             content.into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill),
     )
@@ -2952,7 +2927,7 @@ mod tests {
         assert!(fact.markdown, "hover was not marked as Markdown: {fact:?}");
         assert_eq!(fact.action, None);
 
-        let rendered = Tree::new(&fact_element(fact.clone(), cosmic::theme::spacing()));
+        let rendered = Tree::new(&fact_element(fact.clone()));
         let markdown = Tree::new(&markdown_body(&fact.value));
         assert_eq!(
             tree_shape(&rendered.children[1]),

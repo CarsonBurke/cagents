@@ -116,8 +116,8 @@ enum Column {
     Updated,
 }
 
-const GUTTER: f32 = design::GRID_UNIT * 4.0;
-const COLUMN_SPACING: f32 = design::GRID_UNIT * 3.0;
+const GUTTER: f32 = space::L;
+const COLUMN_SPACING: f32 = space::M;
 const ACCOUNT_MIN_WIDTH: f32 = 180.0;
 const ACTIONS_WIDTH: f32 = design::COMPACT_CONTROL_SIZE * 2.0 + design::GRID_UNIT;
 const USAGE_WIDTH: f32 = 128.0;
@@ -316,10 +316,10 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     widget::scrollable(
         widget::container(
             widget::column::with_children(sections)
-                .spacing(design::GRID_UNIT * 6.0)
+                .spacing(space::XL)
                 .max_width(MAX_WIDTH),
         )
-        .padding(Padding::from([design::GRID_UNIT * 4.0, GUTTER]))
+        .padding(Padding::from([space::L, GUTTER]))
         .center_x(Length::Fill),
     )
     .direction(iced::widget::scrollable::Direction::Vertical(
@@ -345,7 +345,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                     .name(sort.description())
                     .selected(selected)
                     .class(crate::ui_controls::control_style(selected, None))
-                    .padding([2.0, design::GRID_UNIT * 2.0])
+                    .padding([space::XXS, space::S])
                     .on_press(action(Action::Sort(sort))),
                     sort.description(),
                 )
@@ -353,7 +353,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
             .collect(),
     );
     let mut add_content: Vec<Element<'a, Message>> = vec![
-        widget::icon(crate::ui_controls::symbolic_icon("list-add-symbolic"))
+        widget::icon(Icon::Plus.handle())
             .size(design::COMPACT_ICON_SIZE)
             .into(),
     ];
@@ -373,7 +373,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     .name("Add account")
     .selected(state.table.add_menu)
     .class(cosmic::theme::Button::Suggested)
-    .padding([design::GRID_UNIT, design::GRID_UNIT * 3.0])
+    .padding([space::XS, space::M])
     .on_press(action(Action::AddMenu(!state.table.add_menu)));
     let add_button: Element<'a, Message> = if layout.stacked {
         crate::interaction::tooltip(add_button, "Add account")
@@ -441,14 +441,14 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                     )
                     .into(),
                     design::horizontal_rule(),
-                    widget::checkbox(state.table.own_codex_config)
+                    crate::ui_controls::field::checkbox(state.table.own_codex_config)
                         .label("Keep a separate Codex configuration")
                         .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
                         .into(),
                     design::caption("Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.")
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
                 ])
-                .spacing(2),
+                .spacing(space::XXS),
             )
             .width(300)
             .into()
@@ -464,7 +464,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
         .into(),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .width(Length::Fill);
     if layout.compact_toolbar {
         return widget::column::with_children(vec![
@@ -474,15 +474,15 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                 iced::widget::Space::new().width(Length::Fill).into(),
                 add,
             ])
-            .spacing(design::GRID_UNIT * 3.0)
+            .spacing(space::M)
             .align_y(Alignment::Center)
             .into(),
         ])
-        .spacing(design::GRID_UNIT * 3.0)
+        .spacing(space::M)
         .into();
     }
     widget::row::with_children(vec![description.into(), sort, add])
-        .spacing(design::GRID_UNIT * 3.0)
+        .spacing(space::M)
         .align_y(Alignment::Center)
         .into()
 }
@@ -495,26 +495,26 @@ fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element
             design::caption("Choose the provider's home directory. Its login and session history stay where they are; removing this link will leave its files untouched.")
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            widget::text_input("Absolute path to the provider home", path)
+            crate::ui_controls::field::text("Absolute path to the provider home", path)
                 .id(link_id())
                 .on_input(|value| Message::AccountUi(Action::LinkInput(value)))
                 .on_submit(|_| Message::AccountUi(Action::LinkCommit))
                 .width(Length::Fill)
                 .into(),
             widget::row::with_children(vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .on_press_maybe((!state.table.linking).then_some(Message::AccountUi(Action::LinkCancel)))
                     .into(),
-                widget::button::suggested(if state.table.linking { "Adding…" } else { "Use home" })
+                crate::ui_controls::button::primary(if state.table.linking { "Adding…" } else { "Use home" })
                     .on_press_maybe((!state.table.linking && !path.trim().is_empty()).then_some(Message::AccountUi(Action::LinkCommit)))
                     .into(),
             ])
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .into(),
         ])
-        .spacing(design::GRID_UNIT * 2.0),
+        .spacing(space::S),
     )
-    .padding(design::GRID_UNIT * 3.0)
+    .padding(space::M)
     .class(design::surface(Some(design::raised), [design::RADIUS_M; 4], true))
     .into()
 }
@@ -547,19 +547,20 @@ fn group<'a>(
     ];
     if Account::PROVIDERS.contains(&provider) && state.installed.get(&provider) != Some(&false) {
         header.push(
-            crate::ui_controls::compact_icon_control(
-                crate::ui_controls::symbolic_icon("list-add-symbolic"),
+            crate::ui_controls::icon_button(
+                Icon::Plus,
                 format!("Add a {} account", provider.label()),
-                Some(Message::AccountUi(Action::Add {
-                    provider,
-                    device: false,
-                })),
             )
+            .compact()
+            .on_press(Message::AccountUi(Action::Add {
+                provider,
+                device: false,
+            }))
             .into(),
         );
     }
     let header = widget::row::with_children(header)
-        .spacing(design::GRID_UNIT * 2.0)
+        .spacing(space::S)
         .align_y(Alignment::Center);
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
@@ -594,21 +595,19 @@ fn group<'a>(
             widget::container(
                 design::caption(empty).wrapping(cosmic::iced::widget::text::Wrapping::Word),
             )
-            .padding([design::GRID_UNIT * 3.0, design::GRID_UNIT * 3.0])
+            .padding([space::M, space::M])
             .into(),
         );
         if state.installed.get(&provider) == Some(&false) {
             lines.push(
-                widget::button::suggested(format!("Install {}", provider.label()))
+                crate::ui_controls::button::primary(format!("Install {}", provider.label()))
                     .on_press(Message::AccountUi(Action::Install(provider)))
                     .into(),
             );
         }
     }
     widget::column::with_children(vec![
-        widget::container(header)
-            .padding([0.0, design::GRID_UNIT])
-            .into(),
+        widget::container(header).padding([0.0, space::XS]).into(),
         widget::container(widget::column::with_children(lines))
             .width(Length::Fill)
             .class(design::surface(
@@ -618,7 +617,7 @@ fn group<'a>(
             ))
             .into(),
     ])
-    .spacing(design::GRID_UNIT * 2.0)
+    .spacing(space::S)
     .into()
 }
 
@@ -654,7 +653,7 @@ fn line<'a>(
             .spacing(COLUMN_SPACING)
             .height(height),
     )
-    .padding([0.0, design::GRID_UNIT * 3.0])
+    .padding([0.0, space::M])
     .into()
 }
 
@@ -703,7 +702,7 @@ fn row<'a>(
         .map(|column| {
             let cell = match column {
                 Column::Plan => account.plan().map_or_else(dash, |plan| {
-                    design::badge(plan, design::Tone::Themed(design::accent_color))
+                    crate::ui_controls::badge(plan, design::Tone::Themed(design::accent_color))
                 }),
                 Column::Session => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Session)),
@@ -773,7 +772,7 @@ fn stacked_row<'a>(
 ) -> Element<'a, Message> {
     let figures = cells.into_iter().map(|(column, (_, cell))| {
         widget::column::with_children(vec![design::caption(column.title()).into(), cell])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     });
@@ -784,9 +783,9 @@ fn stacked_row<'a>(
         )
         .padding(Padding {
             top: 0.0,
-            right: design::GRID_UNIT * 3.0,
-            bottom: design::GRID_UNIT * 3.0,
-            left: design::GRID_UNIT * 3.0,
+            right: space::M,
+            bottom: space::M,
+            left: space::M,
         })
         .into(),
     ])
@@ -805,13 +804,14 @@ fn account_cell<'a>(
         .as_ref()
         .filter(|(id, _)| id == &account.id);
     let name: Element<'a, Message> = match renaming {
-        Some((_, draft)) => widget::text_input(state.display_name(account), draft.as_str())
-            .id(rename_id())
-            .size(design::TEXT_BODY)
-            .on_input(|text| Message::AccountUi(Action::RenameInput(text)))
-            .on_submit(|_| Message::AccountUi(Action::RenameCommit))
-            .width(Length::Fill)
-            .into(),
+        Some((_, draft)) => {
+            crate::ui_controls::field::text(state.display_name(account), draft.as_str())
+                .id(rename_id())
+                .on_input(|text| Message::AccountUi(Action::RenameInput(text)))
+                .on_submit(|_| Message::AccountUi(Action::RenameCommit))
+                .width(Length::Fill)
+                .into()
+        }
         // Filling the cell is what lets a long name give way to the badge
         // after it instead of running under the row's actions.
         None => design::body(state.display_name(account))
@@ -829,7 +829,7 @@ fn account_cell<'a>(
         .count()
         > 1;
     if several && state.registry.is_default(&account.account) && renaming.is_none() {
-        title.push(design::badge(
+        title.push(crate::ui_controls::badge(
             "Default",
             design::Tone::Themed(design::muted_color),
         ));
@@ -840,7 +840,7 @@ fn account_cell<'a>(
             .is_project_default(repository, &account.account)
         && renaming.is_none()
     {
-        title.push(design::badge(
+        title.push(crate::ui_controls::badge(
             "This project",
             design::Tone::Themed(design::accent_color),
         ));
@@ -855,7 +855,7 @@ fn account_cell<'a>(
             }
         };
         title.push(crate::interaction::tooltip(
-            design::badge(conflict.label(), design::Tone::Themed(tone)),
+            crate::ui_controls::badge(conflict.label(), design::Tone::Themed(tone)),
             conflict.detail(),
         ));
     }
@@ -886,7 +886,7 @@ fn account_cell<'a>(
     }
     let mut lines: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(title)
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .into(),
     ];
@@ -941,11 +941,11 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
     }
     widget::column::with_children(vec![
         widget::row::with_children(figures)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .into(),
         crate::ui_controls::budget_bar(window.left(), tone),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .width(Length::Fill)
     .into()
 }
@@ -970,7 +970,7 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
     let (label, tone) = status(account);
-    let badge = design::badge(label, design::Tone::Themed(tone));
+    let badge = crate::ui_controls::badge(label, design::Tone::Themed(tone));
     match (&account.failure, &account.snapshot) {
         (Some(failure), _) => {
             crate::interaction::tooltip(badge, format!("Last check failed: {failure}"))
@@ -994,11 +994,11 @@ fn actions<'a>(
     let state = &app.account_ui;
     let open = state.table.menu.as_ref() == Some(&account.id);
     let removing = state.removing.contains(&account.id);
-    let menu_button = crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon("view-more-symbolic"),
-        "Account actions",
-        (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
-    );
+    let menu_button = crate::ui_controls::icon_button(Icon::More, "Account actions")
+        .compact()
+        .on_press_maybe(
+            (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
+        );
     // Omp names, signs in to and forgets its accounts itself, which leaves
     // nothing to do with one here but read it again. The space keeps its
     // refresh control in line with the other rows'.
@@ -1021,7 +1021,7 @@ fn actions<'a>(
         refresh_control(account, now).into()
     };
     widget::row::with_children(vec![first, menu])
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .into()
 }
@@ -1070,25 +1070,25 @@ fn menu<'a>(
             in_use_warning(state.table.confirm_in_use, account.account.is_linked()),
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .on_press(action(Action::RemoveCancel))
                     .into(),
-                widget::button::destructive("Remove")
+                crate::ui_controls::button::destructive("Remove")
                     .on_press(action(Action::RemoveConfirm(id.clone())))
                     .into(),
             ])
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .into(),
         ])
-        .spacing(design::GRID_UNIT * 2.0)
-        .padding(design::GRID_UNIT * 2.0)
+        .spacing(space::S)
+        .padding(space::S)
         .into()
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
         if !state.registry.is_default(&account.account) {
             items.push(
                 crate::ui_controls::popover_item(
-                    crate::ui_controls::symbolic_icon("emblem-ok-symbolic"),
+                    Icon::Check,
                     "Set as default",
                     "New conversations and shell terminals use this account",
                     action(Action::SetDefault(id.clone())),
@@ -1103,7 +1103,7 @@ fn menu<'a>(
             {
                 items.push(
                     crate::ui_controls::popover_item(
-                        crate::ui_controls::symbolic_icon("edit-clear-symbolic"),
+                        Icon::Clear,
                         "Use global default for this project",
                         "Remove this project's account choice",
                         action(Action::ClearProjectDefault(
@@ -1116,7 +1116,7 @@ fn menu<'a>(
             } else {
                 items.push(
                     crate::ui_controls::popover_item(
-                        crate::ui_controls::symbolic_icon("folder-symbolic"),
+                        Icon::Folder,
                         "Use for this project",
                         "New shells and conversations in every worktree of this project use this account",
                         action(Action::SetProjectDefault(project, id.clone())),
@@ -1127,7 +1127,7 @@ fn menu<'a>(
         }
         items.push(
             crate::ui_controls::popover_item(
-                crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
+                Icon::Terminal,
                 "Sign in again",
                 "Run the provider's login in a terminal",
                 action(Action::SignIn(id.clone())),
@@ -1137,7 +1137,7 @@ fn menu<'a>(
         if account.account.provider == Provider::Codex && !crate::device::is_remote() {
             items.push(
                 crate::ui_controls::popover_item(
-                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
+                    Icon::Terminal,
                     "Sign in again with a code",
                     "Use a one-time code to sign in to this account without a local browser callback",
                     action(Action::SignInWithCode(id.clone())),
@@ -1147,7 +1147,7 @@ fn menu<'a>(
         }
         items.push(
             crate::ui_controls::popover_item(
-                crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+                Icon::Changes,
                 "Rename",
                 "Give this account a name of your own",
                 action(Action::Rename(id.clone())),
@@ -1158,7 +1158,7 @@ fn menu<'a>(
             if let Some(retained) = state.duplicate_to_keep(account) {
                 items.push(
                     crate::ui_controls::popover_item(
-                        crate::ui_controls::symbolic_icon("folder-symbolic"),
+                        Icon::Folder,
                         "Archive duplicate",
                         format!("Keep {}. Preserve this home's login, files and saved sessions. Link its home to restore it.", state.display_name(retained)),
                         action(Action::ArchiveDuplicate(id.clone())),
@@ -1168,7 +1168,7 @@ fn menu<'a>(
             }
             items.push(
                 crate::ui_controls::popover_item(
-                    crate::ui_controls::symbolic_icon("list-remove-symbolic"),
+                    Icon::Minus,
                     "Remove",
                     if account.account.is_linked() {
                         "Forget this home without changing its files"
@@ -1180,7 +1180,9 @@ fn menu<'a>(
                 .into(),
             );
         }
-        widget::column::with_children(items).spacing(2).into()
+        widget::column::with_children(items)
+            .spacing(space::XXS)
+            .into()
     };
     widget::container(content).width(300).into()
 }
@@ -1194,11 +1196,11 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     };
     let account = widget::row::with_children(vec![
         if login.phase == LoginPhase::CallbackBlocked {
-            widget::icon(crate::ui_controls::symbolic_icon("dialog-warning-symbolic"))
+            widget::icon(Icon::Warning.handle())
                 .size(design::ROW_ICON_SIZE)
                 .into()
         } else {
-            crate::ui_controls::activity_spinner_tone(
+            crate::ui_controls::activity_spinner(
                 f32::from(design::ROW_ICON_SIZE),
                 design::accent_color,
             )
@@ -1223,27 +1225,23 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     .into();
     let cancel: Element<'a, Message> = if login.phase == LoginPhase::CallbackBlocked {
         widget::row::with_children(vec![
-            widget::button::text("Use code")
+            crate::ui_controls::button::quiet("Use code")
                 .on_press(Message::AccountUi(Action::Add {
                     provider: Provider::Codex,
                     device: true,
                 }))
                 .into(),
-            crate::ui_controls::compact_icon_control(
-                crate::ui_controls::symbolic_icon("window-close-symbolic"),
-                "Dismiss failed sign-in",
-                Some(Message::AccountUi(Action::CancelLogin(login.key))),
-            )
-            .into(),
+            crate::ui_controls::icon_button(Icon::Close, "Dismiss failed sign-in")
+                .compact()
+                .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
+                .into(),
         ])
         .into()
     } else if login.phase == LoginPhase::Waiting {
-        crate::ui_controls::compact_icon_control(
-            crate::ui_controls::symbolic_icon("window-close-symbolic"),
-            "Cancel sign-in",
-            Some(Message::AccountUi(Action::CancelLogin(login.key))),
-        )
-        .into()
+        crate::ui_controls::icon_button(Icon::Close, "Cancel sign-in")
+            .compact()
+            .on_press(Message::AccountUi(Action::CancelLogin(login.key)))
+            .into()
     } else {
         iced::widget::Space::new().into()
     };

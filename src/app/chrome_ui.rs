@@ -595,7 +595,8 @@ fn command<'a>(
     id: widget::Id,
     action: Option<Message>,
 ) -> Element<'a, Message> {
-    crate::ui_controls::icon_control(icon.into(), label, false, action.is_some(), action)
+    crate::ui_controls::icon_button(icon.into(), label)
+        .on_press_maybe(action)
         .id(id)
         .into()
 }
@@ -959,7 +960,7 @@ impl Cagents {
     fn new_tab_control(&self) -> Element<'_, Message> {
         let enabled = !self.modal_is_open() && !self.context_inspector_is_overlay();
         let control = command(
-            crate::ui_controls::symbolic_icon("list-add-symbolic"),
+            Icon::Plus,
             format!(
                 "New tab · Thread {} · Terminal {}",
                 workspace_widget::shortcut_chords(
@@ -979,15 +980,9 @@ impl Cagents {
                 .into_iter()
                 .map(|(label, description, kind, id)| {
                     let icon = match kind {
-                        NewTab::Terminal => {
-                            crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
-                        }
-                        NewTab::Thread | NewTab::Resume => {
-                            crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
-                        }
-                        NewTab::Browser => {
-                            crate::ui_controls::symbolic_icon("internet-web-browser-symbolic")
-                        }
+                        NewTab::Terminal => Icon::Terminal.handle(),
+                        NewTab::Thread | NewTab::Resume => Icon::Chat.handle(),
+                        NewTab::Browser => Icon::Browser.handle(),
                     };
                     let tooltip = match kind {
                         NewTab::Thread => workspace_widget::shortcut_tooltip(
@@ -1015,10 +1010,12 @@ impl Cagents {
                 });
             widget::column::with_children(vec![
                 widget::container(design::heading("New tab"))
-                    .padding([6, 8])
+                    .padding([6.0, space::S])
                     .into(),
                 crate::design::horizontal_rule().into(),
-                widget::column::with_children(items).spacing(2).into(),
+                widget::column::with_children(items)
+                    .spacing(space::XXS)
+                    .into(),
             ])
             .spacing(6)
             .width(design::COMMAND_POPOVER_WIDTH)
@@ -1069,23 +1066,22 @@ impl Cagents {
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
         let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
-        let control = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon(severity.icon()),
+        let control = crate::ui_controls::icon_button(
+            severity.icon(),
             match severity {
                 NoticeSeverity::Success => "Application notices: success",
                 NoticeSeverity::Warning => "Application notices",
                 NoticeSeverity::Error => "Application errors",
             },
-            self.chrome_ui.popup == Some(Popup::Notices),
-            !self.modal_is_open(),
-            (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)),
         )
+        .selected(self.chrome_ui.popup == Some(Popup::Notices))
+        .on_press_maybe((!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)))
         .id(widget::Id::new("chrome.notices"))
-        .icon_color(match severity {
-            NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
-            NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
-            NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
-        });
+        .tone(design::Tone::Themed(match severity {
+            NoticeSeverity::Success => design::success_color,
+            NoticeSeverity::Warning => design::warning_color,
+            NoticeSeverity::Error => design::destructive_color,
+        }));
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
@@ -1098,7 +1094,7 @@ impl Cagents {
                                 format!("Repeated {} times", entry.repeats),
                             ),
                         ])
-                        .spacing(design::GRID_UNIT)
+                        .spacing(space::XS)
                         .into()
                     } else {
                         super::notice_body(&entry.notice.message)
@@ -1128,7 +1124,7 @@ impl Cagents {
                 ];
                 if !self.notices.is_empty() {
                     heading_children.push(
-                        widget::button::text("Dismiss all")
+                        crate::ui_controls::button::quiet("Dismiss all")
                             .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
                             .name("Dismiss every application notice")
                             .on_press(Message::DismissAllNotices)
@@ -1136,20 +1132,20 @@ impl Cagents {
                     );
                 }
                 heading_children.push(command(
-                    crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                    Icon::Close,
                     "Close application notices",
                     widget::Id::new(NOTICES_CLOSE_ID),
                     Some(Message::ChromeUi(Action::Close)),
                 ));
                 let heading = widget::row::with_children(heading_children)
                     .align_y(Alignment::Center)
-                    .spacing(8);
+                    .spacing(space::S);
                 widget::container(
                     widget::column::with_children(vec![
                         heading.into(),
                         widget::scrollable(
                             widget::column::with_children(notices)
-                                .spacing(12)
+                                .spacing(space::M)
                                 // Each notice ends in a Dismiss control on its
                                 // right edge, which the floating thumb would
                                 // otherwise cover.
@@ -1161,7 +1157,7 @@ impl Cagents {
                         .height(Length::Shrink)
                         .into(),
                     ])
-                    .spacing(8),
+                    .spacing(space::S),
                 )
                 .padding(6)
                 .width(design::NOTICE_POPOVER_WIDTH)
@@ -1224,16 +1220,14 @@ impl Cagents {
     }
 
     fn sidebar_toggle(&self) -> Element<'_, Message> {
-        crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
+        crate::ui_controls::icon_button(
+            Icon::SplitPanel,
             workspace_widget::shortcut_tooltip(
                 workspace_widget::GlobalShortcut::ToggleInspector,
                 &self.settings.keyboard_shortcuts,
             ),
-            false,
-            !self.modal_is_open(),
-            (!self.modal_is_open()).then_some(Message::ToggleContextInspector),
         )
+        .on_press_maybe((!self.modal_is_open()).then_some(Message::ToggleContextInspector))
         .id(context_inspector_toggle_id())
         .into()
     }
@@ -1251,7 +1245,10 @@ impl Cagents {
                 + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
                 + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
             count as f32 * design::WINDOW_CONTROL_SIZE
-                + count.saturating_sub(1) as f32 * cosmic::theme::spacing().space_xxs as f32
+                // libcosmic's header bar lays the controls out on the
+                // desktop's density, so this gap has to follow it too.
+                + count.saturating_sub(1) as f32
+                    * f32::from(cosmic::theme::spacing().space_xxs)
                 + design::PRIMARY_CONTROL_SIZE
                 + 12.0
         };
@@ -1378,7 +1375,7 @@ impl Cagents {
             },
         );
         let actions = widget::row::with_children(self.workflow_header())
-            .spacing(2)
+            .spacing(space::XXS)
             .align_y(Alignment::Center);
         let header = self.native_header(
             tabs.into(),
@@ -1390,7 +1387,6 @@ impl Cagents {
             crate::design::horizontal_rule().into(),
             content,
         ])
-        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -1409,7 +1405,7 @@ impl Cagents {
                 .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
                 .map_or(0, |index| index + 1);
             actions.push(command(
-                crate::ui_controls::symbolic_icon("go-previous-symbolic"),
+                Icon::ChevronLeft,
                 workspace_widget::shortcut_tooltip(
                     workspace_widget::GlobalShortcut::FocusAdjacent(
                         crate::workspace::FocusDirection::Left,
@@ -1432,7 +1428,7 @@ impl Cagents {
                     .into(),
             );
             actions.push(command(
-                crate::ui_controls::symbolic_icon("go-next-symbolic"),
+                Icon::ChevronRight,
                 workspace_widget::shortcut_tooltip(
                     workspace_widget::GlobalShortcut::FocusAdjacent(
                         crate::workspace::FocusDirection::Right,
@@ -1466,7 +1462,7 @@ impl Cagents {
         let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
             widget::row::with_children(actions)
-                .spacing(2)
+                .spacing(space::XXS)
                 .align_y(Alignment::Center)
                 .into(),
             widget::row::with_children(
@@ -1498,7 +1494,7 @@ impl Cagents {
                         RenameTarget::Channel(_) => "Rename channel",
                     })
                     .into(),
-                    widget::text_input(
+                    crate::ui_controls::field::text(
                         match target {
                             RenameTarget::Pane(_) => "Pane name",
                             RenameTarget::Channel(_) => "Channel name",
@@ -1516,22 +1512,22 @@ impl Cagents {
                     })
                     .into(),
                     widget::row::with_children(vec![
-                        widget::button::standard("Cancel")
+                        crate::ui_controls::button::secondary("Cancel")
                             .on_press(Message::ChromeUi(Action::RenameCancel))
                             .into(),
-                        widget::button::suggested("Rename")
+                        crate::ui_controls::button::primary("Rename")
                             .on_press_maybe(
                                 normalize_card_name(draft)
                                     .map(|_| Message::ChromeUi(Action::RenameSubmit)),
                             )
                             .into(),
                     ])
-                    .spacing(design::GRID_UNIT)
+                    .spacing(space::XS)
                     .into(),
                 ])
-                .spacing(2.0 * design::GRID_UNIT),
+                .spacing(space::S),
             )
-            .padding(3.0 * design::GRID_UNIT)
+            .padding(space::M)
             .width(400)
             .class(cosmic::theme::Container::Card)
             .into(),
@@ -1543,7 +1539,7 @@ impl Cagents {
     /// they run in a native chat or a terminal.
     pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
         let kind = self.card_state(id).map(|card| &card.kind);
-        let generic = || crate::ui_controls::symbolic_icon(card_kind_labels(kind).icon);
+        let generic = || card_kind_labels(kind).icon.handle();
         match kind {
             Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
             Some(CardKind::Chat(session)) => {
@@ -1582,7 +1578,7 @@ impl Cagents {
                     .width(Length::Fill)
                     .into(),
             ])
-            .spacing(8)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .height(Length::Fill),
         )
@@ -1599,7 +1595,7 @@ impl Cagents {
             |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
         ))
         .class(column_title_style())
-        .padding([0, 4])
+        .padding([0.0, space::XS])
         .width(Length::Fill)
         .height(Length::Fill)
         .on_press(Message::FocusCard(id));
@@ -1631,12 +1627,13 @@ impl Cagents {
         };
         if let Some((label, busy)) = status {
             let indicator: Element<'_, Message> = if busy {
-                crate::ui_controls::activity_spinner_tone(
+                crate::ui_controls::activity_spinner(
                     design::TAB_STATUS_ICON_SIZE as f32,
                     design::accent_color,
                 )
             } else {
-                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                Icon::Warning
+                    .handle()
                     .icon()
                     .size(design::TAB_STATUS_ICON_SIZE)
                     .into()
@@ -1645,7 +1642,8 @@ impl Cagents {
         }
         if self.sidebar_state.has_card_update(id) {
             children.push(tooltip(
-                crate::ui_controls::symbolic_icon("notifications-symbolic")
+                Icon::Attention
+                    .handle()
                     .icon()
                     .size(design::TAB_STATUS_ICON_SIZE),
                 "Needs attention",
@@ -1653,14 +1651,14 @@ impl Cagents {
         } else if let Some(activity) = self.sidebar_state.card_activity(id) {
             match activity.state {
                 crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner_tone(
+                    crate::ui_controls::activity_spinner(
                         design::TAB_STATUS_ICON_SIZE as f32,
                         design::warning_color,
                     ),
                     "Working",
                 )),
                 crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
-                    "dialog-warning-symbolic",
+                    Icon::Warning,
                     "Waiting for input",
                     sidebar::BadgeTone::Warning,
                 )),
@@ -1671,13 +1669,11 @@ impl Cagents {
             let blocker = self.chat_switch_blocker(id);
             let ready = blocker.is_none();
             children.push(command(
-                crate::ui_controls::symbolic_icon(
-                    if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
-                        "utilities-terminal-symbolic"
-                    } else {
-                        "chat-bubble-text-symbolic"
-                    },
-                ),
+                if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
+                    Icon::Terminal
+                } else {
+                    Icon::Chat
+                },
                 blocker.unwrap_or_else(|| Cow::Borrowed(self.chat_switch_label(id))),
                 card_control_id(id, "switch"),
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
@@ -1685,7 +1681,7 @@ impl Cagents {
         }
         if focused || self.chrome_ui.hovered_tab == Some(id) {
             children.push(command(
-                crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                Icon::Close,
                 chrome.map_or_else(
                     || Cow::Owned(card_close_name(labels.type_label, title)),
                     |chrome| Cow::Borrowed(chrome.close_name.as_str()),
@@ -1702,10 +1698,10 @@ impl Cagents {
                 widget::row::with_children(children)
                     .align_y(Alignment::Center)
                     .height(Length::Fill)
-                    .spacing(2)
+                    .spacing(space::XXS)
                     .width(Length::Fill),
             )
-            .padding([0, 4])
+            .padding([0.0, space::XS])
             .height(design::PRIMARY_CONTROL_SIZE)
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
@@ -1803,10 +1799,10 @@ impl Cagents {
                     let enabled = !self.modal_is_open()
                         && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
                     let icon = match tab {
-                        ContextTab::Files => "folder-symbolic",
-                        ContextTab::Changes => "document-edit-symbolic",
-                        ContextTab::PullRequest => "pull-request-symbolic",
-                        ContextTab::Details => "dialog-information-symbolic",
+                        ContextTab::Files => Icon::Folder,
+                        ContextTab::Changes => Icon::Changes,
+                        ContextTab::PullRequest => Icon::PullRequest,
+                        ContextTab::Details => Icon::Info,
                     };
                     let visual = (tab == ContextTab::PullRequest)
                         .then_some(indicators.pull_request)
@@ -1833,26 +1829,24 @@ impl Cagents {
                         }
                         _ => {}
                     }
-                    let control = crate::ui_controls::icon_control(
-                        visual.as_ref().map_or_else(
-                            || crate::ui_controls::symbolic_icon(icon),
-                            |(icon, _)| icon.clone(),
-                        ),
+                    let control = crate::ui_controls::icon_button(
+                        visual
+                            .as_ref()
+                            .map_or_else(|| icon.handle(), |(icon, _)| icon.clone()),
                         name,
-                        selected,
-                        enabled,
-                        enabled.then_some(Message::SelectContextTab(tab)),
-                    );
+                    )
+                    .selected(selected)
+                    .on_press_maybe(enabled.then_some(Message::SelectContextTab(tab)));
                     match (&visual, dirty) {
-                        (Some((_, color)), _) => control.icon_color(*color).into(),
+                        (Some((_, color)), _) => control.tone(*color).into(),
                         (None, Some(_)) => control
-                            .icon_tone(design::Tone::Themed(design::warning_color))
+                            .tone(design::Tone::Themed(design::warning_color))
                             .into(),
                         (None, None) => control.into(),
                     }
                 }),
         )
-        .spacing(2)
+        .spacing(space::XXS)
         .align_y(Alignment::Center);
         // Keep named controls in fixed slots as notices and updates come and go.
         // Alerts and updates remain beside the window controls; the toggle
@@ -1864,12 +1858,12 @@ impl Cagents {
             widget::row::with_children(self.notice_control()).into(),
             widget::row::with_children(self.update_control()).into(),
         ])
-        .spacing(2)
+        .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
         let tabs = widget::container(tabs)
-            .padding([0, 8])
+            .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill);
         let body = match self.context_tab {
@@ -1897,16 +1891,16 @@ impl Cagents {
                                         .unwrap_or_default()
                                 }),
                         ),
-                        widget::button::standard(if changes {
+                        crate::ui_controls::button::secondary(if changes {
                             "Open changes"
                         } else {
                             "Open files"
                         })
-                        .leading_icon(crate::ui_controls::symbolic_icon(if changes {
-                            "vcs-diff-symbolic"
+                        .icon(if changes {
+                            Icon::Diff
                         } else {
-                            "folder-open-symbolic"
-                        }))
+                            Icon::OpenFolder
+                        })
                         .name(if changes {
                             "Open device changes"
                         } else {
@@ -1920,9 +1914,9 @@ impl Cagents {
                         )))
                         .into(),
                     ])
-                    .spacing(12),
+                    .spacing(space::M),
                 )
-                .padding(16)
+                .padding(space::L)
                 .width(Length::Fill)
                 .into()
             }
@@ -1948,18 +1942,13 @@ impl Cagents {
                             design::caption("No pane selected")
                                 .width(Length::Fill)
                                 .into(),
-                            crate::ui_controls::icon_control(
-                                crate::ui_controls::symbolic_icon("folder-open-symbolic"),
-                                "Browse files",
-                                false,
-                                true,
-                                Some(Message::SelectContextTab(ContextTab::Files)),
-                            )
-                            .into(),
+                            crate::ui_controls::icon_button(Icon::OpenFolder, "Browse files")
+                                .on_press(Message::SelectContextTab(ContextTab::Files))
+                                .into(),
                         ])
-                        .spacing(8),
+                        .spacing(space::S),
                     )
-                    .padding(12)
+                    .padding(space::M)
                     .width(Length::Fill)
                     .into()
                 },
@@ -1979,7 +1968,6 @@ impl Cagents {
                 crate::design::horizontal_rule().into(),
                 body,
             ])
-            .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill),
         )

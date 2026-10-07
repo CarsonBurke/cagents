@@ -310,7 +310,7 @@ fn verify_local_head(target: &Target, cancellation: &CancellationToken) -> Resul
 fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
     widget::button::custom(design::caption(label))
         .class(crate::ui_controls::control_style(false, None))
-        .padding([4, 8])
+        .padding([space::XS, space::S])
         .on_press(Action::OpenUrl(url.clone()))
         .into()
 }
@@ -332,13 +332,11 @@ fn comment<'a>(
                 .map(|uri| Action::OpenMarkdownLink(uri.to_string()))
         },
     );
-    let actions = crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon("external-link-symbolic"),
-        "Open comment on GitHub",
-        Some(Action::OpenUrl(comment.url.clone())),
-    )
-    .into();
-    widget::container(design::comment_card(
+    let actions = crate::ui_controls::icon_button(Icon::PopOut, "Open comment on GitHub")
+        .compact()
+        .on_press(Action::OpenUrl(comment.url.clone()))
+        .into();
+    widget::container(crate::ui_controls::comment_card(
         author,
         &comment.created_at,
         body,
@@ -366,7 +364,7 @@ fn state_badge<'a>(pr: &PullRequest) -> Element<'a, Action> {
         "" => ("Unknown".to_owned(), design::muted_color),
         other => (readable_state(other), design::muted_color),
     };
-    design::badge(label, design::Tone::Themed(tone))
+    crate::ui_controls::badge(label, design::Tone::Themed(tone))
 }
 
 /// The `owner/name` a pull request URL points at, for the rare frame where the
@@ -432,7 +430,7 @@ fn meta_row<'a>(label: &'a str, value: Element<'a, Action>) -> Element<'a, Actio
             .into(),
         value,
     ])
-    .spacing(design::GRID_UNIT * 2.0)
+    .spacing(space::S)
     .align_y(Alignment::Start)
     .width(Length::Fill)
     .into()
@@ -448,10 +446,10 @@ const META_LABEL_WIDTH: f32 = 80.0;
 fn block<'a>(children: Vec<Element<'a, Action>>) -> Element<'a, Action> {
     widget::container(
         widget::column::with_children(children)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill),
     )
-    .padding(design::GRID_UNIT * 2.0)
+    .padding(space::S)
     .width(Length::Fill)
     .class(design::surface(
         Some(design::raised),
@@ -468,22 +466,22 @@ fn section_header(
 ) -> Element<'static, Action> {
     widget::button::custom(
         widget::row::with_children(vec![
-            crate::ui_controls::symbolic_icon(if open {
-                "go-down-symbolic"
+            Icon::handle(if open {
+                Icon::ChevronDown
             } else {
-                "go-next-symbolic"
+                Icon::ChevronRight
             })
             .icon()
             .size(design::ROW_ICON_SIZE)
             .into(),
             design::heading(label.into()).width(Length::Fill).into(),
         ])
-        .spacing(4)
+        .spacing(space::XS)
         .align_y(Alignment::Center),
     )
     .class(crate::ui_controls::control_style(false, None))
     .height(design::DENSE_ROW_HEIGHT)
-    .padding([0, 4])
+    .padding([0.0, space::XS])
     .width(Length::Fill)
     .on_press(Action::ToggleSection(section))
     .into()
@@ -518,10 +516,11 @@ fn comment_matches(comment: &PullRequestComment, filter: &str) -> bool {
 pub fn view(state: &State) -> Element<'_, Action> {
     let visual = state.preview.as_ref().map(sidebar::pull_request_visual);
     let header = widget::row::with_children(vec![
-        widget::icon(visual.as_ref().map_or_else(
-            || crate::ui_controls::symbolic_icon("pull-request-symbolic"),
-            |(icon, _)| icon.clone(),
-        ))
+        widget::icon(
+            visual
+                .as_ref()
+                .map_or_else(|| Icon::PullRequest.handle(), |(icon, _)| icon.clone()),
+        )
         .size(design::ROW_ICON_SIZE)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
             cosmic::iced::widget::svg::Style {
@@ -544,7 +543,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         .width(Length::Fill)
         .into(),
         widget::container(if state.loading {
-            crate::ui_controls::activity_spinner_tone(
+            crate::ui_controls::activity_spinner(
                 f32::from(design::ROW_ICON_SIZE),
                 design::warning_color,
             )
@@ -554,16 +553,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
         .width(design::ROW_ICON_SIZE)
         .height(design::ROW_ICON_SIZE)
         .into(),
-        crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
-            "Refresh pull request",
-            false,
-            state.target.is_some() && !state.loading,
-            Some(Action::Refresh),
-        )
-        .into(),
+        crate::ui_controls::icon_button(Icon::Refresh, "Refresh pull request")
+            .on_press_maybe((state.target.is_some() && !state.loading).then_some(Action::Refresh))
+            .into(),
     ])
-    .spacing(4)
+    .spacing(space::XS)
     .align_y(Alignment::Center)
     .height(design::HEADER_CONTENT_HEIGHT);
     let mut children: Vec<Element<'_, Action>> = Vec::new();
@@ -627,7 +621,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     .into(),
                 link("Open on GitHub", &pr.url),
             ])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into(),
@@ -644,7 +638,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     .width(Length::Fill)
                     .into(),
             ])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into(),
@@ -663,7 +657,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         {
             identity.push(
                 widget::row::with_children(vec![
-                    design::badge("Out of sync", design::Tone::Themed(design::warning_color)),
+                    crate::ui_controls::badge("Out of sync", design::Tone::Themed(design::warning_color)),
                     design::caption(
                         "Local HEAD differs from the pull request head; checks describe the remote commit.",
                     )
@@ -671,7 +665,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     .width(Length::Fill)
                     .into(),
                 ])
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .align_y(Alignment::Start)
                 .width(Length::Fill)
                 .into(),
@@ -712,14 +706,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
         metadata.push(meta_row(
             "Review",
             match decision {
-                Some("APPROVED") => {
-                    design::badge("Approved", design::Tone::Themed(design::success_color))
-                }
-                Some("CHANGES_REQUESTED") => design::badge(
+                Some("APPROVED") => crate::ui_controls::badge(
+                    "Approved",
+                    design::Tone::Themed(design::success_color),
+                ),
+                Some("CHANGES_REQUESTED") => crate::ui_controls::badge(
                     "Changes requested",
                     design::Tone::Themed(design::destructive_color),
                 ),
-                Some(other) => design::badge(
+                Some(other) => crate::ui_controls::badge(
                     readable_state(other),
                     design::Tone::Themed(design::muted_color),
                 ),
@@ -752,7 +747,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
             };
             metadata.push(meta_row(
                 "Checks",
-                design::badge(summary, design::Tone::Themed(tone)),
+                crate::ui_controls::badge(summary, design::Tone::Themed(tone)),
             ));
         }
         children.push(block(metadata));
@@ -790,15 +785,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         let (symbol, tone): (_, fn(&cosmic::Theme) -> cosmic::iced::Color) =
                             match check.bucket.0.as_str() {
                                 bucket if sidebar::is_check_failure(bucket) => {
-                                    ("dialog-error-symbolic", design::destructive_color)
+                                    (Icon::Error, design::destructive_color)
                                 }
                                 bucket if sidebar::is_check_pending(bucket) => {
-                                    ("content-loading-symbolic", design::warning_color)
+                                    (Icon::Loading, design::warning_color)
                                 }
                                 bucket if sidebar::is_check_success(bucket) => {
-                                    ("emblem-ok-symbolic", design::success_color)
+                                    (Icon::Check, design::success_color)
                                 }
-                                _ => ("dialog-information-symbolic", design::muted_color),
+                                _ => (Icon::Info, design::muted_color),
                             };
                         let mut content = widget::column::with_children(vec![
                             design::body(&check.name).width(Length::Fill).into(),
@@ -815,7 +810,6 @@ pub fn view(state: &State) -> Element<'_, Action> {
                             .width(Length::Fill)
                             .into(),
                         ])
-                        .spacing(0)
                         .width(Length::Fill);
                         if !check.description.is_empty() {
                             content = content
@@ -829,16 +823,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     // and the run of outcomes reads down the
                                     // panel as one column.
                                     widget::container(
-                                        crate::ui_controls::symbolic_icon(symbol)
-                                            .icon()
-                                            .size(design::ROW_ICON_SIZE),
+                                        symbol.handle().icon().size(design::ROW_ICON_SIZE),
                                     )
                                     .width(Length::Fixed(design::ROW_ICON_SIZE.into()))
                                     .align_x(Alignment::Center)
                                     .into(),
                                     content.into(),
                                     widget::container(
-                                        crate::ui_controls::symbolic_icon("external-link-symbolic")
+                                        Icon::PopOut
+                                            .handle()
                                             .icon()
                                             .size(design::COMPACT_ICON_SIZE),
                                     )
@@ -846,14 +839,14 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     .align_x(Alignment::Center)
                                     .into(),
                                 ])
-                                .spacing(design::GRID_UNIT * 2.0)
+                                .spacing(space::S)
                                 .align_y(Alignment::Center),
                             )
                             .class(crate::ui_controls::control_style(
                                 false,
                                 Some(design::Tone::Themed(tone)),
                             ))
-                            .padding([4, 8])
+                            .padding([space::XS, space::S])
                             .width(Length::Fill)
                             .on_press(Action::OpenUrl(check.link.clone()))
                             .into(),
@@ -892,10 +885,13 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     // row rather than stacking as two more full-width entries.
                     children.push(
                         widget::row::with_children(vec![
-                            widget::text_input("Filter author, text, or file", &state.filter)
-                                .on_input(Action::Filter)
-                                .width(Length::Fill)
-                                .into(),
+                            crate::ui_controls::field::search(
+                                "Filter author, text, or file",
+                                &state.filter,
+                            )
+                            .on_input(Action::Filter)
+                            .width(Length::Fill)
+                            .into(),
                             widget::button::custom(design::caption(if state.hide_resolved {
                                 "Show resolved"
                             } else {
@@ -906,7 +902,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                             .on_press(Action::ToggleResolved)
                             .into(),
                         ])
-                        .spacing(design::GRID_UNIT)
+                        .spacing(space::XS)
                         .align_y(Alignment::Center)
                         .width(Length::Fill)
                         .into(),
@@ -935,25 +931,25 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                         .into(),
                                 ];
                                 if thread.outdated {
-                                    head.push(design::badge(
+                                    head.push(crate::ui_controls::badge(
                                         "Outdated",
                                         design::Tone::Themed(design::muted_color),
                                     ));
                                 }
                                 head.push(if thread.resolved {
-                                    design::badge(
+                                    crate::ui_controls::badge(
                                         "Resolved",
                                         design::Tone::Themed(design::success_color),
                                     )
                                 } else {
-                                    design::badge(
+                                    crate::ui_controls::badge(
                                         "Unresolved",
                                         design::Tone::Themed(design::warning_color),
                                     )
                                 });
                                 head
                             })
-                            .spacing(design::GRID_UNIT)
+                            .spacing(space::XS)
                             .align_y(Alignment::Center)
                             .width(Length::Fill)
                             .into(),
@@ -984,7 +980,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     _ => design::muted_color,
                                 };
                             children.push(block(vec![
-                                design::badge(
+                                crate::ui_controls::badge(
                                     readable_state(&review.state.0),
                                     design::Tone::Themed(tone),
                                 ),
@@ -1028,9 +1024,10 @@ pub fn view(state: &State) -> Element<'_, Action> {
     }
     let body = widget::scrollable(
         widget::column::with_children(children)
-            .spacing(8)
+            .spacing(space::S)
             .padding(design::with_vertical_rail(cosmic::iced::Padding::from([
-                4, 8,
+                space::XS,
+                space::S,
             ])))
             .width(Length::Fill),
     )
@@ -1041,7 +1038,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     .width(Length::Fill);
     widget::column::with_children(vec![
         widget::container(header)
-            .padding([0, 8])
+            .padding([0.0, space::S])
             .width(Length::Fill)
             .into(),
         crate::design::horizontal_rule().into(),

@@ -41,19 +41,14 @@ fn action(action: Action) -> Message {
 /// Shared by the transcript and the composer so a control means the same
 /// thing, and is the same size, wherever it appears.
 fn icon<'a>(
-    name: &'static str,
+    name: Icon,
     label: impl Into<Cow<'a, str>>,
     enabled: bool,
     message: Action,
 ) -> Element<'a, Message> {
-    crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon(name),
-        label,
-        false,
-        enabled,
-        Some(action(message)),
-    )
-    .into()
+    crate::ui_controls::icon_button(name, label)
+        .on_press_maybe(enabled.then_some(action(message)))
+        .into()
 }
 
 /// A message's own control, at caption scale.
@@ -62,19 +57,17 @@ fn icon<'a>(
 /// smaller than the composer's: at the primary size a single copy button
 /// looked like a toolbar bolted to every answer.
 fn small_icon<'a>(
-    name: &'static str,
+    name: Icon,
     label: impl Into<Cow<'a, str>>,
     message: Action,
 ) -> Element<'a, Message> {
-    crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon(name),
-        label,
-        Some(action(message)),
-    )
-    // Muted at rest: these sit at the foot of every answer, and drawn in the
-    // text color they competed with the answer for attention.
-    .icon_tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
-    .into()
+    crate::ui_controls::icon_button(name, label)
+        .compact()
+        .on_press(action(message))
+        // Muted at rest: these sit at the foot of every answer, and drawn in the
+        // text color they competed with the answer for attention.
+        .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
+        .into()
 }
 
 /// One message waiting above the composer.
@@ -3411,7 +3404,7 @@ impl Cagents {
         }
         for choice in choices {
             content.push(
-                widget::button::standard(format!(
+                crate::ui_controls::button::secondary(format!(
                     "{}{}",
                     choice.label,
                     if choice.detail.is_empty() {
@@ -3427,7 +3420,7 @@ impl Cagents {
             );
         }
         content.push(
-            widget::button::standard("Open Accounts")
+            crate::ui_controls::button::secondary("Open Accounts")
                 .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                 .into(),
         );
@@ -3437,7 +3430,7 @@ impl Cagents {
                     .height(Length::Shrink),
             )
             .max_height(180)
-            .padding(8)
+            .padding(space::S)
             .into(),
         )
     }

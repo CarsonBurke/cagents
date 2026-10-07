@@ -35,9 +35,11 @@ fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a,
     setting_field(
         "Installed monospace fonts",
         "Choose a fixed-pitch font installed on this computer.",
-        widget::dropdown(labels, selected, move |index| Message::SettingsChanged {
-            field,
-            value: values[index].clone(),
+        crate::ui_controls::field::select(labels, selected, move |index| {
+            Message::SettingsChanged {
+                field,
+                value: values[index].clone(),
+            }
         })
         .into(),
     )
@@ -51,7 +53,7 @@ fn setting_input<'a>(
 ) -> Setting<'a, Message> {
     let label = field.label();
     let error = invalid.get(&field).map(String::as_str);
-    let mut input = widget::text_input(label, value)
+    let mut input = crate::ui_controls::field::text(label, value)
         .on_input(move |value| Message::SettingsDraftChanged { field, value })
         .width(Length::Fill);
     if let Some(error) = error {
@@ -77,36 +79,21 @@ fn setting_stepper<'a>(
         value: format!("{:.3}", next.clamp(min, max)),
     };
     let control = widget::row::with_children(vec![
-        crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("list-remove-symbolic"),
-            format!("Decrease {label}"),
-            false,
-            current > min,
-            (current > min).then(|| change(current - step)),
-        )
-        .into(),
-        widget::container(widget::text::body(format!("{}{}", current, unit)))
+        crate::ui_controls::icon_button(Icon::Minus, format!("Decrease {label}"))
+            .on_press_maybe((current > min).then(|| change(current - step)))
+            .into(),
+        widget::container(design::body(format!("{}{}", current, unit)))
             .center_x(72)
             .center_y(design::PRIMARY_CONTROL_SIZE)
             .into(),
-        crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("list-add-symbolic"),
-            format!("Increase {label}"),
-            false,
-            current < max,
-            (current < max).then(|| change(current + step)),
-        )
-        .into(),
-        crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-            format!("Reset {label}"),
-            false,
-            current != default,
-            (current != default).then(|| change(default)),
-        )
-        .into(),
+        crate::ui_controls::icon_button(Icon::Plus, format!("Increase {label}"))
+            .on_press_maybe((current < max).then(|| change(current + step)))
+            .into(),
+        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label}"))
+            .on_press_maybe((current != default).then(|| change(default)))
+            .into(),
     ])
-    .spacing(design::GRID_UNIT)
+    .spacing(space::XS)
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
@@ -123,20 +110,20 @@ fn settings_choice<'a>(
         .into_iter()
         .map(|(choice, value, selected)| {
             let marker: Element<'a, Message> = if selected {
-                settings_icon("object-select-symbolic").into()
+                settings_icon(Icon::Select).into()
             } else {
                 iced::widget::Space::new().width(16).height(16).into()
             };
             crate::interaction::hover(
                 widget::button::custom(
-                    widget::row::with_children(vec![marker, widget::text::body(choice).into()])
-                        .spacing(2.0 * design::GRID_UNIT)
+                    widget::row::with_children(vec![marker, design::body(choice).into()])
+                        .spacing(space::S)
                         .align_y(Alignment::Center),
                 )
                 .name(choice)
                 .class(crate::sidebar::sidebar_button_style(selected))
                 .selected(selected)
-                .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+                .padding([space::XS, space::S])
                 .height(design::ROW_HEIGHT)
                 .width(Length::Fill)
                 .on_press(Message::SettingsChanged {
@@ -150,7 +137,7 @@ fn settings_choice<'a>(
         label,
         detail,
         widget::column::with_children(buttons)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into(),
     )
@@ -188,7 +175,7 @@ fn default_account_choice<'a>(
     setting_field(
         label,
         detail,
-        widget::dropdown(labels, selected, move |index| {
+        crate::ui_controls::field::select(labels, selected, move |index| {
             Message::AccountUi(match &ids[index] {
                 Some(id) => account_ui::Action::SetDefault(id.clone()),
                 None => account_ui::Action::SetAutomatic(provider),
@@ -273,7 +260,7 @@ fn settings_category_controls<'a>(
             controls.push(setting_field(
                 "Test notification",
                 "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
-                widget::button::standard(if testing_notification {
+                crate::ui_controls::button::secondary(if testing_notification {
                     "Sending test notification…"
                 } else {
                     "Send test notification"
@@ -313,7 +300,7 @@ fn settings_category_controls<'a>(
                 update_row.push(
                     // `Apply` is refused while this window is blocked, so the
                     // button is disabled and the reason shown below it.
-                    widget::button::suggested("Review update")
+                    crate::ui_controls::button::primary("Review update")
                         .on_press_maybe(
                             updates
                                 .apply_blocker
@@ -324,7 +311,7 @@ fn settings_category_controls<'a>(
                 );
             } else {
                 update_row.push(
-                    widget::button::standard(if updates.checking {
+                    crate::ui_controls::button::secondary(if updates.checking {
                         "Checking…"
                     } else {
                         "Check for updates"
@@ -355,7 +342,7 @@ fn settings_category_controls<'a>(
                         },
                         widget::row::with_children(update_row)
                             .align_y(Alignment::Center)
-                            .spacing(2.0 * design::GRID_UNIT)
+                            .spacing(space::S)
                             .width(Length::Fill)
                             .into(),
                     ),
@@ -384,7 +371,7 @@ fn settings_category_controls<'a>(
             settings.push(setting_field(
                 "Manage accounts",
                 "Add, rename, sign in to or remove accounts, and compare what each has left.",
-                widget::button::standard("Open Accounts")
+                crate::ui_controls::button::secondary("Open Accounts")
                     .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                     .into(),
             ));
@@ -399,7 +386,7 @@ fn settings_category_controls<'a>(
                 setting_field(
                     "Reset all settings",
                     "Restore default preferences; saved conversations and tabs are preserved.",
-                    widget::button::destructive("Reset all settings")
+                    crate::ui_controls::button::destructive("Reset all settings")
                         .id(widget::Id::new("settings.reset"))
                         .on_press(Message::ResetSettings)
                         .into(),
@@ -596,7 +583,7 @@ fn settings_category_controls<'a>(
                     setting_field(
                         "App theme",
                         "Colors for the entire application. Terminal and syntax palettes are independent.",
-                        widget::dropdown(
+                        crate::ui_controls::field::select(
                             AppTheme::ALL
                                 .iter()
                                 .map(|theme| theme.label().to_owned())
@@ -833,7 +820,7 @@ fn settings_category_controls<'a>(
                 setting_field(
                     "Browser logins",
                     "Choose sites from local browser profiles to import into this app session.",
-                    widget::button::standard("Import browser logins")
+                    crate::ui_controls::button::secondary("Import browser logins")
                         .on_press(Message::BrowserImport(browser_import_ui::Action::Open))
                         .into(),
                 ),
@@ -1158,23 +1145,23 @@ fn settings_category_controls<'a>(
     }
 }
 
-fn category_icon(category: SettingsCategory) -> &'static str {
+fn category_icon(category: SettingsCategory) -> Icon {
     match category {
-        SettingsCategory::Notifications => "preferences-system-notifications-symbolic",
-        SettingsCategory::General => "preferences-system-symbolic",
-        SettingsCategory::Appearance => "preferences-desktop-display-symbolic",
-        SettingsCategory::Terminal => "utilities-terminal-symbolic",
-        SettingsCategory::Links => "web-browser-symbolic",
-        SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
-        SettingsCategory::NativeChat => "chat-bubble-text-symbolic",
-        SettingsCategory::Editor => "accessories-text-editor-symbolic",
-        SettingsCategory::Accounts => "system-users-symbolic",
-        SettingsCategory::About => "dialog-information-symbolic",
+        SettingsCategory::Notifications => Icon::NotificationSettings,
+        SettingsCategory::General => Icon::Settings,
+        SettingsCategory::Appearance => Icon::Display,
+        SettingsCategory::Terminal => Icon::Terminal,
+        SettingsCategory::Links => Icon::WebBrowser,
+        SettingsCategory::Keyboard => Icon::Keyboard,
+        SettingsCategory::NativeChat => Icon::Chat,
+        SettingsCategory::Editor => Icon::TextEditor,
+        SettingsCategory::Accounts => Icon::Users,
+        SettingsCategory::About => Icon::Info,
     }
 }
 
-fn settings_icon(name: &'static str) -> widget::icon::Icon {
-    crate::ui_controls::symbolic_icon(name).icon().size(16)
+fn settings_icon(name: Icon) -> widget::icon::Icon {
+    name.handle().icon().size(16)
 }
 
 fn category_button<'a>(
@@ -1186,7 +1173,7 @@ fn category_button<'a>(
         settings_icon(category_icon(item)).into(),
         // One line, cut short in a pane too narrow for the full
         // label; the button's accessible name keeps all of it.
-        widget::text::body(item.label())
+        design::body(item.label())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -1202,7 +1189,7 @@ fn category_button<'a>(
         widget::button::custom(
             widget::row::with_children(row)
                 .align_y(Alignment::Center)
-                .spacing(2.0 * design::GRID_UNIT),
+                .spacing(space::S),
         )
         .name(if refused {
             Cow::Owned(format!(
@@ -1215,7 +1202,7 @@ fn category_button<'a>(
         .class(crate::sidebar::sidebar_button_style(item == selected))
         .selected(item == selected)
         .on_press(Message::SelectSettingsCategory(item))
-        .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+        .padding([space::XS, space::S])
         .height(design::ROW_HEIGHT)
         .width(Length::Fill),
     )
@@ -1290,14 +1277,20 @@ fn settings_layout<'a>(
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
-    let gutter = if narrow { 3.0 } else { 5.0 } * design::GRID_UNIT;
+    let gutter = if narrow {
+        space::M
+    } else {
+        5.0 * design::GRID_UNIT
+    };
 
-    let mut search = widget::text_input::search_input("Search settings", query)
+    let mut search = crate::ui_controls::field::search("Search settings", query)
         .id(crate::settings_widgets::search_id())
         .on_input(Message::SettingsSearchChanged)
         .width(Length::Fill);
     if !query.is_empty() {
-        search = search.on_clear(Message::SettingsSearchChanged(String::new()));
+        search = search.trailing_icon(crate::ui_controls::field::clear(
+            Message::SettingsSearchChanged(String::new()),
+        ));
     }
     let navigation: Element<'a, Message> = if narrow {
         let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
@@ -1309,7 +1302,7 @@ fn settings_layout<'a>(
                 .iter()
                 .position(|item| *item == category);
             rows.push(
-                widget::dropdown(labels, selected, |index| {
+                crate::ui_controls::field::select(labels, selected, |index| {
                     Message::SelectSettingsCategory(SettingsCategory::ALL[index])
                 })
                 .width(Length::Fill)
@@ -1318,10 +1311,10 @@ fn settings_layout<'a>(
         }
         widget::container(
             widget::column::with_children(rows)
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .width(Length::Fill),
         )
-        .padding([2.0 * design::GRID_UNIT, gutter])
+        .padding([space::S, gutter])
         .width(Length::Fill)
         .into()
     } else {
@@ -1332,12 +1325,10 @@ fn settings_layout<'a>(
                         .into_iter()
                         .map(|item| category_button(item, category, refused(item))),
                 )
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .width(Length::Fill),
             )
-            .padding(design::with_vertical_rail(
-                [design::GRID_UNIT, 2.0 * design::GRID_UNIT].into(),
-            ))
+            .padding(design::with_vertical_rail([space::XS, space::S].into()))
             .width(Length::Fill),
         )
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1349,15 +1340,15 @@ fn settings_layout<'a>(
         widget::column::with_children(vec![
             widget::container(search)
                 .padding(iced::Padding {
-                    top: 3.0 * design::GRID_UNIT,
-                    right: 2.0 * design::GRID_UNIT,
+                    top: space::M,
+                    right: space::S,
                     bottom: 0.0,
-                    left: 2.0 * design::GRID_UNIT,
+                    left: space::S,
                 })
                 .into(),
             categories.into(),
         ])
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .width(Length::Fixed(RAIL_WIDTH))
         .height(Length::Fill)
         .into()
@@ -1410,13 +1401,13 @@ fn settings_layout<'a>(
         widget::container(
             widget::row::with_children(header)
                 .align_y(Alignment::Center)
-                .spacing(2.0 * design::GRID_UNIT)
+                .spacing(space::S)
                 .width(Length::Fill),
         )
         .max_width(CONTENT_MAX_WIDTH),
     )
     .padding(iced::Padding {
-        top: 3.0 * design::GRID_UNIT,
+        top: space::M,
         right: gutter,
         bottom: 0.0,
         left: gutter,
@@ -1429,7 +1420,7 @@ fn settings_layout<'a>(
                 .width(Length::Fill)
                 .max_width(CONTENT_MAX_WIDTH),
         )
-        .padding([3.0 * design::GRID_UNIT, gutter])
+        .padding([space::M, gutter])
         .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1481,7 +1472,7 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
     setting_field(
         "Color theme",
         "Live terminal colors. Add a custom_terminal_theme table to settings.toml to create your own; application color overrides remain intact.",
-        widget::dropdown(labels, index, move |index| Message::SettingsChanged {
+        crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged {
             field: SettingsField::TerminalTheme,
             value: choices[index].1.to_owned(),
         })
@@ -1509,22 +1500,20 @@ fn shortcut_input<'a>(
             widget::container(
                 widget::row::with_children(vec![
                     design::body(chord.clone()).into(),
-                    crate::ui_controls::icon_control(
-                        crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                    crate::ui_controls::icon_button(
+                        Icon::Close,
                         format!("Remove {chord} shortcut for {label}"),
-                        false,
-                        true,
-                        Some(Message::SettingsDraftChanged {
-                            field,
-                            value: settings::format_chords(&remaining),
-                        }),
                     )
+                    .on_press(Message::SettingsDraftChanged {
+                        field,
+                        value: settings::format_chords(&remaining),
+                    })
                     .into(),
                 ])
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .align_y(Alignment::Center),
             )
-            .padding([0.0, design::GRID_UNIT])
+            .padding([0.0, space::XS])
             .class(design::surface(
                 Some(design::raised),
                 [design::RADIUS_S; 4],
@@ -1533,29 +1522,21 @@ fn shortcut_input<'a>(
             .into()
         })
         .collect();
-    let record: Element<'a, Message> = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("preferences-desktop-keyboard-symbolic"),
-        format!("Record shortcut for {label}"),
-        false,
-        true,
-        Some(Message::Palette(palette_ui::Action::Record(field))),
-    )
-    .into();
+    let record: Element<'a, Message> =
+        crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
+            .on_press(Message::Palette(palette_ui::Action::Record(field)))
+            .into();
     let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
-    let reset: Element<'a, Message> = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-        format!("Reset {label} shortcut"),
-        false,
-        value != default,
-        Some(Message::SettingsDraftChanged {
-            field,
-            value: default,
-        }),
-    )
-    .into();
+    let reset: Element<'a, Message> =
+        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+            .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                field,
+                value: default,
+            }))
+            .into();
     controls.push(
         widget::row::with_children(vec![record, reset])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .into(),
     );
     let mut message = None;
@@ -1586,7 +1567,7 @@ fn shortcut_input<'a>(
     }
     let mut children = vec![
         widget::flex_row(controls)
-            .spacing(design::GRID_UNIT as u16)
+            .spacing(space::XS as u16)
             .align_items(Alignment::Center)
             .into(),
     ];
@@ -1602,6 +1583,8 @@ fn shortcut_input<'a>(
     setting_field(
         label,
         detail,
-        widget::column::with_children(children).spacing(4).into(),
+        widget::column::with_children(children)
+            .spacing(space::XS)
+            .into(),
     )
 }

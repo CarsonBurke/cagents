@@ -491,7 +491,7 @@ pub(super) fn reveal_row(id: widget::Id, position: usize, depth: usize) -> iced:
             if id != Some(&self.id) {
                 return;
             }
-            let padding = cosmic::theme::spacing().space_xxxs as f32;
+            let padding = space::XS;
             let offset = reveal_offset(
                 self.position,
                 self.depth,

@@ -50,3 +50,18 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Probe {
         )
     }
 }
+
+pub(crate) fn headless_renderer() -> cosmic::Renderer {
+    use cosmic::iced::advanced::renderer::Headless;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(<cosmic::Renderer as Headless>::new(
+            cosmic::iced::Font::DEFAULT,
+            cosmic::iced::Pixels::from(16),
+            Some("tiny-skia"),
+        ))
+        .expect("create a headless renderer")
+}

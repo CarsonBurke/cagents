@@ -4144,7 +4144,7 @@ impl Cagents {
         let bar = widget::container(
             widget::row::with_children(vec![
                 widget::row::with_children(chips)
-                    .spacing(design::GRID_UNIT)
+                    .spacing(space::XS)
                     .align_y(Alignment::Center)
                     .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
@@ -4154,7 +4154,7 @@ impl Cagents {
         )
         .width(Length::Fill)
         .height(STATUS_BAR_HEIGHT - design::BORDER_WIDTH)
-        .padding(Padding::from([0.0, design::GRID_UNIT * 2.0]))
+        .padding(Padding::from([0.0, space::S]))
         .align_y(Alignment::Center);
         Some(
             widget::column::with_children(vec![design::horizontal_rule(), bar.into()])
@@ -4250,12 +4250,10 @@ impl Cagents {
                     sections.push(design::horizontal_rule());
                     sections.push(self.account_switcher(provider, &shown.id, now));
                 }
-                widget::container(
-                    widget::column::with_children(sections).spacing(design::GRID_UNIT * 2.0),
-                )
-                .width(POPOVER_WIDTH)
-                .padding(design::GRID_UNIT)
-                .into()
+                widget::container(widget::column::with_children(sections).spacing(space::S))
+                    .width(POPOVER_WIDTH)
+                    .padding(space::XS)
+                    .into()
             }),
             widget::popover::Position::Top,
             Message::AccountUi(Action::Popover(None)),
@@ -4306,7 +4304,7 @@ impl Cagents {
                 );
                 widget::button::custom(
                     widget::row::with_children(items)
-                        .spacing(design::GRID_UNIT * 2.0)
+                        .spacing(space::S)
                         .align_y(Alignment::Center),
                 )
                 .name(if account.account.is_brokered() {
@@ -4316,14 +4314,14 @@ impl Cagents {
                 })
                 .selected(selected)
                 .class(crate::ui_controls::control_style(selected, None))
-                .padding([design::GRID_UNIT, design::GRID_UNIT * 2.0])
+                .padding([space::XS, space::S])
                 .width(Length::Fill)
                 .on_press(Message::AccountUi(Action::ShowAccount(account.id.clone())))
                 .into()
             })
             .collect();
         widget::column::with_children(rows)
-            .spacing(2)
+            .spacing(space::XXS)
             .width(Length::Fill)
             .into()
     }
@@ -4335,7 +4333,7 @@ impl Cagents {
         now: Millis,
         placement: Placement,
     ) -> Element<'a, Message> {
-        let spacing = design::GRID_UNIT * 2.0;
+        let spacing = space::S;
         let mut rows: Vec<Element<'a, Message>> =
             vec![self.account_header(account, now, placement)];
         if let Some(line) = account.identity.as_ref().and_then(identity_line) {
@@ -4366,7 +4364,7 @@ impl Cagents {
                         .into(),
                     );
                     rows.push(
-                        widget::button::suggested("Sign in")
+                        crate::ui_controls::button::primary("Sign in")
                             .on_press(Message::AccountUi(Action::SignIn(account.id.clone())))
                             .into(),
                     );
@@ -4433,7 +4431,11 @@ impl Cagents {
         }
         if !footer.is_empty() {
             rows.push(design::horizontal_rule());
-            rows.push(widget::column::with_children(footer).spacing(2).into());
+            rows.push(
+                widget::column::with_children(footer)
+                    .spacing(space::XXS)
+                    .into(),
+            );
         }
         widget::column::with_children(rows)
             .spacing(spacing)
@@ -4469,12 +4471,11 @@ impl Cagents {
                 .size(design::ROW_ICON_SIZE)
                 .into(),
             widget::column::with_children(title)
-                .spacing(0)
                 .width(Length::Shrink)
                 .into(),
         ];
         if let Some(plan) = account.plan() {
-            items.push(design::badge(
+            items.push(crate::ui_controls::badge(
                 plan,
                 design::Tone::Themed(design::accent_color),
             ));
@@ -4485,16 +4486,14 @@ impl Cagents {
         }
         if placement == Placement::Popover {
             items.push(
-                crate::ui_controls::compact_icon_control(
-                    crate::ui_controls::symbolic_icon("view-pop-out-symbolic"),
-                    "Open in the Accounts pane",
-                    Some(Message::AccountUi(Action::OpenPane)),
-                )
-                .into(),
+                crate::ui_controls::icon_button(Icon::PopOut, "Open in the Accounts pane")
+                    .compact()
+                    .on_press(Message::AccountUi(Action::OpenPane))
+                    .into(),
             );
         }
         widget::row::with_children(items)
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(space::S)
             .align_y(Alignment::Center)
             .into()
     }
@@ -4677,7 +4676,7 @@ enum Placement {
 fn refresh_control<'a>(
     account: &AccountState,
     now: Millis,
-) -> crate::ui_controls::IconControl<'a, Message> {
+) -> crate::ui_controls::IconButton<'a, Message> {
     let refreshing = account.schedule.in_flight(now) || account.queued.is_some();
     let ready = !refreshing && account.schedule.manual_ready(now);
     let label = if refreshing {
@@ -4687,11 +4686,9 @@ fn refresh_control<'a>(
     } else {
         "Checked moments ago"
     };
-    crate::ui_controls::compact_icon_control(
-        crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
-        label,
-        ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))),
-    )
+    crate::ui_controls::icon_button(Icon::Refresh, label)
+        .compact()
+        .on_press_maybe(ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))))
 }
 
 fn identity_line(identity: &Identity) -> Option<String> {
@@ -4726,7 +4723,7 @@ fn usage_window_row<'a>(window: &'a UsageWindow, now: Millis, stale: bool) -> El
         rows.push(design::caption(line).into());
     }
     widget::column::with_children(rows)
-        .spacing(design::GRID_UNIT)
+        .spacing(space::XS)
         .into()
 }
 

@@ -352,10 +352,9 @@ impl Cagents {
     ) -> Element<'a, Message> {
         let report = terminal_end_report(session);
         let relaunch = self.terminal_relaunch(card, session);
-        let spacing = cosmic::theme::spacing();
 
         let mut summary: Vec<Element<'a, Message>> = vec![
-            design::badge(report.status, report.outcome.tone()),
+            crate::ui_controls::badge(report.status, report.outcome.tone()),
             design::heading(report.headline)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .into(),
@@ -369,25 +368,20 @@ impl Cagents {
             );
         }
         let summary = widget::row::with_children(summary)
-            .spacing(spacing.space_xs)
+            .spacing(space::M)
             .align_y(Alignment::Center);
 
         let mut actions: Vec<Element<'a, Message>> = Vec::with_capacity(3);
         if session.transcript_path.is_some() {
             actions.push(
-                crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("document-open-symbolic"),
-                    "Open saved output",
-                    false,
-                    true,
-                    Some(Message::OpenTerminalOutput(card)),
-                )
-                .id(card_control_id(card, "ended.output"))
-                .into(),
+                crate::ui_controls::icon_button(Icon::OpenFile, "Open saved output")
+                    .on_press(Message::OpenTerminalOutput(card))
+                    .id(card_control_id(card, "ended.output"))
+                    .into(),
             );
         }
         actions.push(
-            widget::button::standard("Close")
+            crate::ui_controls::button::secondary("Close")
                 .id(card_control_id(card, "ended.close"))
                 .name(format!("Close {}", terminal_process_name(session)))
                 .on_press(Message::CloseCard(card))
@@ -396,7 +390,7 @@ impl Cagents {
         // The final screen keeps keyboard focus, and Enter there presses
         // this; the tooltip is where that is said without crowding the row.
         actions.push(crate::interaction::tooltip(
-            widget::button::suggested(relaunch.label())
+            crate::ui_controls::button::primary(relaunch.label())
                 .id(card_control_id(card, "ended.relaunch"))
                 .on_press(Message::RetryCard(card)),
             format!("{} (Enter)", relaunch.explanation(session)),
@@ -409,14 +403,14 @@ impl Cagents {
                     .clip(true)
                     .into(),
                 widget::row::with_children(actions)
-                    .spacing(spacing.space_xxs)
+                    .spacing(space::S)
                     .align_y(Alignment::Center)
                     .into(),
             ])
-            .spacing(spacing.space_s)
+            .spacing(space::L)
             .align_y(Alignment::Center),
         )
-        .padding([spacing.space_xxs, spacing.space_s])
+        .padding([space::S, space::L])
         .width(Length::Fill)
         // A narrow card gives the summary up first, then clips the actions
         // rather than spilling them over its neighbour.
@@ -463,12 +457,8 @@ impl Cagents {
             }
         };
         let saved = session.is_some_and(|session| session.transcript_path.is_some());
-        let spacing = cosmic::theme::spacing();
         let mut children: Vec<Element<'a, Message>> = vec![
-            crate::ui_controls::passive_icon(
-                crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
-                design::STATUS_ICON_SIZE,
-            ),
+            crate::ui_controls::passive_icon(Icon::Terminal, design::STATUS_ICON_SIZE),
             design::heading("Output not available").into(),
             design::caption(detail)
                 .align_x(Alignment::Center)
@@ -477,7 +467,7 @@ impl Cagents {
         ];
         if saved {
             children.push(
-                widget::button::text("Open saved output")
+                crate::ui_controls::button::quiet("Open saved output")
                     .on_press_maybe(session.map(|_| Message::OpenTerminalOutput(card)))
                     .into(),
             );
@@ -485,11 +475,11 @@ impl Cagents {
         widget::container(
             widget::column::with_children(children)
                 .align_x(Alignment::Center)
-                .spacing(spacing.space_xxs)
+                .spacing(space::S)
                 .max_width(STATUS_SURFACE_MAX_WIDTH),
         )
         .center(Length::Fill)
-        .padding(spacing.space_m)
+        .padding(space::XL)
         .into()
     }
 }

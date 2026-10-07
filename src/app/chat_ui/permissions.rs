@@ -92,7 +92,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 design::body("Permissions").width(Length::Fill).into(),
                 small_icon(
-                    "window-close-symbolic",
+                    Icon::Close,
                     "Close permissions",
                     Action::PermissionPicker(target, false),
                 ),
@@ -274,7 +274,7 @@ impl Runtime {
                 .into(),
             );
             content.push(
-                widget::text_input(
+                crate::ui_controls::field::text(
                     "e.g. Bash(npm test) or WebFetch(domain:example.com)",
                     form.rule.as_str(),
                 )
@@ -335,7 +335,7 @@ impl Runtime {
         } else {
             content.push(design::caption("Tell Auto which repositories, services or destinations belong to your environment. This adds context to its safety review; hard blocks still apply.").into());
             content.push(
-                widget::text_input(
+                crate::ui_controls::field::text(
                     "e.g. Source control: github.com/my-org and its repositories",
                     form.environment.as_str(),
                 )

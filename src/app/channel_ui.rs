@@ -786,7 +786,7 @@ impl Cagents {
     pub(super) fn channel_dialog_view(&self) -> Option<Element<'_, Message>> {
         let dialog = self.channel_ui.dialog.as_ref()?;
         let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3("Delete channel?").into(),
+            design::title("Delete channel?").into(),
             super::notice_body(dialog.title.clone()),
             super::notice_body(match dialog.chats {
                 0 => "It holds no conversations.".to_owned(),
@@ -804,10 +804,10 @@ impl Cagents {
             )));
         }
         rows.push(super::dialog_ui::confirmation_actions(
-            widget::button::standard("Cancel")
+            crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.channel.close"))
                 .on_press(Message::ChannelUi(Action::Dismiss)),
-            widget::button::destructive(if dialog.failure.is_some() {
+            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
                 "Retry delete"
             } else {
                 "Delete channel"
@@ -816,7 +816,7 @@ impl Cagents {
             .on_press(Message::ChannelUi(Action::ConfirmDelete)),
         ));
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))
     }

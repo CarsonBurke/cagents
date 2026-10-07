@@ -145,37 +145,41 @@ impl Application for DaemonStop {
     fn view(&self) -> Element<'_, StopMessage> {
         widget::container(
             widget::column::with_children(vec![
-                widget::text::title2("Stop daemon?").into(),
-                widget::text::title3(format!(
+                crate::design::display("Stop daemon?").into(),
+                crate::design::title(format!(
                     "Terminate exactly {} live terminal(s)",
                     self.capability.live_terminals
                 ))
                 .into(),
-                widget::text::body(&self.detail).into(),
+                crate::design::body(&self.detail).into(),
                 widget::row::with_children(vec![
-                    widget::button::standard(if self.settled { "Close" } else { "Cancel" })
-                        .id(widget::Id::new("daemon-stop.cancel"))
-                        .on_press_maybe((!self.pending).then_some(StopMessage::Cancel))
-                        .into(),
-                    widget::button::standard("Refresh count")
+                    crate::ui_controls::button::secondary(if self.settled {
+                        "Close"
+                    } else {
+                        "Cancel"
+                    })
+                    .id(widget::Id::new("daemon-stop.cancel"))
+                    .on_press_maybe((!self.pending).then_some(StopMessage::Cancel))
+                    .into(),
+                    crate::ui_controls::button::secondary("Refresh count")
                         .on_press_maybe(
                             (!self.pending && self.settled && self.failed.load(Ordering::Acquire))
                                 .then_some(StopMessage::Refresh),
                         )
                         .into(),
-                    widget::button::destructive("Stop daemon")
+                    crate::ui_controls::button::destructive("Stop daemon")
                         .id(widget::Id::new("daemon-stop.confirm"))
                         .on_press_maybe(
                             (!self.pending && !self.settled).then_some(StopMessage::Confirm),
                         )
                         .into(),
                 ])
-                .spacing(8)
+                .spacing(space::S)
                 .into(),
             ])
-            .spacing(16),
+            .spacing(space::L),
         )
-        .padding(24)
+        .padding(space::XL)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

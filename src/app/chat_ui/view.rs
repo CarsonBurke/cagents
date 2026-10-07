@@ -22,7 +22,7 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
-const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
+const COMPOSER_PADDING: f32 = space::S;
 
 /// The widest a user's message is drawn.
 ///
@@ -89,7 +89,7 @@ const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
 const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
 
 /// The completion list's inset from its own edge.
-const COMPLETION_INSET: f32 = design::GRID_UNIT;
+const COMPLETION_INSET: f32 = space::XS;
 
 /// The completion list's scrollable, named so the keyboard can scroll it.
 const COMPLETION_LIST: &str = "chat-completion";
@@ -149,22 +149,14 @@ fn composer_editor_style(
 /// allows, and `enter_sends` decides which chord the first of them answers to,
 /// so the tooltip names the key the composer is actually bound to rather than
 /// a fixed one.
-fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (&'static str, String) {
+fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, String) {
     let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
     let (name, verb, chord) = match (mode, slot) {
-        (PromptMode::Send, _) => ("mail-send-symbolic", "Send message", primary),
-        (PromptMode::Steer, 0) => ("go-jump-symbolic", "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (
-            "go-jump-symbolic",
-            "Steer the active turn",
-            "Ctrl+Shift+Enter",
-        ),
-        (PromptMode::Queue, 0) => ("list-add-symbolic", "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (
-            "list-add-symbolic",
-            "Queue for the next turn",
-            "Ctrl+Shift+Enter",
-        ),
+        (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
+        (PromptMode::Steer, 0) => (Icon::Jump, "Steer the active turn", primary),
+        (PromptMode::Steer, _) => (Icon::Jump, "Steer the active turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Queue, 0) => (Icon::Plus, "Queue for the next turn", primary),
+        (PromptMode::Queue, _) => (Icon::Plus, "Queue for the next turn", "Ctrl+Shift+Enter"),
     };
     (name, format!("{verb} — {chord}"))
 }
@@ -240,17 +232,14 @@ fn queue_row<'a>(
 ) -> Element<'a, Message> {
     let marker = |name, label: &'static str| {
         crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(
-                crate::ui_controls::symbolic_icon(name),
-                design::COMPACT_ICON_SIZE,
-            ),
+            crate::ui_controls::passive_icon(name, design::COMPACT_ICON_SIZE),
             label,
         )
     };
     let marker: Element<'a, Message> = match timing {
-        QueueTiming::NextStep => marker("go-jump-symbolic", "Delivered at the agent's next step"),
-        QueueTiming::NextTurn => marker("list-add-symbolic", "Sent when this turn ends"),
-        QueueTiming::Leaving => crate::ui_controls::activity_spinner_tone(
+        QueueTiming::NextStep => marker(Icon::Jump, "Delivered at the agent's next step"),
+        QueueTiming::NextTurn => marker(Icon::Plus, "Sent when this turn ends"),
+        QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
         ),
@@ -296,10 +285,7 @@ fn queue_row<'a>(
     if !attachments.is_empty() && !text.trim().is_empty() {
         row.push(crate::interaction::tooltip(
             widget::row::with_children(vec![
-                crate::ui_controls::passive_icon(
-                    crate::ui_controls::symbolic_icon("mail-attachment-symbolic"),
-                    design::COMPACT_ICON_SIZE,
-                ),
+                crate::ui_controls::passive_icon(Icon::Attachment, design::COMPACT_ICON_SIZE),
                 design::caption(attachments.len().to_string()).into(),
             ])
             .spacing(step::GAP_XS)
@@ -345,7 +331,7 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
-            widget::icon(crate::ui_controls::symbolic_icon("dialog-warning-symbolic"))
+            widget::icon(Icon::Warning.handle())
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
             widget::container(selectable_prose::text(
@@ -877,7 +863,7 @@ impl Cagents {
                 }
             }
             _ => widget::row::with_children(vec![
-                crate::ui_controls::activity_spinner_tone(
+                crate::ui_controls::activity_spinner(
                     f32::from(design::ROW_ICON_SIZE),
                     design::accent_color,
                 ),
@@ -1049,7 +1035,7 @@ impl Runtime {
                             .class(cosmic::theme::Text::Custom(design::muted_text)),
                     )
                     .center_x(Length::Fill)
-                    .padding(design::GRID_UNIT * 8.0)
+                    .padding(space::XXL)
                     .into(),
                 );
             }
@@ -1106,7 +1092,7 @@ impl Runtime {
             );
             if codex {
                 choices.push(
-                    widget::button::text("Fork entire conversation")
+                    crate::ui_controls::button::quiet("Fork entire conversation")
                         .on_press_maybe(
                             (!snapshot.busy && self.pending.is_none()).then(|| {
                                 action(Action::Command(target, Command::Branch { id: None }))
@@ -1117,7 +1103,7 @@ impl Runtime {
             }
             for point in &snapshot.branch_points {
                 choices.push(
-                    widget::button::text(&point.label)
+                    crate::ui_controls::button::quiet(&point.label)
                         .on_press_maybe((!snapshot.busy && self.pending.is_none()).then(|| {
                             action(Action::Command(
                                 target,
@@ -1130,7 +1116,7 @@ impl Runtime {
                 );
             }
             choices.push(
-                widget::button::text("Close")
+                crate::ui_controls::button::quiet("Close")
                     .on_press(action(Action::BranchPicker(target, false)))
                     .into(),
             );
@@ -1158,12 +1144,15 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        widget::text_input("Find in conversation (case sensitive)", query)
-                            .id(card_control_id(target.card, "chat-find"))
-                            .on_input(move |query| action(Action::Find(target, query)))
-                            .on_focus(action(Action::FindFocused(target, true)))
-                            .on_unfocus(action(Action::FindFocused(target, false)))
-                            .width(Length::Fill),
+                        crate::ui_controls::field::search(
+                            "Find in conversation (case sensitive)",
+                            query,
+                        )
+                        .id(card_control_id(target.card, "chat-find"))
+                        .on_input(move |query| action(Action::Find(target, query)))
+                        .on_focus(action(Action::FindFocused(target, true)))
+                        .on_unfocus(action(Action::FindFocused(target, false)))
+                        .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -1177,20 +1166,16 @@ impl Runtime {
                     })
                     .into(),
                     small_icon(
-                        "go-up-symbolic",
+                        Icon::ChevronUp,
                         "Previous match",
                         Action::FindNext(target, false),
                     ),
                     small_icon(
-                        "go-down-symbolic",
+                        Icon::ChevronDown,
                         "Next match",
                         Action::FindNext(target, true),
                     ),
-                    small_icon(
-                        "window-close-symbolic",
-                        "Close find",
-                        Action::CloseFind(target),
-                    ),
+                    small_icon(Icon::Close, "Close find", Action::CloseFind(target)),
                 ])
                 .align_y(Alignment::Center)
                 .spacing(step::GAP_S)
@@ -1260,7 +1245,7 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
                 icon(
-                    "view-refresh-symbolic",
+                    Icon::Refresh,
                     if unresumable {
                         "Resume this conversation again"
                     } else {
@@ -1272,7 +1257,7 @@ impl Runtime {
             ];
             if unresumable {
                 controls.push(icon(
-                    "list-add-symbolic",
+                    Icon::Plus,
                     "Start a new conversation beside it",
                     enabled,
                     Action::StartFresh(target.card),
@@ -1280,7 +1265,7 @@ impl Runtime {
             }
             content.push(
                 widget::row::with_children(controls)
-                    .spacing(8)
+                    .spacing(space::S)
                     .align_y(Alignment::Center)
                     .into(),
             );
@@ -1357,17 +1342,17 @@ impl Runtime {
                     agent.description.clone()
                 };
                 let marker = if agent.status == chat::ToolStatus::Running {
-                    crate::ui_controls::activity_spinner_tone(
+                    crate::ui_controls::activity_spinner(
                         f32::from(design::COMPACT_ICON_SIZE),
                         design::accent_color,
                     )
                 } else {
                     crate::ui_controls::passive_icon(
-                        crate::ui_controls::symbolic_icon(match agent.status {
-                            chat::ToolStatus::Succeeded => "emblem-ok-symbolic",
-                            chat::ToolStatus::Failed => "dialog-warning-symbolic",
-                            _ => "process-stop-symbolic",
-                        }),
+                        match agent.status {
+                            chat::ToolStatus::Succeeded => Icon::Check,
+                            chat::ToolStatus::Failed => Icon::Warning,
+                            _ => Icon::Cancel,
+                        },
                         design::COMPACT_ICON_SIZE,
                     )
                 };
@@ -1510,10 +1495,7 @@ impl Runtime {
                         .content_fit(iced::ContentFit::Cover)
                         .into()
                 } else {
-                    crate::ui_controls::passive_icon(
-                        crate::ui_controls::symbolic_icon("mail-attachment-symbolic"),
-                        design::ROW_ICON_SIZE,
-                    )
+                    crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
                 },
                 crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
                     "Pasted image".to_owned()
@@ -1528,7 +1510,7 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
                 icon(
-                    "edit-delete-symbolic",
+                    Icon::Delete,
                     "Remove attachment",
                     !transitioning,
                     Action::RemoveAttachment(target, index),
@@ -1557,7 +1539,7 @@ impl Runtime {
         // finds named siblings but does not move their trees to new indices.
         let mut content = vec![
             widget::column::with_children(content)
-                .spacing(8)
+                .spacing(space::S)
                 .height(Length::Fill)
                 .into(),
         ];
@@ -1730,7 +1712,7 @@ impl Runtime {
         let mut actions = Vec::new();
         if snapshot.capabilities.branch {
             actions.push(icon(
-                "git-branch-symbolic",
+                Icon::Branch,
                 "Branch conversation history",
                 available && !snapshot.busy,
                 Action::BranchPicker(target, !self.branch_picker),
@@ -1740,7 +1722,7 @@ impl Runtime {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
             let next = if mode == "wait" { "immediate" } else { "wait" };
             actions.push(
-                widget::button::text(if mode == "wait" {
+                crate::ui_controls::button::quiet(if mode == "wait" {
                     "Steering: after turn"
                 } else {
                     "Steering: after tools"
@@ -1756,7 +1738,7 @@ impl Runtime {
         }
         if snapshot.capabilities.attachments {
             actions.push(icon(
-                "mail-attachment-symbolic",
+                Icon::Attachment,
                 "Attach files",
                 available && !self.attachment_chooser_pending,
                 Action::Attach(target),
@@ -1769,7 +1751,7 @@ impl Runtime {
             // effect rather than the mechanism: what a reader wants from this
             // is the context figure back.
             actions.push(icon(
-                "view-compress-symbolic",
+                Icon::Compress,
                 "Compact the conversation: summarize earlier turns to free context",
                 available && !snapshot.busy,
                 Action::Command(target, Command::Compact),
@@ -1793,7 +1775,7 @@ impl Runtime {
         }
         if snapshot.busy {
             actions.push(icon(
-                "media-playback-stop-symbolic",
+                Icon::Stop,
                 "Cancel active turn (Esc)",
                 available,
                 Action::Command(target, Command::Interrupt),
@@ -1844,27 +1826,27 @@ impl Runtime {
         // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         let failed = self.error.is_some() || snapshot.error.is_some();
-        let (glyph, state): (Option<&'static str>, &str) = if self.queued.is_some() {
-            (Some("agent-working-symbolic"), "Starting")
+        let (glyph, state): (Option<Icon>, &str) = if self.queued.is_some() {
+            (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
-            (Some("agent-working-symbolic"), "Switching session")
+            (Some(Icon::AgentWorking), "Switching session")
         } else if self.attachment_chooser_pending {
-            (Some("agent-working-symbolic"), "Choosing attachments")
+            (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
-            (Some("agent-working-symbolic"), "Sending")
+            (Some(Icon::AgentWorking), "Sending")
         } else if self.disconnected {
-            (Some("dialog-warning-symbolic"), "Disconnected")
+            (Some(Icon::Warning), "Disconnected")
         } else if snapshot.exited && self.session.owns_codex_listener() {
-            (Some("dialog-warning-symbolic"), "Unavailable")
+            (Some(Icon::Warning), "Unavailable")
         } else if snapshot.exited {
-            (Some("dialog-warning-symbolic"), "Exited")
+            (Some(Icon::Warning), "Exited")
         } else if failed {
-            (Some("dialog-warning-symbolic"), "Error")
+            (Some(Icon::Warning), "Error")
         } else if snapshot.waiting || !snapshot.requests.is_empty() {
-            (Some("agent-waiting-symbolic"), "Waiting for you")
+            (Some(Icon::AgentWaiting), "Waiting for you")
         } else if snapshot.busy {
             (
-                Some("agent-working-symbolic"),
+                Some(Icon::AgentWorking),
                 if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
                     activity_label(snapshot)
                 } else {
@@ -1876,16 +1858,13 @@ impl Runtime {
         };
         if let Some(glyph) = glyph {
             status.push(
-                if glyph == "agent-working-symbolic" || glyph == "agent-waiting-symbolic" {
-                    crate::ui_controls::activity_spinner_tone(
+                if glyph == Icon::AgentWorking || glyph == Icon::AgentWaiting {
+                    crate::ui_controls::activity_spinner(
                         f32::from(design::ROW_ICON_SIZE),
                         design::accent_color,
                     )
                 } else {
-                    crate::ui_controls::passive_icon(
-                        crate::ui_controls::symbolic_icon(glyph),
-                        design::COMPACT_ICON_SIZE,
-                    )
+                    crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
                 },
             );
         }
@@ -1971,10 +1950,7 @@ impl Runtime {
             footer.push(
                 widget::button::custom(
                     widget::row::with_children(vec![
-                        crate::ui_controls::passive_icon(
-                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic"),
-                            design::COMPACT_ICON_SIZE,
-                        ),
+                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
                         design::caption(notice)
                             .class(cosmic::theme::Text::Custom(design::warning_text))
                             .wrapping(iced::widget::text::Wrapping::None)
@@ -2077,20 +2053,16 @@ impl Runtime {
             // shell uses for work in flight, so a reader can tell where the
             // agent is without reading the plan at all.
             let marker: Element<'_, Message> = match entry.status {
-                chat::PlanState::Active => crate::ui_controls::activity_spinner_tone(
+                chat::PlanState::Active => crate::ui_controls::activity_spinner(
                     f32::from(design::COMPACT_ICON_SIZE),
                     design::accent_color,
                 ),
-                chat::PlanState::Done => {
-                    widget::icon(crate::ui_controls::symbolic_icon("emblem-ok-symbolic"))
-                        .size(design::COMPACT_ICON_SIZE)
-                        .into()
-                }
-                chat::PlanState::Pending => {
-                    widget::icon(crate::ui_controls::symbolic_icon("list-remove-symbolic"))
-                        .size(design::COMPACT_ICON_SIZE)
-                        .into()
-                }
+                chat::PlanState::Done => widget::icon(Icon::Check.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+                chat::PlanState::Pending => widget::icon(Icon::Minus.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
             };
             let text = design::caption(entry.text.as_str())
                 .wrapping(iced::widget::text::Wrapping::None)
@@ -2263,7 +2235,7 @@ impl Runtime {
                                 permission_mode_label(&modes[index])
                             }))
                             .into(),
-                            widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
+                            widget::icon(Icon::PanDown.handle())
                                 .size(design::COMPACT_ICON_SIZE)
                                 .into(),
                         ])
@@ -2301,7 +2273,7 @@ impl Runtime {
             .ellipsize(iced::widget::text::Ellipsize::End(
                 iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
-        let icon = crate::ui_controls::symbolic_icon("avatar-default-symbolic");
+        let icon = Icon::Avatar.handle();
         if transitioning || !self.choosing() {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
@@ -2334,7 +2306,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 widget::icon(icon).size(design::COMPACT_ICON_SIZE).into(),
                 label.into(),
-                widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
+                widget::icon(Icon::PanDown.handle())
                     .size(design::COMPACT_ICON_SIZE)
                     .into(),
             ])
@@ -2413,7 +2385,7 @@ impl Runtime {
                     ))
                     .collect::<Vec<_>>(),
             )
-            .spacing(2)
+            .spacing(space::XXS)
             .width(design::MODEL_POPUP_WIDTH)
             .into()
         });
@@ -2457,7 +2429,7 @@ impl Runtime {
                 design::caption(label)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
-                widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
+                widget::icon(Icon::PanDown.handle())
                     .size(design::COMPACT_ICON_SIZE)
                     .into(),
             ])
@@ -2702,18 +2674,16 @@ impl Runtime {
         let sending = self.followups_sending();
         let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
         let control = |name, label: &'static str, enabled: bool, message: Action| {
-            crate::ui_controls::compact_icon_control(
-                crate::ui_controls::symbolic_icon(name),
-                label,
-                enabled.then(|| action(message)),
-            )
-            .icon_tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
-            .into()
+            crate::ui_controls::icon_button(name, label)
+                .compact()
+                .on_press_maybe(enabled.then(|| action(message)))
+                .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
+                .into()
         };
         let copy = |text: &str| {
             (!text.trim().is_empty()).then(|| {
                 small_icon(
-                    "edit-copy-symbolic",
+                    Icon::Copy,
                     "Copy queued message",
                     Action::CopyLiteral(text.to_owned()),
                 )
@@ -2733,14 +2703,14 @@ impl Runtime {
                 // so its absence is not left to be wondered at.
                 controls.push(if queued.editable {
                     control(
-                        "document-edit-symbolic",
+                        Icon::Changes,
                         "Take back to edit",
                         available,
                         Action::TakeBackQueued(target, Some(entry.clone())),
                     )
                 } else {
                     control(
-                        "document-edit-symbolic",
+                        Icon::Changes,
                         "Too large or too rich to edit here; it can still be removed",
                         false,
                         Action::TakeBackQueued(target, Some(entry.clone())),
@@ -2749,7 +2719,7 @@ impl Runtime {
             }
             if caps.queue_start {
                 controls.push(control(
-                    "go-up-symbolic",
+                    Icon::ChevronUp,
                     "Send next, ahead of the rest",
                     available,
                     Action::Command(
@@ -2762,7 +2732,7 @@ impl Runtime {
             }
             if caps.queue_remove {
                 controls.push(control(
-                    "window-close-symbolic",
+                    Icon::Close,
                     "Remove from the queue",
                     available,
                     Action::RemoveQueued(target, entry),
@@ -2793,13 +2763,13 @@ impl Runtime {
                     .into_iter()
                     .chain([
                         control(
-                            "document-edit-symbolic",
+                            Icon::Changes,
                             "Take back to edit",
                             !sending,
                             Action::TakeBackQueued(target, Some(entry.clone())),
                         ),
                         control(
-                            "window-close-symbolic",
+                            Icon::Close,
                             "Remove from the queue",
                             !sending,
                             Action::RemoveQueued(target, entry),
@@ -2876,9 +2846,9 @@ impl Runtime {
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
         small_icon(
             if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                "emblem-ok-symbolic"
+                Icon::Check
             } else {
-                "edit-copy-symbolic"
+                Icon::Copy
             },
             "Copy this message",
             Action::Copy(self.target, item.id.clone(), CopyPart::Text),
@@ -2938,7 +2908,7 @@ impl Runtime {
         }
         rows.push(
             widget::row::with_children(vec![
-                crate::ui_controls::activity_spinner_tone(
+                crate::ui_controls::activity_spinner(
                     f32::from(design::COMPACT_ICON_SIZE),
                     design::accent_color,
                 ),
@@ -2946,16 +2916,14 @@ impl Runtime {
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .into(),
                 small_icon(
-                    "edit-copy-symbolic",
+                    Icon::Copy,
                     "Copy queued message",
                     Action::CopyLiteral(queued.text.clone()),
                 ),
-                crate::ui_controls::compact_icon_control(
-                    crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-                    "Take the message back to edit it",
-                    (!sending).then(|| action(Action::CancelQueued(self.target))),
-                )
-                .into(),
+                crate::ui_controls::icon_button(Icon::Undo, "Take the message back to edit it")
+                    .compact()
+                    .on_press_maybe((!sending).then(|| action(Action::CancelQueued(self.target))))
+                    .into(),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
@@ -3000,11 +2968,7 @@ impl Runtime {
         };
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
-                widget::icon(crate::ui_controls::symbolic_icon(
-                    "mail-attachment-symbolic",
-                ))
-                .size(12)
-                .into(),
+                widget::icon(Icon::Attachment.handle()).size(12).into(),
                 selectable_prose::plain(
                     text,
                     design::TEXT_CAPTION,
@@ -3099,8 +3063,8 @@ impl Runtime {
                 .on_press(action(Action::Toggle(self.target, item.id.clone())))
                 .into()
         };
-        let glyph = |name: &str| -> Element<'static, Message> {
-            widget::icon(crate::ui_controls::symbolic_icon(name))
+        let glyph = |name: Icon| -> Element<'static, Message> {
+            widget::icon(name.handle())
                 .size(14)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
                     cosmic::iced::widget::svg::Style {
@@ -3112,7 +3076,7 @@ impl Runtime {
         if *kind == chat::DeliveryKind::Notice {
             let mut rows = vec![
                 widget::row::with_children(vec![
-                    glyph("notifications-symbolic"),
+                    glyph(Icon::Attention),
                     design::caption(summary.clone()).into(),
                 ])
                 .spacing(step::GAP_S)
@@ -3156,7 +3120,7 @@ impl Runtime {
         }
         // A named sender leads and its own summary follows; an unnamed one is
         // described by the harness's summary, as `chat::delivery_heading`.
-        let mut heading = vec![glyph("chat-bubble-text-symbolic")];
+        let mut heading = vec![glyph(Icon::Chat)];
         let mut subtitle = None;
         if from.is_empty() && !summary.is_empty() {
             heading.push(design::heading(summary.clone()).into());
@@ -3341,9 +3305,9 @@ impl Runtime {
         // thing on the row that looked like it wanted attention.
         let mut controls: Vec<Element<'static, Message>> = vec![small_icon(
             if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                "emblem-ok-symbolic"
+                Icon::Check
             } else {
-                "edit-copy-symbolic"
+                Icon::Copy
             },
             "Copy this message",
             Action::Copy(target, item.id.clone(), CopyPart::Text),
@@ -3405,7 +3369,7 @@ fn paging_view(
 ) -> Element<'static, Message> {
     let mut row: Vec<Element<'_, Message>> = Vec::new();
     if loading {
-        row.push(crate::ui_controls::activity_spinner_tone(
+        row.push(crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::muted_color,
         ));
@@ -3467,10 +3431,7 @@ pub(super) fn request_view<'a>(
             // The same glyph the status line shows while the agent waits
             // on the reader, so the pane and the panel agree about who is
             // holding the conversation up.
-            crate::ui_controls::passive_icon(
-                crate::ui_controls::symbolic_icon("agent-waiting-symbolic"),
-                design::ROW_ICON_SIZE,
-            ),
+            crate::ui_controls::passive_icon(Icon::AgentWaiting, design::ROW_ICON_SIZE),
             design::heading(request.title.as_str())
                 .width(Length::Fill)
                 .into(),
@@ -3583,7 +3544,7 @@ fn field_view<'a>(
                     // carries it, so a list of answers reads as a list
                     // rather than stepping in and out at its left edge.
                     if selected {
-                        widget::icon(crate::ui_controls::symbolic_icon("emblem-ok-symbolic"))
+                        widget::icon(Icon::Check.handle())
                             .size(design::COMPACT_ICON_SIZE)
                             .into()
                     } else {
@@ -3703,11 +3664,11 @@ fn answers_view<'a>(
                     choice.id.clone(),
                 )));
                 let control: Element<'a, Message> = if primary == Some(&choice.id) {
-                    widget::button::suggested(choice.label.as_str())
+                    crate::ui_controls::button::primary(choice.label.as_str())
                         .on_press_maybe(message)
                         .into()
                 } else {
-                    widget::button::standard(choice.label.as_str())
+                    crate::ui_controls::button::secondary(choice.label.as_str())
                         .on_press_maybe(message)
                         .into()
                 };
@@ -3910,7 +3871,7 @@ fn model_list<'a>(
                         // carries it, so the labels stay in one line down
                         // the list instead of stepping in and out.
                         if selected {
-                            widget::icon(crate::ui_controls::symbolic_icon("emblem-ok-symbolic"))
+                            widget::icon(Icon::Check.handle())
                                 .size(design::COMPACT_ICON_SIZE)
                                 .into()
                         } else {
@@ -3939,7 +3900,7 @@ fn model_list<'a>(
         }
     }
     widget::column::with_children(vec![
-        widget::search_input(
+        crate::ui_controls::field::search(
             if headed {
                 "Search models and providers"
             } else {
@@ -3948,7 +3909,6 @@ fn model_list<'a>(
             query,
         )
         .id(card_control_id(target.card, "chat-model-search"))
-        .size(design::TEXT_BODY)
         .width(Length::Fill)
         .on_input(move |query| action(Action::ModelQuery(target, query)))
         // Enter takes the top match, which is what makes three keystrokes

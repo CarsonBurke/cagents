@@ -742,11 +742,9 @@ impl Cagents {
         let control = widget::button::custom(
             widget::row::with_children(vec![
                 design::caption(label).into(),
-                widget::icon(crate::ui_controls::symbolic_icon("go-up-symbolic"))
-                    .size(12)
-                    .into(),
+                widget::icon(Icon::ChevronUp.handle()).size(12).into(),
             ])
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .align_y(Alignment::Center),
         )
         .name(format!("Device: {label}. Open device connections"))
@@ -766,17 +764,12 @@ impl Cagents {
                 let mut rows: Vec<Element<'_, Message>> = vec![
                     widget::row::with_children(vec![
                         design::heading("Devices").width(Length::Fill).into(),
-                        crate::ui_controls::icon_control(
-                            crate::ui_controls::symbolic_icon("list-add-symbolic"),
-                            "Connect to a device",
-                            false,
-                            enabled,
-                            Some(Message::Device(Action::Configure)),
-                        )
-                        .into(),
+                        crate::ui_controls::icon_button(Icon::Plus, "Connect to a device")
+                            .on_press_maybe(enabled.then_some(Message::Device(Action::Configure)))
+                            .into(),
                     ])
                     .align_y(Alignment::Center)
-                    .padding(Padding::from([0.0, design::GRID_UNIT * 2.0]))
+                    .padding(Padding::from([0.0, space::S]))
                     .into(),
                 ];
                 let mut choices = Vec::new();
@@ -809,21 +802,21 @@ impl Cagents {
                     }
                     let switch = widget::button::custom(
                         widget::row::with_children(contents)
-                            .spacing(design::GRID_UNIT * 2.0)
+                            .spacing(space::S)
                             .align_y(Alignment::Center),
                     )
                     .name(format!("Switch to {label}"))
                     .selected(current)
                     .class(crate::ui_controls::control_style(current, None))
                     .width(Length::Fill)
-                    .padding(design::GRID_UNIT * 2.0)
+                    .padding(space::S)
                     .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
-                    let open = crate::ui_controls::icon_control(
-                        crate::ui_controls::symbolic_icon("view-pop-out-symbolic"),
+                    let open = crate::ui_controls::icon_button(
+                        Icon::PopOut,
                         format!("Open {label} in another window"),
-                        false,
-                        enabled,
-                        Some(Message::Device(Action::OpenDeviceWindow(index))),
+                    )
+                    .on_press_maybe(
+                        enabled.then(|| Message::Device(Action::OpenDeviceWindow(index))),
                     );
                     choices.push(
                         widget::row::with_children(vec![
@@ -839,7 +832,7 @@ impl Cagents {
                             open.into(),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(design::GRID_UNIT)
+                        .spacing(space::XS)
                         .into(),
                     );
                 }
@@ -862,23 +855,23 @@ impl Cagents {
                     rows.push(
                         widget::button::custom(
                             widget::row::with_children(vec![
-                                widget::icon(crate::ui_controls::symbolic_icon("folder-symbolic"))
+                                widget::icon(Icon::Folder.handle())
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
                                 design::body("Browse device files").into(),
                             ])
-                            .spacing(design::GRID_UNIT * 2.0)
+                            .spacing(space::S)
                             .align_y(Alignment::Center),
                         )
                         .name("Browse device files")
                         .class(crate::ui_controls::control_style(false, None))
                         .width(Length::Fill)
-                        .padding(design::GRID_UNIT * 2.0)
+                        .padding(space::S)
                         .on_press_maybe(enabled.then_some(Message::Device(Action::Open)))
                         .into(),
                     );
                 }
-                widget::container(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                widget::container(widget::column::with_children(rows).spacing(space::XS))
                     .width(304)
                     .into()
             }),
@@ -889,7 +882,7 @@ impl Cagents {
 
     pub(super) fn device_dialog(&self) -> Element<'_, Message> {
         // Use the tracked window geometry: Responsive hides its descendants from AccessKit.
-        let padding = 8.0 * design::GRID_UNIT;
+        let padding = space::XXL;
         self.device_dialog_layout(iced::Size::new(
             (self.window_width - padding).max(1.0),
             (self.window_height - padding).max(1.0),
@@ -901,53 +894,47 @@ impl Cagents {
         let narrow = size.width < 900.0;
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
-            let mut button = widget::button::standard(label.to_owned());
+            let mut button = crate::ui_controls::button::secondary(label.to_owned());
             if !state.busy {
                 button = button.on_press(action(value));
             }
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![widget::text::title3("Connect to a device").into(),widget::text::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),widget::text_input("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),widget::text_input("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),widget::text_input("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(8).into()];
+            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(space::S).into()];
             if let Some(notice) = &state.notice {
-                rows.push(widget::text::body(notice).into());
+                rows.push(design::body(notice).into());
             }
-            return dialog_ui::surface(widget::column::with_children(rows).spacing(12), 600.0);
+            return dialog_ui::surface(
+                widget::column::with_children(rows).spacing(space::M),
+                600.0,
+            );
         }
-        let icon = |name: &'static str, label: &'static str, value: Action, enabled: bool| {
+        let icon = |name: Icon, label: &'static str, value: Action, enabled: bool| {
             let destructive = matches!(
                 &value,
                 Action::DiscardChanges | Action::Git(GitOperation::RemoveWorktree { .. })
             );
-            let control = crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(name),
-                label,
-                false,
-                !state.busy && enabled,
-                Some(action(value)),
-            );
+            let control = crate::ui_controls::icon_button(name, label)
+                .on_press_maybe((!state.busy && enabled).then_some(action(value)));
             Element::from(if destructive {
-                control.icon_tone(design::Tone::Themed(design::destructive_color))
+                control.tone(design::Tone::Themed(design::destructive_color))
             } else {
                 control
             })
         };
         let modes = crate::ui_controls::segmented_controls(
             [
-                (Panel::Files, "folder-symbolic", "Browse files"),
-                (Panel::Changes, "vcs-diff-symbolic", "Source control"),
-                (Panel::Worktrees, "git-branch-symbolic", "Manage worktrees"),
+                (Panel::Files, Icon::Folder, "Browse files"),
+                (Panel::Changes, Icon::Diff, "Source control"),
+                (Panel::Worktrees, Icon::Branch, "Manage worktrees"),
             ]
             .into_iter()
             .map(|(panel, glyph, label)| {
-                crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon(glyph),
-                    label,
-                    state.panel == panel,
-                    !state.busy,
-                    Some(action(Action::Panel(panel))),
-                )
-                .into()
+                crate::ui_controls::icon_button(glyph, label)
+                    .selected(state.panel == panel)
+                    .on_press_maybe((!state.busy).then(|| action(Action::Panel(panel))))
+                    .into()
             })
             .collect(),
         );
@@ -959,19 +946,14 @@ impl Cagents {
                 modes,
                 design::heading(state.panel.label()).into(),
                 design::caption(device).width(Length::Fill).into(),
-                icon(
-                    "window-close-symbolic",
-                    "Close device tools",
-                    Action::Close,
-                    true,
-                ),
+                icon(Icon::Close, "Close device tools", Action::Close, true),
             ])
             .align_y(Alignment::Center)
-            .spacing(12)
+            .spacing(space::M)
             .into(),
             widget::row::with_children(vec![
                 icon(
-                    "go-up-symbolic",
+                    Icon::ChevronUp,
                     "Parent directory",
                     Action::Visit(
                         state
@@ -982,26 +964,21 @@ impl Cagents {
                     ),
                     state.directory.parent().is_some(),
                 ),
-                widget::text_input("Directory", &state.path)
+                crate::ui_controls::field::text("Directory", &state.path)
                     .on_input(|value| Message::Device(Action::Path(value)))
                     .on_submit(|_| Message::Device(Action::Browse))
                     .width(Length::Fill)
                     .into(),
+                icon(Icon::Refresh, "Browse directory", Action::Browse, true),
                 icon(
-                    "view-refresh-symbolic",
-                    "Browse directory",
-                    Action::Browse,
-                    true,
-                ),
-                icon(
-                    "folder-open-symbolic",
+                    Icon::OpenFolder,
                     "Open as workspace",
                     Action::OpenProject,
                     true,
                 ),
             ])
             .align_y(Alignment::Center)
-            .spacing(4)
+            .spacing(space::XS)
             .into(),
         ];
         if state.path != state.directory.display().to_string()
@@ -1054,9 +1031,9 @@ impl Cagents {
                             Action::Read(entry.name.clone().into())
                         };
                         let glyph = if entry.directory {
-                            "folder-symbolic"
+                            Icon::Folder
                         } else {
-                            "text-editor-symbolic"
+                            Icon::Edit
                         };
                         let selected = state
                             .file
@@ -1064,7 +1041,7 @@ impl Cagents {
                             .is_some_and(|file| file == &PathBuf::from(&entry.name));
                         widget::button::custom(
                             widget::row::with_children(vec![
-                                widget::icon(crate::ui_controls::symbolic_icon(glyph))
+                                widget::icon(glyph.handle())
                                     .size(design::ROW_ICON_SIZE)
                                     .into(),
                                 design::body(&entry.name)
@@ -1075,21 +1052,22 @@ impl Cagents {
                                     .width(Length::Fill)
                                     .into(),
                             ])
-                            .spacing(8)
+                            .spacing(space::S)
                             .align_y(Alignment::Center),
                         )
                         .name(entry.name.clone())
                         .selected(selected)
                         .class(crate::ui_controls::control_style(selected, None))
-                        .padding([6, 8])
+                        .padding([6.0, space::S])
                         .width(Length::Fill)
                         .on_press_maybe((!state.busy && !entry.symlink).then_some(action(value)))
                         .into()
                     })
                     .collect();
-                let file_list = widget::scrollable(widget::column::with_children(files).spacing(2))
-                    .width(if narrow { 176 } else { 224 })
-                    .height(height);
+                let file_list =
+                    widget::scrollable(widget::column::with_children(files).spacing(space::XXS))
+                        .width(if narrow { 176 } else { 224 })
+                        .height(height);
                 let editor: Element<'_, Message> = if let Some(file) = &state.file {
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
@@ -1101,21 +1079,16 @@ impl Cagents {
                             } else {
                                 iced::widget::Space::new().into()
                             },
+                            icon(Icon::Save, "Save on device", Action::Save, state.dirty()),
                             icon(
-                                "document-save-symbolic",
-                                "Save on device",
-                                Action::Save,
-                                state.dirty(),
-                            ),
-                            icon(
-                                "document-revert-symbolic",
+                                Icon::RevertFile,
                                 "Discard changes",
                                 Action::DiscardChanges,
                                 state.dirty(),
                             ),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(4)
+                        .spacing(space::XS)
                         .into(),
                         iced::widget::text_editor(&state.content)
                             .font(crate::terminal::monospace_font(
@@ -1127,20 +1100,16 @@ impl Cagents {
                             .height((height - 38.0).max(120.0))
                             .into(),
                     ])
-                    .spacing(8)
+                    .spacing(space::S)
                     .width(Length::Fill)
                     .into()
                 } else {
                     widget::container(
                         widget::column::with_children(vec![
-                            crate::ui_controls::passive_icon(
-                                crate::ui_controls::symbolic_icon("text-editor-symbolic"),
-                                32,
-                            )
-                            .into(),
+                            crate::ui_controls::passive_icon(Icon::Edit, 32).into(),
                             design::caption("Select a file").into(),
                         ])
-                        .spacing(12)
+                        .spacing(space::M)
                         .align_x(Alignment::Center),
                     )
                     .center(Length::Fill)
@@ -1148,35 +1117,35 @@ impl Cagents {
                     .into()
                 };
                 widget::row::with_children(vec![file_list.into(), editor])
-                    .spacing(16)
+                    .spacing(space::L)
                     .into()
             }
             Panel::Changes => widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     icon(
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         "Git status",
                         Action::Git(GitOperation::Status),
                         true,
                     ),
                     icon(
-                        "vcs-diff-symbolic",
+                        Icon::Diff,
                         "Working tree diff",
                         Action::Git(GitOperation::Diff { staged: false }),
                         true,
                     ),
                     icon(
-                        "vcs-commit-symbolic",
+                        Icon::Commit,
                         "Staged diff",
                         Action::Git(GitOperation::Diff { staged: true }),
                         true,
                     ),
-                    widget::text_input("File path", &state.pathspec)
+                    crate::ui_controls::field::text("File path", &state.pathspec)
                         .on_input(|value| Message::Device(Action::Pathspec(value)))
                         .width(Length::Fill)
                         .into(),
                     icon(
-                        "list-add-symbolic",
+                        Icon::Plus,
                         "Stage path",
                         Action::Git(GitOperation::Stage {
                             paths: vec![state.pathspec.clone().into()],
@@ -1184,7 +1153,7 @@ impl Cagents {
                         !state.pathspec.trim().is_empty(),
                     ),
                     icon(
-                        "list-remove-symbolic",
+                        Icon::Minus,
                         "Unstage path",
                         Action::Git(GitOperation::Unstage {
                             paths: vec![state.pathspec.clone().into()],
@@ -1193,15 +1162,15 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(4)
+                .spacing(space::XS)
                 .into(),
                 widget::row::with_children(vec![
-                    widget::text_input("Commit message", &state.commit_message)
+                    crate::ui_controls::field::text("Commit message", &state.commit_message)
                         .on_input(|value| Message::Device(Action::CommitMessage(value)))
                         .width(Length::Fill)
                         .into(),
                     icon(
-                        "vcs-commit-symbolic",
+                        Icon::Commit,
                         "Commit staged changes",
                         Action::Git(GitOperation::Commit {
                             message: state.commit_message.clone(),
@@ -1210,30 +1179,30 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(4)
+                .spacing(space::XS)
                 .into(),
                 output((height - 92.0).max(120.0)),
             ])
-            .spacing(12)
+            .spacing(space::M)
             .into(),
             Panel::Worktrees => widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     icon(
-                        "view-refresh-symbolic",
+                        Icon::Refresh,
                         "List worktrees",
                         Action::Git(GitOperation::Worktrees),
                         true,
                     ),
-                    widget::text_input("Worktree name", &state.worktree_name)
+                    crate::ui_controls::field::text("Worktree name", &state.worktree_name)
                         .on_input(|value| Message::Device(Action::WorktreeName(value)))
                         .width(Length::Fill)
                         .into(),
-                    widget::text_input("New branch", &state.worktree_branch)
+                    crate::ui_controls::field::text("New branch", &state.worktree_branch)
                         .on_input(|value| Message::Device(Action::WorktreeBranch(value)))
                         .width(Length::Fill)
                         .into(),
                     icon(
-                        "worktree-add-symbolic",
+                        Icon::WorktreeAdd,
                         "Create worktree under .worktrees",
                         Action::Git(GitOperation::CreateWorktree {
                             name: state.worktree_name.clone(),
@@ -1243,7 +1212,7 @@ impl Cagents {
                             && !state.worktree_branch.trim().is_empty(),
                     ),
                     icon(
-                        "list-remove-symbolic",
+                        Icon::Minus,
                         "Remove clean worktree",
                         Action::Git(GitOperation::RemoveWorktree {
                             name: state.worktree_name.clone(),
@@ -1252,15 +1221,15 @@ impl Cagents {
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(4)
+                .spacing(space::XS)
                 .into(),
                 output((height - 52.0).max(120.0)),
             ])
-            .spacing(12)
+            .spacing(space::M)
             .into(),
         };
         rows.push(body);
-        let content = widget::scrollable(widget::column::with_children(rows).spacing(12))
+        let content = widget::scrollable(widget::column::with_children(rows).spacing(space::M))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))

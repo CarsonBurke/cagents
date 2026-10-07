@@ -76,7 +76,7 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout},
+    design::{self, DockLayout, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
         ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
@@ -120,6 +120,7 @@ use crate::{
     terminal::{
         HostedTerminalHandle, TerminalConfig, TerminalEvent, TerminalSurface, TerminalWidget,
     },
+    ui_controls::Icon,
     workspace::{
         CardWidth, ViewportUpdate, VisibilityClass, VisibilityTransition, Workspace, WorkspaceCard,
         WorkspaceConfig, normalize_card_name,
@@ -234,11 +235,11 @@ enum NoticeSeverity {
 }
 
 impl NoticeSeverity {
-    fn icon(self) -> &'static str {
+    fn icon(self) -> Icon {
         match self {
-            Self::Success => "emblem-ok-symbolic",
-            Self::Warning => "dialog-warning-symbolic",
-            Self::Error => "dialog-error-symbolic",
+            Self::Success => Icon::Check,
+            Self::Warning => Icon::Warning,
+            Self::Error => Icon::Error,
         }
     }
 
@@ -505,21 +506,14 @@ fn notice_surface<'a>(
     action: Option<Element<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let mut children = vec![
-        crate::ui_controls::symbolic_icon(severity.icon())
-            .icon()
-            .size(16)
-            .into(),
-        body,
-    ];
+    let mut children = vec![severity.icon().handle().icon().size(16).into(), body];
     if let Some(action) = action {
         children.push(action);
     }
     let mut surface = widget::container(
         widget::row::with_children(children)
             .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs),
+            .spacing(space::S),
     )
     .class(cosmic::theme::Container::custom(move |theme| {
         let component = severity.component(theme.cosmic());
@@ -536,9 +530,9 @@ fn notice_surface<'a>(
         }
     }))
     .padding(if compact {
-        Padding::from([0, spacing.space_xs])
+        Padding::from([0.0, space::M])
     } else {
-        Padding::from(spacing.space_xs)
+        Padding::from(space::M)
     })
     .width(Length::Fill);
     if compact {
@@ -761,7 +755,6 @@ fn save_quarantine_view<'a>(
             }),
         )
     };
-    let spacing = cosmic::theme::spacing();
     Some(notice_surface(
         NoticeSeverity::Error,
         widget::column::with_children(vec![
@@ -769,7 +762,7 @@ fn save_quarantine_view<'a>(
             notice_surface_detail(NoticeSeverity::Error, detail.join("\n")),
             notice_surface_detail(NoticeSeverity::Error, guidance),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .width(Length::Fill)
         .into(),
         action,
@@ -842,7 +835,7 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             ),
             "Changes are being saved again.",
             Some(crate::interaction::tooltip(
-                widget::button::icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
+                widget::button::icon(Icon::Close)
                     .id(widget::Id::new("session-save.acknowledge-recovery"))
                     .name("Acknowledge session save recovery")
                     .width(ICON_CONTROL_SIZE)
@@ -860,7 +853,6 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             None,
         ),
     };
-    let spacing = cosmic::theme::spacing();
     Some(notice_surface(
         severity,
         widget::column::with_children(vec![
@@ -868,7 +860,7 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             notice_surface_detail(severity, detail),
             notice_surface_detail(severity, guidance),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .width(Length::Fill)
         .into(),
         action,
@@ -1351,55 +1343,55 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
     match kind {
         Some(CardKind::Terminal(_)) => CardLabels {
             type_label: "Terminal",
-            icon: "utilities-terminal-symbolic",
+            icon: Icon::Terminal,
             starting: "Starting terminal…",
             unavailable: "Terminal unavailable",
         },
         Some(CardKind::Chat(_)) => CardLabels {
             type_label: "Chat",
-            icon: "chat-bubble-text-symbolic",
+            icon: Icon::Chat,
             starting: "Connecting to agent…",
             unavailable: "Agent connection unavailable",
         },
         Some(CardKind::Browser(_)) => CardLabels {
             type_label: "Browser",
-            icon: "internet-web-browser-symbolic",
+            icon: Icon::Browser,
             starting: "Restoring browser…",
             unavailable: "Browser unavailable",
         },
         Some(CardKind::Repository(_)) => CardLabels {
             type_label: "Repository",
-            icon: "folder-symbolic",
+            icon: Icon::Folder,
             starting: "Loading repository…",
             unavailable: "Repository unavailable",
         },
         Some(CardKind::PullRequests(_)) => CardLabels {
             type_label: "Pull requests",
-            icon: "pull-request-symbolic",
+            icon: Icon::PullRequest,
             starting: "Loading pull requests…",
             unavailable: "Pull requests unavailable",
         },
         Some(CardKind::Settings) => CardLabels {
             type_label: "Settings",
-            icon: "emblem-system-symbolic",
+            icon: Icon::Settings,
             starting: "Loading settings…",
             unavailable: "Settings unavailable",
         },
         Some(CardKind::Accounts) => CardLabels {
             type_label: "Accounts",
-            icon: "avatar-default-symbolic",
+            icon: Icon::Avatar,
             starting: "Loading accounts…",
             unavailable: "Accounts unavailable",
         },
         Some(CardKind::Automations) => CardLabels {
             type_label: "Automations",
-            icon: "alarm-symbolic",
+            icon: Icon::Alarm,
             starting: "Loading automations…",
             unavailable: "Automations unavailable",
         },
         None => CardLabels {
             type_label: "Pane",
-            icon: "view-grid-symbolic",
+            icon: Icon::Grid,
             starting: "Starting pane…",
             unavailable: "Pane unavailable",
         },
@@ -4431,7 +4423,7 @@ impl PullRequestPane {
 /// Static chrome strings for a card kind.
 struct CardLabels {
     type_label: &'static str,
-    icon: &'static str,
+    icon: Icon,
     starting: &'static str,
     unavailable: &'static str,
 }
@@ -6428,7 +6420,6 @@ impl Cagents {
         pane: &'a PullRequestPane,
         width: f32,
     ) -> Element<'a, Message> {
-        let spacing = cosmic::theme::spacing();
         let collapsed = pane.file_panel_collapsed.unwrap_or(width < 640.0);
         let max_width = (width - 320.0).clamp(120.0, 600.0);
         let panel_width = pane.file_panel_width.clamp(120.0, max_width);
@@ -6450,7 +6441,8 @@ impl Cagents {
             side.push(
                 widget::container(
                     widget::row::with_children(vec![
-                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
+                        Icon::PullRequest
+                            .handle()
                             .icon()
                             .size(design::ROW_ICON_SIZE)
                             .into(),
@@ -6462,11 +6454,11 @@ impl Cagents {
                             .width(Length::Fill)
                             .into(),
                     ])
-                    .spacing(spacing.space_xxs)
+                    .spacing(space::S)
                     .align_y(Alignment::Center),
                 )
                 .height(Length::Fixed(design::HEADER_CONTENT_HEIGHT))
-                .padding([0, spacing.space_xs])
+                .padding([0.0, space::M])
                 .align_y(Alignment::Center)
                 .width(Length::Fill)
                 .into(),
@@ -6474,32 +6466,28 @@ impl Cagents {
             side.push(design::horizontal_rule());
             side.push(review.browser(modal_open));
         }
-        let side: Element<'a, pull_request_review::Action> = widget::container(
-            widget::column::with_children(side)
-                .spacing(0)
-                .height(Length::Fill),
-        )
-        .width(Length::Fixed(panel_width))
-        .height(Length::Fill)
-        .into();
+        let side: Element<'a, pull_request_review::Action> =
+            widget::container(widget::column::with_children(side).height(Length::Fill))
+                .width(Length::Fixed(panel_width))
+                .height(Length::Fill)
+                .into();
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
         let file_panel_toggle = || {
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon("view-sidebar-start-symbolic"),
+            crate::ui_controls::icon_button(
+                Icon::Sidebar,
                 if collapsed {
                     "Show review files"
                 } else {
                     "Hide review files"
                 },
-                !collapsed,
-                !modal_open,
-                Some(Message::ReviewFilePanelToggle {
-                    card: id,
-                    collapsed: !collapsed,
-                }),
             )
+            .selected(!collapsed)
+            .on_press_maybe((!modal_open).then(|| Message::ReviewFilePanelToggle {
+                card: id,
+                collapsed: !collapsed,
+            }))
         };
         let mut review_controls = Vec::new();
         if let Some(comment) =
@@ -6546,10 +6534,7 @@ impl Cagents {
             main.push(
                 widget::container(
                     widget::column::with_children(vec![
-                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
-                            .icon()
-                            .size(24)
-                            .into(),
+                        Icon::PullRequest.handle().icon().size(24).into(),
                         design::caption(prompt)
                             .class(cosmic::theme::Text::Custom(design::muted_text))
                             .wrapping(iced::widget::text::Wrapping::Word)
@@ -6558,16 +6543,15 @@ impl Cagents {
                             .into(),
                     ])
                     .align_x(Alignment::Center)
-                    .spacing(spacing.space_xs)
+                    .spacing(space::M)
                     .width(Length::Fill),
                 )
                 .center(Length::Fill)
-                .padding(spacing.space_m)
+                .padding(space::XL)
                 .into(),
             );
         }
         let main = widget::column::with_children(main)
-            .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -6591,7 +6575,6 @@ impl Cagents {
         }
         children.push(main);
         widget::row::with_children(children)
-            .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -8572,7 +8555,6 @@ impl Cagents {
         focused: bool,
         show_resize_splitter: bool,
     ) -> Element<'a, Message> {
-        let spacing = cosmic::theme::spacing();
         let card = self.card_state(id);
         let attention = self.sidebar_state.has_card_update(id) && !focused;
         let labels = card_kind_labels(card.map(|card| &card.kind));
@@ -8602,7 +8584,7 @@ impl Cagents {
             let can_go_back = active && session.history_index > 0;
             let can_go_forward =
                 active && session.history_index.saturating_add(1) < session.history.len();
-            let mut address_input = widget::text_input("URL", address)
+            let mut address_input = crate::ui_controls::field::text("URL", address)
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -8624,21 +8606,19 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "go-previous-symbolic",
-                        ))
-                        .id(chrome.map_or_else(
-                            || card_control_id(id, "browser.back"),
-                            |chrome| chrome.browser_back_id.clone(),
-                        ))
-                        .name("Back")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
+                        widget::button::icon(Icon::ChevronLeft)
+                            .id(chrome.map_or_else(
+                                || card_control_id(id, "browser.back"),
+                                |chrome| chrome.browser_back_id.clone(),
+                            ))
+                            .name("Back")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
                         "Back",
                     ),
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon("go-next-symbolic"))
+                        widget::button::icon(Icon::ChevronRight)
                             .id(chrome.map_or_else(
                                 || card_control_id(id, "browser.forward"),
                                 |chrome| chrome.browser_forward_id.clone(),
@@ -8650,13 +8630,11 @@ impl Cagents {
                         "Forward",
                     ),
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon(
-                            if browser_loading {
-                                "process-stop-symbolic"
-                            } else {
-                                "view-refresh-symbolic"
-                            },
-                        ))
+                        widget::button::icon(if browser_loading {
+                            Icon::Cancel
+                        } else {
+                            Icon::Refresh
+                        })
                         .id(chrome.map_or_else(
                             || card_control_id(id, "browser.reload"),
                             |chrome| chrome.browser_reload_id.clone(),
@@ -8675,23 +8653,21 @@ impl Cagents {
                     ),
                     address_input.into(),
                     crate::interaction::tooltip_above(
-                        widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "document-import-symbolic",
-                        ))
-                        .id(card_control_id(id, "browser.import-logins"))
-                        .name("Import browser logins")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press(Message::BrowserImport(browser_import_ui::Action::Open)),
+                        widget::button::icon(Icon::Import)
+                            .id(card_control_id(id, "browser.import-logins"))
+                            .name("Import browser logins")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press(Message::BrowserImport(browser_import_ui::Action::Open)),
                         "Import browser logins",
                     ),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(spacing.space_xxxs)
+                .spacing(space::XS)
                 .width(Length::Fill),
             )
             .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
-            .padding([0, spacing.space_xxs])
+            .padding([0.0, space::S])
             .class(cosmic::theme::Container::Background);
             let browser_loading = match self.cards.get(&id) {
                 Some(CardRuntime::Browser(browser)) => {
@@ -8738,7 +8714,7 @@ impl Cagents {
                     .into(),
                 );
             }
-            widget::column::with_children(rows).spacing(0).into()
+            widget::column::with_children(rows).into()
         });
 
         // A card that kept model focus under an open dialog would take the
@@ -8751,7 +8727,7 @@ impl Cagents {
             let address = chrome
                 .map(|chrome| chrome.caption.as_str())
                 .unwrap_or(SanitizedLocation::INVALID);
-            let address = widget::text_input("Saved URL", address)
+            let address = crate::ui_controls::field::text("Saved URL", address)
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -8760,19 +8736,18 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     address.into(),
-                    widget::button::suggested("Open in system browser")
+                    crate::ui_controls::button::primary("Open in system browser")
                         .on_press(Message::RetryCard(id))
                         .into(),
                 ])
                 .align_y(Alignment::Center)
-                .spacing(spacing.space_xxxs)
+                .spacing(space::XS)
                 .width(Length::Fill),
             )
             .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
-            .padding([0, spacing.space_xxs])
+            .padding([0.0, space::S])
             .class(cosmic::theme::Container::Background);
             widget::column::with_children(vec![toolbar.into(), crate::design::horizontal_rule()])
-                .spacing(0)
                 .into()
         });
 
@@ -8958,14 +8933,15 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
-                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                            Icon::Warning
+                                .handle()
                                 .icon()
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
-                            widget::text::title3(labels.unavailable).into(),
+                            design::title(labels.unavailable).into(),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .into(),
                         widget::selectable_text(message)
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
@@ -8975,7 +8951,7 @@ impl Cagents {
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
                             let mut controls = vec![
-                                widget::button::suggested(retry_label)
+                                crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
                                     .on_press(Message::RetryCard(id))
@@ -8986,15 +8962,17 @@ impl Cagents {
                             // be the one who asks for it.
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
-                                    widget::button::standard("Start a new conversation here")
-                                        .id(card_control_id(id, "chat.fresh"))
-                                        .name("Start a new conversation in the same directory")
-                                        .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
-                                        .into(),
+                                    crate::ui_controls::button::secondary(
+                                        "Start a new conversation here",
+                                    )
+                                    .id(card_control_id(id, "chat.fresh"))
+                                    .name("Start a new conversation in the same directory")
+                                    .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
+                                    .into(),
                                 );
                             }
                             controls.push(
-                                widget::button::standard("Close")
+                                crate::ui_controls::button::secondary("Close")
                                     .id(card_control_id(id, "failed.close"))
                                     .name(format!("Close {}", labels.type_label))
                                     .on_press(Message::CloseCard(id))
@@ -9002,35 +8980,35 @@ impl Cagents {
                             );
                             controls
                         })
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .into(),
                     ])
-                    .spacing(spacing.space_s),
+                    .spacing(space::L),
                 )
                 .class(cosmic::theme::Container::Secondary)
                 .max_width(520)
-                .padding(spacing.space_m),
+                .padding(space::XL),
             )
             .center(Length::Fill)
             .into(),
             Some(CardRuntime::Loading) | None => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
-                        crate::ui_controls::activity_spinner_tone(24.0, design::accent_color),
-                        widget::text::title3(labels.starting).into(),
+                        crate::ui_controls::activity_spinner(24.0, design::accent_color),
+                        design::title(labels.starting).into(),
                         design::caption("Preparing this workspace pane…")
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .into(),
                     ])
                     .align_x(Alignment::Center)
-                    .spacing(spacing.space_xs),
+                    .spacing(space::M),
                 )
                 .class(cosmic::theme::Container::Card)
                 .max_width(STATUS_SURFACE_MAX_WIDTH)
-                .padding(spacing.space_m),
+                .padding(space::XL),
             )
             .center(Length::Fill)
-            .padding(spacing.space_m)
+            .padding(space::XL)
             .into(),
         };
 
@@ -9049,14 +9027,11 @@ impl Cagents {
                     extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
                 });
             let preview = html.then(|| {
-                crate::ui_controls::icon_control(
-                    crate::ui_controls::symbolic_icon("internet-web-browser-symbolic"),
-                    "Preview HTML",
-                    false,
-                    !self.modal_is_open(),
-                    Some(Message::PreviewLocalFile(id)),
-                )
-                .into()
+                crate::ui_controls::icon_button(Icon::Browser, "Preview HTML")
+                    .on_press_maybe(
+                        (!self.modal_is_open()).then_some(Message::PreviewLocalFile(id)),
+                    )
+                    .into()
             });
             if let Some(toolbar) = repository_widget::selected_file_toolbar_mapped_with(
                 id,
@@ -9077,25 +9052,22 @@ impl Cagents {
             // the output stops: the last lines it printed stay in view.
             rows.push(self.ended_terminal_footer(id, session));
         }
-        let surface: Element<'a, Message> = widget::container(
-            widget::column::with_children(rows)
-                .spacing(0)
-                .height(Length::Fill),
-        )
-        .class(cosmic::theme::Container::custom(move |theme| {
-            iced::widget::container::Style {
-                background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
-                border: iced::Border {
-                    color: design::warning_color(theme),
-                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
+        let surface: Element<'a, Message> =
+            widget::container(widget::column::with_children(rows).height(Length::Fill))
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
+                        border: iced::Border {
+                            color: design::warning_color(theme),
+                            width: if attention { design::BORDER_WIDTH } else { 0.0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                }))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         let edge: Element<'a, Message> = if card.is_some() {
             if show_resize_splitter {
                 let limits = self.workspace.card_resize_limits(id);
@@ -9375,9 +9347,9 @@ impl Cagents {
                         design::body(title).into(),
                         design::caption(detail).into(),
                     ])
-                    .spacing(design::GRID_UNIT),
+                    .spacing(space::XS),
                 )
-                .padding(2.0 * design::GRID_UNIT)
+                .padding(space::S)
                 .width(Length::Fill)
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
@@ -9399,11 +9371,11 @@ impl Cagents {
         rows.push(design::caption("Release the modifier to open · Escape to cancel").into());
         Some(
             widget::container(
-                widget::scrollable(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
                     .height(Length::Shrink),
             )
             .class(cosmic::theme::Container::Card)
-            .padding(3.0 * design::GRID_UNIT)
+            .padding(space::M)
             .width(440)
             .max_height(400)
             .into(),
@@ -15696,14 +15668,14 @@ impl Application for Cagents {
     fn dialog(&self) -> Option<Element<'_, Message>> {
         if self.transient_work_close.is_some() {
             let mut controls: Vec<Element<'_, Message>> = vec![
-                widget::button::standard("Cancel close")
+                crate::ui_controls::button::secondary("Cancel close")
                     .id(widget::Id::new("dialog.transient-close.cancel"))
                     .on_press(Message::CancelTransientWorkClose)
                     .into(),
             ];
             if self.device_ui.dirty() {
                 controls.push(
-                    widget::button::suggested("Return to file")
+                    crate::ui_controls::button::primary("Return to file")
                         .on_press(Message::ReturnToDeviceBeforeClose)
                         .into(),
                 );
@@ -15711,15 +15683,15 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
-                        widget::text::title3("Keep unsaved work before closing").into(),
+                        design::title("Keep unsaved work before closing").into(),
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
                         widget::row::with_children(controls)
-                            .spacing(cosmic::theme::spacing().space_xxs)
+                            .spacing(space::S)
                             .into(),
                     ])
-                    .spacing(3.0 * design::GRID_UNIT),
+                    .spacing(space::M),
                     480.0,
                 ),
                 Some(Message::CancelTransientWorkClose),
@@ -15757,7 +15729,6 @@ impl Application for Cagents {
                 )
             });
         }
-        let spacing = cosmic::theme::spacing();
         // Above the settings surface it is raised from, because it is about to
         // discard every shortcut, font, theme and language-server entry the
         // user configured, with no undo.
@@ -15765,7 +15736,7 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
-                        widget::text::title3("Reset all settings?").into(),
+                        design::title("Reset all settings?").into(),
                         notice_body(
                             "Every customization returns to its default: keyboard shortcuts, \
                              terminal font and theme, editor syntax theme, interface scale, \
@@ -15774,19 +15745,19 @@ impl Application for Cagents {
                         notice_detail("This cannot be undone."),
                         widget::row::with_children(vec![
                             iced::widget::Space::new().width(Length::Fill).into(),
-                            widget::button::standard("Cancel")
+                            crate::ui_controls::button::secondary("Cancel")
                                 .id(widget::Id::new("dialog.reset-settings.cancel"))
                                 .on_press(Message::CancelResetSettings)
                                 .into(),
-                            widget::button::destructive("Reset settings")
+                            crate::ui_controls::button::destructive("Reset settings")
                                 .id(widget::Id::new("dialog.reset-settings.confirm"))
                                 .on_press(Message::ConfirmResetSettings)
                                 .into(),
                         ])
-                        .spacing(spacing.space_xxs)
+                        .spacing(space::S)
                         .into(),
                     ])
-                    .spacing(3.0 * design::GRID_UNIT),
+                    .spacing(space::M),
                     480.0,
                 ),
                 Some(Message::CancelResetSettings),
@@ -15812,13 +15783,13 @@ impl Application for Cagents {
                 .card_state(card)
                 .map_or("Repository".into(), |state| state.title.clone());
             let mut rows: Vec<Element<'_, Message>> = vec![
-                widget::text::title3(if runtime.has_durability_warning() {
+                design::title(if runtime.has_durability_warning() {
                     format!("Confirm the save to {title} before closing")
                 } else {
                     format!("Save changes to {title}?")
                 })
                 .into(),
-                widget::text::body(if runtime.has_durability_warning() {
+                design::body(if runtime.has_durability_warning() {
                     "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
                 } else {
                     "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
@@ -15828,7 +15799,7 @@ impl Application for Cagents {
             ];
             if let Some(error) = runtime.save_error() {
                 rows.push(
-                    widget::text::body(error.to_owned())
+                    design::body(error.to_owned())
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                 );
@@ -15841,7 +15812,7 @@ impl Application for Cagents {
                     Message::SaveAndCloseRepository(card)
                 });
             let mut controls: Vec<Element<'_, Message>> = vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
                     .on_press_maybe(
                         (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
@@ -15850,14 +15821,14 @@ impl Application for Cagents {
             ];
             if runtime.can_abandon_unsaved_changes() {
                 controls.push(
-                    widget::button::destructive("Discard")
+                    crate::ui_controls::button::destructive("Discard")
                         .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
                         .on_press(Message::DiscardAndCloseRepository(card))
                         .into(),
                 );
             }
             controls.push(
-                widget::button::suggested(if runtime.has_save_conflict() {
+                crate::ui_controls::button::primary(if runtime.has_save_conflict() {
                     "Overwrite and close"
                 } else if runtime.has_durability_warning() {
                     "Retry save and close"
@@ -15870,15 +15841,13 @@ impl Application for Cagents {
             );
             rows.push(
                 widget::row::with_children(controls)
-                    .spacing(spacing.space_xxs)
+                    .spacing(space::S)
                     .into(),
             );
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
-                    widget::container(
-                        widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                    )
-                    .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    widget::container(widget::column::with_children(rows).spacing(space::M))
+                        .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
                     560.0,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
@@ -15930,34 +15899,34 @@ impl Application for Cagents {
             None => route,
         };
         let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3("Create pull request").into(),
+            design::title("Create pull request").into(),
             design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
             widget::column::with_children(vec![
                 design::caption("Title").into(),
-                widget::text_input("Title", &dialog.title)
+                crate::ui_controls::field::text("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             widget::column::with_children(vec![
                 design::caption("Head branch").into(),
-                widget::text_input("Head branch", &dialog.head)
+                crate::ui_controls::field::text("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             widget::column::with_children(vec![
                 design::caption("Base branch").into(),
-                widget::text_input("Base branch", &dialog.base)
+                crate::ui_controls::field::text("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
             widget::column::with_children(vec![
                 design::caption("Description").into(),
@@ -15967,22 +15936,22 @@ impl Application for Cagents {
                     .on_action(Message::PullRequestBodyChanged)
                     .into(),
             ])
-            .spacing(spacing.space_xxxs)
+            .spacing(space::XS)
             .into(),
-            widget::checkbox(dialog.draft)
+            crate::ui_controls::field::checkbox(dialog.draft)
                 .label("Create as draft")
                 .on_toggle(Message::PullRequestDraftChanged)
                 .into(),
         ];
         if let Some(confirmed) = dialog.retry_confirmation {
             rows.push(
-                widget::text::body(
+                design::body(
                     "GitHub may have created this pull request. Check GitHub before retrying to avoid creating a duplicate.",
                 )
                 .into(),
             );
             rows.push(
-                widget::checkbox(confirmed)
+                crate::ui_controls::field::checkbox(confirmed)
                     .label("I checked GitHub; no pull request was created")
                     .on_toggle(Message::PullRequestRetryConfirmed)
                     .into(),
@@ -15990,10 +15959,10 @@ impl Application for Cagents {
         }
         rows.push(
             widget::row::with_children(vec![
-                widget::button::standard("Cancel")
+                crate::ui_controls::button::secondary("Cancel")
                     .on_press(Message::CancelDialog)
                     .into(),
-                widget::button::suggested("Create")
+                crate::ui_controls::button::primary("Create")
                     .on_press_maybe(
                         (!head.is_empty()
                             && !base.is_empty()
@@ -16008,17 +15977,14 @@ impl Application for Cagents {
                     )
                     .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .into(),
         );
         Some(dialog_ui::overlay(
             dialog_ui::surface(
-                widget::scrollable(
-                    widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                )
-                .height(Length::Fixed(
-                    (self.window_height - 112.0).clamp(120.0, 620.0),
-                )),
+                widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(
+                    Length::Fixed((self.window_height - 112.0).clamp(120.0, 620.0)),
+                ),
                 620.0,
             ),
             Some(Message::CancelDialog),
@@ -16034,7 +16000,6 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -16089,23 +16054,15 @@ impl Application for Cagents {
                 .unwrap_or_else(|| "Workspace".into());
             let quick = |glyph, label, id, message| {
                 Element::from(
-                    crate::ui_controls::icon_control(
-                        crate::ui_controls::symbolic_icon(glyph),
-                        label,
-                        false,
-                        true,
-                        Some(message),
-                    )
-                    .id(widget::Id::new(id)),
+                    crate::ui_controls::icon_button(glyph, label)
+                        .on_press(message)
+                        .id(widget::Id::new(id)),
                 )
             };
             let mut actions: Vec<Element<'_, Message>> = vec![
                 crate::interaction::tooltip(
-                    widget::button::suggested("New conversation")
-                        .name("New conversation")
-                        .leading_icon(crate::ui_controls::symbolic_icon(
-                            "chat-bubble-text-symbolic",
-                        ))
+                    crate::ui_controls::button::primary("New conversation")
+                        .icon(Icon::Chat)
                         .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
                             chrome_ui::NewTab::Thread,
                         ))),
@@ -16115,13 +16072,13 @@ impl Application for Cagents {
                     ),
                 ),
                 quick(
-                    "document-open-recent-symbolic",
+                    Icon::History,
                     "Resume conversation".to_owned(),
                     "empty.resume-conversation",
                     Message::ResumeConversation(resume_ui::Action::Open),
                 ),
                 quick(
-                    "utilities-terminal-symbolic",
+                    Icon::Terminal,
                     workspace_widget::shortcut_tooltip(
                         workspace_widget::GlobalShortcut::NewTerminal,
                         &self.settings.keyboard_shortcuts,
@@ -16130,7 +16087,7 @@ impl Application for Cagents {
                     Message::NewTerminal,
                 ),
                 quick(
-                    "internet-web-browser-symbolic",
+                    Icon::Browser,
                     if cfg!(feature = "integrated-browser") {
                         "New browser"
                     } else {
@@ -16141,7 +16098,7 @@ impl Application for Cagents {
                     Message::NewBrowser,
                 ),
                 quick(
-                    "avatar-default-symbolic",
+                    Icon::Avatar,
                     "Agent accounts".to_owned(),
                     "empty.accounts",
                     Message::AccountUi(account_ui::Action::OpenPane),
@@ -16155,16 +16112,13 @@ impl Application for Cagents {
                 primary,
                 widget::row::with_children(actions)
                     .align_y(Alignment::Center)
-                    .spacing(8)
+                    .spacing(space::S)
                     .into(),
             ])
-            .spacing(12);
+            .spacing(space::M);
             let mut content: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::passive_icon(
-                    crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic"),
-                    32,
-                ),
-                widget::text::title2(if scoped {
+                crate::ui_controls::passive_icon(Icon::Chat, 32),
+                design::display(if scoped {
                     scope_name
                 } else {
                     "Workspace".into()
@@ -16188,32 +16142,31 @@ impl Application for Cagents {
                             .into_iter()
                             .map(|provider| {
                                 let status = self.account_ui.provider_status(provider);
-                                let control = crate::ui_controls::icon_control(
+                                let control = crate::ui_controls::icon_button(
                                     crate::ui_controls::provider_icon(provider),
                                     format!("{} · {status} · Manage accounts", provider.label()),
-                                    false,
-                                    true,
-                                    Some(Message::AccountUi(account_ui::Action::OpenPane)),
-                                );
+                                )
+                                .on_press(Message::AccountUi(account_ui::Action::OpenPane));
                                 Element::from(if status == "Account available" {
-                                    control.icon_tone(design::Tone::Themed(design::success_color))
+                                    control.tone(design::Tone::Themed(design::success_color))
                                 } else {
                                     control
                                 })
                             })
                             .collect::<Vec<_>>(),
                     )
-                    .spacing(12)
+                    .spacing(space::M)
                     .into(),
                 );
             }
-            let surface = widget::container(widget::column::with_children(content).spacing(16))
-                .padding(24)
-                .width(Length::Fill)
-                .max_width(440);
+            let surface =
+                widget::container(widget::column::with_children(content).spacing(space::L))
+                    .padding(space::XL)
+                    .width(Length::Fill)
+                    .max_width(440);
             widget::container(surface)
                 .center(Length::Fill)
-                .padding(spacing.space_m)
+                .padding(space::XL)
                 .into()
         } else {
             workspace_widget::view(
@@ -16306,7 +16259,6 @@ impl Application for Cagents {
                 InspectorLayout::Docked => {
                     let content: Element<'_, Message> =
                         widget::row::with_children(vec![sidebar, main_content, pane])
-                            .spacing(0)
                             .width(Length::Fill)
                             .height(Length::Fill)
                             .into();
@@ -16330,7 +16282,6 @@ impl Application for Cagents {
                             .into(),
                     );
                     let background = widget::row::with_children(vec![sidebar, main_content])
-                        .spacing(0)
                         .width(Length::Fill)
                         .height(Length::Fill);
                     let dismiss = crate::interaction::opaque(
@@ -18894,7 +18845,7 @@ mod tests {
         let renderer = headless_renderer();
         let mut element = dialog_ui::overlay(
             dialog_ui::surface(
-                widget::button::text("Confirm").on_press(Message::CancelDialog),
+                crate::ui_controls::button::quiet("Confirm").on_press(Message::CancelDialog),
                 320.0,
             ),
             Some(Message::CancelDialog),

@@ -9,7 +9,7 @@ pub(crate) fn surface<'a, M: 'a>(
     crate::interaction::opaque(
         widget::container(content)
             .class(cosmic::theme::Container::Dialog(false))
-            .padding(4.0 * design::GRID_UNIT)
+            .padding(space::L)
             .width(Length::Fill)
             .max_width(max_width),
     )
@@ -17,7 +17,7 @@ pub(crate) fn surface<'a, M: 'a>(
 }
 
 /// The closing row every confirmation shares: right-aligned, the dismissal
-/// before the committing action, on the theme's spacing token.
+/// before the committing action, a sibling-control gap apart.
 pub(super) fn confirmation_actions<'a>(
     dismiss: impl Into<Element<'a, Message>>,
     confirm: impl Into<Element<'a, Message>>,
@@ -27,7 +27,7 @@ pub(super) fn confirmation_actions<'a>(
         dismiss.into(),
         confirm.into(),
     ])
-    .spacing(cosmic::theme::spacing().space_xxs)
+    .spacing(space::S)
     .into()
 }
 
@@ -61,7 +61,7 @@ pub(super) fn overlay<'a>(
         progress,
     ))
     .center(Length::Fill)
-    .padding(4.0 * design::GRID_UNIT)
+    .padding(space::L)
     .width(Length::Fill)
     .height(Length::Fill)
     .into();

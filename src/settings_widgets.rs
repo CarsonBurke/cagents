@@ -1,5 +1,8 @@
 //! Shared settings rows and search metadata for the workbench and editor.
-use crate::{design, settings::EditorSyntaxTheme};
+use crate::{
+    design::{self, space},
+    settings::EditorSyntaxTheme,
+};
 use cosmic::{
     Element,
     iced::{self, Length},
@@ -36,7 +39,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     fn view(self) -> Element<'a, Message> {
         let mut children = Vec::new();
         if !self.label_in_control {
-            children.push(widget::text::caption_heading(self.label).into());
+            children.push(design::heading(self.label).into());
         }
         children.push(self.control);
         if let Some(error) = self.error {
@@ -55,7 +58,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
                 .into(),
         );
         widget::column::with_children(children)
-            .spacing(design::GRID_UNIT)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }
@@ -112,7 +115,7 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         if settings.is_empty() {
             return None;
         }
-        let mut heading: Vec<Element<'a, Message>> = vec![widget::text::title4(self.title).into()];
+        let mut heading: Vec<Element<'a, Message>> = vec![design::title(self.title).into()];
         if !self.detail.is_empty() {
             heading.push(
                 design::caption(self.detail)
@@ -123,13 +126,13 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         }
         let mut children = vec![
             widget::column::with_children(heading)
-                .spacing(design::GRID_UNIT)
+                .spacing(space::XS)
                 .into(),
         ];
         children.append(&mut settings);
         Some(
             widget::column::with_children(children)
-                .spacing(4.0 * design::GRID_UNIT)
+                .spacing(space::L)
                 .width(Length::Fill)
                 .into(),
         )
@@ -152,9 +155,9 @@ pub fn toggle_enabled<'a, Message: 'static>(
     enabled: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
 ) -> Element<'a, Message> {
-    widget::toggler(value)
+    crate::ui_controls::field::toggle(value)
         .label(label.to_owned())
-        .spacing(3.0 * design::GRID_UNIT)
+        .spacing(space::M)
         .width(Length::Fill)
         .on_toggle_maybe(enabled.then_some(on_toggle))
         .into()
@@ -182,7 +185,7 @@ pub fn editor_options<'a, Message: Clone + 'static>(
         field(
             "Syntax theme",
             "Syntax highlighting in editors and diffs. Match app follows the application appearance theme.",
-            widget::dropdown(
+            crate::ui_controls::field::select(
                 EditorSyntaxTheme::ALL
                     .iter()
                     .map(|theme| theme.label().to_owned())

@@ -25,7 +25,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    design::{self, ROW_ICON_SIZE},
+    design::{self, ROW_ICON_SIZE, space},
     github::{
         FileViewedState, GitHubRepoKey, GitHubReviewApi, PullRequest, PullRequestFiles,
         PullRequestKey, PullRequestPage, ReviewContext, ReviewMutationOutcome,
@@ -37,7 +37,7 @@ use crate::{
         line_change_counts,
     },
     sidebar::{CheckStatus, FileListMode, WorktreePullRequestState, sidebar_button_style},
-    ui_controls::{icon_control, symbolic_icon},
+    ui_controls::{Icon, icon_button},
 };
 
 type ActionTask = iced::Task<Action>;
@@ -1616,17 +1616,16 @@ impl State {
     /// in [`Self::summary`] beneath it instead of being elided to a few
     /// letters between the controls.
     pub fn header<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let Some(target) = &self.target else {
             return widget::Space::new().into();
         };
         let pull_request = &target.pull_request;
         let state = WorktreePullRequestState::from_github(pull_request);
         let (icon, state_label) = match state {
-            Some(WorktreePullRequestState::Merged) => ("merged-pull-request-symbolic", "Merged"),
-            Some(WorktreePullRequestState::Closed) => ("closed-pull-request-symbolic", "Closed"),
-            Some(WorktreePullRequestState::Draft) => ("pull-request-symbolic", "Draft"),
-            Some(WorktreePullRequestState::Open) | None => ("pull-request-symbolic", "Open"),
+            Some(WorktreePullRequestState::Merged) => (Icon::MergedPullRequest, "Merged"),
+            Some(WorktreePullRequestState::Closed) => (Icon::ClosedPullRequest, "Closed"),
+            Some(WorktreePullRequestState::Draft) => (Icon::PullRequest, "Draft"),
+            Some(WorktreePullRequestState::Open) | None => (Icon::PullRequest, "Open"),
         };
         let tone = match state {
             Some(WorktreePullRequestState::Merged) => design::Tone::Themed(design::accent_color),
@@ -1640,7 +1639,7 @@ impl State {
         };
         let identity = crate::interaction::tooltip(
             widget::row::with_children(vec![
-                widget::icon::icon(symbolic_icon(icon))
+                widget::icon::icon(icon.handle())
                     .size(ROW_ICON_SIZE)
                     .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
                         cosmic::iced::widget::svg::Style {
@@ -1652,7 +1651,7 @@ impl State {
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .align_y(Alignment::Center),
             format!(
                 "{state_label} pull request #{} in {}/{}",
@@ -1665,49 +1664,35 @@ impl State {
         // controls after it by an index, and iced reconciles named children
         // by the index their name held last frame.
         let activity: Element<'_, Action> = widget::container(if busy {
-            crate::ui_controls::activity_spinner_tone(14.0, design::muted_icon_color)
+            crate::ui_controls::activity_spinner(14.0, design::muted_icon_color)
         } else {
             widget::Space::new().into()
         })
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
-            icon_control(
-                symbolic_icon("git-branch-symbolic"),
-                "Create worktree from reviewed commit",
-                false,
-                !modal_open && !busy && self.context.is_some() && self.range.is_some(),
-                Some(self.fenced(Action::Checkout)),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("view-refresh-symbolic"),
+            icon_button(Icon::Branch, "Create worktree from reviewed commit")
+                .on_press_maybe(
+                    (!modal_open && !busy && self.context.is_some() && self.range.is_some())
+                        .then(|| self.fenced(Action::Checkout)),
+                )
+                .into(),
+            icon_button(
+                Icon::Refresh,
                 if busy {
                     "Refreshing pull request"
                 } else {
                     "Refresh pull request"
                 },
-                false,
-                !modal_open && !busy,
-                Some(Action::Refresh),
             )
+            .on_press_maybe((!modal_open && !busy).then_some(Action::Refresh))
             .into(),
-            icon_control(
-                symbolic_icon("external-link-symbolic"),
-                "Open on GitHub",
-                false,
-                !modal_open,
-                Some(Action::OpenUrl(pull_request.url.clone())),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("window-close-symbolic"),
-                "Close review",
-                false,
-                !modal_open,
-                Some(Action::Close),
-            )
-            .into(),
+            icon_button(Icon::PopOut, "Open on GitHub")
+                .on_press_maybe((!modal_open).then(|| Action::OpenUrl(pull_request.url.clone())))
+                .into(),
+            icon_button(Icon::Close, "Close review")
+                .on_press_maybe((!modal_open).then_some(Action::Close))
+                .into(),
         ]);
         widget::row::with_children(vec![
             identity,
@@ -1715,9 +1700,9 @@ impl State {
             activity,
             controls,
         ])
-        .spacing(spacing.space_xxs)
+        .spacing(space::S)
         .align_y(Alignment::Center)
-        .padding(Padding::from([0, spacing.space_xs]))
+        .padding(Padding::from([0.0, space::M]))
         .height(design::HEADER_CONTENT_HEIGHT)
         .width(Length::Fill)
         .into()
@@ -1726,7 +1711,6 @@ impl State {
     /// What is under review, in full: the title given the room to wrap, who
     /// proposes merging which branch into which, and the review entry point.
     pub fn summary<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let Some(target) = &self.target else {
             return widget::Space::new().into();
         };
@@ -1779,17 +1763,17 @@ impl State {
                     .into(),
                 self.review_control(modal_open),
             ])
-            .spacing(spacing.space_xs)
+            .spacing(space::M)
             .align_y(Alignment::Center)
             .padding(Padding {
-                top: spacing.space_xxs.into(),
+                top: space::S,
                 ..Padding::ZERO
             })
             .into(),
         );
         widget::column::with_children(rows)
-            .spacing(spacing.space_xxxs)
-            .padding(Padding::from([spacing.space_xs, spacing.space_xs]))
+            .spacing(space::XS)
+            .padding(Padding::from([space::M, space::M]))
             .width(Length::Fill)
             .into()
     }
@@ -1827,7 +1811,6 @@ impl State {
     }
 
     fn pane_notice(&self, modal_open: bool) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let message = match (&self.load, &self.notice) {
             (LoadState::Failed(message), _) => {
                 Cow::Owned(format!("Couldn’t load this pull request. {message}"))
@@ -1840,21 +1823,11 @@ impl State {
             }
         };
         let dismiss = if matches!(self.load, LoadState::Failed(_)) {
-            icon_control(
-                symbolic_icon("view-refresh-symbolic"),
-                "Try again",
-                false,
-                !modal_open,
-                Some(Action::Refresh),
-            )
+            icon_button(Icon::Refresh, "Try again")
+                .on_press_maybe((!modal_open).then_some(Action::Refresh))
         } else {
-            icon_control(
-                symbolic_icon("window-close-symbolic"),
-                "Dismiss",
-                false,
-                !modal_open,
-                Some(Action::DismissNotice),
-            )
+            icon_button(Icon::Close, "Dismiss")
+                .on_press_maybe((!modal_open).then_some(Action::DismissNotice))
         };
         widget::container(
             widget::row::with_children(vec![
@@ -1865,8 +1838,8 @@ impl State {
                 dismiss.into(),
             ])
             .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs)
-            .padding(Padding::from([spacing.space_xxxs, spacing.space_xs])),
+            .spacing(space::S)
+            .padding(Padding::from([space::XS, space::M])),
         )
         .width(Length::Fill)
         .into()
@@ -1875,48 +1848,35 @@ impl State {
     /// The file tree with a viewed mark per file and a tri-state mark per
     /// directory. Folders start open and may be folded independently.
     pub fn file_list(&self, modal_open: bool) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let list: Element<'_, Action> = crate::ui_controls::responsive(move |size| {
             self.file_scrollable(modal_open, size.height)
         })
         .into();
         let (mode_icon, mode_label, next_mode) = match self.file_list_mode {
-            FileListMode::Tree => ("view-list-symbolic", "View as list", FileListMode::Flat),
-            FileListMode::Flat => (
-                "view-list-tree-symbolic",
-                "View as tree",
-                FileListMode::Tree,
-            ),
+            FileListMode::Tree => (Icon::List, "View as list", FileListMode::Flat),
+            FileListMode::Flat => (Icon::Tree, "View as tree", FileListMode::Tree),
         };
         let controls = crate::ui_controls::toolbar_actions(vec![
-            icon_control(
-                symbolic_icon(mode_icon),
-                mode_label,
-                false,
-                !modal_open,
-                Some(Action::SetFileListMode(next_mode)),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("view-filter-symbolic"),
+            icon_button(mode_icon, mode_label)
+                .on_press_maybe((!modal_open).then_some(Action::SetFileListMode(next_mode)))
+                .into(),
+            icon_button(
+                Icon::Filter,
                 if self.hide_viewed {
                     "Show viewed files"
                 } else {
                     "Hide viewed files"
                 },
-                self.hide_viewed,
-                !modal_open,
-                Some(Action::ToggleHideViewed),
             )
+            .selected(self.hide_viewed)
+            .on_press_maybe((!modal_open).then_some(Action::ToggleHideViewed))
             .into(),
-            icon_control(
-                symbolic_icon("go-next-symbolic"),
-                "Next unviewed file",
-                false,
-                !modal_open && self.files.iter().any(|file| !file.viewed),
-                Some(Action::NextUnviewed),
-            )
-            .into(),
+            icon_button(Icon::ChevronRight, "Next unviewed file")
+                .on_press_maybe(
+                    (!modal_open && self.files.iter().any(|file| !file.viewed))
+                        .then_some(Action::NextUnviewed),
+                )
+                .into(),
         ]);
         let viewed = self.files.iter().filter(|file| file.viewed).count();
         let toolbar = widget::row::with_children(vec![
@@ -1926,7 +1886,7 @@ impl State {
             controls,
         ])
         .align_y(Alignment::Center)
-        .padding([0, spacing.space_xs]);
+        .padding([0.0, space::M]);
         let unknown = self
             .files
             .iter()
@@ -1943,7 +1903,7 @@ impl State {
         }
         if self.pages.cursor.is_some() {
             status.push(
-                widget::button::text(if self.pages.loading {
+                crate::ui_controls::button::quiet(if self.pages.loading {
                     "Loading viewed states…"
                 } else if self.pages.error.is_some() {
                     "Retry viewed states"
@@ -1981,7 +1941,6 @@ impl State {
     }
 
     fn file_scrollable(&self, modal_open: bool, height: f32) -> Element<'_, Action> {
-        let spacing = cosmic::theme::spacing();
         let tallies = directory_tallies(&self.rows, &self.files);
         let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> = Vec::new();
         let displayed = self.displayed_file_rows(&tallies);
@@ -2040,7 +1999,7 @@ impl State {
                     depth: 0,
                     directory: false,
                     element: widget::container(design::caption(message))
-                        .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                        .padding(Padding::from([space::S, space::M]))
                         .into(),
                 });
             }
@@ -2048,8 +2007,8 @@ impl State {
         widget::scrollable(
             widget::container(crate::sticky_tree::rows(rows, design::DENSE_ROW_HEIGHT))
                 .padding(design::with_vertical_rail(Padding::from([
-                    spacing.space_xxxs,
-                    spacing.space_xxs,
+                    space::XS,
+                    space::S,
                 ])))
                 .width(Length::Fill),
         )
@@ -2072,7 +2031,6 @@ impl State {
         file: &'a ReviewFile,
         modal_open: bool,
     ) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let selected = self.selected.as_ref() == Some(&row.path);
         let counts = line_change_counts(file.entry.added_lines, file.entry.removed_lines);
         let mut trailing: Vec<Element<'a, Action>> = Vec::with_capacity(3);
@@ -2086,7 +2044,7 @@ impl State {
             );
         }
         if !counts.is_empty() {
-            trailing.push(design::change_counts(&counts));
+            trailing.push(crate::ui_controls::change_counts(&counts));
         }
         let (comments, unresolved) = self.discussion_counts(&row.path.display());
         if comments > 0 {
@@ -2143,11 +2101,11 @@ impl State {
                 .into(),
             name,
             widget::row::with_children(trailing)
-                .spacing(spacing.space_xxs)
+                .spacing(space::S)
                 .align_y(Alignment::Center)
                 .into(),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .height(Length::Fill);
         crate::interaction::hover(
@@ -2155,7 +2113,7 @@ impl State {
                 .class(sidebar_button_style(selected))
                 .name(format!("Review {}", row.path.display()))
                 .selected(selected)
-                .padding([0, spacing.space_xxxs])
+                .padding([0.0, space::XS])
                 .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
                 .width(Length::Fill)
                 .on_press_maybe((!modal_open).then(|| Action::SelectFile(row.path.clone()))),
@@ -2170,7 +2128,6 @@ impl State {
         unknown: usize,
         modal_open: bool,
     ) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         let mark = if unknown > 0 {
             Mark::Mixed
         } else {
@@ -2196,7 +2153,7 @@ impl State {
                 .width(Length::Fill)
                 .into(),
         ])
-        .spacing(spacing.space_xxxs)
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .height(Length::Fill);
         let folder = button::custom(content)
@@ -2207,7 +2164,7 @@ impl State {
                 row.path.display()
             ))
             .on_press_maybe((!modal_open).then(|| Action::ToggleDirectory(row.path.clone())))
-            .padding([0, spacing.space_xxxs])
+            .padding([0.0, space::XS])
             .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
             .width(Length::Fill);
         widget::row::with_children(vec![
@@ -2237,7 +2194,6 @@ impl State {
     }
 
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
-        let spacing = cosmic::theme::spacing();
         if self.source.is_none() {
             return widget::container(
                 design::caption(
@@ -2247,7 +2203,7 @@ impl State {
                 )
                 .wrapping(iced::widget::text::Wrapping::Word),
             )
-            .padding(spacing.space_xs)
+            .padding(space::M)
             .into();
         }
         let query = self.browser_query.trim().to_lowercase();
@@ -2262,18 +2218,18 @@ impl State {
                         design::caption(format!("Couldn’t list pull requests. {message}"))
                             .wrapping(iced::widget::text::Wrapping::Word)
                             .into(),
-                        button::standard("Try again")
+                        crate::ui_controls::button::secondary("Try again")
                             .on_press_maybe((!modal_open).then_some(Action::LoadList))
                             .into(),
                     ])
-                    .spacing(spacing.space_xxs),
+                    .spacing(space::S),
                 )
-                .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                .padding(Padding::from([space::S, space::M]))
                 .into(),
             ],
             ListState::Ready(pull_requests) if pull_requests.is_empty() => vec![
                 widget::container(design::caption("No open pull requests."))
-                    .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                    .padding(Padding::from([space::S, space::M]))
                     .into(),
             ],
             ListState::Ready(pull_requests) => {
@@ -2374,7 +2330,7 @@ impl State {
                     ]))
                     .class(sidebar_button_style(false))
                     .width(Length::Fill)
-                    .padding([spacing.space_xxxs, spacing.space_xxs])
+                    .padding([space::XS, space::S])
                     .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
                         generation: self.list_generation,
                         action: Box::new(Action::OpenNumber(entry.number)),
@@ -2388,10 +2344,10 @@ impl State {
             _ => 0,
         };
         let list: Element<'a, Action> = widget::scrollable(
-            widget::container(widget::column::with_children(rows).spacing(0))
+            widget::container(widget::column::with_children(rows))
                 .padding(design::with_vertical_rail(Padding::from([
-                    spacing.space_xxxs,
-                    spacing.space_xxs,
+                    space::XS,
+                    space::S,
                 ])))
                 .width(Length::Fill),
         )
@@ -2405,29 +2361,24 @@ impl State {
         .height(Length::Fill)
         .into();
         let controls = widget::column::with_children(vec![
-            widget::text_input(
+            crate::ui_controls::field::search(
                 "Search loaded PRs by title, # or @author",
                 &self.browser_query,
             )
             .on_input(Action::BrowserQuery)
             .into(),
             widget::row::with_children(vec![
-                widget::dropdown(
+                crate::ui_controls::field::select(
                     &BrowserFilter::ALL,
                     Some(self.browser_filter as usize),
                     Action::BrowserFilterIndex,
                 )
                 .into(),
-                icon_control(
-                    symbolic_icon("view-refresh-symbolic"),
-                    "Refresh pull requests",
-                    false,
-                    !modal_open && !self.list_loading,
-                    Some(Action::LoadList),
-                )
-                .into(),
+                icon_button(Icon::Refresh, "Refresh pull requests")
+                    .on_press_maybe((!modal_open && !self.list_loading).then_some(Action::LoadList))
+                    .into(),
             ])
-            .spacing(spacing.space_xxs)
+            .spacing(space::S)
             .into(),
             design::caption(format!(
                 "{count} matching · {} loaded",
@@ -2446,18 +2397,20 @@ impl State {
             ))
             .into(),
         ])
-        .spacing(spacing.space_xxs)
-        .padding(spacing.space_xs);
-        let mut column = widget::column::with_children(vec![controls.into()]).spacing(0);
+        .spacing(space::S)
+        .padding(space::M);
+        let mut column = widget::column::with_children(vec![controls.into()]);
         if let Ok(number) = query.trim_start_matches('#').parse::<u64>()
             && number > 0
         {
-            column = column.push(button::standard(format!("Open #{number}")).on_press_maybe(
-                (!modal_open).then_some(Action::BrowserFenced {
-                    generation: self.list_generation,
-                    action: Box::new(Action::OpenNumber(number)),
-                }),
-            ));
+            column = column.push(
+                crate::ui_controls::button::secondary(format!("Open #{number}")).on_press_maybe(
+                    (!modal_open).then_some(Action::BrowserFenced {
+                        generation: self.list_generation,
+                        action: Box::new(Action::OpenNumber(number)),
+                    }),
+                ),
+            );
         }
         let mut column = column.push(list);
         if let Some(error) = &self.list_error {
@@ -2466,7 +2419,7 @@ impl State {
         }
         if self.list_cursor.is_some() {
             column = column.push(
-                button::standard(if self.list_loading {
+                crate::ui_controls::button::secondary(if self.list_loading {
                     "Loading…"
                 } else {
                     "Load more pull requests"
@@ -2486,13 +2439,12 @@ pub fn browser_row<'a>(
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, Action> {
-    let spacing = cosmic::theme::spacing();
     let state = WorktreePullRequestState::from_github(pull_request);
     let checks = CheckStatus::from_checks(&pull_request.check_summaries());
-    let icon = symbolic_icon(match state {
-        Some(WorktreePullRequestState::Merged) => "merged-pull-request-symbolic",
-        Some(WorktreePullRequestState::Closed) => "closed-pull-request-symbolic",
-        _ => "pull-request-symbolic",
+    let icon = Icon::handle(match state {
+        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
+        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
+        _ => Icon::PullRequest,
     });
     let tone: fn(&cosmic::Theme) -> iced::Color = match (state, checks) {
         (Some(WorktreePullRequestState::Merged), _) => design::accent_color,
@@ -2541,11 +2493,10 @@ pub fn browser_row<'a>(
             one_line(design::body(pull_request.title.as_str())).into(),
             one_line(design::caption(detail.join(" · "))).into(),
         ])
-        .spacing(0)
         .width(Length::Fill)
         .into(),
     ])
-    .spacing(spacing.space_xxs)
+    .spacing(space::S)
     .align_y(Alignment::Center);
     crate::interaction::hover(
         button::custom(content)
@@ -2555,7 +2506,7 @@ pub fn browser_row<'a>(
                 pull_request.number, pull_request.title
             ))
             .selected(selected)
-            .padding([spacing.space_xxxs, spacing.space_xxs])
+            .padding([space::XS, space::S])
             .width(Length::Fill)
             .on_press_maybe((!modal_open).then_some(Action::Select(pull_request.number))),
     )
@@ -2600,15 +2551,15 @@ fn viewed_control<'a>(
     action: Action,
 ) -> Element<'a, Action> {
     let (icon, label) = match mark {
-        Mark::Unchecked => ("checkbox-symbolic", label_when_unchecked),
-        Mark::Mixed => ("checkbox-mixed-symbolic", label_when_unchecked),
-        Mark::Checked => ("checkbox-checked-symbolic", label_when_checked),
+        Mark::Unchecked => (Icon::Checkbox, label_when_unchecked),
+        Mark::Mixed => (Icon::CheckboxMixed, label_when_unchecked),
+        Mark::Checked => (Icon::CheckboxChecked, label_when_checked),
     };
-    let control = icon_control(symbolic_icon(icon), label, false, enabled, Some(action));
+    let control = icon_button(icon, label).on_press_maybe(enabled.then_some(action));
     match mark {
         Mark::Unchecked => control.into(),
         Mark::Mixed | Mark::Checked => control
-            .icon_tone(design::Tone::Themed(design::accent_color))
+            .tone(design::Tone::Themed(design::accent_color))
             .into(),
     }
 }

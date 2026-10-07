@@ -891,7 +891,7 @@ impl Cagents {
                     .width(Length::Fill)
                     .into(),
             ])
-            .spacing(4);
+            .spacing(space::XS);
             rows.push(
                 widget::button::custom(contents)
                     .name(format!("Resume {}", row.title))
@@ -908,7 +908,7 @@ impl Cagents {
         }
         if state.visible.len() > state.limit {
             rows.push(
-                widget::button::standard("Show more conversations")
+                crate::ui_controls::button::secondary("Show more conversations")
                     .on_press(Message::ResumeConversation(Action::More))
                     .into(),
             );
@@ -939,7 +939,7 @@ impl Cagents {
         if let Some(scope) = &state.scope {
             filters.push(
                 widget::button::standard(scope.label.clone())
-                    .trailing_icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
+                    .trailing_icon(Icon::Close)
                     .name("Search every provider and project")
                     .on_press(Message::ResumeConversation(Action::Unscope))
                     .into(),
@@ -948,19 +948,22 @@ impl Cagents {
         filters.push(iced::widget::Space::new().width(Length::Fill).into());
         filters.push(design::caption(progress).into());
         let mut content = widget::column::with_children(vec![
-            widget::text::title3("Resume conversation").into(),
+            design::title("Resume conversation").into(),
             design::caption(
                 "Return to a saved conversation with its original project and account.",
             )
             .into(),
-            widget::text_input("Search conversations, projects, or accounts…", &state.query)
-                .id(focus_id())
-                .on_input(|query| Message::ResumeConversation(Action::Query(query)))
-                .on_submit(|_| Message::ResumeConversation(Action::Submit))
-                .into(),
+            crate::ui_controls::field::search(
+                "Search conversations, projects, or accounts…",
+                &state.query,
+            )
+            .id(focus_id())
+            .on_input(|query| Message::ResumeConversation(Action::Query(query)))
+            .on_submit(|_| Message::ResumeConversation(Action::Submit))
+            .into(),
             widget::row::with_children(filters)
                 .align_y(Alignment::Center)
-                .spacing(8)
+                .spacing(space::S)
                 // As tall as the scope it may hold, so widening the search
                 // does not move the list.
                 .height(Length::Fixed(32.0))
@@ -970,13 +973,13 @@ impl Cagents {
                 .height(Length::Fill)
                 .into(),
         ])
-        .spacing(12)
+        .spacing(space::M)
         .height(Length::Fill);
         if let Some(error) = &state.error {
             content = content.push(design::caption(error));
         }
         content = content.push(
-            widget::button::standard("Cancel")
+            crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("conversation-resume.cancel"))
                 .on_press(Message::ResumeConversation(Action::Close)),
         );
