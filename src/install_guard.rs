@@ -35,8 +35,13 @@ struct Receipt {
 /// The inner installer publishes routing before switching `current`, while
 /// the coordinator still holds the exact old UI executable path. This is not
 /// a success receipt: shell status independently decides transaction success.
-pub(crate) fn record_deferred() -> io::Result<()> {
-    crate::instance::validate_install_guard()?;
+pub(crate) fn record_deferred(stage: Option<(&Path, &Path)>) -> io::Result<()> {
+    if let Some((prefix, version_root)) = stage {
+        crate::instance::validate_stage_guard()?;
+        record_staged_owner(prefix, version_root)?;
+    } else {
+        crate::instance::validate_install_guard()?;
+    }
     let fd = std::env::var(RESULT_FD_ENV).ok().and_then(|value| value.parse::<i32>().ok())
         .filter(|fd| *fd >= 3).ok_or_else(|| io::Error::other("this update requires an external installer coordinator to defer daemon replacement"))?;
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -164,7 +169,12 @@ impl Drop for Signals {
     }
 }
 
-pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io::Result<()> {
+pub(crate) fn run(
+    prefix: &Path,
+    installer: &Path,
+    arguments: &[OsString],
+    stage_only: bool,
+) -> io::Result<()> {
     if !prefix.is_absolute() {
         return Err(io::Error::other("installation prefix must be absolute"));
     }
@@ -192,7 +202,11 @@ pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io
             "close the running application before installing into a new prefix; no previous UI exists there to restore on failure",
         ));
     }
-    let slots = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    let slots = if stage_only {
+        Vec::new()
+    } else {
+        guard.prepare_and_close_windows(Duration::from_secs(45))?
+    };
     let fd = script.as_raw_fd();
     let mut result = ResultPipe::new()?;
     let result_fd = result.writer.as_raw_fd();
@@ -225,6 +239,20 @@ pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io
     }
     let installed = execute(&mut command);
     let deferred = result.deferred()?;
+    if stage_only {
+        // No window has been prepared: releasing this guard only releases the
+        // launch fence, on success, failure and cancellation alike.
+        drop(guard);
+        return installed.and_then(|()| {
+            if deferred {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "staging installer did not record deferred ownership",
+                ))
+            }
+        });
+    }
     let reopen = if deferred && !slots.is_empty() {
         previous_executable.as_ref().ok_or_else(|| {
             io::Error::other("deferred installation has no previous UI executable")
@@ -243,6 +271,173 @@ pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io
             "{error}; reopening the current installation also failed: {reopen}"
         ))),
     }
+}
+
+const STAGED_OWNER: &str = ".deferred-owner.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedOwner {
+    version: u32,
+    owner_version: Option<String>,
+    #[serde(default)]
+    daemon_compatible: bool,
+    #[serde(default)]
+    candidate_protocol: u16,
+}
+
+fn compatible_owner() -> io::Result<bool> {
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let Ok(client) = crate::control::ControlClient::connect(&socket) else {
+        return Ok(false);
+    };
+    crate::daemon::replacement_owner(&socket, client.proof()).map_err(io::Error::other)?;
+    Ok(true)
+}
+
+fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let layout =
+        crate::update::locate(&version_root.join("bin/cagents")).map_err(io::Error::other)?;
+    if layout.prefix != prefix.canonicalize()?
+        || layout.version_root != version_root.canonicalize()?
+    {
+        return Err(io::Error::other(
+            "staged candidate belongs to another installation",
+        ));
+    }
+    let owner = crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .map(|exe| running_owner_bin(prefix, &exe))
+        .transpose()?;
+    let supplied = std::env::var_os(OWNER_CLI_ENV).map(std::path::PathBuf::from);
+    let expected = owner.as_ref().map(|bin| bin.join("cagents"));
+    if supplied != expected {
+        return Err(io::Error::other(
+            "daemon ownership changed while staging; installation was not changed",
+        ));
+    }
+    // A compatible candidate can attach to the preserved daemon, including
+    // after an older installed updater completes its reviewed UI handoff.
+    // Authenticate both the handshake proof and the kernel socket owner.
+    let daemon_compatible = owner.is_some() && compatible_owner()?;
+    let after = crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .map(|exe| running_owner_bin(prefix, &exe))
+        .transpose()?;
+    if after != owner {
+        return Err(io::Error::other(
+            "daemon ownership changed during compatibility verification; installation was not changed",
+        ));
+    }
+    let owner_version = owner
+        .as_ref()
+        .map(|bin| {
+            bin.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .ok_or_else(|| io::Error::other("daemon version path is not UTF-8"))
+        })
+        .transpose()?
+        .map(str::to_owned);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(version_root.join(STAGED_OWNER))?;
+    serde_json::to_writer(
+        &mut file,
+        &StagedOwner {
+            version: 1,
+            owner_version,
+            daemon_compatible,
+            candidate_protocol: crate::terminal_ipc::PROTOCOL_VERSION,
+        },
+    )
+    .map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+/// A marker only selects a complete same-prefix tree while the kernel still
+/// identifies that exact daemon as the live lease owner. It conveys no authority
+/// to stop a daemon, close windows or replace an installation.
+pub(crate) fn staged_owner_bin(executable: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(version_root) = executable
+        .canonicalize()?
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_owned)
+    else {
+        return Ok(None);
+    };
+    let marker = version_root.join(STAGED_OWNER);
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || meta.nlink() != 1
+        || meta.len() > 1024
+    {
+        return Err(io::Error::other(
+            "invalid staged installation ownership marker",
+        ));
+    }
+    let layout = crate::update::locate(executable).map_err(io::Error::other)?;
+    let owner: StagedOwner = serde_json::from_reader(&mut file).map_err(io::Error::other)?;
+    if owner.version != 1 {
+        return Err(io::Error::other(
+            "unsupported staged installation ownership marker",
+        ));
+    }
+    if owner.daemon_compatible && owner.candidate_protocol != crate::terminal_ipc::PROTOCOL_VERSION
+    {
+        return Err(io::Error::other(
+            "staged compatibility belongs to another candidate protocol",
+        ));
+    }
+    if owner.daemon_compatible {
+        return Ok(None);
+    }
+    let Some(version) = owner.owner_version else {
+        return Ok(None);
+    };
+    if version.is_empty()
+        || !matches!(
+            (
+                Path::new(&version).components().next(),
+                Path::new(&version).components().nth(1)
+            ),
+            (Some(std::path::Component::Normal(_)), None)
+        )
+        || matches!(version.as_str(), "." | "..")
+    {
+        return Err(io::Error::other("invalid staged daemon version"));
+    }
+    let Some(exe) = crate::daemon::running_executable().map_err(io::Error::other)? else {
+        return Ok(None);
+    };
+    let bin = running_owner_bin(&layout.prefix, &exe)?;
+    if bin != layout.prefix.join("versions").join(version).join("bin")
+        || bin == layout.version_root.join("bin")
+    {
+        return Ok(None);
+    }
+    crate::update::locate(&bin.join("cagents")).map_err(io::Error::other)?;
+    Ok(Some(bin))
 }
 
 fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::PathBuf> {

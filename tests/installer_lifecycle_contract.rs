@@ -119,6 +119,26 @@ fn coordinated_release_fixture(
     download: Option<&str>,
     coordinator: &str,
 ) {
+    coordinated_release_mode(
+        compatible,
+        terminals,
+        publish_failure,
+        restart,
+        download,
+        coordinator,
+        false,
+    );
+}
+
+fn coordinated_release_mode(
+    compatible: bool,
+    terminals: usize,
+    publish_failure: Option<&str>,
+    restart: Option<&str>,
+    download: Option<&str>,
+    coordinator: &str,
+    stage_only: bool,
+) {
     let home = tempfile::tempdir().unwrap();
     let data = home.path().join("data with spaces");
     let prefix = data.join("cagents-install");
@@ -134,7 +154,22 @@ fn coordinated_release_fixture(
 CLI=old
 case "$*" in
   'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
-    case "$FIXTURE_COORDINATOR:$CLI" in installed:new|candidate:old|none:*) exit 64 ;; esac
+    case "$FIXTURE_COORDINATOR:$CLI" in
+      installed:new) [ "$FIXTURE_STAGE_ONLY" = true ] || exit 64 ;;
+      candidate:old|none:*|stage-unsupported:new) exit 64 ;;
+    esac
+    if [ "$FIXTURE_COORDINATOR:$CLI" = legacy:old ] && [ "$2" = --help ]; then
+      "$FIXTURE_REAL_CLI" "$@" | sed '/--stage-only/d'
+      exit 0
+    fi
+    if [ "$1" = coordinate-install ] && [ "$2" != --help ]; then
+      printf '%s\n' "$CLI" >> "$FIXTURE_COORDINATOR_USED"
+    fi
+    if [ "$1" = record-deferred-install ] && [ "$FIXTURE_PRE_CAS_CHANGE" = true ]; then
+      "$FIXTURE_REAL_CLI" "$@" || exit "$?"
+      /usr/bin/ln -snf versions/9.9.9 "$FIXTURE_PREFIX/current"
+      exit 0
+    fi
     exec "$FIXTURE_REAL_CLI" "$@"
     ;;
   '--json daemon status')
@@ -265,8 +300,10 @@ esac
     let tools = home.path().join("tools");
     fs::create_dir(&tools).unwrap();
     // Fail after current switches, exercising the real rollback trap.
-    if let Some(failure) = publish_failure {
-        let fail = if failure == "outer-signal" {
+    if let Some(failure) = publish_failure.filter(|failure| *failure != "pre-cas-candidate") {
+        let fail = if failure == "current-changed" {
+            "/usr/bin/ln -snf versions/independent \"$FIXTURE_PREFIX/current\"; exit 8"
+        } else if failure == "outer-signal" {
             "kill -TERM \"$(cat \"$FIXTURE_OUTER_PID_FILE\")\"; sleep 1; exit 8"
         } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
@@ -359,6 +396,9 @@ esac
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     let mut command = Command::new("sh");
     command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"));
+    if stage_only {
+        command.arg("--stage-only");
+    }
     if restart.is_some() {
         command.arg("--restart-daemon");
     }
@@ -394,6 +434,15 @@ esac
         .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
         .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
         .env("FIXTURE_COORDINATOR", coordinator)
+        .env("FIXTURE_STAGE_ONLY", stage_only.to_string())
+        .env(
+            "FIXTURE_PRE_CAS_CHANGE",
+            (publish_failure == Some("pre-cas-candidate")).to_string(),
+        )
+        .env(
+            "FIXTURE_COORDINATOR_USED",
+            home.path().join("coordinator-used"),
+        )
         .env("FIXTURE_OUTER_PID_FILE", home.path().join("outer-pid"))
         .env(
             "CAGENTS_REPOSITORY",
@@ -423,10 +472,14 @@ esac
         .unwrap();
     fs::write(home.path().join("outer-pid"), output.id().to_string()).unwrap();
     let output = output.wait_with_output().unwrap();
-    if coordinator == "none" {
+    if coordinator == "none" || coordinator == "stage-unsupported" {
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("install a current release first")
+            String::from_utf8_lossy(&output.stderr).contains(if coordinator == "none" {
+                "install a current release first"
+            } else {
+                "this release does not support safe staging"
+            })
         );
         assert_eq!(
             fs::read_link(prefix.join("current")).unwrap(),
@@ -453,12 +506,18 @@ esac
     );
     let retained_candidate = success
         || matches!(
+            publish_failure,
+            Some("current-changed" | "pre-cas-candidate")
+        )
+        || matches!(
             restart,
             Some("start-unknown" | "start-signal" | "empty-start-unknown")
         );
     assert_eq!(
         fs::read_link(prefix.join("current")).unwrap(),
-        Path::new(if retained_candidate {
+        Path::new(if publish_failure == Some("current-changed") {
+            "versions/independent"
+        } else if retained_candidate {
             "versions/9.9.9"
         } else {
             "versions/old"
@@ -475,7 +534,39 @@ esac
         );
     }
     assert!(!actions.contains("UNSAFE"), "{actions}");
-    if restart == Some("empty-start-unknown") {
+    if stage_only {
+        assert_eq!(
+            fs::read_to_string(home.path().join("coordinator-used")).unwrap(),
+            "new\n"
+        );
+        assert!(
+            actions.is_empty(),
+            "staging must never call daemon control: {actions}"
+        );
+        assert!(!checkpoint.exists());
+        assert!(!restored.exists());
+        if matches!(
+            publish_failure,
+            Some("current-changed" | "pre-cas-candidate")
+        ) {
+            assert!(prefix.join("versions/old").exists());
+            assert!(prefix.join("versions/9.9.9/.deferred-owner.json").exists());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("retained both version trees")
+            );
+        }
+        if success {
+            let marker: serde_json::Value = serde_json::from_slice(
+                &fs::read(prefix.join("versions/9.9.9/.deferred-owner.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(marker["version"], 1);
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("running windows and daemon were preserved")
+            );
+        }
+    } else if restart == Some("empty-start-unknown") {
         assert_eq!(actions, "require-empty\nnew:start\n");
         assert!(!checkpoint.exists());
         assert!(!restored.exists());
@@ -730,4 +821,67 @@ fn public_release_download_works_without_an_authenticated_gh_account() {
 #[test]
 fn private_authentication_failure_preserves_installation_without_anonymous_downloads() {
     release_fixture(true, 7, None, None, Some("auth-failure"));
+}
+
+#[test]
+fn staging_preserves_daemons_and_rolls_back_publication_without_control_calls() {
+    for compatible in [true, false] {
+        for failure in [None, Some("publish"), Some("signal"), Some("outer-signal")] {
+            for coordinator in ["installed", "candidate", "legacy"] {
+                coordinated_release_mode(compatible, 38, failure, None, None, coordinator, true);
+            }
+        }
+    }
+}
+
+#[test]
+fn staging_rejects_destructive_options_before_touching_installation() {
+    for option in [
+        "--restart-daemon",
+        "--require-empty-daemon",
+        "--relaunch-agents",
+        "--no-relaunch-agents",
+        "--uninstall",
+        "--purge",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new("sh")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+            .args(["--stage-only", option])
+            .env("HOME", root.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--stage-only cannot be combined")
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn staging_keeps_both_trees_when_current_cannot_be_safely_rolled_back() {
+    coordinated_release_mode(
+        false,
+        38,
+        Some("pre-cas-candidate"),
+        None,
+        None,
+        "legacy",
+        true,
+    );
+    coordinated_release_mode(
+        false,
+        38,
+        Some("current-changed"),
+        None,
+        None,
+        "legacy",
+        true,
+    );
+}
+
+#[test]
+fn staging_cannot_borrow_candidate_support_from_an_installed_coordinator() {
+    coordinated_release_mode(false, 38, None, None, None, "stage-unsupported", true);
 }

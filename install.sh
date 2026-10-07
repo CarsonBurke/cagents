@@ -15,6 +15,7 @@ replacement to the application unless --restart-daemon is explicit.
 Options:
   --version VERSION  Install a release version (default: latest v* release)
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
+  --stage-only       Publish a verified update without changing running windows or daemon
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
   --require-empty-daemon  With --restart-daemon, refuse to interrupt live sessions
   --relaunch-agents  With --restart-daemon, relaunch non-resumable agents into their resume picker
@@ -41,6 +42,7 @@ PREFIX=
 UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
+STAGE_ONLY=0
 REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=
 
@@ -55,6 +57,10 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || fail '--prefix requires a path'
             PREFIX=$2
             shift 2
+            ;;
+        --stage-only)
+            STAGE_ONLY=1
+            shift
             ;;
         --restart-daemon)
             RESTART_DAEMON=1
@@ -90,6 +96,12 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    [ "$RESTART_DAEMON" -eq 0 ] && [ "$UNINSTALL" -eq 0 ] \
+        && [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] && [ -z "$RELAUNCH_AGENTS" ] \
+        || fail '--stage-only cannot be combined with restart, relaunch, uninstall or purge options'
+fi
 
 [ -z "$RELAUNCH_AGENTS" ] || [ "$RESTART_DAEMON" -eq 1 ] \
     || fail '--relaunch-agents and --no-relaunch-agents require --restart-daemon'
@@ -421,7 +433,10 @@ cleanup() {
     fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ]; then
-        if [ "$HAD_CURRENT" -eq 1 ]; then
+        if [ ! -L "$PREFIX/current" ] || [ "$(readlink "$PREFIX/current" 2>/dev/null || :)" != "versions/$VERSION" ]; then
+            ROLLBACK_OK=0
+            printf '%s: current changed independently; retained both version trees for recovery at %s\n' "$PROGRAM" "$PREFIX" >&2
+        elif [ "$HAD_CURRENT" -eq 1 ]; then
             rollback_current=$PREFIX/.rollback.$$
             rm -f "$rollback_current" || ROLLBACK_OK=0
             if [ "$ROLLBACK_OK" -eq 1 ] \
@@ -610,17 +625,35 @@ supports_install_guard() {
         && "$1" verify-install-guard --help >/dev/null 2>&1 \
         && "$1" record-deferred-install --help >/dev/null 2>&1
 }
-if supports_install_guard "$PREFIX/current/bin/cagents"; then
+supports_stage_guard() {
+    supports_install_guard "$1" || return 1
+    for stage_command in coordinate-install verify-install-guard record-deferred-install; do
+        stage_help=$("$1" "$stage_command" --help 2>/dev/null) || return 1
+        printf '%s\n' "$stage_help" | awk '$1 == "--stage-only" { found = 1 } END { exit !found }' || return 1
+    done
+}
+supports_selected_guard() {
+    if [ "$STAGE_ONLY" -eq 1 ]; then supports_stage_guard "$1"; else supports_install_guard "$1"; fi
+}
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    # Staged launch routing is interpreted by this exact candidate set. An old
+    # candidate cannot borrow a newer installed coordinator's staging support.
+    supports_stage_guard "$CANDIDATE_COORDINATOR" \
+        || fail 'this release does not support safe staging; installation was not changed'
+    COORDINATOR=$CANDIDATE_COORDINATOR
+elif supports_selected_guard "$PREFIX/current/bin/cagents"; then
     # A newer installed coordinator also makes rollback to an older release
     # safe when that candidate predates the window-coordination commands.
     COORDINATOR=$PREFIX/current/bin/cagents
-elif supports_install_guard "$CANDIDATE_COORDINATOR"; then
+elif supports_selected_guard "$CANDIDATE_COORDINATOR"; then
     COORDINATOR=$CANDIDATE_COORDINATOR
 else
     fail 'neither the installed CLI nor this release supports safe window coordination; install a current release first, then retry this version; installation was not changed'
 fi
 if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
-    "$COORDINATOR" verify-install-guard >/dev/null \
+    set -- verify-install-guard
+    [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
+    "$COORDINATOR" "$@" >/dev/null \
         || fail 'inherited application update fence is invalid; installation was not changed'
 else
     INSTALLER_SOURCE=$0
@@ -644,6 +677,7 @@ else
         [ "$INSTALLER_ACTUAL" = "$INSTALLER_HASH" ] || fail 'installer SHA-256 verification failed'
     fi
     set -- --version "$VERSION" --prefix "$PREFIX"
+    [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
     [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
     [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon
     case $RELAUNCH_AGENTS in
@@ -655,8 +689,13 @@ else
     COORDINATOR_PID=
     COORDINATOR_INTERRUPTED=0
     trap 'COORDINATOR_INTERRUPTED=1; if [ -n "$COORDINATOR_PID" ]; then kill -TERM "$COORDINATOR_PID" 2>/dev/null || :; fi' HUP INT TERM
+    if [ "$STAGE_ONLY" -eq 1 ]; then
+        set -- --stage-only --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@"
+    else
+        set -- --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@"
+    fi
     CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH \
-        "$COORDINATOR" coordinate-install --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@" &
+        "$COORDINATOR" coordinate-install "$@" &
     COORDINATOR_PID=$!
     if [ "$COORDINATOR_INTERRUPTED" -eq 1 ]; then
         kill -TERM "$COORDINATOR_PID" 2>/dev/null || :
@@ -820,7 +859,13 @@ ensure_link() {
 
 
 OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
-if [ "$HAD_CURRENT" -eq 1 ]; then
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    # Private routing is recorded in the complete candidate tree BEFORE it can
+    # become current. The coordinator authenticates the unchanged live owner.
+    "$COORDINATOR" record-deferred-install --stage-only --prefix "$PREFIX" --version-root "$NEW_VERSION_DIR" >/dev/null \
+        || fail 'cannot preserve the running owner for this staged update; installation was not changed'
+    DAEMON_DEFERRED=1
+elif [ "$HAD_CURRENT" -eq 1 ]; then
     if [ "$RESTART_DAEMON" -eq 1 ]; then
         read_daemon_status "$OWNER_CLI"
         case $DAEMON_STATUS in
@@ -871,6 +916,19 @@ if [ "$HAD_CURRENT" -eq 1 ]; then
         esac
     fi
 fi
+# The held launch fence serializes installers. Refuse an unexpected independent
+# current change instead of overwriting the version captured by this transaction.
+if [ "$HAD_CURRENT" -eq 1 ]; then
+    if [ ! -L "$PREFIX/current" ] || [ "$(readlink "$PREFIX/current" 2>/dev/null || :)" != "$PREVIOUS_CURRENT_TARGET" ]; then
+        ROLLBACK_OK=0
+        fail 'current installation changed while preparing the update; retained both version trees for recovery'
+    fi
+else
+    if [ -e "$PREFIX/current" ] || [ -L "$PREFIX/current" ]; then
+        ROLLBACK_OK=0
+        fail 'current installation appeared while preparing the update; retained the candidate for recovery'
+    fi
+fi
 CURRENT_TEMP=$PREFIX/.current.$$
 rm -f "$CURRENT_TEMP"
 ln -s "versions/$VERSION" "$CURRENT_TEMP"
@@ -908,7 +966,9 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 
-if [ "$DAEMON_DEFERRED" -eq 1 ]; then
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    printf 'Staged cagents %s; running windows and daemon were preserved. Use the existing application update control to apply it when ready.\n' "$VERSION"
+elif [ "$DAEMON_DEFERRED" -eq 1 ]; then
     printf 'Installed cagents %s; running sessions were preserved. Open the application to finish updating its daemon.\n' "$VERSION"
 elif [ "$DAEMON_STARTED" -eq 1 ]; then
     printf 'Installed cagents %s; the production daemon is running and will start at login.\n' "$VERSION"
