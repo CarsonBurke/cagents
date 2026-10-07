@@ -971,9 +971,14 @@ fn provider_session(
     source
 }
 
+/// Waits until the provider owns a durable thread and has finished starting
+/// it. Continuity is confirmed by the frame that names the thread, while the
+/// actor may still be writing what that frame asked for.
 fn wait_durable(handle: &crate::chat::runtime::Handle) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !matches!(handle.native_continuity(), NativeContinuity::Durable { .. }) {
+    while !matches!(handle.native_continuity(), NativeContinuity::Durable { .. })
+        || handle.check_update_readiness() != Ok(crate::chat::runtime::UpdateReadiness::Idle)
+    {
         assert!(
             Instant::now() < deadline,
             "provider did not become durable: failure={:?}, snapshot={:?}",
