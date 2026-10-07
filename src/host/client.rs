@@ -55,23 +55,56 @@ fn remaining_handshake_timeout(deadline: Instant, now: Instant) -> io::Result<Du
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "IPC handshake deadline elapsed"))
 }
 
-pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
-    let delivery = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .register_client(client_id);
-    let writer_stream = match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => {
-            disconnect_client(&host, client_id);
-            return;
+/// A registered client. Dropping it unregisters the client and lets its
+/// writer drain and close the socket.
+///
+/// This runs when the client's thread unwinds too. Otherwise a panic would
+/// leave the client subscribed with its writer holding the socket open, so the
+/// peer would wait on a connection that looks alive and never answers.
+struct Registration {
+    host: SharedHost,
+    client_id: ClientId,
+    delivery: Arc<DeliveryQueue>,
+}
+
+impl Registration {
+    fn new(host: SharedHost, client_id: ClientId) -> Self {
+        let delivery = host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register_client(client_id);
+        Self {
+            host,
+            client_id,
+            delivery,
         }
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        disconnect_client(&self.host, self.client_id);
+        self.delivery.close_after_drain();
+    }
+}
+
+type RequestHandler =
+    fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome, ProtocolError>;
+
+pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
+    serve_with(stream, client_id, host, process_request);
+}
+
+fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
+    let registration = Registration::new(Arc::clone(&host), client_id);
+    let delivery = Arc::clone(&registration.delivery);
+    let Ok(writer_stream) = stream.try_clone() else {
+        return;
     };
     if writer_stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .is_err()
     {
-        disconnect_client(&host, client_id);
         return;
     }
     let writer_delivery = Arc::clone(&delivery);
@@ -82,7 +115,6 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         Ok(writer) => writer,
         Err(_) => {
             delivery.abort("the client writer thread could not be started");
-            disconnect_client(&host, client_id);
             return;
         }
     };
@@ -191,7 +223,20 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         }
 
         let request_id = envelope.request_id;
-        let outcome = process_request(&host, client_id, envelope.request);
+        // A request that panics has released every guard it held by the time
+        // it is caught here, so it costs its sender one failed request rather
+        // than the connection. The panic hook has already recorded it.
+        let request = envelope.request;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle(&host, client_id, request)
+        }))
+        .unwrap_or_else(|_| {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "the daemon failed while handling this request",
+                false,
+            ))
+        });
         match outcome {
             Ok((response, extras, shutdown)) => {
                 let proof = current_proof(&host);
@@ -228,8 +273,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         }
     }
 
-    disconnect_client(&host, client_id);
-    delivery.close_after_drain();
+    drop(registration);
     let _ = writer.join();
 }
 
@@ -2083,6 +2127,119 @@ mod tests {
                 .reserve_spawn(crate::model::TerminalId::new())
                 .is_ok()
         );
+    }
+
+    fn panic_test_host(name: &str) -> (HostSessionProof, SharedHost) {
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(name),
+            boot_id: crate::model::BootId::new(name),
+            host_incarnation: crate::model::HostIncarnation::new(name),
+        };
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof.clone()),
+        ));
+        (proof, host)
+    }
+
+    /// The host mutex panics when its holder locks it again, on the promise
+    /// that only that request is lost. Its sender must hear that it failed and
+    /// keep a connection that still answers.
+    #[test]
+    fn a_request_that_panics_is_answered_and_the_connection_keeps_serving() {
+        static RELOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn relocking_once(
+            host: &SharedHost,
+            client_id: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            if !RELOCKED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _held = host.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = host.lock();
+            }
+            process_request(host, client_id, request)
+        }
+        fn exchange(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) -> ServerMessage {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            loop {
+                let envelope = codec
+                    .read::<ServerEnvelope>(stream)
+                    .expect("the request was never answered")
+                    .expect("the connection was closed");
+                if envelope.request_id == Some(request_id) {
+                    return envelope.message;
+                }
+            }
+        }
+
+        let (proof, host) = panic_test_host("panicking-request");
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server_host = Arc::clone(&host);
+        let server =
+            thread::spawn(move || serve_with(server_stream, 1, server_host, relocking_once));
+        assert!(matches!(
+            exchange(
+                &mut stream,
+                &proof,
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: Vec::new(),
+                },
+            ),
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+
+        let ServerMessage::Error(error) = exchange(&mut stream, &proof, 2, ClientRequest::List)
+        else {
+            panic!("the panicking request must be answered with an error");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::Internal);
+        assert!(matches!(
+            exchange(&mut stream, &proof, 3, ClientRequest::List),
+            ServerMessage::Response { .. }
+        ));
+
+        drop(stream);
+        server.join().expect("the client thread survives the panic");
+        assert!(host.lock().unwrap().clients.is_empty());
+    }
+
+    #[test]
+    fn a_client_thread_that_unwinds_unregisters_its_client_and_releases_its_writer() {
+        let (_, host) = panic_test_host("unwinding-client");
+        let (delivered, delivery) = std::sync::mpsc::channel();
+        let client_host = Arc::clone(&host);
+        let client = thread::spawn(move || {
+            let registration = Registration::new(client_host, 7);
+            delivered.send(Arc::clone(&registration.delivery)).unwrap();
+            panic!("fixture client failure");
+        });
+        let delivery = delivery.recv().unwrap();
+        assert!(client.join().is_err());
+        assert!(!host.lock().unwrap().clients.contains_key(&7));
+        // The writer blocks here until the queue is closed, holding the socket.
+        assert!(delivery.pop().is_none());
     }
 
     #[test]
