@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::state::{HostState, SharedHost};
+use super::state::{HostLock, SharedHost};
 use crate::{
     agent::Provider,
     model::{HostSessionProof, TerminalId, agent_recovery::AgentProcess},
@@ -303,7 +303,7 @@ impl Drop for Monitor {
     }
 }
 
-fn observe(host: &Weak<Mutex<HostState>>, candidate: &Candidate) -> Outcome {
+fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
     let Some(host) = host.upgrade() else {
         return Outcome::Failed;
     };

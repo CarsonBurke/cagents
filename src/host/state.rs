@@ -50,7 +50,9 @@ fn model_unavailable(error: String) -> ProtocolError {
 }
 
 pub(crate) type ClientId = u64;
-pub(crate) type SharedHost = Arc<Mutex<HostState>>;
+/// The lock every host user serializes on; see [`super::lock`].
+pub(crate) type HostLock = super::lock::HostMutex<HostState>;
+pub(crate) type SharedHost = Arc<HostLock>;
 
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
@@ -3671,7 +3673,7 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
     Ok(())
 }
 
-fn broadcast_output(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, sequence: u64) {
+fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u64) {
     let Some(host) = host.upgrade() else { return };
     let mut state = host.lock().unwrap_or_else(|error| error.into_inner());
     let HostState {
@@ -3736,7 +3738,7 @@ fn broadcast_output(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, sequ
 /// every delta chained to the previous delivery; an unapplicable delta is
 /// detected by `base_generation` and answered with a full repaint, so a client
 /// that misses a push still recovers.
-fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, generation: u64) {
+fn broadcast_redraw(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -3819,11 +3821,11 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
 }
 
 #[cfg(test)]
-fn record_event(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, event: TerminalEvent) {
+fn record_event(host: &Weak<HostLock>, terminal_id: TerminalId, event: TerminalEvent) {
     record_event_from(host, terminal_id, event, None);
 }
 fn record_event_from(
-    host: &Weak<Mutex<HostState>>,
+    host: &Weak<HostLock>,
     terminal_id: TerminalId,
     event: TerminalEvent,
     worker: Option<&TerminalHandle>,
@@ -4006,7 +4008,7 @@ mod tests {
         state.install_model(registry);
         state.register_client(1);
         state.register_client(2);
-        let host = Arc::new(Mutex::new(state));
+        let host = Arc::new(HostLock::new(state));
         // Both clients observed the reservation before either actor existed.
         let first = spawn_pending_terminal(
             &host,
@@ -4057,7 +4059,7 @@ mod tests {
 
     #[test]
     fn browser_login_claim_is_atomic_across_windows_and_released_after_failed_spawn() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let attempts: Vec<_> = (0..2)
             .map(|_| {
@@ -4432,7 +4434,7 @@ mod tests {
                 last_exit: None,
             },
         };
-        let mut host = Arc::new(Mutex::new(test_host()));
+        let mut host = Arc::new(crate::host::state::HostLock::new(test_host()));
         spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
         let empty_proc = directory.path().join("proc");
         fs::create_dir(&empty_proc).unwrap();
@@ -4482,7 +4484,9 @@ mod tests {
             assert!(!saved.terminals[0].relaunches.is_empty());
             // With no conversation identified, the agent reopens its picker.
             assert_eq!(saved.terminals[0].recipe.arguments, ["--resume"]);
-            host = Arc::new(Mutex::new(test_host_with_incarnation(incarnation)));
+            host = Arc::new(crate::host::state::HostLock::new(
+                test_host_with_incarnation(incarnation),
+            ));
             restore_upgrade_from(
                 &host,
                 Store::open(directory.path()).unwrap(),
@@ -4543,7 +4547,7 @@ for line in sys.stdin:
         for id in [IDLE, ENDED] {
             fs::write(history.join(format!("{id}.jsonl")), "").unwrap();
         }
-        let host = Arc::new(Mutex::new(test_host()));
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let start = |id: &str| {
             let session = Session {
                 native_continuity: Default::default(),
@@ -4646,9 +4650,9 @@ for line in sys.stdin:
         assert_eq!(saved.chats[0].source, idle);
         let empty_proc = cwd.join("proc");
         fs::create_dir(&empty_proc).unwrap();
-        let replacement = Arc::new(Mutex::new(test_host_with_incarnation(
-            "replacement-incarnation",
-        )));
+        let replacement = Arc::new(crate::host::state::HostLock::new(
+            test_host_with_incarnation("replacement-incarnation"),
+        ));
         // Restoring waits for the provider's confirmation, with no prompt.
         restore_upgrade_from(&replacement, store, &empty_proc, None).unwrap();
         let restored = super::super::chat::resolve_upgrade(&replacement, &idle).unwrap();
@@ -4699,7 +4703,7 @@ for line in sys.stdin:
         for id in [A, B] {
             fs::write(history.join(format!("{id}.jsonl")), "").unwrap();
         }
-        let host = Arc::new(Mutex::new(test_host()));
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let source = Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -4776,7 +4780,7 @@ for line in sys.stdin:
         let empty_proc = cwd.join("proc");
         fs::create_dir(&empty_proc).unwrap();
         let replacement = test_host_with_incarnation("replacement-incarnation");
-        let replacement = Arc::new(Mutex::new(replacement));
+        let replacement = Arc::new(HostLock::new(replacement));
         restore_upgrade_from(&replacement, store, &empty_proc, None).unwrap();
         let restored = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         assert_eq!(restored.launch.session_id.as_deref(), Some(B));
@@ -4849,7 +4853,7 @@ for line in sys.stdin:
         forged.chats[0].previous_sources[0].source.proof = second.chats[0].source.proof.clone();
         assert!(forged.validate().is_err());
         let third = test_host_with_incarnation("third-incarnation");
-        let replacement = Arc::new(Mutex::new(third));
+        let replacement = Arc::new(HostLock::new(third));
         restore_upgrade_from(&replacement, store, &empty_proc, None).unwrap();
         let third = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         assert_eq!(third.launch.session_id.as_deref(), Some(B));
@@ -4905,7 +4909,7 @@ for line in sys.stdin:
         // An open directory descriptor is retained but cannot create files after
         // unlink. This fails the real persistence operation, not a mock echo.
         fs::remove_dir(directory.path()).unwrap();
-        let host = Arc::new(Mutex::new(test_host()));
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let capability = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -4938,7 +4942,7 @@ for line in sys.stdin:
     fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
-        let host = Arc::new(Mutex::new(test_host()));
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let capability = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -4980,7 +4984,7 @@ for line in sys.stdin:
             upgrade::handoff::Store,
         };
         let directory = tempfile::tempdir().unwrap();
-        let host = Arc::new(Mutex::new(test_host()));
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),
             program: "omp".into(),
@@ -5088,7 +5092,7 @@ for line in sys.stdin:
                 last_exit: None,
             },
         };
-        let host = Arc::new(Mutex::new(test_host()));
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let pid = loop {
@@ -5162,7 +5166,9 @@ for line in sys.stdin:
             },
         });
         store.save(&failing).unwrap();
-        let failed = Arc::new(Mutex::new(test_host_with_incarnation("failed")));
+        let failed = Arc::new(crate::host::state::HostLock::new(
+            test_host_with_incarnation("failed"),
+        ));
         assert!(restore_upgrade_from(&failed, store, &empty_proc, Some(&holders)).is_err());
         assert!(
             failed.lock().unwrap().terminals[&source.id]
@@ -5175,7 +5181,9 @@ for line in sys.stdin:
         retained.terminals.clear();
         store.save(&retained).unwrap();
 
-        let replacement = Arc::new(Mutex::new(test_host_with_incarnation("second")));
+        let replacement = Arc::new(crate::host::state::HostLock::new(
+            test_host_with_incarnation("second"),
+        ));
         restore_upgrade_from(
             &replacement,
             Store::open(directory.path()).unwrap(),
@@ -5250,7 +5258,9 @@ for line in sys.stdin:
         checkpoint.phase = Phase::Ready;
         let store = Store::open(directory.path()).unwrap();
         store.save(&checkpoint).unwrap();
-        let host = Arc::new(Mutex::new(test_host_with_incarnation("second")));
+        let host = Arc::new(crate::host::state::HostLock::new(
+            test_host_with_incarnation("second"),
+        ));
         restore_upgrade_from(
             &host,
             store,
@@ -5309,7 +5319,7 @@ for line in sys.stdin:
         store.save(&checkpoint).unwrap();
         let replacement = test_host_with_incarnation("replacement-incarnation");
         let expected = (*replacement.proof).clone();
-        let host = Arc::new(Mutex::new(replacement));
+        let host = Arc::new(HostLock::new(replacement));
         restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
         let descriptor = host
             .lock()
@@ -5350,7 +5360,7 @@ for line in sys.stdin:
             second.terminals[0].source.continuity.clone();
         assert!(forged.validate().is_err());
         let third = test_host_with_incarnation("third-incarnation");
-        let host = Arc::new(Mutex::new(third));
+        let host = Arc::new(HostLock::new(third));
         restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
         let third = host
             .lock()
@@ -5378,7 +5388,7 @@ for line in sys.stdin:
 
     #[test]
     fn hidden_output_is_per_subscriber_and_rearms_without_revealing() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
             unset_environment: Default::default(),
             program: "/bin/cat".into(),
@@ -5560,7 +5570,7 @@ for line in sys.stdin:
 
     #[test]
     fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let terminal_id = TerminalId::new();
         let deliveries = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
@@ -5616,7 +5626,7 @@ for line in sys.stdin:
             },
         };
         let id = session.id;
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let (delivery, handle, base) = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
             let delivery = state.register_client(1);
@@ -5722,7 +5732,7 @@ for line in sys.stdin:
 
     #[test]
     fn completed_terminal_history_routes_queries_after_the_event_forwarder_finishes() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let (first, second) = {
             let mut state = shared.lock().unwrap();
             (state.register_client(1), state.register_client(2))
@@ -5812,7 +5822,7 @@ for line in sys.stdin:
 
     #[test]
     fn terminal_search_results_are_delivered_only_to_the_requesting_window_and_never_replayed() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
             unset_environment: Default::default(),
             program: "/bin/cat".into(),
@@ -5885,7 +5895,7 @@ for line in sys.stdin:
 
     #[test]
     fn stable_conversation_title_survives_replay_eviction_without_duplicate_edges() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
             unset_environment: Default::default(),
             program: "/bin/cat".into(),
@@ -5957,7 +5967,7 @@ for line in sys.stdin:
 
     #[test]
     fn leader_exit_preserves_consumption_credit_but_not_process_authority() {
-        let shared = Arc::new(Mutex::new(test_host()));
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
             unset_environment: Default::default(),
             program: "/bin/cat".into(),
@@ -6238,7 +6248,7 @@ for line in sys.stdin:
     #[test]
     fn concurrent_reservation_and_empty_stop_have_only_safe_orderings() {
         for spawn_first in [false, true] {
-            let host = Arc::new(Mutex::new(test_host()));
+            let host = Arc::new(crate::host::state::HostLock::new(test_host()));
             let (release, wait) = std::sync::mpsc::channel();
             let other = Arc::clone(&host);
             let worker = thread::spawn(move || {

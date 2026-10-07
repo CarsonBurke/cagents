@@ -286,15 +286,16 @@ mod tests {
         host::state::HostState,
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
     };
-    use std::sync::Mutex;
 
     #[test]
     fn inherited_execution_authority_cannot_manage_automations() {
-        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("automation-authority-fixture"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        })));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("automation-authority-fixture"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+        )));
         // No registry is installed: denial must precede even reading shared
         // automation definitions, rather than rely on a CLI-only restriction.
         let error = process_under_control(
