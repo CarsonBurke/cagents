@@ -729,7 +729,7 @@ pub(super) fn start_execution(
 /// Discovery can route an old presentation descriptor to recovery, but grants
 /// no launch authority. Recovery authenticates the complete issued descriptor
 /// with the holder before attaching, and never falls back to recipe execution.
-fn has_native_owner(session: &Session) -> Result<bool, ProtocolError> {
+pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError> {
     if session.launch.provider != Provider::Codex {
         return Ok(false);
     }
