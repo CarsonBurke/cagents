@@ -1083,6 +1083,14 @@ impl Claude {
                             &mut item.content,
                             content_text(&block["content"]),
                             block["is_error"].as_bool() == Some(true),
+                            self.tool_inputs.get(&tool_id).map(String::as_str),
+                            // The structured result is the frame's, so it is
+                            // this block's only when the frame has no other.
+                            if content.len() == 1 {
+                                structured_result(frame)
+                            } else {
+                                &Value::Null
+                            },
                         );
                         if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
                         {
@@ -2655,6 +2663,15 @@ fn task_status(status: &str, notification: bool) -> Option<ToolStatus> {
     }
 }
 
+/// What Claude Code reports about a tool's result beside its text:
+/// `tool_use_result` on the wire and `toolUseResult` in a transcript.
+fn structured_result(frame: &Value) -> &Value {
+    match &frame["tool_use_result"] {
+        Value::Null => &frame["toolUseResult"],
+        result => result,
+    }
+}
+
 /// Whether a user frame carrying a single tool result acknowledges an agent
 /// Claude Code runs in the background, which it may do unasked. The structured
 /// result is `tool_use_result` on the wire and `toolUseResult` in a transcript.
@@ -2795,11 +2812,17 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
 ///
 /// Only Claude's own built-in tools are classified, because the tool's name is
 /// what makes the intent unambiguous; an arbitrary tool's arguments are not
-/// evidence of what it does. MCP tools, subagent tasks and the edit tools stay
-/// a tool disclosure, and so does a built-in whose defining input has not
-/// arrived yet, since a command item without its command tells the view less
-/// than the tool call it came from.
+/// evidence of what it does. MCP tools and subagent tasks stay a tool
+/// disclosure, and so does a built-in whose defining input has not arrived
+/// yet, since a command item without its command tells the view less than the
+/// tool call it came from.
 fn tool_content(name: &str, input: &Value, cwd: &Path) -> ItemContent {
+    if let Some(changes) = super::claude_edits::changes(name, input) {
+        return ItemContent::Changes {
+            changes,
+            status: ToolStatus::Running,
+        };
+    }
     let session = || cwd.to_string_lossy().into_owned();
     // Claude's search tools walk `path` and fall back to the session directory
     // when it is absent, which is what the provider itself does.
@@ -2877,13 +2900,43 @@ fn settled(items: Vec<Item>) -> Vec<Item> {
 }
 /// Attach a tool result to whichever variant the call was mapped to, so that a
 /// richer mapping never costs the result the provider reported.
-fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
+///
+/// `input` is the call's own input where it is still held, and `structured`
+/// what Claude Code reported beside the result's text.
+fn apply_result(
+    content: &mut ItemContent,
+    text: String,
+    failed: bool,
+    input: Option<&str>,
+    structured: &Value,
+) {
     let result = if failed {
         ToolStatus::Failed
     } else {
         ToolStatus::Succeeded
     };
     match content {
+        ItemContent::Changes { changes, status } if !failed => {
+            super::claude_edits::applied(changes, structured);
+            *status = result;
+        }
+        // An edit that failed changed nothing, and why it failed is the one
+        // thing a reader needs: a patch has nowhere to say it, so the step
+        // goes back to being the tool call it was, carrying the message.
+        ItemContent::Changes { changes, .. } => {
+            let input = input.map(str::to_owned).unwrap_or_else(|| {
+                json!({"file_path": changes.first().map(|change| change.path.as_str())}).to_string()
+            });
+            *content = ItemContent::Tool {
+                name: serde_json::from_str(&input)
+                    .map(|input| super::claude_edits::tool_name(&input))
+                    .unwrap_or("Edit")
+                    .into(),
+                input,
+                output: text,
+                status: result,
+            };
+        }
         // Only a shell command's result is what a terminal was written to: a
         // file that was read is shown as the bytes it holds.
         ItemContent::Command {
@@ -2899,11 +2952,10 @@ fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
             *output = text;
             *status = result;
         }
-        // `tool_content` maps a Claude tool call to `Command` or `Tool` and to
-        // nothing else, keeping even the edit tools a tool disclosure, so the
-        // remaining variants never hold a Claude tool result.
+        // `tool_content` maps a Claude tool call to `Command`, `Changes` or
+        // `Tool` and to nothing else, so the remaining variants never hold a
+        // Claude tool result.
         ItemContent::Text { .. }
-        | ItemContent::Changes { .. }
         | ItemContent::WebSearch { .. }
         | ItemContent::Image { .. }
         | ItemContent::Delivery { .. } => {}
@@ -4272,6 +4324,7 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 mod tests {
     use super::*;
     use crate::agent::Provider;
+    use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
 
     #[test]
@@ -5216,6 +5269,134 @@ mod tests {
         );
     }
 
+    /// An edit is shown as the change it makes from the moment it is called,
+    /// and as the patch Claude Code applied once it has been: the same item,
+    /// whether the call arrived whole or as streamed fragments of its input.
+    #[test]
+    fn an_edit_is_a_file_change_that_its_result_completes() {
+        let input = json!({"file_path":"/workspace/src/app.rs","old_string":"let a = 1;","new_string":"let a = 2;","replace_all":false});
+        let called = ItemContent::Changes {
+            changes: vec![FileChange {
+                path: "/workspace/src/app.rs".into(),
+                kind: ChangeKind::Updated,
+                diff: "@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n".into(),
+            }],
+            status: ToolStatus::Running,
+        };
+        let result = json!({"type":"user","uuid":"u1","tool_use_result":{
+            "filePath":"/workspace/src/app.rs","oldString":"let a = 1;","newString":"let a = 2;","originalFile":null,
+            "structuredPatch":[{"oldStart":41,"oldLines":3,"newStart":41,"newLines":3,"lines":[" fn main() {","-    let a = 1;","+    let a = 2;"," }"]}],
+            "userModified":false,"replaceAll":false},
+            "message":{"content":[{"type":"tool_result","tool_use_id":"edit","content":"The file /workspace/src/app.rs has been updated successfully."}]}});
+        let applied = ItemContent::Changes {
+            changes: vec![FileChange {
+                path: "/workspace/src/app.rs".into(),
+                kind: ChangeKind::Updated,
+                diff: "@@ -41,3 +41,3 @@\n fn main() {\n-    let a = 1;\n+    let a = 2;\n }\n"
+                    .into(),
+            }],
+            status: ToolStatus::Succeeded,
+        };
+
+        let mut whole = Claude::default();
+        let call = whole.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"edit","name":"Edit","input":input}]}})).unwrap();
+        assert_eq!(items(&call), vec![called.clone()]);
+        assert_eq!(
+            items(&whole.receive(result.clone()).unwrap()),
+            vec![applied.clone()]
+        );
+
+        // Streamed, the input is a prefix of its JSON until the block stops,
+        // and only then is there an edit to make a patch of.
+        let mut streamed = Claude::default();
+        streamed
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-1"}}),
+            ))
+            .unwrap();
+        streamed.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"edit","name":"Edit"}}))).unwrap();
+        let encoded = input.to_string();
+        let (first, second) = encoded.split_at(encoded.len() / 2);
+        let partial = streamed.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":first}}))).unwrap();
+        assert!(
+            matches!(&items(&partial)[..], [ItemContent::Tool { name, input, .. }] if name == "Edit" && input == first)
+        );
+        streamed.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":second}}))).unwrap();
+        let stopped = streamed
+            .receive(stream(json!({"type":"content_block_stop","index":0})))
+            .unwrap();
+        assert_eq!(items(&stopped), vec![called]);
+        assert_eq!(items(&streamed.receive(result).unwrap()), vec![applied]);
+    }
+
+    /// A write is an addition, or an update where its result says the file
+    /// was already there; a transcript names the structured result
+    /// differently from the wire and is read the same.
+    #[test]
+    fn a_write_is_an_addition_until_its_result_says_it_overwrote() {
+        for (key, structured, kind, diff) in [
+            (
+                "tool_use_result",
+                json!({"type":"create","filePath":"notes.md","content":"# Notes\n","structuredPatch":[],"originalFile":null}),
+                ChangeKind::Added,
+                "@@ -0,0 +1,1 @@\n+# Notes\n",
+            ),
+            (
+                "toolUseResult",
+                json!({"type":"update","filePath":"notes.md","content":"# Notes\n","originalFile":"# Old\n",
+                    "structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-# Old","+# Notes"]}]}),
+                ChangeKind::Updated,
+                "@@ -1,1 +1,1 @@\n-# Old\n+# Notes\n",
+            ),
+        ] {
+            let mut adapter = Claude::default();
+            let call = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"write","name":"Write","input":{"file_path":"notes.md","content":"# Notes\n"}}]}})).unwrap();
+            assert!(matches!(&items(&call)[..],
+                [ItemContent::Changes { changes, status: ToolStatus::Running }]
+                if changes[0].kind == ChangeKind::Added && changes[0].diff == "@@ -0,0 +1,1 @@\n+# Notes\n"));
+            let mut result = json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"write","content":"done"}]}});
+            result[key] = structured;
+            assert_eq!(
+                items(&adapter.receive(result).unwrap()),
+                vec![ItemContent::Changes {
+                    changes: vec![FileChange {
+                        path: "notes.md".into(),
+                        kind,
+                        diff: diff.into(),
+                    }],
+                    status: ToolStatus::Succeeded,
+                }]
+            );
+        }
+    }
+
+    /// An edit that failed changed nothing, so it is not shown as a change:
+    /// it is the tool call again, with the reason it failed.
+    #[test]
+    fn a_failed_edit_is_the_tool_call_and_its_error() {
+        let input = json!({"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]});
+        let mut adapter = Claude::default();
+        let call = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"edit","name":"MultiEdit","input":input}]}})).unwrap();
+        assert!(matches!(
+            &items(&call)[..],
+            [ItemContent::Changes {
+                status: ToolStatus::Running,
+                ..
+            }]
+        ));
+        let failed = adapter.receive(json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"edit","is_error":true,"content":"<tool_use_error>String to replace not found in file.</tool_use_error>"}]}})).unwrap();
+        assert_eq!(
+            items(&failed),
+            vec![ItemContent::Tool {
+                name: "MultiEdit".into(),
+                input: input.to_string(),
+                output: "<tool_use_error>String to replace not found in file.</tool_use_error>"
+                    .into(),
+                status: ToolStatus::Failed,
+            }]
+        );
+    }
+
     #[test]
     fn live_skill_context_is_not_rendered_as_a_user_message() {
         let mut adapter = Claude::default();
@@ -5755,7 +5936,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_tool_names_classify_the_action_and_edits_stay_tool_disclosures() {
+    fn builtin_tool_names_classify_the_action_and_other_tools_stay_disclosures() {
         let mut adapter = Claude {
             cwd: PathBuf::from("/workspace"),
             ..Claude::default()
@@ -5765,7 +5946,7 @@ mod tests {
                 {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/app.rs"}},
                 {"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"TODO","path":"src"}},
                 {"type":"tool_use","id":"t3","name":"Glob","input":{"pattern":"**/*.rs"}},
-                {"type":"tool_use","id":"t4","name":"Edit","input":{"file_path":"src/app.rs","old_string":"a","new_string":"b"}}
+                {"type":"tool_use","id":"t4","name":"NotebookEdit","input":{"notebook_path":"a.ipynb","new_source":"x"}}
             ]}}))
             .unwrap();
         let mapped = items(&step)
@@ -5799,7 +5980,7 @@ mod tests {
                     "/workspace".to_owned(),
                     Some(CommandAction::List)
                 ),
-                ("Edit".to_owned(), String::new(), None),
+                ("NotebookEdit".to_owned(), String::new(), None),
             ]
         );
     }
