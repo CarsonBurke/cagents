@@ -376,6 +376,54 @@ pub struct StoredGenerations {
 struct StoreInner {
     connection: Connection,
     closed: bool,
+    refused_closures: RefusedClosures,
+}
+
+/// The closed cards whose final content storage has refused, by card.
+type RefusedClosures = HashMap<CardId, RefusedClosure>;
+
+/// A closed card's final content as storage refused it, with the generation
+/// storage held for the card once the refusal was settled.
+///
+/// A refusal is a property of the content offered and the row it was offered
+/// over ([`StoreError::refuses_content`]), and a window keeps offering the
+/// cards it closed in every snapshot it saves. Remembering the refusal is what
+/// keeps that from becoming the same failed write, and the same warning, on
+/// every save for as long as the window stays open.
+///
+/// It is deliberately not persisted: the next run offers the content once
+/// more, which is also how a build whose rules changed gets to accept it.
+struct RefusedClosure {
+    offered: CardState,
+    generation: u64,
+}
+
+impl RefusedClosure {
+    /// Whether offering `card` over `stored` is the offer already refused,
+    /// with nothing left for it to store.
+    fn repeats(&self, card: &CardState, stored: Option<&ExistingCard>) -> bool {
+        // Destructured in full so that a field added to `CardState` has to be
+        // classified here: what a card write stores is compared, and what
+        // only describes the running window is not.
+        let CardState {
+            id: _,
+            generation: _,
+            title,
+            width_fraction,
+            existence,
+            exposure: _,
+            residency: _,
+            kind,
+        } = &self.offered;
+        // An open row still has the tombstone to take, so only a row that is
+        // absent or already closed makes the offer a pure repeat.
+        stored.is_none_or(|stored| !stored.existence.is_open())
+            && self.generation == stored.map_or(0, |stored| stored.generation)
+            && *title == card.title
+            && *width_fraction == card.width_fraction
+            && *existence == card.existence
+            && *kind == card.kind
+    }
 }
 
 /// A single serialized SQLite state store. All connection access passes through
@@ -495,6 +543,7 @@ impl StateStore {
 
         Ok(Self {
             inner: Mutex::new(StoreInner {
+                refused_closures: RefusedClosures::new(),
                 connection,
                 closed: false,
             }),
@@ -536,10 +585,13 @@ impl StateStore {
     ) -> Result<WorkspaceCommit> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let transaction = inner
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commit = save_workspace_transaction(&transaction, state, base)?;
+        let StoreInner {
+            connection,
+            refused_closures,
+            ..
+        } = &mut *inner;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let commit = save_workspace_transaction(&transaction, state, base, refused_closures)?;
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
@@ -560,9 +612,12 @@ impl StateStore {
         }
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let transaction = inner
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let StoreInner {
+            connection,
+            refused_closures,
+            ..
+        } = &mut *inner;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
         let mut prepared = state.clone();
         let mut generations = base.cards.clone();
@@ -661,6 +716,7 @@ impl StateStore {
                 workspace: base.workspace,
                 cards: &generations,
             },
+            refused_closures,
         )?;
         transaction.commit()?;
         Ok(commit)
@@ -2689,6 +2745,7 @@ fn save_workspace_transaction(
     transaction: &Transaction<'_>,
     state: &WorkspaceState,
     base: SnapshotBase<'_>,
+    refused_closures: &mut RefusedClosures,
 ) -> Result<WorkspaceCommit> {
     validate_workspace(state)?;
     let workspace_id = state.id.to_string();
@@ -2784,20 +2841,29 @@ fn save_workspace_transaction(
 
     for (ordinal, card) in state.cards.iter().enumerate() {
         let expected = base.cards.get(&card.id).copied().unwrap_or(0);
-        let save = if card.existence.is_open() {
-            save_card
+        let stored = existing.get(&card.id);
+        let generation = if card.existence.is_open() {
+            save_card(
+                transaction,
+                &workspace_id,
+                ordinal,
+                card,
+                expected,
+                stored,
+                timestamp,
+            )
         } else {
-            save_closed_card
-        };
-        let generation = save(
-            transaction,
-            &workspace_id,
-            ordinal,
-            card,
-            expected,
-            existing.get(&card.id),
-            timestamp,
-        )
+            save_closed_card(
+                transaction,
+                &workspace_id,
+                ordinal,
+                card,
+                expected,
+                stored,
+                timestamp,
+                refused_closures,
+            )
+        }
         .map_err(|error| error.in_card(card.id))?;
         card_generations.insert(card.id, generation);
     }
@@ -2925,6 +2991,11 @@ fn save_card(
 /// alone is stored over what storage holds: a card the user closed must never
 /// keep the rest of the window from saving, and closing is the remedy offered
 /// for exactly that refusal.
+///
+/// The window goes on offering the card in every later snapshot. A refusal is
+/// therefore remembered in `refused_closures`, and the same content offered
+/// over the same row is neither written nor reported a second time.
+#[allow(clippy::too_many_arguments)]
 fn save_closed_card(
     transaction: &Transaction<'_>,
     workspace_id: &str,
@@ -2933,6 +3004,7 @@ fn save_closed_card(
     expected: u64,
     stored: Option<&ExistingCard>,
     timestamp: i64,
+    refused_closures: &mut RefusedClosures,
 ) -> Result<u64> {
     if let Some(stored) = stored
         && stored.kind == PersistedCardKind::Terminal
@@ -2954,6 +3026,11 @@ fn save_closed_card(
         // reclaim that live identity or erase the archive.
         return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
     }
+    if let Some(refused) = refused_closures.get(&card.id)
+        && refused.repeats(card, stored)
+    {
+        return Ok(refused.generation);
+    }
     transaction.execute_batch("SAVEPOINT closed_card")?;
     let written = save_card(
         transaction,
@@ -2972,16 +3049,30 @@ fn save_closed_card(
                 %error,
                 "storage refused a closed card's final content; storing its tombstone alone"
             );
-            match stored {
+            let generation = match stored {
                 Some(stored) => {
-                    tombstone_card(transaction, card.id, stored, &card.existence, timestamp)
+                    tombstone_card(transaction, card.id, stored, &card.existence, timestamp)?
                 }
                 // Storage never held the card, so there is nothing to close.
-                None => Ok(0),
-            }
+                None => 0,
+            };
+            // Recorded before the transaction commits, which is sound: a
+            // rollback leaves the row at an earlier generation or still open,
+            // and neither matches what is remembered here.
+            refused_closures.insert(
+                card.id,
+                RefusedClosure {
+                    offered: card.clone(),
+                    generation,
+                },
+            );
+            Ok(generation)
         }
         written => {
             transaction.execute_batch("RELEASE closed_card")?;
+            if written.is_ok() {
+                refused_closures.remove(&card.id);
+            }
             written
         }
     }
@@ -5992,6 +6083,7 @@ mod tests {
                 workspace: 0,
                 cards: &BTreeMap::new(),
             },
+            &mut RefusedClosures::new(),
         )
         .unwrap();
         transaction.pragma_update(None, "user_version", 3).unwrap();
@@ -6076,6 +6168,7 @@ mod tests {
                 workspace: 0,
                 cards: &BTreeMap::new(),
             },
+            &mut RefusedClosures::new(),
         )
         .unwrap();
         // The v5 table must refuse the new kinds, or this test proves nothing.
@@ -7034,6 +7127,141 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, StoreError::CorruptRow { .. }));
         assert!(!error.refuses_content());
+    }
+
+    /// Counts how often `body` reports a closed card's final content as
+    /// refused, on this thread only.
+    fn closed_card_refusals(body: impl FnOnce()) -> usize {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        struct IsRefusal(bool);
+        impl Visit for IsRefusal {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0 |= field.name() == "message"
+                    && format!("{value:?}").contains("refused a closed card's final content");
+            }
+        }
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for Count {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut refusal = IsRefusal(false);
+                event.record(&mut refusal);
+                if refusal.0 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(seen.clone()));
+        tracing::subscriber::with_default(subscriber, body);
+        seen.load(Ordering::Relaxed)
+    }
+
+    fn closed_by_user() -> Existence {
+        Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        }
+    }
+
+    /// A window offers the cards it closed in every snapshot it saves. One
+    /// whose final content storage refused is settled by its tombstone, so
+    /// offering it again must neither repeat the write nor the report.
+    #[test]
+    fn refused_closed_card_content_is_offered_to_storage_once() {
+        let directory = tempdir().unwrap();
+        let (mut workspace, session) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(session.clone());
+        let store = StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        // The card closes holding a conversation storage will not let it
+        // become, which is the refusal closing is the remedy for.
+        let mut rebound = session.clone();
+        rebound.launch.provider = crate::agent::Provider::Codex;
+        workspace.cards[0].kind = CardKind::Chat(rebound);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        let refusals = closed_card_refusals(|| {
+            lane.save(&store, &workspace).unwrap();
+        });
+        assert_eq!(refusals, 1, "the refusal is reported when it happens");
+        let closed = stored_card_row(&store, card);
+        let stored = store.load_card(card, None).unwrap().unwrap();
+        assert_eq!(stored.existence, closed_by_user());
+        assert_eq!(stored.kind, CardKind::Chat(session.clone()));
+
+        // Every later save of the window carries the same closed card.
+        let refusals = closed_card_refusals(|| {
+            for _ in 0..3 {
+                let commit = lane.save(&store, &workspace).unwrap();
+                assert_eq!(commit.card_generations[&card], closed.0.cast_unsigned());
+            }
+        });
+        assert_eq!(refusals, 0, "a settled refusal is not attempted again");
+        assert_eq!(stored_card_row(&store, card), closed);
+
+        // Different content is a different offer, and is tried on its merits.
+        workspace.cards[0].title = "renamed after closing".into();
+        let refusals = closed_card_refusals(|| {
+            lane.save(&store, &workspace).unwrap();
+            lane.save(&store, &workspace).unwrap();
+        });
+        assert_eq!(
+            refusals, 1,
+            "a new offer is refused once more, then settled"
+        );
+
+        // Content storage accepts is written, and forgets the refusal.
+        workspace.cards[0].kind = CardKind::Chat(session.clone());
+        let refusals = closed_card_refusals(|| {
+            lane.save(&store, &workspace).unwrap();
+        });
+        assert_eq!(refusals, 0);
+        let stored = store.load_card(card, None).unwrap().unwrap();
+        assert_eq!(stored.title, "renamed after closing");
+        assert!(stored_card_row(&store, card).2.is_some());
+    }
+
+    /// A closed card storage never held has no row to tombstone, so the
+    /// refusal of its content is the whole outcome and is settled the same way.
+    #[test]
+    fn refused_closed_card_storage_never_held_is_offered_once() {
+        let directory = tempdir().unwrap();
+        let (mut workspace, mut session) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        // A source terminal that is not the conversation's own is refused
+        // whatever storage holds.
+        session.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(session);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        let store = StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        let mut lane = SaveLane::default();
+
+        let refusals = closed_card_refusals(|| {
+            for _ in 0..3 {
+                let commit = lane.save(&store, &workspace).unwrap();
+                assert_eq!(commit.card_generations[&card], 0);
+            }
+        });
+        assert_eq!(refusals, 1);
+        assert!(store.load_card(card, None).unwrap().is_none());
     }
 
     #[test]
