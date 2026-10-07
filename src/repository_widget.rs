@@ -8162,6 +8162,11 @@ fn editable_document_view<'a>(
     let content: Element<'a, RepositoryAction> = if runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Preview
     {
+        // The preview is the same document the editor shows, so it reads at
+        // the editor's size: switching modes must not shrink the text, and a
+        // reader who enlarged their editor gets the same from the rendering.
+        let settings =
+            crate::design::markdown_settings(&cosmic::theme::active(), runtime.editor_font_size);
         widget::scrollable(
             widget::container(if preview::standalone(&document.path) {
                 preview::diagram_view(
@@ -8170,10 +8175,12 @@ fn editable_document_view<'a>(
                         .get(&blake3::hash(document.preview_text.as_bytes())),
                     &document.preview_text,
                     document.diagram_pending.is_some(),
+                    settings.code_size,
                 )
             } else if !document.markdown {
                 widget::selectable_text(document.preview_text.as_str())
                     .font(Font::MONOSPACE)
+                    .size(settings.code_size)
                     .into()
             } else {
                 widget::column::with_children(
@@ -8187,10 +8194,7 @@ fn editable_document_view<'a>(
                                     diagrams: &document.diagrams,
                                     loading: document.diagram_pending.is_some(),
                                 },
-                                crate::design::markdown_settings(
-                                    &cosmic::theme::active(),
-                                    crate::design::TEXT_BODY,
-                                ),
+                                settings,
                                 item,
                                 index,
                             )
@@ -8201,14 +8205,7 @@ fn editable_document_view<'a>(
                         })
                         .collect::<Vec<_>>(),
                 )
-                .spacing(
-                    crate::design::markdown_settings(
-                        &cosmic::theme::active(),
-                        crate::design::TEXT_BODY,
-                    )
-                    .spacing
-                    .0,
-                )
+                .spacing(settings.spacing.0)
                 .into()
             })
             .padding(space::XL)
