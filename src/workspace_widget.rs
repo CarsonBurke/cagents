@@ -17,7 +17,9 @@ use crate::{
     input_trace::InputTrace,
     model::CardId,
     settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, format_chords, parse_shortcut},
-    workspace::{FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, Workspace},
+    workspace::{
+        FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, VisibilityClass, Workspace,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -804,13 +806,16 @@ where
                     };
                     let content =
                         cosmic::widget::id_container(build_card(context), container_id(card.id));
+                    let on_screen = mounted.visibility == VisibilityClass::Visible;
                     Some(VirtualCard {
                         id: card.id,
                         x: mounted.start,
                         width: mounted.width,
                         content_width: mounted.content_width,
+                        on_screen,
                         content: CardSurface::new(content)
                             .traced_by(input)
+                            .on_screen(on_screen)
                             .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
                                 card.id,
                             )))
@@ -865,6 +870,7 @@ struct CardSurface<'a, Message> {
     on_pointer_focus: Option<Message>,
     on_pointer_rest: Option<Message>,
     input: InputTrace,
+    on_screen: bool,
 }
 
 impl<'a, Message> CardSurface<'a, Message> {
@@ -874,7 +880,16 @@ impl<'a, Message> CardSurface<'a, Message> {
             on_pointer_focus: None,
             on_pointer_rest: None,
             input: InputTrace::default(),
+            on_screen: false,
         }
+    }
+
+    /// Whether the workspace classes this pane as visible, which a pane the
+    /// camera is still travelling to is before any of it is in the viewport.
+    /// Such a pane takes everything but the pointer; see `update`.
+    fn on_screen(mut self, on_screen: bool) -> Self {
+        self.on_screen = on_screen;
+        self
     }
 
     /// The window's record of its input, which hover activation reads for
@@ -1072,8 +1087,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
             }
             _ => {}
         }
-        let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
-            return;
+        let clipped = match clipped_viewport(layout.bounds(), viewport) {
+            Some(clipped) => clipped,
+            // None of this pane can be pointed at, but one the camera is
+            // travelling to already holds the keyboard: what is typed during
+            // the journey is meant for it.
+            None if self.on_screen && !matches!(event, Event::Mouse(_) | Event::Touch(_)) => {
+                Rectangle::new(layout.bounds().position(), Size::ZERO)
+            }
+            None => return,
         };
         // Observe before the child can capture the press, but do not capture it
         // ourselves: text selection, caret placement and controls still get it.
@@ -1209,6 +1231,9 @@ struct VirtualCard<'a, Message> {
     x: f32,
     width: f32,
     content_width: f32,
+    /// Whether the workspace classes the card as visible. A pane the camera
+    /// is still travelling to is, without yet being inside the viewport.
+    on_screen: bool,
     content: Element<'a, Message>,
 }
 
@@ -1425,7 +1450,13 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         {
             let viewport = &card.viewport(child_layout.bounds(), viewport);
             let cursor = card.cursor(viewport, cursor);
-            if child_layout.bounds().intersects(viewport)
+            // A pane the camera is travelling to already holds the keyboard
+            // and is about to be looked at, so it is shown events as though it
+            // had arrived: keys typed during the journey reach it, and it
+            // sizes itself before it is seen. Panes merely parked in the
+            // overscan still get pointer events alone.
+            if card.on_screen
+                || child_layout.bounds().intersects(viewport)
                 || matches!(
                     event,
                     Event::Mouse(
@@ -2392,6 +2423,7 @@ mod tests {
                     x: 0.0,
                     width: 320.0,
                     content_width: 320.0,
+                    on_screen: true,
                     content: cosmic::widget::id_container(
                         child,
                         widget::Id::new(format!("parked-card-{index}")),
@@ -2472,6 +2504,7 @@ mod tests {
             x: 300.0,
             width,
             content_width,
+            on_screen: true,
             content: widget::Space::new().into(),
         };
         let bounds = |card: &VirtualCard<'_, ()>| {
@@ -3189,6 +3222,143 @@ mod tests {
         )));
     }
 
+    /// A leaf that reports every key press it is shown, as its card.
+    struct KeyProbe(CardId);
+
+    impl Widget<Option<CardId>, Theme, Renderer> for KeyProbe {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fill)
+        }
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.max())
+        }
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+        fn update(
+            &mut self,
+            _tree: &mut Tree,
+            event: &Event,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _renderer: &Renderer,
+            _clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Option<CardId>>,
+            _viewport: &Rectangle,
+        ) {
+            if matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. })) {
+                shell.publish(Some(self.0));
+            }
+        }
+    }
+
+    /// A far jump hands its destination the keyboard at once, but the pane
+    /// only enters the viewport when the camera gets there. The strip showed
+    /// keyboard events to panes inside the viewport alone, so what was typed
+    /// during the journey reached nobody.
+    #[test]
+    fn keys_typed_while_the_camera_travels_reach_the_pane_it_is_travelling_to() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use cosmic::iced::{Font, Pixels};
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(400.0);
+        for index in 0..8 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(CardId::new(), "Pane", CardWidth::Fixed(480.0)).unwrap(),
+                    index,
+                    index == 0,
+                )
+                .unwrap();
+        }
+        let ids: Vec<_> = workspace.order().collect();
+        workspace.focus(ids[6]).unwrap();
+        assert_eq!(workspace.camera().offset(), 0.0);
+
+        let shortcuts = KeyboardShortcuts::default();
+        let mut element = view(
+            &workspace,
+            &shortcuts,
+            FocusedPane::Other,
+            false,
+            &InputTrace::default(),
+            400.0,
+            widget::Id::unique(),
+            |context| Element::new(KeyProbe(context.id)),
+            card_widget_id,
+            // Whatever the strip reports about itself is not a key press.
+            Events { viewport: |_| None },
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()),
+        );
+        let mut messages = Vec::new();
+        let mut clipboard = clipboard::Null;
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("a".into()),
+                modified_key: keyboard::Key::Character("a".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("a".into()),
+                repeat: false,
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard,
+            &mut shell,
+            &viewport,
+        );
+        let mut reached: Vec<_> = messages
+            .into_iter()
+            .flatten()
+            .map(|id| ids.iter().position(|candidate| *candidate == id).unwrap())
+            .collect();
+        reached.sort_unstable();
+        // The pane on screen sees the key as before, and so does the
+        // destination. The pane parked in the overscan beside it does not.
+        assert_eq!(
+            workspace
+                .projection(400.0)
+                .mounted_ids()
+                .collect::<Vec<_>>(),
+            [ids[0], ids[1], ids[6]]
+        );
+        assert_eq!(reached, [0, 6]);
+    }
+
     /// The shell re-runs one `RedrawRequested` through update and layout while
     /// any pass publishes a message, rebuilding the view in between, and warns
     /// once a frame has cost three of those passes. The strip surface reports
@@ -3460,6 +3630,7 @@ mod tests {
                 x: 0.0,
                 width: 100.0,
                 content_width: 100.0,
+                on_screen: true,
                 content: Element::new(AccessibleProbe {
                     node,
                     expected_virtual_offset: Vector::ZERO,
@@ -3529,6 +3700,7 @@ mod tests {
                     x: index as f32 * 100.0,
                     width: 100.0,
                     content_width: 100.0,
+                    on_screen: true,
                     content: CardSurface::new(Element::new(AccessibleProbe {
                         node: index as u64 + 1,
                         expected_virtual_offset: Vector::new(32.0, 0.0),
