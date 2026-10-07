@@ -320,7 +320,8 @@ fn notify_archived(notice: impl FnOnce() + Send + 'static) {
         }
         notices
     });
-    // The receiver is gone only if its thread never started, reported above.
+    // Sending fails only once that thread is gone: it never started, which is
+    // reported above, or a callback panicked, which the panic hook reports.
     let _ = notifier.send(Box::new(notice));
 }
 
@@ -534,8 +535,11 @@ impl PublishedState {
                 drop(phase);
                 let published = Arc::downgrade(self);
                 notify_archived(move || {
+                    // Announce whatever is newest by now, so a burst of
+                    // commands queued behind the host costs one redraw.
                     if let Some(published) = published.upgrade() {
-                        published.request_wake(generation);
+                        published
+                            .request_wake(published.published_generation.load(Ordering::Acquire));
                     }
                 });
                 return Ok(());
