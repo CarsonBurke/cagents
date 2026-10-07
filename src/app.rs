@@ -12625,9 +12625,11 @@ impl Application for Cagents {
             return Task::none();
         }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
-            // A new animation starts from its first frame, not from time spent
-            // idle while the window-frame subscription was disconnected.
-            self.frame_clock.reset();
+            // Whatever this message starts is measured from now. Its first
+            // frame then moves it by the time since the input that began it,
+            // not by the time spent idle while the window-frame subscription
+            // was disconnected, and not by nothing at all.
+            self.frame_clock.start(Instant::now());
         }
         // Camera-only events cannot change labels, selected worktrees, or
         // repository bindings. Keep per-frame work proportional to visible
@@ -20146,16 +20148,20 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(600.0);
         app.workspace.native_scroll(0.0, 600.0);
-        let previous_frame = Instant::now();
-        let _ = app.frame_clock.elapsed(previous_frame);
+        // The last frame of whatever animated before, two idle seconds ago.
+        let navigated = Instant::now();
+        let previous_frame = navigated - Duration::from_secs(2);
+        app.frame_clock.start(previous_frame);
 
         let _ = app.update(Message::FocusCard(target));
-        let first_frame = previous_frame + Duration::from_secs(2);
-        let _ = app.update(Message::Frame(first_frame));
-        assert_eq!(app.workspace.camera().offset(), 0.0);
-        let _ = app.update(Message::Frame(first_frame + Duration::from_millis(16)));
-        assert!(app.workspace.camera().offset() > 0.0);
-        assert!(app.workspace.camera().offset() < app.workspace.camera().target() / 2.0);
+        // The first frame already moves the camera, by the time since the
+        // navigation and not since that earlier frame.
+        let _ = app.update(Message::Frame(navigated + Duration::from_millis(16)));
+        let first = app.workspace.camera().offset();
+        assert!(first > 0.0);
+        assert!(first < app.workspace.camera().target() / 2.0);
+        let _ = app.update(Message::Frame(navigated + Duration::from_millis(32)));
+        assert!(app.workspace.camera().offset() > first);
     }
 
     #[test]

@@ -471,6 +471,16 @@ impl FrameClock {
         self.last
     }
 
+    /// Measures the next frame from `now`, the moment an animation began.
+    ///
+    /// A clock with no frame behind it spends its first one finding out when
+    /// it is, so an animation started on an unset clock stood still for a
+    /// frame before moving. Started here, that frame advances it by the time
+    /// that has really passed since the input that began it.
+    pub fn start(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
     pub fn reset(&mut self) {
         self.last = None;
     }
@@ -3962,6 +3972,26 @@ mod tests {
         assert_eq!(clock.elapsed(start + Duration::from_secs(1)), None);
         assert_eq!(
             clock.elapsed(start + Duration::from_millis(2_016)),
+            Some(Duration::from_millis(16))
+        );
+    }
+
+    #[test]
+    fn a_started_frame_clock_advances_on_its_first_frame() {
+        let start = Instant::now();
+        let mut clock = FrameClock::default();
+        clock.start(start);
+        assert_eq!(clock.frame(), Some(start));
+        assert_eq!(
+            clock.elapsed(start + Duration::from_millis(9)),
+            Some(Duration::from_millis(9))
+        );
+        // Restarting discards whatever was measured before, and a frame the
+        // shell drew before the restart measures nothing.
+        clock.start(start + Duration::from_secs(5));
+        assert_eq!(clock.elapsed(start + Duration::from_secs(4)), None);
+        assert_eq!(
+            clock.elapsed(start + Duration::from_millis(5_016)),
             Some(Duration::from_millis(16))
         );
     }

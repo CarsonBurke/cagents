@@ -11,6 +11,15 @@ use crate::model::CardId;
 
 const POSITION_EPSILON: f32 = 0.25;
 const VELOCITY_EPSILON: f32 = 0.5;
+/// Where the camera stops approaching its target and takes it.
+///
+/// A spring only ever nears its target, and every frame it is still moving
+/// rebuilds the strip. Within half a logical pixel, and slow enough to cover
+/// less than that again in a 60 Hz frame, what is left cannot be seen, so
+/// finishing it there costs nothing visible. The speed bound is what keeps a
+/// camera that is merely passing its target from being stopped on it.
+const SETTLE_DISTANCE: f32 = 0.5;
+const SETTLE_SPEED: f32 = 30.0;
 const SCROLL_SYNC_EPSILON: f32 = 0.5;
 const LAYOUT_DURATION: Duration = Duration::from_millis(220);
 
@@ -558,8 +567,8 @@ impl Camera {
         self.offset = self.target + (displacement + coefficient * seconds) * decay;
         self.velocity = (self.velocity - self.omega * coefficient * seconds) * decay;
 
-        if (self.offset - self.target).abs() <= POSITION_EPSILON
-            && self.velocity.abs() <= VELOCITY_EPSILON
+        if (self.offset - self.target).abs() <= SETTLE_DISTANCE
+            && self.velocity.abs() <= SETTLE_SPEED
         {
             self.offset = self.target;
             self.velocity = 0.0;
@@ -2269,6 +2278,51 @@ mod tests {
         assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
         assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
         assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    #[test]
+    fn the_camera_takes_its_target_once_the_rest_of_the_way_cannot_be_seen() {
+        let frame = Duration::from_micros(16_667);
+        let mut camera = Camera::new(WorkspaceConfig::default().animation_omega).unwrap();
+        camera.animate_to(1_000.0);
+        let mut elapsed = Duration::ZERO;
+        let mut previous = camera.offset();
+        while camera.is_animating() {
+            previous = camera.offset();
+            camera.step(frame);
+            elapsed += frame;
+            assert!(elapsed < Duration::from_secs(1), "the camera never settled");
+        }
+        assert_eq!(camera.offset(), 1_000.0);
+        assert_eq!(camera.velocity(), 0.0);
+        // The last frame is the one that closes the remaining half pixel, so
+        // nothing jumps; and the strip stops rebuilding well before the old
+        // quarter-pixel, half-pixel-per-second rule let it (some 460 ms).
+        assert!(camera.offset() - previous < 1.0);
+        assert!(elapsed < Duration::from_millis(360), "{elapsed:?}");
+        assert!(!camera.step(frame));
+    }
+
+    #[test]
+    fn a_camera_passing_its_target_at_speed_is_not_stopped_on_it() {
+        let mut camera = Camera::new(WorkspaceConfig::default().animation_omega).unwrap();
+        camera.animate_to(1_000.0);
+        camera.step(Duration::from_millis(40));
+        let passing = camera.offset();
+        assert!(camera.velocity() > SETTLE_SPEED);
+
+        // Retargeted to where it already is, the camera is on its target but
+        // still carrying its speed, and has to be let run on and come back.
+        camera.animate_to(passing);
+        assert!(camera.is_animating());
+        camera.step(Duration::from_millis(4));
+        assert!(camera.is_animating());
+        assert!(camera.offset() > passing);
+        for _ in 0..120 {
+            camera.step(Duration::from_micros(16_667));
+        }
+        assert!(!camera.is_animating());
+        assert_eq!(camera.offset(), passing);
     }
 
     #[test]
