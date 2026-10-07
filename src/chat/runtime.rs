@@ -1784,6 +1784,12 @@ impl Actor {
                 .clone()
                 .ok_or("Missing verified app-server peer")?;
             holder.confirm(thread.clone(), identity.clone(), process)?;
+            // Durable continuity is a claim about this thread. Name it first,
+            // so nobody can observe the claim without its conversation.
+            *self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(thread.clone());
             self.state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1792,19 +1798,18 @@ impl Actor {
             };
             self.dirty = true;
         }
-        self.step(step)?;
-        if let Some(identity) = identity {
-            *self
-                .confirmed_session
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = identity;
-        }
+        self.apply_step(step, identity)?;
         if observed {
             self.observe_update();
         }
         Ok(())
     }
     fn step(&mut self, step: Step) -> Result<(), String> {
+        self.apply_step(step, None)
+    }
+    /// Applies one frame. `confirmed` is the conversation identity the
+    /// provider left the frame with, when the frame changed it.
+    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -1890,6 +1895,14 @@ impl Actor {
             if let Some(message) = fatal {
                 return Err(message);
             }
+        }
+        // An outcome is acted on as soon as it is published, and its reader
+        // asks which conversation produced it. Answer before announcing.
+        if let Some(confirmed) = confirmed {
+            *self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = confirmed;
         }
         // The provider's final usage/items may follow its settlement in this
         // same frame. Freeze only after applying the whole frame, then publish
@@ -3606,6 +3619,78 @@ mod tests {
         assert!(notified.recv_timeout(Duration::from_millis(200)).is_err());
         assert_eq!(generation(&handle), before);
         assert!(handle.snapshot(None).unwrap().items.is_empty());
+        handle.close().unwrap();
+    }
+    /// The host records a run's outcome the moment it is announced and then
+    /// asks the handle which conversation produced it.
+    #[test]
+    fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
+        use crate::agent_execution::ProviderEvent;
+        struct WholeTurn(crate::model::RunId);
+        impl Adapter for WholeTurn {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![json!({})],
+                    events: Vec::new(),
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture takes no commands".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                let execution = |event| Event::Execution { run: self.0, event };
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![
+                        Event::Session {
+                            id: "confirmed".into(),
+                            title: None,
+                        },
+                        execution(ProviderEvent::Started {
+                            key: "request".into(),
+                        }),
+                        execution(ProviderEvent::Settled),
+                        execution(ProviderEvent::Finished {
+                            outcome: crate::notifications::Kind::Succeeded,
+                        }),
+                    ],
+                })
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(WholeTurn(crate::model::RunId::new()));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (started, actor) = crossbeam_channel::bounded::<Handle>(1);
+        let (observe, observed) = crossbeam_channel::bounded(1);
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::Execution {
+                update: crate::agent_execution::Update::Finished { .. },
+                ..
+            } = update
+            {
+                let handle = actor.recv_timeout(Duration::from_secs(5)).unwrap();
+                let _ = observe.try_send(handle.confirmed_session_id());
+            }
+        })
+        .unwrap();
+        started.send(handle.clone()).unwrap();
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the outcome was never announced")
+                .as_deref(),
+            Some("confirmed")
+        );
         handle.close().unwrap();
     }
     #[test]
