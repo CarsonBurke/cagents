@@ -998,9 +998,9 @@ impl CachedItem {
         let mut blocks = HashMap::new();
         for_each_fence(self.markdown.items(), &mut |language, code| {
             let key = fence_key(language.unwrap_or_default(), code);
-            let block = previous
-                .remove(&key)
-                .unwrap_or_else(|| prose::CodeBlock::new(language, code, theme));
+            let block = previous.remove(&key).unwrap_or_else(|| {
+                prose::CodeBlock::new(language.and_then(prose::fence_language), code, theme)
+            });
             blocks.insert(key, block);
         });
         self.blocks = blocks;
@@ -13177,6 +13177,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A fence's info string names its language first and says other things
+    /// after; the grammar and the caption both go by the language.
+    #[test]
+    fn a_fence_is_highlighted_by_the_first_word_of_its_info_string() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        for (info, language) in [
+            ("rust", Some("rust")),
+            ("rust,ignore", Some("rust")),
+            ("ts title=\"x.ts\"", Some("ts")),
+            ("  python  {1,3}", Some("python")),
+            (",", None),
+            ("", None),
+        ] {
+            assert_eq!(prose::fence_language(info), language, "{info:?}");
+        }
+        let cached = CachedItem::new(&text("```rust,ignore\nfn main() {}\n```\n"), THEME);
+        let block = cached
+            .block(Some("rust,ignore"), "fn main() {}\n")
+            .expect("the fence is cached under the info string the parser hands over");
+        assert!(
+            block.spans(true).iter().any(|span| span.color.is_some()),
+            "a keyword takes a color"
+        );
     }
 
     /// The token is what licenses reusing a parse, so it must refuse anything

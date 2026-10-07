@@ -100,6 +100,15 @@ impl CodeBlock {
     }
 }
 
+/// The language a fence's info string names: its first word.
+///
+/// What follows the language is for whatever runs the block - `rust,ignore`,
+/// `ts title="x.ts"` - and is neither a grammar to look up nor a caption.
+pub(super) fn fence_language(info: &str) -> Option<&str> {
+    info.split(|character: char| character == ',' || character.is_whitespace())
+        .find(|word| !word.is_empty())
+}
+
 /// An item's parsed Markdown as an element that owns what it draws.
 pub(super) fn view(
     cached: &CachedItem,
@@ -299,7 +308,12 @@ impl Renderer<'_> {
                 design::scrollbar(),
             ))
             .into(),
-            Some(language.unwrap_or("Code").to_owned()),
+            Some(
+                language
+                    .and_then(fence_language)
+                    .unwrap_or("Code")
+                    .to_owned(),
+            ),
             Some(Action::CopyLiteral(code.to_owned())),
         )
     }
