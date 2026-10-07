@@ -244,7 +244,7 @@ impl Recovery {
 /// `tests/codex_continuity_qualification.rs` is that verification, run against
 /// the real executable through a killed daemon. A version belongs here only
 /// after it passes; a server of any other version ends with its daemon.
-pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1"];
+pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1", "0.161.0"];
 
 /// Codex's initialize response includes its own version in a user agent whose
 /// prefix is the client name supplied by this application. Use that response
