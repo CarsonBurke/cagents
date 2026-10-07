@@ -7818,7 +7818,10 @@ impl Cagents {
             });
         }
         // Runtime objects and focus never move out of their ID-indexed maps.
-        self.apply_viewport(update, true, true)
+        let viewport = self.apply_viewport(update, true, true);
+        // Focus did not change, so nothing above follows the active tab to
+        // wherever the new order put it.
+        Task::batch([viewport, self.reveal_active_tab()])
     }
 
     fn apply_viewport(
@@ -20146,6 +20149,89 @@ mod tests {
                 result: Err(crate::editor::FileIoError::Io("fixture".into())),
             })
         ));
+    }
+
+    /// Where `task` asks the tab strip to scroll to, if it asks at all.
+    fn tab_strip_scroll(task: Task<Message>) -> Option<f32> {
+        use cosmic::iced::advanced::widget::operation::scrollable::{
+            AbsoluteOffset, RelativeOffset, Scrollable,
+        };
+
+        struct Strip(Option<f32>);
+        impl Scrollable for Strip {
+            fn snap_to(&mut self, _offset: RelativeOffset<Option<f32>>) {}
+            fn scroll_to(&mut self, offset: AbsoluteOffset<Option<f32>>) {
+                self.0 = offset.x;
+            }
+            fn scroll_by(
+                &mut self,
+                _offset: AbsoluteOffset,
+                _bounds: cosmic::iced::Rectangle,
+                _content_bounds: cosmic::iced::Rectangle,
+            ) {
+            }
+        }
+
+        let mut strip = Strip(None);
+        let tabs = widget::Id::new("workspace.tabs");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            // The task also carries timers that outlive the test. A scroll is
+            // ready at once, so a short quiet spell means none is coming.
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    let bounds = cosmic::iced::Rectangle::default();
+                    operation.scrollable(
+                        Some(&tabs),
+                        bounds,
+                        bounds,
+                        cosmic::iced::Vector::ZERO,
+                        &mut strip,
+                    );
+                }
+            }
+        });
+        runtime.shutdown_background();
+        strip.0
+    }
+
+    /// Reordering does not change which pane is focused, and the tab strip
+    /// only followed focus, so moving the active pane along the strip could
+    /// carry its tab out of sight.
+    #[test]
+    fn moving_the_active_pane_keeps_its_tab_in_view() {
+        let mut app = context_inspector_test_app(false);
+        let cards: Vec<_> = (0..24).map(|_| terminal_card_state()).collect();
+        let active = cards[0].id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(active),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        app.chrome_ui.tabs_focus = Some(active);
+        assert_eq!(
+            tab_strip_scroll(app.reveal_active_tab()),
+            None,
+            "the first tab starts in view"
+        );
+
+        let task = app.reorder_pane(active, None);
+        assert_eq!(app.workspace.order().last(), Some(active));
+        assert_eq!(app.workspace.focused(), Some(active));
+        assert!(
+            tab_strip_scroll(task).is_some_and(|offset| offset > 0.0),
+            "the tab moved to the far end of the strip and was not followed"
+        );
     }
 
     #[test]
