@@ -38,7 +38,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
-#[cfg(any(feature = "host", feature = "ui"))]
 use crate::model::{BootId, HostSessionProof};
 use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
@@ -502,7 +501,6 @@ pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
-#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn replacement_owner(
     socket: &Path,
     proof: &HostSessionProof,
@@ -532,7 +530,6 @@ pub(crate) fn replacement_owner(
 
 /// Validate the exclusive owner before its public listener exists. Holders use
 /// this during startup adoption, and compare it to the connecting peer's PID.
-#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn lease_owner(
     lock_path: &Path,
     proof: &HostSessionProof,
@@ -810,7 +807,6 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(credentials.uid)
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn read_boot_id() -> io::Result<BootId> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let value = value.trim();

@@ -56,6 +56,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         spec,
         Box::new(Claude {
             session_id: Some(session_id),
+            resumed: launch.session_id.is_some(),
             cwd: launch.recipe.working_directory.clone(),
             history,
             ..Claude::default()
@@ -287,6 +288,9 @@ struct Submission {
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
+    /// Whether this process was launched to resume `session_id`, as opposed
+    /// to being handed a new one that names nothing until its first prompt.
+    resumed: bool,
     cwd: PathBuf,
     ready: bool,
     busy: bool,
@@ -1726,6 +1730,21 @@ impl Adapter for Claude {
                         "initialize" => {
                             self.ready = true;
                             step.events.push(Event::Ready(true));
+                            // The CLI names its session only on frames of a
+                            // turn, so an idle resumed conversation would stay
+                            // unconfirmed until its next prompt and could not
+                            // be checkpointed or restored meanwhile. A
+                            // `--resume` the CLI cannot load ends the process
+                            // instead of answering, which makes this reply its
+                            // confirmation of that exact conversation.
+                            if self.resumed
+                                && let Some(id) = &self.session_id
+                            {
+                                step.events.push(Event::Session {
+                                    id: id.clone(),
+                                    title: None,
+                                });
+                            }
                             self.metadata(&response["response"], &mut step);
                             if let Some(mode) =
                                 response["response"]["current_permission_mode"].as_str()
@@ -6755,6 +6774,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["root", "answer"]
         );
+    }
+
+    /// The CLI puts `session_id` only on the frames of a turn. A conversation
+    /// resumed by a daemon restart and then left idle must not stay
+    /// unconfirmed, or no later update can checkpoint it.
+    #[test]
+    fn initializing_confirms_a_resumed_conversation_but_not_an_unused_new_one() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let confirmed = |resumed| {
+            let mut adapter = Claude {
+                session_id: Some(id.into()),
+                resumed,
+                ..Default::default()
+            };
+            let initialize = adapter.initialize().unwrap();
+            let request = initialize.writes[0]["request_id"].as_str().unwrap();
+            adapter
+                .receive(reply(request, json!({})))
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { id: session, .. } if session == id))
+        };
+        assert!(confirmed(true));
+        // `--session-id` names a conversation that does not exist on disk
+        // until its first prompt, so nothing could resume it yet.
+        assert!(!confirmed(false));
     }
 
     #[test]
