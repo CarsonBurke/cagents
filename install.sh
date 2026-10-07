@@ -463,31 +463,37 @@ cleanup() {
     fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$BIN_LINK_CREATED" -eq 1 ] && [ -L "$BIN_LINK" ] \
         && [ "$(readlink "$BIN_LINK" 2>/dev/null || :)" = "$BIN_TARGET" ]; then
         rm -f "$BIN_LINK" || :
     fi
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$DESKTOP_LINK_CREATED" -eq 1 ] && [ -L "$DESKTOP_LINK" ] \
         && [ "$(readlink "$DESKTOP_LINK" 2>/dev/null || :)" = "$DESKTOP_TARGET" ]; then
         rm -f "$DESKTOP_LINK" || :
     fi
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$ICON_LINK_CREATED" -eq 1 ] && [ -L "$ICON_LINK" ] \
         && [ "$(readlink "$ICON_LINK" 2>/dev/null || :)" = "$ICON_TARGET" ]; then
         rm -f "$ICON_LINK" || :
     fi
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$RASTER_ICON_LINK_CREATED" -eq 1 ] && [ -L "$RASTER_ICON_LINK" ] \
         && [ "$(readlink "$RASTER_ICON_LINK" 2>/dev/null || :)" = "$RASTER_ICON_TARGET" ]; then
         rm -f "$RASTER_ICON_LINK" || :
     fi
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$METAINFO_LINK_CREATED" -eq 1 ] && [ -L "$METAINFO_LINK" ] \
         && [ "$(readlink "$METAINFO_LINK" 2>/dev/null || :)" = "$METAINFO_TARGET" ]; then
         rm -f "$METAINFO_LINK" || :
     fi
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$AUTOSTART_LINK_CREATED" -eq 1 ] && [ -L "$AUTOSTART_LINK" ] \
         && [ "$(readlink "$AUTOSTART_LINK" 2>/dev/null || :)" = "$AUTOSTART_TARGET" ]; then
         rm -f "$AUTOSTART_LINK" || :

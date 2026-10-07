@@ -149,7 +149,9 @@ fn coordinated_release_mode(
         "cagents install root\n",
     )
     .unwrap();
-    std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
+    if coordinator != "initial-independent" {
+        std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
+    }
     let status = r#"#!/bin/sh
 CLI=old
 case "$*" in
@@ -550,6 +552,15 @@ esac
             Some("current-changed" | "pre-cas-candidate")
         ) {
             assert!(prefix.join("versions/old").exists());
+            if publish_failure == Some("current-changed") {
+                assert!(
+                    home.path()
+                        .join(".local/bin/cagents")
+                        .symlink_metadata()
+                        .is_ok(),
+                    "uncertain rollback must retain created shared launchers"
+                );
+            }
             assert!(prefix.join("versions/9.9.9/.deferred-owner.json").exists());
             assert!(
                 String::from_utf8_lossy(&output.stderr).contains("retained both version trees")
@@ -861,6 +872,15 @@ fn staging_rejects_destructive_options_before_touching_installation() {
 
 #[test]
 fn staging_keeps_both_trees_when_current_cannot_be_safely_rolled_back() {
+    coordinated_release_mode(
+        false,
+        38,
+        Some("current-changed"),
+        None,
+        None,
+        "initial-independent",
+        true,
+    );
     coordinated_release_mode(
         false,
         38,
