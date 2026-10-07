@@ -136,9 +136,15 @@ determine which models and permission modes are available.
   the workspace strip.
 - **Activate panes on hover** is off by default. When enabled, it previews the
   pane under the pointer after a 300 ms dwell; typing cancels a pending activation.
-- Hold **Alt+Tab** to preview recently used worktrees and channels. Release
-  **Alt** to open the highlighted workspace, or press **Escape** to cancel.
-  Previewing does not start panes in the workspaces you pass.
+- Hold **Alt+Tab** to switch workspace. Recently used worktrees and channels
+  come first, then the rest in sidebar order; a quick tap goes back to the
+  previous one. **Tab**, **Shift+Tab** and the arrow keys move the selection,
+  and a click picks a row. Release **Alt** or press **Enter** to open the
+  highlighted workspace; **Escape**, leaving the window, or releasing on the
+  workspace already open cancels. Keys pressed while the list is open go to it,
+  not to the pane underneath, and previewing does not start panes in the
+  workspaces you pass. If your desktop takes **Alt+Tab** itself, bind another
+  chord to **Next workspace** in **Settings → Keyboard**.
 - Switching worktrees remembers each strip's scroll position and focused
   pane. Hidden terminals release their presentation while their PTYs keep
   running, and editor buffers stay intact. Scroll positions, worktree

@@ -1201,6 +1201,27 @@ fn exposure_update_pending(state: &WorkspaceState, transitions: &[VisibilityTran
 /// between carries the focus with it.
 const FOCUS_SAVE_DELAY: Duration = Duration::from_secs(1);
 
+/// How long the modifier is held before the workspace switcher is drawn. A
+/// tap that toggles between the two most recent workspaces ends sooner, and
+/// would otherwise flash a list nobody reads.
+const WORKSPACE_SWITCHER_DELAY: Duration = Duration::from_millis(120);
+const WORKSPACE_SWITCHER_SCROLL_ID: &str = "workspace-switcher.rows";
+/// Rows have one height so the list can be scrolled to a row by its index.
+const WORKSPACE_SWITCHER_ROW_HEIGHT: f32 = 52.0;
+const WORKSPACE_SWITCHER_ROW_GAP: f32 = space::XXS;
+const WORKSPACE_SWITCHER_VISIBLE_ROWS: f32 = 6.0;
+const WORKSPACE_SWITCHER_LIST_HEIGHT: f32 = WORKSPACE_SWITCHER_VISIBLE_ROWS
+    * WORKSPACE_SWITCHER_ROW_HEIGHT
+    + (WORKSPACE_SWITCHER_VISIBLE_ROWS - 1.0) * WORKSPACE_SWITCHER_ROW_GAP;
+
+/// One destination in the workspace switcher, in the order it is listed.
+struct WorkspaceSwitcherRow {
+    destination: WorkspaceDestination,
+    action: SidebarAction,
+    title: String,
+    detail: String,
+}
+
 fn deferred_terminal_session(
     state: Option<&CardState>,
     runtime_is_loading: bool,
@@ -4033,6 +4054,12 @@ pub enum Message {
     LifecycleSweepElapsed(u64),
     /// The delay on saving a change of focus alone has passed.
     FocusSaveDue,
+    /// The hold that began at this instant has lasted long enough to draw the
+    /// workspace switcher.
+    WorkspaceSwitcherDue(Instant),
+    /// The modifier holding the workspace switcher open since this instant
+    /// was released.
+    WorkspaceSwitcherReleased(Instant),
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
@@ -4600,7 +4627,7 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum WorkspaceDestination {
     Folder(ProjectId),
     Worktree(crate::model::WorktreeId),
@@ -9245,112 +9272,226 @@ impl Cagents {
             self.workspace_history = previous_history;
             return Task::none();
         }
-        self.chrome_ui.workspace_preview = Some(action);
+        let first = self.chrome_ui.workspace_preview.replace(action).is_none();
         self.workspace_cycle_modifiers = modifiers
             & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);
         if self.workspace_cycle_modifiers.is_empty() {
             return self.commit_workspace_preview();
         }
-        Task::none()
+        if !first {
+            // A second step is someone looking for a workspace, not a tap.
+            self.chrome_ui.workspace_switcher_shown = true;
+            return self.reveal_workspace_selection();
+        }
+        let since = Instant::now();
+        self.chrome_ui.workspace_preview_since = Some(since);
+        cosmic::task::future(async move {
+            tokio::time::sleep(WORKSPACE_SWITCHER_DELAY).await;
+            Message::WorkspaceSwitcherDue(since)
+        })
     }
 
     fn commit_workspace_preview(&mut self) -> Task<Message> {
-        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
-        let action = self.chrome_ui.workspace_preview.take();
-        let task = action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+        let action = self.close_workspace_preview();
+        // Coming back round to the workspace already open is a way of
+        // cancelling. Selecting it again would give a workspace without a
+        // terminal or conversation its default pane.
+        let task = action
+            .filter(|action| {
+                WorkspaceDestination::from_action(action) != self.active_workspace_destination()
+            })
+            .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
         self.workspace_history
             .finish(self.active_workspace_destination());
         task
     }
 
+    fn cancel_workspace_preview(&mut self) {
+        if self.close_workspace_preview().is_some() {
+            self.workspace_history
+                .finish(self.active_workspace_destination());
+        }
+    }
+
+    fn close_workspace_preview(&mut self) -> Option<SidebarAction> {
+        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+        self.chrome_ui.workspace_preview_since = None;
+        self.chrome_ui.workspace_switcher_shown = false;
+        self.chrome_ui.workspace_switcher_scroll = 0.0;
+        self.chrome_ui.workspace_preview.take()
+    }
+
+    /// Keys while the switcher is open. It owns the keyboard: a key that
+    /// steers or dismisses it must not also reach the pane beneath, where
+    /// Escape interrupts an agent and the arrows move through a review.
+    fn workspace_switcher_key(&mut self, event: &keyboard::Event) -> Task<Message> {
+        use keyboard::key::Named;
+        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+            return Task::none();
+        };
+        match key {
+            keyboard::Key::Named(Named::Escape) => {
+                self.cancel_workspace_preview();
+                Task::none()
+            }
+            keyboard::Key::Named(Named::Enter) => self.commit_workspace_preview(),
+            keyboard::Key::Named(Named::ArrowDown | Named::ArrowRight) => self.cycle_workspace(
+                crate::workspace::FocusDirection::Right,
+                self.workspace_cycle_modifiers,
+            ),
+            keyboard::Key::Named(Named::ArrowUp | Named::ArrowLeft) => self.cycle_workspace(
+                crate::workspace::FocusDirection::Left,
+                self.workspace_cycle_modifiers,
+            ),
+            _ => match workspace_widget::global_shortcut(
+                event,
+                &self.settings.keyboard_shortcuts,
+                self.focused_pane(),
+            ) {
+                Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
+                    self.cycle_workspace(direction, *modifiers)
+                }
+                _ => Task::none(),
+            },
+        }
+    }
+
+    /// The switcher's rows: recently used workspaces first, then the rest in
+    /// the sidebar's order.
+    fn workspace_switcher_rows(&self) -> Vec<WorkspaceSwitcherRow> {
+        let Some(order) = self.workspace_history.cycle_order() else {
+            return Vec::new();
+        };
+        let mut destinations: HashMap<_, _> =
+            sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state)
+                .into_iter()
+                .filter_map(|action| Some((WorkspaceDestination::from_action(&action)?, action)))
+                .collect();
+        let status = |activity, unread: bool| match activity {
+            Some(crate::agent::ActivityState::Waiting) => Some("Waiting for input"),
+            Some(crate::agent::ActivityState::Working) => Some("Working"),
+            _ if unread => Some("Unread update"),
+            _ => None,
+        };
+        let described = |place: String, status: Option<&str>| match status {
+            Some(status) => format!("{place} · {status}"),
+            None => place,
+        };
+        order
+            .iter()
+            .filter_map(|destination| {
+                let action = destinations.remove(destination)?;
+                let (title, detail) = match &action {
+                    SidebarAction::OpenRepository {
+                        project_id,
+                        repository,
+                    } => (
+                        self.sidebar_model.project(*project_id).map_or_else(
+                            || repository.display().to_string(),
+                            |project| project.name.clone(),
+                        ),
+                        display_path(repository).into_owned(),
+                    ),
+                    SidebarAction::OpenWorktree {
+                        project_id,
+                        worktree_id,
+                        path,
+                    } => {
+                        let project = self.sidebar_model.project(*project_id)?;
+                        let worktree = project
+                            .worktrees
+                            .iter()
+                            .find(|worktree| worktree.id == *worktree_id)?;
+                        (
+                            format!("{} · {}", project.name, worktree.label()),
+                            described(
+                                display_path(path).into_owned(),
+                                status(
+                                    self.sidebar_state.agent_activity(*project_id, *worktree_id),
+                                    self.sidebar_state
+                                        .has_agent_update(*project_id, *worktree_id),
+                                ),
+                            ),
+                        )
+                    }
+                    SidebarAction::OpenChannel { channel_id } => {
+                        let (project, channel) =
+                            self.sidebar_model.projects.iter().find_map(|project| {
+                                let channel = project
+                                    .channels
+                                    .iter()
+                                    .find(|channel| channel.id == *channel_id)?;
+                                Some((project, channel))
+                            })?;
+                        (
+                            format!("{} · {}", project.name, channel.title),
+                            described(
+                                "Channel".to_owned(),
+                                status(channel.activity, channel.unread),
+                            ),
+                        )
+                    }
+                    _ => return None,
+                };
+                Some(WorkspaceSwitcherRow {
+                    destination: *destination,
+                    action,
+                    title,
+                    detail,
+                })
+            })
+            .collect()
+    }
+
+    /// Scrolls the switcher's list just far enough to show the selected row.
+    fn reveal_workspace_selection(&mut self) -> Task<Message> {
+        let selected = self
+            .chrome_ui
+            .workspace_preview
+            .as_ref()
+            .and_then(WorkspaceDestination::from_action);
+        let Some(index) = self
+            .workspace_switcher_rows()
+            .iter()
+            .position(|row| Some(row.destination) == selected)
+        else {
+            return Task::none();
+        };
+        let top = index as f32 * (WORKSPACE_SWITCHER_ROW_HEIGHT + WORKSPACE_SWITCHER_ROW_GAP);
+        let bottom = top + WORKSPACE_SWITCHER_ROW_HEIGHT;
+        let scroll = &mut self.chrome_ui.workspace_switcher_scroll;
+        *scroll = scroll.max(bottom - WORKSPACE_SWITCHER_LIST_HEIGHT).min(top);
+        iced::widget::operation::scroll_to(
+            widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID),
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y: *scroll },
+        )
+    }
+
     fn workspace_switcher(&self) -> Option<Element<'_, Message>> {
         let selected =
             WorkspaceDestination::from_action(self.chrome_ui.workspace_preview.as_ref()?);
-        let destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
-        let mut rows: Vec<Element<'_, Message>> = vec![design::heading("Switch workspace").into()];
-        for destination in self.workspace_history.cycle_order()? {
-            let Some(action) = destinations
-                .iter()
-                .find(|action| WorkspaceDestination::from_action(action) == Some(*destination))
-            else {
-                continue;
-            };
-            let (title, detail) = match action {
-                SidebarAction::OpenRepository {
-                    project_id,
-                    repository,
-                } => (
-                    self.sidebar_model.project(*project_id).map_or_else(
-                        || repository.display().to_string(),
-                        |project| project.name.clone(),
-                    ),
-                    display_path(repository).into_owned(),
-                ),
-                SidebarAction::OpenWorktree {
-                    project_id,
-                    worktree_id,
-                    path,
-                } => {
-                    let Some(project) = self.sidebar_model.project(*project_id) else {
-                        continue;
-                    };
-                    let Some(worktree) = project
-                        .worktrees
-                        .iter()
-                        .find(|worktree| worktree.id == *worktree_id)
-                    else {
-                        continue;
-                    };
-                    let activity = self.sidebar_state.agent_activity(*project_id, *worktree_id);
-                    let status = match activity {
-                        Some(crate::agent::ActivityState::Waiting) => "Waiting for input",
-                        Some(crate::agent::ActivityState::Working) => "Working",
-                        _ if self
-                            .sidebar_state
-                            .has_agent_update(*project_id, *worktree_id) =>
-                        {
-                            "Unread update"
-                        }
-                        _ => "",
-                    };
-                    (
-                        format!("{} · {}", project.name, worktree.label()),
-                        format!("{} {status}", display_path(path)),
-                    )
-                }
-                SidebarAction::OpenChannel { channel_id } => {
-                    let Some(channel) = self
-                        .sidebar_model
-                        .projects
-                        .iter()
-                        .flat_map(|project| &project.channels)
-                        .find(|channel| channel.id == *channel_id)
-                    else {
-                        continue;
-                    };
-                    (
-                        channel.title.clone(),
-                        if channel.unread {
-                            "Channel · Unread update"
-                        } else {
-                            "Channel"
-                        }
-                        .to_owned(),
-                    )
-                }
-                _ => continue,
-            };
-            let active = Some(*destination) == selected;
-            rows.push(
-                widget::container(
+        if !self.chrome_ui.workspace_switcher_shown {
+            // Not drawn yet, but already holding the keyboard.
+            return Some(crate::interaction::keyboard_modal(
+                iced::widget::Space::new(),
+            ));
+        }
+        let rows = self
+            .workspace_switcher_rows()
+            .into_iter()
+            .map(|row| {
+                let active = Some(row.destination) == selected;
+                let content = widget::container(
                     widget::column::with_children(vec![
-                        design::body(title).into(),
-                        design::caption(detail).into(),
+                        design::body(row.title).into(),
+                        design::caption(row.detail).into(),
                     ])
-                    .spacing(space::XS),
+                    .spacing(space::XXS),
                 )
-                .padding(space::S)
+                .padding([0.0, space::S])
+                .height(WORKSPACE_SWITCHER_ROW_HEIGHT)
                 .width(Length::Fill)
+                .align_y(Alignment::Center)
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
                         background: active.then(|| {
@@ -9362,24 +9503,46 @@ impl Cagents {
                                     .into(),
                             )
                         }),
+                        border: iced::Border {
+                            radius: design::RADIUS_S.into(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
-                }))
-                .into(),
-            );
-        }
-        rows.push(design::caption("Release the modifier to open · Escape to cancel").into());
-        Some(
-            widget::container(
-                widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
-                    .height(Length::Shrink),
-            )
-            .class(cosmic::theme::Container::Card)
-            .padding(space::M)
-            .width(440)
-            .max_height(400)
-            .into(),
-        )
+                }));
+                widget::mouse_area(crate::interaction::hover(content))
+                    .interaction(iced::mouse::Interaction::Pointer)
+                    .on_press(Message::Sidebar(row.action))
+                    .into()
+            })
+            .collect::<Vec<Element<'_, Message>>>();
+        Some(crate::interaction::keyboard_modal(
+            crate::interaction::opaque(
+                widget::container(
+                    widget::column::with_children(vec![
+                        design::heading("Switch workspace").into(),
+                        widget::container(
+                            widget::scrollable(
+                                widget::column::with_children(rows)
+                                    .spacing(WORKSPACE_SWITCHER_ROW_GAP),
+                            )
+                            .id(widget::Id::new(WORKSPACE_SWITCHER_SCROLL_ID))
+                            .height(Length::Shrink),
+                        )
+                        .max_height(WORKSPACE_SWITCHER_LIST_HEIGHT)
+                        .into(),
+                        design::caption(
+                            "Tab or arrows to choose · Release to open · Escape to cancel",
+                        )
+                        .into(),
+                    ])
+                    .spacing(space::S),
+                )
+                .class(cosmic::theme::Container::Card)
+                .padding(space::M)
+                .width(440),
+            ),
+        ))
     }
 
     fn next_workspace(
@@ -12419,6 +12582,18 @@ impl Application for Cagents {
             }
         }
         self.tab_history.observe(self.workspace.focused());
+        // A workspace opened some other way while the switcher is held, by a
+        // click on one of its rows or in the sidebar, is the choice. Anything
+        // that takes the keyboard from the switcher ends it too: the release
+        // that would have closed it may never be delivered.
+        if self.chrome_ui.workspace_preview.is_some()
+            && (matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
+                || self.update_prepared
+                || self.workspace_inputs_blocked()
+                || self.chat_ui.image_viewer.is_some())
+        {
+            self.cancel_workspace_preview();
+        }
         if self.chrome_ui.workspace_preview.is_none() {
             self.workspace_history
                 .observe(self.active_workspace_destination());
@@ -14329,6 +14504,22 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::WorkspaceSwitcherReleased(since) => {
+                if self.chrome_ui.workspace_preview_since == Some(since) {
+                    self.commit_workspace_preview()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::WorkspaceSwitcherDue(since) => {
+                if self.chrome_ui.workspace_preview_since != Some(since)
+                    || self.chrome_ui.workspace_switcher_shown
+                {
+                    return Task::none();
+                }
+                self.chrome_ui.workspace_switcher_shown = true;
+                self.reveal_workspace_selection()
+            }
             Message::FocusSaveDue => {
                 if self.focus_save_pending {
                     self.persist();
@@ -14809,6 +15000,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                    self.keyboard_modifiers = *modifiers;
+                }
                 if self.chat_ui.image_viewer.is_some() {
                     if let keyboard::Event::KeyPressed { key, .. } = &event {
                         match key {
@@ -14857,16 +15051,17 @@ impl Application for Cagents {
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
-                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers) {
-                    if self.chrome_ui.workspace_preview.is_some() {
-                        return self.commit_workspace_preview();
-                    }
-                }
-                if is_escape_press(&event) && self.chrome_ui.workspace_preview.take().is_some() {
-                    self.workspace_history
-                        .finish(self.active_workspace_destination());
+                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers)
+                    && let Some(since) = self.chrome_ui.workspace_preview_since
+                {
+                    // A window losing focus is told its modifiers are released
+                    // just before it is told about the focus. Deciding one
+                    // message later lets that cancel instead of commit.
                     self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
-                    return Task::none();
+                    return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
+                }
+                if self.chrome_ui.workspace_preview.is_some() {
+                    return self.workspace_switcher_key(&event);
                 }
                 if !self.workspace_inputs_blocked()
                     && !self.focused_repository_is_saving()
@@ -14887,9 +15082,6 @@ impl Application for Cagents {
                         return self.apply_viewport(update, true, false);
                     }
                     return Task::none();
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
                 }
                 if let Some(task) = self.palette_key_event(&event) {
                     return task;
@@ -15227,13 +15419,12 @@ impl Application for Cagents {
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
-                let mut preview_task = Task::none();
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
                     self.tab_history.finish(self.workspace.focused());
-                    if self.chrome_ui.workspace_preview.is_some() {
-                        preview_task = self.commit_workspace_preview();
-                    }
+                    // Losing the window is not a choice of workspace, and the
+                    // release that would have made one never arrives.
+                    self.cancel_workspace_preview();
                 }
                 let account_focus = match action {
                     refresh_ui::Action::Focused(id, focused)
@@ -15254,13 +15445,7 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([
-                    preview_task,
-                    refresh,
-                    self.flush_document_tone(),
-                    accounts,
-                    shared,
-                ])
+                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -21216,7 +21401,7 @@ mod tests {
     /// Workspace previews freeze visit order until Alt is released, including
     /// channel identities that share their project's worktree directory.
     #[test]
-    fn alt_tab_previews_workspace_history_and_commits_on_release_or_blur() {
+    fn alt_tab_previews_workspace_history_and_commits_only_a_choice() {
         use crate::model::{ChannelId, ProjectChannel, WorktreeId};
         use crate::sidebar::{SidebarProject, SidebarWorktree};
 
@@ -21276,17 +21461,37 @@ mod tests {
         for index in [1, 2, 0, 1] {
             drop(app.update(Message::Sidebar(destinations[index].clone())));
         }
-        let next = |modifiers| Message::KeyEvent {
+        use keyboard::key::{Code, Named};
+        let key = |named, code, modifiers| Message::KeyEvent {
             event: keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Tab),
-                modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                key: keyboard::Key::Named(named),
+                modified_key: keyboard::Key::Named(named),
+                physical_key: keyboard::key::Physical::Code(code),
                 location: keyboard::Location::Standard,
                 modifiers,
                 text: None,
                 repeat: false,
             },
             captured: true,
+        };
+        let next = |modifiers| key(Named::Tab, Code::Tab, modifiers);
+        let released = || Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+            captured: false,
+        };
+        // The release is decided one message after it is seen.
+        let release = |app: &mut Cagents| {
+            let since = app.chrome_ui.workspace_preview_since;
+            drop(app.update(released()));
+            if let Some(since) = since {
+                drop(app.update(Message::WorkspaceSwitcherReleased(since)));
+            }
+        };
+        let preview = |app: &Cagents| {
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action)
         };
         let alt = keyboard::Modifiers::ALT;
         drop(app.update(next(alt)));
@@ -21313,10 +21518,7 @@ mod tests {
         }));
         drop(app.update(next(alt | keyboard::Modifiers::SHIFT)));
         assert_eq!(app.active_workspace_destination(), Some(root));
-        drop(app.update(Message::KeyEvent {
-            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
-            captured: false,
-        }));
+        release(&mut app);
         assert_eq!(app.active_workspace_destination(), Some(channel));
         // Intermediate feature preview did not become more recent than root.
         drop(app.update(next(alt)));
@@ -21329,25 +21531,56 @@ mod tests {
             Some(root)
         );
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(preview(&app), Some(feature));
+        // Losing the window is not a choice of workspace, although the seat
+        // reports the modifiers released on the way out.
         app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let since = app.chrome_ui.workspace_preview_since.unwrap();
+        drop(app.update(released()));
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
             window::Id::RESERVED,
             false,
         ))));
+        drop(app.update(Message::WorkspaceSwitcherReleased(since)));
+        assert_eq!(preview(&app), None);
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        // Nor is Escape, and neither disturbed the visit order.
+        drop(app.update(next(alt)));
+        assert_eq!(preview(&app), Some(root));
+        drop(app.update(key(Named::Escape, Code::Escape, alt)));
+        assert_eq!(preview(&app), None);
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        // The arrows walk the same list, and Enter opens the selection.
+        drop(app.update(next(alt)));
+        drop(app.update(key(Named::ArrowDown, Code::ArrowDown, alt)));
+        assert_eq!(preview(&app), Some(feature));
+        drop(app.update(key(Named::ArrowUp, Code::ArrowUp, alt)));
+        assert_eq!(preview(&app), Some(root));
+        drop(app.update(key(Named::ArrowDown, Code::ArrowDown, alt)));
+        drop(app.update(key(Named::Enter, Code::Enter, alt)));
+        assert_eq!(preview(&app), None);
         assert_eq!(app.active_workspace_destination(), Some(feature));
         drop(app.update(next(alt)));
+        // Coming back round to the open workspace and releasing cancels.
+        drop(app.update(next(alt)));
+        drop(app.update(next(alt)));
+        assert_eq!(preview(&app), Some(feature));
+        release(&mut app);
+        assert_eq!(preview(&app), None);
         assert_eq!(app.active_workspace_destination(), Some(feature));
-        assert_eq!(
-            app.chrome_ui
-                .workspace_preview
-                .as_ref()
-                .and_then(WorkspaceDestination::from_action),
-            Some(channel)
-        );
+        // A workspace opened by a click during the hold is the choice, and the
+        // release that follows does not undo it.
+        drop(app.update(next(alt)));
+        assert_eq!(preview(&app), Some(channel));
+        drop(app.update(Message::Sidebar(destinations[1].clone())));
+        assert_eq!(preview(&app), None);
+        assert_eq!(app.active_workspace_destination(), Some(root));
+        release(&mut app);
+        assert_eq!(app.active_workspace_destination(), Some(root));
         app.settings_reset_confirm = true;
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(preview(&app), None);
+        assert_eq!(app.active_workspace_destination(), Some(root));
     }
 
     #[test]

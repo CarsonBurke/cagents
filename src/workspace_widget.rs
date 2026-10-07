@@ -74,7 +74,8 @@ pub enum GlobalShortcut {
     FocusAdjacent(FocusDirection),
     CyclePaneWidth,
     /// Moves between the top-level workspaces: every project's worktrees and
-    /// channels, in the order the sidebar lists them.
+    /// channels, most recently used first, then in the order the sidebar
+    /// lists them.
     CycleWorkspace(FocusDirection),
     /// Flips the viewed mark on the file the focused review pane shows.
     ReviewToggleViewed,
