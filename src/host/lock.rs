@@ -14,9 +14,10 @@
 
 use std::{
     ops::{Deref, DerefMut},
+    panic::Location,
     sync::{
         Arc, LockResult, Mutex, MutexGuard, OnceLock, TryLockError, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     },
     thread::{self, Thread},
     time::{Duration, Instant},
@@ -43,6 +44,8 @@ pub(crate) struct HostMutex<T> {
     /// Counts acquisitions, so a watcher can tell one long hold from many
     /// short ones.
     acquisitions: AtomicU64,
+    /// Where the newest acquisition was requested, for the stall report.
+    site: AtomicPtr<Location<'static>>,
     watcher: OnceLock<Thread>,
 }
 
@@ -52,6 +55,7 @@ impl<T> HostMutex<T> {
             inner: Mutex::new(value),
             owner: AtomicU64::new(0),
             acquisitions: AtomicU64::new(0),
+            site: AtomicPtr::new(std::ptr::null_mut()),
             watcher: OnceLock::new(),
         }
     }
@@ -87,6 +91,10 @@ impl<T> HostMutex<T> {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             }
         };
+        self.site.store(
+            std::ptr::from_ref(Location::caller()).cast_mut(),
+            Ordering::Relaxed,
+        );
         self.acquisitions.fetch_add(1, Ordering::Relaxed);
         self.owner.store(thread, Ordering::Relaxed);
         Ok(HostGuard {
@@ -102,6 +110,13 @@ impl<T> HostMutex<T> {
         let before = self.acquisitions.load(Ordering::Relaxed);
         let held = self.owner.load(Ordering::Relaxed) != 0;
         (held && self.acquisitions.load(Ordering::Relaxed) == before).then_some(before)
+    }
+
+    /// Where the newest acquisition was requested.
+    fn site(&self) -> Option<&'static Location<'static>> {
+        // SAFETY: the pointer is null or was stored from `Location::caller`,
+        // which is valid for the whole program.
+        unsafe { self.site.load(Ordering::Relaxed).as_ref() }
     }
 }
 
@@ -127,9 +142,10 @@ impl<T: Send + 'static> HostMutex<T> {
         let watcher = thread::Builder::new()
             .name("cagentsd-stall-watch".into())
             .spawn(move || {
-                if watch_for_stall(&host, limit, &stop) {
+                if let Some(holder) = watch_for_stall(&host, limit, &stop) {
                     tracing::error!(
                         limit_seconds = limit.as_secs(),
+                        %holder,
                         "the host mutex has been held without release while another thread \
                          waits; aborting so the next daemon can adopt the hosted sessions"
                     );
@@ -144,29 +160,42 @@ impl<T: Send + 'static> HostMutex<T> {
     }
 }
 
-/// Returns true once a single hold has outlasted `limit`, and false when the
-/// watch is stopped or its mutex is gone.
-fn watch_for_stall<T>(host: &Weak<HostMutex<T>>, limit: Duration, stopped: &AtomicBool) -> bool {
-    let interval = (limit / 8).max(Duration::from_millis(1));
-    let mut suspect: Option<(u64, Instant)> = None;
+/// How many times one hold must be observed before it counts as a stall.
+const STALL_SAMPLES: u32 = 8;
+
+/// Returns where the lock was taken once a single hold has outlasted `limit`,
+/// and `None` when the watch is stopped or its mutex is gone.
+fn watch_for_stall<T>(
+    host: &Weak<HostMutex<T>>,
+    limit: Duration,
+    stopped: &AtomicBool,
+) -> Option<String> {
+    let interval = (limit / STALL_SAMPLES).max(Duration::from_millis(1));
+    // The suspected acquisition, when it was first seen, and how often since.
+    let mut suspect: Option<(u64, Instant, u32)> = None;
     loop {
         if stopped.load(Ordering::Acquire) {
-            return false;
+            return None;
         }
-        let Some(mutex) = host.upgrade() else {
-            return false;
-        };
+        let mutex = host.upgrade()?;
         let held = mutex.held();
-        drop(mutex);
-        match (held, suspect) {
-            (Some(acquisition), Some((suspected, since))) if acquisition == suspected => {
-                if since.elapsed() >= limit {
-                    return true;
+        match (held, &mut suspect) {
+            (Some(acquisition), Some((suspected, since, samples))) if acquisition == *suspected => {
+                *samples += 1;
+                // Elapsed time alone would also condemn a daemon that was
+                // itself stopped for the limit, by a debugger or a freezer.
+                if since.elapsed() >= limit && *samples >= STALL_SAMPLES {
+                    return Some(
+                        mutex
+                            .site()
+                            .map_or_else(|| "unknown".into(), ToString::to_string),
+                    );
                 }
             }
-            (Some(acquisition), _) => suspect = Some((acquisition, Instant::now())),
+            (Some(acquisition), _) => suspect = Some((acquisition, Instant::now(), 0)),
             (None, _) => suspect = None,
         }
+        drop(mutex);
         if suspect.is_some() {
             thread::park_timeout(interval);
         } else {
@@ -262,12 +291,13 @@ mod tests {
         let host = Arc::new(HostMutex::new(0_u64));
         let (stalled, reported) = mpsc::channel();
         let _watch = host
-            .watch_with(Duration::from_millis(80), move || {
+            .watch_with(Duration::from_secs(2), move || {
                 let _ = stalled.send(());
             })
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_millis(400);
+        // Far longer than the limit in total, far shorter per hold.
+        let deadline = Instant::now() + Duration::from_secs(3);
         let workers = (0..4)
             .map(|_| {
                 let host = Arc::clone(&host);

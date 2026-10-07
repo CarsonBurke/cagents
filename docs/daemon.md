@@ -243,7 +243,8 @@ for two minutes, the daemon logs the stall to `cagentsd.log` and aborts, leaving
 a core dump (`coredumpctl info cagentsd`) that names the thread holding it. The
 application then starts a replacement, which recovers as described here. A
 thread that tries to take that lock twice panics on its own instead, which is
-recorded in `cagentsd-crash.log` and costs only the request it was serving.
+recorded in `cagentsd-crash.log` and ends that thread's work rather than the
+daemon's.
 
 | Saved record | Recovery |
 |--------------|----------|
