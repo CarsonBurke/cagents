@@ -157,13 +157,13 @@ struct GitHubRelease {
 /// currently serving. A release update needs the running tree to be the served
 /// one ([`Installation`]); noticing that the served tree has *changed*
 /// ([`superseding_ui`]) needs exactly the opposite.
-struct InstallLayout {
-    prefix: PathBuf,
-    version_root: PathBuf,
+pub(crate) struct InstallLayout {
+    pub(crate) prefix: PathBuf,
+    pub(crate) version_root: PathBuf,
     version: String,
 }
 
-fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
+pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
     let executable = executable.canonicalize()?;
     let bin = executable.parent().ok_or_else(unsupported_install)?;
     if bin.file_name().is_none_or(|name| name != "bin") {

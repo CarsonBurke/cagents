@@ -102,6 +102,14 @@ commands. Unknown ownership refuses the switch. If publishing launchers fails, t
 restores the previous version without stopping compatible sessions. Existing
 version directories are retained.
 
+Explicit `install.sh --stage-only` also preserves unsaved windows and never
+prepares, closes or reopens them. Before publishing the candidate, it records the
+validated running owner. While that owner's protocol is incompatible, ordinary
+CLI commands and desktop launches use its matching executables. Compatible
+candidates can attach to the preserved daemon, so reviewed reopening adopts the
+new UI without replacing a compatible daemon. The application handoff remains a
+separate reviewed operation, including its save checks.
+
 The application shows available updates above the workspace. Dismissing the
 notice moves it into the notices popover; it remains available there. Release
 downloads are checksum verified before the candidate's own CLI reports its

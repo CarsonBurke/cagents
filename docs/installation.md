@@ -253,6 +253,14 @@ matching UI. Finish the staged update in the application or run
 approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
 additionally permits active native turns to stop.
 
+To make a verified build available without saving or closing running windows,
+append `--stage-only` to the installer invocation. It publishes the complete
+candidate while preserving unsaved windows and the running daemon; it does not
+start, stop or checkpoint them. The existing application's update control then
+offers the reviewed apply/reopen flow. Resolve any save blockers before applying:
+staging makes the candidate available but does not complete the application handoff.
+This option cannot be combined with restart, relaunch, uninstall or purge options.
+
 For an explicitly authorized direct daemon replacement, append
 `--restart-daemon` to the installer invocation. The coordinator saves and closes
 application windows before checkpointing. Supported holders retain live
@@ -263,6 +271,7 @@ session-by-session preview and waiting for native turns.
 
 | Option | Effect |
 | --- | --- |
+| `--stage-only` | Publish a verified candidate without closing windows or changing the daemon |
 | `--restart-daemon` | Checkpoint supported sessions and replace the running daemon |
 | `--require-empty-daemon` | With `--restart-daemon`, refuse rather than interrupt live sessions |
 | `--relaunch-agents` | With `--restart-daemon`, relaunch agents that have no exact resume identity into their resume picker (requires an installed CLI that can record this) |
