@@ -1187,13 +1187,21 @@ fn menu<'a>(
     widget::container(content).width(300).into()
 }
 
-fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
-    let phase = match login.phase {
+/// What a pending sign-in's row says it is waiting for.
+fn login_caption(login: &Login) -> &'static str {
+    match login.phase {
+        // Its home has been asked already, so the terminal has ended and
+        // there is nothing left to finish in it: the wait is for the next ask.
+        LoginPhase::Waiting if login.attempts > 0 => "Checking which account signed in…",
         LoginPhase::Waiting => "Finish signing in in the terminal. Closing it cancels.",
         LoginPhase::Verifying => "Checking which account signed in…",
         LoginPhase::Settling => "Saving…",
         LoginPhase::CallbackBlocked => account::login::PORT_BUSY,
-    };
+    }
+}
+
+fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
+    let phase = login_caption(login);
     let account = widget::row::with_children(vec![
         if login.phase == LoginPhase::CallbackBlocked {
             widget::icon(Icon::Warning.handle())
@@ -1251,6 +1259,24 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sign_in_waiting_to_be_asked_again_no_longer_points_at_its_terminal() {
+        let mut login = Login {
+            provider: Provider::Codex,
+            key: uuid::Uuid::from_u128(1),
+            home: "/cagents-fixture/accounts/codex/1".into(),
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: 0,
+            recovered: false,
+        };
+        assert!(login_caption(&login).starts_with("Finish signing in in the terminal"));
+        // Between asks the phase is `Waiting` again, with the terminal ended.
+        login.attempts = 1;
+        assert_eq!(login_caption(&login), "Checking which account signed in…");
+    }
 
     #[test]
     fn a_narrowing_card_drops_the_least_useful_columns_first() {
