@@ -3,6 +3,7 @@ use super::state::{ClientId, HostState, SharedHost};
 mod account_isolation_tests;
 mod native_cleanup;
 mod native_recovery;
+mod owned_listener;
 #[cfg(test)]
 mod startup_tests;
 use crate::{
@@ -934,33 +935,19 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    if let Some(owned_socket) = &owned_socket {
-        // An unclean daemon exit can leave the owned socket inode behind.
-        // Only remove a refused socket inside our private, user-owned directory;
-        // a live listener is reused and an arbitrary endpoint is never touched.
-        if owned_socket.exists() {
-            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-            let private = owned_socket.parent().is_some_and(|directory| {
-                std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
-                    metadata.is_dir()
-                        && metadata.uid() == unsafe { libc::geteuid() }
-                        && metadata.mode() & 0o777 == 0o700
-                })
-            });
-            let socket = std::fs::symlink_metadata(&owned_socket).is_ok_and(|metadata| {
-                metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() }
-            });
-            if private
-                && socket
-                && let Err(failure) = std::os::unix::net::UnixStream::connect(&owned_socket)
-                && failure.kind() == std::io::ErrorKind::ConnectionRefused
-            {
-                std::fs::remove_file(&owned_socket).map_err(|failure| {
-                    unavailable(format!("Cannot retire stopped provider socket: {failure}"))
-                })?;
-            }
+    // A server that stopped without cleaning up leaves its endpoint behind.
+    // A listener still being served is joined; anything else is retired so
+    // this conversation's own server starts again at the same path.
+    let owned_socket = match owned_socket {
+        Some(socket)
+            if !owned_listener::served(&socket).map_err(|failure| {
+                unavailable(format!("Cannot retire stopped provider socket: {failure}"))
+            })? =>
+        {
+            Some(socket)
         }
-    }
+        _ => None,
+    };
     // An authenticated checkpoint may need different resume argv from the
     // immutable recipe issued to windows. Keep that execution detail out of
     // the descriptor, authority registry and runtime's installed identity.
@@ -977,20 +964,19 @@ fn start_with_execution(
         ));
     }
     let process_launch = restart_launch.unwrap_or(&session.launch);
-    let (mut spec, mut adapter) =
-        if let Some(owned_socket) = owned_socket.filter(|path| !path.exists()) {
-            chat::protocol::codex::create_with_listener(process_launch, owned_socket)
-        } else {
-            chat::protocol::create(process_launch)
-        }
-        .map_err(|message| {
-            // Removal may have won after the early check while the adapter
-            // was reading history. Do not hold the lifecycle lease across
-            // those reads, but preserve the actionable account classification.
-            check_launch_account(&session.launch)
-                .err()
-                .unwrap_or_else(|| error(message))
-        })?;
+    let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
+        chat::protocol::codex::create_with_listener(process_launch, owned_socket)
+    } else {
+        chat::protocol::create(process_launch)
+    }
+    .map_err(|message| {
+        // Removal may have won after the early check while the adapter
+        // was reading history. Do not hold the lifecycle lease across
+        // those reads, but preserve the actionable account classification.
+        check_launch_account(&session.launch)
+            .err()
+            .unwrap_or_else(|| error(message))
+    })?;
     if !matches!(
         &spec.transport,
         chat::protocol::TransportSpec::UnixWebSocket { .. }

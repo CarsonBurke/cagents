@@ -152,7 +152,66 @@ fn poll(
     Ok(())
 }
 
+/// How long a launched server has to start accepting at its own endpoint.
+const LISTENER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Join the endpoint of a server this conversation launched, once it accepts.
+///
+/// The socket exists from the moment the server binds it, which is before it
+/// listens, so a refusal there is a launch still in progress rather than a
+/// failure. `halted` reports why waiting any longer is pointless.
+fn join_launched(
+    path: &Path,
+    mut halted: impl FnMut() -> Option<&'static str>,
+) -> Result<UnixStream, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let started = Instant::now();
+    loop {
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.file_type().is_socket()
+        {
+            match connect(path, metadata.dev(), metadata.ino()) {
+                Ok(socket) => return Ok(socket),
+                Err(error) if error.not_listening => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(reason) = halted() {
+            return Err(reason.into());
+        }
+        if started.elapsed() >= LISTENER_TIMEOUT {
+            return Err(format!(
+                "Codex server did not open its local socket within {} seconds",
+                LISTENER_TIMEOUT.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 impl Actor {
+    /// Serve the listener this conversation's own server is bringing up.
+    pub(super) fn run_launched_websocket(
+        &mut self,
+        initial: Step,
+        path: &Path,
+    ) -> Result<(), String> {
+        let socket = join_launched(path, || {
+            if self.stop.load(Ordering::Acquire) {
+                Some("Provider startup cancelled")
+            } else if self
+                .child
+                .as_mut()
+                .is_some_and(|child| child.0.try_wait().ok().flatten().is_some())
+            {
+                Some("Codex server exited before opening its local socket")
+            } else {
+                None
+            }
+        })?;
+        self.serve_websocket(initial, socket)
+    }
+
     pub(super) fn run_websocket(
         &mut self,
         initial: Step,
@@ -161,6 +220,10 @@ impl Actor {
         inode: u64,
     ) -> Result<(), String> {
         let socket = connect(path, device, inode)?;
+        self.serve_websocket(initial, socket)
+    }
+
+    fn serve_websocket(&mut self, initial: Step, socket: UnixStream) -> Result<(), String> {
         if self.native_holder.is_some() {
             let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
             let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -454,5 +517,73 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(original);
+    }
+
+    /// A socket bound at `path` that accepts nothing until it is told to
+    /// listen, which is how a starting server first leaves its endpoint.
+    fn bound(path: &Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as _;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert!(bytes.len() < address.sun_path.len());
+        for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *target = *byte as _;
+        }
+        let socket =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(socket >= 0, "{}", io::Error::last_os_error());
+        let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+        let result = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as _,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        socket
+    }
+
+    #[test]
+    fn a_launched_server_is_joined_once_it_starts_listening() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("codex.sock");
+        let server = bound(&path);
+        let metadata = std::fs::metadata(&path).unwrap();
+        // Joining an endpoint nobody launched stays a single, final attempt.
+        assert!(
+            connect(&path, metadata.dev(), metadata.ino())
+                .unwrap_err()
+                .not_listening
+        );
+        let mut polls = 0;
+        let joined = join_launched(&path, || {
+            polls += 1;
+            if polls == 3 {
+                assert_eq!(unsafe { libc::listen(server.as_raw_fd(), 1) }, 0);
+            }
+            None
+        });
+        assert!(joined.is_ok(), "{joined:?}");
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn waiting_for_a_launched_server_ends_when_it_cannot_arrive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("codex.sock");
+        assert_eq!(
+            join_launched(&path, || Some("Provider startup cancelled")).unwrap_err(),
+            "Provider startup cancelled"
+        );
+        let _server = bound(&path);
+        assert_eq!(
+            join_launched(&path, || Some(
+                "Codex server exited before opening its local socket"
+            ))
+            .unwrap_err(),
+            "Codex server exited before opening its local socket"
+        );
     }
 }
