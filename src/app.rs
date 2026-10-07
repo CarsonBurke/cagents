@@ -5573,13 +5573,14 @@ impl Cagents {
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
         }
-        // A hibernated card holds no hot slot for the sweep to reclaim.
+        // A terminal that started off screen holds a slot a pane on screen
+        // may be waiting for. A hibernated card holds none to hand over.
         if !hibernated
             && self
                 .card_state(card)
                 .is_some_and(|state| state.exposure == Exposure::Offscreen)
         {
-            tasks.push(self.reconcile_scoped_lifecycle());
+            tasks.push(self.lifecycle_sweep());
         }
         self.persist();
         tasks.push(self.commit_terminal_handoffs());

@@ -671,22 +671,14 @@ impl Cagents {
             true,
             true,
         );
-        let residency = self.reconcile_scoped_lifecycle();
+        // The strip being left keeps its visuals for the usual grace, so
+        // coming straight back finds its panes as they were instead of
+        // restoring every one of them. The panes now on screen get their
+        // slots regardless: a visible card takes one from the hidden card
+        // seen longest ago when the budget is full.
+        let residency = self.lifecycle_sweep();
         let source_control = self.rebind_source_control();
         Task::batch([viewport, residency, source_control])
-    }
-
-    pub(super) fn reconcile_scoped_lifecycle(&mut self) -> Task<Message> {
-        // Scope changes release hidden visuals immediately, never their hosted
-        // sessions. A second pass admits visible cards after slots are freed.
-        self.lifecycle.update_budget(LifecycleBudget {
-            max_hot_cards: self.settings.max_hot_cards,
-            offscreen_grace: Duration::ZERO,
-        });
-        let eviction = self.lifecycle_sweep();
-        self.synchronize_lifecycle_budget();
-        let admission = self.lifecycle_sweep();
-        Task::batch([eviction, admission])
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
