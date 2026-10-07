@@ -284,8 +284,26 @@ impl Runtime {
         let target = self.target;
         let id = item.id.clone();
         let copy = Action::Copy(target, id.clone(), part.clone());
+        // What a command or a tool printed is followed from its end. A patch,
+        // an input, and what a read or a search returned are read from the
+        // top, whether or not the step is still running.
+        let follows = matches!(part, CopyPart::Output)
+            && !matches!(
+                item.content,
+                ItemContent::Command {
+                    action: chat::CommandAction::Read
+                        | chat::CommandAction::Search
+                        | chat::CommandAction::List,
+                    ..
+                }
+            );
         code_frame(
-            block.view(self.syntax_theme, limit, target),
+            match limit {
+                Some(height) if !follows => {
+                    block.view_from_start(self.syntax_theme, height, target)
+                }
+                limit => block.view(self.syntax_theme, limit, target),
+            },
             Some(caption.to_owned()),
             Some(copy),
         )

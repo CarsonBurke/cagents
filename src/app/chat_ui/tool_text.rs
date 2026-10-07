@@ -188,10 +188,35 @@ impl ToolText {
         }
     }
 
+    /// The text, whole or within `limit`, where it follows its last line:
+    /// output is read from its end, and a running step's grows there.
     pub(super) fn view(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
         limit: Option<f32>,
+        target: Target,
+    ) -> Element<'static, Message> {
+        self.surface(theme, limit.map(|height| (height, true)), target)
+    }
+
+    /// The text within `height`, opened at its first line: a patch, a file
+    /// that was read and a tool's input are read from the top, and opening
+    /// one at its last screen hid the change it was opened for.
+    pub(super) fn view_from_start(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        height: f32,
+        target: Target,
+    ) -> Element<'static, Message> {
+        self.surface(theme, Some((height, false)), target)
+    }
+
+    /// `limit` is the height the text scrolls within and whether it follows
+    /// its end.
+    fn surface(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
         target: Target,
     ) -> Element<'static, Message> {
         let mut syntax = self.syntax.borrow_mut();
@@ -223,18 +248,20 @@ impl ToolText {
         ])))
         .width(Length::Fill)
         .into();
-        match limit {
-            Some(height) => widget::container(scroll::tool_output(
-                widget::scrollable(body)
-                    .direction(iced::widget::scrollable::Direction::Vertical(
-                        design::scrollbar(),
-                    ))
-                    .anchor_bottom()
-                    .height(Length::Shrink),
+        let Some((height, follows)) = limit else {
+            return body;
+        };
+        let scrolled = widget::scrollable(body)
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
             ))
-            .max_height(height)
-            .into(),
-            None => body,
+            .height(Length::Shrink);
+        if follows {
+            widget::container(scroll::tool_output(scrolled.anchor_bottom()))
+                .max_height(height)
+                .into()
+        } else {
+            widget::container(scrolled).max_height(height).into()
         }
     }
 }
@@ -321,6 +348,61 @@ mod tests {
                 .1
                 .spans(cosmic::theme::is_dark())
         ));
+    }
+
+    /// Output is opened at its last line and a patch at its first.
+    #[test]
+    fn output_opens_at_its_end_and_a_patch_at_its_start() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Scrolled(Vec<f32>);
+        impl Operation for Scrolled {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0.push(translation.y);
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let theme = crate::settings::EditorSyntaxTheme::default();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let text = (0..200)
+            .map(|line| format!("+line {line}\n"))
+            .collect::<String>();
+        let block = ToolText::update(None, &text, Language::Diff);
+        let offset = |mut element: Element<'static, Message>| {
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 2000.0)),
+            );
+            assert!(node.size().height <= 121.0, "{:?}", node.size());
+            let mut scrolled = Scrolled(Vec::new());
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut scrolled,
+            );
+            assert_eq!(scrolled.0.len(), 1);
+            scrolled.0[0]
+        };
+        assert_eq!(offset(block.view_from_start(theme, 120.0, target)), 0.0);
+        assert!(offset(block.view(theme, Some(120.0), target)) > 0.0);
     }
 
     #[test]
