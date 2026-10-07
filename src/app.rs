@@ -5554,13 +5554,7 @@ impl Cagents {
                 // button. Once the terminal is mounted, move keyboard focus
                 // to its input surface; otherwise that button consumes the
                 // first Enter even though typed characters reach the PTY.
-                if self.workspace.focused() == Some(card)
-                    && self
-                        .workspace
-                        .visibility(card)
-                        .is_some_and(VisibilityClass::is_mounted)
-                    && !self.workspace_inputs_blocked()
-                {
+                if self.card_holds_keyboard(card) {
                     tasks.push(
                         iced::widget::operation::focus(self.card_keyboard_focus(card))
                             .map(cosmic::Action::App),
@@ -7708,6 +7702,22 @@ impl Cagents {
     }
 
     /// Where keyboard focus for `card` lands.
+    /// Whether `card` is where the keyboard belongs: the focused pane, in the
+    /// widget tree, with nothing over the workspace taking input instead.
+    ///
+    /// Work that finishes behind the user's back - a terminal starting, a
+    /// chat attaching - asks this before focusing its own control. A focus
+    /// operation unfocuses every widget that is not its target, so one issued
+    /// for a pane that is not in use takes the keyboard from the one that is.
+    fn card_holds_keyboard(&self, card: CardId) -> bool {
+        self.workspace.focused() == Some(card)
+            && self
+                .workspace
+                .visibility(card)
+                .is_some_and(VisibilityClass::is_mounted)
+            && !self.workspace_inputs_blocked()
+    }
+
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_)) => self

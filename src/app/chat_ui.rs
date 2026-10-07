@@ -5682,13 +5682,20 @@ impl Cagents {
                             })
                             .map(|mode| self.handle_chat_ui(Action::Submit(target, mode)))
                             .unwrap_or_else(Task::none);
+                        // An attachment that finishes behind another pane
+                        // leaves the keyboard with the one in use.
+                        let focus = if self.card_holds_keyboard(target.card) {
+                            iced::widget::operation::focus(card_control_id(target.card, control))
+                                .map(cosmic::Action::App)
+                        } else {
+                            Task::none()
+                        };
                         return Task::batch([
                             submitted,
                             usage,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
-                            iced::widget::operation::focus(card_control_id(target.card, control))
-                                .map(cosmic::Action::App),
+                            focus,
                         ]);
                     }
                     Err(failure)
@@ -9702,6 +9709,110 @@ mod tests {
             target,
             Ready(Arc::new(Mutex::new(Some(result)))),
         )));
+    }
+
+    /// Whether `task` asks for the keyboard to go to `control`.
+    ///
+    /// Focus is a widget operation, not a message. Each operation the task
+    /// issues is shown two controls the way a widget tree would show them:
+    /// the one asked about, and another that holds the keyboard.
+    fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+        use cosmic::iced::advanced::widget::operation::Focusable;
+        use cosmic::iced::futures::StreamExt;
+
+        struct Control(bool);
+        impl Focusable for Control {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+
+        let mut asked = Control(false);
+        let mut holder = Control(true);
+        let elsewhere = widget::Id::new("the control in use");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            // Whatever else the task carries may wait on a daemon that is not
+            // there. A focus operation is ready at once, so a short quiet
+            // spell means there is none still to come.
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                if let cosmic::iced::runtime::Action::Widget(mut operation) = action {
+                    let bounds = cosmic::iced::Rectangle::default();
+                    operation.focusable(Some(control), bounds, &mut asked);
+                    operation.focusable(Some(&elsewhere), bounds, &mut holder);
+                }
+            }
+        });
+        runtime.shutdown_background();
+        (asked.0, holder.0)
+    }
+
+    /// A conversation that finishes attaching while another pane is in use
+    /// used to focus its own composer, which also blurred whatever the user
+    /// was typing into.
+    #[test]
+    fn an_attachment_behind_another_pane_leaves_the_keyboard_where_it_is() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (background, target) = starting_chat(&mut app);
+        let composer = card_control_id(background, "chat-composer");
+        let in_use = draft_chat(&mut app);
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(app.workspace.focused(), Some(in_use));
+        assert!(
+            app.workspace
+                .visibility(background)
+                .is_some_and(VisibilityClass::is_mounted),
+            "the conversation is on screen, so only focus keeps the keyboard from it"
+        );
+
+        let handle = fixture_handle(&app, background, Some("background"));
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert!(matches!(
+            app.cards.get(&background),
+            Some(CardRuntime::Chat(runtime)) if !runtime.is_draft()
+        ));
+        assert_eq!(
+            task_focuses(task, &composer),
+            (false, true),
+            "the attachment took the keyboard from the pane in use"
+        );
+    }
+
+    /// The same attachment in the pane the user is in does take the keyboard,
+    /// which is what the guard has to keep working.
+    #[test]
+    fn an_attachment_in_the_focused_pane_takes_the_keyboard() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(app.workspace.focused(), Some(card));
+
+        let handle = fixture_handle(&app, card, Some("focused"));
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert_eq!(
+            task_focuses(task, &card_control_id(card, "chat-composer")),
+            (true, false)
+        );
     }
 
     fn account_commit_reply(task: Task<Message>) -> Message {
