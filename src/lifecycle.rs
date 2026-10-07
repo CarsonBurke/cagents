@@ -34,6 +34,9 @@ struct RuntimeCard {
     /// When the card was last known to be on screen: stamped by every sweep
     /// that finds it there, and once more by the sweep that sees it leave.
     last_visible: Instant,
+    /// On screen or beside it only because the camera crossed it on its way
+    /// somewhere else, which is not a use of it and leaves `last_visible` be.
+    crossed: bool,
     epoch: u64,
 }
 
@@ -113,6 +116,7 @@ impl LifecycleManager {
                 exposure,
                 residency,
                 last_visible: now,
+                crossed: false,
                 epoch: 0,
             },
         );
@@ -130,6 +134,21 @@ impl LifecycleManager {
         prefetch: &HashSet<CardId>,
         now: Instant,
     ) -> Vec<LifecycleAction> {
+        self.reconcile_in_flight(visible, &HashSet::new(), prefetch, now)
+    }
+
+    /// [`Self::reconcile`] while the camera is travelling. `passing` are the
+    /// `visible` cards it is leaving or crossing rather than heading for. One
+    /// that is cold stays cold, and one that was not in use before is not
+    /// counted as used now: a card crossed is seen for a few frames, and the
+    /// ones being left were in use a moment ago.
+    pub fn reconcile_in_flight(
+        &mut self,
+        visible: &HashSet<CardId>,
+        passing: &HashSet<CardId>,
+        prefetch: &HashSet<CardId>,
+        now: Instant,
+    ) -> Vec<LifecycleAction> {
         let mut actions = Vec::new();
 
         // Cold offscreen cards cannot change during a viewport sweep. Visit
@@ -144,7 +163,9 @@ impl LifecycleManager {
                 // only happen on transitions, so the stamp of the last one
                 // that saw it visible can be as old as its stay, and would
                 // evict it the moment it left.
-                runtime.last_visible = now;
+                if !std::mem::take(&mut runtime.crossed) {
+                    runtime.last_visible = now;
+                }
                 runtime.exposure = Exposure::Offscreen;
                 actions.push(LifecycleAction::SetExposure {
                     card: *card,
@@ -163,7 +184,15 @@ impl LifecycleManager {
                 continue;
             };
             self.exposed.insert(card);
-            if next_exposure == Exposure::Visible || runtime.exposure == Exposure::Visible {
+            if next_exposure == Exposure::Visible && passing.contains(&card) {
+                runtime.crossed |= runtime.exposure != Exposure::Visible;
+            } else if next_exposure == Exposure::Visible || passing.is_empty() {
+                // The camera stopped on it or beside it.
+                runtime.crossed = false;
+            }
+            if !runtime.crossed
+                && (next_exposure == Exposure::Visible || runtime.exposure == Exposure::Visible)
+            {
                 runtime.last_visible = now;
             }
             if runtime.exposure != next_exposure {
@@ -177,12 +206,15 @@ impl LifecycleManager {
 
         // Visible work always wins the budget. Iterating the two bands in
         // priority order avoids allocating and sorting hydration candidates.
+        let candidates = || {
+            visible
+                .iter()
+                .filter(|card| !passing.contains(*card))
+                .map(|card| (card, true))
+                .chain(prefetch.iter().map(|card| (card, false)))
+        };
         let mut preemptible = None;
-        for (card, on_screen) in visible
-            .iter()
-            .map(|card| (card, true))
-            .chain(prefetch.iter().map(|card| (card, false)))
-        {
+        for (card, on_screen) in candidates() {
             if !self.is_cold(card) {
                 continue;
             }
@@ -226,7 +258,7 @@ impl LifecycleManager {
         // Slots the grace just freed go to whoever was turned away above.
         // Nothing else would come back for them: the next sweep is the next
         // change of exposure.
-        for card in visible.iter().chain(prefetch) {
+        for (card, _) in candidates() {
             if self.hot.len() >= self.budget.max_hot_cards {
                 break;
             }
@@ -556,6 +588,93 @@ mod tests {
             .iter()
             .position(|action| matches!(action, LifecycleAction::Hydrate { .. }));
         assert!(released < taken);
+    }
+
+    #[test]
+    fn a_card_the_camera_passes_takes_no_slot_and_does_not_outlast_the_one_left() {
+        let now = Instant::now();
+        let left = CardId::new();
+        let crossed = CardId::new();
+        let crossed_cold = CardId::new();
+        let destination = CardId::new();
+        let next = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 4,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        manager.register(left, Exposure::Visible, Residency::Hot, now);
+        // Left a while ago and still within its grace.
+        manager.register(crossed, Exposure::Offscreen, Residency::Hot, now);
+        for card in [crossed_cold, destination, next] {
+            manager.register(card, Exposure::Offscreen, Residency::Hibernated, now);
+        }
+
+        // The camera leaves one pane for another across two more. Only where
+        // it is going is brought up, though a slot is free for another.
+        let departed = now + Duration::from_secs(1);
+        let actions = manager.reconcile_in_flight(
+            &HashSet::from([left, crossed, crossed_cold, destination]),
+            &HashSet::from([left, crossed, crossed_cold]),
+            &HashSet::new(),
+            departed,
+        );
+        assert_eq!(hydrated(&actions), [destination]);
+        assert!(hibernated(&actions).is_empty());
+        assert_eq!(
+            manager.state(crossed_cold),
+            Some((&Exposure::Visible, &Residency::Hibernated))
+        );
+
+        // At rest on the destination, the others off screen in the order the
+        // camera left them.
+        let actions = manager.reconcile(
+            &HashSet::from([destination]),
+            &HashSet::new(),
+            departed + Duration::from_secs(1),
+        );
+        assert!(hydrated(&actions).is_empty());
+        assert!(hibernated(&actions).is_empty());
+
+        // The budget is not spent until the second of these, which takes the
+        // slot of the card that was only crossed: the one left was in use
+        // after it, however recently the other was on screen.
+        let later = departed + Duration::from_secs(2);
+        let actions =
+            manager.reconcile(&HashSet::from([destination, next]), &HashSet::new(), later);
+        assert_eq!(hydrated(&actions), [next]);
+        assert!(hibernated(&actions).is_empty());
+        let actions = manager.reconcile(
+            &HashSet::from([destination, next, crossed_cold]),
+            &HashSet::new(),
+            later,
+        );
+        assert_eq!(hibernated(&actions), [crossed]);
+        assert_eq!(hydrated(&actions), [crossed_cold]);
+    }
+
+    #[test]
+    fn a_card_the_camera_stops_on_after_passing_it_is_one_in_use() {
+        let now = Instant::now();
+        let hidden = CardId::new();
+        let passed = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 1,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        manager.register(hidden, Exposure::Offscreen, Residency::Hot, now);
+        manager.register(passed, Exposure::Offscreen, Residency::Hibernated, now);
+
+        let actions = manager.reconcile_in_flight(
+            &HashSet::from([passed]),
+            &HashSet::from([passed]),
+            &HashSet::new(),
+            now,
+        );
+        assert!(hydrated(&actions).is_empty());
+
+        let actions = manager.reconcile(&HashSet::from([passed]), &HashSet::new(), now);
+        assert_eq!(hibernated(&actions), [hidden]);
+        assert_eq!(hydrated(&actions), [passed]);
     }
 
     #[test]

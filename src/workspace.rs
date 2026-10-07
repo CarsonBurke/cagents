@@ -529,9 +529,13 @@ impl Camera {
     }
 
     pub fn animate_to(&mut self, target: f32) {
-        self.target = finite_nonnegative(target);
-        self.animating = (self.target - self.offset).abs() > POSITION_EPSILON
+        let target = finite_nonnegative(target);
+        self.animating = (target - self.offset).abs() > POSITION_EPSILON
             || self.velocity.abs() > VELOCITY_EPSILON;
+        // Too near to animate is there already. A target left a hair away
+        // would never be reached, and a card whose edge fell in between would
+        // stay a destination.
+        self.target = if self.animating { target } else { self.offset };
     }
 
     pub fn interrupt(&mut self) {
@@ -800,6 +804,19 @@ impl Workspace {
                 .copied()
                 .unwrap_or(VisibilityClass::Offscreen)
         })
+    }
+
+    /// Whether a card on screen is one the camera is leaving or crossing on
+    /// its way somewhere else, rather than one it is heading for.
+    pub fn is_passing(&self, id: CardId) -> bool {
+        if !self.camera.is_animating() {
+            return false;
+        }
+        let (Some(bands), Some(index)) = (&self.visibility_bands, self.card_indices.get(&id))
+        else {
+            return false;
+        };
+        bands.visible.contains(index) && !bands.arriving.contains(index)
     }
 
     /// Only cards in the visible/overscan band, without scanning the strip.
@@ -2030,6 +2047,28 @@ mod tests {
                 .any(|mounted| mounted == removed_id)
         );
         assert!(workspace.opening.is_empty());
+    }
+
+    #[test]
+    fn a_pane_the_camera_only_passes_is_told_apart_from_its_destination() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 8], 600.0);
+        let ids: Vec<_> = workspace.order().collect();
+        assert!(!workspace.is_passing(ids[0]));
+        workspace.focus(ids[7]).unwrap();
+        // The pane being left is still on screen without being where the
+        // camera is going. One in between is not on screen yet.
+        assert!(workspace.is_passing(ids[0]));
+        assert!(!workspace.is_passing(ids[4]));
+        assert!(!workspace.is_passing(ids[7]));
+        let mut crossed = false;
+        for _ in 0..240 {
+            workspace.tick(Duration::from_millis(16));
+            crossed |= workspace.is_passing(ids[4]);
+            assert!(!workspace.is_passing(ids[7]));
+        }
+        assert!(crossed);
+        assert!(!workspace.is_animating());
+        assert!(ids.iter().all(|id| !workspace.is_passing(*id)));
     }
 
     #[test]

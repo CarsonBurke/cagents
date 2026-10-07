@@ -4686,6 +4686,10 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
     focus_save_pending: bool,
+    /// Where the camera was heading when the last sweep found cards on screen
+    /// that it was only passing, which that sweep left cold. The camera
+    /// coming to rest or heading elsewhere is then a reason to sweep again.
+    lifecycle_sweep_destination: Option<f32>,
     /// The main window's latest input, whichever widget or overlay took it;
     /// hover activation reads it. See [`crate::input_trace`].
     input_trace: crate::input_trace::InputTrace,
@@ -5278,7 +5282,7 @@ impl Cagents {
         // browserless build leaves their durable descriptors untouched and
         // renders an explicit external-open path instead.
         Task::batch([
-            self.reconcile_lifecycle(&initially_visible, &initially_prefetch),
+            self.reconcile_lifecycle(&initially_visible, &HashSet::new(), &initially_prefetch),
             self.attach_next_restored_agent(),
             Task::batch(repository_tasks),
         ])
@@ -7914,6 +7918,7 @@ impl Cagents {
             );
         }
         tasks.push(context_overlay_task);
+        reconcile_now |= self.take_passing_sweep();
         if reconcile_now {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
         }
@@ -8001,6 +8006,8 @@ impl Cagents {
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
         let mut visible = HashSet::new();
+        // On screen, but only until the camera has gone by.
+        let mut passing = HashSet::new();
         let mut prefetch = HashSet::new();
         for (id, visibility) in self.workspace.mounted_visibility() {
             // A card in a worktree being deleted is not brought up: its
@@ -8014,6 +8021,9 @@ impl Cagents {
             }
             if visibility == VisibilityClass::Visible {
                 visible.insert(id);
+                if self.workspace.is_passing(id) {
+                    passing.insert(id);
+                }
             } else if visibility == VisibilityClass::Overscan {
                 let browser = match self.cards.get(&id) {
                     Some(CardRuntime::Terminal(_))
@@ -8036,17 +8046,39 @@ impl Cagents {
         // An ended card holds no lifecycle slot, so the reconcile below never
         // brings it up; its final screen is asked for once it is on screen.
         let retained = self.attach_retained_outputs(visible.iter().copied().collect::<Vec<_>>());
-        Task::batch([self.reconcile_lifecycle(&visible, &prefetch), retained])
+        self.lifecycle_sweep_destination =
+            (!passing.is_empty()).then(|| self.workspace.camera().target());
+        Task::batch([
+            self.reconcile_lifecycle(&visible, &passing, &prefetch),
+            retained,
+        ])
+    }
+
+    /// Whether the cards the last sweep left cold as passing are owed
+    /// another: the camera is at rest, so whichever is still on screen is
+    /// there to stay, or it has a new destination, which may be one of them.
+    fn take_passing_sweep(&mut self) -> bool {
+        let camera = self.workspace.camera();
+        let due = self
+            .lifecycle_sweep_destination
+            .is_some_and(|destination| !camera.is_animating() || camera.target() != destination);
+        if due {
+            self.lifecycle_sweep_destination = None;
+        }
+        due
     }
 
     fn reconcile_lifecycle(
         &mut self,
         visible: &HashSet<CardId>,
+        passing: &HashSet<CardId>,
         prefetch: &HashSet<CardId>,
     ) -> Task<Message> {
         let now = Instant::now();
         let surfaces_visible = self.workspace_surfaces_visible();
-        let actions = self.lifecycle.reconcile(visible, prefetch, now);
+        let actions = self
+            .lifecycle
+            .reconcile_in_flight(visible, passing, prefetch, now);
         // Actions are only emitted for real transitions, so an empty sweep left
         // the durable state untouched and needs no snapshot.
         let durable_changed = !actions.is_empty();
@@ -12452,6 +12484,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
         // One notice per lost card, not a single joined line: the log dedupes
@@ -20240,6 +20273,49 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_that_left_a_passing_pane_cold_is_repeated_when_the_camera_rests_or_turns() {
+        let mut app = context_inspector_test_app(false);
+        let cards: Vec<_> = std::iter::repeat_with(terminal_card_state)
+            .take(8)
+            .collect();
+        let origin = cards[0].id;
+        let target = cards[7].id;
+        let retarget = cards[5].id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(origin),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(600.0);
+        app.workspace.native_scroll(0.0, 600.0);
+        let _ = app.update(Message::LifecycleSweep);
+        assert!(!app.take_passing_sweep());
+
+        app.workspace.focus(target).unwrap();
+        assert!(app.workspace.is_passing(origin));
+        let _ = app.update(Message::LifecycleSweep);
+        assert!(!app.take_passing_sweep());
+
+        // Heading somewhere else may make a destination of a pane passed.
+        app.workspace.focus(retarget).unwrap();
+        assert!(app.take_passing_sweep());
+        assert!(!app.take_passing_sweep());
+
+        let _ = app.update(Message::LifecycleSweep);
+        for _ in 0..240 {
+            assert!(!app.take_passing_sweep());
+            app.workspace.tick(Duration::from_millis(16));
+            if !app.workspace.camera().is_animating() {
+                break;
+            }
+        }
+        assert!(!app.workspace.camera().is_animating());
+        assert!(app.take_passing_sweep());
+        assert!(!app.take_passing_sweep());
+    }
+
+    #[test]
     fn a_new_camera_animation_does_not_consume_the_previous_idle_interval() {
         let mut app = context_inspector_test_app(false);
         let cards = vec![
@@ -21310,7 +21386,7 @@ mod tests {
             Some(&Residency::Hibernated)
         );
 
-        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new()));
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts_in_flight(), 0);
         assert_ne!(
             surface_visibility(&app, card),
@@ -21333,7 +21409,7 @@ mod tests {
         let (mut app, card, session) = hibernated_agent_app(None);
         app.restored_agent_attaches.push_back(card);
         drop(app.attach_next_restored_agent());
-        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new()));
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts_in_flight(), 2);
         let started = || StartedTerminal {
             handle: unconnected_surface(directory.path(), session.id),
@@ -23180,6 +23256,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
             terminal_wake_rx,
