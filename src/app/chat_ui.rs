@@ -3426,11 +3426,14 @@ impl Cagents {
         );
         Some(
             widget::container(
-                widget::scrollable(widget::column::with_children(content).spacing(6))
-                    .height(Length::Shrink),
+                widget::scrollable(
+                    widget::column::with_children(content)
+                        .spacing(6)
+                        .padding(space::S),
+                )
+                .height(Length::Shrink),
             )
             .max_height(180)
-            .padding(space::S)
             .into(),
         )
     }
@@ -7245,8 +7248,8 @@ impl Cagents {
                 let Some(count) = runtime.completion().map(|(_, rows)| rows.len()) else {
                     return Task::none();
                 };
-                let (row, viewport) = view::completion_extent(count);
-                if let Some(offset) = runtime.completion.step(down, count, row, viewport) {
+                let (row, viewport, inset) = view::completion_extent(count);
+                if let Some(offset) = runtime.completion.step(down, count, row, viewport, inset) {
                     return view::completion_scroll(target, offset);
                 }
             }

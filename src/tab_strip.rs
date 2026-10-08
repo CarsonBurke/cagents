@@ -10,11 +10,8 @@ use crate::design;
 /// same pitch the strip lays out with.
 pub const SPACING: f32 = 4.0;
 
-/// Inset between the strip's viewport and each end of the bar holding it.
-///
-/// A caller that sizes the scroll viewport has to subtract this from both
-/// ends, so the number lives here rather than being spelled again at the
-/// call site where the two copies could drift apart.
+/// Content inset at each end of the scrolling row. It scrolls with the tabs;
+/// reveal and reorder coordinates include the leading inset.
 pub const EDGE_INSET: f32 = 8.0;
 
 /// Wraps a tab so a middle click closes it without changing left-click
@@ -96,6 +93,7 @@ fn strip<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     let row = widget::row::with_children(tab_row)
         .spacing(SPACING)
+        .padding([0.0, EDGE_INSET])
         .align_y(cosmic::iced::Alignment::Center)
         .height(row_height);
     let row = match reordering {
@@ -107,7 +105,7 @@ fn strip<'a, Message: 'a>(
                 .enumerate()
                 .map(|(index, id)| crate::reorder::Item {
                     id,
-                    start: index as f32 * (config.tab_width + SPACING),
+                    start: EDGE_INSET + index as f32 * (config.tab_width + SPACING),
                     width: config.tab_width,
                 })
                 .collect(),
@@ -136,7 +134,6 @@ fn strip<'a, Message: 'a>(
     widget::container(crate::interaction::overflow_fade_x(
         crate::interaction::horizontal_wheel(tabs),
     ))
-    .padding([0.0, EDGE_INSET])
     .center_y(Length::Fill)
     // Callers pass the nominal header height; the bar that receives the strip
     // spends `BORDER_WIDTH` of it on the rule beneath. Reserving it here keeps
@@ -144,4 +141,58 @@ fn strip<'a, Message: 'a>(
     .height((header_height - design::BORDER_WIDTH).max(0.0))
     .width(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree, operation},
+    };
+    use cosmic::iced::{Rectangle, Size, Vector};
+
+    #[test]
+    fn horizontal_viewport_reaches_strip_edges_and_inset_belongs_to_content() {
+        #[derive(Default)]
+        struct Probe {
+            bounds: Option<(Rectangle, Rectangle)>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                content: Rectangle,
+                _: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.bounds = Some((bounds, content));
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut strip: Element<'_, ()> = horizontal(
+            widget::Id::unique(),
+            vec![widget::Space::new().width(500).height(24).into()],
+            24.0,
+            32.0,
+        );
+        let mut tree = Tree::new(strip.as_widget());
+        let node = strip.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 32.0)),
+        );
+        let mut probe = Probe::default();
+        strip
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let (viewport, content) = probe.bounds.expect("scrollable tab strip");
+        assert_eq!(viewport.x, 0.0);
+        assert_eq!(viewport.width, 300.0);
+        assert_eq!(content.width, 500.0 + 2.0 * EDGE_INSET);
+    }
 }

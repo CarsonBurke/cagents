@@ -1151,14 +1151,18 @@ impl Cagents {
                     .spacing(space::S);
                 widget::container(
                     widget::column::with_children(vec![
-                        heading.into(),
+                        widget::container(heading)
+                            .padding(iced::Padding::new(6.0).bottom(0.0))
+                            .into(),
                         widget::scrollable(
                             widget::column::with_children(notices)
                                 .spacing(space::M)
                                 // Each notice ends in a Dismiss control on its
                                 // right edge, which the floating thumb would
                                 // otherwise cover.
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                                .padding(design::with_vertical_rail(
+                                    iced::Padding::new(6.0).top(0.0),
+                                )),
                         )
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
@@ -1168,7 +1172,6 @@ impl Cagents {
                     ])
                     .spacing(space::S),
                 )
-                .padding(6)
                 .width(design::NOTICE_POPOVER_WIDTH)
                 .max_height(408)
                 .into()
@@ -1285,11 +1288,7 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        // The strip's own wrapper insets both ends; keep that out of the
-        // scroll viewport and reveal calculation.
-        let insets = 2.0 * crate::tab_strip::EDGE_INSET;
-        let available =
-            (self.workspace.viewport_width() - self.workspace_header_width() - insets).max(0.0);
+        let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
         // Reordering uses one shared width. Derive that width from the titles
         // instead of giving every agent the same eight-character title budget.
         let desired = self
@@ -1323,7 +1322,9 @@ impl Cagents {
         // The trailing "new tab" control shares the scrollable row, so a tab
         // revealed flush against the viewport edge would sit underneath it.
         let pitch = width + crate::tab_strip::SPACING;
-        let content = self.workspace.order().count() as f32 * pitch + design::PRIMARY_CONTROL_SIZE;
+        let content = self.workspace.order().count() as f32 * pitch
+            + design::PRIMARY_CONTROL_SIZE
+            + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
             // Everything fits; any offset at all would be wrong.
@@ -1334,7 +1335,7 @@ impl Cagents {
                 Task::none()
             };
         }
-        let leading = index as f32 * pitch;
+        let leading = crate::tab_strip::EDGE_INSET + index as f32 * pitch;
         let trailing = leading + width;
         let offset = self.chrome_ui.tabs_offset;
         let target = if leading < offset {

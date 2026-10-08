@@ -4898,14 +4898,10 @@ fn unreachable_project<'a>(
     // The retry is named after its project, because two unreadable projects
     // would otherwise offer a reader two controls announced identically.
     details = details.push(
-        crate::ui_controls::button::secondary(if project.reloading {
-            "Trying again…"
-        } else {
-            "Try again"
-        })
-        .id(chrome.retry_id.clone())
-        .name(description)
-        .on_press_maybe(reload),
+        crate::ui_controls::button::secondary("Try again")
+            .id(chrome.retry_id.clone())
+            .name(description)
+            .on_press_maybe(reload),
     );
     // Grouped like every other project row, because the enclosing list
     // hit-tests each row's header through `sticky_header_bounds` whether the
@@ -6705,10 +6701,32 @@ fn source_control_header<'a>(
 ) -> Element<'a, SidebarAction> {
     let chrome = &source.chrome;
     let key = &source.key;
+    let activity = source.progress_label().or_else(|| {
+        if matches!(source.data_state, SidebarDataState::Loading) {
+            Some("Loading worktree…")
+        } else if matches!(view, PanelView::Files)
+            && matches!(source.file_search, FileSearch::Pending { .. })
+            && !state.files_query().trim().is_empty()
+        {
+            Some("Searching files…")
+        } else if matches!(view, PanelView::Git(ChangesTab::History)) && source.history_loading {
+            Some("Loading commits…")
+        } else {
+            None
+        }
+    });
+    // Replace the identity glyph in place: neither the title nor the body
+    // gives up room when a background read or mutation starts.
     let mut header = widget::row::with_children(vec![
-        widget::container(worktree_icon().icon().size(ROW_ICON_SIZE))
-            .center_x(Length::Fixed(ROW_ICON_WIDTH))
-            .into(),
+        crate::interaction::tooltip(
+            widget::container(if activity.is_some() {
+                crate::ui_controls::activity_spinner(14.0, design::warning_color)
+            } else {
+                worktree_icon().icon().size(ROW_ICON_SIZE).into()
+            })
+            .center(Length::Fixed(ROW_ICON_WIDTH)),
+            activity.unwrap_or("Worktree"),
+        ),
         widget::container(crate::interaction::tooltip(
             design::heading(worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label))
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -6761,37 +6779,18 @@ fn source_control_header<'a>(
         .into()
 }
 
-/// The progress and error slots beneath the header.
-///
-/// Both notices are permanent slots. The failure arm of the panel ends in a
-/// named `Try again` button, and iced reconciles a named child at the index
-/// its name held last frame while writing the positionally unmatched
-/// children over those same indices: a notice arriving above the button left
-/// the reconciled child list one entry short, so the button had no tree at
-/// all and disappeared from the one frame that was asking for a press.
+/// Error notices beneath the header. Activity stays in the header's fixed
+/// icon slot so a background read or mutation cannot move the body.
 fn source_control_notices<'a>(
     source: &'a SourceControlModel,
 ) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
-    let mut notices: cosmic::iced::widget::Column<
-        'a,
-        SidebarAction,
-        cosmic::Theme,
-        cosmic::Renderer,
-    > = widget::column::with_capacity(4).spacing(space::XS);
-    notices = notices.push(slot(source.progress_label().map(|label| {
-        widget::row::with_children(vec![
-            crate::ui_controls::activity_spinner(14.0, design::warning_color),
-            design::caption(label).into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::S)
-        .into()
-    })));
-    notices.push(slot(source.error.as_deref().map(|error| {
-        design::caption(error)
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into()
-    })))
+    widget::column::with_capacity(3)
+        .spacing(space::XS)
+        .push(slot(source.error.as_deref().map(|error| {
+            design::caption(error)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into()
+        })))
 }
 
 /// Shared worktree identity and loading slots around file or Git navigation.
@@ -7192,7 +7191,7 @@ fn files_section<'a>(
                 state.files_page,
             );
             let hidden = hidden.saturating_sub(visible.len());
-            (visible, hidden, Some("Searching…"))
+            (visible, hidden, None)
         }
         FileSearch::Ready {
             query,
@@ -7604,13 +7603,13 @@ fn changes_section<'a>(
 ) -> Element<'a, SidebarAction> {
     let mut column = widget::column::with_capacity(source.groups().len() + 1).spacing(space::XS);
     if source.groups().iter().all(ChangeGroup::is_empty) {
-        column = column.push(design::caption(if source.reloading {
-            "Loading changes…"
-        } else if state.section_expanded(PanelSection::Untracked) {
-            "Working tree clean."
-        } else {
-            "No tracked changes."
-        }));
+        column = column.push(design::caption(
+            if state.section_expanded(PanelSection::Untracked) {
+                "Working tree clean."
+            } else {
+                "No tracked changes."
+            },
+        ));
     }
     for group in source.groups() {
         // A collapsed untracked group remains discoverable because its
@@ -7653,12 +7652,7 @@ fn changes_section<'a>(
                         ChangeArea::Unstaged => "unstaged changes",
                         ChangeArea::Untracked => "untracked files",
                     };
-                    design::caption(if source.reloading {
-                        format!("Loading {noun}…")
-                    } else {
-                        format!("No {noun}.")
-                    })
-                    .into()
+                    design::caption(format!("No {noun}.")).into()
                 } else {
                     change_group_view(state, source, group, modal_open)
                 }
@@ -8066,8 +8060,8 @@ impl<'a> IconCommand<'a> {
 ///
 /// Which commands exist is a fact about the area: conflicts are staged to mark
 /// them resolved, there is no unstage for an unmerged path, and untracked paths
-/// have nothing to unstage from. An in-flight Git command withholds all three,
-/// because a second mutation against the same index would race the first.
+/// have nothing to unstage from. An in-flight Git command disables the actions
+/// in place, because a second mutation against the same index would race the first.
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
@@ -8075,7 +8069,7 @@ fn group_commands<'a>(
 ) -> Vec<IconCommand<'a>> {
     let key = &source.key;
     let chrome = &group.chrome;
-    if source.busy() || group.is_empty() {
+    if group.is_empty() {
         return Vec::new();
     }
     let mut commands = Vec::with_capacity(2);
@@ -8089,7 +8083,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Unstage,
                 },
-                modal_open,
+                modal_open || source.busy(),
             ),
             id: chrome.unstage_all_id.clone(),
         });
@@ -8103,7 +8097,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Stage,
                 },
-                modal_open,
+                modal_open || source.busy(),
             ),
             id: chrome.stage_all_id.clone(),
         });
@@ -8118,7 +8112,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Discard,
                 },
-                modal_open,
+                modal_open || source.busy(),
             ),
             id: chrome.discard_all_id.clone(),
         });
@@ -8175,9 +8169,6 @@ fn row_commands<'a>(
 ) -> Vec<IconCommand<'a>> {
     let key = &source.key;
     let chrome = &row.chrome;
-    if source.busy() {
-        return Vec::new();
-    }
     let mut commands = Vec::with_capacity(2);
     if area == ChangeArea::Staged {
         commands.push(IconCommand {
@@ -8188,7 +8179,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open,
+                modal_open || source.busy(),
             ),
             id: chrome.unstage_id.clone(),
         });
@@ -8201,7 +8192,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open,
+                modal_open || source.busy(),
             ),
             id: chrome.stage_id.clone(),
         });
@@ -8215,7 +8206,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     request: single_discard_request(key, area, row),
                 },
-                modal_open,
+                modal_open || source.busy(),
             ),
             id: chrome.discard_id.clone(),
         });
@@ -8806,27 +8797,29 @@ fn history_section<'a>(
         ));
     }
     column = column.push(rows);
-    column = column.push(slot(source.can_load_history().then(|| {
-        // The first page is not "more": labelling it that way while the list is
-        // empty hides that nothing has been asked for yet.
-        button::custom(design::caption(if source.history.is_empty() {
-            format!("Load {HISTORY_PAGE_SIZE} commits")
-        } else {
-            format!("Load {HISTORY_PAGE_SIZE} more commits")
-        }))
-        .class(sidebar_button_style(false))
-        .padding([0.0, space::XS])
-        .height(PANEL_ROW_HEIGHT)
-        .id(source.chrome.more_history_id.clone())
-        .on_press_maybe(gated(
-            SidebarAction::LoadMoreHistory {
-                key: key.clone(),
-                page: source.next_history_page,
-            },
-            modal_open,
-        ))
-        .into()
-    })));
+    column = column.push(slot((!source.history_complete && !source.unborn).then(
+        || {
+            // The first page is not "more": labelling it that way while the list is
+            // empty hides that nothing has been asked for yet.
+            button::custom(design::caption(if source.history.is_empty() {
+                format!("Load {HISTORY_PAGE_SIZE} commits")
+            } else {
+                format!("Load {HISTORY_PAGE_SIZE} more commits")
+            }))
+            .class(sidebar_button_style(false))
+            .padding([0.0, space::XS])
+            .height(PANEL_ROW_HEIGHT)
+            .id(source.chrome.more_history_id.clone())
+            .on_press_maybe(gated(
+                SidebarAction::LoadMoreHistory {
+                    key: key.clone(),
+                    page: source.next_history_page,
+                },
+                modal_open || !source.can_load_history(),
+            ))
+            .into()
+        },
+    )));
     column.into()
 }
 
@@ -8838,7 +8831,7 @@ fn history_section<'a>(
 /// how this section came to contradict the commits the repository card beside
 /// it was listing at the same moment.
 fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
-    if source.history_loading {
+    if source.history_loading && source.history.is_empty() {
         return Some("Loading commits…");
     }
     if source.unborn {
@@ -16207,10 +16200,14 @@ pub(crate) mod tests {
             .group(ChangeArea::Unstaged)
             .expect("an unstaged group exists");
         assert!(
-            group_commands(&source, group, false).is_empty()
-                && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false).is_empty(),
+            group_commands(&source, group, false)
+                .iter()
+                .all(|command| command.action.is_none())
+                && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false)
+                    .iter()
+                    .all(|command| command.action.is_none()),
             "two `git add` runs against one index corrupt each other's lock, so the second is not \
-             offered at all"
+             enabled"
         );
     }
 
@@ -16749,6 +16746,98 @@ pub(crate) mod tests {
         assert!(
             fired.contains(&pending.confirm_action()),
             "the dialog's Discard is the only route to a confirmed request; it published {fired:?}"
+        );
+    }
+
+    #[test]
+    fn background_activity_keeps_panel_content_in_place() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let renderer = headless_renderer();
+        let bounds = |mut element: Element<'_, SidebarAction>, width| {
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 700.0)),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| {
+                    let label = node.node().label()?;
+                    let rect = node.node().bounds()?;
+                    Some((label.to_owned(), [rect.x0, rect.y0, rect.x1, rect.y1]))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        for width in [220.0, 380.0] {
+            for panel in [WorktreePanel::Files, WorktreePanel::Changes] {
+                let model = panel_model();
+                let state = panel_state(&model);
+                let before = bounds(
+                    worktree_sidebar(&model, &state, width, false, panel, true),
+                    width,
+                );
+                assert!(before.len() > 3, "fixture must contain visible controls");
+                for mutation in [None, Some(MutationKind::Stage)] {
+                    let mut busy = model.clone();
+                    let source = busy.source_control.as_mut().unwrap();
+                    source.reloading = true;
+                    source.mutation = mutation;
+                    let after = bounds(
+                        worktree_sidebar(&busy, &state, width, false, panel, true),
+                        width,
+                    );
+                    for (label, rect) in &before {
+                        assert_eq!(after.get(label), Some(rect), "{panel:?}: {label} moved");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loading_more_history_keeps_commits_and_pager_in_place() {
+        let mut source = source_control();
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.com".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        source.history = vec![CommitRow::new(&CommitSummary {
+            oid: oid_of(1),
+            parents: vec![],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Existing commit".into(),
+            body: String::new(),
+        })];
+        source.history_loaded = true;
+        assert_eq!(history_notice(&source), None);
+        let renderer = headless_renderer();
+        let state = SidebarState::default();
+        let before = accessible_names(&renderer, history_section(&state, &source, false));
+        assert!(
+            before
+                .iter()
+                .any(|name| name.contains(&format!("Load {HISTORY_PAGE_SIZE} more commits")))
+        );
+        source.mark_history_requested();
+        assert_eq!(history_notice(&source), None);
+        let after = accessible_names(&renderer, history_section(&state, &source, false));
+        assert_eq!(before, after);
+        assert!(
+            frame_enter_presses(&renderer, history_section(&state, &source, false))
+                .iter()
+                .all(|action| !matches!(action, SidebarAction::LoadMoreHistory { .. }))
         );
     }
 
