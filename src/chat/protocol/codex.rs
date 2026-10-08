@@ -2345,18 +2345,39 @@ impl Adapter for Codex {
                     fatal: true,
                 });
             }
-            "error" => step.events.push(Event::Error {
-                message: params["error"]["message"]
+            "error" => {
+                let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| params["error"].to_string()),
-                fatal: false,
-            }),
+                    .unwrap_or_else(|| params["error"].to_string());
+                // A retry describes work still in progress. Putting it in
+                // Snapshot.error leaves a recovered turn marked as failed.
+                if params["willRetry"] == true {
+                    step.events.push(session_notice(message));
+                } else {
+                    step.events.push(Event::Error {
+                        message,
+                        fatal: false,
+                    });
+                }
+            }
             "warning" | "configWarning" | "guardianWarning" | "deprecationNotice" => {
-                step.events.push(Event::Error {
-                    message: params.to_string(),
-                    fatal: false,
-                })
+                let summary = params["message"]
+                    .as_str()
+                    .or_else(|| params["summary"].as_str())
+                    .filter(|text| !text.trim().is_empty());
+                let mut message = summary
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| params.to_string());
+                if summary.is_some() {
+                    for key in ["details", "path"] {
+                        if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
+                            message.push_str("\n\n");
+                            message.push_str(text);
+                        }
+                    }
+                }
+                step.events.push(session_notice(message));
             }
             "turn/diff/updated" => step.events.push(Event::Item(Item {
                 id: format!("{}/diff", string(params, "turnId")?),
@@ -2397,6 +2418,23 @@ impl Adapter for Codex {
         }
         Ok(step)
     }
+}
+
+/// Advisory provider messages belong to the transcript, at their arrival
+/// position. Each occurrence has its own identity so later work and retries
+/// cannot move an old notice to the end or overwrite a previous one.
+fn session_notice(text: String) -> Event {
+    Event::Item(Item {
+        id: format!("codex-notice:{}", uuid::Uuid::new_v4()),
+        role: Role::System,
+        content: ItemContent::Text {
+            text,
+            thinking: false,
+            phase: Phase::Commentary,
+        },
+        started_at: None,
+        at: None,
+    })
 }
 impl Codex {
     fn thread_state(&mut self, thread: &Value, step: &mut Step) -> Result<(), String> {
@@ -3374,6 +3412,86 @@ mod tests {
             branch_points: Vec::new(),
             is_child: false,
             child_buffer: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn retry_notices_are_timeline_items_and_exhausted_retries_are_errors() {
+        let mut adapter = adapter();
+        let frame = json!({"method":"error","params":{"threadId":"thread-exact","turnId":"turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}});
+        let first = adapter.receive(frame.clone()).unwrap();
+        let second = adapter.receive(frame.clone()).unwrap();
+        let [Event::Item(item)] = first.events.as_slice() else {
+            panic!("{:?}", first.events)
+        };
+        assert_eq!(item.role, Role::System);
+        assert!(
+            matches!(&item.content, ItemContent::Text { text, thinking: false, phase: Phase::Commentary } if text == "Reconnecting... 1/2")
+        );
+        let [Event::Item(next)] = second.events.as_slice() else {
+            panic!("{:?}", second.events)
+        };
+        assert_ne!(item.id, next.id);
+        for will_retry in [json!(false), Value::Null] {
+            let mut failed = frame.clone();
+            failed["params"]["willRetry"] = will_retry;
+            assert!(matches!(
+                adapter.receive(failed).unwrap().events.as_slice(),
+                [Event::Error { fatal: false, .. }]
+            ));
+        }
+        let mut foreign = frame;
+        foreign["params"]["threadId"] = json!("another-thread");
+        assert!(adapter.receive(foreign).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn child_retry_is_recorded_in_the_child_timeline() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        let step = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}})).unwrap();
+        assert!(
+            matches!(step.events.as_slice(), [Event::SubagentItem { id, item: Item { role: Role::System, .. } }] if id == "child-thread")
+        );
+    }
+
+    #[test]
+    fn provider_warnings_are_readable_advisory_timeline_items() {
+        for (method, params, expected) in [
+            (
+                "warning",
+                json!({"message":"Warning", "threadId":"thread-exact"}),
+                "Warning",
+            ),
+            (
+                "guardianWarning",
+                json!({"message":"Guardian warning", "threadId":"thread-exact"}),
+                "Guardian warning",
+            ),
+            (
+                "configWarning",
+                json!({"summary":"Config warning", "details":"Fix this setting", "path":"/config.toml"}),
+                "Config warning\n\nFix this setting\n\n/config.toml",
+            ),
+            (
+                "deprecationNotice",
+                json!({"summary":"Deprecated", "details":"Use the new option"}),
+                "Deprecated\n\nUse the new option",
+            ),
+        ] {
+            let step = adapter()
+                .receive(json!({"method":method,"params":params}))
+                .unwrap();
+            assert!(
+                matches!(step.events.as_slice(), [Event::Item(Item { role: Role::System, content: ItemContent::Text {text, ..}, .. })] if text == expected),
+                "{method}: {:?}",
+                step.events
+            );
         }
     }
 

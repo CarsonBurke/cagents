@@ -2070,6 +2070,11 @@ impl Runtime {
         self.source_clock = source_clock;
         self.turns = turn::group(&snapshot.items, &self.asked_after);
         reconcile_disclosure(&mut self.opened, &self.turns);
+        if snapshot.error != self.snapshot.error
+            && let Some(error) = &snapshot.error
+        {
+            self.note(error.clone());
+        }
         self.snapshot = snapshot;
         self.refresh_find();
     }
@@ -8465,6 +8470,37 @@ mod tests {
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
             Some(view::Page::Earlier)
         );
+    }
+
+    #[test]
+    fn provider_failure_stays_at_its_turn_after_recovery_and_new_work() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.error = Some("Provider failure".into());
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let recorded = chat_runtime(&app, card).failures.clone();
+        assert_eq!(recorded.len(), 1);
+        snapshot.generation += 1;
+        snapshot.error = None;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "next-prompt".into(),
+            role: chat::Role::User,
+            content: text("Try again"),
+            started_at: None,
+            at: None,
+        }));
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.failures, recorded);
+        assert_ne!(
+            runtime.failures[0].0.as_ref(),
+            runtime.turns.last().map(|turn| &turn.key)
+        );
+        assert!(runtime.snapshot.error.is_none());
     }
 
     #[test]
