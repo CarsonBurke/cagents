@@ -234,6 +234,7 @@ winit-wayland = { path = "vendor/winit-wayland" }
 
 # Preserve pointer positions while Iced dispatches a queued event batch.
 [patch."https://github.com/pop-os/libcosmic.git"]
+iced_core = { path = "vendor/iced-core" }
 iced_runtime = { path = "vendor/iced-runtime" }
 iced_winit = { path = "vendor/iced-winit" }
 

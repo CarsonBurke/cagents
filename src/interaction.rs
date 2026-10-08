@@ -2081,6 +2081,30 @@ mod tests {
         }
 
         #[test]
+        fn named_button_can_move_across_an_unnamed_spacer() {
+            let row = |swapped: bool| -> Element<'static, Act> {
+                let button: Element<'static, Act> = crate::ui_controls::button::secondary("Move")
+                    .id(Id::new("test.moving.named-button"))
+                    .on_press(Act::Item(7))
+                    .into();
+                let spacer: Element<'static, Act> = cosmic::iced::widget::Space::new()
+                    .width(100)
+                    .height(ROW_HEIGHT)
+                    .into();
+                widget::row::with_children(if swapped {
+                    vec![spacer, button]
+                } else {
+                    vec![button, spacer]
+                })
+                .into()
+            };
+            let mut frames = Frames::new();
+            for swapped in [false, true, false, true] {
+                frames.frame(row(swapped), &[], ANCHOR);
+            }
+        }
+
+        #[test]
         fn unchanged_lazy_named_buttons_keep_pressed_state_across_native_rebuilds() {
             let builds = std::rc::Rc::new(std::cell::Cell::new(0));
             let cached_button = || -> Element<'static, Act> {

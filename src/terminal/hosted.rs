@@ -4,7 +4,7 @@ use std::{
     net::Shutdown,
     os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -1123,8 +1123,9 @@ enum PendingRequest {
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
 /// Ordinary startup is bounded to five seconds; upgrade restoration receives a
-/// bounded per-session allowance. The daemon gets its own process group so closing
-/// the launching CLI, GUI, or terminal does not terminate it.
+/// bounded per-session allowance. On systemd hosts the daemon runs in its own
+/// user scope, keeping UI cgroup shutdown and memory-pressure kills away from
+/// hosted sessions. Other hosts retain the detached process-group fallback.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
@@ -1174,30 +1175,35 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    let mut command = Command::new(&daemon_binary);
-    crate::install_guard::sanitize_child_environment(&mut command);
-    if application == crate::notifications::Application::Ceditor {
-        command.arg(crate::instance::CEDITOR_NOTIFICATION_ARGUMENT);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        // This process may itself have been started with the UI launch
-        // handshake set. Inheriting it would make the daemon, and every child
-        // the tray spawns from it, emit a stray readiness line on stdout.
-        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV);
-    // SAFETY: the hook performs only the close_range syscall before exec.
-    unsafe {
-        command.pre_exec(crate::daemon::seal_inherited_descriptors);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|source| HostedTerminalStartError::LaunchHost {
-            path: daemon_binary,
-            source,
-        })?;
+    start_daemon_at(
+        socket,
+        timeout,
+        &daemon_binary,
+        systemd_user_manager_available(),
+        |scoped| spawn_daemon(&daemon_binary, application, scoped),
+    )
+}
+
+fn start_daemon_at(
+    socket: &Path,
+    timeout: Duration,
+    daemon_binary: &Path,
+    mut scoped: bool,
+    mut launch: impl FnMut(bool) -> io::Result<Child>,
+) -> Result<(), HostedTerminalStartError> {
+    let launch_error = |source| HostedTerminalStartError::LaunchHost {
+        path: daemon_binary.to_owned(),
+        source,
+    };
+    let mut child = match launch(scoped) {
+        Ok(child) => child,
+        Err(source) if scoped => {
+            tracing::warn!(%source, "could not launch daemon user scope; using process-group fallback");
+            scoped = false;
+            launch(false).map_err(launch_error)?
+        }
+        Err(source) => return Err(launch_error(source)),
+    };
     let started = Instant::now();
     let result = loop {
         let status = match child.try_wait() {
@@ -1209,6 +1215,21 @@ fn ensure_daemon_ready_at(
             Ok(false) => thread::sleep(
                 DAEMON_READY_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
             ),
+            // A user manager may disappear or reject transient units after
+            // our availability check. Fall back only after the launcher has
+            // exited and no concurrent daemon owns the lease. Never terminate
+            // an existing daemon or retry while restoration owns its lease.
+            Err(HostedTerminalStartError::HostExited { status, .. })
+                if scoped && started.elapsed() < timeout =>
+            {
+                tracing::warn!(%status, "daemon user scope exited before readiness; using process-group fallback");
+                scoped = false;
+                let _ = child.wait();
+                child = match launch(false) {
+                    Ok(child) => child,
+                    Err(source) => break Err(launch_error(source)),
+                };
+            }
             Err(error) => break Err(error),
         }
     };
@@ -1218,6 +1239,65 @@ fn ensure_daemon_ready_at(
             let _ = child.wait();
         });
     result
+}
+
+fn systemd_user_manager_available() -> bool {
+    // The private manager socket exists independently of a graphical session's
+    // D-Bus environment. No shell or global systemd environment is involved.
+    cfg!(target_os = "linux")
+        && std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .is_some_and(|runtime| runtime.join("systemd/private").exists())
+}
+
+fn daemon_launch_command(
+    daemon_binary: &Path,
+    application: crate::notifications::Application,
+    scoped: bool,
+) -> Command {
+    let mut command = if scoped {
+        let mut command = Command::new("systemd-run");
+        command.args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--expand-environment=no",
+        ]);
+        // Scope names are per launch rather than per installation: detached
+        // provider/terminal holders can outlive their daemon during upgrades.
+        command.arg(format!("--unit=cagentsd-{}", uuid::Uuid::new_v4()));
+        command.arg("--").arg(daemon_binary);
+        command
+    } else {
+        Command::new(daemon_binary)
+    };
+    crate::install_guard::sanitize_child_environment(&mut command);
+    if application == crate::notifications::Application::Ceditor {
+        command.arg(crate::instance::CEDITOR_NOTIFICATION_ARGUMENT);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        // A scope executes locally, preserving this exact sanitized environment
+        // instead of inheriting stale variables from the user service manager.
+        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV);
+    command
+}
+
+fn spawn_daemon(
+    daemon_binary: &Path,
+    application: crate::notifications::Application,
+    scoped: bool,
+) -> io::Result<Child> {
+    let mut command = daemon_launch_command(daemon_binary, application, scoped);
+    // SAFETY: the hook performs only the close_range syscall before exec.
+    unsafe {
+        command.pre_exec(crate::daemon::seal_inherited_descriptors);
+    }
+    command.spawn()
 }
 
 fn daemon_startup_ready(
@@ -2335,6 +2415,130 @@ mod tests {
         // Match the daemon's explicit unlock: a concurrent fork can still own
         // a copy of the descriptor after this thread drops its copy.
         crate::daemon::HostLease::acquire_for_maintenance(&paths).unwrap()
+    }
+
+    #[test]
+    fn unavailable_scope_launcher_falls_back_once() {
+        for spawn_error in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let mut attempts = Vec::new();
+            let mut listener = None;
+            start_daemon_at(
+                &socket,
+                Duration::from_secs(2),
+                Path::new("fixture-daemon"),
+                true,
+                |scoped| {
+                    attempts.push(scoped);
+                    if scoped && spawn_error {
+                        return Err(io::Error::from(io::ErrorKind::NotFound));
+                    }
+                    if !scoped {
+                        listener = Some(UnixListener::bind(&socket).unwrap());
+                    }
+                    Command::new("/bin/false").spawn()
+                },
+            )
+            .unwrap();
+            assert_eq!(attempts, [true, false]);
+        }
+    }
+
+    #[test]
+    fn failed_scope_and_direct_launch_stop_after_one_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let mut attempts = Vec::new();
+        let result = start_daemon_at(
+            &socket,
+            Duration::from_secs(2),
+            Path::new("fixture-daemon"),
+            true,
+            |scoped| {
+                attempts.push(scoped);
+                Command::new("/bin/false").spawn()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(HostedTerminalStartError::HostExited { .. })
+        ));
+        assert_eq!(attempts, [true, false]);
+    }
+
+    #[test]
+    fn scoped_launch_failure_does_not_replace_a_restoring_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let _lease = hold_startup_lease(&socket);
+        let mut attempts = Vec::new();
+        let result = start_daemon_at(
+            &socket,
+            Duration::from_millis(75),
+            Path::new("fixture-daemon"),
+            true,
+            |scoped| {
+                attempts.push(scoped);
+                Command::new("/bin/false").spawn()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(HostedTerminalStartError::HostReadyTimeout { .. })
+        ));
+        assert_eq!(attempts, [true]);
+    }
+
+    #[test]
+    fn existing_daemon_is_preserved_before_launch_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents).unwrap();
+        listener.accept().unwrap();
+    }
+
+    #[test]
+    fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        if !systemd_user_manager_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("scope-evidence");
+        let mut command = daemon_launch_command(
+            Path::new("/bin/sh"),
+            crate::notifications::Application::Cagents,
+            true,
+        );
+        // This argument and environment value must survive systemd without
+        // manager-side variable expansion or replacement by manager state.
+        command
+            .env("CAGENTS_SCOPE_TEST", "caller-value")
+            .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .arg(&output)
+            .arg("$HOME");
+        let status = command.status().unwrap();
+        assert!(status.success(), "scope launch failed: {status}");
+        let evidence = std::fs::read_to_string(output).unwrap();
+        // A detached holder must survive a daemon handoff. Scope launchers
+        // return when the main process exits and leave its children in place.
+        let holder_pid: i32 = evidence.lines().nth(3).unwrap().parse().unwrap();
+        let holder_cgroup = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup"));
+        // SAFETY: this PID belongs to the fixture's own background sleep.
+        unsafe { libc::kill(holder_pid, libc::SIGTERM) };
+        let holder_cgroup = holder_cgroup.unwrap();
+        let caller = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let mut lines = evidence.lines();
+        let scope = lines.next().unwrap();
+        assert_ne!(scope, caller.trim());
+        assert!(
+            scope.contains("cagentsd-") && scope.ends_with(".scope"),
+            "{scope}"
+        );
+        assert_eq!(lines.next(), Some("$HOME"));
+        assert_eq!(lines.next(), Some("caller-value"));
+        assert_eq!(holder_cgroup.trim(), scope);
     }
 
     #[test]
