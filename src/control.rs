@@ -153,15 +153,28 @@ pub enum TopCommand {
         prefix: PathBuf,
         #[arg(long)]
         installer: PathBuf,
+        /// Publish files while preserving running windows and the daemon.
+        #[arg(long)]
+        stage_only: bool,
         #[arg(last = true)]
         arguments: Vec<OsString>,
     },
     /// Validate a launch fence inherited from the update coordinator.
     #[command(hide = true)]
-    VerifyInstallGuard,
+    VerifyInstallGuard {
+        #[arg(long)]
+        stage_only: bool,
+    },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
-    RecordDeferredInstall,
+    RecordDeferredInstall {
+        #[arg(long, requires_all = ["prefix", "version_root"])]
+        stage_only: bool,
+        #[arg(long, requires = "stage_only")]
+        prefix: Option<PathBuf>,
+        #[arg(long, requires = "stage_only")]
+        version_root: Option<PathBuf>,
+    },
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
     RestartWindows {
@@ -1733,7 +1746,7 @@ where
     let wants_json = arguments
         .iter()
         .any(|argument| argument.as_os_str() == OsStr::new("--json"));
-    let cli = match Cli::try_parse_from(arguments) {
+    let cli = match Cli::try_parse_from(arguments.clone()) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -1754,6 +1767,24 @@ where
     if let Err(error) = crate::device::select(cli.device.as_deref()) {
         emit_error(cli.json, &AppError::new("device", error));
         return ExitCode::FAILURE;
+    }
+    if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
+        match crate::install_guard::staged_owner_bin(&std::env::current_exe().unwrap_or_default()) {
+            Ok(Some(bin)) => {
+                use std::os::unix::process::CommandExt;
+                let mut command = Command::new(bin.join("cagents"));
+                command.args(&arguments[1..]);
+                crate::install_guard::sanitize_child_environment(&mut command);
+                let error = command.exec();
+                emit_error(cli.json, &AppError::new("deferred_install", error));
+                return ExitCode::FAILURE;
+            }
+            Ok(None) => (),
+            Err(error) => {
+                emit_error(cli.json, &AppError::new("deferred_install", error));
+                return ExitCode::FAILURE;
+            }
+        }
     }
     if matches!(
         cli.command,
@@ -1787,6 +1818,27 @@ where
     }
 }
 
+fn routes_to_staged_owner(command: &TopCommand) -> bool {
+    !matches!(
+        command,
+        TopCommand::CoordinateInstall { .. }
+            | TopCommand::VerifyInstallGuard { .. }
+            | TopCommand::RecordDeferredInstall { .. }
+            | TopCommand::UpdateWorker { .. }
+            | TopCommand::RestartWindows { .. }
+            | TopCommand::Daemon {
+                command: DaemonCommand::ProtocolVersion | DaemonCommand::StopForRebuild
+            }
+    )
+}
+
+/// Desktop launches need the same matched owner as CLI launches while a staged
+/// update is pending. Internal helpers and remote devices do not use this route.
+pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
+    crate::install_guard::staged_owner_bin(&std::env::current_exe()?)
+        .map(|bin| bin.map(|bin| bin.join("cagents-ui")))
+}
+
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Automation { command } => automations::execute(command),
@@ -1800,26 +1852,46 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::CoordinateInstall {
             prefix,
             installer,
+            stage_only,
             arguments,
         } => {
-            crate::install_guard::run(&prefix, &installer, &arguments)
+            crate::install_guard::run(&prefix, &installer, &arguments, stage_only)
                 .map_err(|error| AppError::new("install", error))?;
             Ok(CommandOutput {
                 command: "update.coordinate_install",
-                data: json!({"reopened": true}),
-                human: "Installer finished; saved windows reopened".into(),
+                data: json!({"reopened": !stage_only, "staged": stage_only}),
+                human: if stage_only {
+                    "Update staged; running windows and daemon preserved"
+                } else {
+                    "Installer finished; saved windows reopened"
+                }
+                .into(),
             })
         }
-        TopCommand::VerifyInstallGuard => {
-            instance::validate_install_guard().map_err(|error| AppError::new("install", error))?;
+        TopCommand::VerifyInstallGuard { stage_only } => {
+            (if stage_only {
+                instance::validate_stage_guard()
+            } else {
+                instance::validate_install_guard()
+            })
+            .map_err(|error| AppError::new("install", error))?;
             Ok(CommandOutput {
                 command: "update.verify_install_guard",
                 data: json!({"valid": true}),
                 human: "Installer owns the application update fence".into(),
             })
         }
-        TopCommand::RecordDeferredInstall => {
-            crate::install_guard::record_deferred()
+        TopCommand::RecordDeferredInstall {
+            stage_only,
+            prefix,
+            version_root,
+        } => {
+            let stage = if stage_only {
+                Some((prefix.as_deref().unwrap(), version_root.as_deref().unwrap()))
+            } else {
+                None
+            };
+            crate::install_guard::record_deferred(stage)
                 .map_err(|error| AppError::new("install", error))?;
             Ok(CommandOutput {
                 command: "update.record_deferred_install",

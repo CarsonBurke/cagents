@@ -421,6 +421,21 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
     .into()
 }
 
+/// Keeps every key from the layers beneath a transient surface that the
+/// application's keyboard subscription drives, so a key that steers or
+/// dismisses it is not also typed into the pane it covers.
+pub fn keyboard_modal<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyboardModal,
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
 /// Blocks click-through without hiding the child's accessibility tree.
 pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Effect {
@@ -1132,6 +1147,7 @@ enum Kind {
         leading: bool,
     },
     Opaque,
+    KeyboardModal,
 }
 
 struct Effect<'a, Message> {
@@ -1178,6 +1194,7 @@ struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
+struct KeyboardModalTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
 
@@ -1233,6 +1250,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
+            Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
             Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
         }
@@ -1404,6 +1422,21 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 shell.request_redraw();
                 return;
             }
+        }
+        // Modifier state is not a key press: widgets beneath keep their own
+        // copy of it for the clicks and drags that follow, and would be left
+        // believing a modifier is still held.
+        if matches!(self.kind, Kind::KeyboardModal)
+            && matches!(
+                event,
+                Event::Keyboard(
+                    cosmic::iced::keyboard::Event::KeyPressed { .. }
+                        | cosmic::iced::keyboard::Event::KeyReleased { .. }
+                )
+            )
+        {
+            shell.capture_event();
+            return;
         }
         if let Kind::TabHistory(true) = self.kind
             && let Event::Keyboard(

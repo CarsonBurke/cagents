@@ -22,7 +22,7 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
-const COMPOSER_PADDING: f32 = space::S;
+const COMPOSER_PADDING: f32 = space::M;
 
 /// The widest a user's message is drawn.
 ///
@@ -68,8 +68,7 @@ const PLAN_CEILING: f32 = 120.0;
 /// Waiting prompts stay within reach without taking over the conversation.
 const QUEUE_CEILING: f32 = 180.0;
 
-/// The line a waiting message's preview is set on, which its marker and
-/// controls center on.
+/// The line a waiting message's preview is set on.
 const QUEUE_LINE_HEIGHT: f32 = 18.0;
 
 /// The padding a status-line control is drawn with.
@@ -85,7 +84,7 @@ const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
 ///
 /// The list sits between the transcript and the composer, so it is bounded:
 /// an agent with forty skills must not push the conversation off screen. A
-/// whole number of rows, so the last visible one is never cut in half.
+/// whole number of rows before adding the inset that scrolls with them.
 const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
 
 /// The completion list's inset from its own edge.
@@ -153,10 +152,10 @@ fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, St
     let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
-        (PromptMode::Steer, 0) => (Icon::Jump, "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (Icon::Jump, "Steer the active turn", "Ctrl+Shift+Enter"),
-        (PromptMode::Queue, 0) => (Icon::Plus, "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (Icon::Plus, "Queue for the next turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Steer, 0) => (Icon::Send, "Steer the active turn", primary),
+        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
+        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
     };
     (name, format!("{verb} — {chord}"))
 }
@@ -221,24 +220,21 @@ enum QueueTiming {
 
 /// One waiting message: when it goes, what it says, and what can be done
 /// with it.
-///
-/// The marker is the glyph of the submit control that queued the message, so
-/// the row reads as the result of the button that was pressed.
 fn queue_row<'a>(
     timing: QueueTiming,
     text: &'a str,
     attachments: &'a [Attachment],
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let marker = |name, label: &'static str| {
-        crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(name, design::COMPACT_ICON_SIZE),
-            label,
-        )
-    };
-    let marker: Element<'a, Message> = match timing {
-        QueueTiming::NextStep => marker(Icon::Jump, "Delivered at the agent's next step"),
-        QueueTiming::NextTurn => marker(Icon::Plus, "Sent when this turn ends"),
+    let marker = match timing {
+        QueueTiming::NextStep => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Send, design::COMPACT_ICON_SIZE),
+            "Delivered at the agent's next step",
+        ),
+        QueueTiming::NextTurn => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
+            "Sent when this turn ends",
+        ),
         QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
@@ -264,46 +260,42 @@ fn queue_row<'a>(
         let text = text.trim();
         text[..text.floor_char_boundary(QUEUE_PREVIEW_BYTES)].into()
     };
-    let mut row: Vec<Element<'a, Message>> = vec![
-        widget::container(marker)
-            .height(QUEUE_LINE_HEIGHT)
-            .align_y(Alignment::Center)
-            .into(),
-        widget::container(
-            design::body(preview)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .width(Length::Fill)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
-                )),
-        )
-        .width(Length::Fill)
-        .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
-        .clip(true)
-        .into(),
-    ];
+    let mut details: Vec<Element<'a, Message>> = Vec::new();
     if !attachments.is_empty() && !text.trim().is_empty() {
-        row.push(crate::interaction::tooltip(
+        details.push(crate::interaction::tooltip(
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Attachment, design::COMPACT_ICON_SIZE),
                 design::caption(attachments.len().to_string()).into(),
             ])
             .spacing(step::GAP_XS)
-            .height(QUEUE_LINE_HEIGHT)
             .align_y(Alignment::Center),
             names(),
         ));
     }
+    let preview = widget::container(
+        design::heading(preview)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .width(Length::Fill)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
+            )),
+    )
+    .width(Length::Fill)
+    .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
+    .clip(true);
+    let mut row = vec![marker, preview.into()];
+    if !details.is_empty() {
+        row.push(widget::row::with_children(details).spacing(space::S).into());
+    }
     row.push(
         widget::row::with_children(controls)
-            .height(QUEUE_LINE_HEIGHT)
             .align_y(Alignment::Center)
             .into(),
     );
     widget::row::with_children(row)
         .spacing(step::GAP_S)
-        .padding([0.0, step::GAP_XS])
-        .align_y(Alignment::Start)
+        .padding([space::XS, space::XS])
+        .align_y(Alignment::Center)
         .into()
 }
 
@@ -557,10 +549,11 @@ fn completion_row<'a>(
 ///
 /// Rows are a fixed height so the keyboard highlight can be scrolled into view
 /// by arithmetic rather than by measuring the laid-out list.
-pub(super) fn completion_extent(count: usize) -> (f32, f32) {
+pub(super) fn completion_extent(count: usize) -> (f32, f32, f32) {
     (
         COMPLETION_ROW,
-        (count as f32 * COMPLETION_ROW).min(COMPLETION_CEILING),
+        (count as f32 * COMPLETION_ROW).min(COMPLETION_CEILING) + 2.0 * COMPLETION_INSET,
+        COMPLETION_INSET,
     )
 }
 
@@ -879,12 +872,44 @@ impl Cagents {
 
 /// Prefer concrete activity from the newest assistant item when available.
 fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
-    match snapshot.items.last().map(|item| &item.content) {
+    if snapshot.has_later {
+        return "Working";
+    }
+    match snapshot
+        .items
+        .last()
+        .filter(|item| item.role == chat::Role::Assistant)
+        .map(|item| &item.content)
+    {
         Some(ItemContent::Text { thinking: true, .. }) => "Thinking",
         Some(ItemContent::Text { .. }) => "Responding",
-        Some(ItemContent::Command { .. }) => "Running command",
+        Some(ItemContent::Command {
+            status: chat::ToolStatus::Running,
+            ..
+        }) => "Running command",
         _ => "Working",
     }
+}
+
+/// Thinking stops at a later answer or prompt, not at another reasoning chunk.
+fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
+    !busy
+        || items
+            .iter()
+            .skip_while(|item| item.id != id)
+            .skip(1)
+            .any(|item| {
+                item.role == chat::Role::User
+                    || (item.role == chat::Role::Assistant
+                        && matches!(
+                            item.content,
+                            ItemContent::Text {
+                                thinking: false,
+                                phase: chat::Phase::Final,
+                                ..
+                            }
+                        ))
+            })
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -998,22 +1023,26 @@ impl Runtime {
                     continue;
                 };
                 anchors.push((transcript.len(), item.id.as_str()));
-                transcript.push(match &item.content {
-                    ItemContent::Text { thinking, .. } => self.prose_view(
-                        item,
-                        cached,
-                        if *thinking {
-                            turn::Slot::Thinking
-                        } else if item.role == chat::Role::System {
-                            turn::Slot::Commentary
+                transcript.push(
+                    if item.role == chat::Role::User && !item.content.is_step() {
+                        if matches!(item.content, ItemContent::Delivery { .. }) {
+                            self.delivery_view(item, cached, markdown_settings)
                         } else {
-                            turn::Slot::Prose
-                        },
-                        markdown_settings,
-                    ),
-                    ItemContent::Image { .. } => self.image_preview(item, cached),
-                    _ => self.step_view(item, cached, markdown_settings),
-                });
+                            self.prompt_view(item)
+                        }
+                    } else {
+                        match &item.content {
+                            ItemContent::Text { .. } => self.prose_view(
+                                item,
+                                cached,
+                                turn::slot_of(item),
+                                markdown_settings,
+                            ),
+                            ItemContent::Image { .. } => self.image_preview(item, cached),
+                            _ => self.step_view(item, cached, markdown_settings),
+                        }
+                    },
+                );
             }
         } else {
             if snapshot.has_earlier {
@@ -1184,8 +1213,9 @@ impl Runtime {
         }
         let transcript = widget::column::with_children(transcript)
             .spacing(step::GAP_L)
-            .padding(design::with_vertical_rail(iced::Padding::ZERO))
+            .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
             .width(Length::Fill);
+        let transcript_index = content.len();
         content.push(selection::transcript(
             scroll::transcript(
                 transcript,
@@ -1395,7 +1425,6 @@ impl Runtime {
                 );
             }
         }
-        content.extend(self.queue_view());
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
         if let Some(provided) = &snapshot.composer
@@ -1424,7 +1453,7 @@ impl Runtime {
                     .completion
                     .enter_chooses(&token, row, &self.snapshot.skills),
             });
-            let (_, viewport) = completion_extent(rows.len());
+            let (_, viewport, _) = completion_extent(rows.len());
             let rows = rows
                 .into_iter()
                 .enumerate()
@@ -1436,10 +1465,9 @@ impl Runtime {
                 .collect::<Vec<_>>();
             content.push(
                 widget::container(
-                    widget::scrollable(
-                        widget::column::with_children(rows)
-                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                    )
+                    widget::scrollable(widget::column::with_children(rows).padding(
+                        design::with_vertical_rail(iced::Padding::new(COMPLETION_INSET)),
+                    ))
                     .id(card_control_id(target.card, COMPLETION_LIST))
                     .on_scroll(move |viewport| {
                         action(Action::CompletionScrolled(
@@ -1452,7 +1480,6 @@ impl Runtime {
                     ))
                     .height(Length::Fixed(viewport)),
                 )
-                .padding(COMPLETION_INSET)
                 .class(design::surface(
                     Some(design::raised),
                     [design::RADIUS_M; 4],
@@ -1722,11 +1749,14 @@ impl Runtime {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
             let next = if mode == "wait" { "immediate" } else { "wait" };
             actions.push(
-                crate::ui_controls::button::quiet(if mode == "wait" {
-                    "Steering: after turn"
-                } else {
-                    "Steering: after tools"
-                })
+                crate::ui_controls::icon_button(
+                    Icon::Jump,
+                    if mode == "wait" {
+                        "Steering: after turn"
+                    } else {
+                        "Steering: after tools"
+                    },
+                )
                 .on_press_maybe(available.then(|| {
                     action(Action::Command(
                         target,
@@ -1761,26 +1791,59 @@ impl Runtime {
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
-        actions.push(iced::widget::Space::new().width(Length::Fill).into());
-        // Only the modes that can act right now are drawn. A permanently
-        // present send control that is merely disabled is a control a reader
-        // cannot use and cannot interpret: the queue button in particular was
-        // a bare plus that never responded and never said what it was for.
-        // Buttons still appear only when there is a message to send.
-        if available && has_draft && key_submit.0.is_some() {
-            for (slot, mode) in modes.iter().enumerate() {
-                let (name, label) = submit_control(*mode, slot, enter_sends);
-                actions.push(icon(name, label, true, Action::Submit(target, *mode)));
-            }
-        }
+        let mut submissions = Vec::new();
         if snapshot.busy {
-            actions.push(icon(
+            submissions.push(icon(
                 Icon::Stop,
                 "Cancel active turn (Esc)",
                 available,
                 Action::Command(target, Command::Interrupt),
             ));
         }
+        // The primary action anchors the trailing edge. Tooltips and
+        // accessible names carry the delivery mode and keyboard chord.
+        for (slot, mode) in modes.iter().enumerate().rev() {
+            let (name, tooltip) = submit_control(*mode, slot, enter_sends);
+            submissions.push(
+                crate::ui_controls::icon_button(name, tooltip)
+                    .selected(slot == 0)
+                    .tone(crate::design::Tone::Themed(if slot == 0 {
+                        design::accent_color
+                    } else {
+                        design::muted_icon_color
+                    }))
+                    .on_press_maybe(
+                        (available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                    )
+                    .into(),
+            );
+        }
+        // Very narrow panes keep every icon's hit target intact.
+        let toolbar: Element<'_, Message> = if content_width < 360.0 {
+            widget::column::with_children(vec![
+                widget::flex_row(actions)
+                    .spacing(step::GAP_XS as u16)
+                    .align_items(Alignment::Center)
+                    .into(),
+                widget::container(
+                    widget::row::with_children(submissions)
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(Alignment::End)
+                .into(),
+            ])
+            .spacing(space::XS)
+            .into()
+        } else {
+            actions.push(iced::widget::Space::new().width(Length::Fill).into());
+            actions.extend(submissions);
+            widget::row::with_children(actions)
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into()
+        };
         // The editor and its controls are one object: a single raised surface
         // with the controls tucked inside its lower edge, so the composer
         // reads as one place to type rather than a field with a toolbar
@@ -1788,18 +1851,20 @@ impl Runtime {
         content.push(
             widget::container(
                 widget::column::with_children(vec![
-                    widget::column::with_children(attachment_chips)
-                        .spacing(step::GAP_XS)
-                        .padding([0, step::GAP_M as u16])
-                        .into(),
-                    editor,
-                    widget::container(
-                        widget::row::with_children(actions)
-                            .spacing(step::GAP_XS)
-                            .align_y(Alignment::Center),
-                    )
-                    .padding(iced::Padding::from([0.0, step::GAP_XS]).bottom(step::GAP_XS))
+                    widget::column::with_children(self.queue_view().into_iter().chain(
+                        (!attachment_chips.is_empty()).then(|| {
+                            widget::column::with_children(attachment_chips)
+                                .spacing(step::GAP_XS)
+                                .padding([0, step::GAP_M as u16])
+                                .into()
+                        }),
+                    ))
+                    .spacing(step::GAP_XS)
                     .into(),
+                    editor,
+                    widget::container(toolbar)
+                        .padding(iced::Padding::from([0.0, space::S]).bottom(space::S))
+                        .into(),
                 ])
                 .width(Length::Fill),
             )
@@ -1844,10 +1909,12 @@ impl Runtime {
             (Some(Icon::Warning), "Error")
         } else if snapshot.waiting || !snapshot.requests.is_empty() {
             (Some(Icon::AgentWaiting), "Waiting for you")
-        } else if snapshot.busy {
+        } else if snapshot.is_working() {
             (
                 Some(Icon::AgentWorking),
-                if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
+                if !snapshot.busy {
+                    "Subagents working"
+                } else if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
                     activity_label(snapshot)
                 } else {
                     snapshot.detail.as_str()
@@ -1988,15 +2055,29 @@ impl Runtime {
             action(Action::PermissionPicker(target, false)),
         );
         let pane = widget::container(super::layout::pane(
-            widget::column::with_children(content)
-                .spacing(step::GAP_S)
-                .height(Length::Fill)
-                .width(Length::Fill)
+            widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
+                if index == transcript_index {
+                    child
+                } else {
+                    widget::container(child)
+                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
+                            step::GAP_M
+                        } else {
+                            0.0
+                        }))
+                        .width(Length::Fill)
+                        .into()
+                }
+            }))
+            .spacing(step::GAP_S)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into(),
+            widget::container(footer)
+                .padding(iced::Padding::from([0.0, step::GAP_M]).bottom(step::GAP_M))
                 .into(),
-            footer,
-            (content_width - 2.0 * step::GAP_M).max(1.0),
+            content_width.max(1.0),
         ))
-        .padding(step::GAP_M)
         .width(Length::Fill)
         .height(Length::Fill);
         let pane = widget::container(pane)
@@ -2703,14 +2784,14 @@ impl Runtime {
                 // so its absence is not left to be wondered at.
                 controls.push(if queued.editable {
                     control(
-                        Icon::Changes,
+                        Icon::Edit,
                         "Take back to edit",
                         available,
                         Action::TakeBackQueued(target, Some(entry.clone())),
                     )
                 } else {
                     control(
-                        Icon::Changes,
+                        Icon::Edit,
                         "Too large or too rich to edit here; it can still be removed",
                         false,
                         Action::TakeBackQueued(target, Some(entry.clone())),
@@ -2763,7 +2844,7 @@ impl Runtime {
                     .into_iter()
                     .chain([
                         control(
-                            Icon::Changes,
+                            Icon::Edit,
                             "Take back to edit",
                             !sending,
                             Action::TakeBackQueued(target, Some(entry.clone())),
@@ -2799,14 +2880,14 @@ impl Runtime {
                 .composer
                 .lines()
                 .all(|line| line.text.trim().is_empty());
-            header.push(
-                design::caption(if empty {
-                    "↑ to edit"
+            header.push(crate::interaction::tooltip(
+                crate::ui_controls::passive_icon(Icon::Keyboard, design::COMPACT_ICON_SIZE),
+                if empty {
+                    "↑ to edit the latest queued message"
                 } else {
-                    "Alt+↑ to edit"
-                })
-                .into(),
-            );
+                    "Alt+↑ to edit the latest queued message"
+                },
+            ));
         }
         Some(
             widget::container(
@@ -2836,8 +2917,8 @@ impl Runtime {
             .padding(step::GAP_S)
             .class(design::surface(
                 Some(design::sunken),
-                [design::RADIUS_M; 4],
-                true,
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
             ))
             .into(),
         )
@@ -3228,26 +3309,23 @@ impl Runtime {
             .into();
         }
         if slot == turn::Slot::Thinking {
-            let finished = !self.snapshot.busy
-                || self
-                    .snapshot
-                    .items
-                    .iter()
-                    .skip_while(|candidate| candidate.id != item.id)
-                    .skip(1)
-                    .any(|candidate| {
-                        matches!(
-                            &candidate.content,
-                            ItemContent::Text {
-                                phase: chat::Phase::Final,
-                                ..
-                            }
+            let (items, busy) = self
+                .selected_subagent
+                .as_ref()
+                .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
+                .map_or(
+                    (self.snapshot.items.as_slice(), self.snapshot.busy),
+                    |agent| {
+                        (
+                            agent.items.as_slice(),
+                            agent.status == chat::ToolStatus::Running,
                         )
-                    });
+                    },
+                );
+            let finished = reasoning_finished(items, busy, &item.id);
             let expanded = !finished || self.expanded.contains(&item.id);
             let elapsed = item.started_at.or(item.at).and_then(|start| {
-                self.snapshot
-                    .items
+                items
                     .iter()
                     .skip_while(|candidate| candidate.id != item.id)
                     .skip(1)
@@ -3367,23 +3445,24 @@ fn paging_view(
     loading: bool,
     blocked: bool,
 ) -> Element<'static, Message> {
-    let mut row: Vec<Element<'_, Message>> = Vec::new();
-    if loading {
-        row.push(crate::ui_controls::activity_spinner(
-            f32::from(design::COMPACT_ICON_SIZE),
-            design::muted_color,
-        ));
-    }
-    row.push(
-        design::caption(match (page, loading) {
-            (Page::Earlier, true) => "Loading earlier history…",
-            (Page::Earlier, false) => "Load earlier history",
-            (Page::Newer, true) => "Loading the newest messages…",
-            (Page::Newer, false) => "Jump to latest messages",
+    let row = vec![
+        widget::container(if loading {
+            crate::ui_controls::activity_spinner(
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::muted_color,
+            )
+        } else {
+            widget::Space::new().into()
+        })
+        .center(Length::Fixed(f32::from(design::COMPACT_ICON_SIZE)))
+        .into(),
+        design::caption(match page {
+            Page::Earlier => "Load earlier history",
+            Page::Newer => "Jump to latest messages",
         })
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .into(),
-    );
+    ];
     widget::container(
         widget::button::custom(
             widget::row::with_children(row)
@@ -3946,6 +4025,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transcript_viewport_reaches_pane_edges_with_inset_inside_content() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Probe {
+            id: widget::Id,
+            viewport: Option<iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.viewport = Some(bounds);
+                }
+            }
+        }
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            false,
+            true,
+            &shortcuts,
+            600.0,
+            Place {
+                name: "Fixture".into(),
+                branch: None,
+            },
+            true,
+            None,
+            vec![],
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 700.0)),
+        );
+        let mut probe = Probe {
+            id: card_control_id(runtime.target.card, "chat-transcript"),
+            viewport: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let bounds = probe.viewport.expect("transcript viewport");
+        assert_eq!(bounds.x, 0.0);
+        assert_eq!(bounds.y, 0.0);
+        assert_eq!(bounds.width, 600.0);
+    }
+
+    #[test]
     fn prompt_notice_and_raw_output_share_transcript_selection() {
         use iced::advanced::{
             layout,
@@ -4117,23 +4259,94 @@ mod tests {
         });
         assert!(runtime.queue_view().is_some());
         runtime.selected_subagent = Some("child".into());
-        Arc::make_mut(&mut runtime.snapshot).queued_messages = (0..chat::QueuedMessage::LIMIT)
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.capabilities.queue_remove = true;
+        snapshot.capabilities.queue_start = true;
+        snapshot.queued_messages = (0..chat::QueuedMessage::LIMIT)
             .map(|id| chat::QueuedMessage::new(id.to_string(), "Long queued prompt\n".repeat(100)))
             .collect();
         let renderer = crate::app::tests::headless_renderer();
-        let mut element = runtime.queue_view().unwrap();
-        let mut tree = iced::advanced::widget::Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 1000.0)),
-        );
-        assert_eq!(node.size().width, 400.0);
-        assert!(
-            node.size().height < 240.0,
-            "queue must leave room for transcript and composer: {:?}",
-            node.size()
-        );
+        for width in [320.0, 400.0, 960.0] {
+            let mut element = runtime.queue_view().unwrap();
+            let mut tree = iced::advanced::widget::Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(
+                    iced::Size::ZERO,
+                    iced::Size::new(width, 1000.0),
+                ),
+            );
+            assert_eq!(node.size().width, width);
+            assert!(
+                node.size().height < 240.0,
+                "queue must leave room for transcript and composer: {:?}",
+                node.size()
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_uses_its_own_transcript_and_does_not_finish_on_another_thought() {
+        let thought = |id: &str| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: "Thinking".into(),
+                    thinking: true,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let mut items = vec![thought("one"), thought("two")];
+        assert!(!reasoning_finished(&items, true, "one"));
+        assert!(reasoning_finished(&items, false, "one"));
+        let mut answer = (*thought("answer")).clone();
+        answer.content = ItemContent::Text {
+            text: "Answer".into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        };
+        items.push(Arc::new(answer));
+        assert!(reasoning_finished(&items, true, "one"));
+    }
+
+    #[test]
+    fn activity_does_not_describe_prompts_completed_commands_or_older_pages_as_live_work() {
+        let mut snapshot = Snapshot {
+            busy: true,
+            ..Snapshot::default()
+        };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "user".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "Prompt".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        }));
+        assert_eq!(activity_label(&snapshot), "Working");
+        Arc::make_mut(&mut snapshot.items[0]).role = chat::Role::Assistant;
+        assert_eq!(activity_label(&snapshot), "Responding");
+        Arc::make_mut(&mut snapshot.items[0]).content = ItemContent::Command {
+            label: "Echo".into(),
+            command: "echo hi".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            output: "hi".into(),
+            exit_code: Some(0),
+            duration_ms: None,
+        };
+        assert_eq!(activity_label(&snapshot), "Working");
+        snapshot.has_later = true;
+        assert_eq!(activity_label(&snapshot), "Working");
     }
 
     #[test]

@@ -2419,12 +2419,9 @@ impl State {
         }
         if self.list_cursor.is_some() {
             column = column.push(
-                crate::ui_controls::button::secondary(if self.list_loading {
-                    "Loading…"
-                } else {
-                    "Load more pull requests"
-                })
-                .on_press_maybe((!modal_open && !self.list_loading).then_some(Action::LoadMore)),
+                crate::ui_controls::button::secondary("Load more pull requests").on_press_maybe(
+                    (!modal_open && !self.list_loading).then_some(Action::LoadMore),
+                ),
             );
         }
         column.height(Length::Fill).width(Length::Fill).into()

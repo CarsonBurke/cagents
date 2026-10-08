@@ -68,7 +68,7 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
     for (index, fault) in ["carry", "save", "none"].iter().enumerate() {
         let mut state = HostState::new(proof.clone());
         state.enable_holder_recovery();
-        let host = Arc::new(Mutex::new(state));
+        let host = Arc::new(crate::host::state::HostLock::new(state));
         let launches = root.join(format!("launches-{index}"));
         let recipe = crate::model::LaunchRecipe {
             program: "/bin/sh".into(),
@@ -187,7 +187,7 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
             crate::host::model::Registry::at(&root.join(format!("registry-{index}.sqlite3")))
                 .unwrap(),
         );
-        let successor = Arc::new(Mutex::new(state));
+        let successor = Arc::new(crate::host::state::HostLock::new(state));
         restore_upgrade(&successor).unwrap();
         restore_orphaned_holders(&successor).unwrap();
         let adopted = successor.lock().unwrap().terminals[&source.id]
@@ -211,7 +211,9 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
         // Exercise the same durable startup path, with no process surviving to
         // incidentally protect us through the legacy process census.
         store.save(&prepared).unwrap();
-        let missing = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let missing = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
         let refusal = restore_upgrade(&missing).unwrap_err();
         assert!(
             refusal.contains("no recipe restart was authorized"),

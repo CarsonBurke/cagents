@@ -2504,8 +2504,16 @@ mod tests {
             String::from_utf8_lossy(&output).contains("while-away"),
             "{output:?}"
         );
-        // The holder no longer listens once adopted.
-        assert!(!socket.exists());
+        // The holder no longer listens once adopted. It removes its endpoint
+        // after answering, so its successor may look first.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while socket.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the adopted holder kept its endpoint"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
 
         let mut writer = File::from(held.master.duplicate().unwrap());
         std::io::Write::write_all(&mut writer, b"hello\n").unwrap();

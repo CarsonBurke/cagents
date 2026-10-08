@@ -102,6 +102,14 @@ commands. Unknown ownership refuses the switch. If publishing launchers fails, t
 restores the previous version without stopping compatible sessions. Existing
 version directories are retained.
 
+Explicit `install.sh --stage-only` also preserves unsaved windows and never
+prepares, closes or reopens them. Before publishing the candidate, it records the
+validated running owner. While that owner's protocol is incompatible, ordinary
+CLI commands and desktop launches use its matching executables. Compatible
+candidates can attach to the preserved daemon, so reviewed reopening adopts the
+new UI without replacing a compatible daemon. The application handoff remains a
+separate reviewed operation, including its save checks.
+
 The application shows available updates above the workspace. Dismissing the
 notice moves it into the notices popover; it remains available there. Release
 downloads are checksum verified before the candidate's own CLI reports its
@@ -229,6 +237,17 @@ surviving holder, the application recovers each terminal card from its saved
 record instead. The daemon keeps that record current for every terminal,
 including ones not on screen, by observing the foreground agent periodically.
 
+The daemon also stops itself rather than stay wedged. Everything it hosts
+serializes on one internal lock; if a single hold keeps another thread waiting
+for two minutes, the daemon logs the stall to `cagentsd.log` and aborts, leaving
+a core dump (`coredumpctl info cagentsd`) that names the thread holding it. The
+application then starts a replacement, which recovers as described here. Native
+conversations survive this only with [durable continuity](#native-provider-continuity);
+the others lose their running turn and resume from disk. A
+thread that tries to take that lock twice panics on its own instead, which is
+recorded in `cagentsd-crash.log` and ends that thread's work rather than the
+daemon's.
+
 | Saved record | Recovery |
 |--------------|----------|
 | An exact agent conversation | Resumes that conversation |
@@ -288,8 +307,10 @@ they do not need to be opened for every release.
 
 ## Native provider continuity
 
-A newly owned native Codex server uses a small dedicated holder that remains
-alive when its daemon connection disappears. The holder owns only the provider
+A newly owned native Codex server runs under a small dedicated holder. Once
+durable continuity is confirmed for it, as described below, the holder remains
+alive when its daemon connection disappears; a holder without that confirmation
+ends its server with the connection. The holder owns only the provider
 process tree and bounded private control metadata; it does not run the UI,
 terminal emulator, transcript store, or a second protocol actor. It never sends
 a prompt or answers an approval. Explicit close terminates and reaps the entire
@@ -304,13 +325,38 @@ Across a kernel boot change, the old process tree is necessarily gone, so an
 exact saved conversation can resume without the ephemeral runtime receipt.
 
 Durable continuity is enabled only after the actual server confirms its exact
-thread, account directory, process identity, and a tested version. The current
-allowlist is Codex **0.157.1**. Other versions and providers retain their existing
-reconnect/resume behavior and do not acquire this durability claim. To extend
-the allowlist in `chat/native_holder.rs`, test a long-running command, a yielded
-command poll, and a pending approval across connection loss, then repeat those
-cases through a killed cagents daemon. Confirm the same server and thread and
-that no prompt or approval was automatically resent.
+thread, account directory, process identity, and a tested version. The
+allowlist is `VERIFIED_CODEX_VERSIONS` in `chat/native_holder.rs`, currently
+Codex **0.157.1**, **0.160.1** and **0.161.0**. It names exact versions, so every Codex
+update leaves it behind until that version is qualified.
+
+A Codex conversation on any other version does not acquire this claim, and its
+server does not outlive the daemon. When the daemon crashes, is killed, or
+aborts itself, the holder ends the server's process tree: the turn in progress,
+its running commands and its pending approvals are lost, and the conversation
+returns by resuming from disk. The daemon logs a warning to `cagentsd.log`
+naming the thread and the reported version when a conversation starts without
+durable continuity for this reason, once per conversation. Other providers
+retain their existing reconnect/resume behavior.
+
+To qualify a version, add it to the allowlist locally and run the
+qualification against the native Codex executable:
+
+```sh
+CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
+    --no-default-features --features host \
+    --test codex_continuity_qualification -- --ignored --test-threads=1
+```
+
+It hosts that executable in an isolated daemon, with a local stand-in for the
+Responses API, and kills the daemon with `SIGKILL` during a long-running
+command, during a poll of a yielded command, and while an approval is pending.
+Each case passes only if the replacement daemon reattaches the same server
+process and thread, the turn finishes there, the model endpoint received each
+prompt once and no request it did not need, and the approval stayed unanswered
+until a client answered it. Keep the entry only if all three pass. A killed
+daemon is how a server meets connection loss in practice, so there is no
+separate connection-loss case.
 
 A replacement daemon must hold the installation's exclusive lease and match
 the private holder's boot, process identities, and exact issued descriptor

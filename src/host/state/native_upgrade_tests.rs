@@ -33,7 +33,9 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
     let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
     let cleanup_proof = Arc::new(Mutex::new(proof.clone()));
     for fail_final_save in [false, true] {
-        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
         let source = provider_session(&root, &program, &proof);
         let id = source.id;
         super::super::chat::start_execution(
@@ -56,7 +58,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 if let Some(handle) = &self.handle
                     && handle.close().is_err()
                 {
-                    let host = Arc::new(Mutex::new(HostState::new(
+                    let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
                         self.proof.lock().unwrap().clone(),
                     )));
                     let _ = super::super::chat::close_retained_native(&host, &self.source);
@@ -157,7 +159,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             state.install_model(
                 crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
             );
-            let successor = Arc::new(Mutex::new(state));
+            let successor = Arc::new(crate::host::state::HostLock::new(state));
             // Startup discovery failed before the UI asked for an upgrade
             // mapping. Preserve the precise refusal for every issued alias.
             super::super::chat::restore_orphaned_native(&successor, &[]).unwrap();
@@ -316,7 +318,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             state.install_model(
                 crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
             );
-            let successor = Arc::new(Mutex::new(state));
+            let successor = Arc::new(crate::host::state::HostLock::new(state));
             let close = crate::terminal::ipc::ClientRequest::ChatCloseRetained {
                 session: paired_source,
             };
@@ -352,7 +354,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             state.install_model(
                 crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
             );
-            let restarted = Arc::new(Mutex::new(state));
+            let restarted = Arc::new(crate::host::state::HostLock::new(state));
             assert!(matches!(
                 super::super::client::process_request(
                     &restarted,
@@ -409,7 +411,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     returning_terminal: false,
                 },
             );
-            let successor = Arc::new(Mutex::new(state));
+            let successor = Arc::new(crate::host::state::HostLock::new(state));
             let execution = super::super::agent_execution::registry(&successor).unwrap();
             execution
                 .lock()
@@ -505,7 +507,9 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
     };
     let proof = daemon("original");
     let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
-    let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+    let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+        proof.clone(),
+    )));
 
     // These exact processes were created only by this isolated fixture.
     #[derive(Default)]
@@ -631,7 +635,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         state.install_model(
             crate::host::model::Registry::at(&root.join(format!("{incarnation}.sqlite3"))).unwrap(),
         );
-        Arc::new(Mutex::new(state))
+        Arc::new(crate::host::state::HostLock::new(state))
     };
     let alive = |pid: i32| {
         fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -967,9 +971,14 @@ fn provider_session(
     source
 }
 
+/// Waits until the provider owns a durable thread and has finished starting
+/// it. Continuity is confirmed by the frame that names the thread, while the
+/// actor may still be writing what that frame asked for.
 fn wait_durable(handle: &crate::chat::runtime::Handle) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !matches!(handle.native_continuity(), NativeContinuity::Durable { .. }) {
+    while !matches!(handle.native_continuity(), NativeContinuity::Durable { .. })
+        || handle.check_update_readiness() != Ok(crate::chat::runtime::UpdateReadiness::Idle)
+    {
         assert!(
             Instant::now() < deadline,
             "provider did not become durable: failure={:?}, snapshot={:?}",

@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use thiserror::Error;
 
@@ -170,6 +170,15 @@ struct OutputObservation {
 
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
+    /// The last grid a hibernated view showed.
+    ///
+    /// Hibernating gives the grid up as a delta base: the daemon releases the
+    /// view's visuals, so `snapshot` becomes a detached marker and the next
+    /// frame is asked for whole. The picture itself is kept here, so a pane
+    /// that comes back shows what it last showed until that frame lands
+    /// rather than an empty rectangle. It is one grid per hibernated terminal,
+    /// and is dropped as soon as a live one replaces it.
+    retained: ArcSwapOption<RenderSnapshot>,
     generation: AtomicU64,
     event_sequence: AtomicU64,
     activity: Mutex<Option<crate::model::TerminalOutputActivity>>,
@@ -208,6 +217,7 @@ impl HostedPublishedState {
         let (acknowledgement_tx, acknowledgement_rx) = crossbeam_channel::bounded(1);
         Self {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
+            retained: ArcSwapOption::empty(),
             generation: AtomicU64::new(0),
             event_sequence: AtomicU64::new(0),
             activity: Mutex::new(None),
@@ -240,7 +250,11 @@ impl HostedPublishedState {
             return;
         }
         let activity = snapshot.activity;
+        let live = !snapshot.detached;
         self.snapshot.store(Arc::new(snapshot));
+        if live {
+            self.retained.store(None);
+        }
         self.generation.store(generation, Ordering::Release);
         self.observe_activity(activity);
         if generation == current_generation {
@@ -356,6 +370,9 @@ impl HostedPublishedState {
         let generation = self.generation.load(Ordering::Acquire);
         self.snapshot
             .store(Arc::new(RenderSnapshot::detached(generation)));
+        // The terminal could not be attached, so there is no next frame for
+        // an old picture to stand in for.
+        self.retained.store(None);
         // The marker replaces the grid under the generation it already had,
         // so only a repaint announcement can carry it to the UI.
         self.announce_repaint(generation);
@@ -438,8 +455,33 @@ impl HostedPublishedState {
     fn hibernate(&self) {
         self.set_visibility(TerminalVisibility::Hibernated);
         let generation = self.generation.load(Ordering::Acquire);
+        // Kept before the marker replaces it, so no draw falls between the
+        // two and finds neither. A view hibernated again before its next
+        // frame arrived keeps the picture it already had.
+        let last = self.snapshot.load_full();
+        if !last.detached && last.rows > 0 {
+            self.retained.store(Some(Arc::clone(&last)));
+            // A failed attach replaces the grid and then drops the picture.
+            // If it did the first before the store above, it did the second
+            // before it too, and the picture must not outlive it.
+            if !Arc::ptr_eq(&last, &self.snapshot.load_full()) {
+                self.retained.store(None);
+            }
+        }
         self.snapshot
             .store(Arc::new(RenderSnapshot::detached(generation)));
+    }
+
+    /// What the view draws: the live grid, or the last one this terminal
+    /// showed while a hibernated view waits for its next.
+    fn frame(&self) -> Arc<RenderSnapshot> {
+        let snapshot = self.snapshot.load_full();
+        if snapshot.detached
+            && let Some(retained) = self.retained.load_full()
+        {
+            return retained;
+        }
+        snapshot
     }
 
     fn snapshot_cursor(&self) -> u64 {
@@ -864,6 +906,14 @@ impl HostedTerminalHandle {
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
         self.inner.published.snapshot.load_full()
+    }
+
+    /// The grid to draw. Unlike [`Self::snapshot`], a hibernated terminal
+    /// answers with the last grid it showed instead of a detached marker, so
+    /// its pane is not blank while the next frame is on its way. Everything
+    /// that reads the terminal's current state still asks `snapshot`.
+    pub fn frame(&self) -> Arc<RenderSnapshot> {
+        self.inner.published.frame()
     }
 
     pub fn activity(&self) -> Option<crate::model::TerminalOutputActivity> {
@@ -3405,6 +3455,57 @@ mod tests {
         assert_eq!(announced(), vec![1, 1]);
     }
 
+    fn frame_text(published: &HostedPublishedState) -> Option<String> {
+        let frame = published.frame();
+        (!frame.detached).then(|| frame.lines[0].cells[0].text.as_str().to_owned())
+    }
+
+    /// Hibernating gives up the grid as far as the protocol is concerned, and
+    /// only that far: the pane goes on showing it until a live one arrives.
+    #[test]
+    fn a_hibernated_view_draws_its_last_grid_until_a_live_one_replaces_it() {
+        let (published, _wake_count) = published_state(true);
+        published.publish(published_grid(3, "a"));
+
+        published.hibernate();
+        assert!(published.snapshot.load().detached);
+        assert_eq!(frame_text(&published).as_deref(), Some("a"));
+
+        // Coming back still asks the daemon for a whole grid, because the
+        // kept one is a picture and no longer a base for deltas.
+        published.set_visible(true);
+        assert_eq!(published.snapshot_cursor(), 0);
+        assert_eq!(frame_text(&published).as_deref(), Some("a"));
+
+        // Hibernated again before that grid arrived, it keeps the picture.
+        published.hibernate();
+        assert_eq!(frame_text(&published).as_deref(), Some("a"));
+
+        // The same generation repopulates the view, and nothing stale is
+        // held once it has.
+        published.set_visible(true);
+        published.publish(published_grid(3, "b"));
+        assert_eq!(frame_text(&published).as_deref(), Some("b"));
+        assert!(published.retained.load().is_none());
+    }
+
+    #[test]
+    fn a_view_with_nothing_to_show_keeps_nothing_when_hibernated() {
+        // Never painted: there is no last grid.
+        let (published, _wake_count) = published_state(true);
+        published.hibernate();
+        assert!(published.retained.load().is_none());
+        assert_eq!(frame_text(&published), None);
+
+        // A terminal that could not be attached has no next frame for an old
+        // picture to stand in for.
+        let (published, _wake_count) = published_state(true);
+        published.publish(published_grid(1, "a"));
+        published.hibernate();
+        published.mark_detached();
+        assert_eq!(frame_text(&published), None);
+    }
+
     #[test]
     fn reconnect_visibility_vote_tracks_current_handle_state() {
         let (published, _wake_count) = published_state(false);
@@ -3667,6 +3768,8 @@ mod tests {
         );
         assert!(handle.snapshot().detached);
         assert_eq!(handle.generation(), previous.generation);
+        // The pane keeps showing the grid it hibernated with.
+        assert_eq!(handle.frame().lines[0].cells[0].text, "c");
 
         // Resume before the old hibernate ACK arrives. It must not override
         // the newer visibility, and the same retained generation must restore

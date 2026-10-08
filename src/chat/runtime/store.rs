@@ -1487,6 +1487,28 @@ mod tests {
     }
 
     #[test]
+    fn local_notice_keeps_its_position_through_progress_and_history_refresh() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let prompt = history_item("prompt", "Start");
+        let mut notice = history_item("codex-notice:test", "Reconnecting... 1/2");
+        notice.role = Role::System;
+        let answer = history_item("answer", "Recovered");
+        for item in [prompt.clone(), notice, answer.clone()] {
+            assert!(store.apply(Event::Item(item)).unwrap().is_empty());
+        }
+        store
+            .apply(Event::LatestHistory {
+                items: vec![prompt, answer],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(ids(&mut store), ["prompt", "codex-notice:test", "answer"]);
+        let snapshot = store.window().unwrap();
+        assert_eq!(snapshot.items[1].role, Role::System);
+        assert!(snapshot.items[1].at.is_some());
+    }
+
+    #[test]
     fn disjoint_latest_appends_and_disjoint_earlier_prepends() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         for id in ["A", "B"] {

@@ -51,7 +51,31 @@ pub struct DaemonImpact {
     pub blockers: Vec<String>,
 }
 
+impl Disposition {
+    /// The name of this outcome beside a session in an update preview.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continues => "Continues",
+            Self::Resumes => "Resumes",
+            Self::WaitsForIdle => "Waits for idle",
+            Self::Interrupted => "Interrupted",
+            Self::ResumePicker => "Choose a conversation",
+            Self::Blocked => "Needs attention",
+        }
+    }
+}
+
 impl DaemonImpact {
+    /// Whether something has to be resolved by hand before the update can
+    /// install. A conversation the update waits on is not that.
+    pub fn blocked(&self) -> bool {
+        !self.blockers.is_empty()
+            || self
+                .sessions
+                .iter()
+                .any(|session| session.disposition == Disposition::Blocked)
+    }
+
     pub fn ready(&self) -> bool {
         self.blockers.is_empty()
             && self.sessions.iter().all(|session| {

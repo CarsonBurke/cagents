@@ -3449,6 +3449,9 @@ impl Cagents {
         login.attempts += 1;
         let account = login.account();
         cosmic::task::future(async move {
+            // The daemon is asked only what the terminal said went wrong. One
+            // that cannot answer leaves that unread; the home is still asked.
+            let mut unread = None;
             if let Some((terminal, _)) = browser_terminal {
                 let blocked =
                     tokio::task::spawn_blocking(move || callback_failed_on_host(terminal))
@@ -3458,12 +3461,7 @@ impl Cagents {
                 match blocked {
                     Ok(true) => return Message::AccountUi(Action::LoginCallbackBlocked(key)),
                     Ok(false) => {}
-                    Err(error) => {
-                        return Message::AccountUi(Action::LoginVerified {
-                            key,
-                            outcome: Outcome::Failed(error),
-                        });
-                    }
+                    Err(error) => unread = Some(error),
                 }
             }
             // No cache: the answer is about a home no other window knows.
@@ -3488,7 +3486,10 @@ impl Cagents {
             } else {
                 probe::run(account, None, true).await
             };
-            Message::AccountUi(Action::LoginVerified { key, outcome })
+            Message::AccountUi(Action::LoginVerified {
+                key,
+                outcome: with_callback_unread(unread, outcome),
+            })
         })
     }
 
@@ -4537,6 +4538,26 @@ fn check_browser_login_host(path: &Path) -> Result<(), String> {
         return Err(account::login::BUSY.into());
     }
     Ok(())
+}
+
+/// What a sign-in's home answered, when the daemon could not say (`unread`)
+/// whether the terminal's browser callback was blocked.
+///
+/// A home that names who signed in settles the sign-in by itself: a blocked
+/// callback signs nothing in, so there is nothing left to read. Only the
+/// answer that would delete the home is withheld, since a callback that never
+/// ran leaves it signed out as well, and that sign-in is kept and explained
+/// rather than discarded. It is asked again once the daemon can be.
+fn with_callback_unread(unread: Option<String>, outcome: Outcome) -> Outcome {
+    match (unread, &outcome) {
+        (
+            Some(error),
+            Outcome::Answered {
+                identity, snapshot, ..
+            },
+        ) if !probe::confirms_login(identity.as_ref(), snapshot.status) => Outcome::Failed(error),
+        _ => outcome,
+    }
 }
 
 fn callback_failed_on_host(terminal: TerminalId) -> Result<bool, String> {
@@ -6882,6 +6903,46 @@ mod app_tests {
         assert!(
             app.account_ui.logins.is_empty(),
             "stop retrying without discarding the pending home"
+        );
+    }
+
+    fn answered(identity: Option<&str>, status: UsageStatus) -> Outcome {
+        Outcome::Answered {
+            catalog: None,
+            identity: identity.map(|email| Identity {
+                email: Some(email.into()),
+                ..Identity::default()
+            }),
+            snapshot: UsageSnapshot::state(status, "fixture", NOW),
+        }
+    }
+
+    #[test]
+    fn a_signed_in_home_settles_a_sign_in_the_daemon_cannot_be_asked_about() {
+        // The daemon holds only the terminal's account of a blocked callback.
+        // It not answering says nothing about a home that did sign in.
+        let unreachable = || Some("Resource temporarily unavailable".to_owned());
+        let signed_in = answered(Some("new@example.com"), UsageStatus::Ok);
+        assert_eq!(
+            with_callback_unread(unreachable(), signed_in.clone()),
+            signed_in
+        );
+
+        // A signed-out home is what a blocked callback leaves too, so it is
+        // asked again rather than deleted as a cancelled sign-in.
+        for signed_out in [
+            answered(None, UsageStatus::NeedsLogin),
+            answered(Some("cached@example.com"), UsageStatus::NeedsLogin),
+        ] {
+            assert_eq!(
+                with_callback_unread(unreachable(), signed_out.clone()),
+                Outcome::Failed("Resource temporarily unavailable".into())
+            );
+            assert_eq!(with_callback_unread(None, signed_out.clone()), signed_out);
+        }
+        assert_eq!(
+            with_callback_unread(unreachable(), Outcome::Busy),
+            Outcome::Busy
         );
     }
 

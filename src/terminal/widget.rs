@@ -1533,7 +1533,10 @@ impl<Message> std::fmt::Debug for TerminalWidget<Message> {
 impl<Message> TerminalWidget<Message> {
     pub fn new(handle: impl Into<TerminalSurface>) -> Self {
         let handle = handle.into();
-        let snapshot = handle.snapshot();
+        // A hibernated terminal draws the last grid it showed. Its pointer
+        // and selection handling read the same grid, as they do the grid a
+        // hidden terminal kept, until the first live frame replaces it.
+        let snapshot = handle.frame();
         Self {
             id: None,
             read_only: false,

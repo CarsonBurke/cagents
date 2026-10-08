@@ -333,6 +333,7 @@ impl Handle {
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
+                    reconnect_only_reported: false,
                     expected_native_peer,
                     native_peer: None,
                     preserve_native: preserve_native.clone(),
@@ -390,41 +391,7 @@ impl Handle {
                             inode,
                         } => actor.run_websocket(initial, &socket, device, inode),
                         TransportSpec::OwnedUnixWebSocket { socket } => {
-                            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                            let started = Instant::now();
-                            let metadata = loop {
-                                if let Ok(metadata) = std::fs::metadata(&socket)
-                                    && metadata.file_type().is_socket()
-                                {
-                                    break Ok(metadata);
-                                }
-                                if actor.stop.load(Ordering::Acquire) {
-                                    break Err("Provider startup cancelled".to_owned());
-                                }
-                                if actor.child.as_mut().is_some_and(|child| {
-                                    child.0.try_wait().ok().flatten().is_some()
-                                }) {
-                                    break Err(
-                                        "Codex server exited before opening its local socket"
-                                            .to_owned(),
-                                    );
-                                }
-                                if started.elapsed() >= Duration::from_secs(15) {
-                                    break Err(
-                                    "Codex server did not open its local socket within 15 seconds"
-                                        .to_owned(),
-                                );
-                                }
-                                thread::sleep(Duration::from_millis(20));
-                            };
-                            metadata.and_then(|metadata| {
-                                actor.run_websocket(
-                                    initial,
-                                    &socket,
-                                    metadata.dev(),
-                                    metadata.ino(),
-                                )
-                            })
+                            actor.run_launched_websocket(initial, &socket)
                         }
                     }
                 }))
@@ -912,7 +879,7 @@ impl Handle {
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         (
-            state.busy || state.waiting || !state.requests.is_empty(),
+            state.is_working() || state.waiting || !state.requests.is_empty(),
             state.ready,
         )
     }
@@ -1309,6 +1276,8 @@ struct Actor {
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
+    /// Whether this conversation's lack of durable continuity was logged.
+    reconnect_only_reported: bool,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
     preserve_native: Arc<AtomicBool>,
@@ -1778,7 +1747,7 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
-        } else if state.busy || state.waiting || !state.requests.is_empty() {
+        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
@@ -1808,6 +1777,26 @@ impl Actor {
             _ => None,
         });
         if let Some(Some(thread)) = &identity
+            && self.native_holder.is_some()
+            && let Some(identity) = self.adapter.server_identity()
+            && super::native_holder::verified_codex_version(&identity.user_agent).is_none()
+            && !std::mem::replace(&mut self.reconnect_only_reported, true)
+        {
+            // The holder of an unconfirmed server ends it when the daemon
+            // connection is lost, so say which conversation that leaves
+            // without the continuity the holder otherwise provides.
+            tracing::warn!(
+                %thread,
+                version = super::native_holder::codex_version(&identity.user_agent)
+                    .unwrap_or("unrecognized"),
+                user_agent = %identity.user_agent,
+                verified = ?super::native_holder::VERIFIED_CODEX_VERSIONS,
+                "Codex version is not verified for durable continuity; this conversation's \
+                 server ends if the daemon exits or restarts, and the conversation then \
+                 resumes from disk without its running turn"
+            );
+        }
+        if let Some(Some(thread)) = &identity
             && let Some(holder) = &mut self.native_holder
             && let Some(identity) = self.adapter.server_identity()
             && let Some(version) =
@@ -1818,6 +1807,12 @@ impl Actor {
                 .clone()
                 .ok_or("Missing verified app-server peer")?;
             holder.confirm(thread.clone(), identity.clone(), process)?;
+            // Durable continuity is a claim about this thread. Name it first,
+            // so nobody can observe the claim without its conversation.
+            *self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(thread.clone());
             self.state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1826,19 +1821,18 @@ impl Actor {
             };
             self.dirty = true;
         }
-        self.step(step)?;
-        if let Some(identity) = identity {
-            *self
-                .confirmed_session
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = identity;
-        }
+        self.apply_step(step, identity)?;
         if observed {
             self.observe_update();
         }
         Ok(())
     }
     fn step(&mut self, step: Step) -> Result<(), String> {
+        self.apply_step(step, None)
+    }
+    /// Applies one frame. `confirmed` is the conversation identity the
+    /// provider left the frame with, when the frame changed it.
+    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -1925,6 +1919,14 @@ impl Actor {
                 return Err(message);
             }
         }
+        // An outcome is acted on as soon as it is published, and its reader
+        // asks which conversation produced it. Answer before announcing.
+        if let Some(confirmed) = confirmed {
+            *self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = confirmed;
+        }
         // The provider's final usage/items may follow its settlement in this
         // same frame. Freeze only after applying the whole frame, then publish
         // its final outcome (which may arrive in a much later frame).
@@ -1958,7 +1960,9 @@ impl Actor {
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::Attention(evidence));
             }
-            return;
+            if !matches!(event, Event::TurnStarted) {
+                return;
+            }
         }
         if matches!(&event, Event::Reset { .. }) {
             *self
@@ -2087,6 +2091,9 @@ fn recover_history_error(
     event: &Event,
 ) {
     match event {
+        // A provider accepting a new turn recovers the preceding operation's
+        // error. A failed history page has its own recovery contract.
+        Event::TurnStarted if history_error.is_none() => *error = None,
         Event::HistoryError(message) => *history_error = Some(message.clone()),
         Event::HistoryRecovered => {
             if history_error
@@ -3229,6 +3236,7 @@ mod tests {
                         message: model,
                         fatal: false,
                     }],
+                    Command::Compact => vec![Event::TurnStarted],
                     _ => return Err("unexpected fixture command".into()),
                 };
                 Ok(Step {
@@ -3263,6 +3271,12 @@ mod tests {
                     Some("page failed")
                 );
             }
+            // Starting work cannot repair a failed history page.
+            handle.command(Command::Compact).unwrap();
+            assert_eq!(
+                handle.snapshot(None).unwrap().error.as_deref(),
+                Some("page failed")
+            );
             if let Some(message) = unrelated {
                 handle
                     .command(Command::SetModel {
@@ -3275,6 +3289,8 @@ mod tests {
             let snapshot = handle.snapshot(None).unwrap();
             assert_eq!(snapshot.error.as_deref(), unrelated);
             assert_eq!(snapshot.items[0].id, "older");
+            handle.command(Command::Compact).unwrap();
+            assert!(handle.snapshot(None).unwrap().error.is_none());
             handle.close().unwrap();
         }
     }
@@ -3640,6 +3656,78 @@ mod tests {
         assert!(notified.recv_timeout(Duration::from_millis(200)).is_err());
         assert_eq!(generation(&handle), before);
         assert!(handle.snapshot(None).unwrap().items.is_empty());
+        handle.close().unwrap();
+    }
+    /// The host records a run's outcome the moment it is announced and then
+    /// asks the handle which conversation produced it.
+    #[test]
+    fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
+        use crate::agent_execution::ProviderEvent;
+        struct WholeTurn(crate::model::RunId);
+        impl Adapter for WholeTurn {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![json!({})],
+                    events: Vec::new(),
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture takes no commands".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                let execution = |event| Event::Execution { run: self.0, event };
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![
+                        Event::Session {
+                            id: "confirmed".into(),
+                            title: None,
+                        },
+                        execution(ProviderEvent::Started {
+                            key: "request".into(),
+                        }),
+                        execution(ProviderEvent::Settled),
+                        execution(ProviderEvent::Finished {
+                            outcome: crate::notifications::Kind::Succeeded,
+                        }),
+                    ],
+                })
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(WholeTurn(crate::model::RunId::new()));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (started, actor) = crossbeam_channel::bounded::<Handle>(1);
+        let (observe, observed) = crossbeam_channel::bounded(1);
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::Execution {
+                update: crate::agent_execution::Update::Finished { .. },
+                ..
+            } = update
+            {
+                let handle = actor.recv_timeout(Duration::from_secs(5)).unwrap();
+                let _ = observe.try_send(handle.confirmed_session_id());
+            }
+        })
+        .unwrap();
+        started.send(handle.clone()).unwrap();
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the outcome was never announced")
+                .as_deref(),
+            Some("confirmed")
+        );
         handle.close().unwrap();
     }
     #[test]

@@ -243,6 +243,7 @@ impl<'a> markdown::Viewer<'a, markdown::Uri, cosmic::Theme, cosmic::Renderer> fo
                 self.diagrams.get(&blake3::hash(code.as_bytes())),
                 code,
                 self.loading,
+                settings.code_size,
             );
         }
         markdown::code_block(settings, lines, Self::on_link_click)
@@ -253,6 +254,7 @@ pub fn diagram_view<'a, Message: Clone + 'static>(
     diagram: Option<&'a Diagram>,
     source: &'a str,
     loading: bool,
+    source_size: iced::Pixels,
 ) -> Element<'a, Message> {
     match diagram {
         Some(Diagram::Ready { handle, .. }) => iced::widget::image(handle.clone())
@@ -260,7 +262,7 @@ pub fn diagram_view<'a, Message: Clone + 'static>(
             .content_fit(iced::ContentFit::Contain)
             .into(),
         _ => widget::column::with_children(vec![
-            widget::text(match diagram {
+            crate::design::body(match diagram {
                 Some(Diagram::Error(error)) => error.as_str(),
                 _ if loading => "Rendering diagram…",
                 _ => "Diagram preview unavailable: at most 24 unique diagrams per document.",
@@ -268,6 +270,7 @@ pub fn diagram_view<'a, Message: Clone + 'static>(
             .into(),
             widget::selectable_text(source)
                 .font(iced::Font::MONOSPACE)
+                .size(source_size)
                 .into(),
         ])
         .spacing(space::S)

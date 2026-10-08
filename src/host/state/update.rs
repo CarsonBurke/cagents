@@ -16,7 +16,8 @@ pub(in crate::host) fn inspect(
             state
                 .chats
                 .iter()
-                .filter(|(_, record)| record.handle.owns_work())
+                // An actor that already stopped admits nothing left to fence.
+                .filter(|(_, record)| record.handle.owns_work() && !record.handle.is_completed())
                 .map(|(&id, record)| (id, record.handle.clone()))
                 .collect::<Vec<_>>(),
         )
@@ -33,7 +34,14 @@ pub(in crate::host) fn inspect(
     }
     if fence_actors {
         for (id, handle) in handles {
-            match handle.check_update_readiness().map_err(upgrade_error)? {
+            let readiness = match handle.check_update_readiness() {
+                Ok(readiness) => readiness,
+                // It stopped after being collected; the impact below reports
+                // what is left of it.
+                Err(_) if handle.is_completed() => continue,
+                Err(error) => return Err(upgrade_error(error)),
+            };
+            match readiness {
                 crate::chat::runtime::UpdateReadiness::Unready => blockers.push(format!(
                     "Conversation {id} is still processing accepted provider work; retry after it settles."
                 )),
@@ -55,6 +63,43 @@ pub(in crate::host) fn inspect(
 }
 
 impl HostState {
+    /// Whether this conversation's provider stopped on its own and left
+    /// nothing for an update to carry: no live process, no retained server
+    /// and no cleanup still owed. Its failure stays on record so the window
+    /// can show it, but the record is all that is left, and the window
+    /// restarts the saved conversation the same way it does after any daemon
+    /// restart. A durable owner is different: its server may still hold a
+    /// turn, and only an explicit close can release it.
+    pub(in crate::host) fn provider_ended(
+        &self,
+        id: TerminalId,
+        record: &super::super::chat::Record,
+    ) -> bool {
+        let reconnects = |continuity: &crate::chat::NativeContinuity| {
+            matches!(continuity, crate::chat::NativeContinuity::ReconnectOnly)
+        };
+        record.handle.is_completed()
+            && !record.returning_terminal
+            && !self.native_closing.contains_key(&id)
+            && reconnects(&record.session.native_continuity)
+            && reconnects(&record.handle.native_continuity())
+            // A terminal still running under this conversation is checkpointed
+            // from the chat's confirmed identity, which a stopped actor no
+            // longer vouches for.
+            && self
+                .terminals
+                .get(&id)
+                .is_none_or(|terminal| terminal.handle.is_completed())
+            && record
+                .paired_terminal
+                .as_ref()
+                .is_none_or(|terminal| terminal.is_completed())
+            && matches!(
+                super::super::chat::has_native_owner(&record.session),
+                Ok(false)
+            )
+    }
+
     pub(crate) fn upgrade_impact(&mut self, policy: Policy) -> Result<DaemonImpact, ProtocolError> {
         let capability = self
             .shutdown_preflight(Instant::now())
@@ -156,17 +201,27 @@ impl HostState {
                     Disposition::Blocked,
                     "Finish the pending return to terminal or close this conversation.",
                 )
+            } else if self.provider_ended(id, record) {
+                (
+                    Disposition::Resumes,
+                    "Its provider already stopped. The saved conversation will reopen with a new provider process.",
+                )
             } else if record.handle.is_completed() {
                 (
                     Disposition::Blocked,
-                    "Close this conversation to finish its pending provider cleanup, then retry.",
+                    "Its provider stopped but may still hold unfinished work. Close this conversation to release it.",
                 )
             } else if let Err(reason) = &environment {
                 (Disposition::Blocked, reason.as_str())
-            } else if !ready || !aligned || launch.terminal_recipe().is_none() {
+            } else if !ready {
                 (
                     Disposition::Blocked,
-                    "Wait for the provider to confirm its resumable conversation, or close it.",
+                    "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
+                )
+            } else if !aligned || launch.terminal_recipe().is_none() {
+                (
+                    Disposition::Blocked,
+                    "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",
                 )
             } else if durable
                 && self.terminals.get(&id).is_some_and(|terminal| {

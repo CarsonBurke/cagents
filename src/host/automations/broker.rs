@@ -20,7 +20,7 @@ use crate::{
     host::{
         agent_execution,
         model::Claimed,
-        state::{HostState, SharedHost},
+        state::{HostLock, SharedHost},
     },
 };
 
@@ -53,7 +53,7 @@ impl Wake {
 }
 
 struct Inner {
-    host: Weak<Mutex<HostState>>,
+    host: Weak<HostLock>,
     registry: agent_execution::SharedRegistry,
     root: PathBuf,
     wake: Wake,
@@ -729,6 +729,7 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::state::HostState;
 
     #[test]
     fn update_write_gate_defers_precheck_observation_without_blocking_scheduler_shutdown() {
@@ -775,11 +776,13 @@ mod tests {
                 200,
             )
             .unwrap();
-        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("test"),
-            boot_id: BootId::new("test"),
-            host_incarnation: HostIncarnation::new("test"),
-        })));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("test"),
+                boot_id: BootId::new("test"),
+                host_incarnation: HostIncarnation::new("test"),
+            },
+        )));
         let registry = Arc::new(Mutex::new(registry));
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(&host),

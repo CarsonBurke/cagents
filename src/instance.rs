@@ -886,6 +886,15 @@ const INSTALL_GUARD_FD: i32 = 197;
 /// Verify the inherited open-file description owns the active exclusive fence.
 /// Do not wrap it in OwnedLock: dropping a validator must not unlock its parent.
 pub(crate) fn validate_install_guard() -> io::Result<()> {
+    validate_install_fence(true)
+}
+
+/// Staging owns the same authenticated launch fence without closing modern windows.
+pub(crate) fn validate_stage_guard() -> io::Result<()> {
+    validate_install_fence(false)
+}
+
+fn validate_install_fence(require_closed: bool) -> io::Result<()> {
     use std::os::fd::BorrowedFd;
     if env::var(INSTALL_GUARD_ENV).ok().as_deref() != Some("197") {
         return Err(io::Error::other("installer has no inherited update fence"));
@@ -921,7 +930,7 @@ pub(crate) fn validate_install_guard() -> io::Result<()> {
     if unsafe { libc::flock(INSTALL_GUARD_FD, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
         return Err(io::Error::other("installer does not own the update fence"));
     }
-    if !running_window_slots(&runtime)?.is_empty() {
+    if require_closed && !running_window_slots(&runtime)?.is_empty() {
         return Err(io::Error::other(
             "application windows have not finished closing",
         ));

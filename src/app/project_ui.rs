@@ -1212,6 +1212,9 @@ impl Cagents {
                         });
                     // Queued behind any save of the open worktree, so the
                     // tombstone is the catalog's last word on it.
+                    if let Some(id) = target.worktree {
+                        self.refresh_ui.git.forget_worktree(target.project, id);
+                    }
                     if let (Some(id), Some(session)) = (target.worktree, &self.session) {
                         session.save_worktrees([WorktreeState {
                             id,

@@ -1229,17 +1229,23 @@ impl Cagents {
             .into(),
         };
         rows.push(body);
-        let content = widget::scrollable(widget::column::with_children(rows).spacing(space::M))
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                design::scrollbar(),
-            ))
-            .height(Length::Fill);
-        widget::container(dialog_ui::surface(content, 1100.0))
-            .height(Length::Fill)
-            .max_height(size.height.min(820.0))
-            .width(Length::Fill)
-            .max_width(1100.0)
-            .into()
+        let content = widget::scrollable(
+            widget::column::with_children(rows)
+                .spacing(space::M)
+                .padding(design::with_vertical_rail(Padding::new(space::L))),
+        )
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            design::scrollbar(),
+        ))
+        .height(Length::Fill);
+        widget::container(crate::interaction::opaque(
+            widget::container(content).class(cosmic::theme::Container::Dialog(false)),
+        ))
+        .height(Length::Fill)
+        .max_height(size.height.min(820.0))
+        .width(Length::Fill)
+        .max_width(1100.0)
+        .into()
     }
 }
 

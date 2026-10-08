@@ -366,6 +366,8 @@ fn create_inner(
             selection_dirty: false,
             turn: None,
             busy: false,
+            lifecycle_revision: 0,
+            subagent_status: None,
             ready: false,
             attached: false,
             direct_input: false,
@@ -398,7 +400,9 @@ enum Pending {
     History {
         earlier: bool,
     },
-    Turn,
+    Turn {
+        revision: u64,
+    },
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
     /// wire announces that the figures a reader was looking at have moved.
@@ -473,6 +477,8 @@ struct Codex {
     selection_dirty: bool,
     turn: Option<String>,
     busy: bool,
+    lifecycle_revision: u64,
+    subagent_status: Option<ToolStatus>,
     ready: bool,
     attached: bool,
     direct_input: bool,
@@ -525,7 +531,8 @@ impl Codex {
         if self.is_child || id.is_empty() || id.len() > 256 || self.thread.as_deref() == Some(id) {
             return Ok(());
         }
-        if !self.children.contains_key(id) {
+        let discovered = !self.children.contains_key(id);
+        if discovered {
             if self.children.len() >= 32 {
                 let completed = self
                     .children
@@ -567,28 +574,26 @@ impl Codex {
                 Pending::ChildResume(id.into()),
             )?;
         }
-        let status = match metadata["status"]
-            .as_str()
-            .or_else(|| metadata["status"]["type"].as_str())
+        let status = agent_status(&metadata["status"]);
+        if let Some(status) = status
+            && let Some(child) = self.children.get_mut(id)
         {
-            Some("completed" | "idle" | "shutdown") => ToolStatus::Succeeded,
-            Some("errored" | "failed" | "notFound") => ToolStatus::Failed,
-            Some("interrupted") => ToolStatus::Denied,
-            _ => ToolStatus::Running,
-        };
+            // Sparse collab metadata must not reset a known terminal outcome.
+            child.subagent_status = Some(status);
+        }
         step.events.push(Event::Subagent {
             id: id.into(),
-            kind: metadata["agentRole"]
+            kind: metadata["agentNickname"]
                 .as_str()
-                .or_else(|| metadata["agentNickname"].as_str())
-                .unwrap_or("Codex agent")
+                .or_else(|| metadata["agentRole"].as_str())
+                .unwrap_or(if discovered { "Codex agent" } else { "" })
                 .into(),
             description: metadata["message"]
                 .as_str()
                 .or_else(|| metadata["preview"].as_str())
                 .unwrap_or_default()
                 .into(),
-            status: Some(status),
+            status,
         });
         Ok(())
     }
@@ -596,30 +601,21 @@ impl Codex {
     // never escape into the parent's ID space. Keep the original correlation
     // inside the child and allocate every wire request through the parent.
     fn child_step(&mut self, id: &str, content: Step, step: &mut Step) -> Result<(), String> {
-        let outcome = content.events.iter().find_map(|event| {
-            if let Event::TurnFinished { outcome, .. } = event {
-                Some(*outcome)
-            } else {
-                None
-            }
-        });
-        for event in &content.events {
-            if let Event::Status { busy, .. } = event {
-                step.events.push(Event::Subagent {
-                    id: id.into(),
-                    kind: String::new(),
-                    description: String::new(),
-                    status: Some(if *busy {
-                        ToolStatus::Running
-                    } else {
-                        match outcome {
-                            Some(crate::notifications::Kind::Failed) => ToolStatus::Failed,
-                            Some(crate::notifications::Kind::Cancelled) => ToolStatus::Denied,
-                            _ => ToolStatus::Succeeded,
-                        }
-                    }),
-                });
-            }
+        if content.events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Status { .. } | Event::TurnFinished { .. } | Event::Ready(false)
+            )
+        }) {
+            step.events.push(Event::Subagent {
+                id: id.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: self
+                    .children
+                    .get(id)
+                    .and_then(|child| child.subagent_status),
+            });
         }
         step.events.extend(chat::child_events(id, content.events));
         for frame in content.writes {
@@ -1396,10 +1392,10 @@ impl Adapter for Codex {
                 let input = self.input(text, attachments)?;
                 match mode {
                     PromptMode::Send => {
-                        if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn)) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
+                        if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
-                        self.call(&mut step, "turn/start", params, Pending::Turn)?;
+                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision })?;
                     }
                     PromptMode::Steer => {
                         let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to steer")?;
@@ -1523,14 +1519,26 @@ impl Adapter for Codex {
                     self.finish_history(&mut step)?;
                 }
                 if let Pending::ChildResume(id) = &pending {
-                    self.children.remove(id);
-                    self.child_buffer.remove(id);
-                    step.events.push(Event::Subagent {
-                        id: id.clone(),
-                        kind: String::new(),
-                        description: "Child history unavailable".into(),
-                        status: Some(ToolStatus::Failed),
-                    });
+                    let message = error["message"]
+                        .as_str()
+                        .unwrap_or("Unknown provider error");
+                    step.events.extend(chat::child_events(
+                        id,
+                        vec![session_notice(format!(
+                            "Child history unavailable: {message}. Live activity is still shown."
+                        ))],
+                    ));
+                    // Hydration failed, not execution. Retain the live parser
+                    // and replay the events observed while the read was pending.
+                    if let Some(child) = self.children.get_mut(id) {
+                        child.ready = true;
+                    }
+                    for frame in self.child_buffer.remove(id).unwrap_or_default() {
+                        if let Some(child) = self.children.get_mut(id) {
+                            let content = child.receive(frame)?;
+                            self.child_step(id, content, &mut step)?;
+                        }
+                    }
                     return Ok(step);
                 }
                 if matches!(pending, Pending::ChildList) {
@@ -1677,7 +1685,7 @@ impl Adapter for Codex {
                     self.call(
                         &mut step,
                         "thread/list",
-                        json!({"ancestorThreadId":self.thread,"limit":32}),
+                        json!({"ancestorThreadId":self.thread,"sourceKinds":["subAgentThreadSpawn"],"limit":32}),
                         Pending::ChildList,
                     )?;
                     if result["initialTurnsPage"].is_object() {
@@ -1871,17 +1879,21 @@ impl Adapter for Codex {
                     self.page(result, &mut step, earlier)?;
                     self.finish_history(&mut step)?;
                 }
-                Pending::Turn => {
+                Pending::Turn { revision } => {
                     self.materialized = true;
-                    self.turn = Some(string(&result["turn"], "id")?.into());
-                    self.busy = true;
-                    step.events.push(Event::Waiting(false));
-                    // Preserve selection until an explicit user change. No settings
-                    // update RPC is sent while another client's turn is running.
-                    step.events.push(Event::Status {
-                        busy: true,
-                        detail: "Codex turn started".into(),
-                    });
+                    let id = string(&result["turn"], "id")?;
+                    // Notifications can finish this turn or start another before
+                    // its RPC reply. An acknowledgement only fills missing state.
+                    if revision == self.lifecycle_revision {
+                        self.turn = Some(id.into());
+                        self.busy = true;
+                        self.subagent_status = Some(ToolStatus::Running);
+                        step.events.push(Event::Waiting(false));
+                        step.events.push(Event::Status {
+                            busy: true,
+                            detail: "Codex turn started".into(),
+                        });
+                    }
                     if let Some(execution) = self.execution.as_mut()
                         && frame["id"].as_str() == Some(execution.request.as_str())
                     {
@@ -1892,12 +1904,14 @@ impl Adapter for Codex {
                         execution.early_bytes = 0;
                         if let Some(completed) = completed {
                             self.finish_execution(&completed, &mut step)?;
-                            self.busy = false;
-                            self.turn = None;
-                            step.events.push(Event::Status {
-                                busy: false,
-                                detail: turn_detail(&completed["status"]),
-                            });
+                            if !self.busy || self.turn.as_deref() == Some(turn.as_str()) {
+                                self.busy = false;
+                                self.turn = None;
+                                step.events.push(Event::Status {
+                                    busy: false,
+                                    detail: turn_detail(&completed["status"]),
+                                });
+                            }
                         }
                     }
                 }
@@ -2033,6 +2047,22 @@ impl Adapter for Codex {
         let thread = params["threadId"]
             .as_str()
             .or_else(|| params["thread"]["id"].as_str());
+        if method == "thread/started" {
+            let metadata = &params["thread"];
+            let parent = metadata["parentThreadId"].as_str().or_else(|| {
+                metadata["source"]["subAgent"]["thread_spawn"]["parent_thread_id"].as_str()
+            });
+            if parent.is_some_and(|id| {
+                self.thread.as_deref() == Some(id) || self.children.contains_key(id)
+            }) && let Some(id) = thread
+            {
+                self.discover_child(id, metadata, &mut step)?;
+                // Discovery already consumed this metadata. Replaying its
+                // initial active state after hydration could revive a child
+                // that finished while the read was pending.
+                return Ok(step);
+            }
+        }
         if thread.is_some() && thread != self.thread.as_deref() {
             if let Some(id) = thread
                 && self.children.contains_key(id)
@@ -2105,7 +2135,7 @@ impl Adapter for Codex {
                 }
             }
             "thread/status/changed" => {
-                self.busy = params["status"]["type"] == "active";
+                self.observe_thread_status(&params["status"]);
                 step.events
                     .push(Event::Waiting(waiting_on_user(&params["status"])));
                 if !self.busy {
@@ -2163,16 +2193,24 @@ impl Adapter for Codex {
                         });
                     }
                 }
-                self.busy = method == "turn/started";
-                step.events.push(Event::Waiting(false));
-                self.turn = if self.busy {
-                    Some(string(turn, "id")?.into())
-                } else {
-                    None
-                };
+                let turn_id = string(turn, "id")?;
+                let current =
+                    method == "turn/started" || self.turn.as_deref().is_none_or(|id| id == turn_id);
+                if current {
+                    self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
+                    self.busy = method == "turn/started";
+                    self.subagent_status = if self.busy {
+                        Some(ToolStatus::Running)
+                    } else {
+                        agent_status(&turn["status"])
+                    };
+                    step.events.push(Event::Waiting(false));
+                    self.turn = self.busy.then(|| turn_id.to_owned());
+                }
                 for value in array(turn, "items")? {
-                    for item in parse_item(value, !self.busy, string(turn, "id")?)? {
-                        if self.busy && streams_updates(&item.content) {
+                    for item in parse_item(value, method == "turn/completed", string(turn, "id")?)?
+                    {
+                        if method == "turn/started" && streams_updates(&item.content) {
                             if self.active_items.len() >= MAX_ACTIVE_ITEMS
                                 && !self.active_items.contains_key(&item.id)
                             {
@@ -2185,13 +2223,15 @@ impl Adapter for Codex {
                 }
                 // Non-blocking questions can outlive their originating turn.
                 // Only serverRequest/resolved or thread closure invalidates them.
-                if !self.busy {
-                    self.active_items.clear();
+                if current {
+                    if !self.busy {
+                        self.active_items.clear();
+                    }
+                    step.events.push(Event::Status {
+                        busy: self.busy,
+                        detail: turn_detail(&turn["status"]),
+                    });
                 }
-                step.events.push(Event::Status {
-                    busy: self.busy,
-                    detail: turn_detail(&turn["status"]),
-                });
                 if turn["error"].is_object() {
                     step.events.push(Event::Error {
                         message: turn["error"]["message"]
@@ -2339,24 +2379,51 @@ impl Adapter for Codex {
                 self.attached = false;
                 step.events.push(Event::Ready(false));
                 self.busy = false;
+                self.subagent_status = Some(
+                    self.subagent_status
+                        .filter(|status| *status != ToolStatus::Running)
+                        .unwrap_or(ToolStatus::Denied),
+                );
+                self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                 self.invalidate(&mut step);
                 step.events.push(Event::Error {
                     message: format!("Codex {method}; reconnect explicitly"),
                     fatal: true,
                 });
             }
-            "error" => step.events.push(Event::Error {
-                message: params["error"]["message"]
+            "error" => {
+                let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| params["error"].to_string()),
-                fatal: false,
-            }),
+                    .unwrap_or_else(|| params["error"].to_string());
+                // A retry describes work still in progress. Putting it in
+                // Snapshot.error leaves a recovered turn marked as failed.
+                if params["willRetry"] == true {
+                    step.events.push(session_notice(message));
+                } else {
+                    step.events.push(Event::Error {
+                        message,
+                        fatal: false,
+                    });
+                }
+            }
             "warning" | "configWarning" | "guardianWarning" | "deprecationNotice" => {
-                step.events.push(Event::Error {
-                    message: params.to_string(),
-                    fatal: false,
-                })
+                let summary = params["message"]
+                    .as_str()
+                    .or_else(|| params["summary"].as_str())
+                    .filter(|text| !text.trim().is_empty());
+                let mut message = summary
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| params.to_string());
+                if summary.is_some() {
+                    for key in ["details", "path"] {
+                        if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
+                            message.push_str("\n\n");
+                            message.push_str(text);
+                        }
+                    }
+                }
+                step.events.push(session_notice(message));
             }
             "turn/diff/updated" => step.events.push(Event::Item(Item {
                 id: format!("{}/diff", string(params, "turnId")?),
@@ -2398,14 +2465,47 @@ impl Adapter for Codex {
         Ok(step)
     }
 }
+
+/// Advisory provider messages belong to the transcript, at their arrival
+/// position. Each occurrence has its own identity so later work and retries
+/// cannot move an old notice to the end or overwrite a previous one.
+fn session_notice(text: String) -> Event {
+    Event::Item(Item {
+        id: format!("codex-notice:{}", uuid::Uuid::new_v4()),
+        role: Role::System,
+        content: ItemContent::Text {
+            text,
+            thinking: false,
+            phase: Phase::Commentary,
+        },
+        started_at: None,
+        at: None,
+    })
+}
 impl Codex {
+    fn observe_thread_status(&mut self, status: &Value) {
+        self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
+        self.busy = status["type"] == "active";
+        match status["type"].as_str() {
+            Some("active") => self.subagent_status = Some(ToolStatus::Running),
+            Some("systemError") => self.subagent_status = Some(ToolStatus::Failed),
+            Some("idle")
+                if self
+                    .subagent_status
+                    .is_none_or(|value| value == ToolStatus::Running) =>
+            {
+                self.subagent_status = Some(ToolStatus::Succeeded);
+            }
+            _ => {}
+        }
+    }
     fn thread_state(&mut self, thread: &Value, step: &mut Step) -> Result<(), String> {
         let id = string(thread, "id")?;
         if self.thread.as_deref() != Some(id) {
             return Err("Codex metadata belongs to a different thread".into());
         }
         self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
-        self.busy = thread["status"]["type"] == "active";
+        self.observe_thread_status(&thread["status"]);
         step.events
             .push(Event::Waiting(waiting_on_user(&thread["status"])));
         step.events.push(Event::Session {
@@ -2420,6 +2520,16 @@ impl Codex {
         Ok(())
     }
 }
+fn agent_status(status: &Value) -> Option<ToolStatus> {
+    match status.as_str().or_else(|| status["type"].as_str()) {
+        Some("completed" | "idle" | "shutdown") => Some(ToolStatus::Succeeded),
+        Some("errored" | "failed" | "notFound" | "systemError") => Some(ToolStatus::Failed),
+        Some("interrupted") => Some(ToolStatus::Denied),
+        Some("running" | "pendingInit" | "active" | "inProgress") => Some(ToolStatus::Running),
+        _ => None,
+    }
+}
+
 fn waiting_on_user(status: &Value) -> bool {
     status["type"] == "active"
         && status["activeFlags"].as_array().is_some_and(|flags| {
@@ -3355,6 +3465,8 @@ mod tests {
             selection_dirty: false,
             turn: None,
             busy: false,
+            lifecycle_revision: 0,
+            subagent_status: None,
             ready: true,
             attached: true,
             direct_input: true,
@@ -3374,6 +3486,86 @@ mod tests {
             branch_points: Vec::new(),
             is_child: false,
             child_buffer: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn retry_notices_are_timeline_items_and_exhausted_retries_are_errors() {
+        let mut adapter = adapter();
+        let frame = json!({"method":"error","params":{"threadId":"thread-exact","turnId":"turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}});
+        let first = adapter.receive(frame.clone()).unwrap();
+        let second = adapter.receive(frame.clone()).unwrap();
+        let [Event::Item(item)] = first.events.as_slice() else {
+            panic!("{:?}", first.events)
+        };
+        assert_eq!(item.role, Role::System);
+        assert!(
+            matches!(&item.content, ItemContent::Text { text, thinking: false, phase: Phase::Commentary } if text == "Reconnecting... 1/2")
+        );
+        let [Event::Item(next)] = second.events.as_slice() else {
+            panic!("{:?}", second.events)
+        };
+        assert_ne!(item.id, next.id);
+        for will_retry in [json!(false), Value::Null] {
+            let mut failed = frame.clone();
+            failed["params"]["willRetry"] = will_retry;
+            assert!(matches!(
+                adapter.receive(failed).unwrap().events.as_slice(),
+                [Event::Error { fatal: false, .. }]
+            ));
+        }
+        let mut foreign = frame;
+        foreign["params"]["threadId"] = json!("another-thread");
+        assert!(adapter.receive(foreign).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn child_retry_is_recorded_in_the_child_timeline() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        let step = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}})).unwrap();
+        assert!(
+            matches!(step.events.as_slice(), [Event::SubagentItem { id, item: Item { role: Role::System, .. } }] if id == "child-thread")
+        );
+    }
+
+    #[test]
+    fn provider_warnings_are_readable_advisory_timeline_items() {
+        for (method, params, expected) in [
+            (
+                "warning",
+                json!({"message":"Warning", "threadId":"thread-exact"}),
+                "Warning",
+            ),
+            (
+                "guardianWarning",
+                json!({"message":"Guardian warning", "threadId":"thread-exact"}),
+                "Guardian warning",
+            ),
+            (
+                "configWarning",
+                json!({"summary":"Config warning", "details":"Fix this setting", "path":"/config.toml"}),
+                "Config warning\n\nFix this setting\n\n/config.toml",
+            ),
+            (
+                "deprecationNotice",
+                json!({"summary":"Deprecated", "details":"Use the new option"}),
+                "Deprecated\n\nUse the new option",
+            ),
+        ] {
+            let step = adapter()
+                .receive(json!({"method":method,"params":params}))
+                .unwrap();
+            assert!(
+                matches!(step.events.as_slice(), [Event::Item(Item { role: Role::System, content: ItemContent::Text {text, ..}, .. })] if text == expected),
+                "{method}: {:?}",
+                step.events
+            );
         }
     }
 
@@ -3511,6 +3703,175 @@ mod tests {
             .unwrap();
         assert!(adapter.history_initialized);
         assert_eq!(adapter.cursor.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn reattachment_requests_subagent_sources_explicitly() {
+        let mut parent = adapter();
+        parent
+            .pending
+            .insert(json!("attach").to_string(), Pending::Attach);
+        let attached = parent.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        let list = attached
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/list")
+            .unwrap();
+        assert_eq!(
+            list["params"]["sourceKinds"],
+            json!(["subAgentThreadSpawn"])
+        );
+        assert_eq!(list["params"]["ancestorThreadId"], "thread-exact");
+    }
+
+    #[test]
+    fn proven_child_start_discovers_early_streams_and_hydration_failure_keeps_them() {
+        let mut parent = adapter();
+        let started = parent.receive(json!({"method":"thread/started","params":{"thread":{"id":"child", "parentThreadId":"thread-exact", "agentNickname":"Scout", "status":{"type":"active"}}}})).unwrap();
+        assert_eq!(started.writes[0]["method"], "thread/resume");
+        assert!(parent.children.contains_key("child"));
+        let live = parent.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"child","turnId":"turn","itemId":"answer","delta":"Early streamed text"}})).unwrap();
+        assert!(live.events.is_empty());
+        let failed = parent
+            .receive(
+                json!({"id":started.writes[0]["id"],"error":{"message":"History read failed"}}),
+            )
+            .unwrap();
+        assert!(parent.children.contains_key("child"));
+        assert!(!parent.child_buffer.contains_key("child"));
+        assert!(failed.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child" && delta == "Early streamed text")));
+        assert!(!failed.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Failed),
+                ..
+            }
+        )));
+        let foreign = parent.receive(json!({"method":"thread/started","params":{"thread":{"id":"foreign","parentThreadId":"another-root"}}})).unwrap();
+        assert!(foreign.events.is_empty());
+        assert!(!parent.children.contains_key("foreign"));
+    }
+
+    #[test]
+    fn child_discovery_cannot_replay_active_metadata_over_idle_hydration() {
+        let mut parent = adapter();
+        let started = parent.receive(json!({"method":"thread/started","params":{"thread":{"id":"child","parentThreadId":"thread-exact","agentNickname":"Scout","status":{"type":"active"}}}})).unwrap();
+        let hydrated = parent.receive(json!({"id":started.writes[0]["id"],"result":{"thread":{"id":"child","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        assert!(!parent.children["child"].busy);
+        assert!(hydrated.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Succeeded),
+                ..
+            }
+        )));
+        let mut sparse = Step::default();
+        parent
+            .discover_child("child", &json!({}), &mut sparse)
+            .unwrap();
+        assert!(sparse.events.iter().any(
+            |event| matches!(event, Event::Subagent {kind, status:None, ..} if kind.is_empty())
+        ));
+    }
+
+    #[test]
+    fn native_prompt_late_ack_does_not_claim_a_new_active_turn_without_an_id() {
+        let mut adapter = adapter();
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "Prompt".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old","status":"completed","items":[]}}})).unwrap();
+        adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+        adapter.receive(json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress","items":[]}}})).unwrap();
+        assert!(adapter.busy);
+        assert_eq!(adapter.turn, None);
+    }
+
+    #[test]
+    fn child_terminal_outcomes_survive_idle_and_closure_and_new_turn_restarts_work() {
+        for (outcome, expected) in [
+            ("failed", ToolStatus::Failed),
+            ("interrupted", ToolStatus::Denied),
+            ("completed", ToolStatus::Succeeded),
+        ] {
+            let mut parent = adapter();
+            let mut child = adapter();
+            child.thread = Some("child".into());
+            child.is_child = true;
+            parent.children.insert("child".into(), Box::new(child));
+            parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"t","status":outcome,"items":[]}}})).unwrap();
+            for frame in [
+                json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"idle"}}}),
+                json!({"method":"thread/closed","params":{"threadId":"child"}}),
+            ] {
+                let observed = parent.receive(frame).unwrap();
+                assert!(observed.events.iter().any(|event| matches!(event, Event::Subagent {status:Some(status), ..} if *status == expected)), "{:?}", observed.events);
+            }
+            let next = parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"next","items":[]}}})).unwrap();
+            assert!(next.events.iter().any(|event| matches!(
+                event,
+                Event::Subagent {
+                    status: Some(ToolStatus::Running),
+                    ..
+                }
+            )));
+        }
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child".into());
+        child.is_child = true;
+        child.subagent_status = Some(ToolStatus::Running);
+        parent.children.insert("child".into(), Box::new(child));
+        let closed = parent
+            .receive(json!({"method":"thread/closed","params":{"threadId":"child"}}))
+            .unwrap();
+        assert!(closed.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Denied),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn native_prompt_late_ack_and_old_completion_cannot_reactivate_or_stop_a_new_turn() {
+        for newer in [false, true] {
+            let mut adapter = adapter();
+            let sent = adapter
+                .command(Command::Prompt {
+                    text: "Prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let start = |id| json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":id,"status":"inProgress","items":[]}}});
+            let complete = json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old","status":"completed","items":[]}}});
+            adapter.receive(start("old")).unwrap();
+            adapter.receive(complete.clone()).unwrap();
+            if newer {
+                adapter.receive(start("new")).unwrap();
+            }
+            let ack = adapter.receive(json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress","items":[]}}})).unwrap();
+            assert_eq!(adapter.busy, newer);
+            assert_eq!(adapter.turn.as_deref(), newer.then_some("new"));
+            assert!(
+                !ack.events
+                    .iter()
+                    .any(|event| matches!(event, Event::Status { busy: true, .. }))
+            );
+            if newer {
+                adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"new","item":{"id":"cmd","type":"commandExecution","command":"echo hi","cwd":"/tmp","status":"inProgress","commandActions":[]}}})).unwrap();
+                adapter.receive(complete).unwrap();
+                assert!(adapter.busy);
+                assert_eq!(adapter.turn.as_deref(), Some("new"));
+                assert!(!adapter.active_items.is_empty());
+            }
+        }
     }
 
     #[test]

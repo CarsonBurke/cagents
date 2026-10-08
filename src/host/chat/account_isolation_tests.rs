@@ -150,11 +150,13 @@ fn native_codex_starts_keep_each_account_on_its_own_home() {
     for round in 0..2 {
         // The second round is a restarted daemon, whose conversations start
         // again from the recipes they were issued with.
-        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new(format!("account-isolation-{round}")),
-            boot_id: crate::daemon::read_boot_id().unwrap(),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        })));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new(format!("account-isolation-{round}")),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+        )));
         for (session, (_, home)) in sessions.iter().zip(&accounts) {
             // The provider stand-in exits without answering; only where it
             // ran matters here.
