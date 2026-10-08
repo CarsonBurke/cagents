@@ -3855,3 +3855,237 @@ fn slash_path_without_configured_fetch_url_is_not_a_remote_argument() {
         );
     }
 }
+
+#[test]
+fn remote_ref_lookup_requires_the_exact_name_and_retains_tag_object_ids() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let published = publish_main(&fixture);
+    fixture.write("other.txt", b"another commit\n");
+    fixture.git_in_work(&["add", "other.txt"]);
+    let other = fixture.commit("nested branch");
+    fixture.git_in_work(&["push", "origin", "HEAD:refs/heads/a/refs/heads/main"]);
+    let listing = fixture.text(&["ls-remote", "origin", "refs/heads/main"]);
+    assert!(listing.starts_with(other.as_str()), "{listing}");
+    let requested = RemoteSideRef::parse("refs/heads/main").unwrap();
+    let service = fixture.service();
+    assert_eq!(
+        service
+            .remote_ref_oid(
+                &fixture.work(),
+                "origin",
+                &requested,
+                &CancellationToken::new()
+            )
+            .unwrap(),
+        Some(published),
+        "an earlier suffix match must not replace the exact branch"
+    );
+    fixture.run(&fixture.origin(), &["update-ref", "-d", "refs/heads/main"]);
+    assert_eq!(
+        service
+            .remote_ref_oid(
+                &fixture.work(),
+                "origin",
+                &requested,
+                &CancellationToken::new()
+            )
+            .unwrap(),
+        None,
+        "suffix-only matches must not invent the requested branch"
+    );
+    fixture.git_in_work(&["tag", "-a", "v1", "-m", "annotated"]);
+    fixture.git_in_work(&["push", "origin", "refs/tags/v1"]);
+    let tag = Oid::parse_object(fixture.text(&["rev-parse", "refs/tags/v1"])).unwrap();
+    assert_ne!(tag, other);
+    assert_eq!(
+        service
+            .remote_ref_oid(
+                &fixture.work(),
+                "origin",
+                &RemoteSideRef::parse("refs/tags/v1").unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap(),
+        Some(tag),
+        "an annotated tag lookup returns its tag object rather than its peeled commit"
+    );
+}
+
+#[test]
+fn ambiguous_push_reconciliation_uses_push_urls_and_git_url_rewrites() {
+    for configuration in 0..3 {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let first = publish_main(&fixture);
+        let push = fixture.root.path().join("push.git");
+        fixture.run(
+            fixture.root.path(),
+            &[
+                "clone",
+                "--bare",
+                fixture.origin().to_str().unwrap(),
+                push.to_str().unwrap(),
+            ],
+        );
+        if configuration != 0 {
+            fixture.git_in_work(&["remote", "set-url", "origin", "rewrite:repository"]);
+            let fetch_key = format!("url.{}.insteadOf", fixture.origin().display());
+            let push_key = format!("url.{}.pushInsteadOf", push.display());
+            fixture.git_in_work(&["config", &fetch_key, "rewrite:repository"]);
+            fixture.git_in_work(&["config", &push_key, "rewrite:repository"]);
+            if configuration == 2 {
+                let unmatched = fixture.root.path().join("unmatched-fetch.git");
+                fixture.git_in_work(&[
+                    "config",
+                    "--add",
+                    "remote.origin.url",
+                    unmatched.to_str().unwrap(),
+                ]);
+                assert_eq!(
+                    fixture.text(&["remote", "get-url", "--push", "--all", "origin"]),
+                    push.to_str().unwrap()
+                );
+            }
+        } else {
+            fixture.git_in_work(&[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                push.to_str().unwrap(),
+            ]);
+        }
+        fixture.write("second.txt", b"second\n");
+        fixture.git_in_work(&["add", "second.txt"]);
+        let second = fixture.commit("second");
+        let service = RepositoryService::new(
+            &fixture.git,
+            Arc::new(AmbiguousPushExecutor(SystemProcessExecutor)),
+        );
+        let request = PushRequest {
+            worktree: fixture.work(),
+            branch: ValidatedBranchName::parse("main").unwrap(),
+            target: PushTarget::Upstream {
+                remote: "origin".into(),
+                remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            },
+        };
+        let outcome = service.push(&request, &CancellationToken::new()).unwrap();
+        assert!(
+            matches!(outcome, PushOutcome::Pushed { ref oid, .. } if *oid == second),
+            "{outcome:?}"
+        );
+        assert_eq!(remote_oid(&fixture, "refs/heads/main"), first);
+        assert_eq!(
+            String::from_utf8(fixture.run(&push, &["rev-parse", "refs/heads/main"]))
+                .unwrap()
+                .trim(),
+            second.as_str()
+        );
+
+        // The fetch endpoint now has the desired commit, while the push
+        // endpoint is missing. That fetch evidence cannot prove a push.
+        fixture.git_in_work(&[
+            "remote",
+            "set-url",
+            "origin",
+            fixture.origin().to_str().unwrap(),
+        ]);
+        fixture.git_in_work(&[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            fixture.origin().to_str().unwrap(),
+        ]);
+        fixture.git_in_work(&["push", "origin", "refs/heads/main:refs/heads/main"]);
+        let missing = fixture.root.path().join("missing-push.git");
+        fixture.git_in_work(&[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            missing.to_str().unwrap(),
+        ]);
+        let outcome = service.push(&request, &CancellationToken::new()).unwrap();
+        assert!(
+            matches!(outcome, PushOutcome::OutcomeUnknown { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(remote_oid(&fixture, "refs/heads/main"), second);
+        assert!(!missing.exists());
+    }
+}
+
+#[test]
+fn ambiguous_push_requires_the_ref_at_every_configured_push_destination() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    publish_main(&fixture);
+    let first_push = fixture.root.path().join("first-push.git");
+    let second_push = fixture.root.path().join("second-push.git");
+    for destination in [&first_push, &second_push] {
+        fixture.run(
+            fixture.root.path(),
+            &[
+                "clone",
+                "--bare",
+                fixture.origin().to_str().unwrap(),
+                destination.to_str().unwrap(),
+            ],
+        );
+        fixture.git_in_work(&[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            destination.to_str().unwrap(),
+        ]);
+    }
+    fixture.write("second.txt", b"second\n");
+    fixture.git_in_work(&["add", "second.txt"]);
+    let second = fixture.commit("second");
+    let service = RepositoryService::new(
+        &fixture.git,
+        Arc::new(AmbiguousPushExecutor(SystemProcessExecutor)),
+    );
+    let request = PushRequest {
+        worktree: fixture.work(),
+        branch: ValidatedBranchName::parse("main").unwrap(),
+        target: PushTarget::Upstream {
+            remote: "origin".into(),
+            remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        },
+    };
+    let outcome = service.push(&request, &CancellationToken::new()).unwrap();
+    assert!(
+        matches!(outcome, PushOutcome::Pushed { ref oid, .. } if *oid == second),
+        "{outcome:?}"
+    );
+    for destination in [&first_push, &second_push] {
+        assert_eq!(
+            String::from_utf8(fixture.run(destination, &["rev-parse", "refs/heads/main"]))
+                .unwrap()
+                .trim(),
+            second.as_str()
+        );
+    }
+    let missing = fixture.root.path().join("missing-push.git");
+    fixture.git_in_work(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        missing.to_str().unwrap(),
+        second_push.to_str().unwrap(),
+    ]);
+    let outcome = service.push(&request, &CancellationToken::new()).unwrap();
+    assert!(
+        matches!(outcome, PushOutcome::OutcomeUnknown { .. }),
+        "the first destination alone cannot prove success: {outcome:?}"
+    );
+    assert!(!missing.exists());
+}
