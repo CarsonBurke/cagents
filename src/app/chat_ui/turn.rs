@@ -185,6 +185,7 @@ impl Turn {
         match self.outcome {
             Some(ToolStatus::Failed) => self.summary.push_str(" · failed"),
             Some(ToolStatus::Denied) => self.summary.push_str(" · denied"),
+            Some(ToolStatus::Stopped) => self.summary.push_str(" · stopped"),
             Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => {}
         }
     }

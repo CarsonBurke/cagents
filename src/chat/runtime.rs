@@ -2400,8 +2400,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             kind,
             description,
             status,
+            background,
         } => {
             let agent = subagent(state, &id);
+            if let Some(background) = background {
+                agent.background = background;
+            }
             if !kind.is_empty() {
                 agent.kind = kind;
             }
@@ -2625,6 +2629,7 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
         kind: String::new(),
         description: String::new(),
         status: ToolStatus::Running,
+        background: false,
         items: Vec::new(),
     });
     state.subagents.last_mut().expect("subagent was inserted")
@@ -2907,6 +2912,7 @@ mod tests {
                 kind: "Explore".into(),
                 description: "Inspect".into(),
                 status: None,
+                background: Some(true),
             },
         );
         apply_event(
@@ -2952,9 +2958,12 @@ mod tests {
                 kind: String::new(),
                 description: String::new(),
                 status: Some(ToolStatus::Succeeded),
+                background: None,
             },
         );
         assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
+        // An update that does not say leaves what is known in place.
+        assert!(state.subagents[0].background);
     }
     /// Readiness is what a sender waits on, so it ends with the provider.
     #[test]

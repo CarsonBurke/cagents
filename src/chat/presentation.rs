@@ -294,6 +294,7 @@ mod tests {
             kind: "review".into(),
             description: String::new(),
             status: super::super::ToolStatus::Running,
+            background: false,
             items: vec![child.clone()],
         };
         let mut snapshot = Snapshot {

@@ -420,6 +420,9 @@ enum Pending {
         original_id: Value,
     },
     ChildList,
+    /// Interrupting one child's turn, which leaves the parent and the other
+    /// children running.
+    StopChild,
     Fork,
 }
 
@@ -599,6 +602,8 @@ impl Codex {
                 .unwrap_or_default()
                 .into(),
             status,
+            // A child is a thread of its own, not work inside the parent's turn.
+            background: Some(true),
         });
         Ok(())
     }
@@ -620,6 +625,7 @@ impl Codex {
                     .children
                     .get(id)
                     .and_then(|child| child.subagent_status),
+                background: None,
             });
         }
         step.events.extend(chat::child_events(id, content.events));
@@ -857,6 +863,7 @@ impl Codex {
             branch: self.direct_input,
             queue_remove: self.queue_available && self.direct_input,
             queue_start: self.queue_available && self.direct_input,
+            stop_subagent: self.ready,
             ..Capabilities::default()
         }
     }
@@ -1416,6 +1423,15 @@ impl Adapter for Codex {
                 let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to interrupt")?;
                 self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?;
             }
+            // The client's form of the model's own `interrupt_agent`: a child
+            // is a thread of its own, so interrupting its turn reaches neither
+            // the parent nor its siblings. Unlike input, this is not refused
+            // for a child the server keeps from direct use.
+            Command::StopSubagent { id } => {
+                let child = self.children.get(&id).ok_or("This Codex subagent is no longer followed")?;
+                let turn = child.turn.clone().ok_or("This Codex subagent has no active turn to stop")?;
+                self.call(&mut step, "turn/interrupt", json!({"threadId":id,"turnId":turn}), Pending::StopChild)?;
+            }
             operation @ (Command::RemoveQueued { .. } | Command::StartQueued { .. }) => {
                 if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
                 let (method, id, pending) = match operation {
@@ -1580,7 +1596,12 @@ impl Adapter for Codex {
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 let message = format!(
-                    "Codex RPC error: {}",
+                    "{}: {}",
+                    if matches!(pending, Pending::StopChild) {
+                        "Codex could not stop the subagent"
+                    } else {
+                        "Codex RPC error"
+                    },
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
@@ -2039,6 +2060,8 @@ impl Adapter for Codex {
                     }
                 }
                 Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
+                // The child's own turn completion reports how it ended.
+                Pending::StopChild => {}
                 Pending::Other => {
                     if result["thread"].is_object() {
                         self.thread_state(&result["thread"], &mut step)?;
@@ -2399,7 +2422,7 @@ impl Adapter for Codex {
                 self.subagent_status = Some(
                     self.subagent_status
                         .filter(|status| *status != ToolStatus::Running)
-                        .unwrap_or(ToolStatus::Denied),
+                        .unwrap_or(ToolStatus::Stopped),
                 );
                 self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                 self.invalidate(&mut step);
@@ -2541,7 +2564,7 @@ fn agent_status(status: &Value) -> Option<ToolStatus> {
     match status.as_str().or_else(|| status["type"].as_str()) {
         Some("completed" | "idle" | "shutdown") => Some(ToolStatus::Succeeded),
         Some("errored" | "failed" | "notFound" | "systemError") => Some(ToolStatus::Failed),
-        Some("interrupted") => Some(ToolStatus::Denied),
+        Some("interrupted") => Some(ToolStatus::Stopped),
         Some("running" | "pendingInit" | "active" | "inProgress") => Some(ToolStatus::Running),
         _ => None,
     }
@@ -3818,7 +3841,7 @@ mod tests {
     fn child_terminal_outcomes_survive_idle_and_closure_and_new_turn_restarts_work() {
         for (outcome, expected) in [
             ("failed", ToolStatus::Failed),
-            ("interrupted", ToolStatus::Denied),
+            ("interrupted", ToolStatus::Stopped),
             ("completed", ToolStatus::Succeeded),
         ] {
             let mut parent = adapter();
@@ -3855,10 +3878,66 @@ mod tests {
         assert!(closed.events.iter().any(|event| matches!(
             event,
             Event::Subagent {
-                status: Some(ToolStatus::Denied),
+                status: Some(ToolStatus::Stopped),
                 ..
             }
         )));
+    }
+
+    /// A child is a thread of its own: stopping it interrupts its turn alone,
+    /// and cancelling the parent's turn names only the parent's.
+    #[test]
+    fn stopping_a_child_interrupts_only_its_own_turn() {
+        let mut parent = adapter();
+        parent.thread = Some("parent".into());
+        parent.turn = Some("parent-turn".into());
+        parent.ready = true;
+        for (id, turn) in [("busy-child", Some("child-turn")), ("idle-child", None)] {
+            let mut child = adapter();
+            child.thread = Some(id.into());
+            child.is_child = true;
+            child.turn = turn.map(str::to_owned);
+            parent.children.insert(id.into(), Box::new(child));
+        }
+        assert!(parent.capabilities().stop_subagent);
+        assert!(!parent.capabilities().interrupt_stops_background);
+        let stop = parent
+            .command(Command::StopSubagent {
+                id: "busy-child".into(),
+            })
+            .unwrap();
+        assert_eq!(stop.writes.len(), 1);
+        assert_eq!(stop.writes[0]["method"], "turn/interrupt");
+        assert_eq!(
+            stop.writes[0]["params"],
+            json!({"threadId":"busy-child","turnId":"child-turn"})
+        );
+        let refused = parent
+            .receive(json!({"id":stop.writes[0]["id"],"error":{"code":-32600,"message":"no active turn to interrupt"}}))
+            .unwrap();
+        assert!(refused.events.iter().any(|event| matches!(
+            event,
+            Event::Error { message, fatal: false } if message.starts_with("Codex could not stop the subagent")
+        )));
+        assert!(
+            parent
+                .command(Command::StopSubagent {
+                    id: "idle-child".into()
+                })
+                .is_err()
+        );
+        assert!(
+            parent
+                .command(Command::StopSubagent {
+                    id: "unknown".into()
+                })
+                .is_err()
+        );
+        let cancel = parent.command(Command::Interrupt).unwrap();
+        assert_eq!(
+            cancel.writes[0]["params"],
+            json!({"threadId":"parent","turnId":"parent-turn"})
+        );
     }
 
     #[test]
