@@ -4678,70 +4678,99 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Ok(MutationOutcome::Applied { paths: applied });
         }
 
-        // `request.untracked` was chosen from a snapshot the user has since been
-        // looking at in a confirmation dialog. Another Git client may have
-        // staged or committed one of those paths in the meantime, and unlinking
-        // a *tracked* file is not what the user confirmed — so the
-        // classification is re-established here, immediately before the
-        // deletions, from the index rather than from the stale snapshot.
-        let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation) {
-            Ok(paths) => paths,
+        // This is Git's actual worktree index, including linked worktrees.
+        // Hold its standard lock while classifying and unlinking: otherwise a
+        // terminal's `git add` can make a selected path tracked after the read.
+        let mut index_lock = match self.discard_index_lock(&request.worktree, cancellation) {
+            Ok(lock) => lock,
             Err(error) => {
-                // The tracked half may already have destroyed working-tree
-                // edits. Preserve its exact outcome while refusing every
-                // untracked path whose classification could not be checked.
-                let reason = format!("could not verify that the path is still untracked: {error}");
-                let failures = untracked
-                    .into_iter()
-                    .map(|path| MutationFailure::Path {
-                        path,
-                        reason: reason.clone(),
-                    })
-                    .collect();
-                return Ok(report_discard(applied, failures));
+                return Ok(report_discard(
+                    applied,
+                    discard_failures(&untracked, format!("cannot protect the index: {error}")),
+                ));
             }
         };
-
-        // Opened once, and every unlink below is anchored to this descriptor
-        // rather than to the worktree's name.
-        let root = match fs_safety::Root::open(&request.worktree) {
-            Ok(root) => root,
-            Err(error) => {
-                // Attributed to each path rather than reported once, so every
-                // failure a discard reports is path-scoped and disjoint from
-                // the paths it applied: the caller can always retry exactly
-                // the remainder.
-                let reason = format!("{}: {error}", request.worktree.display());
-                let failures = untracked
-                    .into_iter()
-                    .map(|path| MutationFailure::Path {
-                        path,
-                        reason: reason.clone(),
-                    })
-                    .collect();
-                return Ok(report_discard(applied, failures));
+        let mut failures = (|| {
+            // The confirmation may have outlived the snapshot. Re-establish
+            // tracking under the lock, before deleting any untracked file.
+            let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation)
+            {
+                Ok(paths) => paths,
+                Err(error) => {
+                    return discard_failures(
+                        &untracked,
+                        format!("could not verify that the path is still untracked: {error}"),
+                    );
+                }
+            };
+            let root = match fs_safety::Root::open(&request.worktree) {
+                Ok(root) => root,
+                Err(error) => {
+                    return discard_failures(
+                        &untracked,
+                        format!("{}: {error}", request.worktree.display()),
+                    );
+                }
+            };
+            // A refused directory does not prevent independent selected files
+            // being attempted. Cancellation or loss of the index lock ends the
+            // remaining batch, whose paths are still known untouched.
+            let mut failures = Vec::new();
+            for (position, path) in untracked.iter().enumerate() {
+                let protected = if cancellation.is_cancelled() {
+                    Err("discard cancelled before deletion".to_owned())
+                } else {
+                    index_lock.check()
+                };
+                if let Err(reason) = protected {
+                    failures.extend(discard_failures(&untracked[position..], reason));
+                    break;
+                }
+                if tracked_now.contains(path) {
+                    failures.push(MutationFailure::Path {
+                        path: path.clone(),
+                        reason: "the path is tracked now but was untracked when it was selected"
+                            .into(),
+                    });
+                    continue;
+                }
+                match delete_untracked(&root, path) {
+                    Ok(()) => applied.push(path.clone()),
+                    Err(failure) => failures.push(failure),
+                }
             }
-        };
-        // Every selected path is attempted. Git reports an untracked nested
-        // repository as its directory, and a directory is one thing a discard
-        // will never unlink — so stopping at the first refusal made the set of
-        // files that survived depend on nothing but where that directory's name
-        // happened to sort among them.
-        let mut failures = Vec::new();
-        for path in untracked {
-            if tracked_now.contains(&path) {
-                failures.push(MutationFailure::Path {
-                    path,
-                    reason: "the path is tracked now but was untracked when it was selected".into(),
-                });
-                continue;
-            }
-            match delete_untracked(&root, &path) {
-                Ok(()) => applied.push(path),
-                Err(failure) => failures.push(failure),
+            failures
+        })();
+        if let Err(reason) = index_lock.release() {
+            let cleanup = format!("could not release the discard index lock: {reason}");
+            if applied.is_empty()
+                && let Some(MutationFailure::Path { reason, .. }) = failures.first_mut()
+            {
+                // A wholly refused discard presents its first path failure.
+                // Keep lock cleanup diagnostics visible there as well.
+                reason.push_str("; ");
+                reason.push_str(&cleanup);
+            } else {
+                failures.push(MutationFailure::Rejected { reason: cleanup });
             }
         }
         Ok(report_discard(applied, failures))
+    }
+
+    fn discard_index_lock(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<DiscardIndexLock, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+            ),
+            cancellation,
+        )?;
+        let index = parse_path_line(&output.stdout, "index_path")?;
+        DiscardIndexLock::acquire(&index).map_err(|reason| ValidationError::Io(reason).into())
     }
 
     pub fn commit_command(&self, request: &CommitRequest) -> Result<CommandSpec, ValidationError> {
@@ -5849,6 +5878,118 @@ fn pathspec_arguments<'a>(
     arguments.push(OsString::from("--"));
     arguments.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
     arguments
+}
+
+/// A cooperative Git index guard. Git writers respect `index.lock`; clients
+/// that deliberately replace another writer's lock violate that protocol.
+/// Never publish index bytes or remove a foreign/stale lock. A crash leaves
+/// the same stale-lock evidence Git itself leaves, requiring explicit recovery.
+struct DiscardIndexLock {
+    parent: fs_safety::Root,
+    name: OsString,
+    file: fs::File,
+    version: (u64, u64, u64, i64, i64, i64, i64),
+    active: bool,
+}
+
+impl DiscardIndexLock {
+    fn acquire(index: &Path) -> Result<Self, String> {
+        if !index.is_absolute() {
+            return Err("Git reported a relative index path".into());
+        }
+        let parent = index.parent().ok_or("Git reported no index parent")?;
+        let parent = fs_safety::Root::open(parent).map_err(|error| error.to_string())?;
+        let mut name = index
+            .file_name()
+            .ok_or("Git reported no index name")?
+            .to_owned();
+        name.push(".lock");
+        let (file, temporary) =
+            fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
+        if let Err(error) = fs_safety::rename_new_within(&parent, &temporary, &name) {
+            let cleanup = fs_safety::unlink_within(&parent, &temporary);
+            return Err(match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup) => format!("{error}; temporary cleanup failed: {cleanup}"),
+            });
+        }
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "index lock acquired but its metadata is unavailable; left {} untouched: {error}",
+                parent.path().join(&name).display()
+            )
+        })?;
+        Ok(Self {
+            parent,
+            name,
+            version: Self::version(&metadata),
+            file,
+            active: true,
+        })
+    }
+
+    fn version(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    }
+
+    fn owns_lock(&self) -> Result<(), String> {
+        let opened = self.file.metadata().map_err(|error| error.to_string())?;
+        let named = fs_safety::metadata_beneath(&self.parent, Path::new(&self.name))
+            .map_err(|error| error.to_string())?;
+        if Self::version(&opened) != self.version || Self::version(&named) != self.version {
+            return Err(
+                "index lock was replaced or modified; foreign evidence was preserved".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let opened = self.parent.metadata().map_err(|error| error.to_string())?;
+        let named = fs::metadata(self.parent.path()).map_err(|error| error.to_string())?;
+        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+            return Err("the index directory was replaced; no further files were deleted".into());
+        }
+        self.owns_lock()
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        if !std::mem::take(&mut self.active) {
+            return Ok(());
+        }
+        self.owns_lock()?;
+        fs_safety::unlink_within(&self.parent, &self.name).map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for DiscardIndexLock {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(reason) = self.release()
+        {
+            tracing::warn!(path = %self.parent.path().join(&self.name).display(), %reason, "discard index lock cleanup failed");
+        }
+    }
+}
+
+fn discard_failures(paths: &[RepoPath], reason: String) -> Vec<MutationFailure> {
+    paths
+        .iter()
+        .map(|path| MutationFailure::Path {
+            path: path.clone(),
+            reason: reason.clone(),
+        })
+        .collect()
 }
 
 /// Names exactly what a discard deleted and what it refused.
@@ -7970,14 +8111,83 @@ mod tests {
     }
 
     #[test]
+    fn discard_index_guard_preserves_foreign_or_modified_evidence() {
+        for replace in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let index = directory.path().join("index");
+            let lock = directory.path().join("index.lock");
+            let mut guard = DiscardIndexLock::acquire(&index).unwrap();
+            if replace {
+                fs::remove_file(&lock).unwrap();
+            }
+            fs::write(&lock, b"foreign evidence").unwrap();
+            assert!(guard.check().is_err());
+            assert!(guard.release().is_err());
+            drop(guard);
+            assert_eq!(fs::read(&lock).unwrap(), b"foreign evidence");
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn discard_index_guard_releases_through_its_open_directory_after_a_move() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("metadata");
+        let moved = root.path().join("moved");
+        fs::create_dir(&directory).unwrap();
+        let mut guard = DiscardIndexLock::acquire(&directory.join("index")).unwrap();
+        fs::rename(&directory, &moved).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("index.lock"), b"replacement writer").unwrap();
+        assert!(guard.check().is_err());
+        guard.release().unwrap();
+        assert!(!moved.join("index.lock").exists());
+        assert_eq!(
+            fs::read(directory.join("index.lock")).unwrap(),
+            b"replacement writer"
+        );
+    }
+
+    #[test]
+    fn discard_index_guard_releases_owned_lock_during_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = DiscardIndexLock::acquire(&directory.path().join("index")).unwrap();
+            panic!("injected discard worker panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    fn fake_discard_service(
+        worktree: &Path,
+        classifications: Vec<Result<ProcessOutput, ProcessFailure>>,
+    ) -> RepositoryService<FakeExecutor> {
+        let git_directory = worktree.join(".git");
+        fs::create_dir_all(&git_directory).unwrap();
+        let mut index_path = git_directory
+            .join("index")
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        index_path.push(b'\n');
+        fake_service(
+            classifications
+                .into_iter()
+                .flat_map(|classification| [success(&index_path), classification])
+                .collect(),
+        )
+    }
+
+    #[test]
     fn discard_requires_confirmation_and_never_removes_a_directory() {
         let worktree = tempfile::tempdir().unwrap();
         fs::create_dir(worktree.path().join("keep")).unwrap();
         fs::write(worktree.path().join("keep/file.txt"), b"data").unwrap();
 
-        // One `git ls-files` read per request with untracked paths, which
-        // re-establishes that they are still untracked.
-        let service = fake_service(vec![success(b""), success(b"")]);
+        // Resolve the index and classify the selection once per request,
+        // while holding the index lock against external Git writers.
+        let service = fake_discard_service(worktree.path(), vec![success(b""), success(b"")]);
         let unconfirmed = service.discard(
             &DiscardRequest {
                 worktree: worktree.path().to_path_buf(),
@@ -8038,7 +8248,7 @@ mod tests {
         fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
         std::os::unix::fs::symlink(outside.path(), worktree.path().join("link")).unwrap();
 
-        let service = fake_service(vec![success(b"")]);
+        let service = fake_discard_service(worktree.path(), vec![success(b"")]);
         let outcome = service
             .discard(
                 &DiscardRequest {
@@ -8107,7 +8317,10 @@ mod tests {
             untracked: vec![path("sub/victim.txt")],
             confirmed: true,
         };
-        let service = fake_service((0..=ROUNDS).map(|_| success(b"")).collect());
+        let service = fake_discard_service(
+            worktree.path(),
+            (0..=ROUNDS).map(|_| success(b"")).collect(),
+        );
         for _ in 0..ROUNDS {
             let _ = fs::write(parked_directory.join("victim.txt"), b"inside");
             let _ = fs::write(active.join("victim.txt"), b"inside");
