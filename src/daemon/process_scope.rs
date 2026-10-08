@@ -1,5 +1,6 @@
 //! Give a process owner and its future descendants their own OOM selection unit.
-//! Called only in an execed holder, before it forks the actual provider/PTY root.
+//! Holders enroll before spawning their provider/PTY root. Direct providers
+//! enroll before receiving their first prompt.
 use std::{
     fs, io,
     os::unix::process::CommandExt,
