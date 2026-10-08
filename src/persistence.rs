@@ -599,6 +599,233 @@ impl StateStore {
         Ok(commit)
     }
 
+    /// Resolve an archived resource owner for a daemon-authorized canonical pane.
+    /// Historical descriptors can share an identity, so only the recipe's actual
+    /// owner can authorize this transfer. The commit rechecks ownership and CAS.
+    pub fn closed_terminal_pane_adoption(
+        &self,
+        state: &WorkspaceState,
+        canonical: CardId,
+        terminal: TerminalId,
+    ) -> Result<Option<TerminalPaneAdoption>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let owner: Option<(String, String, String)> = inner
+            .connection
+            .query_row(
+                "SELECT c.card_id,c.workspace_id,c.existence_json FROM terminal_recipes t
+             JOIN cards c ON c.card_id=t.card_id WHERE t.terminal_id=?1",
+                [terminal.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((owner, workspace, existence)) = owner else {
+            return Ok(None);
+        };
+        let alias = parse_id("terminal owner", &owner)?;
+        if alias == canonical
+            || workspace != state.id.to_string()
+            || from_json::<Existence>("terminal owner existence", &existence)?.is_open()
+        {
+            return Ok(None);
+        }
+        let Some(source) = state.cards.iter().find(|card| card.id == alias) else {
+            return Ok(None);
+        };
+        if source.existence != from_json::<Existence>("terminal owner existence", &existence)?
+            || !matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal)
+        {
+            return Ok(None);
+        }
+        Ok(Some(TerminalPaneAdoption {
+            alias,
+            canonical,
+            terminal,
+        }))
+    }
+
+    /// Repair one already-closed historical owner from an authoritative shared
+    /// pane descriptor. This is maintenance of a live database: it deliberately
+    /// does not run startup reconciliation or save a reconstructed workspace.
+    /// Navigation, drafts, pending operations and unrelated actor proofs remain
+    /// untouched. The caller must verify the supplied pane against the daemon's
+    /// current shared view; this API does not authorize an actor start or resume.
+    pub fn repair_closed_terminal_pane_owner(
+        path: impl AsRef<Path>,
+        boot_id: &BootId,
+        workspace: WorkspaceId,
+        canonical: &CardState,
+        base: SnapshotBase<'_>,
+    ) -> Result<Option<WorkspaceCommit>> {
+        let CardKind::Terminal(session) = &canonical.kind else {
+            return Err(StoreError::InvalidState(
+                "canonical pane must be a terminal".into(),
+            ));
+        };
+        if !canonical.existence.is_open()
+            || !canonical.width_fraction.is_finite()
+            || canonical.width_fraction <= 0.0
+            || boot_id.as_str().is_empty()
+        {
+            return Err(StoreError::InvalidState(
+                "invalid canonical pane repair".into(),
+            ));
+        }
+        let mut connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::InvalidState(
+                "repair requires the current store schema".into(),
+            ));
+        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if metadata(&transaction, "last_boot_id")?.as_deref() != Some(boot_id.as_str()) {
+            return Err(StoreError::InvalidState(
+                "repair requires the store's current boot".into(),
+            ));
+        }
+        let workspace_id = workspace.to_string();
+        let actual = select_generation(&transaction, SELECT_WORKSPACE_GENERATION, &workspace_id)?;
+        check_generation("workspace", workspace, base.workspace, actual)?;
+        if !select_existence(&transaction, SELECT_WORKSPACE_EXISTENCE, &workspace_id)?
+            .is_some_and(|existence| existence.is_open())
+        {
+            return Err(StoreError::InvalidState(
+                "repair requires an open workspace".into(),
+            ));
+        }
+        let owner: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT c.card_id,c.workspace_id FROM terminal_recipes t
+             JOIN cards c ON c.card_id=t.card_id WHERE t.terminal_id=?1",
+                [session.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((owner, owner_workspace)) = owner else {
+            return Err(StoreError::InvalidState(
+                "terminal has no historical owner".into(),
+            ));
+        };
+        if owner_workspace != workspace_id {
+            return Err(StoreError::InvalidState(
+                "terminal belongs to another workspace".into(),
+            ));
+        }
+        let alias: CardId = parse_id("terminal owner", &owner)?;
+        let stored = existing_cards(&transaction, &workspace_id)?;
+        if alias == canonical.id {
+            // Replays do not overwrite a canonical actor's newer runtime proof.
+            return Ok(None);
+        }
+        let source = &stored[&alias];
+        if source.existence.is_open() || source.kind != PersistedCardKind::Terminal {
+            return Err(StoreError::InvalidState(
+                "repair requires an already-closed terminal owner".into(),
+            ));
+        }
+        check_generation(
+            "card",
+            alias,
+            base.cards.get(&alias).copied().unwrap_or(0),
+            Some(source.generation),
+        )?;
+        if let Some(target) = stored.get(&canonical.id) {
+            if !target.existence.is_open() || target.kind != PersistedCardKind::Terminal {
+                return Err(StoreError::InvalidState(
+                    "repair cannot replace or resurrect a canonical pane".into(),
+                ));
+            }
+            let target_session = load_terminal_record(&transaction, canonical.id)?;
+            if target_session.id != session.id {
+                return Err(StoreError::InvalidState(
+                    "canonical pane owns a different terminal".into(),
+                ));
+            }
+        }
+        let expected_target = base.cards.get(&canonical.id).copied().unwrap_or(0);
+        check_generation(
+            "card",
+            canonical.id,
+            expected_target,
+            stored.get(&canonical.id).map(|card| card.generation),
+        )?;
+        let archived = load_terminal_record(&transaction, alias)?;
+        if archived.launch != session.launch
+            || archived.owned_codex_listener != session.owned_codex_listener
+            || archived.recovery_origin != session.recovery_origin
+            || archived.predecessor != session.predecessor
+            || archived.resume_hint != session.resume_hint
+            || archived.transcript_path != session.transcript_path
+        {
+            return Err(StoreError::InvalidState(
+                "canonical pane must preserve the historical terminal's identity and transcript"
+                    .into(),
+            ));
+        }
+        let timestamp = now_unix_ms();
+        let source_generation = next_generation(source.generation, "card", alias)?;
+        transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
+        // Preserve existence_json byte for byte: the user's closure has its own
+        // timestamp and reason, independent of this later identity transfer.
+        transaction.execute(
+            "UPDATE cards SET content_json=?1,content_hash=NULL,generation=?2,updated_at_unix_ms=?3 WHERE card_id=?4",
+            params![to_json(&archived)?,u64_to_i64(source_generation,"card generation")?,timestamp,alias.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE terminal_recipes SET card_id=?1 WHERE terminal_id=?2 AND card_id=?3",
+            params![
+                canonical.id.to_string(),
+                session.id.to_string(),
+                alias.to_string()
+            ],
+        )?;
+        let ordinal: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT ordinal FROM cards WHERE card_id=?1),
+                 (SELECT COALESCE(MAX(ordinal),-1)+1 FROM cards WHERE workspace_id=?2))",
+            params![canonical.id.to_string(), workspace_id],
+            |row| row.get(0),
+        )?;
+        let ordinal = usize::try_from(ordinal)
+            .map_err(|_| StoreError::InvalidState("invalid card ordinal".into()))?;
+        let target_generation = save_card(
+            &transaction,
+            &workspace_id,
+            ordinal,
+            canonical,
+            expected_target,
+            stored.get(&canonical.id),
+            timestamp,
+        )?;
+        let generation = next_generation(base.workspace, "workspace", workspace)?;
+        transaction.execute(
+            "UPDATE workspaces SET generation=?1,updated_at_unix_ms=?2 WHERE workspace_id=?3",
+            params![
+                u64_to_i64(generation, "workspace generation")?,
+                timestamp,
+                workspace_id
+            ],
+        )?;
+        let mut card_generations: BTreeMap<_, _> = stored
+            .into_iter()
+            .map(|(id, card)| (id, card.generation))
+            .collect();
+        card_generations.insert(alias, source_generation);
+        card_generations.insert(canonical.id, target_generation);
+        transaction.commit()?;
+        Ok(Some(WorkspaceCommit {
+            generation,
+            card_generations,
+        }))
+    }
+
     /// Commit canonical pane adoption and the complete navigation snapshot in
     /// one transaction. Ordinary snapshots cannot transfer resource ownership.
     pub fn save_workspace_with_terminal_adoptions(
@@ -4794,6 +5021,299 @@ mod tests {
         assert_eq!(after.id, before.id);
         assert_eq!(after.launch, before.launch);
         assert_eq!(restored.card_scopes, state.card_scopes);
+    }
+
+    #[test]
+    fn closed_terminal_owner_repair_is_narrow_cas_and_idempotent() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("closed-adoption");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let alias = state.cards[0].id;
+        let mut canonical = state.cards[0].clone();
+        canonical.id = CardId::new();
+        let CardKind::Terminal(session) = &canonical.kind else {
+            panic!()
+        };
+        let terminal = session.id;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot_id,
+                state.id,
+                &canonical,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards
+                }
+            )
+            .is_err()
+        );
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 123,
+                reason: Some("closed by user".into()),
+            },
+        };
+        state.focused = None;
+        state.chat_drafts.insert(alias, "historical draft".into());
+        state
+            .chat_drafts
+            .insert(canonical.id, "unsaved canonical draft".into());
+        state.pending_terminal_creations.insert(CardId::new());
+        lane.save(&store, &state).unwrap();
+        assert_eq!(
+            store
+                .closed_terminal_pane_adoption(&state, canonical.id, terminal)
+                .unwrap(),
+            Some(TerminalPaneAdoption {
+                alias,
+                canonical: canonical.id,
+                terminal
+            })
+        );
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot("other"),
+                state.id,
+                &canonical,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot_id,
+                state.id,
+                &canonical,
+                SnapshotBase {
+                    workspace: lane.workspace - 1,
+                    cards: &lane.cards
+                }
+            )
+            .is_err()
+        );
+        let mut conflicting = canonical.clone();
+        let CardKind::Terminal(conflict) = &mut conflicting.kind else {
+            panic!()
+        };
+        conflict.launch.program = "/unrelated".into();
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot_id,
+                state.id,
+                &conflicting,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards
+                }
+            )
+            .is_err()
+        );
+        let mut unrelated = workspace_with_terminal(&boot_id);
+        unrelated.cards[0].id = canonical.id;
+        unrelated.focused = Some(canonical.id);
+        let mut unrelated_lane = SaveLane::default();
+        unrelated_lane.save(&store, &unrelated).unwrap();
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot_id,
+                state.id,
+                &canonical,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards
+                }
+            )
+            .is_err()
+        );
+        // Use a fresh canonical id after proving a foreign target stays untouched.
+        assert_eq!(
+            store.stored_generations(unrelated.id).unwrap().workspace,
+            unrelated_lane.workspace
+        );
+        canonical.id = CardId::new();
+        let CardKind::Terminal(session) = &canonical.kind else {
+            panic!()
+        };
+        let before_metadata: Vec<(String, String)> = {
+            let inner = store.lock_inner().unwrap();
+            inner
+                .connection
+                .prepare("SELECT key,value FROM metadata ORDER BY key")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        let mut stale_cards = lane.cards.clone();
+        stale_cards.insert(alias, 0);
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot_id,
+                state.id,
+                &canonical,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &stale_cards
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store.stored_generations(state.id).unwrap().workspace,
+            lane.workspace
+        );
+        let commit = StateStore::repair_closed_terminal_pane_owner(
+            &path,
+            &boot_id,
+            state.id,
+            &canonical,
+            SnapshotBase {
+                workspace: lane.workspace,
+                cards: &lane.cards,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let archived = store.load_card(alias, None).unwrap().unwrap();
+        assert_eq!(archived.existence, state.cards[0].existence);
+        assert_eq!(archived.kind, state.cards[0].kind);
+        let inner = store.lock_inner().unwrap();
+        assert_eq!(
+            load_terminal_record(&inner.connection, canonical.id).unwrap(),
+            *session
+        );
+        let after_metadata: Vec<(String, String)> = inner
+            .connection
+            .prepare("SELECT key,value FROM metadata ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(after_metadata, before_metadata);
+        drop(inner);
+        assert_eq!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path,
+                &boot_id,
+                state.id,
+                &canonical,
+                SnapshotBase {
+                    workspace: commit.generation,
+                    cards: &commit.card_generations
+                }
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .closed_terminal_pane_adoption(&state, canonical.id, terminal)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.stored_generations(state.id).unwrap().workspace,
+            commit.generation
+        );
+    }
+
+    #[test]
+    fn closed_terminal_admission_selects_actual_owner_among_archives() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("historical-aliases");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let first = state.cards[0].id;
+        let CardKind::Terminal(session) = &state.cards[0].kind else {
+            panic!()
+        };
+        let terminal = session.id;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        let mut second = state.cards[0].clone();
+        second.id = CardId::new();
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("old alias".into()),
+            },
+        };
+        state.cards.push(second.clone());
+        state.focused = Some(second.id);
+        let commit = store
+            .save_workspace_with_terminal_adoptions(
+                &state,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                &[TerminalPaneAdoption {
+                    alias: first,
+                    canonical: second.id,
+                    terminal,
+                }],
+            )
+            .unwrap();
+        lane.workspace = commit.generation;
+        lane.cards = commit.card_generations;
+        state.cards[1].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 2,
+                reason: Some("closed by user".into()),
+            },
+        };
+        state.focused = None;
+        lane.save(&store, &state).unwrap();
+        let canonical = CardId::new();
+        assert_eq!(
+            store
+                .closed_terminal_pane_adoption(&state, canonical, terminal)
+                .unwrap(),
+            Some(TerminalPaneAdoption {
+                alias: second.id,
+                canonical,
+                terminal
+            })
+        );
+        state.cards[1].existence = Existence::Open;
+        assert_eq!(
+            store
+                .closed_terminal_pane_adoption(&state, canonical, terminal)
+                .unwrap(),
+            None
+        );
+        state.cards[1].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 999,
+                reason: Some("changed local closure".into()),
+            },
+        };
+        assert_eq!(
+            store
+                .closed_terminal_pane_adoption(&state, canonical, terminal)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

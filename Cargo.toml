@@ -112,6 +112,10 @@ test = false
 bench = false
 required-features = ["host"]
 
+[[example]]
+name = "repair-closed-terminal-owner"
+required-features = ["ui"]
+
 [dependencies]
 cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
