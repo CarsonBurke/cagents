@@ -3517,7 +3517,11 @@ fn discard_refuses_foreign_index_lock_and_releases_its_lock_after_path_refusal()
         .service()
         .discard(&request, &CancellationToken::new())
         .unwrap();
-    assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
+    assert!(
+        matches!(&outcome, MutationOutcome::NotApplied { failure }
+            if failure.to_string().contains(index_lock.to_str().unwrap())),
+        "contention must identify the actual lock path: {outcome:?}"
+    );
     assert_eq!(fs::read(&index_lock).unwrap(), b"foreign writer evidence");
     assert_eq!(
         fs::read(fixture.work().join("selected.txt")).unwrap(),

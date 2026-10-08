@@ -5907,10 +5907,14 @@ impl DiscardIndexLock {
         let (file, temporary) =
             fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
         if let Err(error) = fs_safety::rename_new_within(&parent, &temporary, &name) {
+            let reason = format!(
+                "cannot acquire {}: {error}",
+                parent.path().join(&name).display()
+            );
             let cleanup = fs_safety::unlink_within(&parent, &temporary);
             return Err(match cleanup {
-                Ok(()) => error.to_string(),
-                Err(cleanup) => format!("{error}; temporary cleanup failed: {cleanup}"),
+                Ok(()) => reason,
+                Err(cleanup) => format!("{reason}; temporary cleanup failed: {cleanup}"),
             });
         }
         let metadata = file.metadata().map_err(|error| {
