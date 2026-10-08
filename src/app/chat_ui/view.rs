@@ -85,7 +85,7 @@ const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
 ///
 /// The list sits between the transcript and the composer, so it is bounded:
 /// an agent with forty skills must not push the conversation off screen. A
-/// whole number of rows, so the last visible one is never cut in half.
+/// whole number of rows before adding the inset that scrolls with them.
 const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
 
 /// The completion list's inset from its own edge.
@@ -557,10 +557,11 @@ fn completion_row<'a>(
 ///
 /// Rows are a fixed height so the keyboard highlight can be scrolled into view
 /// by arithmetic rather than by measuring the laid-out list.
-pub(super) fn completion_extent(count: usize) -> (f32, f32) {
+pub(super) fn completion_extent(count: usize) -> (f32, f32, f32) {
     (
         COMPLETION_ROW,
-        (count as f32 * COMPLETION_ROW).min(COMPLETION_CEILING),
+        (count as f32 * COMPLETION_ROW).min(COMPLETION_CEILING) + 2.0 * COMPLETION_INSET,
+        COMPLETION_INSET,
     )
 }
 
@@ -1184,8 +1185,9 @@ impl Runtime {
         }
         let transcript = widget::column::with_children(transcript)
             .spacing(step::GAP_L)
-            .padding(design::with_vertical_rail(iced::Padding::ZERO))
+            .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
             .width(Length::Fill);
+        let transcript_index = content.len();
         content.push(selection::transcript(
             scroll::transcript(
                 transcript,
@@ -1424,7 +1426,7 @@ impl Runtime {
                     .completion
                     .enter_chooses(&token, row, &self.snapshot.skills),
             });
-            let (_, viewport) = completion_extent(rows.len());
+            let (_, viewport, _) = completion_extent(rows.len());
             let rows = rows
                 .into_iter()
                 .enumerate()
@@ -1436,10 +1438,9 @@ impl Runtime {
                 .collect::<Vec<_>>();
             content.push(
                 widget::container(
-                    widget::scrollable(
-                        widget::column::with_children(rows)
-                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                    )
+                    widget::scrollable(widget::column::with_children(rows).padding(
+                        design::with_vertical_rail(iced::Padding::new(COMPLETION_INSET)),
+                    ))
                     .id(card_control_id(target.card, COMPLETION_LIST))
                     .on_scroll(move |viewport| {
                         action(Action::CompletionScrolled(
@@ -1452,7 +1453,6 @@ impl Runtime {
                     ))
                     .height(Length::Fixed(viewport)),
                 )
-                .padding(COMPLETION_INSET)
                 .class(design::surface(
                     Some(design::raised),
                     [design::RADIUS_M; 4],
@@ -1988,15 +1988,29 @@ impl Runtime {
             action(Action::PermissionPicker(target, false)),
         );
         let pane = widget::container(super::layout::pane(
-            widget::column::with_children(content)
-                .spacing(step::GAP_S)
-                .height(Length::Fill)
-                .width(Length::Fill)
+            widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
+                if index == transcript_index {
+                    child
+                } else {
+                    widget::container(child)
+                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
+                            step::GAP_M
+                        } else {
+                            0.0
+                        }))
+                        .width(Length::Fill)
+                        .into()
+                }
+            }))
+            .spacing(step::GAP_S)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into(),
+            widget::container(footer)
+                .padding(iced::Padding::from([0.0, step::GAP_M]).bottom(step::GAP_M))
                 .into(),
-            footer,
-            (content_width - 2.0 * step::GAP_M).max(1.0),
+            content_width.max(1.0),
         ))
-        .padding(step::GAP_M)
         .width(Length::Fill)
         .height(Length::Fill);
         let pane = widget::container(pane)
@@ -3367,23 +3381,24 @@ fn paging_view(
     loading: bool,
     blocked: bool,
 ) -> Element<'static, Message> {
-    let mut row: Vec<Element<'_, Message>> = Vec::new();
-    if loading {
-        row.push(crate::ui_controls::activity_spinner(
-            f32::from(design::COMPACT_ICON_SIZE),
-            design::muted_color,
-        ));
-    }
-    row.push(
-        design::caption(match (page, loading) {
-            (Page::Earlier, true) => "Loading earlier history…",
-            (Page::Earlier, false) => "Load earlier history",
-            (Page::Newer, true) => "Loading the newest messages…",
-            (Page::Newer, false) => "Jump to latest messages",
+    let row = vec![
+        widget::container(if loading {
+            crate::ui_controls::activity_spinner(
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::muted_color,
+            )
+        } else {
+            widget::Space::new().into()
+        })
+        .center(Length::Fixed(f32::from(design::COMPACT_ICON_SIZE)))
+        .into(),
+        design::caption(match page {
+            Page::Earlier => "Load earlier history",
+            Page::Newer => "Jump to latest messages",
         })
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .into(),
-    );
+    ];
     widget::container(
         widget::button::custom(
             widget::row::with_children(row)
@@ -3944,6 +3959,69 @@ mod frame_cost;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_viewport_reaches_pane_edges_with_inset_inside_content() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Probe {
+            id: widget::Id,
+            viewport: Option<iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.viewport = Some(bounds);
+                }
+            }
+        }
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            false,
+            true,
+            &shortcuts,
+            600.0,
+            Place {
+                name: "Fixture".into(),
+                branch: None,
+            },
+            true,
+            None,
+            vec![],
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 700.0)),
+        );
+        let mut probe = Probe {
+            id: card_control_id(runtime.target.card, "chat-transcript"),
+            viewport: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let bounds = probe.viewport.expect("transcript viewport");
+        assert_eq!(bounds.x, 0.0);
+        assert_eq!(bounds.y, 0.0);
+        assert_eq!(bounds.width, 600.0);
+    }
 
     #[test]
     fn prompt_notice_and_raw_output_share_transcript_selection() {

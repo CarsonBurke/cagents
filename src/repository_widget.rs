@@ -9294,12 +9294,8 @@ impl DiffScrollGeometry {
         // downstream is measured in, so a code column never ends underneath it.
         let viewport_width = (width - crate::design::SCROLLBAR_GUTTER).max(0.0);
         let code_viewport = match mode {
-            DiffMode::Inline => {
-                viewport_width - 2.0 * gutter - DIFF_MARKER_WIDTH - 2.0 * DIFF_ROW_PADDING
-            }
-            DiffMode::Split => {
-                (viewport_width - DIFF_SPLIT_DIVIDER) / 2.0 - gutter - 2.0 * DIFF_ROW_PADDING
-            }
+            DiffMode::Inline => viewport_width - 2.0 * gutter - DIFF_MARKER_WIDTH,
+            DiffMode::Split => (viewport_width - DIFF_SPLIT_DIVIDER) / 2.0 - gutter,
         }
         .max(0.0);
         Self {
@@ -9309,7 +9305,7 @@ impl DiffScrollGeometry {
     }
 
     fn overflow(self, code_width: f32) -> f32 {
-        (code_width - self.code_viewport).max(0.0)
+        (code_width + 2.0 * DIFF_ROW_PADDING - self.code_viewport).max(0.0)
     }
 }
 
@@ -9638,17 +9634,20 @@ fn diff_text<'a>(
         span.color = Some(readable_diff_color(foreground, background));
     }
     Element::new(DiffHorizontalContent {
-        content: iced::widget::rich_text(spans)
-            .size(DIFF_FONT_SIZE)
-            .font(Font::MONOSPACE)
-            .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(
-                DIFF_LINE_HEIGHT,
-            )))
-            .wrapping(iced::widget::text::Wrapping::None)
-            .width(code_width)
-            .into(),
+        content: widget::container(
+            iced::widget::rich_text(spans)
+                .size(DIFF_FONT_SIZE)
+                .font(Font::MONOSPACE)
+                .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(
+                    DIFF_LINE_HEIGHT,
+                )))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(code_width),
+        )
+        .padding([0.0, DIFF_ROW_PADDING])
+        .into(),
         width: Length::Fill,
-        content_width: code_width,
+        content_width: code_width + 2.0 * DIFF_ROW_PADDING,
         offset: horizontal,
         accessible_text: Some(DiffAccessibleText {
             text,
@@ -9674,7 +9673,7 @@ fn diff_container<'a>(
                 ..Default::default()
             }
         }))
-        .padding([3.0, DIFF_ROW_PADDING])
+        .padding([3.0, 0.0])
         .height(DIFF_ROW_HEIGHT)
         .width(width)
         .clip(true)
@@ -11474,18 +11473,18 @@ mod tests {
                 for mode in [DiffMode::Split, DiffMode::Inline, DiffMode::Split] {
                     let geometry = DiffScrollGeometry::new(width, 44.0, mode);
                     if mode == DiffMode::Inline {
-                        let two_gutter_code = geometry.viewport_width
-                            - 2.0 * 44.0
-                            - DIFF_MARKER_WIDTH
-                            - 2.0 * DIFF_ROW_PADDING;
+                        let two_gutter_code =
+                            geometry.viewport_width - 2.0 * 44.0 - DIFF_MARKER_WIDTH;
                         assert!((geometry.code_viewport - two_gutter_code).abs() < 0.01);
                     }
                     let offset = geometry.overflow(code_width);
-                    if widest <= geometry.code_viewport {
+                    if widest + 2.0 * DIFF_ROW_PADDING <= geometry.code_viewport {
                         assert_eq!(offset, 0.0, "short lines must not scroll");
                     } else {
                         assert!(
-                            (widest - offset - geometry.code_viewport).abs() < 1.0,
+                            (widest + 2.0 * DIFF_ROW_PADDING - offset - geometry.code_viewport)
+                                .abs()
+                                < 1.0,
                             "the last shaped pixel, not an estimated column, ends the range"
                         );
                     }
@@ -11523,8 +11522,17 @@ mod tests {
                         let content = half.children().next().unwrap();
                         let code = content.children().last().unwrap();
                         assert!((code.bounds().width - geometry.code_viewport).abs() < 0.01);
-                        let shaped = code.children().next().unwrap();
-                        assert!((shaped.bounds().x - code.bounds().x + offset).abs() < 0.01);
+                        let padded = code.children().next().unwrap();
+                        assert!((padded.bounds().x - code.bounds().x + offset).abs() < 0.01);
+                        assert!(
+                            (padded.bounds().width - code_width - 2.0 * DIFF_ROW_PADDING).abs()
+                                < 0.01
+                        );
+                        let shaped = padded.children().next().unwrap();
+                        assert!(
+                            (shaped.bounds().x - code.bounds().x + offset - DIFF_ROW_PADDING).abs()
+                                < 0.01
+                        );
                         assert!((shaped.bounds().width - code_width).abs() < 0.01);
                     }
                 }

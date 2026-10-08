@@ -14,7 +14,7 @@ use crate::{
 };
 use cosmic::{
     Element,
-    iced::{Length, widget::text_editor},
+    iced::{Alignment, Length, widget::text_editor},
     widget,
 };
 use std::collections::BTreeMap;
@@ -1142,7 +1142,28 @@ impl State {
             .is_some_and(|(_, pending)| !pending.background_read());
         let mut listing: Vec<Element<'_, Action>> = Vec::new();
         let mut content = widget::column::with_children(vec![
-            crate::design::title("Automations").into(),
+            widget::row::with_children(vec![
+                crate::design::title("Automations")
+                    .width(Length::Fill)
+                    .into(),
+                crate::interaction::tooltip(
+                    widget::container(if self.pending.is_some() {
+                        crate::ui_controls::activity_spinner(14.0, crate::design::warning_color)
+                    } else {
+                        widget::Space::new().into()
+                    })
+                    .center(Length::Fixed(f32::from(crate::design::ROW_ICON_SIZE))),
+                    if self.pending.is_none() {
+                        "Automations"
+                    } else if self.history_status == HistoryStatus::Loading {
+                        "Loading run history…"
+                    } else {
+                        "Updating automations…"
+                    },
+                ),
+            ])
+            .align_y(Alignment::Center)
+            .into(),
             crate::design::body("Recurring agent work continues while this window is closed.")
                 .into(),
         ])
@@ -1163,9 +1184,6 @@ impl State {
         }
         if let Some(notice) = &self.notice {
             content = content.push(crate::design::body(notice));
-        }
-        if busy {
-            content = content.push(crate::design::body("Updating…"));
         }
         if let Some(confirmation) = &self.confirmation {
             content =
@@ -1355,7 +1373,10 @@ impl State {
                     }
                     let history_notice = match self.history_status {
                         HistoryStatus::Unrequested => Some("History has not been loaded."),
-                        HistoryStatus::Loading => Some("Loading run history…"),
+                        HistoryStatus::Loading if self.history.is_empty() => {
+                            Some("Loading run history…")
+                        }
+                        HistoryStatus::Loading => None,
                         HistoryStatus::Failed => {
                             Some("Could not refresh history. Try Refresh history.")
                         }
