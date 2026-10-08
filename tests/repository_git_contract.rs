@@ -3261,3 +3261,115 @@ fn remotes_report_gits_primary_fetch_and_push_urls() {
         None
     );
 }
+/// Inject failures only after Git has really destroyed the tracked edits.
+/// The result must still identify that applied half and leave the rest intact.
+#[test]
+fn discard_reports_restored_paths_when_untracked_classification_fails() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum ReadFailure {
+        Cancelled,
+        Launch,
+        Malformed,
+    }
+    struct FailClassification {
+        restored: AtomicBool,
+        failure: ReadFailure,
+    }
+    impl ProcessExecutor for FailClassification {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if self.restored.load(Ordering::Relaxed)
+                && command.arguments.iter().any(|arg| arg == "ls-files")
+            {
+                return match self.failure {
+                    ReadFailure::Malformed => Ok(ProcessOutput {
+                        exit_code: Some(0),
+                        signal: None,
+                        success: true,
+                        stdout: b"unterminated path".to_vec(),
+                        stderr: Vec::new(),
+                    }),
+                    ReadFailure::Cancelled | ReadFailure::Launch => Err(ProcessFailure {
+                        kind: match self.failure {
+                            ReadFailure::Cancelled => ProcessFailureKind::Cancelled,
+                            _ => ProcessFailureKind::Spawn,
+                        },
+                        program: command.program.clone(),
+                        exit_code: None,
+                        signal: None,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        message: "injected classification failure".into(),
+                        started: matches!(self.failure, ReadFailure::Cancelled),
+                    }),
+                };
+            }
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if output.success && command.arguments.iter().any(|arg| arg == "restore") {
+                self.restored.store(true, Ordering::Relaxed);
+            }
+            Ok(output)
+        }
+    }
+
+    for failure in [
+        ReadFailure::Cancelled,
+        ReadFailure::Launch,
+        ReadFailure::Malformed,
+    ] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.write("tracked.txt", b"committed\n");
+        fixture.git_in_work(&["add", "tracked.txt"]);
+        fixture.commit("initial");
+        fixture.write("tracked.txt", b"uncommitted edits\n");
+        fixture.write("first.txt", b"first untracked\n");
+        fixture.write("second.txt", b"second untracked\n");
+        let executor = Arc::new(FailClassification {
+            restored: AtomicBool::new(false),
+            failure,
+        });
+        let service = RepositoryService::new(&fixture.git, Arc::clone(&executor));
+        let outcome = service
+            .discard(
+                &DiscardRequest {
+                    worktree: fixture.work(),
+                    tracked: vec![PathSelection::new(path("tracked.txt"))],
+                    untracked: vec![path("first.txt"), path("second.txt"), path("first.txt")],
+                    confirmed: true,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("the applied tracked half must not disappear into a read error");
+        assert!(executor.restored.load(Ordering::Relaxed));
+        let MutationOutcome::PartiallyApplied { paths, failures } = outcome else {
+            panic!("expected exact partial accounting, got {outcome:?}");
+        };
+        assert_eq!(paths, vec![path("tracked.txt")]);
+        assert_eq!(failures.len(), 2);
+        for (failure, name) in failures.iter().zip(["first.txt", "second.txt"]) {
+            assert!(
+                matches!(failure, MutationFailure::Path { path: refused, reason }
+                if *refused == path(name) && reason.contains("could not verify"))
+            );
+        }
+        assert_eq!(
+            fs::read(fixture.work().join("tracked.txt")).unwrap(),
+            b"committed\n"
+        );
+        assert_eq!(
+            fs::read(fixture.work().join("first.txt")).unwrap(),
+            b"first untracked\n"
+        );
+        assert_eq!(
+            fs::read(fixture.work().join("second.txt")).unwrap(),
+            b"second untracked\n"
+        );
+    }
+}
