@@ -17,6 +17,7 @@ mod completion;
 mod fold;
 mod images;
 mod layout;
+mod markdown_source;
 mod permissions;
 mod prose;
 mod retained;
@@ -814,6 +815,8 @@ struct CachedItem {
     tool_output: Option<tool_text::ToolText>,
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
+    /// The body as the Markdown parser is given it, resumed on each append.
+    source: markdown_source::Source,
     markdown: markdown::Content,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
     /// block's language and text: what a frame looks a block up by. The
@@ -828,14 +831,16 @@ struct CachedItem {
 impl CachedItem {
     #[cfg(test)]
     fn new(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
-        Self::updated(content, theme, None, false)
+        Self::updated(content, theme, None, false, false)
     }
 
+    /// `growing` is whether the item's text may still be appended to.
     fn updated(
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
         previous: Option<Self>,
         expanded: bool,
+        growing: bool,
     ) -> Self {
         let (input, output, preview, patches) = previous
             .map(|cached| {
@@ -888,6 +893,7 @@ impl CachedItem {
             tool_output,
             patches,
             token: ChangeToken::of(content),
+            source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
             blocks: HashMap::new(),
             detail: None,
@@ -895,12 +901,11 @@ impl CachedItem {
             image: None,
         };
         match content {
-            ItemContent::Text { text, .. } => cached.extend(text, 0, theme),
-            // A notice's body is a log line or a raw result, drawn verbatim.
-            ItemContent::Delivery { kind, body, .. } if *kind != chat::DeliveryKind::Notice => {
-                cached.extend(body, 0, theme)
+            ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
+                if let Some(body) = Self::prose(content) {
+                    cached.extend(body, growing, theme);
+                }
             }
-            ItemContent::Delivery { .. } => {}
             ItemContent::Command {
                 status,
                 exit_code,
@@ -962,14 +967,44 @@ impl CachedItem {
         }
         cached
     }
-    /// Parses the part of `body` past `parsed`, the bytes already seen.
+    /// The text of `content` that is drawn as Markdown.
+    fn prose(content: &ItemContent) -> Option<&str> {
+        match content {
+            ItemContent::Text { text, .. } => Some(text),
+            // A notice's body is a log line or a raw result, drawn verbatim.
+            ItemContent::Delivery { kind, body, .. } if *kind != chat::DeliveryKind::Notice => {
+                Some(body)
+            }
+            _ => None,
+        }
+    }
+
+    /// Parses the part of `body` not yet seen, `body` being what was parsed
+    /// before with more appended, and `growing` whether more may follow.
     ///
-    /// `markdown::Content` re-parses only its trailing block, and the fence
-    /// scan resumes from its own cursor, so a streamed answer costs its new
-    /// bytes per frame instead of its whole length.
-    fn extend(&mut self, body: &str, parsed: usize, theme: crate::settings::EditorSyntaxTheme) {
-        self.markdown.push_str(&body[parsed..]);
+    /// `markdown::Content` re-parses only its trailing block, and the rewrite
+    /// the parser is given resumes from the last whole line, so a streamed
+    /// answer costs its new bytes per frame instead of its whole length. The
+    /// exception is text that turned out to be something else than it was
+    /// first handed over as, which is parsed again from the top.
+    fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
+        match self.source.advance(body, growing) {
+            markdown_source::Step::Append(text) => self.markdown.push_str(&text),
+            markdown_source::Step::Restart(text) => {
+                self.markdown = markdown::Content::parse(&text);
+            }
+        }
         self.highlight(theme);
+    }
+
+    /// Hands the parser what was kept back from it while `content`, which is
+    /// what this was last parsed from, could still grow.
+    fn settle(&mut self, content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) {
+        if self.source.provisional()
+            && let Some(body) = Self::prose(content)
+        {
+            self.extend(body, false, theme);
+        }
     }
 
     /// A fence larger than this is drawn plain: a syntect pass over it would
@@ -986,9 +1021,9 @@ impl CachedItem {
         let mut blocks = HashMap::new();
         for_each_fence(self.markdown.items(), &mut |language, code| {
             let key = fence_key(language.unwrap_or_default(), code);
-            let block = previous
-                .remove(&key)
-                .unwrap_or_else(|| prose::CodeBlock::new(language, code, theme));
+            let block = previous.remove(&key).unwrap_or_else(|| {
+                prose::CodeBlock::new(language.and_then(prose::fence_language), code, theme)
+            });
             blocks.insert(key, block);
         });
         self.blocks = blocks;
@@ -1971,20 +2006,32 @@ impl Runtime {
             self.expanded.retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
-        for item in snapshot.items.iter().chain(
-            snapshot
-                .subagents
-                .iter()
-                .flat_map(|agent| agent.items.iter()),
-        ) {
+        // Text is appended to the newest item of a running turn and to no
+        // other, so only there is the end of an answer read as unfinished.
+        let newest = snapshot.items.len().wrapping_sub(1);
+        let items = snapshot
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item, snapshot.busy && index == newest))
+            .chain(
+                snapshot
+                    .subagents
+                    .iter()
+                    .flat_map(|agent| agent.items.iter())
+                    .map(|item| (item, false)),
+            );
+        for (item, growing) in items {
             let token = ChangeToken::of(&item.content);
             if let Some(cached) = self.cache.get_mut(&item.id) {
                 if cached.token == token {
+                    if !growing {
+                        cached.settle(&item.content, self.syntax_theme);
+                    }
                     continue;
                 }
                 if let Some(body) = cached.token.appended(&item.content) {
-                    let parsed = cached.token.body;
-                    cached.extend(body, parsed, self.syntax_theme);
+                    cached.extend(body, growing, self.syntax_theme);
                     cached.token = token;
                     continue;
                 }
@@ -1997,6 +2044,7 @@ impl Runtime {
                     self.syntax_theme,
                     previous,
                     self.expanded.contains(&item.id),
+                    growing,
                 ),
             );
         }
@@ -2991,7 +3039,13 @@ impl Cagents {
                     let previous = runtime.cache.remove(&item.id);
                     runtime.cache.insert(
                         item.id.clone(),
-                        CachedItem::updated(&item.content, runtime.syntax_theme, previous, true),
+                        CachedItem::updated(
+                            &item.content,
+                            runtime.syntax_theme,
+                            previous,
+                            true,
+                            false,
+                        ),
                     );
                 }
             }
@@ -6782,6 +6836,7 @@ impl Cagents {
                                 runtime.syntax_theme,
                                 previous,
                                 runtime.expanded.contains(&id),
+                                false,
                             ),
                         );
                     }
@@ -13088,10 +13143,10 @@ mod tests {
             let Some(body) = streamed.token.appended(&content) else {
                 panic!("a longer prefix of the same body must read as an append");
             };
-            let parsed = streamed.token.body;
-            streamed.extend(body, parsed, THEME);
+            streamed.extend(body, true, THEME);
             streamed.token = ChangeToken::of(&content);
         }
+        streamed.settle(&text(BODY), THEME);
         assert_eq!(parsed_codes(&streamed), parsed_codes(&whole));
         assert_eq!(streamed.token, whole.token);
         assert_eq!(
@@ -13136,6 +13191,240 @@ mod tests {
         assert_eq!(text_of(plain.spans(true)), "plain\n");
         assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
         assert!(cached.block(Some("rust"), "fn other() {}\n").is_none());
+    }
+
+    /// Everything an item's Markdown would put on screen, block by block, as
+    /// the reader would read it.
+    fn shown(cached: &CachedItem) -> String {
+        fn walk(items: &[markdown::Item], style: markdown::Style, out: &mut String) {
+            let line = |text: &markdown::Text, out: &mut String| {
+                for span in text.spans(style).iter() {
+                    out.push_str(&span.text);
+                }
+                out.push('\n');
+            };
+            for item in items {
+                match item {
+                    markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => {
+                        line(text, out)
+                    }
+                    markdown::Item::CodeBlock { language, code, .. } => {
+                        out.push_str(&format!("[{}]\n{code}", language.as_deref().unwrap_or("")));
+                    }
+                    markdown::Item::List { bullets, .. } => {
+                        for bullet in bullets {
+                            let (markdown::Bullet::Point { items }
+                            | markdown::Bullet::Task { items, .. }) = bullet;
+                            out.push_str("* ");
+                            walk(items, style, out);
+                        }
+                    }
+                    markdown::Item::Quote(items) => walk(items, style, out),
+                    markdown::Item::Rule => out.push_str("----\n"),
+                    markdown::Item::Table { columns, rows } => {
+                        for column in columns {
+                            walk(&column.header, style, out);
+                        }
+                        for cell in rows.iter().flat_map(|row| &row.cells) {
+                            walk(cell, style, out);
+                        }
+                    }
+                    markdown::Item::Image { alt, .. } => line(alt, out),
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(
+            cached.markdown.items(),
+            markdown::Style::from(iced::Theme::Dark),
+            &mut out,
+        );
+        out
+    }
+
+    /// The items a parse produced, in full but for the per-line highlighting
+    /// iced keeps on a code block, which the transcript never draws and
+    /// which depends on how the block was streamed.
+    fn outline(items: &[markdown::Item]) -> String {
+        items
+            .iter()
+            .map(|item| match item {
+                markdown::Item::CodeBlock { language, code, .. } => {
+                    format!("CodeBlock({language:?}, {code:?})")
+                }
+                markdown::Item::List { start, bullets } => {
+                    let bullets = bullets
+                        .iter()
+                        .map(|bullet| match bullet {
+                            markdown::Bullet::Point { items } => outline(items),
+                            markdown::Bullet::Task { items, done } => {
+                                format!("{done}:{}", outline(items))
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    format!("List({start:?}, {bullets:?})")
+                }
+                markdown::Item::Quote(items) => format!("Quote({})", outline(items)),
+                item => format!("{item:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// What an agent writes reaches the reader: a separator does not swallow
+    /// the section under it, a generic keeps its parameters, and an indented
+    /// block is a code block with its code in it.
+    #[test]
+    fn an_answer_keeps_what_the_parser_would_drop() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        for (body, expected) in [
+            (
+                "Intro\n\n---\nSecond part\nstill second\n\n---\nThird part\n",
+                "Intro\n----\nSecond part still second\n----\nThird part\n",
+            ),
+            ("+++\nkept\n+++\nafter\n", "+++ kept +++ after\n"),
+            (
+                "Returns Vec<Option<String>> or HashMap<K, V>.\n",
+                "Returns Vec<Option<String>> or HashMap<K, V>.\n",
+            ),
+            (
+                "<details>\n<summary>More</summary>\n\nbody\n</details>\n",
+                "<details> <summary>More</summary>\nbody </details>\n",
+            ),
+            ("Press <kbd>Ctrl</kbd> now\n", "Press <kbd>Ctrl</kbd> now\n"),
+            ("one<br>two<br/>three\n", "one\ntwo\nthree\n"),
+            (
+                "See <https://example.com/a> and `Vec<T>`.\n",
+                "See https://example.com/a and Vec<T>.\n",
+            ),
+            (
+                "Run:\n\n    cargo test\n    cargo fmt\n\nThen stop.\n",
+                "Run:\n[]\ncargo test\ncargo fmt\nThen stop.\n",
+            ),
+            (
+                "```rust\nlet x: Vec<T> = a < b;\n---\n```\n",
+                "[rust]\nlet x: Vec<T> = a < b;\n---\n",
+            ),
+            (
+                "| a | b |\n|---|---|\n| one<br>two | Option<T> |\n",
+                "a\nb\none\ntwo\nOption<T>\n",
+            ),
+            // A path in a generic is not a link to its first segment.
+            (
+                "Takes Vec<std::string> and Option<std::path::PathBuf>.\n",
+                "Takes Vec<std::string> and Option<std::path::PathBuf>.\n",
+            ),
+            // A code span that wraps is code on both lines.
+            (
+                "Call `get::<T>\n(key)` on Map<K>\n",
+                "Call get::<T> (key) on Map<K>\n",
+            ),
+            // A quoted fence inside a fence is code, not the fence's end.
+            (
+                "```\n> ```\nVec<T>\n---\n```\nAfter <a>\n",
+                "[]\n> ```\nVec<T>\n---\nAfter <a>\n",
+            ),
+            // A fence ends with the list item it is in, and one at the
+            // margin after it is a fence of its own.
+            ("- ```\n  in <a>\nout <b>\n", "* []\nin <a>\nout <b>\n"),
+            (
+                "- ```\n  in <a>\n```\nnext <b>\n```\nlast <c>\n",
+                "* []\nin <a>\n[]\nnext <b>\nlast <c>\n",
+            ),
+        ] {
+            assert_eq!(
+                shown(&CachedItem::new(&text(body), THEME)),
+                expected,
+                "{body:?}"
+            );
+        }
+        let linked = CachedItem::new(&text("See <https://example.com/a>."), THEME);
+        assert!(
+            format!("{:?}", linked.markdown.items())
+                .contains("link: Some(\"https://example.com/a\")"),
+            "an autolink is still a link"
+        );
+    }
+
+    /// However an answer is cut into deltas, it parses into the items the
+    /// whole answer parses into - including where the end of a line was kept
+    /// back until a late `>` made it an autolink or a line break.
+    ///
+    /// The bodies hold no list whose items are separated by blank lines:
+    /// iced's incremental parse starts a second list at such an item, with or
+    /// without the rewrite, and that is not what this is about.
+    #[test]
+    fn a_streamed_answer_parses_as_the_whole_one_does() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        for body in [
+            "Intro\n\n---\nNext <part>\n\n---\n\nUse Vec<Option<String>> and `Vec<T>`.\n",
+            "See <https://example.com/a> or <me@example.com>.\n\n| a | b |\n|---|---|\n| one<br>two | Option<T> |\n",
+            "Before\n\n```rust,ignore\nfn a<T>() {}\n---\n```\n\n~~~\n<b>\n~~~\n\nAfter <c>\n",
+            "Run:\n\n    cargo test\n\n    cargo fmt\n\nThen:\n\n1. One\n\n   ```sh\n   echo <x>\n   ```\n\nDone <kbd>k</kbd>\n",
+            "<details>\n<summary>S</summary>\n\nλ body\n</details>\n\n+++\nlast\n",
+        ] {
+            let whole = CachedItem::new(&text(body), THEME);
+            let boundaries: Vec<usize> = (1..=body.len())
+                .filter(|end| body.is_char_boundary(*end))
+                .collect();
+            // A character at a time, then in deltas of a few uneven sizes.
+            let mut cuts = vec![boundaries.clone()];
+            for stride in [2, 3, 5, 11] {
+                let mut cut: Vec<usize> = boundaries.iter().copied().step_by(stride).collect();
+                cut.push(body.len());
+                cuts.push(cut);
+            }
+            for cut in cuts {
+                let mut streamed = CachedItem::new(&text(""), THEME);
+                for end in cut {
+                    let content = text(&body[..end]);
+                    if streamed.token == ChangeToken::of(&content) {
+                        continue;
+                    }
+                    let grown = streamed
+                        .token
+                        .appended(&content)
+                        .expect("a longer prefix of the same body reads as an append");
+                    streamed.extend(grown, true, THEME);
+                    streamed.token = ChangeToken::of(&content);
+                }
+                streamed.settle(&text(body), THEME);
+                assert_eq!(
+                    outline(streamed.markdown.items()),
+                    outline(whole.markdown.items()),
+                    "{body:?}"
+                );
+                assert_eq!(
+                    streamed.blocks.keys().collect::<HashSet<_>>(),
+                    whole.blocks.keys().collect::<HashSet<_>>()
+                );
+            }
+        }
+    }
+
+    /// A fence's info string names its language first and says other things
+    /// after; the grammar and the caption both go by the language.
+    #[test]
+    fn a_fence_is_highlighted_by_the_first_word_of_its_info_string() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        for (info, language) in [
+            ("rust", Some("rust")),
+            ("rust,ignore", Some("rust")),
+            ("ts title=\"x.ts\"", Some("ts")),
+            ("  python  {1,3}", Some("python")),
+            (",", None),
+            ("", None),
+        ] {
+            assert_eq!(prose::fence_language(info), language, "{info:?}");
+        }
+        let cached = CachedItem::new(&text("```rust,ignore\nfn main() {}\n```\n"), THEME);
+        let block = cached
+            .block(Some("rust,ignore"), "fn main() {}\n")
+            .expect("the fence is cached under the info string the parser hands over");
+        assert!(
+            block.spans(true).iter().any(|span| span.color.is_some()),
+            "a keyword takes a color"
+        );
     }
 
     /// The token is what licenses reusing a parse, so it must refuse anything

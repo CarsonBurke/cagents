@@ -358,6 +358,7 @@ fn create_inner(
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
+            output_streams: BTreeMap::new(),
             models: Vec::new(),
             listing: Vec::new(),
             modalities: BTreeMap::new(),
@@ -466,6 +467,10 @@ struct Codex {
     pending: BTreeMap<String, Pending>,
     requests: BTreeMap<String, PendingRequest>,
     active_items: BTreeMap<String, Item>,
+    /// What is held of each running command's output between deltas: the
+    /// start of an escape sequence the next delta finishes. An entry exists
+    /// only for an item in `active_items`, and goes when the item does.
+    output_streams: BTreeMap<String, super::terminal_output::Stream>,
     models: Vec<Model>,
     /// The pages of a model listing still under way. The listing is
     /// reported whole, since a model missing from part of it reads as one
@@ -2226,6 +2231,7 @@ impl Adapter for Codex {
                 if current {
                     if !self.busy {
                         self.active_items.clear();
+                        self.output_streams.clear();
                     }
                     step.events.push(Event::Status {
                         busy: self.busy,
@@ -2262,6 +2268,7 @@ impl Adapter for Codex {
                 for item in parse_item(&params["item"], done, string(params, "turnId")?)? {
                     if done {
                         self.active_items.remove(&item.id);
+                        self.output_streams.remove(&item.id);
                     } else if streams_updates(&item.content) {
                         if self.active_items.len() >= MAX_ACTIVE_ITEMS
                             && !self.active_items.contains_key(&item.id)
@@ -2324,10 +2331,20 @@ impl Adapter for Codex {
                         // An MCP progress notification only carries a message
                         // when the server wrote one.
                         let delta = if method.ends_with("progress") {
-                            params["message"].as_str().unwrap_or_default()
+                            params["message"].as_str().unwrap_or_default().into()
+                        } else if method.starts_with("item/commandExecution") {
+                            // A command writes for a terminal, and a delta
+                            // may end anywhere in what it wrote.
+                            std::borrow::Cow::Owned(
+                                self.output_streams
+                                    .entry(id.clone())
+                                    .or_default()
+                                    .push(string(params, "delta")?),
+                            )
                         } else {
-                            string(params, "delta")?
+                            std::borrow::Cow::Borrowed(string(params, "delta")?)
                         };
+                        let delta = delta.as_ref();
                         let limit =
                             MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                         let offset = output.len();
@@ -2678,7 +2695,8 @@ fn message_phase(value: &Value) -> Phase {
 /// Codex's own best-effort parse of a shell command, which may decompose into
 /// several actions because a command can be a pipeline. The first classified
 /// action is what the invocation was for; `unknown` entries carry nothing the
-/// view cannot already read off the command itself.
+/// view cannot already read off the command itself. The label is what the
+/// action was applied to; the view supplies the verb, from the action.
 fn command_intent(actions: &Value) -> (CommandAction, String) {
     let Some(actions) = actions.as_array() else {
         return (CommandAction::Run, String::new());
@@ -2689,16 +2707,16 @@ fn command_intent(actions: &Value) -> (CommandAction, String) {
             Some("read") => {
                 return (
                     CommandAction::Read,
-                    path.map(|path| format!("Read {path}")).unwrap_or_default(),
+                    path.map(str::to_owned).unwrap_or_default(),
                 );
             }
             Some("search") => {
                 return (
                     CommandAction::Search,
                     match (action["query"].as_str(), path) {
-                        (Some(query), Some(path)) => format!("Search {query} in {path}"),
-                        (Some(query), None) => format!("Search {query}"),
-                        (None, Some(path)) => format!("Search {path}"),
+                        (Some(query), Some(path)) => format!("{query} in {path}"),
+                        (Some(query), None) => query.to_owned(),
+                        (None, Some(path)) => path.to_owned(),
                         (None, None) => String::new(),
                     },
                 );
@@ -2706,7 +2724,7 @@ fn command_intent(actions: &Value) -> (CommandAction, String) {
             Some("listFiles") => {
                 return (
                     CommandAction::List,
-                    path.map(|path| format!("List {path}")).unwrap_or_default(),
+                    path.map(str::to_owned).unwrap_or_default(),
                 );
             }
             _ => {}
@@ -2879,7 +2897,11 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                         .as_i64()
                         .and_then(|code| i32::try_from(code).ok()),
                     duration_ms: value["durationMs"].as_u64(),
-                    output: value["aggregatedOutput"].as_str().unwrap_or("").into(),
+                    // The whole output, so a line the command redrew while
+                    // it ran is kept only as it was last drawn.
+                    output: super::terminal_output::display(
+                        value["aggregatedOutput"].as_str().unwrap_or("").into(),
+                    ),
                 },
                 started_at: None,
                 at: None,
@@ -3453,6 +3475,7 @@ mod tests {
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
+            output_streams: BTreeMap::new(),
             models: vec![Model {
                 id: "model".into(),
                 label: "Model".into(),
@@ -4741,6 +4764,40 @@ mod tests {
         );
     }
 
+    /// A command writes for a terminal, and Codex forwards what it wrote: a
+    /// colour cut in two by the end of a delta must not reach the transcript
+    /// as its second half, and the output reported whole at the end shows a
+    /// redrawn line as it was last drawn.
+    #[test]
+    fn command_output_reaches_the_transcript_without_terminal_escapes() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let item = json!({"id":"0","type":"commandExecution","command":"cargo build","cwd":"/tmp","status":"inProgress","aggregatedOutput":"\u{1b}[1mStart\u{1b}[0m\n"});
+        let mut page = Step::default();
+        adapter.page(&json!({"data":[{"id":"turn-a","status":"inProgress","items":[item]}],"nextCursor":"older"}),&mut page, false).unwrap();
+        let mut delta = |text: &str| {
+            adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":text}})).unwrap().events
+        };
+        // The introducer alone appends nothing, so there is nothing to send.
+        assert!(delta("\u{1b}[1;3").is_empty());
+        let events = delta("2m   Compiling\u{1b}[0m a\n 1/2\r");
+        assert!(
+            matches!(&events[0], Event::OutputDelta { offset: 6, delta, .. } if delta == "   Compiling a\n 1/2"),
+            "{events:?}"
+        );
+        let events = delta(" 2/2\r\n");
+        assert!(
+            matches!(&events[0], Event::OutputDelta { offset: 25, delta, .. } if delta == "\n 2/2\n"),
+            "{events:?}"
+        );
+        let completed = json!({"id":"0","type":"commandExecution","command":"cargo build","cwd":"/tmp","status":"completed","exitCode":0,"aggregatedOutput":"\u{1b}[1mStart\u{1b}[0m\n\u{1b}[1;32m   Compiling\u{1b}[0m a\n 1/2\r 2/2\r\n"});
+        let done = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn-a","item":completed}})).unwrap();
+        assert!(done.events.iter().any(|event| matches!(event,
+            Event::Item(Item { content: ItemContent::Command { output, .. }, .. })
+            if output == "Start\n   Compiling a\n 2/2\n")));
+        assert!(adapter.output_streams.is_empty());
+    }
+
     #[test]
     fn resumed_step_and_final_history_use_same_turn_scoped_identity() {
         let mut adapter = adapter();
@@ -4910,7 +4967,7 @@ mod tests {
             panic!("A Codex commandExecution must map to a command");
         };
         assert_eq!(*action, CommandAction::Read);
-        assert_eq!(label, "Read src/app.rs");
+        assert_eq!(label, "src/app.rs");
         assert_eq!(command, "sed -n '1,20p' src/app.rs");
         assert_eq!(working_directory, "/repo");
         assert_eq!(*exit_code, Some(0));

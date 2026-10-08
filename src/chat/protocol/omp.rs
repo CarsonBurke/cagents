@@ -184,7 +184,12 @@ impl Call {
                 .as_i64()
                 .and_then(|code| i32::try_from(code).ok()),
             duration_ms: duration(details),
-            output,
+            // Only a shell command writes for a terminal; a file that was
+            // read is shown as the bytes it holds.
+            output: match self.action {
+                CommandAction::Run => super::terminal_output::display(output),
+                _ => output,
+            },
         }
     }
 }
@@ -2351,6 +2356,29 @@ mod tests {
         assert!(matches!(&finished.events[0],
             Event::Item(Item { content: ItemContent::Command { command, working_directory, status: ToolStatus::Succeeded, .. }, .. })
             if command == "cargo check" && working_directory == "/repo"));
+    }
+
+    /// A shell command's output is shown without the escapes it wrote for a
+    /// terminal, while it runs and when it ends; a file that was read is not
+    /// a terminal's output and is shown as it is.
+    #[test]
+    fn shell_output_loses_its_terminal_escapes_and_a_read_file_does_not() {
+        let mut adapter = Omp::default();
+        let output = |step: &Step| match &step.events[0] {
+            Event::Item(Item {
+                content: ItemContent::Command { output, .. },
+                ..
+            }) => output.clone(),
+            other => panic!("{other:?}"),
+        };
+        adapter.receive(json!({"type":"tool_execution_start","toolCallId":"call","toolName":"bash","args":{"command":"cargo check","cwd":"/repo"}})).unwrap();
+        let progressed = adapter.receive(json!({"type":"tool_execution_update","toolCallId":"call","toolName":"bash","partialResult":{"content":[{"type":"text","text":"\u{1b}[32m    Checking\u{1b}[0m a\n 1/2\r 2/2"}]}})).unwrap();
+        assert_eq!(output(&progressed), "    Checking a\n 2/2");
+        let finished = adapter.receive(json!({"type":"tool_execution_end","toolCallId":"call","toolName":"bash","result":{"content":[{"type":"text","text":"\u{1b}[1;31merror\u{1b}[0m: failed\n"}],"details":{"exitCode":101}}})).unwrap();
+        assert_eq!(output(&finished), "error: failed\n");
+        adapter.receive(json!({"type":"tool_execution_start","toolCallId":"read","toolName":"read","args":{"path":"palette.txt"}})).unwrap();
+        let read = adapter.receive(json!({"type":"tool_execution_end","toolCallId":"read","toolName":"read","result":{"content":[{"type":"text","text":"red = \u{1b}[31m\n"}]}})).unwrap();
+        assert_eq!(output(&read), "red = \u{1b}[31m\n");
     }
 
     #[test]

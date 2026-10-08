@@ -100,6 +100,15 @@ impl CodeBlock {
     }
 }
 
+/// The language a fence's info string names: its first word.
+///
+/// What follows the language is for whatever runs the block - `rust,ignore`,
+/// `ts title="x.ts"` - and is neither a grammar to look up nor a caption.
+pub(super) fn fence_language(info: &str) -> Option<&str> {
+    info.split(|character: char| character == ',' || character.is_whitespace())
+        .find(|word| !word.is_empty())
+}
+
 /// An item's parsed Markdown as an element that owns what it draws.
 pub(super) fn view(
     cached: &CachedItem,
@@ -299,7 +308,12 @@ impl Renderer<'_> {
                 design::scrollbar(),
             ))
             .into(),
-            Some(language.unwrap_or("Code").to_owned()),
+            Some(
+                language
+                    .and_then(fence_language)
+                    .unwrap_or("Code")
+                    .to_owned(),
+            ),
             Some(Action::CopyLiteral(code.to_owned())),
         )
     }
@@ -315,7 +329,7 @@ fn heading(
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
     widget::container(selectable_prose::text(
-        text.spans(settings.style),
+        text.spans(heading_style(settings, level)),
         match level {
             HeadingLevel::H1 => settings.h1_size,
             HeadingLevel::H2 => settings.h2_size,
@@ -334,6 +348,26 @@ fn heading(
         0.0
     }))
     .into()
+}
+
+/// The style a heading's text is set in.
+///
+/// The three largest levels are told from a paragraph by their size. The
+/// scale is compact, so the three smallest are the body's own size, and
+/// without a weight of their own a `####` heading read as one more line of
+/// the paragraph under it.
+fn heading_style(settings: markdown::Settings, level: markdown::HeadingLevel) -> markdown::Style {
+    use markdown::HeadingLevel;
+    match level {
+        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => settings.style,
+        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => markdown::Style {
+            font: iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..settings.style.font
+            },
+            ..settings.style
+        },
+    }
 }
 
 fn paragraph(
@@ -367,6 +401,30 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every heading level is told from body text by its size or its weight.
+    #[test]
+    fn every_heading_level_differs_from_a_paragraph() {
+        use markdown::HeadingLevel;
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        for (level, size) in [
+            (HeadingLevel::H1, settings.h1_size),
+            (HeadingLevel::H2, settings.h2_size),
+            (HeadingLevel::H3, settings.h3_size),
+            (HeadingLevel::H4, settings.h4_size),
+            (HeadingLevel::H5, settings.h5_size),
+            (HeadingLevel::H6, settings.h6_size),
+        ] {
+            let style = heading_style(settings, level);
+            assert!(
+                size.0 > settings.text_size.0 || style.font.weight != settings.style.font.weight,
+                "{level:?}"
+            );
+            // A heading keeps the family and the colours of the text around it.
+            assert_eq!(style.font.family, settings.style.font.family);
+            assert_eq!(style.link_color, settings.style.link_color);
+        }
+    }
 
     #[test]
     fn code_selection_preserves_source_line_endings_and_trailing_newlines() {

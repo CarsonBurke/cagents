@@ -4,9 +4,11 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub mod claude;
+mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
+mod terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {

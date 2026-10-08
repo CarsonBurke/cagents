@@ -284,8 +284,26 @@ impl Runtime {
         let target = self.target;
         let id = item.id.clone();
         let copy = Action::Copy(target, id.clone(), part.clone());
+        // What a command or a tool printed is followed from its end. A patch,
+        // an input, and what a read or a search returned are read from the
+        // top, whether or not the step is still running.
+        let follows = matches!(part, CopyPart::Output)
+            && !matches!(
+                item.content,
+                ItemContent::Command {
+                    action: chat::CommandAction::Read
+                        | chat::CommandAction::Search
+                        | chat::CommandAction::List,
+                    ..
+                }
+            );
         code_frame(
-            block.view(self.syntax_theme, limit, target),
+            match limit {
+                Some(height) if !follows => {
+                    block.view_from_start(self.syntax_theme, height, target)
+                }
+                limit => block.view(self.syntax_theme, limit, target),
+            },
             Some(caption.to_owned()),
             Some(copy),
         )
@@ -457,20 +475,26 @@ impl Runtime {
         // A long command wraps onto the next line rather than running under
         // the outcome beside it: a pane is often narrow, and a row whose end
         // is hidden is a row the reader cannot check.
+        // What the step is comes first and stays: the tool's name and
+        // input, or the command. What it last printed follows on a muted
+        // line of its own, so a running build can be followed without the
+        // row forgetting what is being built.
+        let mut preview: Vec<Element<'static, Message>> = Vec::new();
         if matches!(item.content, ItemContent::Tool { .. }) {
-            let mut preview = vec![design::body(label.to_owned()).into()];
+            preview.push(design::body(label.to_owned()).into());
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
-            line.push(
-                widget::column::with_children(preview)
-                    .spacing(GAP_XS)
-                    .width(Length::Fill)
-                    .into(),
-            );
         } else {
-            line.push(cached.preview.view());
+            preview.push(cached.preview.view());
         }
+        preview.extend(cached.preview.tail_view());
+        line.push(
+            widget::column::with_children(preview)
+                .spacing(GAP_XS)
+                .width(Length::Fill)
+                .into(),
+        );
         if let Some(detail) = &cached.detail {
             line.push(design::caption(detail.clone()).into());
         }
