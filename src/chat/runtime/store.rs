@@ -1210,24 +1210,22 @@ fn shrink(content: &mut ItemContent) {
         // the patches to match by count.
         ItemContent::Changes { changes, .. } => {
             let mut budget = BULK_BYTES;
-            let kept = changes
-                .iter_mut()
-                .take_while(|change| {
-                    clamp(&mut change.path, NAME_BYTES);
-                    let mut spent = change.path.len() + ELEMENT_BYTES;
-                    if let crate::chat::ChangeKind::Renamed { from } = &mut change.kind {
-                        clamp(from, NAME_BYTES);
-                        spent += from.len();
+            let mut kept = 0;
+            for change in changes.iter_mut() {
+                clamp(&mut change.path, NAME_BYTES);
+                let mut spent = change.path.len() + ELEMENT_BYTES;
+                if let crate::chat::ChangeKind::Renamed { from } = &mut change.kind {
+                    clamp(from, NAME_BYTES);
+                    spent += from.len();
+                }
+                match budget.checked_sub(spent) {
+                    Some(room) => {
+                        budget = room;
+                        kept += 1;
                     }
-                    match budget.checked_sub(spent) {
-                        Some(room) => {
-                            budget = room;
-                            true
-                        }
-                        None => false,
-                    }
-                })
-                .count();
+                    None => break,
+                }
+            }
             changes.truncate(kept);
         }
         ItemContent::WebSearch { query, results } => {
