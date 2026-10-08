@@ -168,6 +168,24 @@ pub struct Inbox {
     pub replies_to: Option<MessageId>,
 }
 
+/// Exact messages received by an inbox client. Acknowledgement happens only
+/// after the response has reached it, so a disconnected poll loses no mail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Receipt {
+    pub ids: Vec<MessageId>,
+}
+
+impl Receipt {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ids.len() > MAX_PENDING {
+            return Err(format!(
+                "A mailbox receipt may contain at most {MAX_PENDING} IDs"
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub fn short(id: impl std::fmt::Display) -> String {
     id.to_string().chars().take(8).collect()
 }

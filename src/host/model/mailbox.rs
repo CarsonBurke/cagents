@@ -6,7 +6,7 @@ use super::Registry;
 use crate::{
     agent_execution::{
         Lineage,
-        mailbox::{Inbox, MAX_PENDING, Message, Party, State},
+        mailbox::{Inbox, MAX_PENDING, Message, Party, Receipt, State},
     },
     model::{MessageId, TerminalId},
 };
@@ -113,6 +113,37 @@ fn message(row: &Row<'_>) -> rusqlite::Result<Message> {
         },
         created_ms: row.get::<_, i64>(10)? as u64,
     })
+}
+
+fn select_messages(
+    db: &Connection,
+    recipient: Option<Lineage>,
+    query: &Inbox,
+) -> Result<Vec<Message>, String> {
+    let (filter, limit) = match (&query.replies_to, query.all) {
+        (Some(_), _) => ("AND reply_to = ?2 AND state = 'pending'", -1),
+        (None, true) => ("AND ?2 IS NULL", RECENT as i64),
+        (None, false) => ("AND ?2 IS NULL AND state = 'pending'", -1),
+    };
+    let mut statement = db
+        .prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM messages WHERE recipient_lineage IS ?1 {filter}
+             ORDER BY created_ms DESC, rowid DESC LIMIT ?3"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut messages: Vec<Message> = statement
+        .query_map(
+            params![
+                Recipient(recipient),
+                query.replies_to.map(|id| id.to_string()),
+                limit
+            ],
+            message,
+        )
+        .and_then(Iterator::collect)
+        .map_err(|error| error.to_string())?;
+    messages.reverse();
+    Ok(messages)
 }
 
 impl Registry {
@@ -284,6 +315,53 @@ impl Registry {
             .map_err(|error| error.to_string())
     }
 
+    /// Returns bodies without changing delivery state. A reply that cannot
+    /// reach its client therefore leaves the messages available to retry.
+    pub(crate) fn peek_messages(
+        &self,
+        recipient: Option<Lineage>,
+        query: &Inbox,
+    ) -> Result<Vec<Message>, String> {
+        select_messages(&self.db, recipient, query)
+    }
+
+    /// Atomically validates the whole receipt against its recipient before
+    /// settling pending messages. Already settled or pruned IDs are harmless.
+    pub(crate) fn acknowledge_messages(
+        &mut self,
+        recipient: Option<Lineage>,
+        session: Option<TerminalId>,
+        receipt: &Receipt,
+        now: u64,
+    ) -> Result<(), String> {
+        receipt.validate()?;
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        for id in &receipt.ids {
+            let foreign: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 AND recipient_lineage IS NOT ?2)",
+                params![id.to_string(), Recipient(recipient)],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if foreign {
+                return Err("A mailbox receipt may acknowledge only the caller's messages".into());
+            }
+        }
+        for id in &receipt.ids {
+            tx.execute(
+                "UPDATE messages SET state = 'read', delivered_session = ?2, settled_ms = ?3
+                 WHERE id = ?1 AND state = 'pending' AND recipient_lineage IS ?4",
+                params![
+                    id.to_string(),
+                    session.map(|id| id.to_string()),
+                    now as i64,
+                    Recipient(recipient)
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// The messages `recipient` asks for, oldest first. Those it had not yet
     /// received are marked read, so the courier no longer delivers them.
     pub(crate) fn read_messages(
@@ -294,31 +372,7 @@ impl Registry {
         now: u64,
     ) -> Result<Vec<Message>, String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let mut messages: Vec<Message> = {
-            let (filter, limit) = match (&query.replies_to, query.all) {
-                (Some(_), _) => ("AND reply_to = ?2 AND state = 'pending'", -1),
-                (None, true) => ("AND ?2 IS NULL", RECENT as i64),
-                (None, false) => ("AND ?2 IS NULL AND state = 'pending'", -1),
-            };
-            let mut statement = tx
-                .prepare(&format!(
-                    "SELECT {COLUMNS} FROM messages WHERE recipient_lineage IS ?1 {filter}
-                     ORDER BY created_ms DESC, rowid DESC LIMIT ?3"
-                ))
-                .map_err(|error| error.to_string())?;
-            statement
-                .query_map(
-                    params![
-                        Recipient(recipient),
-                        query.replies_to.map(|id| id.to_string()),
-                        limit
-                    ],
-                    message,
-                )
-                .and_then(Iterator::collect)
-                .map_err(|error| error.to_string())?
-        };
-        messages.reverse();
+        let mut messages = select_messages(&tx, recipient, query)?;
         for message in &mut messages {
             if message.state != State::Pending {
                 continue;
@@ -472,6 +526,89 @@ mod tests {
         assert_eq!(
             registry.message(first.id).unwrap().unwrap().to.session,
             Some(session)
+        );
+    }
+
+    #[test]
+    fn disconnected_peeks_leave_messages_pending_until_an_exact_receipt() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let mut first = message(Party::user(), party(recipient), 1);
+        first.to.session = None;
+        registry.post_message(&first).unwrap();
+        let query = Inbox {
+            all: false,
+            replies_to: None,
+        };
+        let disconnected = registry.peek_messages(Some(recipient), &query).unwrap();
+        assert_eq!(disconnected, vec![first.clone()]);
+        assert_eq!(
+            registry.peek_messages(Some(recipient), &query).unwrap(),
+            disconnected
+        );
+        let mut second = message(Party::user(), party(recipient), 2);
+        second.to.session = None;
+        registry.post_message(&second).unwrap();
+        let session = TerminalId::new();
+        let receipt = Receipt {
+            ids: vec![first.id],
+        };
+        registry
+            .acknowledge_messages(Some(recipient), Some(session), &receipt, 3)
+            .unwrap();
+        registry
+            .acknowledge_messages(Some(recipient), None, &receipt, 4)
+            .unwrap();
+        let settled = registry.message(first.id).unwrap().unwrap();
+        assert_eq!(settled.state, State::Read);
+        assert_eq!(settled.to.session, Some(session));
+        assert_eq!(
+            registry.peek_messages(Some(recipient), &query).unwrap(),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn receipts_are_bounded_and_recipient_scoped_without_partial_settlement() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let mine = message(Party::user(), party(recipient), 1);
+        let foreign = message(party(recipient), Party::user(), 2);
+        registry.post_message(&mine).unwrap();
+        registry.post_message(&foreign).unwrap();
+        for ids in [vec![mine.id, foreign.id], vec![mine.id; MAX_PENDING + 1]] {
+            assert!(
+                registry
+                    .acknowledge_messages(Some(recipient), None, &Receipt { ids }, 3)
+                    .is_err()
+            );
+            assert_eq!(
+                registry.message(mine.id).unwrap().unwrap().state,
+                State::Pending
+            );
+            assert_eq!(
+                registry.message(foreign.id).unwrap().unwrap().state,
+                State::Pending
+            );
+        }
+        assert!(
+            registry
+                .acknowledge_messages(None, None, &Receipt { ids: vec![mine.id] }, 4)
+                .is_err()
+        );
+        registry
+            .acknowledge_messages(
+                None,
+                None,
+                &Receipt {
+                    ids: vec![foreign.id],
+                },
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.message(foreign.id).unwrap().unwrap().state,
+            State::Read
         );
     }
 

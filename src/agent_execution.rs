@@ -364,6 +364,10 @@ pub enum Operation {
     SendMessage(mailbox::Outgoing),
     /// Read the messages left for the caller.
     Inbox(mailbox::Inbox),
+    /// Read without settling messages; acknowledge only after receiving them.
+    PeekInbox(mailbox::Inbox),
+    /// Settle exact received IDs in the authenticated recipient's mailbox.
+    AcknowledgeInbox(mailbox::Receipt),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -423,6 +427,7 @@ pub enum Reply {
     Requests(Vec<chat::Request>),
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
+    InboxAcknowledged,
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
