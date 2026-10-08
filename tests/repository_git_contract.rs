@@ -4089,3 +4089,110 @@ fn ambiguous_push_requires_the_ref_at_every_configured_push_destination() {
     );
     assert!(!missing.exists());
 }
+
+#[test]
+fn ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config() {
+    const CHILD: &str = "CAGENTS_TEST_PUSH_ALIAS_ENV";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "protocol.allow")
+            .env("GIT_CONFIG_VALUE_0", "never")
+            .env("GIT_CONFIG_KEY_1", "protocol.file.allow")
+            .env("GIT_CONFIG_VALUE_1", "always")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated URL alias test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let published = publish_main(&fixture);
+    let actual_push = fixture.root.path().join("first=push.git");
+    fixture.git_in_work(&["remote", "set-url", "origin", "rewrite:repository"]);
+    fixture.git_in_work(&[
+        "config",
+        &format!("url.{}.insteadOf", actual_push.display()),
+        "rewrite:repository",
+    ]);
+    fixture.git_in_work(&[
+        "config",
+        &format!("url.{}.insteadOf", fixture.origin().display()),
+        actual_push.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        fixture.text(&["remote", "get-url", "--push", "origin"]),
+        actual_push.to_str().unwrap()
+    );
+    assert!(
+        fixture
+            .text(&[
+                "ls-remote",
+                actual_push.to_str().unwrap(),
+                "refs/heads/main"
+            ])
+            .starts_with(published.as_str()),
+        "ordinary lookup of the resolved URL applies the second rewrite"
+    );
+    let service = RepositoryService::new(
+        &fixture.git,
+        Arc::new(AmbiguousPushExecutor(SystemProcessExecutor)),
+    );
+    let request = PushRequest {
+        worktree: fixture.work(),
+        branch: ValidatedBranchName::parse("main").unwrap(),
+        target: PushTarget::Upstream {
+            remote: "origin".into(),
+            remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        },
+    };
+    let outcome = service.push(&request, &CancellationToken::new()).unwrap();
+    assert!(
+        matches!(outcome, PushOutcome::OutcomeUnknown { .. }),
+        "second-rewrite evidence must not prove a failed actual destination: {outcome:?}"
+    );
+    assert!(!actual_push.exists());
+
+    fixture.run(
+        fixture.root.path(),
+        &[
+            "clone",
+            "--bare",
+            fixture.origin().to_str().unwrap(),
+            actual_push.to_str().unwrap(),
+        ],
+    );
+    fixture.run(&fixture.origin(), &["update-ref", "-d", "refs/heads/main"]);
+    let outcome = service.push(&request, &CancellationToken::new()).unwrap();
+    assert!(
+        matches!(outcome, PushOutcome::Pushed { ref oid, .. } if *oid == published),
+        "the actual destination with '=' in its path must still reconcile: {outcome:?}"
+    );
+    assert_eq!(
+        String::from_utf8(fixture.run(&actual_push, &["rev-parse", "refs/heads/main"]))
+            .unwrap()
+            .trim(),
+        published.as_str()
+    );
+    assert!(bare_refs(&fixture).is_empty());
+    assert_eq!(
+        fixture.text(&["config", "--get", "protocol.allow"]),
+        "never"
+    );
+    assert_eq!(
+        fixture.text(&["config", "--get", "protocol.file.allow"]),
+        "always"
+    );
+}

@@ -5271,18 +5271,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let Some(destinations) = self.push_destinations(worktree, remote, cancellation) else {
             return false;
         };
+        let inherited_count = std::env::var_os("GIT_CONFIG_COUNT");
         destinations.into_iter().all(|destination| {
-            let command = self.git_read(
+            let Some(command) = self.push_endpoint_command(
                 worktree,
-                [
-                    OsString::from("ls-remote"),
-                    OsString::from("--refs"),
-                    OsString::from("--exit-code"),
-                    OsString::from("--"),
-                    destination,
-                    OsString::from(remote_ref.as_str()),
-                ],
-            );
+                &destination,
+                remote_ref,
+                inherited_count.as_deref(),
+            ) else {
+                return false;
+            };
             let Ok(output) = self.executor.execute(&command, cancellation) else {
                 return false;
             };
@@ -5290,6 +5288,49 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 && matches!(parse_remote_ref_oid(&output.stdout, remote_ref),
                     Ok(Some(oid)) if oid == *expected)
         })
+    }
+
+    fn push_endpoint_command(
+        &self,
+        worktree: &Path,
+        endpoint: &OsStr,
+        remote_ref: &RemoteSideRef,
+        inherited_count: Option<&OsStr>,
+    ) -> Option<CommandSpec> {
+        let count = match inherited_count {
+            None => 0,
+            Some(value) => value.to_str()?.parse::<u32>().ok()?,
+        };
+        // Git's environment config count is bounded by a signed int. Leave
+        // existing entries inherited and append one without overflowing it.
+        if count >= i32::MAX as u32 {
+            return None;
+        }
+        let marker = format!("cagents-reconciliation-{}:", uuid::Uuid::new_v4().simple());
+        let mut key = OsString::from("url.");
+        key.push(endpoint);
+        key.push(".insteadOf");
+        // Passing an already resolved URL to ls-remote would apply insteadOf
+        // a second time. A fresh full-marker alias maps directly to this URL
+        // once, while retaining all inherited auth and transport configuration.
+        // Environment framing also preserves '=' and non-UTF8 endpoint bytes,
+        // and keeps credential-bearing URLs out of process arguments.
+        Some(
+            self.git_read(
+                worktree,
+                [
+                    "ls-remote",
+                    "--refs",
+                    "--exit-code",
+                    "--",
+                    &marker,
+                    remote_ref.as_str(),
+                ],
+            )
+            .env("GIT_CONFIG_COUNT", (count + 1).to_string())
+            .env(format!("GIT_CONFIG_KEY_{count}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{count}"), marker),
+        )
     }
 
     fn push_destinations(
@@ -9175,6 +9216,17 @@ mod tests {
             }
         );
         let commands = service.executor.commands.lock().unwrap();
+        let count: u32 = commands[6].environment[OsStr::new("GIT_CONFIG_COUNT")]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let marker =
+            commands[6].environment[OsStr::new(&format!("GIT_CONFIG_VALUE_{}", count - 1))].clone();
+        assert_eq!(
+            commands[6].environment[OsStr::new(&format!("GIT_CONFIG_KEY_{}", count - 1))],
+            OsString::from("url./origin.insteadOf")
+        );
         assert_eq!(
             commands[6].arguments,
             vec![
@@ -9189,7 +9241,7 @@ mod tests {
                 OsString::from("--refs"),
                 OsString::from("--exit-code"),
                 OsString::from("--"),
-                OsString::from("/origin"),
+                marker,
                 OsString::from("refs/heads/feature"),
             ]
         );
@@ -9311,6 +9363,79 @@ mod tests {
             .push_destinations(Path::new("/repo"), "origin", &CancellationToken::new())
             .unwrap();
         assert_eq!(destinations[0].as_os_str().as_bytes(), b"/non-utf8-\xff");
+    }
+
+    #[test]
+    fn push_endpoint_alias_preserves_bytes_and_appends_bounded_config_entries() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let service = fake_service(vec![]);
+        let endpoint = OsString::from_vec(b"/private=endpoint-\xff.git".to_vec());
+        let reference = RemoteSideRef::parse("refs/heads/main").unwrap();
+        let command = service
+            .push_endpoint_command(
+                Path::new("/repo"),
+                &endpoint,
+                &reference,
+                Some(OsStr::new("2")),
+            )
+            .unwrap();
+        assert_eq!(
+            command.environment[OsStr::new("GIT_CONFIG_COUNT")],
+            OsString::from("3")
+        );
+        assert_eq!(
+            command.environment[OsStr::new("GIT_CONFIG_KEY_2")].as_bytes(),
+            b"url./private=endpoint-\xff.git.insteadOf"
+        );
+        let marker = &command.environment[OsStr::new("GIT_CONFIG_VALUE_2")];
+        assert!(command.arguments.contains(marker));
+        assert!(!command.arguments.iter().any(|argument| {
+            argument
+                .as_bytes()
+                .windows(b"private=endpoint".len())
+                .any(|part| part == b"private=endpoint")
+        }));
+        assert!(
+            !command
+                .environment
+                .contains_key(OsStr::new("GIT_CONFIG_KEY_0"))
+        );
+        assert!(
+            !command
+                .environment
+                .contains_key(OsStr::new("GIT_CONFIG_KEY_1"))
+        );
+        assert!(
+            !command
+                .removed_environment
+                .iter()
+                .any(|name| name.as_bytes().starts_with(b"GIT_CONFIG_"))
+        );
+        for invalid in [
+            OsString::from("-1"),
+            OsString::from("not-a-count"),
+            OsString::from("2147483647"),
+            OsString::from("4294967296"),
+            OsString::from_vec(vec![0xff]),
+        ] {
+            assert!(
+                service
+                    .push_endpoint_command(
+                        Path::new("/repo"),
+                        &endpoint,
+                        &reference,
+                        Some(&invalid)
+                    )
+                    .is_none()
+            );
+        }
+        let default = service
+            .push_endpoint_command(Path::new("/repo"), &endpoint, &reference, None)
+            .unwrap();
+        assert_eq!(
+            default.environment[OsStr::new("GIT_CONFIG_COUNT")],
+            OsString::from("1")
+        );
     }
 
     #[test]
