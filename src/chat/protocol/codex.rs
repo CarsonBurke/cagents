@@ -2228,20 +2228,15 @@ impl Adapter for Codex {
                 }
                 // Non-blocking questions can outlive their originating turn.
                 // Only serverRequest/resolved or thread closure invalidates them.
-<<<<<<< HEAD
-                if !self.busy {
-                    self.active_items.clear();
-                    self.output_streams.clear();
-=======
                 if current {
                     if !self.busy {
                         self.active_items.clear();
+                        self.output_streams.clear();
                     }
                     step.events.push(Event::Status {
                         busy: self.busy,
                         detail: turn_detail(&turn["status"]),
                     });
->>>>>>> origin/main
                 }
                 if turn["error"].is_object() {
                     step.events.push(Event::Error {

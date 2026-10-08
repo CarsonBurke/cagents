@@ -790,7 +790,10 @@ mod tests {
                 "Vec<std::string> or Option<std::path::PathBuf>\n",
                 "Vec\\<std::string> or Option\\<std::path::PathBuf>\n",
             ),
-            ("<a:b> <T:Clone> <x@-y.z> <x@y..z>\n", "\\<a:b> \\<T:Clone> \\<x@-y.z> \\<x@y..z>\n"),
+            (
+                "<a:b> <T:Clone> <x@-y.z> <x@y..z>\n",
+                "\\<a:b> \\<T:Clone> \\<x@-y.z> \\<x@y..z>\n",
+            ),
             // Nothing is interpreted in a code span, so nothing is escaped.
             (
                 "`Vec<T>` and ``a ` <b>`` then <c>\n",
@@ -890,10 +893,7 @@ mod tests {
                 "1. Step\n\n   ```\n   <a>\n\n  <b>\n",
                 "1. Step\n\n   ```\n   <a>\n\n  \\<b>\n",
             ),
-            (
-                "> - ```\n>   <a>\n> <b>\n",
-                "> - ```\n>   <a>\n> \\<b>\n",
-            ),
+            ("> - ```\n>   <a>\n> <b>\n", "> - ```\n>   <a>\n> \\<b>\n"),
             // So a fence at the margin does not close the item's: it opens
             // one of its own.
             (
@@ -923,8 +923,14 @@ mod tests {
                 "a ``code <x>\nmore ` <y>\n  still`` b <z>\n",
                 "a ``code <x>\nmore ` <y>\n  still`` b \\<z>\n",
             ),
-            ("- a `code <x>\n  still` <y>\n", "- a `code <x>\n  still` \\<y>\n"),
-            ("a `code <x>\r\nstill` <y>\r\n", "a `code <x>\r\nstill` \\<y>\r\n"),
+            (
+                "- a `code <x>\n  still` <y>\n",
+                "- a `code <x>\n  still` \\<y>\n",
+            ),
+            (
+                "a `code <x>\r\nstill` <y>\r\n",
+                "a `code <x>\r\nstill` \\<y>\r\n",
+            ),
             ("a `code <x>\nstill` <y>", "a `code <x>\nstill` \\<y>"),
             // The paragraph ends first, so the span never opened.
             (
@@ -1057,18 +1063,27 @@ mod tests {
             advance("see <https://example.com> or one<b", true),
             ("<https://example.com> or one".into(), true)
         );
-        assert_eq!(advance("see <https://example.com> or one<br /", true), (String::new(), true));
+        assert_eq!(
+            advance("see <https://example.com> or one<br /", true),
+            (String::new(), true)
+        );
         assert_eq!(
             advance("see <https://example.com> or one<br />two Vec<Opt", true),
             ("<br>two Vec".into(), true)
         );
         assert_eq!(
-            advance("see <https://example.com> or one<br />two Vec<Option<", true),
+            advance(
+                "see <https://example.com> or one<br />two Vec<Option<",
+                true
+            ),
             ("\\<Option".into(), true)
         );
         // The answer ended there, so the `<` is only that.
         assert_eq!(
-            advance("see <https://example.com> or one<br />two Vec<Option<", false),
+            advance(
+                "see <https://example.com> or one<br />two Vec<Option<",
+                false
+            ),
             ("\\<".into(), false)
         );
     }

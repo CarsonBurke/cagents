@@ -13326,10 +13326,7 @@ mod tests {
             ),
             // A fence ends with the list item it is in, and one at the
             // margin after it is a fence of its own.
-            (
-                "- ```\n  in <a>\nout <b>\n",
-                "* []\nin <a>\nout <b>\n",
-            ),
+            ("- ```\n  in <a>\nout <b>\n", "* []\nin <a>\nout <b>\n"),
             (
                 "- ```\n  in <a>\n```\nnext <b>\n```\nlast <c>\n",
                 "* []\nin <a>\n[]\nnext <b>\nlast <c>\n",

@@ -1070,8 +1070,9 @@ impl Store {
                                 begin < end0 && end > start0
                             };
                             if within {
-                                change.diff =
-                                    body0[begin.max(start0) - start0..end.min(end0) - start0].into();
+                                change.diff = body0
+                                    [begin.max(start0) - start0..end.min(end0) - start0]
+                                    .into();
                             }
                             within
                         });
@@ -2048,7 +2049,11 @@ mod tests {
         assert!(events.is_empty(), "{events:?}");
         assert_eq!(patches(&mut store), [[("src/app.rs".to_owned(), diff)]]);
         // A single line longer than the old bound is a line like any other.
-        let line = format!("@@ -1 +1 @@\n-{}\n+{}\n", "a".repeat(40_000), "b".repeat(40_000));
+        let line = format!(
+            "@@ -1 +1 @@\n-{}\n+{}\n",
+            "a".repeat(40_000),
+            "b".repeat(40_000)
+        );
         let events = store
             .apply(change_set(vec![change("min.js", line.clone())]))
             .unwrap();
@@ -2109,10 +2114,17 @@ mod tests {
         // that says which lines it is.
         let window = store.window().unwrap();
         assert_eq!(window.items[0].id, "edit");
-        assert!(window.items[1].id.starts_with("edit:native-part:1:changes:"));
+        assert!(
+            window.items[1]
+                .id
+                .starts_with("edit:native-part:1:changes:")
+        );
         // A result that replaces the patch replaces every part of it.
         store
-            .apply(change_set(vec![change("a.rs", "@@ -1 +1 @@\n-a\n+b\n".into())]))
+            .apply(change_set(vec![change(
+                "a.rs",
+                "@@ -1 +1 @@\n-a\n+b\n".into(),
+            )]))
             .unwrap();
         assert_eq!(
             patches(&mut store),
