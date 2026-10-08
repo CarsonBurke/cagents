@@ -61,7 +61,14 @@ impl Cagents {
     pub(super) fn open_automations(&mut self) -> Task<Message> {
         self.refresh_automation_choices();
         let open = self.open_utility_card(CardKind::Automations);
-        let read = self.update_automation_ui(Action::Refresh);
+        // A retained editor owns its choices and does not need a list read.
+        // Starting a foreground refresh here would drop the first keystrokes
+        // after reopening the pane or returning from a window-close warning.
+        let read = if self.automation_ui.has_draft() {
+            Task::none()
+        } else {
+            self.update_automation_ui(Action::Refresh)
+        };
         Task::batch([open, read])
     }
 
@@ -83,7 +90,19 @@ impl Cagents {
         ) {
             self.refresh_automation_choices();
         }
+        let was_draft_dialog = self.automation_ui.draft_dialog_open();
         match self.automation_ui.update(action) {
+            None if !was_draft_dialog && self.automation_ui.draft_dialog_open() => {
+                iced::widget::operation::focus(crate::automation_ui::draft_dialog_focus_id())
+                    .map(cosmic::Action::App)
+            }
+            None if was_draft_dialog
+                && self.automation_ui.has_draft()
+                && !self.automation_ui.draft_dialog_open() =>
+            {
+                iced::widget::operation::focus(crate::automation_ui::draft_editor_focus_id())
+                    .map(cosmic::Action::App)
+            }
             None => Task::none(),
             Some(Effect::ReadRun(run)) => {
                 let ids = self

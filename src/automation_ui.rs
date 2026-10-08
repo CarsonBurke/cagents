@@ -82,6 +82,8 @@ pub enum Action {
     Select(Uuid),
     Edit,
     CancelEdit,
+    KeepDraft(u64),
+    DiscardDraft(u64),
     Save,
     Field(Field, String),
     Provider(usize),
@@ -116,6 +118,9 @@ pub enum Action {
 }
 
 impl Action {
+    pub fn answers_draft_dialog(&self) -> bool {
+        matches!(self, Self::KeepDraft(_) | Self::DiscardDraft(_))
+    }
     pub fn background(&self) -> bool {
         matches!(self, Self::Received { .. } | Self::Tick)
     }
@@ -163,7 +168,30 @@ struct Confirmation {
     title: &'static str,
 }
 
+#[derive(PartialEq, Eq)]
+struct DraftValues {
+    name: String,
+    model: String,
+    effort: Option<String>,
+    permission: String,
+    timezone: String,
+    hour: String,
+    minute: String,
+    cron: String,
+    timeout: String,
+    provider: usize,
+    account: Option<usize>,
+    target: Option<usize>,
+    schedule: usize,
+    weekday: usize,
+    reuse: bool,
+    precheck: bool,
+    prompt: String,
+    shell: String,
+}
+
 pub struct Draft {
+    baseline: Option<DraftValues>,
     base: Option<(Uuid, u64)>,
     name: String,
     model: String,
@@ -208,6 +236,7 @@ impl Draft {
         existing: Option<&Automation>,
     ) -> Self {
         let mut value = Self {
+            baseline: None,
             base: None,
             name: String::new(),
             model: String::new(),
@@ -310,7 +339,36 @@ impl Draft {
         }
         value.preselect_account();
         value.refresh_timezone_matches();
+        value.baseline = Some(value.values());
         value
+    }
+
+    fn values(&self) -> DraftValues {
+        DraftValues {
+            name: self.name.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            permission: self.permission.clone(),
+            timezone: self.timezone.clone(),
+            hour: self.hour.clone(),
+            minute: self.minute.clone(),
+            cron: self.cron.clone(),
+            timeout: self.timeout.clone(),
+            provider: self.provider,
+            account: self.account,
+            target: self.target,
+            schedule: self.schedule,
+            weekday: self.weekday,
+            reuse: self.reuse,
+            precheck: self.precheck,
+            prompt: self.prompt.text(),
+            shell: self.shell.text(),
+        }
+    }
+    fn dirty(&self) -> bool {
+        self.baseline
+            .as_ref()
+            .is_some_and(|baseline| self.values() != *baseline)
     }
 
     /// Suggestions for the typed timezone; none once it names a zone.
@@ -526,6 +584,8 @@ pub struct State {
     search: String,
     selected: Option<Automation>,
     draft: Option<Draft>,
+    discard_draft: Option<(u64, Action)>,
+    discard_generation: u64,
     confirmation: Option<Confirmation>,
     history: Vec<Firing>,
     history_status: HistoryStatus,
@@ -542,6 +602,65 @@ pub struct State {
 }
 
 impl State {
+    pub fn has_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+    pub fn draft_dirty(&self) -> bool {
+        self.draft.as_ref().is_some_and(Draft::dirty)
+    }
+    pub fn draft_close_blocker(&self) -> Option<&'static str> {
+        if self.draft.is_some() && matches!(self.pending, Some((_, Pending::Save))) {
+            Some("Wait for the automation save to finish before closing the window.")
+        } else if self.draft_dirty() {
+            Some(
+                "The automation has unsaved changes. Keep editing or discard the draft before closing the window.",
+            )
+        } else {
+            None
+        }
+    }
+    pub fn can_discard_draft(&self) -> bool {
+        self.draft.is_some() && !matches!(self.pending, Some((_, Pending::Save)))
+    }
+    pub fn discard_draft_before_close(&mut self) -> bool {
+        if !self.can_discard_draft() {
+            return false;
+        }
+        self.draft = None;
+        self.discard_draft = None;
+        true
+    }
+    pub fn draft_dialog_open(&self) -> bool {
+        self.discard_draft.is_some()
+    }
+    pub fn keep_draft_action(&self) -> Option<Action> {
+        self.discard_draft
+            .as_ref()
+            .map(|(generation, _)| Action::KeepDraft(*generation))
+    }
+    pub fn draft_dialog(&self) -> Option<Element<'_, Action>> {
+        let (generation, _) = self.discard_draft.as_ref()?;
+        Some(crate::app::dialog_ui::surface(
+            widget::column::with_children(vec![
+                crate::design::title("Discard automation changes?").into(),
+                crate::design::body("Your unsaved changes will be lost.").into(),
+                widget::row::with_children(vec![
+                    crate::ui_controls::button::secondary("Keep editing")
+                        .id(draft_dialog_focus_id())
+                        .on_press(Action::KeepDraft(*generation))
+                        .into(),
+                    crate::ui_controls::button::destructive("Discard changes")
+                        .on_press(Action::DiscardDraft(*generation))
+                        .into(),
+                ])
+                .spacing(space::S)
+                .into(),
+            ])
+            .spacing(space::M),
+            560.0,
+        ))
+    }
+
     /// Archived homes remain usable by definitions that already selected them,
     /// but are never choices when creating a new automation.
     pub fn set_archived_accounts(&mut self, accounts: Vec<AccountChoice>) {
@@ -601,6 +720,24 @@ impl State {
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        if self.discard_draft.is_some() && !action.background() && !action.answers_draft_dialog() {
+            return None;
+        }
+        if let Action::KeepDraft(generation) | Action::DiscardDraft(generation) = &action {
+            if self
+                .discard_draft
+                .as_ref()
+                .is_none_or(|(expected, _)| expected != generation)
+            {
+                return None;
+            }
+            let (_, next) = self.discard_draft.take().expect("checked draft intent");
+            if matches!(action, Action::DiscardDraft(_)) {
+                self.draft = None;
+                return self.update(next);
+            }
+            return None;
+        }
         if matches!(
             &action,
             Action::Field(..)
@@ -874,6 +1011,15 @@ impl State {
             }
             return self.request(Pending::Mutate, confirmation.request);
         }
+        if matches!(
+            action,
+            Action::New | Action::Select(_) | Action::Edit | Action::CancelEdit
+        ) && self.draft_dirty()
+        {
+            self.discard_generation = self.discard_generation.wrapping_add(1);
+            self.discard_draft = Some((self.discard_generation, action));
+            return None;
+        }
         self.confirmation = None;
         match action {
             Action::Browse => {
@@ -948,6 +1094,7 @@ impl State {
                 })
             }
             Action::CancelEdit => self.draft = None,
+            Action::KeepDraft(_) | Action::DiscardDraft(_) => {}
             Action::Save => {
                 if let Some(draft) = &self.draft {
                     match draft.definition(&self.models) {
@@ -1968,15 +2115,23 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
     }
     button.width(Length::Fill).into()
 }
+pub fn draft_dialog_focus_id() -> widget::Id {
+    widget::Id::new("dialog.automation-draft.keep")
+}
+pub fn draft_editor_focus_id() -> widget::Id {
+    widget::Id::new("automation-draft.name")
+}
 fn input<'a>(label: &'static str, value: &'a str, field: Field) -> Element<'a, Action> {
-    widget::column::with_children(vec![
-        crate::design::caption(label).into(),
-        crate::ui_controls::field::text(label, value)
-            .on_input(move |value| Action::Field(field, value))
-            .into(),
-    ])
-    .spacing(space::XS)
-    .into()
+    let input = crate::ui_controls::field::text(label, value)
+        .on_input(move |value| Action::Field(field, value));
+    let input = if matches!(field, Field::Name) {
+        input.id(draft_editor_focus_id())
+    } else {
+        input
+    };
+    widget::column::with_children(vec![crate::design::caption(label).into(), input.into()])
+        .spacing(space::XS)
+        .into()
 }
 fn timestamp(milliseconds: u64) -> String {
     crate::chat::local_time((milliseconds / 1000).min(i64::MAX as u64) as i64)
@@ -2099,6 +2254,97 @@ mod tests {
             channel: None,
             blocked: None,
         }
+    }
+
+    #[test]
+    fn automation_draft_dirty_baseline_tracks_values_and_restored_edits() {
+        for existing in [None, Some(automation())] {
+            let mut draft = Draft::new(&[], &[], existing.as_ref());
+            assert!(!draft.dirty());
+            draft.advanced = !draft.advanced;
+            draft.custom_model = !draft.custom_model;
+            draft
+                .prompt
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            assert!(
+                !draft.dirty(),
+                "disclosure, chooser and caret do not change saved values"
+            );
+            let original = draft.name.clone();
+            draft.name.push_str(" revised");
+            assert!(draft.dirty());
+            draft.name = original;
+            assert!(!draft.dirty(), "editing back to the baseline is clean");
+            draft.timeout = "invalid timeout".into();
+            assert!(draft.dirty(), "invalid input is still unsaved work");
+        }
+    }
+    #[test]
+    fn automation_draft_navigation_requires_generation_fenced_discard() {
+        let mut state = State::default();
+        state.update(Action::New);
+        state.update(Action::Field(Field::Name, "Keep this draft".into()));
+        let selected = Uuid::new_v4();
+        assert!(state.update(Action::Select(selected)).is_none());
+        assert!(state.draft_dialog_open());
+        let old = state.discard_generation;
+        state.update(Action::Field(Field::Name, "ignored under modal".into()));
+        assert_eq!(state.draft.as_ref().unwrap().name, "Keep this draft");
+        state.update(Action::KeepDraft(old));
+        assert!(!state.draft_dialog_open());
+        assert!(state.draft_dirty());
+        state.update(Action::CancelEdit);
+        let current = state.discard_generation;
+        state.update(Action::DiscardDraft(old));
+        assert!(state.draft_dialog_open());
+        assert!(state.has_draft());
+        state.update(Action::DiscardDraft(current));
+        assert!(!state.has_draft());
+        state.update(Action::New);
+        assert!(
+            state.update(Action::Select(selected)).is_some(),
+            "untouched New may be replaced"
+        );
+        assert!(!state.has_draft());
+    }
+    #[test]
+    fn automation_draft_edit_and_new_replacement_preserve_work_until_confirmed() {
+        let mut state = State {
+            selected: Some(automation()),
+            ..Default::default()
+        };
+        state.update(Action::Edit);
+        assert!(!state.draft_dirty());
+        state.update(Action::Field(Field::Name, "Edited definition".into()));
+        for next in [Action::New, Action::Edit] {
+            state.update(next);
+            assert_eq!(state.draft.as_ref().unwrap().name, "Edited definition");
+            assert!(state.draft_dialog().is_some());
+            state.update(state.keep_draft_action().unwrap());
+        }
+        state.update(Action::New);
+        let generation = state.discard_generation;
+        state.update(Action::DiscardDraft(generation));
+        assert_eq!(state.draft.as_ref().unwrap().name, "");
+        assert!(!state.draft_dirty());
+    }
+    #[test]
+    fn automation_draft_close_cannot_discard_an_inflight_save() {
+        let mut state = State::default();
+        state.update(Action::New);
+        state.update(Action::Field(Field::Name, "Unsaved".into()));
+        state.pending = Some((7, Pending::Save));
+        assert!(state.draft_close_blocker().unwrap().contains("save"));
+        assert!(!state.can_discard_draft());
+        assert!(!state.discard_draft_before_close());
+        state.update(Action::Received {
+            sequence: 7,
+            result: std::sync::Arc::new(Err("Save failed".into())),
+        });
+        assert!(state.draft_dirty());
+        assert!(state.can_discard_draft());
+        assert!(state.discard_draft_before_close());
+        assert!(state.draft_close_blocker().is_none());
     }
 
     #[test]
