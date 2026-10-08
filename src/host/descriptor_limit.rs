@@ -69,6 +69,31 @@ mod tests {
 
     #[test]
     fn children_start_with_the_limit_the_daemon_was_given() {
+        const CHILD: &str = "CAGENTS_TEST_DESCRIPTOR_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let before = current().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::descriptor_limit::tests::children_start_with_the_limit_the_daemon_was_given",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated descriptor-limit test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let after = current().unwrap();
+            assert_eq!(after.rlim_cur, before.rlim_cur);
+            assert_eq!(after.rlim_max, before.rlim_max);
+            return;
+        }
+        // Both RLIMIT_NOFILE and INHERITED belong to the process. Exercise
+        // them in isolation from the descriptor-heavy parallel host tests.
         let mut limit = current().unwrap();
         // A daemon started with the customary soft limit, below its hard one.
         limit.rlim_cur = limit.rlim_cur.min(1024).min(limit.rlim_max - 1);
