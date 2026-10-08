@@ -4684,7 +4684,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // a *tracked* file is not what the user confirmed — so the
         // classification is re-established here, immediately before the
         // deletions, from the index rather than from the stale snapshot.
-        let tracked_now = self.indexed_paths(&request.worktree, &untracked, cancellation)?;
+        let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation) {
+            Ok(paths) => paths,
+            Err(error) => {
+                // The tracked half may already have destroyed working-tree
+                // edits. Preserve its exact outcome while refusing every
+                // untracked path whose classification could not be checked.
+                let reason = format!("could not verify that the path is still untracked: {error}");
+                let failures = untracked
+                    .into_iter()
+                    .map(|path| MutationFailure::Path {
+                        path,
+                        reason: reason.clone(),
+                    })
+                    .collect();
+                return Ok(report_discard(applied, failures));
+            }
+        };
 
         // Opened once, and every unlink below is anchored to this descriptor
         // rather than to the worktree's name.
