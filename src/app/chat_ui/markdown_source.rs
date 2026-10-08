@@ -1097,7 +1097,6 @@ mod tests {
             ("<me@example.com b", " c>"),
             ("<Option<", "String>>"),
             ("<details ", "open>"),
-            ("<br ", "x>"),
         ] {
             let whole = format!("{tag}{rest}");
             assert_eq!(
@@ -1112,6 +1111,10 @@ mod tests {
                 "{whole:?}"
             );
         }
+        // Whitespace can still precede a line break's closing delimiter.
+        assert_eq!(line_break(b"<br "), Scan::Unfinished);
+        assert_eq!(line_break(b"<br x>"), Scan::Nothing);
+        assert_eq!(line_break(b"<br />"), Scan::Whole(6));
     }
 
     #[test]
