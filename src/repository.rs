@@ -3998,7 +3998,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         expected_head: &Oid,
         cancellation: &CancellationToken,
     ) -> Result<PullRequestRange, RepositoryError> {
-        validate_remote_name(remote)?;
+        let _remote = self.checked_remote(worktree, remote, cancellation)?;
         let (head_ref, base_ref) = pull_request_refs(number)?;
         let output = self.run_checked(
             &self.git_read(
@@ -4983,7 +4983,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let (Some(remote), Some(merge)) = (remote, merge) else {
             return Ok(None);
         };
-        validate_remote_name(&remote)?;
+        let _remote = self.checked_remote(worktree, &remote, cancellation)?;
         Ok(Some(PushTarget::Upstream {
             remote,
             remote_ref: ValidatedRefName::parse(merge)?,
@@ -5074,7 +5074,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 
     pub fn push_command(&self, request: &PushRequest) -> Result<CommandSpec, ValidationError> {
-        self.push_command_to(request, &request.target.remote_side_ref()?)
+        let remote = CheckedRemote::simple(request.target.remote())?;
+        Ok(self.push_command_to(request, &request.target.remote_side_ref()?, remote))
     }
 
     /// The push command for one already-resolved destination, so the ref that
@@ -5084,13 +5085,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         request: &PushRequest,
         destination: &RemoteSideRef,
-    ) -> Result<CommandSpec, ValidationError> {
-        validate_remote_name(request.target.remote())?;
+        remote: CheckedRemote<'_>,
+    ) -> CommandSpec {
         let mut arguments = vec![OsString::from("push"), OsString::from("--porcelain")];
         if request.target.sets_upstream() {
             arguments.push(OsString::from("--set-upstream"));
         }
-        arguments.push(OsString::from(request.target.remote()));
+        arguments.push(OsString::from(remote.0));
         // An explicit refspec, never a push default: the remote-side ref this
         // updates must be the one the user was shown. `--set-upstream` records
         // this refspec's own destination as `branch.<name>.merge`, so the
@@ -5098,7 +5099,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // tracking configuration land in the form Git expects to read back.
         // Force is never offered.
         arguments.push(push_refspec(&request.branch, destination).into());
-        Ok(self.git_mutation(&request.worktree, arguments))
+        self.git_mutation(&request.worktree, arguments)
     }
 
     /// Pushes one branch, reconciling an uncertain outcome against the remote.
@@ -5111,7 +5112,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // asked to validate, the ref reconciliation looks up on the remote,
         // and the ref this reports as updated are all this one value.
         let destination = request.target.remote_side_ref()?;
-        let command = self.push_command_to(request, &destination)?;
+        let remote =
+            self.checked_remote(&request.worktree, request.target.remote(), cancellation)?;
+        let command = self.push_command_to(request, &destination, remote);
         if request.target.sets_upstream() {
             // The remote-side name is user text on a first publish, so Git
             // validates it before anything leaves the machine.
@@ -5190,6 +5193,38 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    /// A slash-containing argument can also name a local repository path.
+    /// Accept it only when this repository explicitly configures that remote.
+    fn checked_remote<'a>(
+        &self,
+        worktree: &Path,
+        remote: &'a str,
+        cancellation: &CancellationToken,
+    ) -> Result<CheckedRemote<'a>, RepositoryError> {
+        if !remote.contains('/') {
+            return Ok(CheckedRemote::simple(remote)?);
+        }
+        ValidatedRefName::parse(format!("refs/remotes/{remote}"))
+            .map_err(|_| ValidationError::InvalidRemote(remote.to_owned()))?;
+        if remote.starts_with('-') || remote.starts_with('/') || remote.contains(':') {
+            return Err(ValidationError::InvalidRemote(remote.to_owned()).into());
+        }
+        if !self
+            .remotes(worktree, cancellation)?
+            .iter()
+            .any(|configured| {
+                configured.name == remote
+                    && configured
+                        .fetch_url
+                        .as_ref()
+                        .is_some_and(|url| !url.is_empty())
+            })
+        {
+            return Err(ValidationError::InvalidRemote(remote.to_owned()).into());
+        }
+        Ok(CheckedRemote(remote))
+    }
+
     /// The object id a remote currently has for one ref, or `None` when the
     /// remote does not have it.
     ///
@@ -5204,7 +5239,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         remote_ref: &RemoteSideRef,
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
-        validate_remote_name(remote)?;
+        let _remote = self.checked_remote(worktree, remote, cancellation)?;
         let command = self.git_read(
             worktree,
             [
@@ -5505,7 +5540,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .find(|remote| remote.name == "origin")
             .or_else(|| (remotes.len() == 1).then(|| &remotes[0]));
         if let Some(remote) = remote {
-            validate_remote_name(&remote.name)?;
+            let _remote = self.checked_remote(repository, &remote.name, cancellation)?;
             let output = self.run_checked(
                 &self.git_read(
                     repository,
@@ -5909,6 +5944,17 @@ fn cleanup_whitespace(message: &str) -> String {
 /// would push to happily and to no effect.
 fn push_refspec(branch: &ValidatedBranchName, destination: &RemoteSideRef) -> String {
     format!("{}:{destination}", branch.full_ref())
+}
+
+/// A remote argument whose path-like spelling has been checked against the
+/// repository configuration, or which meets the existing simple-name rules.
+struct CheckedRemote<'a>(&'a str);
+
+impl<'a> CheckedRemote<'a> {
+    fn simple(remote: &'a str) -> Result<Self, ValidationError> {
+        validate_remote_name(remote)?;
+        Ok(Self(remote))
+    }
 }
 
 /// Remote names reach both a configuration key and a command line, so a name
@@ -10121,7 +10167,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                             "No configured remote owns {reference}"
                         ))
                     })?;
-                validate_remote_name(remote)?;
+                let _remote =
+                    self.checked_remote(&journal.request.repository, remote, cancellation)?;
                 ValidatedBranchName::parse(branch)?;
                 let mut fetch = self.git_mutation(
                     &journal.request.repository,
