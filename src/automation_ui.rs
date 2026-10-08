@@ -145,7 +145,9 @@ impl Pending {
     fn background_read(self) -> bool {
         matches!(
             self,
-            Self::RefreshAutomation | Self::RefreshHistory | Self::HistoryRun { .. }
+            Self::RefreshAutomation
+                | Self::RefreshHistory
+                | Self::HistoryRun { .. }
         )
     }
 }
@@ -512,6 +514,9 @@ pub struct State {
     sequence: u64,
     pending: Option<(u64, Pending)>,
     rows: Vec<Summary>,
+    // The newest firing learned from an authoritative first history page.
+    // Older pages and detail reads may update it, but cannot replace it.
+    last_firings: BTreeMap<Uuid, (u64, Uuid)>,
     more: bool,
     after: Option<Uuid>,
     search: String,
@@ -568,6 +573,18 @@ impl State {
             request,
         })
     }
+    fn refresh_last_outcome(&mut self, firing: &Firing, newest_page: bool) {
+        let key = (firing.created_ms, firing.id);
+        let known = self.last_firings.get(&firing.automation).copied();
+        if known.is_some_and(|latest| key < latest) || (!newest_page && known != Some(key)) {
+            return;
+        }
+        if let Some(row) = self.rows.iter_mut().find(|row| row.id == firing.automation) {
+            row.last_state = Some(firing.state);
+            self.last_firings.insert(firing.automation, key);
+        }
+    }
+
     fn refresh_history_runs(&mut self, from: usize) -> Option<Effect> {
         let index =
             (from..self.history.len()).find(|&index| self.history[index].state.is_active())?;
@@ -621,6 +638,9 @@ impl State {
                         self.rows.clear();
                     }
                     for row in rows {
+                        // The list is authoritative but does not carry the latest
+                        // firing identity. Retire our earlier detail-read fence.
+                        self.last_firings.remove(&row.id);
                         if let Some(current) =
                             self.rows.iter_mut().find(|current| current.id == row.id)
                         {
@@ -629,6 +649,8 @@ impl State {
                             self.rows.push(row);
                         }
                     }
+                    self.last_firings
+                        .retain(|id, _| self.rows.iter().any(|row| row.id == *id));
                 }
                 Ok(Response::Automation(automation)) => {
                     let id = automation.id;
@@ -664,6 +686,10 @@ impl State {
                     );
                 }
                 Ok(Response::History(page)) => {
+                    let newest_page = !matches!(pending, Pending::History { append: true });
+                    for firing in &page.firings {
+                        self.refresh_last_outcome(firing, newest_page);
+                    }
                     self.history_status = HistoryStatus::Loaded;
                     if matches!(pending, Pending::RefreshHistory) {
                         // Keep the reader's paginated snapshot stable. Automatically
@@ -716,6 +742,7 @@ impl State {
                     self.history_next = page.next;
                 }
                 Ok(Response::Detail(detail)) => {
+                    self.refresh_last_outcome(&detail.firing, false);
                     if let Pending::HistoryRun { index } = pending {
                         if let Some(firing) = self
                             .history
@@ -735,6 +762,7 @@ impl State {
                     return run.map(Effect::ReadRun);
                 }
                 Ok(Response::Firing(firing)) => {
+                    self.refresh_last_outcome(&firing, true);
                     if let crate::automations::Trigger::Manual { request } = firing.trigger {
                         if self
                             .manual_requests
@@ -750,6 +778,7 @@ impl State {
                 Ok(Response::Removed) => {
                     if let Some(selected) = self.selected.take() {
                         self.rows.retain(|row| row.id != selected.id);
+                        self.last_firings.remove(&selected.id);
                     }
                     self.notice = Some("Automation removed. Past runs remain in history.".into());
                 }
@@ -789,7 +818,10 @@ impl State {
                 return None;
             }
             if let Some(run) = &self.run {
-                return self.request(Pending::Run, Request::ShowFiring { id: run.firing.id });
+                return self.request(
+                    Pending::Run,
+                    Request::ShowFiring { id: run.firing.id },
+                );
             }
             if let Some(automation) = &self.selected {
                 return self.request(
@@ -2180,6 +2212,126 @@ mod tests {
             skip: None,
             diagnostic: None,
         }
+    }
+
+    #[test]
+    fn latest_outcome_follows_history_without_older_details_overwriting_it() {
+        use crate::automations::{FiringState, HistoryPage};
+        let selected = automation();
+        let mut state = State {
+            rows: vec![selected.summary(None)],
+            selected: Some(selected.clone()),
+            ..Default::default()
+        };
+        let mut latest = history_firing(100, FiringState::Accepted);
+        latest.automation = selected.id;
+        for outcome in [
+            FiringState::Accepted,
+            FiringState::Running,
+            FiringState::Succeeded,
+        ] {
+            latest.state = outcome;
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
+                panic!("history request expected");
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings: vec![latest.clone()],
+                    next: None,
+                }))),
+            });
+            assert_eq!(state.rows[0].last_state, Some(outcome));
+        }
+        let mut older = history_firing(1, FiringState::Failed);
+        older.automation = selected.id;
+        state.refresh_last_outcome(&older, false);
+        assert_eq!(state.rows[0].last_state, Some(FiringState::Succeeded));
+        // Even an authoritative newest page can include older firings too.
+        state.refresh_last_outcome(&older, true);
+        assert_eq!(state.rows[0].last_state, Some(FiringState::Succeeded));
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
+            panic!("history request expected");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("offline".into())),
+        });
+        assert_eq!(state.rows[0].last_state, Some(FiringState::Succeeded));
+    }
+
+    #[test]
+    fn newer_runs_update_last_outcome_without_replacing_paginated_history() {
+        use crate::automations::{FiringState, HistoryPage};
+        let selected = automation();
+        let mut loaded = history_firing(1, FiringState::Succeeded);
+        loaded.automation = selected.id;
+        let mut newer = history_firing(100, FiringState::Running);
+        newer.automation = selected.id;
+        let mut state = State {
+            rows: vec![selected.summary(Some(loaded.state))],
+            history: vec![loaded.clone()],
+            history_status: HistoryStatus::Loaded,
+            pending: Some((1, Pending::RefreshHistory)),
+            ..Default::default()
+        };
+        state.update(Action::Received {
+            sequence: 1,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![newer.clone()],
+                next: None,
+            }))),
+        });
+        assert_eq!(state.history[0].id, loaded.id);
+        assert!(state.history_newer);
+        assert_eq!(state.rows[0].last_state, Some(FiringState::Running));
+        newer.state = FiringState::Failed;
+        state.pending = Some((2, Pending::HistoryRun { index: 0 }));
+        state.update(Action::Received {
+            sequence: 2,
+            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                definition: selected.definition,
+                firing: newer,
+                agent: None,
+                run: None,
+            }))),
+        });
+        assert_eq!(state.rows[0].last_state, Some(FiringState::Failed));
+    }
+
+    #[test]
+    fn authoritative_list_outcomes_retire_earlier_detail_fences() {
+        use crate::automations::FiringState;
+        let automation = automation();
+        let mut old = history_firing(100, FiringState::Succeeded);
+        old.automation = automation.id;
+        let mut state = State {
+            rows: vec![automation.summary(Some(old.state))],
+            last_firings: BTreeMap::from([(automation.id, (old.created_ms, old.id))]),
+            pending: Some((1, Pending::List { append: false })),
+            ..Default::default()
+        };
+        // Another firing finishes after our cached history. The list reports
+        // its state but has no firing identity that could authorize old detail.
+        state.update(Action::Received {
+            sequence: 1,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![
+                automation.summary(Some(FiringState::Failed)),
+            ]))),
+        });
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Run(old.id)) else {
+            panic!("old run detail expected");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                definition: automation.definition,
+                firing: old,
+                agent: None,
+                run: None,
+            }))),
+        });
+        assert_eq!(state.rows[0].last_state, Some(FiringState::Failed));
     }
 
     #[test]
