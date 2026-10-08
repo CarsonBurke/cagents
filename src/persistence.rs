@@ -625,7 +625,10 @@ impl StateStore {
         let alias = parse_id("terminal owner", &owner)?;
         if alias == canonical
             || workspace != state.id.to_string()
-            || from_json::<Existence>("terminal owner existence", &existence)?.is_open()
+            || !matches!(
+                from_json::<Existence>("terminal owner existence", &existence)?,
+                Existence::Closed { .. }
+            )
         {
             return Ok(None);
         }
@@ -656,6 +659,42 @@ impl StateStore {
         workspace: WorkspaceId,
         canonical: &CardState,
         base: SnapshotBase<'_>,
+    ) -> Result<Option<WorkspaceCommit>> {
+        Self::repair_closed_terminal_pane_owner_checked(
+            path, boot_id, workspace, canonical, base, None,
+        )
+    }
+
+    /// Explicit maintenance of a reviewed offline pane whose authoritative
+    /// configuration changed after its historical alias was closed. The caller
+    /// must verify the exact shared view and absence from both daemon actor
+    /// inventories before using this exception. The original launch must match
+    /// storage, and neither this transfer nor its caller may start an actor.
+    pub fn repair_closed_terminal_pane_owner_with_offline_recipe(
+        path: impl AsRef<Path>,
+        boot_id: &BootId,
+        workspace: WorkspaceId,
+        canonical: &CardState,
+        base: SnapshotBase<'_>,
+        expected_historical_launch: &crate::model::LaunchRecipe,
+    ) -> Result<Option<WorkspaceCommit>> {
+        Self::repair_closed_terminal_pane_owner_checked(
+            path,
+            boot_id,
+            workspace,
+            canonical,
+            base,
+            Some(expected_historical_launch),
+        )
+    }
+
+    fn repair_closed_terminal_pane_owner_checked(
+        path: impl AsRef<Path>,
+        boot_id: &BootId,
+        workspace: WorkspaceId,
+        canonical: &CardState,
+        base: SnapshotBase<'_>,
+        expected_historical_launch: Option<&crate::model::LaunchRecipe>,
     ) -> Result<Option<WorkspaceCommit>> {
         let CardKind::Terminal(session) = &canonical.kind else {
             return Err(StoreError::InvalidState(
@@ -726,7 +765,9 @@ impl StateStore {
             return Ok(None);
         }
         let source = &stored[&alias];
-        if source.existence.is_open() || source.kind != PersistedCardKind::Terminal {
+        if !matches!(source.existence, Existence::Closed { .. })
+            || source.kind != PersistedCardKind::Terminal
+        {
             return Err(StoreError::InvalidState(
                 "repair requires an already-closed terminal owner".into(),
             ));
@@ -758,7 +799,22 @@ impl StateStore {
             stored.get(&canonical.id).map(|card| card.generation),
         )?;
         let archived = load_terminal_record(&transaction, alias)?;
-        if archived.launch != session.launch
+        if expected_historical_launch.is_some_and(|expected| archived.launch != *expected) {
+            return Err(StoreError::InvalidState(
+                "historical launch changed since offline repair review".into(),
+            ));
+        }
+        let reviewed_offline_recipe = expected_historical_launch.is_some_and(|expected|
+            archived.launch == *expected
+                && archived.launch.working_directory == session.launch.working_directory
+                && matches!(&session.continuity,TerminalContinuity::RelaunchAvailable {recipe,..} if recipe==&session.launch)
+        );
+        if expected_historical_launch.is_some() && !reviewed_offline_recipe {
+            return Err(StoreError::InvalidState(
+                "reviewed recipe repair requires the same directory and offline continuity".into(),
+            ));
+        }
+        if (archived.launch != session.launch && !reviewed_offline_recipe)
             || archived.owned_codex_listener != session.owned_codex_listener
             || archived.recovery_origin != session.recovery_origin
             || archived.predecessor != session.predecessor
@@ -5230,6 +5286,121 @@ mod tests {
         assert_eq!(
             store.stored_generations(state.id).unwrap().workspace,
             commit.generation
+        );
+    }
+
+    #[test]
+    fn closed_terminal_offline_recipe_repair_requires_reviewed_source_and_preserves_history() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("offline-recipe");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let alias = state.cards[0].id;
+        let CardKind::Terminal(source) = state.cards[0].kind.clone() else {
+            panic!()
+        };
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 123,
+                reason: Some("closed by user".into()),
+            },
+        };
+        state.focused = None;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        let mut canonical = state.cards[0].clone();
+        canonical.id = CardId::new();
+        canonical.existence = Existence::Open;
+        let CardKind::Terminal(target) = &mut canonical.kind else {
+            panic!()
+        };
+        target.launch.program = "omp".into();
+        target.launch.arguments = vec!["--resume".into(), "exact-thread".into()];
+        target.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: target.launch.clone(),
+            last_exit: None,
+        };
+        let base = SnapshotBase {
+            workspace: lane.workspace,
+            cards: &lane.cards,
+        };
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner(
+                &path, &boot_id, state.id, &canonical, base
+            )
+            .is_err()
+        );
+        let mut wrong_source = source.launch.clone();
+        wrong_source.arguments.push("unreviewed".into());
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner_with_offline_recipe(
+                &path,
+                &boot_id,
+                state.id,
+                &canonical,
+                base,
+                &wrong_source
+            )
+            .is_err()
+        );
+        let mut wrong_directory = canonical.clone();
+        let CardKind::Terminal(target) = &mut wrong_directory.kind else {
+            panic!()
+        };
+        target.launch.working_directory = "/different".into();
+        target.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: target.launch.clone(),
+            last_exit: None,
+        };
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner_with_offline_recipe(
+                &path,
+                &boot_id,
+                state.id,
+                &wrong_directory,
+                base,
+                &source.launch
+            )
+            .is_err()
+        );
+        let mut current = canonical.clone();
+        let CardKind::Terminal(target) = &mut current.kind else {
+            panic!()
+        };
+        target.continuity = source.continuity.clone();
+        assert!(
+            StateStore::repair_closed_terminal_pane_owner_with_offline_recipe(
+                &path,
+                &boot_id,
+                state.id,
+                &current,
+                base,
+                &source.launch
+            )
+            .is_err()
+        );
+        StateStore::repair_closed_terminal_pane_owner_with_offline_recipe(
+            &path,
+            &boot_id,
+            state.id,
+            &canonical,
+            base,
+            &source.launch,
+        )
+        .unwrap()
+        .unwrap();
+        let archived = store.load_card(alias, None).unwrap().unwrap();
+        assert_eq!(archived.kind, CardKind::Terminal(source));
+        assert_eq!(archived.existence, state.cards[0].existence);
+        let inner = store.lock_inner().unwrap();
+        let CardKind::Terminal(target) = &canonical.kind else {
+            panic!()
+        };
+        assert_eq!(
+            load_terminal_record(&inner.connection, canonical.id).unwrap(),
+            *target
         );
     }
 

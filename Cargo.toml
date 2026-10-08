@@ -116,6 +116,10 @@ required-features = ["host"]
 name = "repair-closed-terminal-owner"
 required-features = ["ui"]
 
+[[example]]
+name = "enrich-shared-terminal-hint"
+required-features = ["ui"]
+
 [dependencies]
 cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
