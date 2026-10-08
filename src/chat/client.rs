@@ -289,6 +289,43 @@ fn restore(
         return Ok(ClientRequest::ChatAttach { session });
     }
     let mut refusal = None;
+    if !session
+        .proof
+        .as_ref()
+        .is_some_and(HostSessionProof::is_complete)
+    {
+        // Shared panes can be published before their first attachment records
+        // ownership. Recover the daemon's exact descriptor before considering
+        // a restart; a missing presentation proof does not mean no writer exists.
+        let request_id = *attach_request;
+        *attach_request += 1;
+        codec
+            .write(
+                stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: Some(proof.clone()),
+                    request: ClientRequest::ChatList,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let sessions = match receive(stream, codec, request_id, Some(proof))? {
+            ServerResponse::ChatListed { sessions } => sessions,
+            _ => return Err("Daemon did not return its native chat inventory".into()),
+        };
+        if let Some(hosted) = sessions.into_iter().find(|hosted| hosted.id == session.id) {
+            if hosted.proof.as_ref() != Some(proof)
+                || hosted.launch.provider != session.launch.provider
+                || hosted.launch.recipe != session.launch.recipe
+                || (session.launch.session_id.is_some()
+                    && session.launch.session_id != hosted.launch.session_id)
+            {
+                return Err("The hosted chat does not match the exact saved conversation".into());
+            }
+            return Ok(ClientRequest::ChatAttach { session: hosted });
+        }
+    }
     if session
         .proof
         .as_ref()
@@ -1920,6 +1957,92 @@ mod tests {
     ) -> (Result<ClientRequest, StartFailure>, ClientRequest) {
         let (outcome, request, _) = negotiate_with_recovery(live, session, answer);
         (outcome, request)
+    }
+
+    #[test]
+    fn proofless_restore_attaches_the_exact_hosted_writer() {
+        let live = host_proof("live");
+        for durable in [false, true] {
+            for named in [false, true] {
+                let mut saved = omp_card(named.then_some(CONVERSATION), None);
+                if durable {
+                    saved.native_continuity = super::super::NativeContinuity::Durable {
+                        provider_version: "test".into(),
+                    };
+                }
+                let mut hosted = saved.clone();
+                hosted.proof = Some(live.clone());
+                hosted.launch.session_id = Some(CONVERSATION.into());
+                let (outcome, asked) = negotiate(
+                    &live,
+                    saved,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatListed {
+                            sessions: vec![hosted.clone()],
+                        },
+                    },
+                );
+                assert!(matches!(asked, ClientRequest::ChatList));
+                assert!(
+                    matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proofless_restore_refuses_a_conflicting_hosted_identity() {
+        let live = host_proof("live");
+        let saved = omp_card(Some(CONVERSATION), None);
+        let mut hosted = saved.clone();
+        hosted.proof = Some(live.clone());
+        for conflict in 0..4 {
+            let mut other = hosted.clone();
+            match conflict {
+                0 => other.proof = Some(host_proof("stale")),
+                1 => other.launch.provider = crate::agent::Provider::Claude,
+                2 => other.launch.recipe.working_directory = "/other".into(),
+                _ => other.launch.session_id = Some("other-conversation".into()),
+            }
+            let (outcome, _) = negotiate(
+                &live,
+                saved.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatListed {
+                        sessions: vec![other],
+                    },
+                },
+            );
+            assert!(
+                outcome.is_err(),
+                "identity conflict must not start or attach"
+            );
+        }
+    }
+
+    #[test]
+    fn proofless_restore_without_a_hosted_writer_preserves_restart_policy() {
+        let live = host_proof("live");
+        for durable in [false, true] {
+            let mut saved = omp_card(Some(CONVERSATION), None);
+            if durable {
+                saved.native_continuity = super::super::NativeContinuity::Durable {
+                    provider_version: "test".into(),
+                };
+            }
+            let (outcome, _) = negotiate(
+                &live,
+                saved,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatListed { sessions: vec![] },
+                },
+            );
+            if durable {
+                assert!(outcome.is_err(), "uncertain durable work must not restart");
+            } else {
+                assert!(matches!(outcome, Ok(ClientRequest::ChatStart { .. })));
+            }
+        }
     }
 
     fn negotiate_with_recovery(
