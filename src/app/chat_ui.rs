@@ -18,6 +18,7 @@ mod fold;
 mod images;
 mod layout;
 mod markdown_source;
+mod monospace;
 mod permissions;
 mod prose;
 mod retained;
@@ -823,6 +824,11 @@ struct CachedItem {
     /// palette is the runtime's, applied when the block is highlighted, so a
     /// change of syntax theme rehighlights rather than restyles.
     blocks: HashMap<u64, prose::CodeBlock>,
+    /// The key of the last fence the Markdown held when its blocks were last
+    /// prepared. Only that fence can still be growing, and its key changes
+    /// with every byte it gains, so this is how the next pass finds the block
+    /// to continue.
+    open: Option<u64>,
     /// A step's trailing metadata — exit status and duration — formed once per
     /// change rather than once per frame.
     detail: Option<String>,
@@ -896,6 +902,7 @@ impl CachedItem {
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
             blocks: HashMap::new(),
+            open: None,
             detail: None,
             stamp: None,
             image: None,
@@ -1015,24 +1022,54 @@ impl CachedItem {
     /// Prepares every fenced block the Markdown now holds, keeping the blocks
     /// that are unchanged since the last pass. A streamed block changes on
     /// every refresh until its fence closes, so it is the one block a
-    /// refresh usually prepares again.
+    /// refresh usually prepares again, and it is continued from its last
+    /// whole line rather than highlighted from its first.
     fn highlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         let mut previous = std::mem::take(&mut self.blocks);
+        let mut open = self.open.take();
         let mut blocks = HashMap::new();
+        let mut last = None;
         for_each_fence(self.markdown.items(), &mut |language, code| {
             let key = fence_key(language.unwrap_or_default(), code);
-            let block = previous.remove(&key).unwrap_or_else(|| {
-                prose::CodeBlock::new(language.and_then(prose::fence_language), code, theme)
-            });
+            last = Some(key);
+            if blocks.contains_key(&key) {
+                return;
+            }
+            let block = previous
+                .remove(&key)
+                .or_else(|| {
+                    let mut block = previous.remove(&open.take()?)?;
+                    block
+                        .extend(language.and_then(prose::fence_language), code)
+                        .then_some(block)
+                })
+                .unwrap_or_else(|| {
+                    prose::CodeBlock::open(language.and_then(prose::fence_language), code, theme)
+                });
             blocks.insert(key, block);
         });
+        for (key, block) in &mut blocks {
+            if Some(*key) != last {
+                block.settle();
+            }
+        }
         self.blocks = blocks;
+        self.open = last;
+    }
+
+    /// Gives up what the last fence would be continued from, once nothing is
+    /// streaming into the item.
+    fn settle_blocks(&mut self) {
+        if let Some(block) = self.open.take().and_then(|key| self.blocks.get_mut(&key)) {
+            block.settle();
+        }
     }
 
     /// Discards the highlighting and does it again in `theme`.
     fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         self.preview.rehighlight(theme);
         self.blocks.clear();
+        self.open = None;
         self.highlight(theme);
     }
 
@@ -2047,6 +2084,13 @@ impl Runtime {
                     growing,
                 ),
             );
+        }
+        // Nothing streams into an idle conversation, so no block is waiting
+        // to be continued.
+        if !snapshot.busy {
+            for cached in self.cache.values_mut() {
+                cached.settle_blocks();
+            }
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
@@ -13154,6 +13198,52 @@ mod tests {
             whole.blocks.keys().collect::<HashSet<_>>(),
             "the streamed fences are highlighted under the same identities"
         );
+    }
+
+    /// The fence a stream is still writing is continued from its last whole
+    /// line on every refresh. However the stream is cut - through a line, a
+    /// comment that spans several, or the fence that closes the block - each
+    /// block must end up drawing exactly what the whole message's does, in
+    /// both palettes.
+    #[test]
+    fn streamed_fences_draw_what_a_whole_message_does() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        const BODY: &str = "Intro\n\n```rust\n/* a comment\n   over lines */ fn main() {\n    \
+             let text = \"a string\n        over two\";\n}\n```\n\nBetween\n\n\
+             - a list\n\n  ```sh\n  echo \"one\"\r\n  ls # caf\u{e9}\n  ```\n\n> ```rust\n> let quoted = 1;\n> ```\n\n\
+             ```rust\nfn main() {}\n```\n\n```rust\nfn main() {}\n```\n\n~~~\nplain\n";
+        let whole = CachedItem::new(&text(BODY), THEME);
+        assert_eq!(parsed_codes(&whole).len(), 6);
+        assert_eq!(whole.blocks.len(), 5, "two of the fences are the same");
+        let boundaries: Vec<usize> = (1..=BODY.len())
+            .filter(|end| BODY.is_char_boundary(*end))
+            .collect();
+        for step in [1, 2, 3, 5, 7, 11, 48, 97] {
+            let mut streamed = CachedItem::new(&text(""), THEME);
+            for end in boundaries
+                .iter()
+                .copied()
+                .filter(|end| end % step == 0 || *end == BODY.len())
+            {
+                let content = text(&BODY[..end]);
+                let body = streamed.token.appended(&content).expect("an append");
+                streamed.extend(body, true, THEME);
+                streamed.token = ChangeToken::of(&content);
+            }
+            streamed.settle(&text(BODY), THEME);
+            assert_eq!(parsed_codes(&streamed), parsed_codes(&whole));
+            assert_eq!(streamed.blocks.len(), whole.blocks.len());
+            for (key, block) in &whole.blocks {
+                let streamed = streamed.blocks.get(key).expect("the same fence");
+                for dark in [false, true] {
+                    assert_eq!(
+                        streamed.spans(dark).as_ref(),
+                        block.spans(dark).as_ref(),
+                        "in pieces of {step}"
+                    );
+                }
+            }
+        }
     }
 
     /// A fence that names its language is highlighted in both of the

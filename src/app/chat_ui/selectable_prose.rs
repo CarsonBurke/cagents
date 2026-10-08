@@ -21,7 +21,13 @@ pub(super) struct State {
     pub(super) managed: bool,
     pub(super) dirty: bool,
     pub(super) spans: Option<Arc<[Span<'static, String>]>>,
-    paragraph: ParagraphBuffer,
+    /// How the spans were last laid out, which is what they are shaped as
+    /// when something asks where a point falls among them.
+    shape: Option<Shape>,
+    /// The spans shaped for hit testing, the first time a pointer needs them.
+    /// The child draws from a paragraph of its own, so a block that is only
+    /// read - a streaming one above all - is shaped once rather than twice.
+    paragraph: std::cell::OnceCell<ParagraphBuffer>,
     pub(super) anchor: usize,
     pub(super) end: usize,
     dragging: bool,
@@ -38,7 +44,8 @@ impl Default for State {
             managed: false,
             dirty: false,
             spans: None,
-            paragraph: ParagraphBuffer::default(),
+            shape: None,
+            paragraph: std::cell::OnceCell::new(),
             anchor: 0,
             end: 0,
             dragging: false,
@@ -47,13 +54,48 @@ impl Default for State {
     }
 }
 
+/// The room, size and font a block's spans are laid out with.
+#[derive(Clone, Copy)]
+struct Shape {
+    bounds: Size,
+    size: iced::Pixels,
+    font: iced::Font,
+}
+
+impl Shape {
+    fn text<Content>(self, content: Content) -> iced::advanced::Text<Content, iced::Font> {
+        iced::advanced::Text {
+            content,
+            bounds: self.bounds,
+            size: self.size,
+            line_height: Default::default(),
+            font: self.font,
+            align_x: Default::default(),
+            align_y: iced::alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Advanced,
+            wrapping: Wrapping::default(),
+            ellipsize: Default::default(),
+        }
+    }
+}
+
 impl State {
+    fn paragraph(&self) -> &ParagraphBuffer {
+        self.paragraph
+            .get_or_init(|| match (&self.spans, self.shape) {
+                (Some(spans), Some(shape)) => {
+                    ParagraphBuffer::with_spans(shape.text(spans.as_ref()))
+                }
+                _ => ParagraphBuffer::default(),
+            })
+    }
+
     pub(super) fn hit(&self, position: Point) -> usize {
-        hit(&self.paragraph, &self.plain, position)
+        hit(self.paragraph(), &self.plain, position)
     }
 
     pub(super) fn link(&self, position: Point) -> Option<String> {
-        self.paragraph
+        self.paragraph()
             .hit_span(position)
             .and_then(|index| self.spans.as_ref()?.get(index))
             .and_then(|span| span.link.clone())
@@ -175,7 +217,7 @@ impl Selectable {
     }
 
     fn hit(&self, state: &State, position: Point) -> usize {
-        hit(&state.paragraph, &self.plain, position)
+        hit(state.paragraph(), &self.plain, position)
     }
 }
 
@@ -260,36 +302,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
         state.validate_selection(&self.plain);
-        let description = iced::advanced::Text {
-            content: self.spans.as_ref(),
+        let shape = Shape {
             bounds: limits.max(),
             size: self.size,
-            line_height: Default::default(),
             font: self.font,
-            align_x: Default::default(),
-            align_y: iced::alignment::Vertical::Top,
-            shaping: iced::widget::text::Shaping::Advanced,
-            wrapping: Wrapping::default(),
-            ellipsize: Default::default(),
         };
         if state
             .spans
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(previous, &self.spans))
         {
-            state.paragraph = ParagraphBuffer::with_spans(description);
+            state.paragraph.take();
             state.spans = Some(self.spans.clone());
-        } else {
-            match state.paragraph.compare(description.with_content(())) {
+        } else if let Some(paragraph) = state.paragraph.get_mut() {
+            match paragraph.compare(shape.text(())) {
                 iced::advanced::text::Difference::None => {}
-                iced::advanced::text::Difference::Bounds => {
-                    state.paragraph.resize(description.bounds)
-                }
+                iced::advanced::text::Difference::Bounds => paragraph.resize(shape.bounds),
                 iced::advanced::text::Difference::Shape => {
-                    state.paragraph = ParagraphBuffer::with_spans(description)
+                    state.paragraph.take();
                 }
             }
         }
+        state.shape = Some(shape);
         self.child = iced::widget::rich_text(self.selected_spans(state))
             .size(self.size)
             .font(self.font)
@@ -384,7 +418,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
                 if state.anchor == state.end
                     && let Some(position) = position
-                    && let Some(span) = state.paragraph.hit_span(position)
+                    && let Some(span) = state.paragraph().hit_span(position)
                     && let Some(link) = self.spans.get(span).and_then(|span| span.link.clone())
                 {
                     shell.publish(action(Action::OpenDocument(self.target, link)));
@@ -430,7 +464,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         {
             let state = tree.state.downcast_ref::<State>();
             if state
-                .paragraph
+                .paragraph()
                 .hit_span(position)
                 .and_then(|index| self.spans.get(index))
                 .is_some_and(|span| span.link.is_some())
@@ -499,22 +533,16 @@ mod tests {
             child: widget::text("").into(),
         };
         let state = State {
-            paragraph: ParagraphBuffer::with_spans(iced::advanced::Text {
-                content: spans.as_ref(),
+            spans: Some(spans),
+            shape: Some(Shape {
                 bounds: Size::new(300.0, 200.0),
                 size: selectable.size,
-                line_height: Default::default(),
                 font: selectable.font,
-                align_x: Default::default(),
-                align_y: iced::alignment::Vertical::Top,
-                shaping: iced::widget::text::Shaping::Advanced,
-                wrapping: Wrapping::default(),
-                ellipsize: Default::default(),
             }),
             ..Default::default()
         };
         let second = state
-            .paragraph
+            .paragraph()
             .buffer()
             .layout_runs()
             .find(|run| run.line_i == 1)
