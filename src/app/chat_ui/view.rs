@@ -22,7 +22,10 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
-const COMPOSER_PADDING: f32 = space::M;
+const COMPOSER_PADDING: f32 = crate::tab_strip::EDGE_INSET + space::S;
+// Icon hit targets include their own centered inset; align the visible glyph.
+const COMPOSER_TOOLBAR_PADDING: f32 =
+    COMPOSER_PADDING - (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
 
 /// The widest a user's message is drawn.
 ///
@@ -1871,7 +1874,9 @@ impl Runtime {
                     .into(),
                     editor,
                     widget::container(toolbar)
-                        .padding(iced::Padding::from([0.0, space::S]).bottom(space::S))
+                        .padding(
+                            iced::Padding::from([0.0, COMPOSER_TOOLBAR_PADDING]).bottom(space::S),
+                        )
                         .into(),
                 ])
                 .width(Length::Fill),
@@ -1943,16 +1948,18 @@ impl Runtime {
                 },
             );
         }
-        status.push(
-            design::caption(state)
-                .class(if failed && !transitioning && self.pending.is_none() {
-                    cosmic::theme::Text::Custom(design::warning_text)
-                } else {
-                    cosmic::theme::Text::default()
-                })
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        );
+        if !state.is_empty() {
+            status.push(
+                design::caption(state)
+                    .class(if failed && !transitioning && self.pending.is_none() {
+                        cosmic::theme::Text::Custom(design::warning_text)
+                    } else {
+                        cosmic::theme::Text::default()
+                    })
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            );
+        }
         if !place.name.is_empty() {
             status.push(
                 design::caption(place.name.clone())
@@ -2078,7 +2085,9 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
             widget::container(footer)
-                .padding(iced::Padding::from([0.0, step::GAP_M]).bottom(step::GAP_M))
+                .padding(
+                    iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
+                )
                 .into(),
             content_width.max(1.0),
         ))
