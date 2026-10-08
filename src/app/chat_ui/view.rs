@@ -1415,15 +1415,6 @@ impl Runtime {
                 height,
                 height + design::BORDER_WIDTH,
             ));
-            if selected.is_some() {
-                content.push(
-                    design::caption(
-                        "Viewing a subagent · messages still go to the main conversation",
-                    )
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
-                );
-            }
         }
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
@@ -1565,10 +1556,23 @@ impl Runtime {
         // requests, and attachments arrive. The pinned Iced child reconciler
         // finds named siblings but does not move their trees to new indices.
         let mut content = vec![
-            widget::column::with_children(content)
-                .spacing(space::S)
-                .height(Length::Fill)
-                .into(),
+            widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
+                if index == transcript_index {
+                    child
+                } else {
+                    widget::container(child)
+                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
+                            step::GAP_M
+                        } else {
+                            0.0
+                        }))
+                        .width(Length::Fill)
+                        .into()
+                }
+            }))
+            .spacing(space::S)
+            .height(Length::Fill)
+            .into(),
         ];
         let has_text = self
             .composer
@@ -1596,11 +1600,15 @@ impl Runtime {
         // the moment the preference changed. The steering and queueing modes
         // still say so, because there the mode is not what a reader expects
         // Enter to do.
-        let placeholder = match modes.first() {
-            Some(PromptMode::Send) => "Message",
-            Some(PromptMode::Steer) => "Steer this turn",
-            Some(PromptMode::Queue) => "Queue for the next turn",
-            None => "Message",
+        let placeholder = if selected.is_some() {
+            "Message main agent"
+        } else {
+            match modes.first() {
+                Some(PromptMode::Send) => "Message",
+                Some(PromptMode::Steer) => "Steer this turn",
+                Some(PromptMode::Queue) => "Queue for the next turn",
+                None => "Message",
+            }
         };
         // Key bindings must remain available while the editor changes its own
         // contents. The action handler checks the current draft before sending;
@@ -2056,15 +2064,11 @@ impl Runtime {
         );
         let pane = widget::container(super::layout::pane(
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
-                if index == transcript_index {
+                if index == 0 {
                     child
                 } else {
                     widget::container(child)
-                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
-                            step::GAP_M
-                        } else {
-                            0.0
-                        }))
+                        .padding([0.0, step::GAP_M])
                         .width(Length::Fill)
                         .into()
                 }
@@ -4085,6 +4089,74 @@ mod tests {
         assert_eq!(bounds.x, 0.0);
         assert_eq!(bounds.y, 0.0);
         assert_eq!(bounds.width, 600.0);
+    }
+
+    #[test]
+    fn composer_stays_inset_with_and_without_a_conversation_title() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Probe {
+            id: widget::Id,
+            bounds: Option<iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        let items = frame_cost::transcript(1);
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for title in [None, Some("Conversation".to_owned())] {
+            for width in [280.0, 600.0] {
+                let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+                Arc::make_mut(&mut runtime.snapshot).title = title.clone();
+                let mut element = runtime.view(
+                    false,
+                    true,
+                    &shortcuts,
+                    width,
+                    Place {
+                        name: "Fixture".into(),
+                        branch: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
+                );
+                let mut probe = Probe {
+                    id: card_control_id(runtime.target.card, "chat-composer"),
+                    bounds: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut probe,
+                );
+                let bounds = probe.bounds.expect("composer editor");
+                assert_eq!(bounds.x, step::GAP_M);
+                assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
+            }
+        }
     }
 
     #[test]
