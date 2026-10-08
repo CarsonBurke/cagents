@@ -286,6 +286,23 @@ impl Tree {
         diff: impl Fn(&mut Tree, &mut T),
         new_state: impl Fn(&T) -> Self,
     ) {
+        // Most rows/columns have no named children. Preserve their vector
+        // allocation and positional reconciliation without building an index.
+        let is_named =
+            |id: &Option<Id>| matches!(id, Some(Id(Internal::Custom(_, _))));
+        if !new_ids.iter().any(is_named)
+            && !self.children.iter().any(|child| is_named(&child.id))
+        {
+            self.children.truncate(new_children.len());
+            self.children.extend(
+                new_children[self.children.len()..].iter().map(&new_state),
+            );
+            for (child, new) in self.children.iter_mut().zip(new_children) {
+                diff(child, new);
+            }
+            return;
+        }
+
         // Match by identity, then assemble in the new widget order. Keeping
         // matched children at their old indices can hand a widget its sibling's
         // state after a reorder; truncating first also loses surviving names.
@@ -548,6 +565,33 @@ mod reconciliation_tests {
             &[(None, 3), (Some("same"), 4), (Some("same"), 5)],
         );
         assert_eq!(values(&tree), [3, 1, 2]);
+    }
+
+    #[test]
+    fn unnamed_fast_path_keeps_storage_and_diffs_new_and_retained_children() {
+        let mut tree = Tree::empty();
+        tree.children = Vec::with_capacity(8);
+        let mut initial = [10_u32, 20];
+        let make = |value: &u32| Tree {
+            id: None,
+            tag: Tag::of::<u32>(),
+            state: State::new(*value),
+            children: Vec::new(),
+        };
+        let diff = |child: &mut Tree, _: &mut u32| {
+            *child.state.downcast_mut::<u32>() += 1;
+        };
+        tree.diff_children_custom(&mut initial, vec![None; 2], diff, make);
+        assert_eq!(values(&tree), [11, 21]);
+        let allocation = tree.children.as_ptr();
+        let mut expanded = [100, 200, 30];
+        tree.diff_children_custom(&mut expanded, vec![None; 3], diff, make);
+        assert_eq!(values(&tree), [12, 22, 31]);
+        assert_eq!(tree.children.as_ptr(), allocation);
+        let mut shortened = [0];
+        tree.diff_children_custom(&mut shortened, vec![None], diff, make);
+        assert_eq!(values(&tree), [13]);
+        assert_eq!(tree.children.as_ptr(), allocation);
     }
 
     #[test]
