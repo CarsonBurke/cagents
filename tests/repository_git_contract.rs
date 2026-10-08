@@ -3209,3 +3209,55 @@ fn a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head() {
         "{remaining}"
     );
 }
+
+/// Multi-valued URLs use Git's first destination, so forge association cannot
+/// identify a different repository than `git fetch <remote>` reads (#828).
+#[test]
+fn remotes_report_gits_primary_fetch_and_push_urls() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    for (key, urls) in [
+        (
+            "remote.origin.url",
+            [
+                "https://github.com/acme/fetch-first.git",
+                "https://github.com/acme/fetch-second.git",
+            ],
+        ),
+        (
+            "remote.origin.pushurl",
+            [
+                "https://github.com/acme/push-first.git",
+                "https://github.com/acme/push-second.git",
+            ],
+        ),
+    ] {
+        for url in urls {
+            fixture.git_in_work(&["config", "--add", key, url]);
+        }
+    }
+    let remotes = fixture
+        .service()
+        .remotes(&fixture.work(), &CancellationToken::new())
+        .unwrap();
+    assert_eq!(remotes.len(), 1);
+    let primary_fetch = fixture.text(&["remote", "get-url", "origin"]);
+    let primary_push = fixture.text(&["remote", "get-url", "--push", "origin"]);
+    assert_eq!(
+        remotes[0].fetch_url.as_deref(),
+        Some(primary_fetch.as_str())
+    );
+    assert_eq!(remotes[0].push_url.as_deref(), Some(primary_push.as_str()));
+    let key = cagents::github::remote_repository_key(&primary_fetch).unwrap();
+    assert_eq!(
+        cagents::github::remote_for_repository(&remotes, &key).as_deref(),
+        Some("origin")
+    );
+    let secondary =
+        cagents::github::remote_repository_key("https://github.com/acme/fetch-second.git").unwrap();
+    assert_eq!(
+        cagents::github::remote_for_repository(&remotes, &secondary),
+        None
+    );
+}

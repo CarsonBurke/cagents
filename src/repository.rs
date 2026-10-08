@@ -2428,10 +2428,12 @@ pub fn parse_remote_config(output: &[u8]) -> Result<Vec<RemoteRecord>, GitParseE
         // URLs are opaque configuration text rather than a path this service
         // reopens, so an undecodable byte is rendered rather than fatal.
         let value = String::from_utf8_lossy(value).into_owned();
+        // Git fetches from the first configured URL. Preserve that primary
+        // destination when a remote has multiple fetch or push URLs.
         if variable == "url" {
-            entry.fetch_url = Some(value);
+            entry.fetch_url.get_or_insert(value);
         } else {
-            entry.push_url = Some(value);
+            entry.push_url.get_or_insert(value);
         }
     }
     Ok(remotes.into_values().collect())
