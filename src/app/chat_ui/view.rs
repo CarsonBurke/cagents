@@ -22,7 +22,7 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
-const COMPOSER_PADDING: f32 = space::S;
+const COMPOSER_PADDING: f32 = space::M;
 
 /// The widest a user's message is drawn.
 ///
@@ -68,8 +68,7 @@ const PLAN_CEILING: f32 = 120.0;
 /// Waiting prompts stay within reach without taking over the conversation.
 const QUEUE_CEILING: f32 = 180.0;
 
-/// The line a waiting message's preview is set on, which its marker and
-/// controls center on.
+/// The line a waiting message's preview is set on.
 const QUEUE_LINE_HEIGHT: f32 = 18.0;
 
 /// The padding a status-line control is drawn with.
@@ -153,10 +152,10 @@ fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, St
     let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
-        (PromptMode::Steer, 0) => (Icon::Jump, "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (Icon::Jump, "Steer the active turn", "Ctrl+Shift+Enter"),
-        (PromptMode::Queue, 0) => (Icon::Plus, "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (Icon::Plus, "Queue for the next turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Steer, 0) => (Icon::Send, "Steer the active turn", primary),
+        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
+        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
     };
     (name, format!("{verb} — {chord}"))
 }
@@ -221,24 +220,21 @@ enum QueueTiming {
 
 /// One waiting message: when it goes, what it says, and what can be done
 /// with it.
-///
-/// The marker is the glyph of the submit control that queued the message, so
-/// the row reads as the result of the button that was pressed.
 fn queue_row<'a>(
     timing: QueueTiming,
     text: &'a str,
     attachments: &'a [Attachment],
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let marker = |name, label: &'static str| {
-        crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(name, design::COMPACT_ICON_SIZE),
-            label,
-        )
-    };
-    let marker: Element<'a, Message> = match timing {
-        QueueTiming::NextStep => marker(Icon::Jump, "Delivered at the agent's next step"),
-        QueueTiming::NextTurn => marker(Icon::Plus, "Sent when this turn ends"),
+    let marker = match timing {
+        QueueTiming::NextStep => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Send, design::COMPACT_ICON_SIZE),
+            "Delivered at the agent's next step",
+        ),
+        QueueTiming::NextTurn => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
+            "Sent when this turn ends",
+        ),
         QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
@@ -264,46 +260,42 @@ fn queue_row<'a>(
         let text = text.trim();
         text[..text.floor_char_boundary(QUEUE_PREVIEW_BYTES)].into()
     };
-    let mut row: Vec<Element<'a, Message>> = vec![
-        widget::container(marker)
-            .height(QUEUE_LINE_HEIGHT)
-            .align_y(Alignment::Center)
-            .into(),
-        widget::container(
-            design::body(preview)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .width(Length::Fill)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
-                )),
-        )
-        .width(Length::Fill)
-        .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
-        .clip(true)
-        .into(),
-    ];
+    let mut details: Vec<Element<'a, Message>> = Vec::new();
     if !attachments.is_empty() && !text.trim().is_empty() {
-        row.push(crate::interaction::tooltip(
+        details.push(crate::interaction::tooltip(
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Attachment, design::COMPACT_ICON_SIZE),
                 design::caption(attachments.len().to_string()).into(),
             ])
             .spacing(step::GAP_XS)
-            .height(QUEUE_LINE_HEIGHT)
             .align_y(Alignment::Center),
             names(),
         ));
     }
+    let preview = widget::container(
+        design::heading(preview)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .width(Length::Fill)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
+            )),
+    )
+    .width(Length::Fill)
+    .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
+    .clip(true);
+    let mut row = vec![marker, preview.into()];
+    if !details.is_empty() {
+        row.push(widget::row::with_children(details).spacing(space::S).into());
+    }
     row.push(
         widget::row::with_children(controls)
-            .height(QUEUE_LINE_HEIGHT)
             .align_y(Alignment::Center)
             .into(),
     );
     widget::row::with_children(row)
         .spacing(step::GAP_S)
-        .padding([0.0, step::GAP_XS])
-        .align_y(Alignment::Start)
+        .padding([space::XS, space::XS])
+        .align_y(Alignment::Center)
         .into()
 }
 
@@ -1397,7 +1389,6 @@ impl Runtime {
                 );
             }
         }
-        content.extend(self.queue_view());
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
         if let Some(provided) = &snapshot.composer
@@ -1722,11 +1713,14 @@ impl Runtime {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
             let next = if mode == "wait" { "immediate" } else { "wait" };
             actions.push(
-                crate::ui_controls::button::quiet(if mode == "wait" {
-                    "Steering: after turn"
-                } else {
-                    "Steering: after tools"
-                })
+                crate::ui_controls::icon_button(
+                    Icon::Jump,
+                    if mode == "wait" {
+                        "Steering: after turn"
+                    } else {
+                        "Steering: after tools"
+                    },
+                )
                 .on_press_maybe(available.then(|| {
                     action(Action::Command(
                         target,
@@ -1761,26 +1755,59 @@ impl Runtime {
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
-        actions.push(iced::widget::Space::new().width(Length::Fill).into());
-        // Only the modes that can act right now are drawn. A permanently
-        // present send control that is merely disabled is a control a reader
-        // cannot use and cannot interpret: the queue button in particular was
-        // a bare plus that never responded and never said what it was for.
-        // Buttons still appear only when there is a message to send.
-        if available && has_draft && key_submit.0.is_some() {
-            for (slot, mode) in modes.iter().enumerate() {
-                let (name, label) = submit_control(*mode, slot, enter_sends);
-                actions.push(icon(name, label, true, Action::Submit(target, *mode)));
-            }
-        }
+        let mut submissions = Vec::new();
         if snapshot.busy {
-            actions.push(icon(
+            submissions.push(icon(
                 Icon::Stop,
                 "Cancel active turn (Esc)",
                 available,
                 Action::Command(target, Command::Interrupt),
             ));
         }
+        // The primary action anchors the trailing edge. Tooltips and
+        // accessible names carry the delivery mode and keyboard chord.
+        for (slot, mode) in modes.iter().enumerate().rev() {
+            let (name, tooltip) = submit_control(*mode, slot, enter_sends);
+            submissions.push(
+                crate::ui_controls::icon_button(name, tooltip)
+                    .selected(slot == 0)
+                    .tone(crate::design::Tone::Themed(if slot == 0 {
+                        design::accent_color
+                    } else {
+                        design::muted_icon_color
+                    }))
+                    .on_press_maybe(
+                        (available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                    )
+                    .into(),
+            );
+        }
+        // Very narrow panes keep every icon's hit target intact.
+        let toolbar: Element<'_, Message> = if content_width < 360.0 {
+            widget::column::with_children(vec![
+                widget::flex_row(actions)
+                    .spacing(step::GAP_XS as u16)
+                    .align_items(Alignment::Center)
+                    .into(),
+                widget::container(
+                    widget::row::with_children(submissions)
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(Alignment::End)
+                .into(),
+            ])
+            .spacing(space::XS)
+            .into()
+        } else {
+            actions.push(iced::widget::Space::new().width(Length::Fill).into());
+            actions.extend(submissions);
+            widget::row::with_children(actions)
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into()
+        };
         // The editor and its controls are one object: a single raised surface
         // with the controls tucked inside its lower edge, so the composer
         // reads as one place to type rather than a field with a toolbar
@@ -1788,18 +1815,20 @@ impl Runtime {
         content.push(
             widget::container(
                 widget::column::with_children(vec![
-                    widget::column::with_children(attachment_chips)
-                        .spacing(step::GAP_XS)
-                        .padding([0, step::GAP_M as u16])
-                        .into(),
-                    editor,
-                    widget::container(
-                        widget::row::with_children(actions)
-                            .spacing(step::GAP_XS)
-                            .align_y(Alignment::Center),
-                    )
-                    .padding(iced::Padding::from([0.0, step::GAP_XS]).bottom(step::GAP_XS))
+                    widget::column::with_children(self.queue_view().into_iter().chain(
+                        (!attachment_chips.is_empty()).then(|| {
+                            widget::column::with_children(attachment_chips)
+                                .spacing(step::GAP_XS)
+                                .padding([0, step::GAP_M as u16])
+                                .into()
+                        }),
+                    ))
+                    .spacing(step::GAP_XS)
                     .into(),
+                    editor,
+                    widget::container(toolbar)
+                        .padding(iced::Padding::from([0.0, space::S]).bottom(space::S))
+                        .into(),
                 ])
                 .width(Length::Fill),
             )
@@ -2717,14 +2746,14 @@ impl Runtime {
                 // so its absence is not left to be wondered at.
                 controls.push(if queued.editable {
                     control(
-                        Icon::Changes,
+                        Icon::Edit,
                         "Take back to edit",
                         available,
                         Action::TakeBackQueued(target, Some(entry.clone())),
                     )
                 } else {
                     control(
-                        Icon::Changes,
+                        Icon::Edit,
                         "Too large or too rich to edit here; it can still be removed",
                         false,
                         Action::TakeBackQueued(target, Some(entry.clone())),
@@ -2777,7 +2806,7 @@ impl Runtime {
                     .into_iter()
                     .chain([
                         control(
-                            Icon::Changes,
+                            Icon::Edit,
                             "Take back to edit",
                             !sending,
                             Action::TakeBackQueued(target, Some(entry.clone())),
@@ -2813,14 +2842,14 @@ impl Runtime {
                 .composer
                 .lines()
                 .all(|line| line.text.trim().is_empty());
-            header.push(
-                design::caption(if empty {
-                    "↑ to edit"
+            header.push(crate::interaction::tooltip(
+                crate::ui_controls::passive_icon(Icon::Keyboard, design::COMPACT_ICON_SIZE),
+                if empty {
+                    "↑ to edit the latest queued message"
                 } else {
-                    "Alt+↑ to edit"
-                })
-                .into(),
-            );
+                    "Alt+↑ to edit the latest queued message"
+                },
+            ));
         }
         Some(
             widget::container(
@@ -2850,8 +2879,8 @@ impl Runtime {
             .padding(step::GAP_S)
             .class(design::surface(
                 Some(design::sunken),
-                [design::RADIUS_M; 4],
-                true,
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
             ))
             .into(),
         )
@@ -4195,23 +4224,31 @@ mod tests {
         });
         assert!(runtime.queue_view().is_some());
         runtime.selected_subagent = Some("child".into());
-        Arc::make_mut(&mut runtime.snapshot).queued_messages = (0..chat::QueuedMessage::LIMIT)
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.capabilities.queue_remove = true;
+        snapshot.capabilities.queue_start = true;
+        snapshot.queued_messages = (0..chat::QueuedMessage::LIMIT)
             .map(|id| chat::QueuedMessage::new(id.to_string(), "Long queued prompt\n".repeat(100)))
             .collect();
         let renderer = crate::app::tests::headless_renderer();
-        let mut element = runtime.queue_view().unwrap();
-        let mut tree = iced::advanced::widget::Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 1000.0)),
-        );
-        assert_eq!(node.size().width, 400.0);
-        assert!(
-            node.size().height < 240.0,
-            "queue must leave room for transcript and composer: {:?}",
-            node.size()
-        );
+        for width in [320.0, 400.0, 960.0] {
+            let mut element = runtime.queue_view().unwrap();
+            let mut tree = iced::advanced::widget::Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(
+                    iced::Size::ZERO,
+                    iced::Size::new(width, 1000.0),
+                ),
+            );
+            assert_eq!(node.size().width, width);
+            assert!(
+                node.size().height < 240.0,
+                "queue must leave room for transcript and composer: {:?}",
+                node.size()
+            );
+        }
     }
 
     #[test]
