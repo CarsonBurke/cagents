@@ -296,6 +296,51 @@ enum ArchivePhase {
 
 type ArchiveObserver = dyn Fn(TerminalEvent) + Send + Sync;
 
+/// Runs a completed terminal's subscriber callback on a thread of its own.
+///
+/// A completed terminal has no worker, so its commands execute on whichever
+/// thread sends them, and the daemon sends them while holding the host mutex
+/// its wake and event callbacks lock. Calling either inline deadlocks that
+/// thread against itself and, behind it, every other user of the host. One
+/// shared thread keeps the notifications of all completed terminals ordered.
+fn notify_archived(notice: impl FnOnce() + Send + 'static) {
+    type Notice = Box<dyn FnOnce() + Send>;
+    static NOTIFIER: OnceLock<Sender<Notice>> = OnceLock::new();
+    let notifier = NOTIFIER.get_or_init(|| {
+        let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
+        if let Err(error) = thread::Builder::new()
+            .name("terminal-archive-notify".into())
+            .spawn(move || {
+                for notice in pending {
+                    // This thread serves every completed terminal for the life
+                    // of the process. A subscriber that panics has already
+                    // been reported by the panic hook; it must not take the
+                    // redraws and search results of all the others with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
+                }
+            })
+        {
+            tracing::error!(%error, "completed terminals cannot notify their subscribers");
+        }
+        notices
+    });
+    // Sending fails only when that thread never started, which is reported
+    // above.
+    let _ = notifier.send(Box::new(notice));
+}
+
+/// Returns once every notice queued before this call has run.
+#[cfg(test)]
+pub(crate) fn flush_archived_notices() {
+    let (done, flushed) = crossbeam_channel::bounded(1);
+    notify_archived(move || {
+        let _ = done.send(());
+    });
+    flushed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the archive notifier stalled");
+}
+
 struct PublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
@@ -379,7 +424,7 @@ impl PublishedState {
         latest
     }
 
-    fn archived_command(&self, command: Command) -> Result<(), TerminalSendError> {
+    fn archived_command(self: &Arc<Self>, command: Command) -> Result<(), TerminalSendError> {
         if let Command::HostVisibility(visibility) = &command {
             // HostState already offers this retained generation when a view
             // becomes visible. Calling its wake callback here would reenter
@@ -485,13 +530,22 @@ impl PublishedState {
                         .saturating_add(1),
                 );
                 // Serialize mutations and publication; wake outside the lock
-                // so subscriber callbacks can inspect the retained surface.
+                // so subscriber callbacks can inspect the retained surface,
+                // and off this thread because the sender may hold the host.
                 let generation = snapshot.generation;
                 self.snapshot.store(snapshot);
                 self.published_generation
                     .store(generation, Ordering::Release);
                 drop(phase);
-                self.request_wake(generation);
+                let published = Arc::downgrade(self);
+                notify_archived(move || {
+                    // Announce whatever is newest by now, so a burst of
+                    // commands queued behind the host costs one redraw.
+                    if let Some(published) = published.upgrade() {
+                        published
+                            .request_wake(published.published_generation.load(Ordering::Acquire));
+                    }
+                });
                 return Ok(());
             }
         };
@@ -503,8 +557,8 @@ impl PublishedState {
     }
 
     fn emit_archived(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
-        if let Some(observer) = self.archive_observer.get() {
-            observer(event);
+        if let Some(observer) = self.archive_observer.get().cloned() {
+            notify_archived(move || observer(event));
         } else {
             let _ = events.send(event);
         }
@@ -3837,6 +3891,66 @@ mod tests {
             Err(TerminalSendError::Closed)
         );
         assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    /// The daemon resizes, searches and copies while holding the host mutex
+    /// its wake and event callbacks lock. A completed terminal runs those
+    /// commands on the sender's thread, so calling back inline wedged the
+    /// whole daemon the first time a pane showing one was resized.
+    #[test]
+    fn completed_pty_notifies_a_subscriber_whose_lock_the_sender_holds() {
+        let host = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let wakes = Arc::clone(&host);
+        let handle = TerminalHandle::spawn(
+            shell_session("printf 'retained'; exit 0"),
+            TerminalConfig::default(),
+            move |wake| wakes.lock().unwrap().0.push(wake.generation),
+        )
+        .unwrap();
+        let events = Arc::clone(&host);
+        handle.set_archived_event_observer(move |_, event| events.lock().unwrap().1.push(event));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let held = host.lock().unwrap();
+        handle
+            .resize(TerminalSize {
+                columns: 10,
+                rows: 5,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            })
+            .unwrap();
+        handle.search(1, "retained".into(), true).unwrap();
+        let generation = handle.generation();
+        drop(held);
+
+        flush_archived_notices();
+        let (wakes, events) = &*host.lock().unwrap();
+        assert!(wakes.contains(&generation));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::SearchResults { request: 1, .. }))
+        );
+        handle.shutdown().unwrap();
+    }
+
+    /// One notifier thread outlives every completed terminal, so a subscriber
+    /// that panics must cost only its own notice.
+    #[test]
+    fn a_panicking_archived_notice_does_not_silence_later_ones() {
+        notify_archived(|| panic!("fixture subscriber failure"));
+        let (delivered, later) = crossbeam_channel::bounded(1);
+        notify_archived(move || {
+            let _ = delivered.send(());
+        });
+        later
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the notifier stopped after one subscriber panicked");
     }
 
     #[test]

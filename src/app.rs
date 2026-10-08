@@ -4686,6 +4686,10 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
     focus_save_pending: bool,
+    /// Where the camera was heading when the last sweep found cards on screen
+    /// that it was only passing, which that sweep left cold. The camera
+    /// coming to rest or heading elsewhere is then a reason to sweep again.
+    lifecycle_sweep_destination: Option<f32>,
     /// The main window's latest input, whichever widget or overlay took it;
     /// hover activation reads it. See [`crate::input_trace`].
     input_trace: crate::input_trace::InputTrace,
@@ -5278,7 +5282,7 @@ impl Cagents {
         // browserless build leaves their durable descriptors untouched and
         // renders an explicit external-open path instead.
         Task::batch([
-            self.reconcile_lifecycle(&initially_visible, &initially_prefetch),
+            self.reconcile_lifecycle(&initially_visible, &HashSet::new(), &initially_prefetch),
             self.attach_next_restored_agent(),
             Task::batch(repository_tasks),
         ])
@@ -5554,13 +5558,7 @@ impl Cagents {
                 // button. Once the terminal is mounted, move keyboard focus
                 // to its input surface; otherwise that button consumes the
                 // first Enter even though typed characters reach the PTY.
-                if self.workspace.focused() == Some(card)
-                    && self
-                        .workspace
-                        .visibility(card)
-                        .is_some_and(VisibilityClass::is_mounted)
-                    && !self.workspace_inputs_blocked()
-                {
+                if self.card_holds_keyboard(card) {
                     tasks.push(
                         iced::widget::operation::focus(self.card_keyboard_focus(card))
                             .map(cosmic::Action::App),
@@ -5573,13 +5571,14 @@ impl Cagents {
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
         }
-        // A hibernated card holds no hot slot for the sweep to reclaim.
+        // A terminal that started off screen holds a slot a pane on screen
+        // may be waiting for. A hibernated card holds none to hand over.
         if !hibernated
             && self
                 .card_state(card)
                 .is_some_and(|state| state.exposure == Exposure::Offscreen)
         {
-            tasks.push(self.reconcile_scoped_lifecycle());
+            tasks.push(self.lifecycle_sweep());
         }
         self.persist();
         tasks.push(self.commit_terminal_handoffs());
@@ -6844,6 +6843,29 @@ impl Cagents {
         cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
     }
 
+    /// Keeps the saved focus on a pane the window still holds open.
+    ///
+    /// The saved focus mirrors the strip's, and [`Self::apply_viewport`] is
+    /// what carries one to the other. A pane can stop being open with no
+    /// viewport update to carry the handoff - another client closes it, its
+    /// project is removed - and storage refuses a workspace that focuses a
+    /// pane it does not hold open, which sets the whole window aside. So every
+    /// snapshot is settled here before it is taken. The strip is asked again
+    /// rather than trusted: it can still show a pane whose close it could not
+    /// take, and that pane is no more open for being on screen.
+    fn settle_focus(&mut self) {
+        if self.durable.focused.is_none() || self.durable.focused_index().is_some() {
+            return;
+        }
+        let focused = self.workspace.focused().filter(|id| {
+            self.durable
+                .cards
+                .iter()
+                .any(|card| card.id == *id && card.existence.is_open())
+        });
+        Arc::make_mut(&mut self.durable).focused = focused;
+    }
+
     fn persist(&mut self) {
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7706,6 +7728,22 @@ impl Cagents {
         }
     }
 
+    /// Whether `card` is where the keyboard belongs: the focused pane, in the
+    /// widget tree, with nothing over the workspace taking input instead.
+    ///
+    /// Work that finishes behind the user's back - a terminal starting, a
+    /// chat attaching - asks this before focusing its own control. A focus
+    /// operation unfocuses every widget that is not its target, so one issued
+    /// for a pane that is not in use takes the keyboard from the one that is.
+    fn card_holds_keyboard(&self, card: CardId) -> bool {
+        self.workspace.focused() == Some(card)
+            && self
+                .workspace
+                .visibility(card)
+                .is_some_and(VisibilityClass::is_mounted)
+            && !self.workspace_inputs_blocked()
+    }
+
     /// Where keyboard focus for `card` lands.
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
         match self.cards.get(&card) {
@@ -7807,7 +7845,15 @@ impl Cagents {
             });
         }
         // Runtime objects and focus never move out of their ID-indexed maps.
-        self.apply_viewport(update, true, true)
+        let viewport = self.apply_viewport(update, true, true);
+        // Focus did not change, so nothing above follows the active tab to
+        // wherever the new order put it. Dragging some other tab leaves the
+        // strip where the drag has it.
+        if self.workspace.focused() == Some(card) {
+            Task::batch([viewport, self.reveal_active_tab()])
+        } else {
+            viewport
+        }
     }
 
     fn apply_viewport(
@@ -7869,7 +7915,13 @@ impl Cagents {
                 _ => {}
             }
             match transition.to {
-                VisibilityClass::Offscreen => schedule_delayed_sweep = true,
+                VisibilityClass::Offscreen => {
+                    schedule_delayed_sweep = true;
+                    // A card's grace runs from the sweep that sees it leave
+                    // the screen, so one that left without passing through
+                    // the overscan is shown to a sweep now.
+                    reconcile_now |= transition.from == VisibilityClass::Visible;
+                }
                 VisibilityClass::Overscan if browser_card => {
                     reconcile_now = true;
                     schedule_delayed_sweep = true;
@@ -7889,6 +7941,7 @@ impl Cagents {
             );
         }
         tasks.push(context_overlay_task);
+        reconcile_now |= self.take_passing_sweep();
         if reconcile_now {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
         }
@@ -7976,6 +8029,8 @@ impl Cagents {
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
         let mut visible = HashSet::new();
+        // On screen, but only until the camera has gone by.
+        let mut passing = HashSet::new();
         let mut prefetch = HashSet::new();
         for (id, visibility) in self.workspace.mounted_visibility() {
             // A card in a worktree being deleted is not brought up: its
@@ -7989,6 +8044,9 @@ impl Cagents {
             }
             if visibility == VisibilityClass::Visible {
                 visible.insert(id);
+                if self.workspace.is_passing(id) {
+                    passing.insert(id);
+                }
             } else if visibility == VisibilityClass::Overscan {
                 let browser = match self.cards.get(&id) {
                     Some(CardRuntime::Terminal(_))
@@ -8011,17 +8069,39 @@ impl Cagents {
         // An ended card holds no lifecycle slot, so the reconcile below never
         // brings it up; its final screen is asked for once it is on screen.
         let retained = self.attach_retained_outputs(visible.iter().copied().collect::<Vec<_>>());
-        Task::batch([self.reconcile_lifecycle(&visible, &prefetch), retained])
+        self.lifecycle_sweep_destination =
+            (!passing.is_empty()).then(|| self.workspace.camera().target());
+        Task::batch([
+            self.reconcile_lifecycle(&visible, &passing, &prefetch),
+            retained,
+        ])
+    }
+
+    /// Whether the cards the last sweep left cold as passing are owed
+    /// another: the camera is at rest, so whichever is still on screen is
+    /// there to stay, or it has a new destination, which may be one of them.
+    fn take_passing_sweep(&mut self) -> bool {
+        let camera = self.workspace.camera();
+        let due = self
+            .lifecycle_sweep_destination
+            .is_some_and(|destination| !camera.is_animating() || camera.target() != destination);
+        if due {
+            self.lifecycle_sweep_destination = None;
+        }
+        due
     }
 
     fn reconcile_lifecycle(
         &mut self,
         visible: &HashSet<CardId>,
+        passing: &HashSet<CardId>,
         prefetch: &HashSet<CardId>,
     ) -> Task<Message> {
         let now = Instant::now();
         let surfaces_visible = self.workspace_surfaces_visible();
-        let actions = self.lifecycle.reconcile(visible, prefetch, now);
+        let actions = self
+            .lifecycle
+            .reconcile_in_flight(visible, passing, prefetch, now);
         // Actions are only emitted for real transitions, so an empty sweep left
         // the durable state untouched and needs no snapshot.
         let durable_changed = !actions.is_empty();
@@ -8035,6 +8115,7 @@ impl Cagents {
                     }
                 }
                 LifecycleAction::Hydrate { card, epoch } => {
+                    tracing::debug!(target: "cagents::lifecycle", action = "hydrate", ?card);
                     if let Some(state) = self.card_state_mut(card) {
                         state.residency = Residency::Hydrating { epoch };
                     }
@@ -8139,6 +8220,7 @@ impl Cagents {
                     }
                 }
                 LifecycleAction::Hibernate { card, epoch } => {
+                    tracing::debug!(target: "cagents::lifecycle", action = "hibernate", ?card);
                     let result = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
                             handle.hibernate().map_err(|error| error.to_string())
@@ -12198,6 +12280,10 @@ impl Application for Cagents {
             settings_warnings,
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
+        let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
+        if let Some(session) = &session {
+            session.save_worktrees(retired);
+        }
         let window_view = startup.window_view;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
@@ -12220,9 +12306,7 @@ impl Application for Cagents {
                     worktrees
                         .iter()
                         .filter(|worktree| {
-                            worktree.project_id == project.id
-                                && worktree.existence.is_open()
-                                && worktree_ui::worktree_directory_available(&worktree.path)
+                            worktree.project_id == project.id && worktree.existence.is_open()
                         })
                         .map(|worktree| {
                             SidebarWorktree::from_durable(
@@ -12427,6 +12511,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
         // One notice per lost card, not a single joined line: the log dedupes
@@ -12625,9 +12710,11 @@ impl Application for Cagents {
             return Task::none();
         }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
-            // A new animation starts from its first frame, not from time spent
-            // idle while the window-frame subscription was disconnected.
-            self.frame_clock.reset();
+            // Whatever this message starts is measured from now. Its first
+            // frame then moves it by the time since the input that began it,
+            // not by the time spent idle while the window-frame subscription
+            // was disconnected, and not by nothing at all.
+            self.frame_clock.start(Instant::now());
         }
         // Camera-only events cannot change labels, selected worktrees, or
         // repository bindings. Keep per-frame work proportional to visible
@@ -12995,19 +13082,11 @@ impl Application for Cagents {
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
                             session.save_worktrees(loaded.worktrees.iter().map(|(record, _)| {
-                                WorktreeState {
-                                    id: record.id,
-                                    project_id: loaded.project.id,
-                                    generation: 0,
-                                    path: record.path.clone(),
-                                    branch: record.branch.as_deref().map(|branch| {
-                                        branch
-                                            .strip_prefix("refs/heads/")
-                                            .unwrap_or(branch)
-                                            .to_owned()
-                                    }),
-                                    existence: Existence::Open,
-                                }
+                                worktree_ui::worktree_state(
+                                    loaded.project.id,
+                                    record,
+                                    Existence::Open,
+                                )
                             }));
                         }
                         let worktrees = loaded
@@ -20129,6 +20208,132 @@ mod tests {
         ));
     }
 
+    /// Where `task` asks the tab strip to scroll to, if it asks at all.
+    fn tab_strip_scroll(task: Task<Message>) -> Option<f32> {
+        use cosmic::iced::advanced::widget::operation::scrollable::{
+            AbsoluteOffset, RelativeOffset, Scrollable,
+        };
+
+        struct Strip(Option<f32>);
+        impl Scrollable for Strip {
+            fn snap_to(&mut self, _offset: RelativeOffset<Option<f32>>) {}
+            fn scroll_to(&mut self, offset: AbsoluteOffset<Option<f32>>) {
+                self.0 = offset.x;
+            }
+            fn scroll_by(
+                &mut self,
+                _offset: AbsoluteOffset,
+                _bounds: cosmic::iced::Rectangle,
+                _content_bounds: cosmic::iced::Rectangle,
+            ) {
+            }
+        }
+
+        let mut strip = Strip(None);
+        let tabs = widget::Id::new("workspace.tabs");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            // The task also carries timers that outlive the test. A scroll is
+            // ready at once, so a short quiet spell means none is coming.
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    let bounds = cosmic::iced::Rectangle::default();
+                    operation.scrollable(
+                        Some(&tabs),
+                        bounds,
+                        bounds,
+                        cosmic::iced::Vector::ZERO,
+                        &mut strip,
+                    );
+                }
+            }
+        });
+        runtime.shutdown_background();
+        strip.0
+    }
+
+    /// Reordering does not change which pane is focused, and the tab strip
+    /// only followed focus, so moving the active pane along the strip could
+    /// carry its tab out of sight.
+    #[test]
+    fn moving_the_active_pane_keeps_its_tab_in_view() {
+        let mut app = context_inspector_test_app(false);
+        let cards: Vec<_> = (0..24).map(|_| terminal_card_state()).collect();
+        let active = cards[0].id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(active),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        app.chrome_ui.tabs_focus = Some(active);
+        assert_eq!(
+            tab_strip_scroll(app.reveal_active_tab()),
+            None,
+            "the first tab starts in view"
+        );
+
+        let task = app.reorder_pane(active, None);
+        assert_eq!(app.workspace.order().last(), Some(active));
+        assert_eq!(app.workspace.focused(), Some(active));
+        assert!(
+            tab_strip_scroll(task).is_some_and(|offset| offset > 0.0),
+            "the tab moved to the far end of the strip and was not followed"
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_left_a_passing_pane_cold_is_repeated_when_the_camera_rests_or_turns() {
+        let mut app = context_inspector_test_app(false);
+        let cards: Vec<_> = std::iter::repeat_with(terminal_card_state)
+            .take(8)
+            .collect();
+        let origin = cards[0].id;
+        let target = cards[7].id;
+        let retarget = cards[5].id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(origin),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(600.0);
+        app.workspace.native_scroll(0.0, 600.0);
+        let _ = app.update(Message::LifecycleSweep);
+        assert!(!app.take_passing_sweep());
+
+        app.workspace.focus(target).unwrap();
+        assert!(app.workspace.is_passing(origin));
+        let _ = app.update(Message::LifecycleSweep);
+        assert!(!app.take_passing_sweep());
+
+        // Heading somewhere else may make a destination of a pane passed.
+        app.workspace.focus(retarget).unwrap();
+        assert!(app.take_passing_sweep());
+        assert!(!app.take_passing_sweep());
+
+        let _ = app.update(Message::LifecycleSweep);
+        for _ in 0..240 {
+            assert!(!app.take_passing_sweep());
+            app.workspace.tick(Duration::from_millis(16));
+            if !app.workspace.camera().is_animating() {
+                break;
+            }
+        }
+        assert!(!app.workspace.camera().is_animating());
+        assert!(app.take_passing_sweep());
+        assert!(!app.take_passing_sweep());
+    }
+
     #[test]
     fn a_new_camera_animation_does_not_consume_the_previous_idle_interval() {
         let mut app = context_inspector_test_app(false);
@@ -20146,16 +20351,25 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(600.0);
         app.workspace.native_scroll(0.0, 600.0);
-        let previous_frame = Instant::now();
-        let _ = app.frame_clock.elapsed(previous_frame);
+        // The last frame of whatever animated before, two idle seconds ago.
+        let previous_frame = Instant::now() - Duration::from_secs(2);
+        app.frame_clock.start(previous_frame);
 
         let _ = app.update(Message::FocusCard(target));
-        let first_frame = previous_frame + Duration::from_secs(2);
-        let _ = app.update(Message::Frame(first_frame));
-        assert_eq!(app.workspace.camera().offset(), 0.0);
-        let _ = app.update(Message::Frame(first_frame + Duration::from_millis(16)));
-        assert!(app.workspace.camera().offset() > 0.0);
-        assert!(app.workspace.camera().offset() < app.workspace.camera().target() / 2.0);
+        // Read back rather than taken before the update, which a stalled
+        // thread would put a frame or more behind the clock's own start.
+        let navigated = app
+            .frame_clock
+            .frame()
+            .expect("navigation starts the clock");
+        // The first frame already moves the camera, by the time since the
+        // navigation and not since that earlier frame.
+        let _ = app.update(Message::Frame(navigated + Duration::from_millis(16)));
+        let first = app.workspace.camera().offset();
+        assert!(first > 0.0);
+        assert!(first < app.workspace.camera().target() / 2.0);
+        let _ = app.update(Message::Frame(navigated + Duration::from_millis(32)));
+        assert!(app.workspace.camera().offset() > first);
     }
 
     #[test]
@@ -21191,7 +21405,7 @@ mod tests {
             Some(&Residency::Hibernated)
         );
 
-        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new()));
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts_in_flight(), 0);
         assert_ne!(
             surface_visibility(&app, card),
@@ -21214,7 +21428,7 @@ mod tests {
         let (mut app, card, session) = hibernated_agent_app(None);
         app.restored_agent_attaches.push_back(card);
         drop(app.attach_next_restored_agent());
-        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new()));
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts_in_flight(), 2);
         let started = || StartedTerminal {
             handle: unconnected_surface(directory.path(), session.id),
@@ -23061,6 +23275,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
             terminal_wake_rx,
@@ -23278,6 +23493,45 @@ mod tests {
         assert!(app.focus_save_pending);
         let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
         assert!(!app.focus_save_pending);
+    }
+
+    /// Every snapshot handed to the session writer is one storage accepts,
+    /// whichever path stopped a pane being open and whatever it left the strip
+    /// showing.
+    #[test]
+    fn a_snapshot_never_focuses_a_pane_the_window_no_longer_holds_open() {
+        let closed = || Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed fixture".into()),
+            },
+        };
+        let mut app = context_inspector_test_app(true);
+        let first_id = app.durable.focused.unwrap();
+        let second = terminal_card_state();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        let update = app.workspace.focus(second_id).unwrap();
+        let _ = app.apply_viewport(update, false, false);
+        assert_eq!(app.durable.focused, Some(second_id));
+
+        // The strip closes the focused pane and its update goes unapplied.
+        app.workspace.request_close(second_id).unwrap();
+        app.workspace.commit_close(second_id).unwrap();
+        Arc::make_mut(&mut app.durable).cards[1].existence = closed();
+        let saved = app.persistent_workspace();
+        crate::persistence::validate_workspace(&saved).unwrap();
+        assert_eq!(saved.focused, Some(first_id));
+        assert_eq!(app.durable.focused, Some(first_id));
+
+        // The strip still shows a pane the window no longer holds open.
+        Arc::make_mut(&mut app.durable).cards[0].existence = closed();
+        assert_eq!(app.workspace.focused(), Some(first_id));
+        let saved = app.persistent_workspace();
+        crate::persistence::validate_workspace(&saved).unwrap();
+        assert_eq!(saved.focused, None);
     }
 
     #[test]

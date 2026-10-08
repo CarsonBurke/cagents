@@ -1977,6 +1977,22 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
+        // `spawn` returns as soon as the child stops sharing this process's
+        // memory. Until its exec completes, `/proc` shows it with this image
+        // and environment, then with the new image and no environment yet.
+        let own = fs::read_link("/proc/self/exe").unwrap();
+        let executed = || {
+            fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image != own)
+                && fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| !environ.is_empty())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !executed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture never finished exec"
+            );
+            std::thread::yield_now();
+        }
         let start = process_identity(&fs::read(format!("/proc/{pid}/stat")).unwrap())
             .unwrap()
             .1;

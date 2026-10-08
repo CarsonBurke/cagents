@@ -726,7 +726,14 @@ impl State {
     /// Moves the highlight one row among `count`, wrapping at either end, and
     /// returns the offset that brings its row into a `viewport` of rows
     /// `row` tall when the list has to scroll for it.
-    pub fn step(&mut self, down: bool, count: usize, row: f32, viewport: f32) -> Option<f32> {
+    pub fn step(
+        &mut self,
+        down: bool,
+        count: usize,
+        row: f32,
+        viewport: f32,
+        inset: f32,
+    ) -> Option<f32> {
         if count == 0 {
             return None;
         }
@@ -737,7 +744,7 @@ impl State {
         } else {
             (current + count - 1) % count
         };
-        let top = self.highlighted as f32 * row;
+        let top = inset + self.highlighted as f32 * row;
         let bottom = top + row;
         let offset = if top < self.offset {
             top
@@ -1125,18 +1132,26 @@ mod tests {
     }
 
     #[test]
+    fn highlight_reveal_accounts_for_scrolling_padding() {
+        let mut state = State::default();
+        assert_eq!(state.step(false, 10, 28.0, 92.0, 4.0), Some(192.0));
+        assert_eq!(state.step(true, 10, 28.0, 92.0, 4.0), Some(4.0));
+        assert_eq!(state.step(true, 10, 28.0, 92.0, 4.0), None);
+    }
+
+    #[test]
     fn the_highlight_wraps_and_keeps_its_row_in_view() {
         let mut state = State::default();
         // Up from the first row wraps to the last, scrolling it into view.
-        assert_eq!(state.step(false, 10, 28.0, 84.0), Some(196.0));
+        assert_eq!(state.step(false, 10, 28.0, 84.0, 0.0), Some(196.0));
         assert_eq!(state.highlighted, 9);
         // Down from the last wraps to the first, back at the top.
-        assert_eq!(state.step(true, 10, 28.0, 84.0), Some(0.0));
+        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), Some(0.0));
         assert_eq!(state.highlighted, 0);
         // Moving within the visible rows does not scroll.
-        assert_eq!(state.step(true, 10, 28.0, 84.0), None);
-        assert_eq!(state.step(true, 10, 28.0, 84.0), None);
-        assert_eq!(state.step(true, 10, 28.0, 84.0), Some(28.0));
+        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), None);
+        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), None);
+        assert_eq!(state.step(true, 10, 28.0, 84.0, 0.0), Some(28.0));
         assert_eq!(state.highlighted, 3);
 
         state.dismissed = Some((0, 0));
@@ -1220,7 +1235,7 @@ mod tests {
         assert!(!state.enter_chooses(&at("/Review|"), &review, &omp));
 
         // Once the reader looks into the list, Enter takes what they chose.
-        state.step(true, 2, 28.0, 56.0);
+        state.step(true, 2, 28.0, 56.0, 0.0);
         assert!(state.enter_chooses(&at("cd /|"), &commits, &codex));
         assert!(state.enter_chooses(&at("see /its|"), &commits, &codex));
         assert!(!state.enter_chooses(&at("/clear|"), &clear, &codex));

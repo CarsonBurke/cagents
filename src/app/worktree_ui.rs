@@ -27,6 +27,52 @@ pub(super) fn worktree_directory_available(path: &Path) -> bool {
     }
 }
 
+/// The durable record of a worktree as Git lists it.
+pub(super) fn worktree_state(
+    project: ProjectId,
+    record: &WorktreeRecord,
+    existence: Existence,
+) -> WorktreeState {
+    WorktreeState {
+        id: record.id,
+        project_id: project,
+        generation: 0,
+        path: record.path.clone(),
+        branch: record.branch.as_deref().map(|branch| {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_owned()
+        }),
+        existence,
+    }
+}
+
+/// How a record closes when its checkout left the disk by some other hand: a
+/// `git worktree remove` in a terminal, or an agent cleaning up after itself.
+/// Git listing the path again reopens the record.
+pub(super) fn removed_outside() -> Existence {
+    project_ui::removed_existence("worktree removed outside the application")
+}
+
+/// Close the restored records whose checkout is gone, returning the ones that
+/// changed so they can be saved. Without this a record outlives its worktree
+/// indefinitely, and every start looks for each of them on disk again. The
+/// closed records still seed ownership boundaries: a session that survives
+/// its worktree must not fall into the repository that contained it.
+pub(super) fn retire_missing_worktrees(worktrees: &mut [WorktreeState]) -> Vec<WorktreeState> {
+    worktrees
+        .iter_mut()
+        .filter(|worktree| {
+            worktree.existence.is_open() && !worktree_directory_available(&worktree.path)
+        })
+        .map(|worktree| {
+            worktree.existence = removed_outside();
+            worktree.clone()
+        })
+        .collect()
+}
+
 pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
     match &card.kind {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
@@ -671,22 +717,14 @@ impl Cagents {
             true,
             true,
         );
-        let residency = self.reconcile_scoped_lifecycle();
+        // The strip being left keeps its visuals for the usual grace, so
+        // coming straight back finds its panes as they were instead of
+        // restoring every one of them. The panes now on screen get their
+        // slots regardless: a visible card takes one from the hidden card
+        // seen longest ago when the budget is full.
+        let residency = self.lifecycle_sweep();
         let source_control = self.rebind_source_control();
         Task::batch([viewport, residency, source_control])
-    }
-
-    pub(super) fn reconcile_scoped_lifecycle(&mut self) -> Task<Message> {
-        // Scope changes release hidden visuals immediately, never their hosted
-        // sessions. A second pass admits visible cards after slots are freed.
-        self.lifecycle.update_budget(LifecycleBudget {
-            max_hot_cards: self.settings.max_hot_cards,
-            offscreen_grace: Duration::ZERO,
-        });
-        let eviction = self.lifecycle_sweep();
-        self.synchronize_lifecycle_budget();
-        let admission = self.lifecycle_sweep();
-        Task::batch([eviction, admission])
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
@@ -1699,6 +1737,38 @@ mod tests {
         let _ = app.select_worktree(directory.path().into(), false);
         assert!(app.workspace.cards().is_empty());
         assert!(app.card_state(shell.id).unwrap().existence.is_open());
+    }
+
+    fn restored(path: &Path, existence: Existence) -> WorktreeState {
+        WorktreeState {
+            id: crate::model::WorktreeId::new(),
+            project_id: ProjectId::new(),
+            generation: 3,
+            path: path.into(),
+            branch: None,
+            existence,
+        }
+    }
+
+    #[test]
+    fn restored_records_of_missing_worktrees_are_retired_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut worktrees = [
+            restored(directory.path(), Existence::Open),
+            restored(&directory.path().join("removed"), Existence::Open),
+            restored(&directory.path().join("deleted"), removed_outside()),
+        ];
+        let retired = retire_missing_worktrees(&mut worktrees);
+        assert_eq!(
+            retired
+                .iter()
+                .map(|worktree| worktree.id)
+                .collect::<Vec<_>>(),
+            [worktrees[1].id]
+        );
+        assert!(worktrees[0].existence.is_open());
+        assert!(!worktrees[1].existence.is_open());
+        assert!(retire_missing_worktrees(&mut worktrees).is_empty());
     }
 
     #[test]

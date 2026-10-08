@@ -1,8 +1,9 @@
-use super::state::{ClientId, HostState, SharedHost};
+use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 mod native_cleanup;
 mod native_recovery;
+mod owned_listener;
 #[cfg(test)]
 mod startup_tests;
 use crate::{
@@ -22,7 +23,7 @@ pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -383,7 +384,7 @@ fn attached_mut(
     }
     Ok(record)
 }
-fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
+fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -934,33 +935,19 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    if let Some(owned_socket) = &owned_socket {
-        // An unclean daemon exit can leave the owned socket inode behind.
-        // Only remove a refused socket inside our private, user-owned directory;
-        // a live listener is reused and an arbitrary endpoint is never touched.
-        if owned_socket.exists() {
-            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-            let private = owned_socket.parent().is_some_and(|directory| {
-                std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
-                    metadata.is_dir()
-                        && metadata.uid() == unsafe { libc::geteuid() }
-                        && metadata.mode() & 0o777 == 0o700
-                })
-            });
-            let socket = std::fs::symlink_metadata(&owned_socket).is_ok_and(|metadata| {
-                metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() }
-            });
-            if private
-                && socket
-                && let Err(failure) = std::os::unix::net::UnixStream::connect(&owned_socket)
-                && failure.kind() == std::io::ErrorKind::ConnectionRefused
-            {
-                std::fs::remove_file(&owned_socket).map_err(|failure| {
-                    unavailable(format!("Cannot retire stopped provider socket: {failure}"))
-                })?;
-            }
+    // A server that stopped without cleaning up leaves its endpoint behind.
+    // A listener still being served is joined; anything else is retired so
+    // this conversation's own server starts again at the same path.
+    let owned_socket = match owned_socket {
+        Some(socket)
+            if !owned_listener::served(&socket).map_err(|failure| {
+                unavailable(format!("Cannot retire stopped provider socket: {failure}"))
+            })? =>
+        {
+            Some(socket)
         }
-    }
+        _ => None,
+    };
     // An authenticated checkpoint may need different resume argv from the
     // immutable recipe issued to windows. Keep that execution detail out of
     // the descriptor, authority registry and runtime's installed identity.
@@ -977,20 +964,19 @@ fn start_with_execution(
         ));
     }
     let process_launch = restart_launch.unwrap_or(&session.launch);
-    let (mut spec, mut adapter) =
-        if let Some(owned_socket) = owned_socket.filter(|path| !path.exists()) {
-            chat::protocol::codex::create_with_listener(process_launch, owned_socket)
-        } else {
-            chat::protocol::create(process_launch)
-        }
-        .map_err(|message| {
-            // Removal may have won after the early check while the adapter
-            // was reading history. Do not hold the lifecycle lease across
-            // those reads, but preserve the actionable account classification.
-            check_launch_account(&session.launch)
-                .err()
-                .unwrap_or_else(|| error(message))
-        })?;
+    let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
+        chat::protocol::codex::create_with_listener(process_launch, owned_socket)
+    } else {
+        chat::protocol::create(process_launch)
+    }
+    .map_err(|message| {
+        // Removal may have won after the early check while the adapter
+        // was reading history. Do not hold the lifecycle lease across
+        // those reads, but preserve the actionable account classification.
+        check_launch_account(&session.launch)
+            .err()
+            .unwrap_or_else(|| error(message))
+    })?;
     if !matches!(
         &spec.transport,
         chat::protocol::TransportSpec::UnixWebSocket { .. }
@@ -3042,11 +3028,13 @@ mod tests {
                 .unwrap()
                 .contains("history project directory is unavailable")
         );
-        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("removed-history"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        })));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("removed-history"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+        )));
         let failure = start(&host, 1, session, None, false, None, Default::default()).unwrap_err();
         assert_eq!(failure.code, ProtocolErrorCode::AccountRemoved);
         assert!(
@@ -3360,7 +3348,7 @@ for line in sys.stdin:
         };
         (
             directory,
-            Arc::new(Mutex::new(HostState::new(current))),
+            Arc::new(crate::host::state::HostLock::new(HostState::new(current))),
             crate::upgrade::handoff::Chat {
                 source,
                 launch,
@@ -3971,7 +3959,9 @@ done
             boot_id: "boot".into(),
             host_incarnation: "incarnation".into(),
         };
-        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
         let source = Session {
             id: TerminalId::new(),
             owned_codex_listener: None,
@@ -4225,7 +4215,9 @@ done
             host_incarnation: "current".into(),
             ..allocator.clone()
         };
-        let host = Arc::new(Mutex::new(HostState::new(current.clone())));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            current.clone(),
+        )));
         let mut session = Session {
             id: TerminalId::new(),
             native_continuity: Default::default(),
@@ -4553,7 +4545,9 @@ done
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("incarnation"),
         };
-        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),
@@ -4727,7 +4721,9 @@ done
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("incarnation"),
         };
-        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),

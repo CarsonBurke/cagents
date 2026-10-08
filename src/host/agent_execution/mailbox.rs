@@ -243,7 +243,7 @@ struct WakeState {
 }
 
 struct Inner {
-    host: Weak<Mutex<crate::host::state::HostState>>,
+    host: Weak<crate::host::state::HostLock>,
     registry: SharedRegistry,
     seal: Arc<Seal>,
     state: Mutex<WakeState>,

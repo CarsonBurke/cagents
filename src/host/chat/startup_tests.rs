@@ -71,11 +71,13 @@ fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
             session_id: None,
         },
     };
-    let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
-        host_session_id: HostSessionId::new("managed-start"),
-        boot_id: crate::daemon::read_boot_id().unwrap(),
-        host_incarnation: HostIncarnation::new("incarnation"),
-    })));
+    let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+        HostSessionProof {
+            host_session_id: HostSessionId::new("managed-start"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        },
+    )));
     let failure = start(&host, 1, session, None, false, None, Default::default()).unwrap_err();
     assert_eq!(
         failure.message, "Native holder did not acknowledge its server",

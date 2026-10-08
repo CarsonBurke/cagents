@@ -607,7 +607,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         children.push(design::heading(&pr.title).into());
         children.push(link("Open pull request on GitHub", &pr.url));
     }
-    if state.loaded && !state.loading && state.error.is_none() && state.inspection.is_none() {
+    if state.loaded && state.error.is_none() && state.inspection.is_none() {
         children.push(design::caption("No pull request matches this worktree branch.").into());
     }
     if let Some(pr) = state.pull_request.as_deref() {

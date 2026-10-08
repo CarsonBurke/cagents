@@ -24,7 +24,10 @@ struct Entry {
     fallback: Option<String>,
     read_failure: Option<String>,
     read_full_scan: bool,
-    last_read: Instant,
+    /// When the worktree list was last re-read. Polling is paced from this
+    /// rather than from any read, since the edits a partial watch still
+    /// reports would otherwise postpone the scan it stands in for.
+    last_full_scan: Instant,
 }
 
 #[derive(Default)]
@@ -57,6 +60,17 @@ impl State {
         }
         self.queue.retain(|id| *id != project);
         self.configure();
+    }
+
+    /// Take a worktree the application deleted out of the last listing, so its
+    /// absence from the next one is not read as a removal made elsewhere.
+    pub(super) fn forget_worktree(&mut self, project: ProjectId, worktree: WorktreeId) {
+        if let Some(entry) = self.entries.get_mut(&project) {
+            entry
+                .snapshot
+                .worktrees
+                .retain(|(record, _)| record.id != worktree);
+        }
     }
 
     fn configure(&self) {
@@ -126,10 +140,19 @@ impl Cagents {
         };
         let project = loaded.project.id;
         let state = &mut self.refresh_ui.git;
-        if let Some(old) = state.entries.remove(&project)
-            && let Some(cancel) = old.cancellation
-        {
-            cancel.cancel();
+        if let Some(old) = state.entries.remove(&project) {
+            if let Some(cancel) = &old.cancellation {
+                cancel.cancel();
+            }
+            // A reload replaces the listing wholesale, so what it dropped is
+            // settled here rather than by the read that follows it.
+            if let Some(session) = &self.session {
+                session.save_worktrees(records_removed_outside(
+                    project,
+                    &old.snapshot,
+                    &loaded.worktrees,
+                ));
+            }
         }
         let failure = if state.monitor.is_none() {
             match git_watch::Monitor::start() {
@@ -159,7 +182,7 @@ impl Cagents {
                 read_full_scan: false,
                 pending: git_watch::Change::default(),
                 fallback: failure,
-                last_read: Instant::now(),
+                last_full_scan: Instant::now(),
             },
         );
         state.changed(
@@ -215,7 +238,7 @@ impl Cagents {
             .iter()
             .filter(|(_, entry)| {
                 (entry.fallback.is_some() || entry.read_failure.is_some())
-                    && entry.last_read.elapsed() >= FALLBACK_INTERVAL
+                    && entry.last_full_scan.elapsed() >= FALLBACK_INTERVAL
             })
             .map(|(&id, _)| id)
             .collect::<Vec<_>>();
@@ -348,7 +371,9 @@ impl Cagents {
                         if entry.read_full_scan {
                             entry.read_failure = None;
                         }
-                        entry.snapshot = snapshot.clone();
+                        let previous = std::mem::replace(&mut entry.snapshot, snapshot.clone());
+                        let removed =
+                            records_removed_outside(project, &previous, &snapshot.worktrees);
                         let reconfigure = plan.is_some();
                         let archived = entry.archived.clone();
                         if let Some(plan) = plan {
@@ -381,21 +406,11 @@ impl Cagents {
                             );
                         }
                         if let Some(session) = &self.session {
-                            session.save_worktrees(snapshot.worktrees.iter().map(|(record, _)| {
-                                WorktreeState {
-                                    id: record.id,
-                                    project_id: project,
-                                    generation: 0,
-                                    path: record.path.clone(),
-                                    branch: record.branch.as_deref().map(|branch| {
-                                        branch
-                                            .strip_prefix("refs/heads/")
-                                            .unwrap_or(branch)
-                                            .to_owned()
-                                    }),
-                                    existence: Existence::Open,
-                                }
-                            }));
+                            session.save_worktrees(removed.into_iter().chain(
+                                snapshot.worktrees.iter().map(|(record, _)| {
+                                    worktree_ui::worktree_state(project, record, Existence::Open)
+                                }),
+                            ));
                         }
                         if reconfigure {
                             self.refresh_ui.git.configure();
@@ -446,7 +461,9 @@ impl Cagents {
             let generation = entry.generation;
             let cancellation = CancellationToken::default();
             entry.cancellation = Some(cancellation.clone());
-            entry.last_read = Instant::now();
+            if change.topology {
+                entry.last_full_scan = Instant::now();
+            }
             running += 1;
             tasks.push(cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
@@ -489,17 +506,25 @@ fn read_local_with_plan(
             .list_worktrees(&snapshot.repository.common_dir, &cancellation)
             .map_err(|error| error.to_string())?
             .into_iter()
-            .filter(|record| record.bare || record.path.is_dir())
+            .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
             .map(|record| (record, None))
             .collect();
     }
+    let mut vanished = HashSet::new();
     for (record, status) in &mut snapshot.worktrees {
         if record.bare || (!change.topology && !change.worktrees.contains(&record.id)) {
             continue;
         }
-        let current = git
-            .status_with_untracked(&record.path, false, &cancellation)
-            .map_err(|error| error.to_string())?;
+        let current = match git.status_with_untracked(&record.path, false, &cancellation) {
+            Ok(current) => current,
+            // Its own removal is often the event being read, and one absent
+            // checkout must not fail its siblings.
+            Err(_) if checkout_removed(&record.path) => {
+                vanished.insert(record.id);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         match &current.head {
             HeadState::Branch { name, oid } => {
                 record.branch = Some(format!("refs/heads/{name}"));
@@ -527,13 +552,16 @@ fn read_local_with_plan(
         }
         *status = Some(current);
     }
+    snapshot
+        .worktrees
+        .retain(|(record, _)| !vanished.contains(&record.id));
     snapshot.heads.retain(|id, _| {
         snapshot
             .worktrees
             .iter()
             .any(|(record, _)| record.id == *id)
     });
-    let plan = (change.membership || change.topology)
+    let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
             git_watch::Project::read_changed(
                 project,
@@ -550,6 +578,37 @@ fn read_local_with_plan(
         })
         .transpose()?;
     Ok((snapshot, plan))
+}
+
+/// Whether a failed read is explained by the directory no longer being a
+/// checkout: deleted outright, or part-way through `git worktree remove`,
+/// which takes `.git` before the files and the listing that names them. A
+/// permission or transient I/O failure is not evidence of either.
+fn checkout_removed(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join(".git")).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    })
+}
+
+/// The records to close for worktrees Git listed in `previous` and no longer
+/// does. One the application deleted has already left the snapshot, so its own
+/// tombstone stands.
+fn records_removed_outside(
+    project: ProjectId,
+    previous: &Snapshot,
+    listed: &[(WorktreeRecord, Option<StatusSnapshot>)],
+) -> Vec<WorktreeState> {
+    previous
+        .worktrees
+        .iter()
+        .filter(|(old, _)| !listed.iter().any(|(new, _)| new.id == old.id))
+        .map(|(record, _)| {
+            worktree_ui::worktree_state(project, record, worktree_ui::removed_outside())
+        })
+        .collect()
 }
 
 fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
@@ -844,6 +903,71 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_gone_from_the_listing_is_closed_unless_the_application_deleted_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let snapshot = fixture(&first);
+        for name in ["outside", "inside"] {
+            let path = directory.path().join(name);
+            git(
+                &first,
+                &["worktree", "add", "-b", name, path.to_str().unwrap()],
+            );
+        }
+        let project = ProjectId::new();
+        let read = |snapshot| {
+            read_local(
+                project,
+                snapshot,
+                git_watch::Change {
+                    topology: true,
+                    ..Default::default()
+                },
+                CancellationToken::default(),
+            )
+            .unwrap()
+            .0
+        };
+        let previous = read(snapshot);
+        let inside = previous
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path.ends_with("inside"))
+            .unwrap()
+            .0
+            .id;
+        let mut state = State::default();
+        state.entries.insert(
+            project,
+            Entry {
+                snapshot: previous.clone(),
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                read_failure: None,
+                read_full_scan: false,
+                pending: Default::default(),
+                fallback: None,
+                last_full_scan: Instant::now(),
+            },
+        );
+        for name in ["outside", "inside"] {
+            git(&first, &["worktree", "remove", "--force", name]);
+        }
+        state.forget_worktree(project, inside);
+        let listed = read(previous).worktrees;
+        assert_eq!(listed.len(), 1);
+        let closed = records_removed_outside(project, &state.entries[&project].snapshot, &listed);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].project_id, project);
+        assert_eq!(closed[0].path, directory.path().join("outside"));
+        assert_eq!(closed[0].branch.as_deref(), Some("outside"));
+        assert!(!closed[0].existence.is_open());
+    }
+
+    #[test]
     fn stale_local_completion_cannot_resurrect_a_closed_project() {
         let directory = tempfile::tempdir().unwrap();
         let snapshot = fixture(&directory.path().join("repo"));
@@ -862,7 +986,7 @@ mod tests {
                 read_full_scan: false,
                 pending: Default::default(),
                 fallback: None,
-                last_read: Instant::now(),
+                last_full_scan: Instant::now(),
             },
         );
         app.repository_generations.insert(project, 2);
@@ -905,7 +1029,7 @@ mod tests {
                     read_full_scan: false,
                     pending: Default::default(),
                     fallback: Some("watch limit".into()),
-                    last_read: Instant::now() - FALLBACK_INTERVAL,
+                    last_full_scan: Instant::now() - FALLBACK_INTERVAL,
                 },
             );
         }
@@ -925,6 +1049,140 @@ mod tests {
             "fallback never schedules gh"
         );
     }
+
+    #[test]
+    fn fallback_rescans_the_worktree_list_while_watched_edits_keep_arriving() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let worktree = snapshot.worktrees[0].0.id;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.clear();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            snapshot.repository.id,
+            "Partly watched".into(),
+            snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.repository_generations.insert(project, 1);
+        app.refresh_ui.git.entries.insert(
+            project,
+            Entry {
+                snapshot: snapshot.clone(),
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                read_failure: None,
+                read_full_scan: false,
+                pending: Default::default(),
+                fallback: Some("directory watch limit reached".into()),
+                last_full_scan: Instant::now() - FALLBACK_INTERVAL,
+            },
+        );
+        // An edit in a directory that is still watched is read on its own.
+        app.refresh_ui.git.changed(
+            project,
+            git_watch::Change {
+                worktrees: [worktree].into(),
+                ..Default::default()
+            },
+        );
+        drop(app.start_git_reads());
+        assert!(!app.refresh_ui.git.entries[&project].read_full_scan);
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((snapshot, None)),
+        }));
+        drop(app.git_fallback_tick());
+        let entry = &app.refresh_ui.git.entries[&project];
+        assert!(
+            entry.cancellation.is_some() && entry.read_full_scan,
+            "a targeted read must not stand in for the overdue worktree scan"
+        );
+        assert!(entry.last_full_scan.elapsed() < FALLBACK_INTERVAL);
+    }
+
+    #[test]
+    fn a_removed_worktree_leaves_without_failing_its_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let snapshot = fixture(&first);
+        git(
+            &first,
+            &["worktree", "add", "-b", "second", second.to_str().unwrap()],
+        );
+        let project = ProjectId::new();
+        let (snapshot, _) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.worktrees.len(), 2);
+        let ids = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect();
+        // Removed outside the application; Git still lists it as prunable.
+        fs::remove_dir_all(&second).unwrap();
+        let (updated, plan) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: ids,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            updated
+                .worktrees
+                .iter()
+                .map(|(record, _)| record.path.as_path())
+                .collect::<Vec<_>>(),
+            [first.as_path()]
+        );
+        assert!(updated.worktrees[0].1.is_some());
+        assert_eq!(
+            plan.expect("watches follow the surviving worktrees")
+                .worktrees
+                .len(),
+            1
+        );
+        // `git worktree remove` takes `.git` first; a large checkout is still
+        // on disk, and still listed, while its files go.
+        let third = directory.path().join("third");
+        git(
+            &first,
+            &["worktree", "add", "-b", "third", third.to_str().unwrap()],
+        );
+        fs::remove_file(third.join(".git")).unwrap();
+        let (updated, _) = read_local(
+            project,
+            updated,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(updated.worktrees.len(), 1);
+        assert_eq!(updated.worktrees[0].0.path, first);
+    }
+
     #[test]
     fn local_edit_retains_archived_pr_authority_but_checkout_to_other_fork_drops_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -977,7 +1235,7 @@ mod tests {
                 read_full_scan: false,
                 pending: Default::default(),
                 fallback: None,
-                last_read: Instant::now(),
+                last_full_scan: Instant::now(),
             },
         );
         snapshot.worktrees[0].1.as_mut().unwrap().dirty.unstaged = 1;
@@ -1027,7 +1285,7 @@ mod tests {
                 read_full_scan: false,
                 pending: Default::default(),
                 fallback: Some("watch limit".into()),
-                last_read: Instant::now(),
+                last_full_scan: Instant::now(),
             },
         );
         state.changed(

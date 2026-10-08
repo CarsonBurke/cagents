@@ -40,6 +40,11 @@ impl TerminalSurface {
         self.handle.snapshot()
     }
 
+    /// The grid to draw; see [`HostedTerminalHandle::frame`].
+    pub fn frame(&self) -> Arc<RenderSnapshot> {
+        self.handle.frame()
+    }
+
     pub fn activity(&self) -> Option<crate::model::TerminalOutputActivity> {
         self.handle.activity()
     }

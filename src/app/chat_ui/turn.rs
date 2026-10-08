@@ -369,7 +369,7 @@ fn renders(content: &ItemContent) -> bool {
 /// draws instead of being typeset like an answer. It used to be dropped from
 /// the transcript entirely and the newest one pinned above it as a heading,
 /// which read as the conversation's subtitle and cost a row on every frame.
-fn slot_of(item: &Item) -> Slot {
+pub(super) fn slot_of(item: &Item) -> Slot {
     if item.role == Role::System {
         return Slot::Commentary;
     }

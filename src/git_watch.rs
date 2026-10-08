@@ -116,7 +116,10 @@ impl Project {
         })
     }
 
-    fn paths(&self) -> BTreeMap<PathBuf, RecursiveMode> {
+    /// Git's own bookkeeping: the directories whose entries change when a
+    /// worktree is added, removed, locked, or moved to another commit. A
+    /// handful per worktree, so they are registered ahead of any content.
+    fn metadata_paths(&self) -> BTreeMap<PathBuf, RecursiveMode> {
         let mut paths = BTreeMap::from([(self.common_dir.clone(), RecursiveMode::NonRecursive)]);
         if let Some(parent) = self.common_dir.parent() {
             paths.insert(parent.to_owned(), RecursiveMode::NonRecursive);
@@ -130,23 +133,28 @@ impl Project {
             }
             paths.insert(worktree.git_dir.clone(), RecursiveMode::NonRecursive);
             paths.insert(worktree.git_dir.join("refs"), RecursiveMode::Recursive);
-            for directory in &worktree.directories {
-                if directory
-                    .ancestors()
-                    .take_while(|path| path.starts_with(&worktree.root))
-                    .any(|path| {
-                        std::fs::symlink_metadata(path)
-                            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                    })
-                {
-                    continue;
-                }
-                paths
-                    .entry(directory.clone())
-                    .or_insert(RecursiveMode::NonRecursive);
-            }
         }
         paths
+    }
+
+    /// Every directory on the way to a tracked file: one watch each, and by
+    /// far the larger share of a checkout's registrations.
+    fn content_paths(&self) -> impl Iterator<Item = &Path> {
+        self.worktrees.iter().flat_map(|worktree| {
+            worktree
+                .directories
+                .iter()
+                .filter(|directory| {
+                    !directory
+                        .ancestors()
+                        .take_while(|path| path.starts_with(&worktree.root))
+                        .any(|path| {
+                            std::fs::symlink_metadata(path)
+                                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                        })
+                })
+                .map(PathBuf::as_path)
+        })
     }
 
     fn change(&self, event: &Event) -> Option<Change> {
@@ -294,6 +302,67 @@ impl Pending {
     }
 }
 
+/// What the watcher should hold for a set of projects, and which of them it
+/// could not cover in full.
+#[derive(Default)]
+struct Registrations {
+    desired: BTreeMap<PathBuf, RecursiveMode>,
+    owners: BTreeMap<PathBuf, BTreeSet<ProjectId>>,
+    failures: BTreeMap<ProjectId, String>,
+}
+
+impl Registrations {
+    /// Metadata is claimed for every project before any content, so a budget
+    /// spent on one large checkout still leaves each project's worktree list
+    /// watched. A project left short of content watches is reported and polled.
+    fn within(projects: &BTreeMap<ProjectId, Arc<Project>>, limit: usize) -> Self {
+        let mut registrations = Self::default();
+        for (&id, project) in projects {
+            if let Some(reason) = &project.polling {
+                registrations.failures.insert(id, reason.clone());
+            }
+            for (path, mode) in project.metadata_paths() {
+                registrations.claim(id, path, mode, limit);
+            }
+        }
+        for (&id, project) in projects {
+            for path in project.content_paths() {
+                registrations.claim(id, path.to_owned(), RecursiveMode::NonRecursive, limit);
+            }
+        }
+        registrations
+    }
+
+    fn claim(&mut self, id: ProjectId, path: PathBuf, mode: RecursiveMode, limit: usize) {
+        self.owners.entry(path.clone()).or_default().insert(id);
+        // Never follow a tracked symlink into another checkout. Missing
+        // ancestors remain covered by their existing parent; a creation event
+        // rebuilds this registration.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                self.failures.insert(id, error.to_string());
+                return;
+            }
+        }
+        if self.desired.len() >= limit && !self.desired.contains_key(&path) {
+            self.failures
+                .insert(id, "directory watch limit reached".to_owned());
+            return;
+        }
+        self.desired
+            .entry(path)
+            .and_modify(|old| {
+                if mode == RecursiveMode::Recursive {
+                    *old = mode;
+                }
+            })
+            .or_insert(mode);
+    }
+}
+
 /// One native watcher for the window, with at most one pending wake regardless
 /// of event rate. Registration happens on its coordinator, never the UI thread.
 pub(crate) struct Monitor {
@@ -365,43 +434,11 @@ impl Monitor {
                         }
                         std::mem::replace(&mut pending.projects, projects.clone())
                     };
-                    let mut desired = BTreeMap::new();
-                    let mut owners = BTreeMap::<PathBuf, BTreeSet<ProjectId>>::new();
-                    let mut failures = BTreeMap::new();
-                    for (&id, project) in &projects {
-                        if let Some(reason) = &project.polling {
-                            failures.insert(id, reason.clone());
-                        }
-                        for (path, mode) in project.paths() {
-                            owners.entry(path.clone()).or_default().insert(id);
-                            // Never follow a tracked symlink into another checkout.
-                            // Missing ancestors remain covered by their existing
-                            // parent; a creation event rebuilds this registration.
-                            match std::fs::symlink_metadata(&path) {
-                                Ok(metadata) if metadata.is_dir() => {}
-                                Ok(_) => continue,
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                    continue;
-                                }
-                                Err(error) => {
-                                    failures.insert(id, error.to_string());
-                                    continue;
-                                }
-                            }
-                            if desired.len() >= MAX_DIRECTORIES && !desired.contains_key(&path) {
-                                failures.insert(id, "directory watch limit reached".to_owned());
-                                continue;
-                            }
-                            desired
-                                .entry(path)
-                                .and_modify(|old| {
-                                    if mode == RecursiveMode::Recursive {
-                                        *old = mode;
-                                    }
-                                })
-                                .or_insert(mode);
-                        }
-                    }
+                    let Registrations {
+                        mut desired,
+                        owners,
+                        mut failures,
+                    } = Registrations::within(&projects, MAX_DIRECTORIES);
                     // A recursive metadata watch already owns its descendants.
                     // Avoid overlapping registrations, whose removal can also
                     // remove a descendant's native watch on some backends.
@@ -671,6 +708,61 @@ mod tests {
         pending.changes.clear();
         pending.event(Ok(modified(project.worktrees[0].root.join("src/main.rs"))));
         assert!(pending.changes.is_empty());
+    }
+
+    #[test]
+    fn a_spent_budget_still_watches_every_projects_worktree_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let projects = [("large", 64), ("small", 0)]
+            .map(|(name, modules)| {
+                let mut project = project(&directory.path().join(name));
+                for worktree in &mut project.worktrees {
+                    worktree.directories.extend(
+                        (0..modules).map(|module| worktree.root.join(format!("src/{module}"))),
+                    );
+                    for directory in &worktree.directories {
+                        std::fs::create_dir_all(directory).unwrap();
+                    }
+                    std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
+                }
+                std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
+                (project.id, Arc::new(project))
+            })
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let metadata = projects
+            .values()
+            .flat_map(|project| project.metadata_paths().into_keys())
+            .collect::<BTreeSet<_>>();
+        // Room for all metadata and a single content directory.
+        let registrations = Registrations::within(&projects, metadata.len() + 1);
+        for project in projects.values() {
+            assert_eq!(
+                registrations
+                    .desired
+                    .get(&project.common_dir.join("worktrees")),
+                Some(&RecursiveMode::Recursive)
+            );
+            for worktree in &project.worktrees {
+                assert!(
+                    registrations
+                        .desired
+                        .contains_key(worktree.root.parent().unwrap())
+                );
+                assert!(registrations.desired.contains_key(&worktree.git_dir));
+            }
+            assert_eq!(
+                registrations.failures.get(&project.id).map(String::as_str),
+                Some("directory watch limit reached"),
+                "content left unwatched is still reported, so it is polled"
+            );
+        }
+        assert_eq!(registrations.desired.len(), metadata.len() + 1);
+        assert!(
+            Registrations::within(&projects, MAX_DIRECTORIES)
+                .failures
+                .is_empty()
+        );
     }
 
     fn wait_for(monitor: &Monitor, project: ProjectId, predicate: impl Fn(&Change) -> bool) {

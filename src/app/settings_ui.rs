@@ -311,18 +311,14 @@ fn settings_category_controls<'a>(
                 );
             } else {
                 update_row.push(
-                    crate::ui_controls::button::secondary(if updates.checking {
-                        "Checking…"
-                    } else {
-                        "Check for updates"
-                    })
-                    .id(widget::Id::new("settings.updates.check"))
-                    .on_press_maybe(
-                        updates
-                            .can_check
-                            .then_some(Message::UpdateUi(update_ui::Action::CheckNow)),
-                    )
-                    .into(),
+                    crate::ui_controls::button::secondary("Check for updates")
+                        .id(widget::Id::new("settings.updates.check"))
+                        .on_press_maybe(
+                            updates
+                                .can_check
+                                .then_some(Message::UpdateUi(update_ui::Action::CheckNow)),
+                        )
+                        .into(),
                 );
             }
             vec![settings_group(
