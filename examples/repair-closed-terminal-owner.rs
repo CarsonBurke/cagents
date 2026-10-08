@@ -1,6 +1,7 @@
 //! Narrow maintenance helper. Request JSON contains a reviewed authoritative
 //! shared Pane, database path, boot_id, workspace id and expected generations.
-//! It never connects to the daemon, starts actors or reconciles store startup.
+//! Offline recipe changes also verify the daemon's current view and inventories.
+//! It never starts actors or reconciles store startup.
 use cagents::{
     control::ControlClient,
     model::{
