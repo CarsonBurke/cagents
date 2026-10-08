@@ -81,12 +81,12 @@ impl Preview {
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
             ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
-            // The row already names the tool, so its second line is the
-            // input until there is output to follow instead.
-            ItemContent::Tool { input, output, .. } if output.trim().is_empty() => {
-                (input.as_str(), Language::structured(input), "")
+            // The row already names the tool, so its second line is what
+            // the tool was called with. That stays once there is output: a
+            // name alone does not tell one call of a tool from the next.
+            ItemContent::Tool { input, output, .. } => {
+                (input.as_str(), Language::structured(input), output.as_str())
             }
-            ItemContent::Tool { output, .. } => ("", Language::Plain, output.as_str()),
             _ => (turn::step_label(content), Language::Plain, ""),
         };
         // Bound preview work independently of the complete source kept for
@@ -419,9 +419,9 @@ mod tests {
             status: chat::ToolStatus::Succeeded,
         };
         let theme = crate::settings::EditorSyntaxTheme::default();
-        let collapsed = CachedItem::updated(&item, theme, None, false);
+        let collapsed = CachedItem::updated(&item, theme, None, false, false);
         assert!(collapsed.patches.is_empty());
-        let expanded = CachedItem::updated(&item, theme, Some(collapsed), true);
+        let expanded = CachedItem::updated(&item, theme, Some(collapsed), true, false);
         assert_eq!(expanded.patches[0].text.as_ref(), diff);
         assert_eq!(
             copy_text(CopyPart::Change(0), &item).as_deref(),
@@ -523,8 +523,16 @@ mod tests {
         if let ItemContent::Tool { output, .. } = &mut finished {
             *output = "first\nlast\n".into();
         }
+        // A finished tool is still the call it was, with its output under it.
         let preview = Preview::update(None, &finished, theme);
-        assert_eq!((preview.text.as_str(), preview.tail.as_str()), ("", "last"));
+        assert_eq!(
+            (
+                preview.text.as_str(),
+                preview.language,
+                preview.tail.as_str()
+            ),
+            ("{\"query\":\"x\"}", Language::Json, "last")
+        );
         // New output moves the tail and leaves the highlighted command alone.
         let before = Preview::update(None, &command("", "cargo test", Run, "one\n"), theme);
         let spans = before.block.spans(true).clone();
@@ -560,7 +568,7 @@ mod tests {
         let source = format!("{{\"text\":\"{}\"}}", "λ".repeat(700));
         let mut item = tool(&source);
         let theme = crate::settings::EditorSyntaxTheme::Auto;
-        let cached = CachedItem::updated(&item, theme, None, false);
+        let cached = CachedItem::updated(&item, theme, None, false, false);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
         assert!(cached.preview.text.len() < source.len());
@@ -568,17 +576,17 @@ mod tests {
             copy_text(CopyPart::Input, &item).as_deref(),
             Some(source.as_str())
         );
-        let cached = CachedItem::updated(&item, theme, Some(cached), true);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true, false);
         let source_cache = cached.tool_input.as_ref().unwrap().text.clone();
         if let ItemContent::Tool { status, .. } = &mut item {
             *status = chat::ToolStatus::Failed;
         }
-        let cached = CachedItem::updated(&item, theme, Some(cached), true);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true, false);
         assert!(Arc::ptr_eq(
             &source_cache,
             &cached.tool_input.as_ref().unwrap().text
         ));
-        let cached = CachedItem::updated(&item, theme, Some(cached), false);
+        let cached = CachedItem::updated(&item, theme, Some(cached), false, false);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
         assert_eq!(

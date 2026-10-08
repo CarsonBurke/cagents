@@ -251,18 +251,6 @@ fn structured_patch(hunks: &Value) -> Option<String> {
     Some(diff)
 }
 
-/// The name of the tool an edit's input was written for, where only the
-/// input was kept: each of the three takes an argument the others do not.
-pub(super) fn tool_name(input: &Value) -> &'static str {
-    if input["edits"].is_array() {
-        "MultiEdit"
-    } else if input["content"].is_string() {
-        "Write"
-    } else {
-        "Edit"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

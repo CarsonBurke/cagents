@@ -831,14 +831,16 @@ struct CachedItem {
 impl CachedItem {
     #[cfg(test)]
     fn new(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
-        Self::updated(content, theme, None, false)
+        Self::updated(content, theme, None, false, false)
     }
 
+    /// `growing` is whether the item's text may still be appended to.
     fn updated(
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
         previous: Option<Self>,
         expanded: bool,
+        growing: bool,
     ) -> Self {
         let (input, output, preview, patches) = previous
             .map(|cached| {
@@ -899,12 +901,11 @@ impl CachedItem {
             image: None,
         };
         match content {
-            ItemContent::Text { text, .. } => cached.extend(text, theme),
-            // A notice's body is a log line or a raw result, drawn verbatim.
-            ItemContent::Delivery { kind, body, .. } if *kind != chat::DeliveryKind::Notice => {
-                cached.extend(body, theme)
+            ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
+                if let Some(body) = Self::prose(content) {
+                    cached.extend(body, growing, theme);
+                }
             }
-            ItemContent::Delivery { .. } => {}
             ItemContent::Command {
                 status,
                 exit_code,
@@ -966,22 +967,44 @@ impl CachedItem {
         }
         cached
     }
+    /// The text of `content` that is drawn as Markdown.
+    fn prose(content: &ItemContent) -> Option<&str> {
+        match content {
+            ItemContent::Text { text, .. } => Some(text),
+            // A notice's body is a log line or a raw result, drawn verbatim.
+            ItemContent::Delivery { kind, body, .. } if *kind != chat::DeliveryKind::Notice => {
+                Some(body)
+            }
+            _ => None,
+        }
+    }
+
     /// Parses the part of `body` not yet seen, `body` being what was parsed
-    /// before with more appended.
+    /// before with more appended, and `growing` whether more may follow.
     ///
     /// `markdown::Content` re-parses only its trailing block, and the rewrite
     /// the parser is given resumes from the last whole line, so a streamed
     /// answer costs its new bytes per frame instead of its whole length. The
-    /// exception is an unfinished line that turned out to be something else
-    /// than it was first handed over as, which is parsed again from the top.
-    fn extend(&mut self, body: &str, theme: crate::settings::EditorSyntaxTheme) {
-        match self.source.advance(body) {
+    /// exception is text that turned out to be something else than it was
+    /// first handed over as, which is parsed again from the top.
+    fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
+        match self.source.advance(body, growing) {
             markdown_source::Step::Append(text) => self.markdown.push_str(&text),
             markdown_source::Step::Restart(text) => {
                 self.markdown = markdown::Content::parse(&text);
             }
         }
         self.highlight(theme);
+    }
+
+    /// Hands the parser what was kept back from it while `content`, which is
+    /// what this was last parsed from, could still grow.
+    fn settle(&mut self, content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) {
+        if self.source.provisional()
+            && let Some(body) = Self::prose(content)
+        {
+            self.extend(body, false, theme);
+        }
     }
 
     /// A fence larger than this is drawn plain: a syntect pass over it would
@@ -1983,19 +2006,32 @@ impl Runtime {
             self.expanded.retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
-        for item in snapshot.items.iter().chain(
-            snapshot
-                .subagents
-                .iter()
-                .flat_map(|agent| agent.items.iter()),
-        ) {
+        // Text is appended to the newest item of a running turn and to no
+        // other, so only there is the end of an answer read as unfinished.
+        let newest = snapshot.items.len().wrapping_sub(1);
+        let items = snapshot
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item, snapshot.busy && index == newest))
+            .chain(
+                snapshot
+                    .subagents
+                    .iter()
+                    .flat_map(|agent| agent.items.iter())
+                    .map(|item| (item, false)),
+            );
+        for (item, growing) in items {
             let token = ChangeToken::of(&item.content);
             if let Some(cached) = self.cache.get_mut(&item.id) {
                 if cached.token == token {
+                    if !growing {
+                        cached.settle(&item.content, self.syntax_theme);
+                    }
                     continue;
                 }
                 if let Some(body) = cached.token.appended(&item.content) {
-                    cached.extend(body, self.syntax_theme);
+                    cached.extend(body, growing, self.syntax_theme);
                     cached.token = token;
                     continue;
                 }
@@ -2008,6 +2044,7 @@ impl Runtime {
                     self.syntax_theme,
                     previous,
                     self.expanded.contains(&item.id),
+                    growing,
                 ),
             );
         }
@@ -2997,7 +3034,13 @@ impl Cagents {
                     let previous = runtime.cache.remove(&item.id);
                     runtime.cache.insert(
                         item.id.clone(),
-                        CachedItem::updated(&item.content, runtime.syntax_theme, previous, true),
+                        CachedItem::updated(
+                            &item.content,
+                            runtime.syntax_theme,
+                            previous,
+                            true,
+                            false,
+                        ),
                     );
                 }
             }
@@ -6773,6 +6816,7 @@ impl Cagents {
                                 runtime.syntax_theme,
                                 previous,
                                 runtime.expanded.contains(&id),
+                                false,
                             ),
                         );
                     }
@@ -12944,9 +12988,10 @@ mod tests {
             let Some(body) = streamed.token.appended(&content) else {
                 panic!("a longer prefix of the same body must read as an append");
             };
-            streamed.extend(body, THEME);
+            streamed.extend(body, true, THEME);
             streamed.token = ChangeToken::of(&content);
         }
+        streamed.settle(&text(BODY), THEME);
         assert_eq!(parsed_codes(&streamed), parsed_codes(&whole));
         assert_eq!(streamed.token, whole.token);
         assert_eq!(
@@ -13109,6 +13154,31 @@ mod tests {
                 "| a | b |\n|---|---|\n| one<br>two | Option<T> |\n",
                 "a\nb\none\ntwo\nOption<T>\n",
             ),
+            // A path in a generic is not a link to its first segment.
+            (
+                "Takes Vec<std::string> and Option<std::path::PathBuf>.\n",
+                "Takes Vec<std::string> and Option<std::path::PathBuf>.\n",
+            ),
+            // A code span that wraps is code on both lines.
+            (
+                "Call `get::<T>\n(key)` on Map<K>\n",
+                "Call get::<T> (key) on Map<K>\n",
+            ),
+            // A quoted fence inside a fence is code, not the fence's end.
+            (
+                "```\n> ```\nVec<T>\n---\n```\nAfter <a>\n",
+                "[]\n> ```\nVec<T>\n---\nAfter <a>\n",
+            ),
+            // A fence ends with the list item it is in, and one at the
+            // margin after it is a fence of its own.
+            (
+                "- ```\n  in <a>\nout <b>\n",
+                "* []\nin <a>\nout <b>\n",
+            ),
+            (
+                "- ```\n  in <a>\n```\nnext <b>\n```\nlast <c>\n",
+                "* []\nin <a>\n[]\nnext <b>\nlast <c>\n",
+            ),
         ] {
             assert_eq!(
                 shown(&CachedItem::new(&text(body), THEME)),
@@ -13125,8 +13195,8 @@ mod tests {
     }
 
     /// However an answer is cut into deltas, it parses into the items the
-    /// whole answer parses into - including across the restart a late `>`
-    /// forces on an autolink or a line break.
+    /// whole answer parses into - including where the end of a line was kept
+    /// back until a late `>` made it an autolink or a line break.
     ///
     /// The bodies hold no list whose items are separated by blank lines:
     /// iced's incremental parse starts a second list at such an item, with or
@@ -13163,9 +13233,10 @@ mod tests {
                         .token
                         .appended(&content)
                         .expect("a longer prefix of the same body reads as an append");
-                    streamed.extend(grown, THEME);
+                    streamed.extend(grown, true, THEME);
                     streamed.token = ChangeToken::of(&content);
                 }
+                streamed.settle(&text(body), THEME);
                 assert_eq!(
                     outline(streamed.markdown.items()),
                     outline(whole.markdown.items()),

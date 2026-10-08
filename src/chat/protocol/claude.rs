@@ -327,6 +327,11 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<String, Item>,
+    /// The tool each call shown as a file change was made with. A change has
+    /// no place for the name, and an edit that fails is shown as its call
+    /// again; the input says which tool that was only while it is still
+    /// held, which a large write's never is.
+    edit_tools: HashMap<String, String>,
     tool_inputs: HashMap<String, String>,
     tool_input_order: VecDeque<String>,
     dismissed_denials: VecDeque<String>,
@@ -426,6 +431,7 @@ impl Claude {
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(id) = self.tool_order.pop_front() {
                 self.tools.remove(&id);
+                self.edit_tools.remove(&id);
                 self.tool_inputs.remove(&id);
             }
         }
@@ -1063,6 +1069,10 @@ impl Claude {
                                     status: Some(ToolStatus::Running),
                                 });
                             }
+                            if matches!(item.content, ItemContent::Changes { .. }) {
+                                self.edit_tools
+                                    .insert(tool_id.clone(), string(block, "name").into());
+                            }
                             self.tool(item.clone());
                             step.events.push(Event::Item(item));
                         }
@@ -1085,6 +1095,7 @@ impl Claude {
                             &mut item.content,
                             content_text(&block["content"]),
                             block["is_error"].as_bool() == Some(true),
+                            self.edit_tools.get(&tool_id).map(String::as_str),
                             self.tool_inputs.get(&tool_id).map(String::as_str),
                             // The structured result is the frame's, so it is
                             // this block's only when the frame has no other.
@@ -1664,6 +1675,7 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.edit_tools.clear();
                 self.tool_inputs.clear();
                 self.tool_input_order.clear();
                 self.dismissed_denials.clear();
@@ -2952,12 +2964,14 @@ fn settled(items: Vec<Item>) -> Vec<Item> {
 /// Attach a tool result to whichever variant the call was mapped to, so that a
 /// richer mapping never costs the result the provider reported.
 ///
-/// `input` is the call's own input where it is still held, and `structured`
-/// what Claude Code reported beside the result's text.
+/// `edit` is the tool an edit was made with, `input` the call's own input
+/// where it is still held, and `structured` what Claude Code reported beside
+/// the result's text.
 fn apply_result(
     content: &mut ItemContent,
     text: String,
     failed: bool,
+    edit: Option<&str>,
     input: Option<&str>,
     structured: &Value,
 ) {
@@ -2979,10 +2993,7 @@ fn apply_result(
                 json!({"file_path": changes.first().map(|change| change.path.as_str())}).to_string()
             });
             *content = ItemContent::Tool {
-                name: serde_json::from_str(&input)
-                    .map(|input| super::claude_edits::tool_name(&input))
-                    .unwrap_or("Edit")
-                    .into(),
+                name: edit.unwrap_or("Edit").into(),
                 input,
                 output: text,
                 status: result,
@@ -3348,6 +3359,9 @@ impl Claude {
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
                         self.remember_tool_input(&item.id, &parsed)?;
+                        if matches!(content, ItemContent::Changes { .. }) {
+                            self.edit_tools.insert(item.id.clone(), name.clone());
+                        }
                         if !matches!(content, ItemContent::Tool { .. }) {
                             item.content = content;
                             step.events.push(Event::Item(item.clone()));
@@ -5500,6 +5514,46 @@ mod tests {
                 status: ToolStatus::Failed,
             }]
         );
+    }
+
+    /// A write too large for its input to be held, and an edit whose input
+    /// has since been pushed out by later calls, still fail as the tool they
+    /// were: the name is kept for as long as the call is.
+    #[test]
+    fn a_failed_edit_keeps_its_name_without_its_input() {
+        let mut adapter = Claude::default();
+        let content = "x".repeat(chat::PermissionDenial::INPUT_LIMIT);
+        adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
+            {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
+            {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
+        ]}})).unwrap();
+        assert!(!adapter.tool_inputs.contains_key("write"));
+        for call in 0..chat::PermissionDenial::LIMIT {
+            adapter.receive(json!({"type":"assistant","uuid":format!("b{call}"),"message":{"id":format!("msg-b{call}"),"content":[
+                {"type":"tool_use","id":format!("read-{call}"),"name":"Read","input":{"file_path":"src/app.rs"}},
+            ]}})).unwrap();
+        }
+        assert!(!adapter.tool_inputs.contains_key("edit"));
+        for (id, name, path) in [
+            ("write", "Write", "big.txt"),
+            ("edit", "MultiEdit", "src/app.rs"),
+        ] {
+            let failed = adapter.receive(json!({"type":"user","uuid":format!("u-{id}"),"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":true,"content":"denied"}]}})).unwrap();
+            assert_eq!(
+                items(&failed),
+                vec![ItemContent::Tool {
+                    name: name.into(),
+                    input: json!({"file_path": path}).to_string(),
+                    output: "denied".into(),
+                    status: ToolStatus::Failed,
+                }]
+            );
+        }
+        // The name is let go of with the call.
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(adapter.edit_tools.is_empty());
     }
 
     #[test]

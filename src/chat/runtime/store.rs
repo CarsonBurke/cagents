@@ -24,10 +24,13 @@ const METADATA_LIMIT: usize = 64 * 1024;
 /// An identity string a provider can make arbitrarily long is trimmed to this
 /// many bytes, so one runaway label costs a label rather than a turn.
 const NAME_BYTES: usize = 1024;
-/// Patch and snippet text live inside vectors that no chunk can page, so an
+/// Paths and snippet text live inside vectors that no chunk can page, so an
 /// oversized item keeps at most this much of them. Half the identity budget
-/// leaves room for the paths, titles and URLs alongside.
+/// leaves room for the titles and URLs alongside.
 const BULK_BYTES: usize = METADATA_LIMIT / 2;
+/// How far before a part's nominal end a patch is searched for the end of a
+/// line to be cut at instead.
+const LINE_BYTES: usize = 4 * 1024;
 /// Charged per vector element beside its own text to cover what postcard adds:
 /// a variant tag and a length prefix per string. Without it an item of many
 /// tiny paths could satisfy the text budget and still overrun the serialized one.
@@ -125,7 +128,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL);
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             Ok(Self {
                 db,
@@ -220,7 +223,11 @@ impl Store {
                 }
             }
         }
-        let (body0, body1, body2) = match &mut item.content {
+        // A change set's patches are one body, end to end, and each one's
+        // length is kept beside it so that a part of the body can be given
+        // back to the files it belongs to.
+        let mut spans: Vec<usize> = Vec::new();
+        let (mut body0, body1, body2) = match &mut item.content {
             ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
             // A delivery's body is as unbounded as prose; who sent it is identity.
             ItemContent::Delivery { body, .. } => {
@@ -231,13 +238,20 @@ impl Store {
             ItemContent::Command { output, .. } => {
                 (std::mem::take(output), String::new(), String::new())
             }
-            // A patch and a search snippet sit inside a vector, and a chunk is
-            // addressed by byte offset, so a paged body could never be split
-            // back into the elements it came from. These payloads stay in the
-            // item and `shrink` bounds them instead.
-            ItemContent::Changes { .. } | ItemContent::WebSearch { .. } => {
-                (String::new(), String::new(), String::new())
+            // A file's patch is as unbounded as the file: a write's is the
+            // whole of what was written.
+            ItemContent::Changes { changes, .. } => {
+                let patches: Vec<String> = changes
+                    .iter_mut()
+                    .map(|change| std::mem::take(&mut change.diff))
+                    .collect();
+                spans = patches.iter().map(String::len).collect();
+                (patches.concat(), String::new(), String::new())
             }
+            // A search snippet sits inside a vector with nothing kept of
+            // where it starts, so it stays in the item and `shrink` bounds it
+            // instead.
+            ItemContent::WebSearch { .. } => (String::new(), String::new(), String::new()),
             ItemContent::Tool { input, output, .. } => {
                 (std::mem::take(input), std::mem::take(output), String::new())
             }
@@ -256,16 +270,16 @@ impl Store {
                 None => self.edge_ordinals(older, 1)?[0],
             },
         };
-        let len0 = if preserve_input {
-            previous.as_ref().map_or(0, |(_, _, length)| *length)
-        } else {
-            body0.len() as i64
-        };
         let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
         if metadata.len() > METADATA_LIMIT {
             // Every identity field a provider controls is trimmed rather than
             // dropping a turn of the conversation.
             shrink(&mut item.content);
+            if let ItemContent::Changes { changes, .. } = &item.content {
+                // The files that were dropped take their patches with them.
+                spans.truncate(changes.len());
+                body0.truncate(spans.iter().sum());
+            }
             metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
             warning = Some(format!(
                 "Provider item {} exceeded the 64 KiB identity budget and was shortened to fit",
@@ -278,8 +292,14 @@ impl Store {
                 brief(&item.id)
             )));
         }
+        let len0 = if preserve_input {
+            previous.as_ref().map_or(0, |(_, _, length)| *length)
+        } else {
+            body0.len() as i64
+        };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64]).map_err(|e| e.to_string())?;
+        let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -864,6 +884,21 @@ impl Store {
             .map_or(target, |index| start + index)
             .min(target))
     }
+    /// Where a patch is cut near `target`: after the last line that ends
+    /// within `LINE_BYTES` before it, so that a part starts where a line does
+    /// and the first byte it shows is the one that says what the line is. A
+    /// longer line is cut as any other text is.
+    fn line_boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, String> {
+        let start = target.saturating_sub(LINE_BYTES);
+        match self
+            .field(id, 0, start, target)?
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+        {
+            Some(index) => Ok(start + index + 1),
+            None => self.boundary(id, len0, target),
+        }
+    }
     fn changed(&mut self, id: &str) {
         if let Some(changed) = &mut self.changed {
             changed.insert(id.into());
@@ -887,7 +922,7 @@ impl Store {
             .collect();
         let mut reused = std::collections::HashSet::new();
         let records = {
-            let mut statement = self.db.prepare("SELECT id,ordinal,metadata,len0,len1,len2 FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129").map_err(|e| e.to_string())?;
+            let mut statement = self.db.prepare("SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129").map_err(|e| e.to_string())?;
             let rows = statement
                 .query_map([self.end.map_or(i64::MAX, |cursor| cursor.0)], |row| {
                     Ok((
@@ -897,6 +932,7 @@ impl Store {
                         row.get::<_, i64>(3)? as usize,
                         row.get::<_, i64>(4)? as usize,
                         row.get::<_, i64>(5)? as usize,
+                        row.get::<_, Vec<u8>>(6)?,
                     ))
                 })
                 .map_err(|e| e.to_string())?;
@@ -907,8 +943,17 @@ impl Store {
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1, len2) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
+            let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
+            let patch = matches!(base.content, ItemContent::Changes { .. });
+            let cut = |target: usize| {
+                if patch {
+                    self.line_boundary(&id, len0, target)
+                } else {
+                    self.boundary(&id, len0, target)
+                }
+            };
             let total = len0 + len1;
             let kind = layout(&base.content);
             let parts = total.max(1).div_ceil(PART_BYTES);
@@ -918,11 +963,11 @@ impl Store {
                 parts
             };
             for part in (0..until).rev() {
-                let start = self.boundary(&id, len0, part * PART_BYTES)?;
+                let start = cut(part * PART_BYTES)?;
                 let end = if (part + 1) * PART_BYTES >= total {
                     total
                 } else {
-                    self.boundary(&id, len0, (part + 1) * PART_BYTES)?
+                    cut((part + 1) * PART_BYTES)?
                 };
                 let (start0, end0) = (start.min(len0), end.min(len0));
                 let (start1, end1) = (start.saturating_sub(len0), end.saturating_sub(len0));
@@ -1004,9 +1049,36 @@ impl Store {
                             *label = format!("{base} (part {}/{parts})", part + 1);
                         }
                     }
+                    // Each file is given the lines of its patch that fall in
+                    // this part, and a part names only the files it has lines
+                    // of. A path is what the view counts edited files by, so
+                    // unlike a command's label it does not say which part
+                    // this is.
+                    ItemContent::Changes { changes, .. } => {
+                        let mut lengths = spans.iter();
+                        let mut from = 0;
+                        changes.retain_mut(|change| {
+                            let length = lengths.next().copied().unwrap_or(0);
+                            let (begin, end) = (from, from + length);
+                            from = end;
+                            // A file without a patch goes with the part its
+                            // place falls in, which at the very end is the
+                            // last.
+                            let within = if length == 0 {
+                                (start0..end0).contains(&begin) || (begin == len0 && end0 == len0)
+                            } else {
+                                begin < end0 && end > start0
+                            };
+                            if within {
+                                change.diff =
+                                    body0[begin.max(start0) - start0..end.min(end0) - start0].into();
+                            }
+                            within
+                        });
+                    }
                     // Bounded when the item was cached, so there is no chunked
                     // body to restore here.
-                    ItemContent::Changes { .. } | ItemContent::WebSearch { .. } => {}
+                    ItemContent::WebSearch { .. } => {}
                     ItemContent::Tool {
                         name,
                         input,
@@ -1116,10 +1188,10 @@ impl Drop for Store {
     }
 }
 /// Bounds the identity fields a provider can make arbitrarily large so an
-/// oversized item is shortened rather than lost. The payloads that live in a
-/// vector share one budget and the vector is cut where that budget runs out,
-/// because an item naming a thousand paths cannot carry a useful patch for
-/// each of them anyway and its paths are worth more than its last patch.
+/// oversized item is shortened rather than lost. What lives in a vector
+/// shares one budget and the vector is cut where that budget runs out: a
+/// change set keeps its first files, each with its whole patch, and a search
+/// its first results.
 fn shrink(content: &mut ItemContent) {
     match content {
         ItemContent::Command {
@@ -1132,17 +1204,30 @@ fn shrink(content: &mut ItemContent) {
             clamp(command, NAME_BYTES);
             clamp(working_directory, NAME_BYTES);
         }
+        // The patches are already chunks, so the paths are all there is to
+        // bound. The files kept are the first ones, in order: `put_at` cuts
+        // the patches to match by count.
         ItemContent::Changes { changes, .. } => {
             let mut budget = BULK_BYTES;
-            changes.retain_mut(|change| {
-                clamp(&mut change.path, NAME_BYTES);
-                let Some(room) = budget.checked_sub(change.path.len() + ELEMENT_BYTES) else {
-                    return false;
-                };
-                clamp_lines(&mut change.diff, room);
-                budget = room - change.diff.len();
-                true
-            });
+            let kept = changes
+                .iter_mut()
+                .take_while(|change| {
+                    clamp(&mut change.path, NAME_BYTES);
+                    let mut spent = change.path.len() + ELEMENT_BYTES;
+                    if let crate::chat::ChangeKind::Renamed { from } = &mut change.kind {
+                        clamp(from, NAME_BYTES);
+                        spent += from.len();
+                    }
+                    match budget.checked_sub(spent) {
+                        Some(room) => {
+                            budget = room;
+                            true
+                        }
+                        None => false,
+                    }
+                })
+                .count();
+            changes.truncate(kept);
         }
         ItemContent::WebSearch { query, results } => {
             clamp(query, NAME_BYTES);
@@ -1184,26 +1269,6 @@ fn clamp(text: &mut String, limit: usize) {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    text.truncate(end);
-}
-/// Truncates patch text after the last newline that fits in `limit`.
-///
-/// A unified diff is line-structured: the first byte of a line decides whether
-/// that line is added, removed or context, and a hunk header declares how many
-/// of each follow. A patch cut mid-line therefore does not merely lose text, it
-/// can survive as an intact-looking patch describing an edit the provider never
-/// made, so the cut only ever lands on a line boundary and the remainder stays
-/// a true prefix of what was sent.
-fn clamp_lines(text: &mut String, limit: usize) {
-    if text.len() <= limit {
-        return;
-    }
-    // A newline is ASCII, so a position found in the byte prefix is always a
-    // character boundary.
-    let end = text.as_bytes()[..limit]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
     text.truncate(end);
 }
 /// A caching shortfall degrades presentation; it never terminates the provider.
@@ -1909,62 +1974,154 @@ mod tests {
             other => panic!("unexpected content {other:?}"),
         }
     }
-    /// A patch cut mid-line can stay syntactically intact while describing an
-    /// edit nobody made, so an oversized change set must lose whole lines only.
-    #[test]
-    fn oversized_change_set_is_truncated_on_a_line_boundary() {
-        let mut store = Store::at(std::env::temp_dir()).unwrap();
-        let mut diff = String::from("@@ -1 +1,8000 @@\n-gone\n");
-        for line in 0..8000 {
-            diff.push_str(&format!("+line {line} of the provider's patch\n"));
+    fn change_set(changes: Vec<crate::chat::FileChange>) -> Event {
+        Event::Item(Item {
+            id: "edit".into(),
+            role: Role::Assistant,
+            content: ItemContent::Changes {
+                changes,
+                status: crate::chat::ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        })
+    }
+    fn change(path: &str, diff: String) -> crate::chat::FileChange {
+        crate::chat::FileChange {
+            path: path.into(),
+            kind: crate::chat::ChangeKind::Updated,
+            diff,
         }
-        assert!(diff.len() > PART_BYTES);
+    }
+    /// Each part's changes, as `(path, patch)`.
+    fn patches(store: &mut Store) -> Vec<Vec<(String, String)>> {
+        store
+            .window()
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Changes { changes, .. } => changes
+                    .iter()
+                    .map(|change| (change.path.clone(), change.diff.clone()))
+                    .collect(),
+                other => panic!("unexpected content {other:?}"),
+            })
+            .collect()
+    }
+    /// A write's patch is the whole file, so a patch is paged like any other
+    /// body: one far past the identity budget comes back complete and without
+    /// a warning, where it used to come back as its first 32 KiB.
+    #[test]
+    fn a_patch_past_the_identity_budget_round_trips() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let mut diff = String::from("@@ -0,0 +1,2500 @@\n");
+        for line in 0..2500 {
+            diff.push_str(&format!("+line {line} of a file λ the provider wrote\n"));
+        }
+        assert!(diff.len() > METADATA_LIMIT && diff.len() < PART_BYTES);
         let events = store
-            .apply(Event::Item(Item {
-                id: "edit".into(),
-                role: Role::Assistant,
-                content: ItemContent::Changes {
-                    changes: vec![crate::chat::FileChange {
-                        path: "src/app.rs".into(),
-                        kind: crate::chat::ChangeKind::Updated,
-                        diff: diff.clone(),
-                    }],
-                    status: crate::chat::ToolStatus::Succeeded,
-                },
-                started_at: None,
-                at: None,
-            }))
+            .apply(change_set(vec![change("src/app.rs", diff.clone())]))
             .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(patches(&mut store), [[("src/app.rs".to_owned(), diff)]]);
+        // A single line longer than the old bound is a line like any other.
+        let line = format!("@@ -1 +1 @@\n-{}\n+{}\n", "a".repeat(40_000), "b".repeat(40_000));
+        let events = store
+            .apply(change_set(vec![change("min.js", line.clone())]))
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(patches(&mut store), [[("min.js".to_owned(), line)]]);
+    }
+    /// A change set larger than a part is shown in parts, each naming the
+    /// files it holds lines of and starting where a line does: the first byte
+    /// of a patch line says whether it was added or removed, so a part that
+    /// began inside one would show an edit nobody made.
+    #[test]
+    fn a_change_set_pages_on_line_boundaries_without_losing_a_file() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let patch = |name: &str, lines: usize| {
+            let mut diff = format!("@@ -1 +1,{lines} @@\n-gone from {name}\n");
+            for line in 0..lines {
+                diff.push_str(&format!("+line {line} of {name} → added\n"));
+            }
+            diff
+        };
+        let changes = vec![
+            change("empty-first", String::new()),
+            change("a.rs", patch("a.rs", 9000)),
+            change("mode-only", String::new()),
+            change("b.rs", patch("b.rs", 40)),
+            change("c.rs", patch("c.rs", 7000)),
+            change("empty-last", String::new()),
+        ];
+        let total: usize = changes.iter().map(|change| change.diff.len()).sum();
+        assert!(total > 3 * PART_BYTES);
+        let events = store.apply(change_set(changes.clone())).unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        let parts = patches(&mut store);
+        assert_eq!(parts.len(), total.div_ceil(PART_BYTES));
+        let mut restored: Vec<(String, String)> = Vec::new();
+        for part in &parts {
+            for (path, diff) in part {
+                assert!(
+                    diff.is_empty() || diff.starts_with(['@', '+', '-']),
+                    "a part of {path} starts inside a line: {:?}",
+                    &diff[..diff.len().min(32)]
+                );
+                assert!(diff.is_empty() || diff.ends_with('\n'));
+                match restored.last_mut() {
+                    Some((last, whole)) if last == path => whole.push_str(diff),
+                    _ => restored.push((path.clone(), diff.clone())),
+                }
+            }
+        }
+        assert_eq!(
+            restored,
+            changes
+                .into_iter()
+                .map(|change| (change.path, change.diff))
+                .collect::<Vec<_>>()
+        );
+        // A part past the first is another item to the view, under an id
+        // that says which lines it is.
+        let window = store.window().unwrap();
+        assert_eq!(window.items[0].id, "edit");
+        assert!(window.items[1].id.starts_with("edit:native-part:1:changes:"));
+        // A result that replaces the patch replaces every part of it.
+        store
+            .apply(change_set(vec![change("a.rs", "@@ -1 +1 @@\n-a\n+b\n".into())]))
+            .unwrap();
+        assert_eq!(
+            patches(&mut store),
+            [[("a.rs".to_owned(), "@@ -1 +1 @@\n-a\n+b\n".to_owned())]]
+        );
+    }
+    /// What cannot be paged is the list of paths, so a change set naming more
+    /// of them than fit keeps its first files, each with the whole of its own
+    /// patch and none of a dropped file's.
+    #[test]
+    fn a_change_set_of_too_many_paths_keeps_its_first_files_whole() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let changes: Vec<_> = (0..200)
+            .map(|index| {
+                change(
+                    &format!("{index:04}/{}", "p".repeat(NAME_BYTES - 5)),
+                    format!("@@ -1 +1 @@\n-old {index}\n+new {index}\n"),
+                )
+            })
+            .collect();
+        let events = store.apply(change_set(changes.clone())).unwrap();
         assert!(
             matches!(events.as_slice(), [Event::Error { fatal: false, .. }]),
             "{events:?}"
         );
-        let window = store.window().unwrap();
-        assert_eq!(window.items.len(), 1);
-        match &window.items[0].content {
-            ItemContent::Changes { changes, .. } => {
-                let [change] = changes.as_slice() else {
-                    panic!("unexpected change set {changes:?}");
-                };
-                assert_eq!(change.path, "src/app.rs");
-                assert!(change.diff.len() < diff.len(), "patch was not bounded");
-                assert!(
-                    diff.starts_with(change.diff.as_str()),
-                    "surviving patch is not a prefix of what the provider sent"
-                );
-                assert!(
-                    change.diff.ends_with('\n'),
-                    "patch was cut inside a line: {:?}",
-                    &change.diff[change.diff.len().saturating_sub(64)..]
-                );
-                for line in change.diff.lines() {
-                    assert!(
-                        line.starts_with(|first: char| matches!(first, '@' | '+' | '-' | ' ')),
-                        "surviving patch has a line no diff parser accepts: {line:?}"
-                    );
-                }
-            }
-            other => panic!("unexpected content {other:?}"),
+        let [kept] = &patches(&mut store)[..] else {
+            panic!("the paths that fit are one part");
+        };
+        assert!(!kept.is_empty() && kept.len() < changes.len());
+        for ((path, diff), change) in kept.iter().zip(&changes) {
+            assert_eq!((path, diff), (&change.path, &change.diff));
         }
     }
     /// Command output is the one field of a command that pages, so it must come
