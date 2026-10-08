@@ -55,6 +55,9 @@ struct Args {
     /// Maximum idle wait; UI windows remain open throughout this wait.
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=1800))]
     wait_seconds: u64,
+    /// Print one read-only impact preview as JSON, including blockers, and exit.
+    #[arg(long)]
+    preview_only: bool,
 }
 
 fn fail(message: impl Into<String>) -> Box<dyn std::error::Error> {
@@ -325,7 +328,12 @@ fn log_impact(impact: &DaemonImpact) {
         impact.blockers.len()
     );
     for session in &impact.sessions {
-        eprintln!("  {}: {}", session.id, session.disposition.label());
+        eprintln!(
+            "  {}: {}: {}",
+            session.id,
+            session.disposition.label(),
+            session.reason.escape_debug()
+        );
     }
     for blocker in &impact.blockers {
         eprintln!("  blocker: {blocker}");
@@ -448,6 +456,12 @@ fn main() -> Result<()> {
     verify_target(&args.target_version_root, &pins)?;
     let socket = cagents::terminal_ipc::daemon_socket_path()?;
     let mut client = ControlClient::connect(&socket)?;
+    if args.preview_only {
+        verify_old(&mut client, &socket, &args)?;
+        let impact = client.upgrade_impact(Policy::WhenIdle)?;
+        println!("{}", serde_json::to_string_pretty(&impact)?);
+        return Ok(());
+    }
     let proof = client.proof().clone();
     let approved = ready_preview(&mut client, &socket, &args)?;
     eprintln!("Idle preview ready; saving windows before final fenced recheck");
