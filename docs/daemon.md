@@ -36,6 +36,15 @@ that peer before switching variants.
 Where the daemon keeps its state is listed in
 [Configuration](configuration.md#files-and-directories).
 
+On Linux with a systemd user manager, the daemon and each hosted session use
+separate user scopes. Native and terminal holders enter their session scope
+before spawning providers or PTYs; direct providers enter theirs before the
+first prompt. Later tool processes inherit that session's scope, so a memory
+pressure kill of one session does not select the UI, daemon, or another session
+as part of the same unit. Enrollment is bounded and verified. If it fails,
+launch continues through the existing process path and logs degraded isolation;
+direct providers also report any startup children created before enrollment.
+
 ## Control CLI
 
 The `cagents` CLI prints human-readable output by default and stable JSON

@@ -426,6 +426,10 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                     && record.holder.pid == pid
                     && record.holder.is_current() =>
             {
+                crate::daemon::process_scope::warn_if_shared(
+                    record.holder.pid as u32,
+                    record.root.pid as u32,
+                );
                 Ok(record)
             }
             Some(Report::Failed(error)) => Err(error),
@@ -1020,6 +1024,9 @@ extern "C" fn serve_if_requested() {
         else {
             return Err("Missing native holder spawn request".to_owned());
         };
+        // This is an execed holder, not a post-fork pre_exec hook. Complete
+        // scope enrollment before the provider's first process can exist.
+        let _ = crate::daemon::process_scope::enroll_holder();
         let mut residence = Residence::start(spawn)?;
         send(
             &control,
@@ -1101,6 +1108,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        crate::daemon::process_scope::tests::assert_separate(
+            record.holder.pid as u32,
+            record.root.pid as u32,
+        );
         assert_eq!(
             std::fs::read_link(format!("/proc/{}/cwd", record.root.pid)).unwrap(),
             working.path()

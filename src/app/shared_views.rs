@@ -519,6 +519,33 @@ impl Cagents {
         }
     }
 
+    fn prepare_closed_terminal_adoption(&mut self, pane: &Pane) {
+        let CardKind::Terminal(terminal) = &pane.kind else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let adoption = session.operation_store().closed_terminal_pane_adoption(
+            &self.durable,
+            pane.id,
+            terminal.id,
+        );
+        match adoption {
+            Ok(Some(adoption)) => {
+                if !self.shared_views.adoptions.contains(&adoption) {
+                    // The alias was already closed. Keep its tombstone, runtime,
+                    // and any archived draft intact; the canonical pane's draft
+                    // and live actor also remain untouched.
+                    self.shared_views.adoptions.push(adoption);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, pane = %pane.id,
+                "could not resolve an archived canonical terminal owner"),
+        }
+    }
+
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
         let index = match &view.scope {
             Scope::Channel(id) => {
@@ -569,6 +596,7 @@ impl Cagents {
             self.detach_shared_pane(id);
         }
         for shared in &view.panes {
+            self.prepare_closed_terminal_adoption(shared);
             let mut projected = shared.clone();
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
@@ -982,6 +1010,72 @@ mod tests {
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
     }
+    #[test]
+    fn closed_terminal_shared_adoption_preserves_closure_and_both_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let mut canonical = app.durable.cards[0].clone();
+        let alias = canonical.id;
+        canonical.id = CardId::new();
+        let pane = Pane::from_card(&canonical, None).unwrap();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards[0].existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 123,
+                reason: Some("closed by user".into()),
+            },
+        };
+        durable.focused = None;
+        durable.chat_drafts.insert(alias, "historical draft".into());
+        durable
+            .chat_drafts
+            .insert(canonical.id, "canonical draft".into());
+        let before = durable.clone();
+        let (runtime, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("closed-owner"),
+        )
+        .unwrap();
+        runtime.snapshot(Arc::clone(&app.durable));
+        runtime.flush(Duration::from_secs(5)).unwrap();
+        let store = runtime.operation_store();
+        app.session = Some(runtime);
+        app.prepare_closed_terminal_adoption(&pane);
+        app.prepare_closed_terminal_adoption(&pane);
+        assert_eq!(app.shared_views.adoptions.len(), 1);
+        assert_eq!(*app.durable, before);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .push(canonical.clone());
+        app.session.as_ref().unwrap().snapshot_terminal_adoptions(
+            Arc::clone(&app.durable),
+            app.shared_views.adoptions.clone(),
+        );
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            store.load_card(alias, None).unwrap().unwrap().existence,
+            before.cards[0].existence
+        );
+        assert!(
+            store
+                .load_card(canonical.id, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        assert_eq!(app.durable.chat_drafts, before.chat_drafts);
+        app.shared_views.adoptions.clear();
+        app.prepare_closed_terminal_adoption(&pane);
+        assert!(app.shared_views.adoptions.is_empty());
+    }
+
     #[test]
     fn shared_pull_request_adoption_initializes_native_viewer() {
         let (mut app, channel, _, mut pane) = fixture();

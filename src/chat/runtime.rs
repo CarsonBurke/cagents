@@ -1212,6 +1212,14 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     let child = process
         .spawn()
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    // Scope enrollment happens before this child is handed to the actor and
+    // therefore before any prompt/tool request. Keep the original Child, pipes,
+    // process group and account lease: systemd only relocates its cgroup.
+    if let Err(error) = crate::daemon::process_scope::enroll_process(child.id()) {
+        tracing::warn!(%error, provider = %spec.program, "provider scope isolation unavailable; using existing launch fallback");
+    }
+    crate::daemon::process_scope::warn_if_shared(child.id(), child.id());
+    crate::daemon::process_scope::warn_if_bootstrap_shared(child.id());
     Ok(Some(ChildGuard(child, false)))
 }
 
@@ -4102,5 +4110,39 @@ mod tests {
             handle.close().is_err(),
             "a retry cannot erase uncertain teardown"
         );
+    }
+    #[test]
+    fn direct_provider_scope_preserves_pipes_and_process_group() {
+        use std::io::{BufRead, Write};
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
+        let pid = provider.0.id();
+        crate::daemon::process_scope::tests::assert_separate(pid, pid);
+        // SAFETY: querying our unreaped child, never changing its process group.
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+        provider
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"scope transport preserved\n")
+            .unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(provider.0.stdout.take().unwrap())
+            .read_line(&mut reply)
+            .unwrap();
+        assert_eq!(reply, "scope transport preserved\n");
+        provider.terminate();
     }
 }
