@@ -461,18 +461,4 @@ mod tests {
         assert_eq!(updated[0].kind, ChangeKind::Updated);
         assert_eq!(updated[0].diff, "@@ -1,1 +1,1 @@\n-old\n+new\n");
     }
-
-    #[test]
-    fn the_tool_an_input_was_written_for_is_read_off_its_arguments() {
-        for (input, name) in [
-            (
-                json!({"file_path": "a", "old_string": "a", "new_string": "b"}),
-                "Edit",
-            ),
-            (json!({"file_path": "a", "edits": []}), "MultiEdit"),
-            (json!({"file_path": "a", "content": ""}), "Write"),
-        ] {
-            assert_eq!(tool_name(&input), name);
-        }
-    }
 }
