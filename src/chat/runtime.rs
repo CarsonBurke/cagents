@@ -1960,7 +1960,9 @@ impl Actor {
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::Attention(evidence));
             }
-            return;
+            if !matches!(event, Event::TurnStarted) {
+                return;
+            }
         }
         if matches!(&event, Event::Reset { .. }) {
             *self
@@ -2089,6 +2091,9 @@ fn recover_history_error(
     event: &Event,
 ) {
     match event {
+        // A provider accepting a new turn recovers the preceding operation's
+        // error. A failed history page has its own recovery contract.
+        Event::TurnStarted if history_error.is_none() => *error = None,
         Event::HistoryError(message) => *history_error = Some(message.clone()),
         Event::HistoryRecovered => {
             if history_error
@@ -3231,6 +3236,7 @@ mod tests {
                         message: model,
                         fatal: false,
                     }],
+                    Command::Compact => vec![Event::TurnStarted],
                     _ => return Err("unexpected fixture command".into()),
                 };
                 Ok(Step {
@@ -3265,6 +3271,12 @@ mod tests {
                     Some("page failed")
                 );
             }
+            // Starting work cannot repair a failed history page.
+            handle.command(Command::Compact).unwrap();
+            assert_eq!(
+                handle.snapshot(None).unwrap().error.as_deref(),
+                Some("page failed")
+            );
             if let Some(message) = unrelated {
                 handle
                     .command(Command::SetModel {
@@ -3277,6 +3289,8 @@ mod tests {
             let snapshot = handle.snapshot(None).unwrap();
             assert_eq!(snapshot.error.as_deref(), unrelated);
             assert_eq!(snapshot.items[0].id, "older");
+            handle.command(Command::Compact).unwrap();
+            assert!(handle.snapshot(None).unwrap().error.is_none());
             handle.close().unwrap();
         }
     }
