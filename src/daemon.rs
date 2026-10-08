@@ -2,6 +2,8 @@
 pub(crate) mod holder_registry;
 #[cfg(feature = "host")]
 pub(crate) mod owned_children;
+#[cfg(feature = "host")]
+pub(crate) mod process_scope;
 
 use std::{
     env,

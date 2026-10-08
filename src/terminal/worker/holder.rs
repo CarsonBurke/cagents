@@ -276,6 +276,7 @@ pub(super) fn spawn_recoverable(
         Report::Failed(message) => return Err(message),
         _ => return Err("terminal holder answered out of turn".into()),
     };
+    crate::daemon::process_scope::warn_if_shared(owner.pid as u32, pid as u32);
     holder.protocol = PROTOCOL;
     if let Some(id) = registered_id {
         let record = registry::evidence(&registry::socket(&registry::directory()?, id))?
@@ -1066,6 +1067,9 @@ fn serve(control: UnixStream) -> i32 {
         .first()
         .map(|program| program.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Isolate this execed keeper before the PTY root and all of its tools
+    // inherit its cgroup. A failed request retains the existing launch path.
+    let _ = crate::daemon::process_scope::enroll_holder();
     let pair = match native_pty_system().openpty(size) {
         Ok(pair) => pair,
         Err(error) => return fail(format!("open PTY: {error:#}")),
@@ -1978,6 +1982,10 @@ mod tests {
         let (exits, exited) = crossbeam_channel::bounded(1);
         let held = spawn(command("stty size; read line; exit 7"), size(), exits).unwrap();
         assert!(held.child.unreaped());
+        crate::daemon::process_scope::tests::assert_separate(
+            holder_pid(&held),
+            held.child.pid() as u32,
+        );
         assert!(read_until(&held.master, "24 80").contains("24 80"));
 
         held.master
@@ -2169,6 +2177,10 @@ mod tests {
             )
             .unwrap();
             read_until(&held.master, "ready");
+            crate::daemon::process_scope::tests::assert_separate(
+                holder_pid(&held),
+                held.child.pid() as u32,
+            );
             held.master
                 .resize(PtySize {
                     cols: 120,
