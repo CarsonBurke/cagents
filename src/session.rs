@@ -1442,6 +1442,14 @@ impl SessionStore for Arc<StateStore> {
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace(self, state, base)
     }
+    fn save_workspace_with_terminal_adoptions(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[crate::persistence::TerminalPaneAdoption],
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace_with_terminal_adoptions(self, state, base, adoptions)
+    }
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
         StateStore::save_project(self, project)
     }
@@ -4436,6 +4444,61 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|project| project.id == unrelated.id)
+        );
+    }
+
+    #[test]
+    fn writer_commits_canonical_terminal_adoption_and_later_snapshots() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("canonical-adoption.sqlite3");
+        let boot = BootId::new("boot-canonical-adoption");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        let alias = state.cards[0].id;
+        let CardKind::Terminal(session) = &state.cards[0].kind else {
+            panic!("terminal fixture")
+        };
+        let terminal = session.id;
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+
+        let mut canonical = state.cards[0].clone();
+        canonical.id = CardId::new();
+        let canonical_id = canonical.id;
+        state.cards[0].existence = closed();
+        state.cards.push(canonical);
+        state.focused = Some(canonical_id);
+        runtime.snapshot_terminal_adoptions(
+            Arc::new(state.clone()),
+            vec![crate::persistence::TerminalPaneAdoption {
+                alias,
+                canonical: canonical_id,
+                terminal,
+            }],
+        );
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+
+        state.cards[1].title = "canonical shell".into();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        runtime.shutdown();
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+        let restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.focused, Some(canonical_id));
+        assert!(restored.cards.iter().any(|card| card.id == canonical_id
+            && card.title == "canonical shell"
+            && card.existence.is_open()));
+        assert!(
+            !store
+                .load_card(alias, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
         );
     }
 
