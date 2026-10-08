@@ -317,12 +317,12 @@ impl Tree {
             }
         }
 
+        let mut ids = new_ids.into_iter();
         self.children = new_children
             .iter_mut()
-            .zip(new_ids)
             .enumerate()
-            .map(|(index, (new, id))| {
-                let previous = match id {
+            .map(|(index, new)| {
+                let previous = match ids.next().flatten() {
                     Some(Id(Internal::Custom(_, name))) => named
                         .get_mut(name.as_ref())
                         .and_then(VecDeque::pop_front),
@@ -565,6 +565,34 @@ mod reconciliation_tests {
             &[(None, 3), (Some("same"), 4), (Some("same"), 5)],
         );
         assert_eq!(values(&tree), [3, 1, 2]);
+    }
+
+    #[test]
+    fn missing_or_extra_ids_do_not_change_the_number_of_children() {
+        let mut tree = Tree::empty();
+        reconcile(&mut tree, &[(Some("first"), 1), (None, 2)]);
+        let make = |value: &u32| Tree {
+            id: None,
+            tag: Tag::of::<u32>(),
+            state: State::new(*value),
+            children: Vec::new(),
+        };
+        let mut expanded = [10, 20, 30];
+        tree.diff_children_custom(
+            &mut expanded,
+            vec![Some(Id::new("first"))],
+            |_, _| {},
+            make,
+        );
+        assert_eq!(values(&tree), [1, 2, 30]);
+        let mut shortened = [40];
+        tree.diff_children_custom(
+            &mut shortened,
+            vec![Some(Id::new("first")), Some(Id::new("extra"))],
+            |_, _| {},
+            make,
+        );
+        assert_eq!(values(&tree), [1]);
     }
 
     #[test]
