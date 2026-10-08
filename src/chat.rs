@@ -940,12 +940,20 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Parent prompt controls use `busy`; card activity includes delegated work.
+    pub fn is_working(&self) -> bool {
+        self.busy
+            || self
+                .subagents
+                .iter()
+                .any(|agent| agent.status == ToolStatus::Running)
+    }
     pub fn activity(&self) -> ActivityState {
         if self.exited {
             ActivityState::Unknown
         } else if self.waiting || !self.requests.is_empty() {
             ActivityState::Waiting
-        } else if self.busy {
+        } else if self.is_working() {
             ActivityState::Working
         } else {
             ActivityState::Idle
@@ -1682,6 +1690,23 @@ pub enum Event {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delegated_work_keeps_card_active_without_blocking_parent_prompts() {
+        let mut snapshot = super::Snapshot::default();
+        snapshot.subagents.push(super::Subagent {
+            id: "child".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: super::ToolStatus::Running,
+            items: Vec::new(),
+        });
+        assert!(!snapshot.busy);
+        assert!(snapshot.is_working());
+        assert_eq!(snapshot.activity(), super::ActivityState::Working);
+        snapshot.subagents[0].status = super::ToolStatus::Succeeded;
+        assert_eq!(snapshot.activity(), super::ActivityState::Idle);
+    }
+
     use super::*;
 
     #[test]

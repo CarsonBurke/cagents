@@ -879,7 +879,7 @@ impl Handle {
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         (
-            state.busy || state.waiting || !state.requests.is_empty(),
+            state.is_working() || state.waiting || !state.requests.is_empty(),
             state.ready,
         )
     }
@@ -1747,7 +1747,7 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
-        } else if state.busy || state.waiting || !state.requests.is_empty() {
+        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
