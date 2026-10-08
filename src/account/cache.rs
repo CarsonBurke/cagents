@@ -209,6 +209,12 @@ impl Cache {
     /// lock.
     fn write(&self, document: &Document) -> io::Result<()> {
         let bytes = serde_json::to_vec(document).map_err(io::Error::other)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the account usage update is too large; the existing cache was preserved",
+            ));
+        }
         let mut temporary = tempfile::Builder::new()
             .prefix(".account-usage.")
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
@@ -293,6 +299,27 @@ mod tests {
             }),
             snapshot,
         }
+    }
+
+    #[test]
+    fn oversized_entry_preserves_the_shared_usage_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("claude:/account", entry(10, "before")).unwrap();
+        let before = cache.load(100);
+        let bytes = fs::read(cache.path()).unwrap();
+        let oversized = entry(20, &"x".repeat(MAX_BYTES as usize));
+        assert!(cache.store("codex:/other", oversized).is_err());
+        assert_eq!(fs::read(cache.path()).unwrap(), bytes);
+        assert_eq!(cache.load(100), before);
+        cache.store("claude:/account", entry(30, "after")).unwrap();
+        assert_eq!(
+            cache.load(100)["claude:/account"]
+                .snapshot
+                .detail
+                .as_deref(),
+            Some("after")
+        );
     }
 
     #[test]

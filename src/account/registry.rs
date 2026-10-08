@@ -976,6 +976,12 @@ fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
     if !document.ends_with('\n') {
         document.push('\n');
     }
+    if document.len() as u64 > MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the accounts update is too large; the existing registry was preserved",
+        ));
+    }
     let mut temporary = tempfile::Builder::new()
         .prefix(".accounts.toml.")
         .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
@@ -1020,6 +1026,36 @@ mod tests {
             .environment
             .insert("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into());
         recipe
+    }
+
+    #[test]
+    fn oversized_update_preserves_the_readable_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let (before, ()) = store
+            .update(|registry| {
+                registry.set_default(&Account::system(Provider::Claude));
+            })
+            .unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        let result = store.update(|registry| {
+            for index in 0..5000 {
+                registry.set_project_default(
+                    &PathBuf::from(format!("/projects/repository-{index}/.git")),
+                    &Account::system(Provider::Codex),
+                );
+            }
+        });
+        assert!(
+            result.is_err(),
+            "an update cannot write a registry this build rejects"
+        );
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        assert_eq!(store.load().unwrap(), before);
+        store
+            .update(|registry| registry.set_automatic(Provider::Claude))
+            .unwrap();
+        assert!(store.load().unwrap().automatic(Provider::Claude));
     }
 
     #[test]
