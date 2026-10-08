@@ -196,14 +196,9 @@ fn highlight_side(
     highlight_lines(text, &settings.token, theme, cancellation)
 }
 
-/// Highlights a snippet whose language is named by `token` - a Markdown
-/// fence's info string, say - in both of `theme`'s palettes.
-///
-/// This is the highlighting a diff gets, applied to text that has no path:
-/// the same grammars, the same palettes, and the same spans, so code an agent
-/// quotes reads the way the same code reads in the editor beside it. A
-/// snippet is small and highlighted where it is cached, so nothing cancels
-/// it.
+/// A whole snippet highlighted in one pass, which is what highlighting it a
+/// line at a time through [`SnippetHighlighter`] is checked against.
+#[cfg(test)]
 pub(crate) fn highlight_snippet(
     code: &str,
     token: &str,
@@ -211,6 +206,51 @@ pub(crate) fn highlight_snippet(
 ) -> SyntaxLines {
     highlight_lines(code, token, theme, &CancellationToken::new())
         .unwrap_or_else(|Cancelled| unreachable!("a fresh token is never cancelled"))
+}
+
+/// Highlights a snippet whose language is named by `token` - a Markdown
+/// fence's info string, say - in both of `theme`'s palettes, a line at a
+/// time.
+///
+/// This is the highlighting a diff gets, applied to text that has no path:
+/// the same grammars, the same palettes, and the same spans, so code an agent
+/// quotes reads the way the same code reads in the editor beside it.
+///
+/// It takes lines rather than the snippet because a fence an agent is
+/// streaming grows by a few words per frame, and highlighting all of it again
+/// for each of them costs its whole length every time. The lexical state
+/// after a line depends only on the lines before it, so the caller keeps this
+/// at the last whole line it has and feeds it what came after.
+pub(crate) struct SnippetHighlighter {
+    parser: HighlightParser,
+    /// A snippet is highlighted where it is cached, so nothing cancels it.
+    uncancelled: CancellationToken,
+}
+
+impl SnippetHighlighter {
+    pub(crate) fn new(token: &str, theme: crate::settings::EditorSyntaxTheme) -> Self {
+        Self {
+            parser: HighlightParser::new(token, theme),
+            uncancelled: CancellationToken::new(),
+        }
+    }
+
+    /// Highlights the snippet's next line, in both palettes, and moves past
+    /// it.
+    pub(crate) fn line(&mut self, line: &str) -> [Vec<SyntaxSpan>; 2] {
+        self.parser
+            .line(line, &self.uncancelled)
+            .unwrap_or_else(|Cancelled| unreachable!("a fresh token is never cancelled"))
+    }
+
+    /// Highlights a last line that has no ending yet without moving past it,
+    /// so the rest of the line can still arrive.
+    pub(crate) fn unfinished(&mut self, line: &str) -> [Vec<SyntaxSpan>; 2] {
+        let state = (self.parser.parser.clone(), self.parser.stack.clone());
+        let spans = self.line(line);
+        (self.parser.parser, self.parser.stack) = state;
+        spans
+    }
 }
 
 /// The spans that draw one line of `text` under its highlights alone, with no
@@ -343,6 +383,7 @@ impl HighlightParser {
     }
 }
 
+#[cfg(test)]
 fn highlight_lines(
     text: &str,
     token: &str,
