@@ -159,6 +159,11 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 impl PromptArgs {
     fn read(self) -> Result<String, AppError> {
         if let Some(text) = self.flag {
+            check_text_length(
+                text.len(),
+                "prompt",
+                crate::agent_execution::MAX_PROMPT_BYTES,
+            )?;
             return Ok(text);
         }
         read_text(
@@ -180,21 +185,47 @@ pub(super) fn read_text(
     limit: usize,
 ) -> Result<String, AppError> {
     match (text, file) {
-        (Some(text), _) if text == "-" => {
-            let mut input = String::new();
-            io::stdin()
-                .take(limit as u64 + 1)
-                .read_to_string(&mut input)
-                .map(|_| input)
-                .map_err(|e| AppError::new(code, e))
+        (Some(text), _) if text == "-" => read_bounded_text(io::stdin().lock(), code, limit),
+        (Some(text), _) => {
+            check_text_length(text.len(), code, limit)?;
+            Ok(text)
         }
-        (Some(text), _) => Ok(text),
-        (None, Some(file)) => std::fs::read_to_string(&file)
-            .map_err(|e| AppError::new(code, format!("{}: {e}", file.display()))),
+        (None, Some(path)) => {
+            let file = std::fs::File::open(&path)
+                .map_err(|error| AppError::new(code, format!("{}: {error}", path.display())))?;
+            read_bounded_text(file, code, limit).map_err(|error| {
+                AppError::new(code, format!("{}: {}", path.display(), error.message))
+            })
+        }
         // Standard input is read only when asked for: a caller whose input
         // is a pipe that never closes would otherwise wait forever on
         // forgotten text.
         (None, None) => Err(AppError::new(code, missing)),
+    }
+}
+
+fn read_bounded_text(
+    reader: impl Read,
+    code: &'static str,
+    limit: usize,
+) -> Result<String, AppError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| AppError::new(code, error))?;
+    check_text_length(bytes.len(), code, limit)?;
+    String::from_utf8(bytes).map_err(|error| AppError::new(code, error))
+}
+
+fn check_text_length(length: usize, code: &'static str, limit: usize) -> Result<(), AppError> {
+    if length > limit {
+        Err(AppError::new(
+            code,
+            format!("The {code} exceeds {limit} bytes"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1325,6 +1356,59 @@ mod tests {
             panic!("agent command")
         };
         command
+    }
+
+    #[test]
+    fn text_sources_enforce_byte_limits_without_truncation() {
+        let text = "éé";
+        assert_eq!(
+            read_bounded_text(text.as_bytes(), "prompt", 4).unwrap(),
+            text
+        );
+        let error = read_bounded_text(text.as_bytes(), "prompt", 3).unwrap_err();
+        assert!(error.message.contains("exceeds 3 bytes"));
+        assert!(read_bounded_text(&b"\xff"[..], "message", 8).is_err());
+        assert!(read_text(Some("12345".into()), None, "message", "", 4).is_err());
+        let prompt = PromptArgs {
+            text: None,
+            prompt_file: None,
+            flag: Some("x".repeat(crate::agent_execution::MAX_PROMPT_BYTES + 1)),
+        };
+        assert!(prompt.read().unwrap_err().message.contains("exceeds"));
+        let legacy_literal = PromptArgs {
+            text: None,
+            prompt_file: None,
+            flag: Some("-".into()),
+        };
+        assert_eq!(legacy_literal.read().unwrap(), "-");
+    }
+
+    #[test]
+    fn oversized_reader_consumes_only_the_limit_and_one_sentinel_byte() {
+        let mut reader = io::Cursor::new(vec![b'x'; 4096]);
+        assert!(read_bounded_text(&mut reader, "message", 16).is_err());
+        assert_eq!(reader.position(), 17);
+    }
+
+    #[test]
+    fn prompt_and_message_files_share_bounded_reads_and_keep_path_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.txt");
+        std::fs::write(&path, "éé").unwrap();
+        assert_eq!(
+            read_text(None, Some(path.clone()), "prompt", "", 4).unwrap(),
+            "éé"
+        );
+        let error = read_text(None, Some(path.clone()), "message", "", 3).unwrap_err();
+        assert!(error.message.contains("exceeds 3 bytes"));
+        assert!(error.message.contains("input.txt"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            read_text(None, Some(path), "prompt", "", 4)
+                .unwrap_err()
+                .message
+                .contains("input.txt")
+        );
     }
 
     #[test]
