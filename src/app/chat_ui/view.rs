@@ -872,12 +872,44 @@ impl Cagents {
 
 /// Prefer concrete activity from the newest assistant item when available.
 fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
-    match snapshot.items.last().map(|item| &item.content) {
+    if snapshot.has_later {
+        return "Working";
+    }
+    match snapshot
+        .items
+        .last()
+        .filter(|item| item.role == chat::Role::Assistant)
+        .map(|item| &item.content)
+    {
         Some(ItemContent::Text { thinking: true, .. }) => "Thinking",
         Some(ItemContent::Text { .. }) => "Responding",
-        Some(ItemContent::Command { .. }) => "Running command",
+        Some(ItemContent::Command {
+            status: chat::ToolStatus::Running,
+            ..
+        }) => "Running command",
         _ => "Working",
     }
+}
+
+/// Thinking stops at a later answer or prompt, not at another reasoning chunk.
+fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
+    !busy
+        || items
+            .iter()
+            .skip_while(|item| item.id != id)
+            .skip(1)
+            .any(|item| {
+                item.role == chat::Role::User
+                    || (item.role == chat::Role::Assistant
+                        && matches!(
+                            item.content,
+                            ItemContent::Text {
+                                thinking: false,
+                                phase: chat::Phase::Final,
+                                ..
+                            }
+                        ))
+            })
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -991,22 +1023,26 @@ impl Runtime {
                     continue;
                 };
                 anchors.push((transcript.len(), item.id.as_str()));
-                transcript.push(match &item.content {
-                    ItemContent::Text { thinking, .. } => self.prose_view(
-                        item,
-                        cached,
-                        if *thinking {
-                            turn::Slot::Thinking
-                        } else if item.role == chat::Role::System {
-                            turn::Slot::Commentary
+                transcript.push(
+                    if item.role == chat::Role::User && !item.content.is_step() {
+                        if matches!(item.content, ItemContent::Delivery { .. }) {
+                            self.delivery_view(item, cached, markdown_settings)
                         } else {
-                            turn::Slot::Prose
-                        },
-                        markdown_settings,
-                    ),
-                    ItemContent::Image { .. } => self.image_preview(item, cached),
-                    _ => self.step_view(item, cached, markdown_settings),
-                });
+                            self.prompt_view(item)
+                        }
+                    } else {
+                        match &item.content {
+                            ItemContent::Text { .. } => self.prose_view(
+                                item,
+                                cached,
+                                turn::slot_of(item),
+                                markdown_settings,
+                            ),
+                            ItemContent::Image { .. } => self.image_preview(item, cached),
+                            _ => self.step_view(item, cached, markdown_settings),
+                        }
+                    },
+                );
             }
         } else {
             if snapshot.has_earlier {
@@ -1873,10 +1909,12 @@ impl Runtime {
             (Some(Icon::Warning), "Error")
         } else if snapshot.waiting || !snapshot.requests.is_empty() {
             (Some(Icon::AgentWaiting), "Waiting for you")
-        } else if snapshot.busy {
+        } else if snapshot.is_working() {
             (
                 Some(Icon::AgentWorking),
-                if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
+                if !snapshot.busy {
+                    "Subagents working"
+                } else if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
                     activity_label(snapshot)
                 } else {
                     snapshot.detail.as_str()
@@ -3271,26 +3309,23 @@ impl Runtime {
             .into();
         }
         if slot == turn::Slot::Thinking {
-            let finished = !self.snapshot.busy
-                || self
-                    .snapshot
-                    .items
-                    .iter()
-                    .skip_while(|candidate| candidate.id != item.id)
-                    .skip(1)
-                    .any(|candidate| {
-                        matches!(
-                            &candidate.content,
-                            ItemContent::Text {
-                                phase: chat::Phase::Final,
-                                ..
-                            }
+            let (items, busy) = self
+                .selected_subagent
+                .as_ref()
+                .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
+                .map_or(
+                    (self.snapshot.items.as_slice(), self.snapshot.busy),
+                    |agent| {
+                        (
+                            agent.items.as_slice(),
+                            agent.status == chat::ToolStatus::Running,
                         )
-                    });
+                    },
+                );
+            let finished = reasoning_finished(items, busy, &item.id);
             let expanded = !finished || self.expanded.contains(&item.id);
             let elapsed = item.started_at.or(item.at).and_then(|start| {
-                self.snapshot
-                    .items
+                items
                     .iter()
                     .skip_while(|candidate| candidate.id != item.id)
                     .skip(1)
@@ -4249,6 +4284,69 @@ mod tests {
                 node.size()
             );
         }
+    }
+
+    #[test]
+    fn reasoning_uses_its_own_transcript_and_does_not_finish_on_another_thought() {
+        let thought = |id: &str| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: "Thinking".into(),
+                    thinking: true,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let mut items = vec![thought("one"), thought("two")];
+        assert!(!reasoning_finished(&items, true, "one"));
+        assert!(reasoning_finished(&items, false, "one"));
+        let mut answer = (*thought("answer")).clone();
+        answer.content = ItemContent::Text {
+            text: "Answer".into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        };
+        items.push(Arc::new(answer));
+        assert!(reasoning_finished(&items, true, "one"));
+    }
+
+    #[test]
+    fn activity_does_not_describe_prompts_completed_commands_or_older_pages_as_live_work() {
+        let mut snapshot = Snapshot {
+            busy: true,
+            ..Snapshot::default()
+        };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "user".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "Prompt".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        }));
+        assert_eq!(activity_label(&snapshot), "Working");
+        Arc::make_mut(&mut snapshot.items[0]).role = chat::Role::Assistant;
+        assert_eq!(activity_label(&snapshot), "Responding");
+        Arc::make_mut(&mut snapshot.items[0]).content = ItemContent::Command {
+            label: "Echo".into(),
+            command: "echo hi".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            output: "hi".into(),
+            exit_code: Some(0),
+            duration_ms: None,
+        };
+        assert_eq!(activity_label(&snapshot), "Working");
+        snapshot.has_later = true;
+        assert_eq!(activity_label(&snapshot), "Working");
     }
 
     #[test]
