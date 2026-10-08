@@ -134,8 +134,10 @@ enum Pending {
     Save,
     Mutate,
     History { append: bool },
+    RefreshList,
     RefreshAutomation,
     RefreshHistory,
+    RefreshRun,
     HistoryRun { index: usize },
     Run,
     OpenRun,
@@ -145,8 +147,10 @@ impl Pending {
     fn background_read(self) -> bool {
         matches!(
             self,
-            Self::RefreshAutomation
+            Self::RefreshList
+                | Self::RefreshAutomation
                 | Self::RefreshHistory
+                | Self::RefreshRun
                 | Self::HistoryRun { .. }
         )
     }
@@ -819,7 +823,7 @@ impl State {
             }
             if let Some(run) = &self.run {
                 return self.request(
-                    Pending::Run,
+                    Pending::RefreshRun,
                     Request::ShowFiring { id: run.firing.id },
                 );
             }
@@ -841,7 +845,7 @@ impl State {
             }
             if self.rows.len() <= PAGE {
                 return self.request(
-                    Pending::List { append: false },
+                    Pending::RefreshList,
                     Request::List {
                         after: None,
                         limit: PAGE,
@@ -2332,6 +2336,77 @@ mod tests {
             }))),
         });
         assert_eq!(state.rows[0].last_state, Some(FiringState::Failed));
+    }
+
+    #[test]
+    fn periodic_list_reads_allow_search_and_new_drafts_without_accepting_late_replies() {
+        let automation = automation();
+        let row = automation.summary(None);
+        let mut state = State {
+            rows: vec![row.clone()],
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence: poll, .. }) = state.update(Action::Tick) else {
+            panic!("list poll expected");
+        };
+        assert!(state.pending.unwrap().1.background_read());
+        assert!(state.update(Action::Tick).is_none());
+        state.update(Action::Search("daily".into()));
+        assert_eq!(state.search, "daily");
+        state.update(Action::Received {
+            sequence: poll,
+            result: std::sync::Arc::new(Ok(Response::Listed(Vec::new()))),
+        });
+        assert_eq!(state.rows.len(), 1, "superseded list is ignored");
+        let Some(Effect::Request { sequence: poll, .. }) = state.update(Action::Tick) else {
+            panic!("next list poll expected");
+        };
+        state.update(Action::New);
+        assert!(state.draft.is_some());
+        state.update(Action::Received {
+            sequence: poll,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![row]))),
+        });
+        assert!(state.pending.is_none());
+        assert!(state.draft.is_some());
+        // An explicit initial load still retains its foreground guard.
+        state.draft = None;
+        state.update(Action::Refresh);
+        state.update(Action::New);
+        assert!(state.draft.is_none());
+    }
+
+    #[test]
+    fn periodic_run_reads_allow_navigation_and_ignore_superseded_replies() {
+        let detail = RunDetail {
+            definition: automation().definition,
+            firing: history_firing(100, crate::automations::FiringState::Running),
+            agent: None,
+            run: None,
+        };
+        let mut state = State {
+            run: Some(detail.clone()),
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence: poll, .. }) = state.update(Action::Tick) else {
+            panic!("run poll expected");
+        };
+        assert!(state.pending.unwrap().1.background_read());
+        assert!(state.update(Action::Tick).is_none());
+        let Some(Effect::Request {
+            sequence: browse,
+            request,
+        }) = state.update(Action::Browse)
+        else {
+            panic!("navigation supersedes the run poll");
+        };
+        assert!(matches!(request, Request::List { .. }));
+        state.update(Action::Received {
+            sequence: poll,
+            result: std::sync::Arc::new(Ok(Response::Detail(detail))),
+        });
+        assert!(state.run.is_none());
+        assert_eq!(state.pending.unwrap().0, browse);
     }
 
     #[test]
