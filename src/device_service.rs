@@ -292,19 +292,25 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             let metadata = original.metadata().map_err(|error| error.to_string())?;
             let (parent, target) =
                 fs_safety::open_parent_beneath(&root, &path).map_err(|error| error.to_string())?;
-            use std::os::unix::fs::PermissionsExt;
-            let (mut file, temporary) =
-                fs_safety::create_temporary_in(&parent, metadata.permissions().mode())
-                    .map_err(|error| error.to_string())?;
+            let (mut file, temporary) = fs_safety::create_temporary_in(&parent, 0o600)
+                .map_err(|error| error.to_string())?;
             let saved = (|| {
+                // Keep the replacement private until the source's access rules
+                // are installed, before writing any sensitive content.
+                fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
+                file.write_all(content.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                // Creation applies the daemon's umask and writing can clear
+                // set-ID bits. Restore the exact source mode after writing,
+                // then its ACL because chmod rewrites the ACL mask.
+                file.set_permissions(metadata.permissions())
+                    .map_err(|error| error.to_string())?;
                 fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
                 if !fs_safety::copy_extended_attributes(&original, &file).is_empty() {
                     return Err(
                         "remote save cannot preserve this file's extended attributes".into(),
                     );
                 }
-                file.write_all(content.as_bytes())
-                    .map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
                 // Recheck after writing the temporary, before replacing disk bytes.
                 if read(&root, &path)? != expected {
@@ -643,6 +649,109 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn device_save_preserves_permissions_under_restrictive_umask() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_SAVE_UMASK";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "device_service::tests::device_save_preserves_permissions_under_restrictive_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated save test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // umask is process-wide: change it only in this isolated test process.
+        unsafe { libc::umask(0o077) };
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        for mode in [0o755, 0o664, 0o4755, 0o2755] {
+            std::fs::write(&path, "before").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            execute(Operation::Write {
+                root: directory.path().to_owned(),
+                path: "file".into(),
+                expected: "before".into(),
+                content: "after".into(),
+            })
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn device_save_preserves_access_acl() {
+        use std::os::fd::AsRawFd;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        std::fs::write(&path, "before").unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        // Linux POSIX ACL xattr v2: a named user can read, while the
+        // owning group cannot. Mode bits alone cannot express these rules.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 12_345),
+            (0x04, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let attribute = c"system.posix_acl_access";
+        let result = unsafe {
+            libc::fsetxattr(
+                original.as_raw_fd(),
+                attribute.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
+                return; // The fixture filesystem does not support POSIX ACLs.
+            }
+            panic!("could not set fixture access ACL: {error}");
+        }
+        execute(Operation::Write {
+            root: directory.path().to_owned(),
+            path: "file".into(),
+            expected: "before".into(),
+            content: "after".into(),
+        })
+        .unwrap();
+        let replacement = std::fs::File::open(&path).unwrap();
+        let mut restored = vec![0_u8; acl.len()];
+        let length = unsafe {
+            libc::fgetxattr(
+                replacement.as_raw_fd(),
+                attribute.as_ptr(),
+                restored.as_mut_ptr().cast(),
+                restored.len(),
+            )
+        };
+        assert_eq!(length, acl.len() as libc::ssize_t);
+        assert_eq!(restored, acl);
+    }
+
     #[test]
     fn writes_remote_file_and_refuses_conflicts_and_escape() {
         let dir = tempfile::tempdir().unwrap();
