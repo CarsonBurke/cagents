@@ -8848,21 +8848,10 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
 
 /// One selectable panel row, indented by tree depth.
 ///
-/// A row carries no [`Id`], and none of the lists that build rows may give it
-/// one. A list's length and order are whatever the repository holds and
-/// whatever the filter admits, so a row cannot be pinned to an index, and
-/// `Tree::diff_children_custom` reconciles a named child by *name* while
-/// leaving `children` in its old order: the row that took a departed sibling's
-/// index is then handed that sibling's tree, the tags agree because every row
-/// is the same button, and the state that frame's `take_all_named` already
-/// lifted out is never put back. The next draw downcasts a `State::None` and
-/// aborts the process — which is precisely what one keystroke into
-/// `Filter files` used to do.
-///
-/// Nameless, the row is matched positionally instead, so it inherits a live
-/// button state from whichever row held its index. The accessible name it
-/// still carries is what labels it; the id only ever bought a stable AccessKit
-/// node number, and nothing addresses a row by id.
+/// Rows use positional widget state. Their accessible name labels them, and
+/// no command addresses an individual row through a widget [`Id`]. Keeping
+/// these rows nameless also avoids retaining state for every filtered entry.
+
 fn panel_row<'a>(
     name: impl Into<Cow<'a, str>>,
     depth: usize,

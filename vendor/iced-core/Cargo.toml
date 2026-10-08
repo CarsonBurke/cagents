@@ -1,0 +1,60 @@
+[package]
+name = "iced_core"
+description = "The essential ideas of iced"
+version = "0.14.0"
+edition = "2024"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+homepage = "https://iced.rs"
+categories = ["gui"]
+keywords = ["gui", "ui", "graphics", "interface", "widgets"]
+
+[workspace]
+
+[features]
+advanced = []
+crisp = []
+basic-shaping = []
+advanced-shaping = []
+a11y = ["iced_accessibility"]
+wayland = ["cctk"]
+
+[dependencies]
+palette = "0.7"
+bitflags = "2.5"
+bytes = "1.6"
+glam = "0.25"
+lilt = "0.8"
+log = "0.4"
+num-traits = "0.2"
+rustc-hash = "2.0"
+smol_str = "0.3"
+thiserror = "2"
+unicode-segmentation = "1.0"
+web-time = "1.1"
+
+serde = { version = "1.0", optional = true, features = ["derive"] }
+# TODO(POP): I think some of these dependencies were removed. Check on that
+# xxhash-rust.workspace = true
+window_clipboard = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+dnd = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+mime = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+
+# /TODO(POP)
+[dependencies.iced_accessibility]
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "caec74c2559924443f12fc6faf97a5bcefe6271d"
+optional = true
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+approx = "0.5"
+
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "32283d7", optional = true }
+
+[build-dependencies]
+build_helpers = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
