@@ -39,8 +39,16 @@ pub(super) struct ToolText {
     syntax: std::cell::RefCell<Option<(crate::settings::EditorSyntaxTheme, prose::CodeBlock)>>,
 }
 
+/// What a closed step's row says beyond its verb.
+///
+/// `text` is what the step is: the command that ran, the target it was applied
+/// to, a tool's input. `tail` is the last line of what it has printed, which
+/// is how a reader follows a build without opening it. The two are kept
+/// apart because the output used to take the command's place on the row, and
+/// a transcript of `Compiling…` lines no longer said what had been run.
 pub(super) struct Preview {
     pub(super) text: String,
+    pub(super) tail: String,
     language: Language,
     /// The text highlighted in both palettes, drawn from on every frame.
     block: prose::CodeBlock,
@@ -53,44 +61,63 @@ impl Preview {
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let (source, language) = match content {
-            ItemContent::Command { output, .. } | ItemContent::Tool { output, .. }
-                if !output.trim().is_empty() =>
-            {
-                (
-                    output
-                        .rsplit('\n')
-                        .find(|line| !line.trim().is_empty())
-                        .unwrap_or(output),
-                    Language::Plain,
-                )
+        let (source, language, output) = match content {
+            // Only a shell command is shell: a read's or a search's command
+            // is the path or the pattern it was given.
+            ItemContent::Command {
+                command,
+                label,
+                action: chat::CommandAction::Run,
+                output,
+                ..
+            } if label.is_empty() || label == command => {
+                (command.as_str(), Language::Shell, output.as_str())
             }
-            ItemContent::Command { command, label, .. } if label.is_empty() || label == command => {
-                (command.as_str(), Language::Shell)
-            }
+            ItemContent::Command {
+                action: chat::CommandAction::Run,
+                output,
+                ..
+            } => (turn::step_label(content), Language::Plain, output.as_str()),
+            // The last line of a file that was read, or of a search's
+            // matches, says nothing about how the step went.
+            ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
+            // The row already names the tool, so its second line is what
+            // the tool was called with. That stays once there is output: a
+            // name alone does not tell one call of a tool from the next.
             ItemContent::Tool { input, output, .. } => {
-                let source = if input.is_empty() { output } else { input };
-                (source.as_str(), Language::structured(source))
+                (input.as_str(), Language::structured(input), output.as_str())
             }
-            _ => (turn::step_label(content), Language::Plain),
+            _ => (turn::step_label(content), Language::Plain, ""),
         };
         // Bound preview work independently of the complete source kept for
         // expansion and copying. Layout also caps wrapped text at two rows.
-        let mut chars = source.chars();
-        let mut text: String = chars.by_ref().take(512).collect();
-        if chars.next().is_some() {
-            text.push('…');
-        }
+        let bounded = |source: &str| {
+            let mut chars = source.chars();
+            let mut text: String = chars.by_ref().take(512).collect();
+            if chars.next().is_some() {
+                text.push('…');
+            }
+            text
+        };
+        let text = bounded(source);
+        let tail = bounded(
+            output
+                .rsplit('\n')
+                .map(str::trim_end)
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default(),
+        );
         if let Some(previous) = previous
             && previous.text == text
             && previous.language == language
             && previous.theme == theme
         {
-            return previous;
+            return Self { tail, ..previous };
         }
         let block = prose::CodeBlock::new(language.token(), &text, theme);
         Self {
             text,
+            tail,
             language,
             block,
             theme,
@@ -121,6 +148,20 @@ impl Preview {
             .clip(true)
             .into()
     }
+
+    /// The step's latest output, on one muted line under what it is.
+    pub(super) fn tail_view(&self) -> Option<Element<'static, Message>> {
+        (!self.tail.is_empty()).then(|| {
+            design::caption(self.tail.clone())
+                .font(iced::Font::MONOSPACE)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::advanced::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill)
+                .into()
+        })
+    }
 }
 
 impl ToolText {
@@ -147,10 +188,35 @@ impl ToolText {
         }
     }
 
+    /// The text, whole or within `limit`, where it follows its last line:
+    /// output is read from its end, and a running step's grows there.
     pub(super) fn view(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
         limit: Option<f32>,
+        target: Target,
+    ) -> Element<'static, Message> {
+        self.surface(theme, limit.map(|height| (height, true)), target)
+    }
+
+    /// The text within `height`, opened at its first line: a patch, a file
+    /// that was read and a tool's input are read from the top, and opening
+    /// one at its last screen hid the change it was opened for.
+    pub(super) fn view_from_start(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        height: f32,
+        target: Target,
+    ) -> Element<'static, Message> {
+        self.surface(theme, Some((height, false)), target)
+    }
+
+    /// `limit` is the height the text scrolls within and whether it follows
+    /// its end.
+    fn surface(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
         target: Target,
     ) -> Element<'static, Message> {
         let mut syntax = self.syntax.borrow_mut();
@@ -182,18 +248,20 @@ impl ToolText {
         ])))
         .width(Length::Fill)
         .into();
-        match limit {
-            Some(height) => widget::container(scroll::tool_output(
-                widget::scrollable(body)
-                    .direction(iced::widget::scrollable::Direction::Vertical(
-                        design::scrollbar(),
-                    ))
-                    .anchor_bottom()
-                    .height(Length::Shrink),
+        let Some((height, follows)) = limit else {
+            return body;
+        };
+        let scrolled = widget::scrollable(body)
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
             ))
-            .max_height(height)
-            .into(),
-            None => body,
+            .height(Length::Shrink);
+        if follows {
+            widget::container(scroll::tool_output(scrolled.anchor_bottom()))
+                .max_height(height)
+                .into()
+        } else {
+            widget::container(scrolled).max_height(height).into()
         }
     }
 }
@@ -282,6 +350,61 @@ mod tests {
         ));
     }
 
+    /// Output is opened at its last line and a patch at its first.
+    #[test]
+    fn output_opens_at_its_end_and_a_patch_at_its_start() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Scrolled(Vec<f32>);
+        impl Operation for Scrolled {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0.push(translation.y);
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let theme = crate::settings::EditorSyntaxTheme::default();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let text = (0..200)
+            .map(|line| format!("+line {line}\n"))
+            .collect::<String>();
+        let block = ToolText::update(None, &text, Language::Diff);
+        let offset = |mut element: Element<'static, Message>| {
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 2000.0)),
+            );
+            assert!(node.size().height <= 121.0, "{:?}", node.size());
+            let mut scrolled = Scrolled(Vec::new());
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut scrolled,
+            );
+            assert_eq!(scrolled.0.len(), 1);
+            scrolled.0[0]
+        };
+        assert_eq!(offset(block.view_from_start(theme, 120.0, target)), 0.0);
+        assert!(offset(block.view(theme, Some(120.0), target)) > 0.0);
+    }
+
     #[test]
     fn expanded_patches_retain_lines_beyond_the_old_inline_limit() {
         let diff = (0..600)
@@ -296,9 +419,9 @@ mod tests {
             status: chat::ToolStatus::Succeeded,
         };
         let theme = crate::settings::EditorSyntaxTheme::default();
-        let collapsed = CachedItem::updated(&item, theme, None, false);
+        let collapsed = CachedItem::updated(&item, theme, None, false, false);
         assert!(collapsed.patches.is_empty());
-        let expanded = CachedItem::updated(&item, theme, Some(collapsed), true);
+        let expanded = CachedItem::updated(&item, theme, Some(collapsed), true, false);
         assert_eq!(expanded.patches[0].text.as_ref(), diff);
         assert_eq!(
             copy_text(CopyPart::Change(0), &item).as_deref(),
@@ -314,6 +437,112 @@ mod tests {
             output: String::new(),
             status: chat::ToolStatus::Succeeded,
         }
+    }
+
+    fn command(
+        label: &str,
+        command: &str,
+        action: chat::CommandAction,
+        output: &str,
+    ) -> ItemContent {
+        ItemContent::Command {
+            label: label.into(),
+            command: command.into(),
+            working_directory: String::new(),
+            action,
+            status: chat::ToolStatus::Running,
+            exit_code: None,
+            duration_ms: None,
+            output: output.into(),
+        }
+    }
+
+    /// A row goes on saying what ran while its output scrolls past under it.
+    #[test]
+    fn output_follows_a_step_without_replacing_what_it_is() {
+        use chat::CommandAction::{Read, Run};
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for (content, text, language, tail) in [
+            (
+                command("", "cargo test", Run, ""),
+                "cargo test",
+                Language::Shell,
+                "",
+            ),
+            (
+                command(
+                    "",
+                    "cargo test",
+                    Run,
+                    "   Compiling a\n   Compiling b  \n\n",
+                ),
+                "cargo test",
+                Language::Shell,
+                "   Compiling b",
+            ),
+            (
+                command("Run the tests", "cargo test", Run, "ok\n"),
+                "Run the tests",
+                Language::Plain,
+                "ok",
+            ),
+            // A read's command is a path, its output is the file, and a
+            // stored label loses its verb.
+            (
+                command("src/app.rs", "src/app.rs", Read, "fn main() {}\n"),
+                "src/app.rs",
+                Language::Plain,
+                "",
+            ),
+            (
+                command("Read src/app.rs", "sed -n 1,9p src/app.rs", Read, ""),
+                "src/app.rs",
+                Language::Plain,
+                "",
+            ),
+            (
+                tool("{\"query\":\"x\"}"),
+                "{\"query\":\"x\"}",
+                Language::Json,
+                "",
+            ),
+        ] {
+            let preview = Preview::update(None, &content, theme);
+            assert_eq!(
+                (
+                    preview.text.as_str(),
+                    preview.language,
+                    preview.tail.as_str()
+                ),
+                (text, language, tail),
+                "{content:?}"
+            );
+            assert_eq!(preview.tail_view().is_some(), !tail.is_empty());
+        }
+        let mut finished = tool("{\"query\":\"x\"}");
+        if let ItemContent::Tool { output, .. } = &mut finished {
+            *output = "first\nlast\n".into();
+        }
+        // A finished tool is still the call it was, with its output under it.
+        let preview = Preview::update(None, &finished, theme);
+        assert_eq!(
+            (
+                preview.text.as_str(),
+                preview.language,
+                preview.tail.as_str()
+            ),
+            ("{\"query\":\"x\"}", Language::Json, "last")
+        );
+        // New output moves the tail and leaves the highlighted command alone.
+        let before = Preview::update(None, &command("", "cargo test", Run, "one\n"), theme);
+        let spans = before.block.spans(true).clone();
+        let after = Preview::update(
+            Some(before),
+            &command("", "cargo test", Run, "one\ntwo\n"),
+            theme,
+        );
+        assert_eq!(after.tail, "two");
+        assert!(Arc::ptr_eq(&spans, after.block.spans(true)));
     }
 
     #[test]
@@ -339,7 +568,7 @@ mod tests {
         let source = format!("{{\"text\":\"{}\"}}", "λ".repeat(700));
         let mut item = tool(&source);
         let theme = crate::settings::EditorSyntaxTheme::Auto;
-        let cached = CachedItem::updated(&item, theme, None, false);
+        let cached = CachedItem::updated(&item, theme, None, false, false);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
         assert!(cached.preview.text.len() < source.len());
@@ -347,17 +576,17 @@ mod tests {
             copy_text(CopyPart::Input, &item).as_deref(),
             Some(source.as_str())
         );
-        let cached = CachedItem::updated(&item, theme, Some(cached), true);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true, false);
         let source_cache = cached.tool_input.as_ref().unwrap().text.clone();
         if let ItemContent::Tool { status, .. } = &mut item {
             *status = chat::ToolStatus::Failed;
         }
-        let cached = CachedItem::updated(&item, theme, Some(cached), true);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true, false);
         assert!(Arc::ptr_eq(
             &source_cache,
             &cached.tool_input.as_ref().unwrap().text
         ));
-        let cached = CachedItem::updated(&item, theme, Some(cached), false);
+        let cached = CachedItem::updated(&item, theme, Some(cached), false, false);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
         assert_eq!(

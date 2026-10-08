@@ -1165,9 +1165,12 @@ pub enum ItemContent {
     },
     /// A shell command the provider ran on the user's behalf.
     Command {
-        /// The provider's own summary, e.g. `Read src/app.rs`. Empty when the
-        /// provider offered none, in which case the view falls back to
-        /// `command`.
+        /// What the command was applied to, or the provider's own summary of
+        /// it: `src/app.rs` for a read, `TODO in src` for a search, `Run the
+        /// tests` for a shell command the provider described. The view puts
+        /// the verb `action` implies in front, so the label carries none.
+        /// Empty when the provider offered nothing, in which case the view
+        /// falls back to `command`.
         label: String,
         command: String,
         working_directory: String,

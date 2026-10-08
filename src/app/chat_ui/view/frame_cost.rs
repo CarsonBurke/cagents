@@ -324,7 +324,7 @@ impl Pane {
         let previous = runtime.cache.remove(id);
         runtime.cache.insert(
             id.to_owned(),
-            CachedItem::updated(&item.content, runtime.syntax_theme, previous, true),
+            CachedItem::updated(&item.content, runtime.syntax_theme, previous, true, false),
         );
     }
 
