@@ -290,14 +290,13 @@ impl Tree {
         // matched children at their old indices can hand a widget its sibling's
         // state after a reorder; truncating first also loses surviving names.
         let mut named: HashMap<String, VecDeque<Tree>> = HashMap::new();
-        let mut positional = HashMap::new();
-        for (index, child) in
-            mem::take(&mut self.children).into_iter().enumerate()
-        {
+        let mut positional = Vec::with_capacity(self.children.len());
+        for child in mem::take(&mut self.children) {
             if let Some(Id(Internal::Custom(_, name))) = &child.id {
                 named.entry(name.to_string()).or_default().push_back(child);
+                positional.push(None);
             } else {
-                positional.insert(index, child);
+                positional.push(Some(child));
             }
         }
 
@@ -310,7 +309,7 @@ impl Tree {
                     Some(Id(Internal::Custom(_, name))) => named
                         .get_mut(name.as_ref())
                         .and_then(VecDeque::pop_front),
-                    _ => positional.remove(&index),
+                    _ => positional.get_mut(index).and_then(Option::take),
                 };
                 let mut child = previous.unwrap_or_else(|| new_state(new));
                 diff(&mut child, new);
