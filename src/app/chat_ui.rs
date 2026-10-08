@@ -319,6 +319,7 @@ impl Action {
             | Self::Submit(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
+            | Self::Interrupt(target)
             | Self::Attach(target)
             | Self::Paste(target)
             | Self::Dropped(target, _)

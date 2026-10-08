@@ -3816,6 +3816,9 @@ impl History {
         let mut agent_ids = HashMap::<String, String>::new();
         let mut agent_status = HashMap::new();
         let mut background_agent_tools = HashSet::new();
+        // Foreground agents whose task was stopped, whose refused result
+        // would otherwise read as a failure.
+        let mut stopped_agent_tools = HashSet::<String>::new();
         let mut position = 0;
         let mut line = Vec::new();
         while position < metadata.len() {
@@ -3864,7 +3867,9 @@ impl History {
                         }
                         agent_status.insert(
                             tool_id.to_owned(),
-                            if block["is_error"].as_bool() == Some(true) {
+                            if stopped_agent_tools.contains(tool_id) {
+                                ToolStatus::Stopped
+                            } else if block["is_error"].as_bool() == Some(true) {
                                 ToolStatus::Failed
                             } else if background_agent_tools.contains(tool_id) {
                                 ToolStatus::Running
@@ -3881,7 +3886,7 @@ impl History {
                     "task_started" | "task_progress" | "task_notification" | "task_updated"
                 )
                 && let Some(tool_id) = value["tool_use_id"].as_str()
-                && background_agent_tools.contains(tool_id)
+                && agent_tools.contains_key(tool_id)
             {
                 let patch = if value["patch"].is_object() {
                     &value["patch"]
@@ -3892,7 +3897,14 @@ impl History {
                     string(patch, "status"),
                     string(&value, "subtype") == "task_notification",
                 );
-                agent_status.insert(tool_id.into(), status.unwrap_or(ToolStatus::Running));
+                if background_agent_tools.contains(tool_id) {
+                    agent_status.insert(tool_id.into(), status.unwrap_or(ToolStatus::Running));
+                } else if status == Some(ToolStatus::Stopped) {
+                    stopped_agent_tools.insert(tool_id.into());
+                    if let Some(status) = agent_status.get_mut(tool_id) {
+                        *status = ToolStatus::Stopped;
+                    }
+                }
             }
             if let Some(content) = recorded_notification(&value) {
                 for (tool, task, status) in notification_outcomes(&content) {
@@ -6608,6 +6620,38 @@ mod tests {
                 ToolStatus::Succeeded
             )]
         );
+    }
+
+    /// A stopped foreground agent's refused result replays as stopped, as it
+    /// read live, whichever of the two the transcript records first.
+    #[test]
+    fn a_replayed_stopped_foreground_agent_is_not_a_failure() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let launch = |tool: &str| json!({"type":"assistant","uuid":format!("{tool}-launch"),"sessionId":session,"message":{"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{}}]}});
+        let stopped = |tool: &str| json!({"type":"system","subtype":"task_notification","uuid":format!("{tool}-stopped"),"sessionId":session,"tool_use_id":tool,"status":"stopped"});
+        let refused = |tool: &str| json!({"type":"user","uuid":format!("{tool}-result"),"sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":tool,"is_error":true,"content":"Stopped"}]}});
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            launch("tool-first"),
+            stopped("tool-first"),
+            refused("tool-first"),
+            launch("tool-last"),
+            refused("tool-last"),
+            stopped("tool-last"),
+            launch("tool-failed"),
+            refused("tool-failed"),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let history = History::index(file, session).unwrap();
+        for (tool, status) in [
+            ("tool-first", ToolStatus::Stopped),
+            ("tool-last", ToolStatus::Stopped),
+            ("tool-failed", ToolStatus::Failed),
+        ] {
+            assert_eq!(history.agent_status.get(tool), Some(&status), "{tool}");
+        }
     }
 
     /// A transcript records a background agent finishing only as the
