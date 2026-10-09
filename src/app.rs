@@ -7985,8 +7985,8 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
-        if let Some(card) = self.workspace.take_widget_focus_request()
-            && !self.context_inspector_overlay_active
+        if !self.context_inspector_overlay_active
+            && let Some(card) = self.workspace.take_widget_focus_request()
         {
             tasks.push(
                 iced::widget::operation::focus(self.card_keyboard_focus(card))
@@ -24069,6 +24069,25 @@ mod tests {
         assert_eq!(
             app.card_keyboard_focus(pane),
             app.card_header_widget_id(pane)
+        );
+    }
+
+    #[test]
+    fn restored_editor_startup_focus_survives_an_initial_inspector_overlay() {
+        let (mut app, pane) = editing_repository_app();
+        app.window_width = 900.0;
+        app.context_inspector_open = true;
+        let update = app.workspace.resize_viewport(500.0);
+        let initial = app.apply_viewport(update, false, false);
+        assert!(app.context_inspector_overlay_active);
+        assert_eq!(focused(&app, initial), Some(context_inspector_toggle_id()));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        let ready = app.apply_viewport(update, false, false);
+        assert!(!app.context_inspector_overlay_active);
+        assert_eq!(
+            focused(&app, ready),
+            Some(repository_widget::editor_focus_id(pane))
         );
     }
 
