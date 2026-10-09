@@ -349,6 +349,56 @@ pub struct TerminalPaneAdoption {
     pub terminal: TerminalId,
 }
 
+/// A daemon-authorized canonical terminal whose archived owner is resolved by
+/// the persistence writer. The UI never needs to read storage to enqueue it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPaneRestoration {
+    pub canonical: CardId,
+    pub terminal: TerminalId,
+}
+
+fn select_closed_terminal_adoption(
+    connection: &Connection,
+    state: &WorkspaceState,
+    canonical: CardId,
+    terminal: TerminalId,
+) -> Result<Option<TerminalPaneAdoption>> {
+    let owner: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT c.card_id,c.workspace_id,c.existence_json FROM terminal_recipes t
+             JOIN cards c ON c.card_id=t.card_id WHERE t.terminal_id=?1",
+            [terminal.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((owner, workspace, existence)) = owner else {
+        return Ok(None);
+    };
+    let alias = parse_id("terminal owner", &owner)?;
+    if alias == canonical
+        || workspace != state.id.to_string()
+        || !matches!(
+            from_json::<Existence>("terminal owner existence", &existence)?,
+            Existence::Closed { .. }
+        )
+    {
+        return Ok(None);
+    }
+    let Some(source) = state.cards.iter().find(|card| card.id == alias) else {
+        return Ok(None);
+    };
+    if source.existence != from_json::<Existence>("terminal owner existence", &existence)?
+        || !matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal)
+    {
+        return Ok(None);
+    }
+    Ok(Some(TerminalPaneAdoption {
+        alias,
+        canonical,
+        terminal,
+    }))
+}
+
 /// What storage holds after a workspace snapshot commits. The writer lane keeps
 /// this as the base for its next snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -606,41 +656,7 @@ impl StateStore {
     ) -> Result<Option<TerminalPaneAdoption>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let owner: Option<(String, String, String)> = inner
-            .connection
-            .query_row(
-                "SELECT c.card_id,c.workspace_id,c.existence_json FROM terminal_recipes t
-             JOIN cards c ON c.card_id=t.card_id WHERE t.terminal_id=?1",
-                [terminal.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((owner, workspace, existence)) = owner else {
-            return Ok(None);
-        };
-        let alias = parse_id("terminal owner", &owner)?;
-        if alias == canonical
-            || workspace != state.id.to_string()
-            || !matches!(
-                from_json::<Existence>("terminal owner existence", &existence)?,
-                Existence::Closed { .. }
-            )
-        {
-            return Ok(None);
-        }
-        let Some(source) = state.cards.iter().find(|card| card.id == alias) else {
-            return Ok(None);
-        };
-        if source.existence != from_json::<Existence>("terminal owner existence", &existence)?
-            || !matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal)
-        {
-            return Ok(None);
-        }
-        Ok(Some(TerminalPaneAdoption {
-            alias,
-            canonical,
-            terminal,
-        }))
+        select_closed_terminal_adoption(&inner.connection, state, canonical, terminal)
     }
 
     /// Repair one already-closed historical owner from an authoritative shared
@@ -886,7 +902,19 @@ impl StateStore {
         base: SnapshotBase<'_>,
         adoptions: &[TerminalPaneAdoption],
     ) -> Result<WorkspaceCommit> {
-        if adoptions.is_empty() {
+        self.save_workspace_with_terminal_panes(state, base, adoptions, &[])
+    }
+
+    /// Resolve restored recipe ownership and commit all canonical changes in
+    /// the same ordered writer transaction as their navigation snapshot.
+    pub(crate) fn save_workspace_with_terminal_panes(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[TerminalPaneAdoption],
+        restorations: &[TerminalPaneRestoration],
+    ) -> Result<WorkspaceCommit> {
+        if adoptions.is_empty() && restorations.is_empty() {
             return self.save_workspace(state, base);
         }
         let mut inner = self.lock_inner()?;
@@ -900,7 +928,24 @@ impl StateStore {
         transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
         let mut prepared = state.clone();
         let mut generations = base.cards.clone();
-        for adoption in adoptions {
+        let mut adoptions = adoptions.to_vec();
+        for restoration in restorations {
+            if !state.cards.iter().any(|card| card.id == restoration.canonical
+                && card.existence.is_open()
+                && matches!(&card.kind, CardKind::Terminal(session) if session.id == restoration.terminal)) {
+                return Err(StoreError::InvalidState("terminal restoration needs its exact open canonical pane".into()));
+            }
+            if let Some(adoption) = select_closed_terminal_adoption(
+                &transaction,
+                state,
+                restoration.canonical,
+                restoration.terminal,
+            )? && !adoptions.contains(&adoption)
+            {
+                adoptions.push(adoption);
+            }
+        }
+        for adoption in &adoptions {
             let source = state
                 .cards
                 .iter()
@@ -1988,6 +2033,14 @@ impl StateStore {
         let mut live = HashSet::new();
         collect_live_terminal_ids(&inner.connection, &mut live)?;
         Ok(live)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_writer_holds_connection(&self) -> bool {
+        matches!(
+            self.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
     }
 
     fn lock_inner(&self) -> Result<MutexGuard<'_, StoreInner>> {
@@ -5481,6 +5534,53 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        // The writer resolves the actual second owner, not the first matching archive.
+        state.cards[1].existence = store.load_card(second.id, None).unwrap().unwrap().existence;
+        let mut target = second.clone();
+        target.id = canonical;
+        state.cards.push(target);
+        state.focused = Some(canonical);
+        store
+            .save_workspace_with_terminal_panes(
+                &state,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                &[],
+                &[TerminalPaneRestoration {
+                    canonical,
+                    terminal,
+                }],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .load_card(first, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        assert!(
+            !store
+                .load_card(second.id, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        let inner = store.lock_inner().unwrap();
+        let owner: String = inner
+            .connection
+            .query_row(
+                "SELECT card_id FROM terminal_recipes WHERE terminal_id=?1",
+                [terminal.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, canonical.to_string());
     }
 
     #[test]

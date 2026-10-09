@@ -21,9 +21,31 @@ pub(super) struct State {
     default_requests: HashSet<CardId>,
     pub blocked: HashSet<Scope>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+    pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+    restoration_requests: HashMap<CardId, TerminalId>,
 }
 
 impl State {
+    pub(super) fn prune_restoration_requests(&mut self, workspace: &WorkspaceState) {
+        if self.restoration_requests.is_empty() {
+            return;
+        }
+        let open = workspace
+            .cards
+            .iter()
+            .filter_map(|card| {
+                if card.existence.is_open() {
+                    if let CardKind::Terminal(session) = &card.kind {
+                        return Some((card.id, session.id));
+                    }
+                }
+                None
+            })
+            .collect::<HashMap<_, _>>();
+        self.restoration_requests
+            .retain(|card, terminal| open.get(card) == Some(terminal));
+    }
+
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
         let mut state = Self::default();
         state.retained = workspace.local_only_cards.clone();
@@ -370,6 +392,7 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        self.shared_views.prune_restoration_requests(&self.durable);
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         let mut views = self.workspace_model.views.clone();
@@ -519,31 +542,44 @@ impl Cagents {
         }
     }
 
-    fn prepare_closed_terminal_adoption(&mut self, pane: &Pane) {
+    fn prepare_terminal_restoration(&mut self, pane: &Pane) {
         let CardKind::Terminal(terminal) = &pane.kind else {
             return;
         };
-        let Some(session) = &self.session else {
-            return;
-        };
-        let adoption = session.operation_store().closed_terminal_pane_adoption(
-            &self.durable,
-            pane.id,
-            terminal.id,
-        );
-        match adoption {
-            Ok(Some(adoption)) => {
-                if !self.shared_views.adoptions.contains(&adoption) {
-                    // The alias was already closed. Keep its tombstone, runtime,
-                    // and any archived draft intact; the canonical pane's draft
-                    // and live actor also remain untouched.
-                    self.shared_views.adoptions.push(adoption);
-                }
+        let already_projected = self.durable.cards.iter().any(|card| {
+            card.id == pane.id
+                && card.existence.is_open()
+                && matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal.id)
+        });
+        if already_projected {
+            if self.shared_views.restoration_requests.get(&pane.id) == Some(&terminal.id) {
+                return;
             }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, pane = %pane.id,
-                "could not resolve an archived canonical terminal owner"),
+        } else {
+            // A new reopen must resolve ownership again. The writer retains
+            // queued intents across transient failures independently of this
+            // projection-local deduplication.
+            self.shared_views.restoration_requests.remove(&pane.id);
         }
+        if self.session.is_none() || !self.durable.cards.iter().any(|source| {
+            source.id != pane.id
+                && !source.existence.is_open()
+                && matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal.id)
+        }) {
+            return;
+        }
+        // Resolving the recipe's actual archived owner belongs to the ordered
+        // writer checkpoint. Even a contended autosave must not block native input.
+        let restoration = crate::persistence::TerminalPaneRestoration {
+            canonical: pane.id,
+            terminal: terminal.id,
+        };
+        if !self.shared_views.restorations.contains(&restoration) {
+            self.shared_views.restorations.push(restoration);
+        }
+        self.shared_views
+            .restoration_requests
+            .insert(pane.id, terminal.id);
     }
 
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
@@ -596,7 +632,7 @@ impl Cagents {
             self.detach_shared_pane(id);
         }
         for shared in &view.panes {
-            self.prepare_closed_terminal_adoption(shared);
+            self.prepare_terminal_restoration(shared);
             let mut projected = shared.clone();
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
@@ -1011,6 +1047,145 @@ mod tests {
         (app, a, b, pane)
     }
     #[test]
+    fn shared_terminal_reconcile_does_not_block_native_input_on_autosave_contention() {
+        fn run(closed_owner: bool) -> Duration {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.sqlite3");
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let mut card = app.durable.cards[0].clone();
+            let source_id = card.id;
+            if closed_owner {
+                card.id = CardId::new();
+            }
+            assert!(matches!(card.kind, CardKind::Terminal(_)));
+            let channel = ChannelId::new();
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    id: channel,
+                    project_id: ProjectId::new(),
+                    title: "shared terminal".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: true,
+                    cards: vec![source_id],
+                    focused: Some(source_id),
+                });
+            let mut view = View::empty(Scope::Channel(channel));
+            view.panes.push(Pane::from_card(&card, None).unwrap());
+            app.workspace_model.views.push(view);
+            app.shared_views.initialized.insert(Scope::Channel(channel));
+            let (runtime, _) = crate::session::SessionRuntime::open(
+                &path,
+                crate::model::BootId::new("adoption-contention"),
+            )
+            .unwrap();
+            runtime.snapshot(Arc::clone(&app.durable));
+            runtime.flush(Duration::from_secs(5)).unwrap();
+            let store = runtime.operation_store();
+            app.session = Some(runtime);
+            if closed_owner {
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.cards[0].existence = Existence::Closed {
+                    tombstone: crate::model::Tombstone {
+                        operation_id: None,
+                        closed_at_unix_ms: 123,
+                        reason: Some("already closed historical owner".into()),
+                    },
+                };
+                durable.focused = None;
+                let navigation = durable
+                    .channels
+                    .iter_mut()
+                    .find(|item| item.id == channel)
+                    .unwrap();
+                navigation.cards.clear();
+                navigation.focused = None;
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .snapshot(Arc::clone(&app.durable));
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(5))
+                    .unwrap();
+                let CardKind::Terminal(terminal) = &card.kind else {
+                    unreachable!()
+                };
+                assert!(
+                    store
+                        .closed_terminal_pane_adoption(&app.durable, card.id, terminal.id)
+                        .unwrap()
+                        .is_some(),
+                    "fixture needs an actual closed DB recipe owner"
+                );
+            }
+            let (entered, ready) = std::sync::mpsc::channel();
+            let (begin_delay, begin) = std::sync::mpsc::channel();
+            let blocker = std::thread::spawn(move || {
+                let mut connection = rusqlite::Connection::open(path).unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                entered.send(()).unwrap();
+                if begin.recv_timeout(Duration::from_secs(4)).is_ok() {
+                    std::thread::sleep(Duration::from_millis(600));
+                }
+                transaction.rollback().unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut pending = (*app.durable).clone();
+            pending.cards[0].title = "ordinary pending autosave".into();
+            app.session.as_ref().unwrap().snapshot(Arc::new(pending));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !store.audit_writer_holds_connection() {
+                assert!(
+                    Instant::now() < deadline,
+                    "autosave did not acquire its connection"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            begin_delay.send(()).unwrap();
+            // This is the actual synchronous native model-update callback.
+            let started = Instant::now();
+            drop(app.reconcile_shared_views());
+            let elapsed = started.elapsed();
+            blocker.join().unwrap();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            eprintln!(
+                "shared terminal reconciliation closed_owner={closed_owner} blocked native input for {elapsed:?}"
+            );
+            if closed_owner {
+                let restored = store
+                    .load_card(card.id, None)
+                    .unwrap()
+                    .expect("canonical pane checkpoint lands");
+                assert!(restored.existence.is_open());
+                assert!(
+                    !store
+                        .load_card(source_id, None)
+                        .unwrap()
+                        .unwrap()
+                        .existence
+                        .is_open()
+                );
+            }
+            elapsed
+        }
+        let normal = run(false);
+        let restoration = run(true);
+        assert!(
+            normal < Duration::from_millis(100) && restoration < Duration::from_millis(100),
+            "native model callbacks waited on contended autosave: normal={normal:?}, closed-owner restoration={restoration:?}"
+        );
+    }
+
+    #[test]
     fn closed_terminal_shared_adoption_preserves_closure_and_both_drafts() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -1041,17 +1216,19 @@ mod tests {
         runtime.flush(Duration::from_secs(5)).unwrap();
         let store = runtime.operation_store();
         app.session = Some(runtime);
-        app.prepare_closed_terminal_adoption(&pane);
-        app.prepare_closed_terminal_adoption(&pane);
-        assert_eq!(app.shared_views.adoptions.len(), 1);
+        app.prepare_terminal_restoration(&pane);
+        app.prepare_terminal_restoration(&pane);
+        assert_eq!(app.shared_views.restorations.len(), 1);
+        assert!(app.shared_views.adoptions.is_empty());
         assert_eq!(*app.durable, before);
         assert!(app.terminal_starts.lock().unwrap().is_empty());
         Arc::make_mut(&mut app.durable)
             .cards
             .push(canonical.clone());
-        app.session.as_ref().unwrap().snapshot_terminal_adoptions(
+        app.session.as_ref().unwrap().snapshot_terminal_panes(
             Arc::clone(&app.durable),
             app.shared_views.adoptions.clone(),
+            app.shared_views.restorations.clone(),
         );
         app.session
             .as_ref()
@@ -1071,9 +1248,24 @@ mod tests {
                 .is_open()
         );
         assert_eq!(app.durable.chat_drafts, before.chat_drafts);
-        app.shared_views.adoptions.clear();
-        app.prepare_closed_terminal_adoption(&pane);
+        app.shared_views.restorations.clear();
+        app.prepare_terminal_restoration(&pane);
         assert!(app.shared_views.adoptions.is_empty());
+        // Repeated shared-view refreshes retain coalesced autosave behavior.
+        // The ordered writer already owns the first restoration checkpoint.
+        assert!(app.shared_views.restorations.is_empty());
+        let canonical_card = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == canonical.id)
+            .unwrap();
+        canonical_card.existence = before.cards[0].existence.clone();
+        // A close observed by persistence clears the memo before any later
+        // projection can reopen the same canonical identity.
+        app.shared_views.prune_restoration_requests(&app.durable);
+        assert!(app.shared_views.restoration_requests.is_empty());
+        app.prepare_terminal_restoration(&pane);
+        assert_eq!(app.shared_views.restorations.len(), 1);
     }
 
     #[test]
