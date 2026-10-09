@@ -118,7 +118,12 @@ pub(super) struct Handle(Arc<Shared>);
 
 impl Handle {
     fn change(&self, change: impl FnOnce(&mut Pending)) {
-        change(&mut self.0.pending.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped {
+            return;
+        }
+        change(&mut pending);
+        drop(pending);
         let _ = self.0.wake.try_send(());
     }
 
@@ -217,20 +222,14 @@ impl Broker {
         let thread = thread::Builder::new()
             .name("cagentsd-notifications".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                match runtime {
-                    Ok(runtime) => runtime.block_on(run(shared, host, receiver, application)),
-                    Err(error) => publish(
-                        &shared,
-                        &host,
-                        Snapshot {
-                            diagnostic: Some(format!("Notifications unavailable: {error}")),
-                            ..Default::default()
-                        },
-                    ),
-                }
+                supervise(&shared, &host, || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    runtime.block_on(run(shared.clone(), host.clone(), receiver, application));
+                    Ok(())
+                });
             })?;
         Ok(Self {
             handle,
@@ -249,6 +248,36 @@ impl Drop for Broker {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn supervise(
+    shared: &Weak<Shared>,
+    host: &Weak<HostLock>,
+    run: impl FnOnce() -> Result<(), String>,
+) {
+    if let Err(error) = super::service::attempt("notification service", run) {
+        tracing::warn!(%error, "desktop notifications are unavailable");
+        let Some(core) = shared.upgrade() else {
+            return;
+        };
+        let pending = std::mem::replace(
+            &mut *core.pending.lock().unwrap_or_else(|p| p.into_inner()),
+            Pending {
+                stopped: true,
+                ..Default::default()
+            },
+        );
+        answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+        // Attention already collected by the broker remains readable even if
+        // its portal/runtime fails. Only the delivery capability is lost.
+        let mut snapshot = core
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        snapshot.diagnostic = Some(format!("Notifications unavailable: {error}"));
+        publish(shared, host, snapshot);
     }
 }
 
@@ -711,6 +740,74 @@ async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_panic_publishes_failure_preserves_attention_and_releases_requesters() {
+        let (wake, _receiver) = mpsc::channel(1);
+        let handle = Handle(Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        }));
+        let host = crate::host::service::test_host();
+        let notice = Notice {
+            id: Uuid::new_v4(),
+            event: Event {
+                target: Target::Session(TerminalId::new()),
+                source_session: None,
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: "collected-before-panic".into(),
+                    kind: crate::notifications::Kind::Succeeded,
+                },
+            },
+            delivered: false,
+            acknowledged: false,
+            window: None,
+        };
+        handle
+            .0
+            .snapshot
+            .lock()
+            .unwrap()
+            .notices
+            .push(notice.clone());
+        let pending_test = handle.test();
+        let shared = Arc::downgrade(&handle.0);
+        let thread = std::thread::spawn(move || {
+            supervise(&shared, &Arc::downgrade(&host), || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let _guard = host.lock().unwrap();
+                        let _reentrant = host.lock().unwrap();
+                        unreachable!();
+                    })
+            });
+        });
+        thread.join().unwrap();
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.notices, vec![notice]);
+        assert!(
+            snapshot
+                .diagnostic
+                .unwrap()
+                .starts_with("Notifications unavailable:")
+        );
+        assert!(matches!(
+            pending_test.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TestOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            handle.test().recv_timeout(Duration::from_secs(1)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
 
     #[test]
     fn retirement_coalescing_preserves_only_later_worker_evidence() {

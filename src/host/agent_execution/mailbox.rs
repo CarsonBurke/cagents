@@ -359,11 +359,19 @@ impl Drop for Courier {
 
 impl Handle {
     fn run(&self) {
+        self.run_with(|| self.prune(), |host| self.deliver(host));
+    }
+
+    fn run_with(
+        &self,
+        mut prune: impl FnMut() -> Result<(), String>,
+        mut deliver: impl FnMut(&SharedHost) -> Result<Option<u64>, String>,
+    ) {
         let mut pruned_at: Option<Instant> = None;
         loop {
             if pruned_at.is_none_or(|at| at.elapsed() >= PRUNE_EVERY) {
                 pruned_at = Some(Instant::now());
-                if let Err(error) = self.prune() {
+                if let Err(error) = crate::host::service::attempt("message pruning", &mut prune) {
                     tracing::warn!(%error, "cannot forget old messages");
                 }
             }
@@ -377,7 +385,7 @@ impl Handle {
             let Some(host) = self.0.host.upgrade() else {
                 return;
             };
-            let delay = match self.deliver(&host) {
+            let delay = match crate::host::service::attempt("message delivery", || deliver(&host)) {
                 Ok(Some(released)) => {
                     Duration::from_millis(released.saturating_sub(super::now())).min(FALLBACK)
                 }
@@ -509,5 +517,49 @@ impl Handle {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn courier_survives_prune_and_delivery_panics_and_stops() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = crate::host::service::test_host();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            )),
+            seal: Arc::new(Seal::new([7; 32])),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+        }));
+        let owner = handle.clone();
+        let (reported, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut deliveries = 0;
+            owner.run_with(
+                || panic!("injected pruning failure"),
+                |host| {
+                    deliveries += 1;
+                    if deliveries == 1 {
+                        owner.wake();
+                        let _guard = host.lock().unwrap();
+                        let _reentrant = host.lock().unwrap();
+                        unreachable!();
+                    }
+                    // The guard from the failed attempt has unwound.
+                    let _guard = host.lock().unwrap();
+                    owner.0.state.lock().unwrap().stopped = true;
+                    reported.send(deliveries).unwrap();
+                    Ok(None)
+                },
+            );
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        thread.join().unwrap();
     }
 }

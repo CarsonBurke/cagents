@@ -286,6 +286,10 @@ impl Handle {
     }
 
     fn run(&self) {
+        self.run_with(|host| self.tick(host));
+    }
+
+    fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Duration, String>) {
         loop {
             let observed = {
                 let state = self.0.wake.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -297,7 +301,8 @@ impl Handle {
             let Some(host) = self.0.host.upgrade() else {
                 break;
             };
-            let delay = match self.tick(&host) {
+            let delay = match crate::host::service::attempt("automation scheduling", || tick(&host))
+            {
                 Ok(delay) => delay,
                 Err(error) => {
                     tracing::warn!(%error, "automation scheduling is temporarily unavailable");
@@ -730,6 +735,42 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
 mod tests {
     use super::*;
     use crate::host::state::HostState;
+
+    #[test]
+    fn scheduler_retries_a_panicked_tick_and_stops() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = crate::host::service::test_host();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            )),
+            root: directory.path().into(),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+        }));
+        let (reported, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut ticks = 0;
+            handle.run_with(|host| {
+                ticks += 1;
+                if ticks == 1 {
+                    handle.0.wake.notify();
+                    let _guard = host.lock().unwrap();
+                    let _reentrant = host.lock().unwrap();
+                    unreachable!();
+                }
+                let _guard = host.lock().unwrap();
+                handle.0.wake.state.lock().unwrap().stopped = true;
+                reported.send(ticks).unwrap();
+                Ok(Duration::ZERO)
+            });
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        thread.join().unwrap();
+    }
 
     #[test]
     fn update_write_gate_defers_precheck_observation_without_blocking_scheduler_shutdown() {

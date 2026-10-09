@@ -210,17 +210,9 @@ impl Monitor {
             match thread::Builder::new()
                 .name(format!("cagentsd-activity-{index}"))
                 .spawn(move || {
-                    for candidate in received {
-                        let outcome = if wake.generation().is_some() {
-                            observe(&host, &candidate)
-                        } else {
-                            Outcome::Failed
-                        };
-                        if completed.send((candidate, outcome)).is_err() {
-                            break;
-                        }
-                        wake.completed();
-                    }
+                    work(received, completed, &wake, |candidate| {
+                        observe(&host, candidate)
+                    });
                 }) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -237,51 +229,7 @@ impl Monitor {
         let thread = thread::Builder::new()
             .name("cagentsd-activity".into())
             .spawn(move || {
-                let mut schedule = Schedule::default();
-                let mut process_generation = None;
-                while let Some(generation) = coordinator_wake.generation() {
-                    let Some(host) = host.upgrade() else {
-                        break;
-                    };
-                    let observed_generation = coordinator_wake.process_generation();
-                    if process_generation != Some(observed_generation) {
-                        let candidates = {
-                            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                            if state.shutting_down {
-                                break;
-                            }
-                            state
-                                .terminals
-                                .iter()
-                                .filter_map(|(&id, record)| {
-                                    if record.handle.is_completed() {
-                                        return None;
-                                    }
-                                    let process = record.handle.cached_agent_process()?;
-                                    matches!(process.provider, Provider::Claude | Provider::Codex)
-                                        .then(|| Candidate {
-                                            id,
-                                            process,
-                                            handle: record.handle.clone(),
-                                            proof: state.proof().clone(),
-                                        })
-                                })
-                                .collect()
-                        };
-                        schedule.reconcile(candidates, Instant::now());
-                        process_generation = Some(observed_generation);
-                    }
-                    for (candidate, outcome) in results.try_iter() {
-                        schedule.complete(&candidate, outcome, Instant::now());
-                    }
-                    while let Some(candidate) = schedule.next(Instant::now()) {
-                        if jobs.send(candidate).is_err() {
-                            break;
-                        }
-                    }
-                    drop(host);
-                    coordinator_wake.wait(generation, schedule.deadline());
-                }
+                coordinate(host, &coordinator_wake, &jobs, &results, candidates);
                 drop(jobs);
                 for worker in workers {
                     let _ = worker.join();
@@ -300,6 +248,100 @@ impl Drop for Monitor {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn work(
+    received: crossbeam_channel::Receiver<Candidate>,
+    completed: crossbeam_channel::Sender<(Candidate, Outcome)>,
+    wake: &Wake,
+    mut observe: impl FnMut(&Candidate) -> Outcome,
+) {
+    for candidate in received {
+        let outcome = if wake.generation().is_some() {
+            super::service::attempt("agent activity observation", || Ok(observe(&candidate)))
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "agent activity observation failed");
+                    Outcome::Failed
+                })
+        } else {
+            Outcome::Failed
+        };
+        if completed.send((candidate, outcome)).is_err() {
+            break;
+        }
+        wake.completed();
+    }
+}
+
+fn candidates(host: &SharedHost) -> Option<Vec<Candidate>> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.shutting_down {
+        return None;
+    }
+    Some(
+        state
+            .terminals
+            .iter()
+            .filter_map(|(&id, record)| {
+                if record.handle.is_completed() {
+                    return None;
+                }
+                let process = record.handle.cached_agent_process()?;
+                matches!(process.provider, Provider::Claude | Provider::Codex).then(|| Candidate {
+                    id,
+                    process,
+                    handle: record.handle.clone(),
+                    proof: state.proof().clone(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn coordinate(
+    host: Weak<HostLock>,
+    coordinator_wake: &Wake,
+    jobs: &crossbeam_channel::Sender<Candidate>,
+    results: &crossbeam_channel::Receiver<(Candidate, Outcome)>,
+    mut candidates: impl FnMut(&SharedHost) -> Option<Vec<Candidate>>,
+) {
+    let mut schedule = Schedule::default();
+    let mut process_generation = None;
+    while let Some(generation) = coordinator_wake.generation() {
+        let Some(host) = host.upgrade() else {
+            break;
+        };
+        let observed_generation = coordinator_wake.process_generation();
+        if process_generation != Some(observed_generation) {
+            match super::service::attempt("activity reconciliation", || {
+                let Some(candidates) = candidates(&host) else {
+                    return Ok(false);
+                };
+                schedule.reconcile(candidates, Instant::now());
+                Ok(true)
+            }) {
+                Ok(false) => break,
+                Ok(true) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "agent activity reconciliation is temporarily unavailable");
+                    drop(host);
+                    coordinator_wake.wait(generation, Some(Instant::now() + INTERVAL));
+                    continue;
+                }
+            }
+            process_generation = Some(observed_generation);
+        }
+        for (candidate, outcome) in results.try_iter() {
+            schedule.complete(&candidate, outcome, Instant::now());
+        }
+        while let Some(candidate) = schedule.next(Instant::now()) {
+            if jobs.send(candidate).is_err() {
+                break;
+            }
+        }
+        drop(host);
+        coordinator_wake.wait(generation, schedule.deadline());
     }
 }
 
@@ -419,6 +461,74 @@ mod tests {
                 host_incarnation: HostIncarnation::new("activity-test"),
             },
         }
+    }
+
+    #[test]
+    fn activity_worker_reports_panics_and_observes_the_next_job() {
+        let candidate = candidate();
+        let host = crate::host::service::test_host();
+        let wake = Arc::new(Wake::default());
+        let (jobs, received) = crossbeam_channel::bounded(1);
+        let (completed, results) = crossbeam_channel::unbounded();
+        let worker_wake = wake.clone();
+        let thread = std::thread::spawn(move || {
+            let mut calls = 0;
+            work(received, completed, &worker_wake, |_| {
+                calls += 1;
+                let _guard = host.lock().unwrap();
+                if calls == 1 {
+                    let _reentrant = host.lock().unwrap();
+                    unreachable!();
+                }
+                Outcome::Observed
+            });
+        });
+        let now = Instant::now();
+        let mut schedule = Schedule::default();
+        schedule.reconcile(vec![candidate.clone()], now);
+        jobs.send(schedule.next(now).unwrap()).unwrap();
+        let (failed, outcome) = results.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Failed));
+        schedule.complete(&failed, outcome, now);
+        assert!(schedule.next(now + INTERVAL).is_none());
+        jobs.send(schedule.next(now + INTERVAL * 2).unwrap())
+            .unwrap();
+        let (observed, outcome) = results.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, Outcome::Observed));
+        schedule.complete(&observed, outcome, now);
+        drop(jobs);
+        thread.join().unwrap();
+        let _ = candidate.handle.shutdown();
+    }
+
+    #[test]
+    fn activity_coordinator_retries_panicked_reconciliation_without_a_new_process_event() {
+        let candidate = candidate();
+        let host = crate::host::service::test_host();
+        let weak_host = Arc::downgrade(&host);
+        let wake = Arc::new(Wake::default());
+        let (jobs, received) = crossbeam_channel::bounded(1);
+        let (_completed, results) = crossbeam_channel::unbounded();
+        let coordinator_wake = wake.clone();
+        let returned = candidate.clone();
+        let thread = std::thread::spawn(move || {
+            let mut calls = 0;
+            coordinate(weak_host, &coordinator_wake, &jobs, &results, |host| {
+                calls += 1;
+                let _guard = host.lock().unwrap();
+                if calls == 1 {
+                    let _reentrant = host.lock().unwrap();
+                    unreachable!();
+                }
+                Some(vec![returned.clone()])
+            });
+            calls
+        });
+        let dispatched = received.recv_timeout(Duration::from_secs(5));
+        wake.stop();
+        assert_eq!(thread.join().unwrap(), 2);
+        assert_eq!(dispatched.unwrap().id, candidate.id);
+        let _ = candidate.handle.shutdown();
     }
 
     #[test]
