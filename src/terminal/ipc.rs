@@ -128,7 +128,8 @@ use crate::{
 /// Version 61 carries owner-scoped agent names and directory channel membership.
 /// Version 62 guards non-UI interrupts and binds stop/update consent to
 /// the running background subagents it would terminate.
-pub const PROTOCOL_VERSION: u16 = 62;
+/// Version 63 carries the daemon-observed completion time of a native turn.
+pub const PROTOCOL_VERSION: u16 = 63;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2029,6 +2030,28 @@ mod tests {
         let applied = wire.apply(Some(&restored)).unwrap();
         assert_eq!(applied.activity, next.activity);
         assert_eq!(applied.lines, restored.lines);
+    }
+
+    #[test]
+    fn chat_completion_time_round_trips_and_old_json_remains_unknown() {
+        let snapshot = crate::chat::Snapshot {
+            finished_at: Some(1_700_000_000_123),
+            turn_generation: 7,
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(snapshot.clone()),
+        };
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("finished_at");
+        let restored: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.finished_at, None);
+        assert_eq!(restored.turn_generation, 7);
     }
 
     #[test]

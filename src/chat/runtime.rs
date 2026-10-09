@@ -1474,6 +1474,7 @@ struct Actor {
 struct TurnAttention {
     key: String,
     settled: bool,
+    started: bool,
 }
 
 impl Default for TurnAttention {
@@ -1481,6 +1482,7 @@ impl Default for TurnAttention {
         Self {
             key: uuid::Uuid::new_v4().to_string(),
             settled: false,
+            started: false,
         }
     }
 }
@@ -1488,7 +1490,11 @@ impl Default for TurnAttention {
 impl TurnAttention {
     fn apply(&mut self, event: &Event) -> Option<crate::notifications::Evidence> {
         match event {
-            Event::TurnStarted => *self = Self::default(),
+            Event::TurnStarted => {
+                *self = Self::default();
+                self.started = true;
+            }
+            Event::Reset { .. } => *self = Self::default(),
             Event::TurnSettled => self.settled = true,
             Event::TurnFinished { key, outcome } => {
                 return Some(crate::notifications::Evidence {
@@ -1499,6 +1505,27 @@ impl TurnAttention {
             _ => {}
         }
         None
+    }
+
+    fn finish(&self, state: &mut Snapshot, at: Option<u64>) -> bool {
+        if matches!(
+            state.activity(),
+            ActivityState::Working | ActivityState::Waiting
+        ) {
+            // Providers can announce a background task in a later frame than
+            // the parent's settlement. Its eventual finish must replace the
+            // earlier idle time, rather than merely reveal it again.
+            return state.finished_at.take().is_some();
+        }
+        if self.started
+            && self.settled
+            && state.activity() == ActivityState::Idle
+            && state.finished_at.is_none()
+        {
+            state.finished_at = at;
+            return at.is_some();
+        }
+        false
     }
 }
 impl Actor {
@@ -2141,6 +2168,7 @@ impl Actor {
             }
         }
         if matches!(&event, Event::Reset { .. }) {
+            self.attention.apply(&event);
             *self
                 .confirmed_session
                 .lock()
@@ -2167,7 +2195,13 @@ impl Actor {
         self.dirty = true;
     }
     fn publish_activity(&mut self) {
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // Evaluate after the whole provider frame, including any children or
+        // attention requests reported after the parent result.
+        if self.attention.finish(&mut state, observed_at()) {
+            state.generation = state.generation.saturating_add(1);
+            self.dirty = true;
+        }
         let activity = state.activity();
         let generation = state.generation;
         let became_ready = state.ready && !self.ready;
@@ -2315,6 +2349,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::TurnStarted => {
             state.turn_generation = state.turn_generation.wrapping_add(1);
+            state.finished_at = None;
         }
         Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
         Event::ItemsRemoved { ids } => {
@@ -2346,6 +2381,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),
         Event::Reset { reason } => {
+            state.finished_at = None;
             state.branch_points.clear();
             state.forked = None;
             state.interrupt_mode = None;
@@ -2921,6 +2957,74 @@ mod tests {
     }
 
     #[test]
+    fn completion_time_waits_for_provider_settlement_and_background_work() {
+        let mut attention = TurnAttention::default();
+        let mut state = Snapshot::default();
+        attention.apply(&Event::TurnFinished {
+            key: None,
+            outcome: crate::notifications::Kind::Succeeded,
+        });
+        assert!(
+            !attention.finish(&mut state, Some(10)),
+            "imported history has no observed start"
+        );
+        attention.apply(&Event::TurnStarted);
+        state.busy = true;
+        attention.apply(&Event::TurnSettled);
+        assert!(!attention.finish(&mut state, Some(20)));
+        state.busy = false;
+        state.subagents.push(crate::chat::Subagent {
+            id: "child".into(),
+            kind: "test".into(),
+            description: "Background work".into(),
+            status: crate::chat::ToolStatus::Running,
+            background: true,
+            items: Vec::new(),
+        });
+        assert!(!attention.finish(&mut state, Some(30)));
+        state.subagents[0].status = crate::chat::ToolStatus::Succeeded;
+        state.waiting = true;
+        assert!(
+            !attention.finish(&mut state, Some(40)),
+            "attention still required"
+        );
+        state.waiting = false;
+        assert!(attention.finish(&mut state, Some(50)));
+        assert_eq!(state.finished_at, Some(50));
+        assert!(
+            !attention.finish(&mut state, Some(60)),
+            "heartbeat cannot move completion"
+        );
+        attention.apply(&Event::TurnFinished {
+            key: Some("delayed-outcome".into()),
+            outcome: crate::notifications::Kind::Cancelled,
+        });
+        assert!(!attention.finish(&mut state, Some(70)));
+        assert_eq!(state.finished_at, Some(50));
+        state.subagents[0].status = crate::chat::ToolStatus::Running;
+        assert!(attention.finish(&mut state, Some(75)));
+        assert_eq!(state.finished_at, None);
+        state.subagents[0].status = crate::chat::ToolStatus::Succeeded;
+        assert!(attention.finish(&mut state, Some(76)));
+        assert_eq!(state.finished_at, Some(76));
+        attention.apply(&Event::TurnStarted);
+        apply_event(&mut state, &mut BTreeMap::new(), Event::TurnStarted);
+        assert_eq!(state.finished_at, None);
+        assert!(!attention.finish(&mut state, Some(80)));
+        attention.apply(&Event::Reset {
+            reason: "reset".into(),
+        });
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Reset {
+                reason: "reset".into(),
+            },
+        );
+        assert!(!attention.finish(&mut state, Some(90)));
+    }
+
+    #[test]
     fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
         use super::*;
         let mut attention = TurnAttention::default();
@@ -2948,6 +3052,7 @@ mod tests {
             !attention.settled,
             "current transport failure still needs an outcome"
         );
+        assert!(!attention.finish(&mut Snapshot::default(), Some(100)));
     }
 
     use super::super::Role;
@@ -3834,6 +3939,80 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn actor_publishes_completion_only_after_the_entire_frame_and_late_children() {
+        struct CompletionFixture(usize);
+        impl Adapter for CompletionFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                let child = |status| Event::Subagent {
+                    id: "late-child".into(),
+                    kind: "test".into(),
+                    description: "Work".into(),
+                    status: Some(status),
+                    background: Some(true),
+                };
+                let events = match self.0 {
+                    1 => vec![
+                        Event::TurnStarted,
+                        Event::TurnSettled,
+                        Event::Status {
+                            busy: false,
+                            detail: "Idle".into(),
+                        },
+                        child(crate::chat::ToolStatus::Running),
+                    ],
+                    2 | 5 => vec![child(crate::chat::ToolStatus::Succeeded)],
+                    3 => vec![Event::Ready(true)],
+                    4 => vec![child(crate::chat::ToolStatus::Running)],
+                    _ => unreachable!(),
+                };
+                Ok(Step {
+                    events,
+                    ..Step::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(CompletionFixture(0));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle.command(Command::Refresh).unwrap();
+        let working = handle.snapshot(None).unwrap();
+        assert!(working.is_working());
+        assert_eq!(working.finished_at, None);
+        handle.command(Command::Refresh).unwrap();
+        let first = handle.snapshot(None).unwrap().finished_at.unwrap();
+        handle.command(Command::Refresh).unwrap();
+        assert_eq!(handle.snapshot(None).unwrap().finished_at, Some(first));
+        handle.command(Command::Refresh).unwrap();
+        assert_eq!(handle.snapshot(None).unwrap().finished_at, None);
+        handle.command(Command::Refresh).unwrap();
+        assert!(handle.snapshot(None).unwrap().finished_at.unwrap() >= first);
+        handle.close().unwrap();
     }
 
     #[test]

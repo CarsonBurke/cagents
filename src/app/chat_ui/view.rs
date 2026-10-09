@@ -1110,6 +1110,24 @@ impl Runtime {
                     transcript.push(notice_entry(error, target));
                 }
             }
+            if !snapshot.has_later
+                && snapshot.activity() == crate::agent::ActivityState::Idle
+                && snapshot.queued_messages.is_empty()
+                && self.queued.is_none()
+                && self.followups.is_empty()
+                && self.pending.is_none()
+                && let Some((_, label, full)) = &self.finished_stamp
+            {
+                transcript.push(
+                    widget::tooltip(
+                        design::caption(label.clone())
+                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                        design::caption(full.clone()),
+                        widget::tooltip::Position::Top,
+                    )
+                    .into(),
+                );
+            }
             if snapshot.has_later {
                 transcript.push(paging_view(
                     target,
@@ -3445,7 +3463,7 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
-        // An answer's footer says when it finished and offers to copy it, and
+        // An answer's hover footer dates the message and offers to copy it, and
         // nothing else: a reader of an answer reaches for those two, and the
         // Markdown source of a rendered answer was a developer's control on a
         // reader's surface.

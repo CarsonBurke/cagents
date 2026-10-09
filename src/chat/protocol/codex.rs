@@ -2202,7 +2202,6 @@ impl Adapter for Codex {
                 self.materialized = true;
                 let turn = &params["turn"];
                 if method == "turn/completed" {
-                    step.events.push(Event::TurnSettled);
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
                         Some("completed") => Some(Kind::Succeeded),
@@ -2225,6 +2224,9 @@ impl Adapter for Codex {
                 let current =
                     method == "turn/started" || self.turn.as_deref().is_none_or(|id| id == turn_id);
                 if current {
+                    if method == "turn/completed" {
+                        step.events.push(Event::TurnSettled);
+                    }
                     self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                     self.busy = method == "turn/started";
                     self.subagent_status = if self.busy {
@@ -3990,10 +3992,22 @@ mod tests {
             );
             if newer {
                 adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"new","item":{"id":"cmd","type":"commandExecution","command":"echo hi","cwd":"/tmp","status":"inProgress","commandActions":[]}}})).unwrap();
-                adapter.receive(complete).unwrap();
+                let old = adapter.receive(complete).unwrap();
+                assert!(
+                    !old.events
+                        .iter()
+                        .any(|event| matches!(event, Event::TurnSettled))
+                );
                 assert!(adapter.busy);
                 assert_eq!(adapter.turn.as_deref(), Some("new"));
                 assert!(!adapter.active_items.is_empty());
+                let current = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"new","status":"completed","items":[]}}})).unwrap();
+                assert!(
+                    current
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::TurnSettled))
+                );
             }
         }
     }
