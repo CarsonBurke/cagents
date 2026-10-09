@@ -315,6 +315,7 @@ fn write_with_sync(
     let published = (|| {
         // Keep the replacement private until the source's access rules
         // are installed, before writing any sensitive content.
+        fs_safety::copy_ownership(&original, &file).map_err(|error| error.to_string())?;
         fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
         file.write_all(content.as_bytes())
             .map_err(|error| error.to_string())?;
@@ -996,6 +997,33 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn remote_save_preserves_shared_file_ownership_and_access_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let Some(group) = crate::fs_safety::tests::shared_group(&file) else {
+            return;
+        };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let before = file.metadata().unwrap();
+        let reply = execute(Operation::Write {
+            root: directory.path().into(),
+            path: "shared.txt".into(),
+            expected: "before\n".into(),
+            content: "after\n".into(),
+        })
+        .unwrap();
+        assert!(matches!(reply, Reply::Saved));
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), group));
+        assert_eq!(after.mode() & 0o777, before.mode() & 0o777);
+        assert_eq!(std::fs::read(&path).unwrap(), b"after\n");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn concurrent_device_saves_conflict_instead_of_overwriting() {
         let directory = tempfile::tempdir().unwrap();
