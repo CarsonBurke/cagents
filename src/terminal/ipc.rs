@@ -2057,6 +2057,34 @@ mod tests {
     }
 
     #[test]
+    fn chat_prompt_suggestion_round_trips_and_old_json_remains_absent() {
+        let snapshot = crate::chat::Snapshot {
+            session_id: Some("session-exact".into()),
+            turn_generation: 7,
+            prompt_suggestion: Some(crate::chat::PromptSuggestion {
+                session_id: "session-exact".into(),
+                source: "turn-exact".into(),
+                turn_generation: 7,
+                text: "Check the resulting diff\nThen run tests".into(),
+            }),
+            ..Default::default()
+        };
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(snapshot.clone()),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("prompt_suggestion");
+        let restored: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.prompt_suggestion, None);
+        assert_eq!(restored.turn_generation, 7);
+    }
+
+    #[test]
     fn framing_round_trips_and_rejects_oversized_prefixes() {
         let message = ClientEnvelope {
             version: PROTOCOL_VERSION,

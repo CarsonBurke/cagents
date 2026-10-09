@@ -8013,7 +8013,16 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("session"));
         let target = chat_runtime(&app, card).target;
-        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).turn_generation = 7;
+        show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            chat::Snapshot {
+                session_id: Some("session".into()),
+                turn_generation: 7,
+                ready: true,
+                ..Default::default()
+            },
+        );
         write(&mut app, card, "Typed before the prediction");
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.replace_draft(text_editor::Content::new());

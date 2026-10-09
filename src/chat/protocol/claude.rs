@@ -1702,7 +1702,11 @@ impl Adapter for Claude {
                 event: crate::agent_execution::ProviderEvent::Scope,
             });
         }
-        if let Some(id) = frame["session_id"].as_str().filter(|id| !id.is_empty()) {
+        // Optional predictions cannot announce or replace the conversation's
+        // identity. Ignore wrong-session metadata without disrupting the chat.
+        if string(&frame, "type") != "prompt_suggestion"
+            && let Some(id) = frame["session_id"].as_str().filter(|id| !id.is_empty())
+        {
             validate_id(id)?;
             if self
                 .session_id
@@ -4566,8 +4570,19 @@ mod tests {
 
     #[test]
     fn prompt_suggestion_follows_only_current_completed_session_without_transcript_items() {
+        let session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let suggestion = |session: &str| json!({"type":"prompt_suggestion","session_id":session,"uuid":"suggestion","suggestion":"Run the focused tests"});
+        let mut unnamed = Claude::default();
+        assert!(
+            unnamed
+                .receive(suggestion(session))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(unnamed.session_id.is_none());
         let mut adapter = Claude {
-            session_id: Some("exact-session".into()),
+            session_id: Some(session.into()),
             ready: true,
             ..Default::default()
         };
@@ -4575,22 +4590,36 @@ mod tests {
         adapter
             .receive(json!({"type":"result","subtype":"success","is_error":false,"uuid":"result"}))
             .unwrap();
-        let suggestion = |session: &str| json!({"type":"prompt_suggestion","session_id":session,"uuid":"suggestion","suggestion":"Run the focused tests"});
         assert!(
             adapter
-                .receive(suggestion("other-session"))
+                .receive(suggestion("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"))
                 .unwrap()
                 .events
                 .is_empty()
         );
-        let accepted = adapter.receive(suggestion("exact-session")).unwrap();
+        assert_eq!(adapter.session_id.as_deref(), Some(session));
+        assert!(
+            adapter
+                .receive(
+                    json!({"type":"keep_alive","session_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"})
+                )
+                .is_err()
+        );
+        assert!(
+            adapter
+                .receive(suggestion("not-a-session"))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let accepted = adapter.receive(suggestion(session)).unwrap();
         assert!(
             matches!(accepted.events.as_slice(), [Event::PromptSuggestion { text, .. }] if text == "Run the focused tests")
         );
         assert!(accepted.writes.is_empty());
         assert!(
             adapter
-                .receive(suggestion("exact-session"))
+                .receive(suggestion(session))
                 .unwrap()
                 .events
                 .is_empty()
@@ -4608,7 +4637,7 @@ mod tests {
             .unwrap();
         assert!(
             !adapter
-                .receive(suggestion("exact-session"))
+                .receive(suggestion(session))
                 .unwrap()
                 .events
                 .iter()
