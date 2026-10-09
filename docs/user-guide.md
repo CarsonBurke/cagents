@@ -697,6 +697,13 @@ requests. OMP child activity is read-only: its installed RPC API has no child
 messaging, stop, or restart command. Large optional child histories are omitted
 without disconnecting the parent, while live activity remains available.
 
+The latest native chat page shows “Finished at” after the provider confirms
+the turn has settled and delegated work is finished. The time stays visible
+without hovering over an answer; its tooltip includes the full date. Resumed
+work clears it until the conversation settles again. Imported history whose
+completion time is unknown has no marker. This time records completion, not a
+guarantee that a provider's prompt cache remains available.
+
 See [native chat provider parity](native-chat-parity.md) for the supported
 operations and remaining provider-specific differences.
 

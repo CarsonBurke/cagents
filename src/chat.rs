@@ -745,6 +745,10 @@ pub struct Snapshot {
     /// and autonomous turns, even when publications coalesce the idle state.
     #[serde(default)]
     pub turn_generation: u64,
+    /// Daemon wall-clock time when a provider-confirmed turn and its delegated
+    /// work finished. Historical imports without an observed turn have no time.
+    #[serde(default)]
+    pub finished_at: Option<u64>,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,

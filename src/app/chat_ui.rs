@@ -1329,6 +1329,7 @@ pub(super) struct Runtime {
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
+    finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
@@ -1850,6 +1851,7 @@ impl Runtime {
                 ..Snapshot::default()
             }),
             source_clock: None,
+            finished_stamp: None,
             connection,
             queued: None,
             followups: Vec::new(),
@@ -2036,6 +2038,19 @@ impl Runtime {
         if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
         {
             return;
+        }
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+            self.finished_stamp = snapshot.finished_at.and_then(|at| {
+                let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
+                let full = format!(
+                    "{:04}-{:02}-{:02} {}",
+                    time.year + 1900,
+                    time.month + 1,
+                    time.day,
+                    time.clock()
+                );
+                Some((at, format!("Finished at {}", time.clock()), full))
+            });
         }
         self.subagent_scroll
             .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
