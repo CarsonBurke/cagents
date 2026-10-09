@@ -212,6 +212,8 @@ pub(crate) enum PlatformError {
     UnsafeRuntimeDirectory { path: PathBuf },
     #[error("daemon lock path {path:?} is not a regular file")]
     UnsafeLockPath { path: PathBuf },
+    #[error("daemon lock path {path:?} has {links} filesystem links; expected exactly one")]
+    UnsafeLockLinkCount { path: PathBuf, links: u64 },
     #[error("another cagents daemon owns {path:?}")]
     AlreadyRunning { path: PathBuf },
     #[error("refusing to replace non-socket runtime path {path:?}")]
@@ -732,7 +734,14 @@ fn validate_lock_file(
             path: path.to_owned(),
         });
     }
-    validate_owner(path, metadata, effective_uid)
+    validate_owner(path, metadata, effective_uid)?;
+    if metadata.nlink() != 1 {
+        return Err(PlatformError::UnsafeLockLinkCount {
+            path: path.to_owned(),
+            links: metadata.nlink(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_owner(
@@ -1105,6 +1114,72 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
         assert_eq!(mode(&target), 0o644);
+    }
+
+    fn hardlinked_lock_fixture() -> (tempfile::TempDir, RuntimePaths, PathBuf) {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("runtime");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.path().join("owned-existing-file.txt");
+        fs::write(&target, b"existing owned content must remain intact\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let paths = paths(directory);
+        fs::hard_link(&target, &paths.lock).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().nlink(), 2);
+        assert_eq!(
+            fs::metadata(&target).unwrap().ino(),
+            fs::metadata(&paths.lock).unwrap().ino()
+        );
+        (root, paths, target)
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn hardlinked_daemon_lock_is_refused_before_rewriting_the_other_name() {
+        let (_root, paths, target) = hardlinked_lock_fixture();
+        let before = fs::metadata(&target).unwrap();
+        let contents = fs::read(&target).unwrap();
+
+        assert!(matches!(
+            HostLease::acquire(&paths, &proof()),
+            Err(PlatformError::UnsafeLockLinkCount { path, links: 2 }) if path == paths.lock
+        ));
+
+        let after = fs::metadata(&target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), contents);
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o777, 0o640);
+        assert_eq!(after.nlink(), 2);
+    }
+
+    #[test]
+    fn hardlinked_lock_read_paths_refuse_without_recovering_the_socket() {
+        let (_root, paths, target) = hardlinked_lock_fixture();
+        let before = fs::metadata(&target).unwrap();
+        let contents = fs::read(&target).unwrap();
+        leave_stale_socket(&paths.socket);
+
+        assert!(matches!(
+            HostLease::is_held(&paths),
+            Err(PlatformError::UnsafeLockLinkCount { path, links: 2 }) if path == paths.lock
+        ));
+        assert!(matches!(
+            lease_owner(&paths.lock, &proof()),
+            Err(PlatformError::UnsafeLockLinkCount { path, links: 2 }) if path == paths.lock
+        ));
+        let mut lock = File::open(&paths.lock).unwrap();
+        assert!(matches!(
+            daemon_pidfd_from_lock(&mut lock, &paths),
+            Err(PlatformError::UnsafeLockLinkCount { path, links: 2 }) if path == paths.lock
+        ));
+
+        assert!(paths.socket.exists());
+        let after = fs::metadata(&target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), contents);
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o777, 0o640);
+        assert_eq!(after.nlink(), 2);
     }
 
     #[cfg(feature = "host")]
