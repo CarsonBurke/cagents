@@ -1,5 +1,6 @@
 mod account_ui;
 mod agent_ui;
+mod automation_approval;
 mod automation_ui;
 mod branch_ui;
 #[cfg(feature = "integrated-browser")]
@@ -4256,6 +4257,7 @@ pub enum Message {
     DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
+    AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -4818,6 +4820,7 @@ pub struct Cagents {
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
+    automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
@@ -10981,6 +10984,9 @@ impl Cagents {
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.automation_approval_open() {
+            return self.cancel_automation_approval();
+        }
         if self.session_recovery.open() {
             return self.update_session_recovery(session_recovery::Action::Cancel);
         }
@@ -11027,6 +11033,7 @@ impl Cagents {
         }
         self.session_recovery.open()
             || self.daemon_health_ui.confirmation
+            || self.automation_approval_open()
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
@@ -12648,6 +12655,7 @@ impl Application for Cagents {
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
+            automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
                     window_view
@@ -15382,6 +15390,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if let Some(task) = self.automation_approval_key(&event, captured) {
+                    return task;
+                }
                 if let Some(task) = self.session_recovery_key_event(&event, captured) {
                     return task;
                 }
@@ -15929,6 +15940,7 @@ impl Application for Cagents {
             }
             Message::SessionRecovery(action) => self.update_session_recovery(action),
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
+            Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
                 self.daemon_health_ui.health = health;
                 if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
@@ -16185,6 +16197,7 @@ impl Application for Cagents {
             self.git_subscription(),
             self.account_subscription(),
             self.automation_subscription(),
+            self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
             Subscription::run_with(
@@ -16285,6 +16298,9 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.automation_approval_dialog() {
+            return Some(dialog);
+        }
         if self.transient_work_close.is_some() {
             let mut controls: Vec<Element<'_, Message>> = vec![
                 crate::ui_controls::button::secondary("Cancel close")
@@ -16986,11 +17002,15 @@ impl Application for Cagents {
         let bar = self
             .status_bar()
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
-        let surface: Element<'_, Message> =
-            widget::column::with_children(vec![surface, self.daemon_health_banner(), bar])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+        let surface: Element<'_, Message> = widget::column::with_children(vec![
+            surface,
+            self.daemon_health_banner(),
+            self.automation_approval_banner(),
+            bar,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -24599,6 +24619,7 @@ mod tests {
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
+            automation_approval: automation_approval::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
             channel_offsets: HashMap::new(),

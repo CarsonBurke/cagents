@@ -20,10 +20,13 @@ pub(in crate::host) fn process_under_control(
     request: crate::automations::Request,
 ) -> Result<crate::automations::Response, String> {
     use crate::automations::{Request, Response};
-    if authority.token().is_some() {
-        return Err("An agent's child-execution capability does not grant automation management. Use an explicit user session.".into());
+    if authority.token().is_some() && !request.allowed_from_hosted_conversation() {
+        return Err("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into());
     }
     let registry = agent_execution::registry(host)?;
+    if authority.token().is_some() {
+        return process_hosted(host, &authority, request);
+    }
     let handle = || {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -32,6 +35,69 @@ pub(in crate::host) fn process_under_control(
             .ok_or_else(|| "The automation scheduler is unavailable".to_owned())
     };
     let response = match request {
+        Request::Propose { .. } => {
+            return Err(
+                "Prepare automation approval requests from a live hosted conversation".into(),
+            );
+        }
+        Request::Proposal { id } => Response::Proposal(Box::new(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_proposal(id, None)?
+                .ok_or("The automation proposal is unavailable")?,
+        )),
+        Request::PendingProposals {
+            repository,
+            after,
+            limit,
+        } => Response::Proposals(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending_automation_proposals(&repository, after, limit)?,
+        ),
+        Request::ResolveProposal {
+            id,
+            revision,
+            approved,
+        } => {
+            let proposal = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_proposal(id, None)?
+                .ok_or("The automation proposal is unavailable")?;
+            if proposal.revision != revision {
+                return Err(
+                    "The automation proposal changed; review its current definition".into(),
+                );
+            }
+            if proposal.state != crate::automations::ProposalState::Pending {
+                return Ok(Response::Proposal(Box::new(proposal)));
+            }
+            let _directory = if approved {
+                Some(validate_target(
+                    host,
+                    &proposal.definition,
+                    &proposal.target_identity,
+                )?)
+            } else {
+                None
+            };
+            let next = if approved {
+                handle()?;
+                agent_execution::selected_account(&proposal.definition.agent)?;
+                Some(Compiled::new(&proposal.definition.schedule)?.next_after(now()?)?)
+            } else {
+                None
+            };
+            Response::Proposal(Box::new(
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .resolve_automation_proposal(&proposal, next, now()?)?,
+            ))
+        }
         Request::List { after, limit } => {
             return registry
                 .lock()
@@ -101,6 +167,120 @@ pub(in crate::host) fn process_under_control(
     };
     super::wake(host);
     Ok(response)
+}
+
+/// Inspection and proposal ownership follow authenticated session lineage.
+/// A plain token, stale session or delegated child never gains scheduler
+/// mutation authority through this path.
+fn process_hosted(
+    host: &SharedHost,
+    authority: &crate::agent_execution::Authority,
+    request: crate::automations::Request,
+) -> Result<crate::automations::Response, String> {
+    use crate::automations::{Request, Response};
+    let (owner, source) = agent_execution::caller(host, authority)?;
+    let source = source.ok_or("A live hosted conversation is required")?;
+    let registry = agent_execution::registry(host)?;
+    // Waiters need only their lineage's immutable receipt. Avoid loading the
+    // project model on every poll, and let a retry recover its saved decision
+    // without depending on later project or account defaults.
+    match &request {
+        Request::Proposal { id } => {
+            let proposal = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_proposal(*id, Some(&owner))?
+                .ok_or("This conversation has no such automation proposal")?;
+            return Ok(Response::Proposal(Box::new(proposal)));
+        }
+        Request::Propose {
+            request,
+            definition,
+        } => {
+            if let Some(previous) = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_proposal(*request, Some(&owner))?
+            {
+                if previous.requested != *definition {
+                    return Err(
+                        "This request ID belongs to another saved definition; use a new request ID"
+                            .into(),
+                    );
+                }
+                return Ok(Response::Proposal(Box::new(previous)));
+            }
+        }
+        _ => {}
+    }
+    let directory = {
+        let host = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(chat) = host.chats.get(&source) {
+            chat.session.launch.recipe.working_directory.clone()
+        } else {
+            host.terminals
+                .get(&source)
+                .ok_or("The requesting session is no longer live")?
+                .session
+                .launch
+                .working_directory
+                .clone()
+        }
+    };
+    let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
+    let repository = crate::project_location::place(&directory, &model)
+        .project
+        .ok_or("The requesting conversation has no open project")?;
+    let require_scope = |target: &std::path::Path| {
+        if target == repository {
+            Ok(())
+        } else {
+            Err("Hosted conversations can inspect and propose automations only in their own project".to_owned())
+        }
+    };
+    match request {
+        Request::Propose { request, definition } => {
+            let requested = definition.clone();
+            let project = crate::project_location::resolve(
+                &definition.agent.target.repository, Some(&model),
+            )?.key;
+            require_scope(&project)?;
+            let (definition, identity) = prepare(host, definition)?;
+            require_scope(&definition.agent.target.repository)?;
+            let channel_title = definition.agent.target.channel.map(|channel| {
+                let channel = model.channel(channel).ok_or("The selected channel is unavailable")?;
+                require_scope(&channel.repository)?;
+                Ok::<_, String>(channel.title.clone())
+            }).transpose()?;
+            let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
+                .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
+            Ok(Response::Proposal(Box::new(proposal)))
+        }
+        Request::List { after, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())
+            .project_automations(&repository, after, limit).map(Response::Listed),
+        Request::Show { id } => {
+            let automation = registry.lock().unwrap_or_else(|p| p.into_inner()).automation(id)?;
+            require_scope(&automation.definition.agent.target.repository)?;
+            Ok(Response::Automation(automation))
+        }
+        Request::History { id: Some(id), before, limit } => {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            require_scope(&registry.automation(id)?.definition.agent.target.repository)?;
+            registry.automation_history(Some(id), before, limit).map(Response::History)
+        }
+        Request::ShowFiring { id } => {
+            let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_run_detail(id)?;
+            require_scope(&detail.definition.agent.target.repository)?;
+            Ok(Response::Detail(detail))
+        }
+        Request::ShowRun { run } => {
+            let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_detail_for_run(run)?;
+            require_scope(&detail.definition.agent.target.repository)?;
+            Ok(Response::Detail(detail))
+        }
+        Request::History { id: None, .. } => Err("Choose an automation ID for scoped run history".into()),
+        _ => Err("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into()),
+    }
 }
 
 pub(in crate::host) fn create(
@@ -301,13 +481,39 @@ mod tests {
         let error = process_under_control(
             &host,
             Authority::session("private-child-capability".into()),
+            Request::ResolveProposal {
+                id: Uuid::new_v4(),
+                revision: 1,
+                approved: true,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("does not grant automation management"));
+        assert!(!error.contains("private-child-capability"));
+    }
+
+    #[test]
+    fn scoped_inspection_requires_authentication_instead_of_falling_back_to_user() {
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            crate::host::model::Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        let mut state = HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("automation-scope-fixture"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        });
+        state.install_model(registry);
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        let error = process_under_control(
+            &host,
+            Authority::session("unregistered-capability".into()),
             Request::List {
                 after: None,
                 limit: 1,
             },
         )
         .unwrap_err();
-        assert!(error.contains("does not grant automation management"));
-        assert!(!error.contains("private-child-capability"));
+        assert!(error.contains("Invalid agent session authority"));
+        assert!(!error.contains("unregistered-capability"));
     }
 }
