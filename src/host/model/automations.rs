@@ -1352,6 +1352,20 @@ fn accept_firing(
     );
     match accepted {
         Ok(accepted) => {
+            if automation.channel.is_none() {
+                // Naming is a user choice, independent of the execution prompt.
+                // Only initialize the owned channel: subsequent firings and
+                // automation renames preserve any separately chosen title.
+                tx.execute(
+                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1",
+                    params![
+                        accepted.agent.channel.to_string(),
+                        automation.definition.name,
+                        crate::model::ChannelTitleSource::Manual as i64,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
             tx.execute_batch("RELEASE automation_accept")
                 .map_err(|error| error.to_string())?;
             firing.agent = Some(accepted.agent.id);
@@ -2597,6 +2611,162 @@ mod tests {
             .unwrap()
             .unwrap();
         (automation, firing, agent)
+    }
+
+    #[test]
+    fn first_channel_uses_current_name_after_a_rename_during_precheck() {
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "exit 0".into(),
+            timeout_seconds: 5,
+        });
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        assert!(claim.accepted.is_none());
+        let mut renamed = automation.definition;
+        renamed.name = "Current standup name".into();
+        registry
+            .edit_automation(
+                automation.id,
+                automation.revision,
+                renamed,
+                210,
+                test_identity(),
+            )
+            .unwrap();
+        let accepted = registry
+            .finish_automation_precheck(
+                claim.firing.id,
+                crate::host::automations::precheck::Outcome::Passed,
+                220,
+            )
+            .unwrap()
+            .unwrap();
+        let model = registry.model().unwrap();
+        let channel = model.channel(accepted.agent.channel).unwrap();
+        assert_eq!(channel.title, "Current standup name");
+        assert_eq!(
+            channel.title_source,
+            crate::model::ChannelTitleSource::Manual
+        );
+    }
+
+    #[test]
+    fn automation_channel_name_survives_renames_provider_titles_and_subsequent_runs() {
+        use crate::model::ChannelTitleSource;
+        for mode in [SessionMode::Fresh, SessionMode::Reuse] {
+            for custom_title in [None, Some("My standup channel")] {
+                let (mut registry, directory, mut definition) = fixture();
+                definition.session_mode = mode;
+                let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+                let channel = registry
+                    .model()
+                    .unwrap()
+                    .channel(agent.channel)
+                    .unwrap()
+                    .clone();
+                assert_eq!(channel.title, "Review daily");
+                assert_eq!(channel.title_source, ChannelTitleSource::Manual);
+                let released = if mode == SessionMode::Fresh {
+                    registry.close_agent(&agent.origin, agent.id).unwrap()
+                } else {
+                    agent.clone()
+                };
+                registry
+                    .finish_automation_release(firing.id, &released, 230)
+                    .unwrap();
+                if let Some(title) = custom_title {
+                    registry
+                        .apply(&ModelEdit::RetitleChannel {
+                            id: agent.channel,
+                            title: title.into(),
+                        })
+                        .unwrap();
+                }
+                let mut renamed = automation.definition.clone();
+                renamed.name = "Renamed automation".into();
+                let renamed = registry
+                    .edit_automation(
+                        automation.id,
+                        automation.revision,
+                        renamed,
+                        240,
+                        test_identity(),
+                    )
+                    .unwrap();
+                let expected_title = custom_title.unwrap_or("Review daily");
+                assert_eq!(
+                    registry
+                        .model()
+                        .unwrap()
+                        .channel(agent.channel)
+                        .unwrap()
+                        .title,
+                    expected_title
+                );
+                registry
+                    .apply(&ModelEdit::SuggestChannelTitle {
+                        id: agent.channel,
+                        title: "Provider-generated task title".into(),
+                        source: ChannelTitleSource::Provider,
+                    })
+                    .unwrap();
+                let due = Occurrence {
+                    due_ms: 300,
+                    local: "2026-09-28T09:00".into(),
+                };
+                let enabled = registry
+                    .set_automation_enabled(
+                        renamed.id,
+                        renamed.revision,
+                        Some(due.clone()),
+                        true,
+                        250,
+                    )
+                    .unwrap();
+                drop(registry);
+                let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+                let next = registry
+                    .claim_automation(
+                        enabled.id,
+                        enabled.execution_revision,
+                        Some(&due),
+                        crate::automations::Trigger::Scheduled {
+                            occurrence: due.clone(),
+                        },
+                        Some(Occurrence {
+                            due_ms: 400,
+                            local: "2026-09-29T09:00".into(),
+                        }),
+                        false,
+                        300,
+                    )
+                    .unwrap()
+                    .accepted
+                    .unwrap();
+                assert_eq!(next.agent.channel, agent.channel);
+                assert_eq!(next.agent.id == agent.id, mode == SessionMode::Reuse);
+                let model = registry.model().unwrap();
+                assert_eq!(model.channels.len(), 1);
+                let channel = model.channel(agent.channel).unwrap();
+                assert_eq!(channel.title, expected_title);
+                assert_eq!(channel.title_source, ChannelTitleSource::Manual);
+            }
+        }
     }
 
     #[test]

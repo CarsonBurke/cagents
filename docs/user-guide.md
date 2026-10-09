@@ -416,6 +416,13 @@ exact saved launch settings before confirmation; changing those settings or the
 schedule pauses future runs until you confirm again. Renaming preserves the
 existing execution settings.
 
+The first accepted run creates the automation’s own channel, named after the
+automation. Later runs keep that channel and its title; provider-generated
+conversation titles do not replace it. You can rename the channel separately.
+Renaming the automation keeps its existing channel title, so its execution name
+and channel name can be managed independently. If it has not run yet, its first
+channel uses the automation’s current name.
+
 The daemon runs enabled schedules with every window closed. It must itself be
 running: cagents does not install a system scheduler. On startup it considers
 only the latest missed occurrence within 15 minutes and records older missed
