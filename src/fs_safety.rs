@@ -649,6 +649,36 @@ pub fn copy_extended_attributes(source: &File, destination: &File) -> Vec<Attrib
     lost
 }
 
+/// Preserves an existing file's owner and group on its temporary replacement.
+/// Apply this before access ACLs or content: the owner/group entries in those
+/// permissions must retain their original meaning. Every failure prevents
+/// publication. A later chmod must restore any set-ID bits cleared by chown.
+pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let source = source.metadata()?;
+    let target = destination.metadata()?;
+    if source.uid() == target.uid() && source.gid() == target.gid() {
+        return Ok(());
+    }
+    // SAFETY: destination is a live descriptor; uid and gid come from the
+    // source descriptor. No pathname is resolved again by this operation.
+    let status = unsafe { libc::fchown(destination.as_raw_fd(), source.uid(), source.gid()) };
+    if status < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot preserve file ownership: {error}"),
+        ));
+    }
+    let installed = destination.metadata()?;
+    if installed.uid() != source.uid() || installed.gid() != source.gid() {
+        return Err(io::Error::other(
+            "the filesystem did not preserve file ownership",
+        ));
+    }
+    Ok(())
+}
+
 /// Preserves the source's POSIX access ACL on a new file after its mode is set.
 /// Unlike optional content attributes, losing an ACL can grant unintended
 /// access, so every failure prevents publication. An absent source ACL removes
@@ -1067,7 +1097,7 @@ fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::{
@@ -1075,6 +1105,51 @@ mod tests {
         io::Write,
         os::unix::fs::{MetadataExt, PermissionsExt},
     };
+
+    /// Select an actually permitted non-primary group for owned fixtures.
+    pub(crate) fn shared_group(file: &File) -> Option<libc::gid_t> {
+        // SAFETY: a zero count/null buffer asks only for the required count.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0; count as usize];
+        // SAFETY: the buffer has exactly count writable gid entries.
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        assert!(count >= 0);
+        groups.truncate(count as usize);
+        let primary = file.metadata().unwrap().gid();
+        let group = groups
+            .into_iter()
+            .find(|group| *group != primary)
+            .or_else(|| {
+                (unsafe { libc::geteuid() } == 0).then_some(if primary == 0 { 1 } else { 0 })
+            });
+        let Some(group) = group else {
+            eprintln!("shared ownership fixture requires another permitted group");
+            return None;
+        };
+        // SAFETY: the descriptor is live; -1 leaves its owner unchanged.
+        assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), !0, group) }, 0);
+        Some(group)
+    }
+
+    #[test]
+    fn ownership_transfer_uses_descriptors_and_rejects_unusable_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = File::create(directory.path().join("source")).unwrap();
+        let Some(group) = shared_group(&source) else {
+            return;
+        };
+        let destination = File::create(directory.path().join("replacement")).unwrap();
+        copy_ownership(&source, &destination).unwrap();
+        assert_eq!(destination.metadata().unwrap().gid(), group);
+        assert_eq!(
+            destination.metadata().unwrap().uid(),
+            source.metadata().unwrap().uid()
+        );
+        let root = Root::open(directory.path()).unwrap();
+        let unusable = File::from(root.directory.try_clone().unwrap());
+        assert!(copy_ownership(&source, &unusable).is_err());
+    }
 
     fn fifo(path: &Path) {
         let name = c_path(path).expect("path");

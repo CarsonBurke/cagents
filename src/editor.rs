@@ -898,7 +898,7 @@ fn save_file_with_hooks(
 }
 
 /// Writes `bytes` into a temporary sibling that carries the destination's
-/// permissions, access ACL and content attributes, then renames it over the
+/// ownership, permissions, access ACL and content attributes, then renames it over the
 /// destination.
 ///
 /// The replacement is a new inode, so every piece of metadata the old one
@@ -919,6 +919,7 @@ fn publish_replacement(
     let result = (|| {
         // Establish access rules before any sensitive bytes exist: otherwise
         // the final chmod could briefly expose a mode-only view of an ACL.
+        fs_safety::copy_ownership(destination, &temporary).map_err(io_error)?;
         fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
         temporary.write_all(bytes).map_err(io_error)?;
         // Set the mode after writing: writing can clear set-ID permission bits.
@@ -1521,6 +1522,80 @@ mod tests {
             fs::read(outside.path().join("secret")).unwrap(),
             b"outside\n"
         );
+    }
+
+    #[test]
+    fn ownership_transfer_refusal_preserves_destination_and_cleans_temporary() {
+        use std::os::unix::fs::MetadataExt;
+        // Only metadata is consulted; the installed executable is not read or changed.
+        let foreign = File::open("/usr/bin/true")
+            .or_else(|_| File::open("/bin/true"))
+            .unwrap();
+        let source = foreign.metadata().unwrap();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("destination");
+        fs::write(&path, "before").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let parent = Root::open(directory.path()).unwrap();
+        let result = publish_replacement(
+            &parent,
+            Path::new("destination"),
+            &foreign,
+            b"after",
+            source.permissions(),
+            || Ok(()),
+            fs_safety::sync_directory,
+        );
+        match result {
+            Err(error) => {
+                assert!(error.to_string().contains("file ownership"), "{error}");
+                assert_eq!(fs::read(&path).unwrap(), b"before");
+                let after = fs::metadata(&path).unwrap();
+                assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+            }
+            Ok(_) => {
+                // Privileged test runners may preserve a foreign owner; that is valid.
+                let after = fs::metadata(&path).unwrap();
+                assert_eq!((after.uid(), after.gid()), (source.uid(), source.gid()));
+                assert_eq!(fs::read(&path).unwrap(), b"after");
+            }
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            (
+                foreign.metadata().unwrap().uid(),
+                foreign.metadata().unwrap().gid()
+            ),
+            (source.uid(), source.gid())
+        );
+    }
+
+    #[test]
+    fn atomic_save_preserves_shared_file_ownership_and_access_mode() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempdir().unwrap();
+        let path = root.path().join("shared.txt");
+        fs::write(&path, "before\n").unwrap();
+        let file = File::open(&path).unwrap();
+        let Some(group) = fs_safety::tests::shared_group(&file) else {
+            return;
+        };
+        fs::set_permissions(&path, Permissions::from_mode(0o660)).unwrap();
+        let before = file.metadata().unwrap();
+        let outcome = save_file(
+            root.path(),
+            Path::new("shared.txt"),
+            "after\n",
+            blake3::hash(b"before\n"),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), group));
+        assert_eq!(after.mode() & 0o777, before.mode() & 0o777);
+        assert_eq!(fs::read(&path).unwrap(), b"after\n");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]
