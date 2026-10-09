@@ -4016,11 +4016,10 @@ mod tests {
             Some(expected)
         );
         assert_eq!(content.find_matches("ffi"), vec![(at(2, 1), at(2, 4))]);
-        assert!(Content::with_text("ß").find_matches("s").is_empty());
-        assert_eq!(
-            Content::with_text("sss").find_matches("ss"),
-            vec![(at(0, 0), at(0, 2))]
-        );
+        let partial: Content = Content::with_text("ß");
+        assert!(partial.find_matches("s").is_empty());
+        let ascii: Content = Content::with_text("sss");
+        assert_eq!(ascii.find_matches("ss"), vec![(at(0, 0), at(0, 2))]);
     }
 
     #[test]
