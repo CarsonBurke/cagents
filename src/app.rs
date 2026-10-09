@@ -29,6 +29,7 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+mod session_recovery;
 mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
@@ -655,12 +656,13 @@ fn notice_surface_action<'a>(
 fn save_health_views<'a>(
     health: &'a SaveHealthState,
     card_title: impl Fn(CardId) -> Option<&'a str>,
+    recovery: Option<Element<'a, Message>>,
 ) -> Vec<Element<'a, Message>> {
     let path = health.database_path.as_deref().map_or_else(
         || "unavailable (the data directory could not be resolved)".to_owned(),
         |path| path.display().to_string(),
     );
-    let refused = save_quarantine_view(health, &path, card_title);
+    let refused = save_quarantine_view(health, &path, card_title, recovery);
     save_lane_view(health, path)
         .into_iter()
         .chain(refused)
@@ -723,6 +725,7 @@ fn save_quarantine_view<'a>(
     health: &'a SaveHealthState,
     path: &str,
     card_title: impl Fn(CardId) -> Option<&'a str>,
+    recovery: Option<Element<'a, Message>>,
 ) -> Option<Element<'a, Message>> {
     if health.quarantined.is_empty() {
         return None;
@@ -756,6 +759,13 @@ fn save_quarantine_view<'a>(
             }),
         )
     };
+    let actions: Vec<_> = action.into_iter().chain(recovery).collect();
+    let action = (!actions.is_empty()).then(|| {
+        widget::row::with_children(actions)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into()
+    });
     Some(notice_surface(
         NoticeSeverity::Error,
         widget::column::with_children(vec![
@@ -4251,6 +4261,7 @@ pub enum Message {
     Lsp(LspEvent),
     LanguageServersReaped,
     RetrySessionSave,
+    SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
@@ -4746,6 +4757,7 @@ pub struct Cagents {
     daemon_health_ui: daemon_health_ui::State,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
+    session_recovery: session_recovery::State,
     settings: AppSettings,
     settings_base: AppSettings,
     settings_save_generation: u64,
@@ -10935,6 +10947,9 @@ impl Cagents {
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.session_recovery.open() {
+            return self.update_session_recovery(session_recovery::Action::Cancel);
+        }
         if self.daemon_health_ui.confirmation {
             return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
         }
@@ -10976,7 +10991,8 @@ impl Cagents {
         if self.browser_import.open() {
             return true;
         }
-        self.daemon_health_ui.confirmation
+        self.session_recovery.open()
+            || self.daemon_health_ui.confirmation
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
@@ -12555,6 +12571,7 @@ impl Application for Cagents {
             daemon_health_ui: daemon_health_ui::State::default(),
             session,
             save_health,
+            session_recovery: session_recovery::State::default(),
             settings_base: settings.clone(),
             settings_save_generation: 0,
             settings_ack_generation: 0,
@@ -15317,6 +15334,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if let Some(task) = self.session_recovery_key_event(&event, captured) {
+                    return task;
+                }
                 if let Some(task) = self.daemon_health_key_event(&event, captured) {
                     return task;
                 }
@@ -15859,6 +15879,7 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::SessionRecovery(action) => self.update_session_recovery(action),
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::DaemonHealth(health) => {
                 self.daemon_health_ui.health = health;
@@ -16289,6 +16310,9 @@ impl Application for Cagents {
         }
         #[cfg(feature = "integrated-browser")]
         if let Some(dialog) = self.browser_import_dialog() {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.session_recovery_dialog() {
             return Some(dialog);
         }
         if let Some(dialog) = self.daemon_health_dialog() {
@@ -18037,7 +18061,7 @@ mod tests {
             !state.window_state_refused(),
             "a refused catalog row leaves terminal handoffs free to commit"
         );
-        assert_eq!(save_health_views(&state, |_| None).len(), 1);
+        assert_eq!(save_health_views(&state, |_| None, None).len(), 1);
 
         let mut event = health_event(
             2,
@@ -18052,7 +18076,7 @@ mod tests {
         assert!(state.apply(event));
         assert!(state.window_state_refused());
         assert_eq!(
-            save_health_views(&state, |_| None).len(),
+            save_health_views(&state, |_| None, None).len(),
             2,
             "the lane's failure and the refusal are separate notices"
         );
@@ -24230,6 +24254,7 @@ mod tests {
             daemon_health_ui: daemon_health_ui::State::default(),
             session: None,
             save_health: None,
+            session_recovery: session_recovery::State::default(),
             settings_draft: SettingsDraft::from_settings(&settings),
             settings_base: settings.clone(),
             settings_save_generation: 0,

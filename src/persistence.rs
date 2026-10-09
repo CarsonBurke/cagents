@@ -400,6 +400,53 @@ fn select_closed_terminal_adoption(
     }))
 }
 
+fn validate_terminal_ownership_recovery(
+    transaction: &Transaction<'_>,
+    state: &WorkspaceState,
+    base: SnapshotBase<'_>,
+    recovery: TerminalPaneAdoption,
+) -> Result<()> {
+    let invalid = |reason: &str| {
+        StoreError::InvalidState(format!("terminal ownership recovery refused: {reason}"))
+    };
+    if base.cards.contains_key(&recovery.canonical)
+        || transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cards WHERE card_id=?1)",
+            [recovery.canonical.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Err(invalid("the live pane has already been saved"));
+    }
+    if select_closed_terminal_adoption(transaction, state, recovery.canonical, recovery.terminal)?
+        != Some(recovery)
+    {
+        return Err(invalid("the exact closed owner changed"));
+    }
+    let source = state.cards.iter().find(|card| card.id == recovery.alias);
+    let target = state
+        .cards
+        .iter()
+        .find(|card| card.id == recovery.canonical);
+    let (Some(source), Some(target)) = (source, target) else {
+        return Err(invalid("both panes must remain in the window"));
+    };
+    let (CardKind::Terminal(archived), CardKind::Terminal(live)) = (&source.kind, &target.kind)
+    else {
+        return Err(invalid("both panes must retain their terminal descriptors"));
+    };
+    if !target.existence.is_open()
+        || live.id != recovery.terminal
+        || archived != live
+        || load_terminal_record(transaction, recovery.alias)? != *archived
+    {
+        return Err(invalid(
+            "the terminal recipe or continuity evidence changed",
+        ));
+    }
+    Ok(())
+}
+
 /// What storage holds after a workspace snapshot commits. The writer lane keeps
 /// this as the base for its next snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -915,7 +962,36 @@ impl StateStore {
         adoptions: &[TerminalPaneAdoption],
         restorations: &[TerminalPaneRestoration],
     ) -> Result<WorkspaceCommit> {
-        if adoptions.is_empty() && restorations.is_empty() {
+        self.save_workspace_with_terminal_panes_and_recovery(
+            state,
+            base,
+            adoptions,
+            restorations,
+            None,
+        )
+    }
+
+    /// Explicitly recover an unsaved pane from an exact closed historical owner.
+    /// The complete workspace and the ownership transfer commit together; this
+    /// never permits an ordinary snapshot to take another pane's identity.
+    pub fn save_workspace_recovering_terminal_owner(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        recovery: TerminalPaneAdoption,
+    ) -> Result<WorkspaceCommit> {
+        self.save_workspace_with_terminal_panes_and_recovery(state, base, &[], &[], Some(recovery))
+    }
+
+    fn save_workspace_with_terminal_panes_and_recovery(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[TerminalPaneAdoption],
+        restorations: &[TerminalPaneRestoration],
+        recovery: Option<TerminalPaneAdoption>,
+    ) -> Result<WorkspaceCommit> {
+        if adoptions.is_empty() && restorations.is_empty() && recovery.is_none() {
             return self.save_workspace(state, base);
         }
         let mut inner = self.lock_inner()?;
@@ -930,6 +1006,10 @@ impl StateStore {
         let mut prepared = state.clone();
         let mut generations = base.cards.clone();
         let mut adoptions = adoptions.to_vec();
+        if let Some(recovery) = recovery {
+            validate_terminal_ownership_recovery(&transaction, state, base, recovery)?;
+            adoptions.push(recovery);
+        }
         for restoration in restorations {
             if !state.cards.iter().any(|card| card.id == restoration.canonical
                 && card.existence.is_open()
@@ -5721,6 +5801,245 @@ mod tests {
     struct SaveLane {
         workspace: u64,
         cards: BTreeMap<CardId, u64>,
+    }
+
+    fn refused_terminal_owner_fixture(
+        store: &StateStore,
+        boot_id: &BootId,
+    ) -> (WorkspaceState, SaveLane, TerminalPaneAdoption) {
+        let mut state = workspace_with_terminal(boot_id);
+        let mut lane = SaveLane::default();
+        lane.save(store, &state).unwrap();
+        state.cards[0].title = "Archived shell".into();
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 784,
+                reason: Some("user closed".into()),
+            },
+        };
+        state.focused = None;
+        lane.save(store, &state).unwrap();
+        let mut live = state.cards[0].clone();
+        live.id = CardId::new();
+        live.generation = 0;
+        live.title = "Unsaved live shell".into();
+        live.existence = Existence::Open;
+        let CardKind::Terminal(terminal) = &live.kind else {
+            unreachable!()
+        };
+        let recovery = TerminalPaneAdoption {
+            alias: state.cards[0].id,
+            canonical: live.id,
+            terminal: terminal.id,
+        };
+        state
+            .chat_drafts
+            .insert(live.id, "Unsent work that must survive recovery".into());
+        state
+            .card_scopes
+            .insert(live.id, PathBuf::from("/owned-project"));
+        state.focused = Some(live.id);
+        state.cards.push(live);
+        let refusal = card_refusal(lane.save(store, &state), recovery.canonical);
+        assert!(refusal.to_string().contains("already belongs to card"));
+        (state, lane, recovery)
+    }
+
+    #[test]
+    fn ownership_recovery_saves_the_new_pane_and_preserves_its_closed_history() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("reviewed-recovery");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (state, lane, recovery) = refused_terminal_owner_fixture(&store, &boot_id);
+        let archived = state.cards[0].clone();
+        let commit = store
+            .save_workspace_recovering_terminal_owner(
+                &state,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                recovery,
+            )
+            .unwrap();
+        assert!(commit.card_generations.contains_key(&recovery.canonical));
+        let restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.chat_drafts, state.chat_drafts);
+        assert_eq!(restored.card_scopes, state.card_scopes);
+        assert_eq!(restored.focused, Some(recovery.canonical));
+        let old = store.load_card(recovery.alias, None).unwrap().unwrap();
+        assert_eq!(old.title, archived.title);
+        assert_eq!(old.existence, archived.existence);
+        assert_eq!(old.kind, archived.kind);
+        let inner = store.lock_inner().unwrap();
+        let owner: String = inner
+            .connection
+            .query_row(
+                "SELECT card_id FROM terminal_recipes WHERE terminal_id=?1",
+                [recovery.terminal.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, recovery.canonical.to_string());
+        assert_eq!(
+            load_terminal_record(&inner.connection, recovery.canonical).unwrap(),
+            match &state.cards[1].kind {
+                CardKind::Terminal(session) => session.clone(),
+                _ => unreachable!(),
+            }
+        );
+    }
+
+    #[test]
+    fn ownership_recovery_rechecks_closed_owner_evidence_and_new_target() {
+        for case in [
+            "open owner",
+            "changed tombstone",
+            "stale source",
+            "forged continuity",
+            "saved target",
+        ] {
+            let directory = tempdir().unwrap();
+            let boot_id = boot(case);
+            let store =
+                StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+            let (mut state, lane, recovery) = refused_terminal_owner_fixture(&store, &boot_id);
+            match case {
+                "open owner" | "changed tombstone" => {
+                    let existence = if case == "open owner" {
+                        Existence::Open
+                    } else {
+                        Existence::Closed {
+                            tombstone: Tombstone {
+                                operation_id: None,
+                                closed_at_unix_ms: 999,
+                                reason: None,
+                            },
+                        }
+                    };
+                    store
+                        .lock_inner()
+                        .unwrap()
+                        .connection
+                        .execute(
+                            "UPDATE cards SET existence_json=?1 WHERE card_id=?2",
+                            params![to_json(&existence).unwrap(), recovery.alias.to_string()],
+                        )
+                        .unwrap();
+                }
+                "stale source" => {
+                    store
+                        .lock_inner()
+                        .unwrap()
+                        .connection
+                        .execute(
+                            "UPDATE cards SET generation=generation+1 WHERE card_id=?1",
+                            [recovery.alias.to_string()],
+                        )
+                        .unwrap();
+                }
+                "forged continuity" => {
+                    for card in &mut state.cards {
+                        let CardKind::Terminal(session) = &mut card.kind else {
+                            unreachable!()
+                        };
+                        session.continuity = TerminalContinuity::Live {
+                            boot_id: boot_id.clone(),
+                            host_session_id: HostSessionId::new("unreviewed"),
+                            host_incarnation: HostIncarnation::new("unreviewed"),
+                        };
+                    }
+                }
+                "saved target" => {
+                    let mut saved = state.clone();
+                    saved.cards[1].kind = CardKind::Settings;
+                    store
+                        .save_workspace(
+                            &saved,
+                            SnapshotBase {
+                                workspace: lane.workspace,
+                                cards: &lane.cards,
+                            },
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = store.stored_generations(state.id).unwrap();
+            assert!(
+                store
+                    .save_workspace_recovering_terminal_owner(
+                        &state,
+                        SnapshotBase {
+                            workspace: lane.workspace,
+                            cards: &lane.cards
+                        },
+                        recovery
+                    )
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                store.stored_generations(state.id).unwrap(),
+                before,
+                "{case}"
+            );
+            let owner: String = store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT card_id FROM terminal_recipes WHERE terminal_id=?1",
+                    [recovery.terminal.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(owner, recovery.alias.to_string(), "{case}");
+        }
+    }
+
+    #[test]
+    fn ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("atomic-recovery");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut state, lane, recovery) = refused_terminal_owner_fixture(&store, &boot_id);
+        let mut invalid = state.cards[1].clone();
+        invalid.id = CardId::new();
+        invalid.kind = CardKind::Settings;
+        invalid.width_fraction = 0.0;
+        state.cards.push(invalid);
+        let before = store.load_card(recovery.alias, None).unwrap().unwrap();
+        assert!(
+            store
+                .save_workspace_recovering_terminal_owner(
+                    &state,
+                    SnapshotBase {
+                        workspace: lane.workspace,
+                        cards: &lane.cards
+                    },
+                    recovery
+                )
+                .is_err()
+        );
+        assert!(store.load_card(recovery.canonical, None).unwrap().is_none());
+        assert_eq!(
+            store.load_card(recovery.alias, None).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            store.stored_generations(state.id).unwrap().workspace,
+            lane.workspace
+        );
+        assert_eq!(
+            load_terminal_record(&store.lock_inner().unwrap().connection, recovery.alias)
+                .unwrap()
+                .id,
+            recovery.terminal
+        );
     }
 
     impl SaveLane {
