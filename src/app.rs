@@ -2472,7 +2472,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::ChannelUi(action) => !action.answers_own_dialog(),
         Message::SidebarSelection(_) => false,
         Message::AccountUi(action) => action.blocked_while_modal(),
-        Message::AutomationUi(action) => !action.background(),
+        Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2499,6 +2499,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::WindowCloseRequested(_)
                 | Message::CancelTransientWorkClose
                 | Message::ReturnToDeviceBeforeClose
+                | Message::ReturnToAutomationBeforeClose
+                | Message::DiscardAutomationAndClose(_)
                 | Message::CommitClose(_)
                 | Message::ConfirmTerminalClose
                 | Message::CancelTerminalClose
@@ -3994,6 +3996,8 @@ pub enum Message {
     WindowCloseRequested(window::Id),
     CancelTransientWorkClose,
     ReturnToDeviceBeforeClose,
+    ReturnToAutomationBeforeClose,
+    DiscardAutomationAndClose(u64),
     /// iced has removed a window, and winit has queued its destruction.
     WindowClosed(window::Id),
     NewWindow,
@@ -4806,6 +4810,7 @@ pub struct Cagents {
     pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
     transient_work_close: Option<window::Id>,
+    automation_close_generation: u64,
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     terminal_close_attempts: HashSet<TerminalId>,
@@ -10789,6 +10794,9 @@ impl Cagents {
         if self.transient_work_close.is_some() {
             return cosmic::task::message(Message::CancelTransientWorkClose);
         }
+        if let Some(action) = self.automation_ui.keep_draft_action() {
+            return self.update_automation_ui(action);
+        }
         if self.device_ui.open {
             return self.update_device(device_ui::Action::Close);
         }
@@ -10823,6 +10831,7 @@ impl Cagents {
         }
         self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
+            || self.automation_ui.draft_dialog_open()
             || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
@@ -11376,6 +11385,9 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
+        if let Some(blocker) = self.automation_ui.draft_close_blocker() {
+            return Some(blocker);
+        }
         if self.device_ui.dirty() {
             return Some(
                 "The device file has unsaved edits. Return to the file to save or discard them, then close the window again.",
@@ -11506,6 +11518,9 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
+        if self.automation_ui.draft_dialog_open() {
+            return Some(crate::automation_ui::draft_dialog_focus_id());
+        }
         if self.resume_ui.open {
             return Some(resume_ui::focus_id());
         }
@@ -12460,6 +12475,7 @@ impl Application for Cagents {
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
             transient_work_close: None,
+            automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
@@ -14377,6 +14393,8 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 if self.window_close_transient_blocker().is_some() {
+                    self.automation_close_generation =
+                        self.automation_close_generation.wrapping_add(1);
                     self.transient_work_close = Some(window);
                     return iced::widget::operation::focus(widget::Id::new(
                         "dialog.transient-close.cancel",
@@ -14398,7 +14416,11 @@ impl Application for Cagents {
             }
             Message::CancelTransientWorkClose => {
                 self.transient_work_close = None;
-                let target = if self.device_ui.open && self.device_ui.dirty() {
+                let target = if self.automation_ui.draft_dialog_open() {
+                    Some(crate::automation_ui::draft_dialog_focus_id())
+                } else if self.automation_ui.draft_close_blocker().is_some() {
+                    Some(crate::automation_ui::draft_editor_focus_id())
+                } else if self.device_ui.open && self.device_ui.dirty() {
                     Some(device_ui::file_editor_id())
                 } else {
                     self.nested_modal_focus_target().or_else(|| {
@@ -14411,11 +14433,45 @@ impl Application for Cagents {
                     iced::widget::operation::focus(target).map(cosmic::Action::App)
                 })
             }
+            Message::ReturnToAutomationBeforeClose => {
+                if self.transient_work_close.is_none()
+                    || self.automation_ui.draft_close_blocker().is_none()
+                {
+                    return Task::none();
+                }
+                self.transient_work_close = None;
+                if let Some(action) = self.automation_ui.keep_draft_action() {
+                    self.automation_ui.update(action);
+                }
+                Task::batch([
+                    self.open_automations(),
+                    iced::widget::operation::focus(crate::automation_ui::draft_editor_focus_id())
+                        .map(cosmic::Action::App),
+                ])
+            }
+            Message::DiscardAutomationAndClose(generation) => {
+                if generation != self.automation_close_generation {
+                    return Task::none();
+                }
+                let Some(window) = self.transient_work_close else {
+                    return Task::none();
+                };
+                if self.automation_ui.draft_close_blocker().is_none()
+                    || !self.automation_ui.discard_draft_before_close()
+                {
+                    return Task::none();
+                }
+                self.transient_work_close = None;
+                cosmic::task::message(Message::WindowCloseRequested(window))
+            }
             Message::ReturnToDeviceBeforeClose => {
                 if self.transient_work_close.is_none() || !self.device_ui.dirty() {
                     return Task::none();
                 }
                 self.transient_work_close = None;
+                if let Some(action) = self.automation_ui.keep_draft_action() {
+                    self.automation_ui.update(action);
+                }
                 self.device_ui.open = true;
                 Task::batch([
                     self.update_device(device_ui::Action::BackToFile),
@@ -15212,6 +15268,9 @@ impl Application for Cagents {
                     if self.transient_work_close.is_some() {
                         return cosmic::task::message(Message::CancelTransientWorkClose);
                     }
+                    if let Some(action) = self.automation_ui.keep_draft_action() {
+                        return self.update_automation_ui(action);
+                    }
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
                             .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
@@ -15944,6 +16003,22 @@ impl Application for Cagents {
                         .into(),
                 );
             }
+            if self.automation_ui.draft_close_blocker().is_some() {
+                controls.push(
+                    crate::ui_controls::button::primary("Keep editing automation")
+                        .on_press(Message::ReturnToAutomationBeforeClose)
+                        .into(),
+                );
+                if self.automation_ui.draft_dirty() && self.automation_ui.can_discard_draft() {
+                    controls.push(
+                        crate::ui_controls::button::destructive("Discard automation changes")
+                            .on_press(Message::DiscardAutomationAndClose(
+                                self.automation_close_generation,
+                            ))
+                            .into(),
+                    );
+                }
+            }
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
@@ -15953,12 +16028,22 @@ impl Application for Cagents {
                         )),
                         widget::row::with_children(controls)
                             .spacing(space::S)
+                            .wrap()
                             .into(),
                     ])
                     .spacing(space::M),
                     480.0,
                 ),
                 Some(Message::CancelTransientWorkClose),
+                1.0,
+            ));
+        }
+        if let Some(dialog) = self.automation_ui.draft_dialog() {
+            return Some(dialog_ui::overlay(
+                dialog.map(Message::AutomationUi),
+                self.automation_ui
+                    .keep_draft_action()
+                    .map(Message::AutomationUi),
                 1.0,
             ));
         }
@@ -17976,6 +18061,111 @@ mod tests {
         let _ = app.update(Message::WindowCloseRequested(window));
         assert!(app.dirty_repository_close.is_none());
         assert_eq!(app.exit, closing);
+    }
+
+    #[test]
+    fn automation_draft_reopen_keeps_editor_responsive_without_foreground_refresh() {
+        let mut app = context_inspector_test_app(false);
+        app.automation_ui.update(crate::automation_ui::Action::New);
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "Retained draft".into(),
+            ));
+        assert!(app.automation_ui.draft_dirty());
+        drop(app.open_automations());
+        drop(
+            app.update(Message::AutomationUi(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                String::new(),
+            ))),
+        );
+        assert!(app.automation_ui.has_draft());
+        assert!(
+            !app.automation_ui.draft_dirty(),
+            "the first edit after reopening must reach the editor"
+        );
+    }
+
+    #[test]
+    fn automation_draft_window_close_keeps_work_and_restarts_close_after_discard() {
+        let mut app = context_inspector_test_app(false);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.automation_ui.update(crate::automation_ui::Action::New);
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "Unsaved automation".into(),
+            ));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_none());
+        assert_eq!(app.transient_work_close, Some(window));
+        assert!(app.modal_is_open());
+        assert!(app.dialog().is_some());
+        drop(app.update(Message::CancelTransientWorkClose));
+        assert!(app.automation_ui.draft_dirty());
+        assert!(app.transient_work_close.is_none());
+        drop(app.update(Message::WindowCloseRequested(window)));
+        drop(app.update(Message::DiscardAutomationAndClose(
+            app.automation_close_generation,
+        )));
+        assert!(!app.automation_ui.has_draft());
+        // The discard schedules a fresh close request so device/repository/chat
+        // blockers are checked again instead of entering exit directly.
+        assert!(app.exit.is_none());
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_some());
+    }
+    #[test]
+    fn automation_draft_window_close_rejects_discard_from_an_older_prompt() {
+        let mut app = context_inspector_test_app(false);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.automation_ui.update(crate::automation_ui::Action::New);
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "First draft".into(),
+            ));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        let old = app.automation_close_generation;
+        drop(app.update(Message::CancelTransientWorkClose));
+        assert!(app.automation_ui.discard_draft_before_close());
+        app.automation_ui.update(crate::automation_ui::Action::New);
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "Second draft".into(),
+            ));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert_ne!(old, app.automation_close_generation);
+        drop(app.update(Message::DiscardAutomationAndClose(old)));
+        assert!(app.automation_ui.draft_dirty());
+        assert_eq!(app.transient_work_close, Some(window));
+        assert!(app.exit.is_none());
+    }
+    #[test]
+    fn automation_draft_modal_blocks_workspace_messages_and_keep_preserves_the_draft() {
+        let mut app = context_inspector_test_app(false);
+        app.automation_ui.update(crate::automation_ui::Action::New);
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "Draft".into(),
+            ));
+        drop(app.update(Message::AutomationUi(
+            crate::automation_ui::Action::CancelEdit,
+        )));
+        assert!(app.modal_is_open());
+        assert!(app.dialog().is_some());
+        let before = app.context_inspector_open;
+        drop(app.update(Message::ToggleContextInspector));
+        assert_eq!(app.context_inspector_open, before);
+        let keep = app.automation_ui.keep_draft_action().unwrap();
+        drop(app.update(Message::AutomationUi(keep)));
+        assert!(!app.modal_is_open());
+        assert!(app.automation_ui.draft_dirty());
     }
 
     /// Once the window is gone, an activation must be refused rather than
@@ -23365,6 +23555,7 @@ mod tests {
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
             transient_work_close: None,
+            automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
