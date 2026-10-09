@@ -136,7 +136,7 @@ impl Cagents {
                     if let Err(error) = observe(&observer, &presence) {
                         tracing::debug!(%error, "notification observation disconnected");
                     }
-                    thread::sleep(Duration::from_secs(2));
+                    thread::sleep(crate::daemon_health::retry_delay());
                 }
             });
         let (wake, receiver) = crossbeam_channel::bounded(1);
@@ -184,7 +184,7 @@ impl Cagents {
                                 last_error = Some(error.clone());
                                 let _ = sender.send_blocking(Action::Failed(error));
                             }
-                            match receiver.recv_timeout(Duration::from_secs(2)) {
+                            match receiver.recv_timeout(crate::daemon_health::retry_delay()) {
                                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                                     break 'control;
                                 }

@@ -12,8 +12,14 @@ impl Cagents {
         {
             return Subscription::none();
         }
-        cosmic::iced::time::every(Duration::from_secs(10))
-            .map(|_| Message::ReviewRequests(Action::Tick))
+        cosmic::iced::time::every(Duration::from_secs(
+            if crate::daemon_health::current().unavailable() {
+                30
+            } else {
+                10
+            },
+        ))
+        .map(|_| Message::ReviewRequests(Action::Tick))
     }
 
     pub(super) fn update_review_requests(&mut self, action: Action) -> Task<Message> {
@@ -33,7 +39,11 @@ impl Cagents {
             .update(action, repositories.values().cloned())
             .map(Message::ReviewRequests)
             .map(cosmic::Action::App);
-        let requests = self.refresh_ui.review_requests.take_observed();
+        let requests = if crate::daemon_health::current().unavailable() {
+            Vec::new()
+        } else {
+            self.refresh_ui.review_requests.take_observed()
+        };
         let report = if requests.is_empty()
             || !self.settings.notifications.enabled
             || !self.settings.notifications.review_requests

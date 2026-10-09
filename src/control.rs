@@ -366,6 +366,12 @@ pub enum ControlError {
     Configure(#[source] io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
+    #[error("the daemon did not answer within {} s", timeout.as_secs_f64())]
+    ReplyTimeout {
+        timeout: Duration,
+        #[source]
+        error: FrameError,
+    },
     #[error("the daemon closed the connection before responding")]
     ConnectionClosed,
     #[error("daemon protocol version {actual} is unsupported; expected {PROTOCOL_VERSION}")]
@@ -510,9 +516,16 @@ fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStre
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
-        let stream =
-            connect_control_socket(socket_path, IO_TIMEOUT).map_err(ControlError::Connect)?;
-        Self::from_stream(stream)
+        #[cfg(feature = "ui")]
+        let health_request = crate::daemon_health::begin();
+        let result = (|| {
+            let stream =
+                connect_control_socket(socket_path, IO_TIMEOUT).map_err(ControlError::Connect)?;
+            Self::from_stream(stream)
+        })();
+        #[cfg(feature = "ui")]
+        crate::daemon_health::connection(socket_path, &result, health_request);
+        result
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
@@ -1424,6 +1437,23 @@ impl ControlClient {
         streaming_terminal: Option<TerminalId>,
         deadline: Option<Instant>,
     ) -> Result<ServerResponse, ControlError> {
+        #[cfg(feature = "ui")]
+        let health_request = crate::daemon_health::begin();
+        let result = self.request_inner_unobserved(request, streaming_terminal, deadline);
+        #[cfg(feature = "ui")]
+        crate::daemon_health::request(&self.stream, &result, health_request);
+        result
+    }
+
+    fn request_inner_unobserved(
+        &mut self,
+        request: ClientRequest,
+        streaming_terminal: Option<TerminalId>,
+        deadline: Option<Instant>,
+    ) -> Result<ServerResponse, ControlError> {
+        let reply_timeout = deadline
+            .map(|end| end.saturating_duration_since(Instant::now()))
+            .unwrap_or(IO_TIMEOUT);
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         if self.next_request_id == 0 {
@@ -1452,7 +1482,8 @@ impl ControlClient {
                 Some(deadline) => read_frame(&mut DeadlineReader {
                     stream: &mut self.stream,
                     deadline,
-                })?
+                })
+                .map_err(|error| reply_error(error, Some(reply_timeout)))?
                 .ok_or(ControlError::ConnectionClosed)?,
                 None => self.read_envelope()?,
             };
@@ -1526,7 +1557,10 @@ impl ControlClient {
     }
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {
-        read_frame(&mut self.stream)?.ok_or(ControlError::ConnectionClosed)
+        let timeout = self.stream.read_timeout().ok().flatten();
+        read_frame(&mut self.stream)
+            .map_err(|error| reply_error(error, timeout))?
+            .ok_or(ControlError::ConnectionClosed)
     }
 
     fn validate_pinned_envelope(&self, envelope: &ServerEnvelope) -> Result<(), ControlError> {
@@ -1626,8 +1660,10 @@ impl HandshakeClient {
                 },
             },
         )?;
-        let envelope: ServerEnvelope =
-            read_frame(&mut self.stream)?.ok_or(ControlError::ConnectionClosed)?;
+        let timeout = self.stream.read_timeout().ok().flatten();
+        let envelope: ServerEnvelope = read_frame(&mut self.stream)
+            .map_err(|error| reply_error(error, timeout))?
+            .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
@@ -1664,12 +1700,22 @@ impl HandshakeClient {
         }
     }
 }
+fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
+    if let Some(timeout) = timeout
+        && matches!(&error, FrameError::Io(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+    {
+        ControlError::ReplyTimeout { timeout, error }
+    } else {
+        ControlError::Frame(error)
+    }
+}
 fn is_timeout_error(error: &ControlError) -> bool {
-    matches!(
-        error,
-        ControlError::Frame(FrameError::Io(error))
-            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
-    )
+    matches!(error, ControlError::ReplyTimeout { .. })
+        || matches!(
+            error,
+            ControlError::Frame(FrameError::Io(error))
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        )
 }
 
 fn response_from_message(message: ServerMessage) -> Result<ServerResponse, ControlError> {
@@ -5128,11 +5174,51 @@ mod tests {
                 started + Duration::from_millis(100),
             )
             .unwrap_err();
-        assert!(matches!(error, ControlError::Frame(FrameError::Io(error))
-            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
+        assert!(
+            matches!(error, ControlError::ReplyTimeout { timeout, .. } if timeout <= Duration::from_millis(100))
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_long_reply_deadline_reports_the_actual_budget() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned),
+            )
+            .unwrap();
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            // No response: the client must enforce its complete deadline.
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let started = Instant::now();
+        let error = client
+            .request_with_deadline(ClientRequest::List, started + Duration::from_millis(6100))
+            .unwrap_err();
+        assert!(
+            matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > IO_TIMEOUT && *timeout <= Duration::from_millis(6100)),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("the daemon did not answer within 6."),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(8));
         drop(client);
         server.join().unwrap();
     }
