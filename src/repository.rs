@@ -5178,6 +5178,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             remote_ref: destination.clone(),
             oid,
         };
+        // Capture the endpoints before Git attempts the push. External Git
+        // clients may change remote configuration while the command runs;
+        // evidence from a newly configured destination cannot confirm this push.
+        // Capture errors do not prevent Git from returning a definitive result.
+        let destinations =
+            self.push_destinations(&request.worktree, request.target.remote(), cancellation);
         let failure = match self.run(&command, cancellation) {
             Ok(output) if output.success => return Ok(pushed(local_oid)),
             Ok(output) => {
@@ -5211,14 +5217,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // died, so the remote's own ref is consulted under a fresh token —
         // reconciliation has to run even when the original token is cancelled.
         let reconciliation = CancellationToken::new();
-        match self.remote_ref_oid(
+        let Some(destinations) = destinations else {
+            return Ok(PushOutcome::OutcomeUnknown { failure });
+        };
+        if self.push_destinations_match(
             &request.worktree,
             request.target.remote(),
+            &destinations,
             &destination,
+            &local_oid,
             &reconciliation,
         ) {
-            Ok(Some(remote_oid)) if remote_oid == local_oid => Ok(pushed(local_oid)),
-            _ => Ok(PushOutcome::OutcomeUnknown { failure }),
+            Ok(pushed(local_oid))
+        } else {
+            Ok(PushOutcome::OutcomeUnknown { failure })
         }
     }
 
@@ -5254,13 +5266,193 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(CheckedRemote(remote))
     }
 
+    /// A configured remote may fetch from one URL and push to several others.
+    /// Every push destination must provide the exact ref as evidence. Lookup
+    /// errors remain unknown; their resolved URLs and stderr may contain
+    /// credentials, so they are neither logged nor attached to the outcome.
+    fn push_destinations_match(
+        &self,
+        worktree: &Path,
+        remote: &str,
+        captured_destinations: &[OsString],
+        remote_ref: &RemoteSideRef,
+        expected: &Oid,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        if self
+            .push_destinations(worktree, remote, cancellation)
+            .as_deref()
+            != Some(captured_destinations)
+        {
+            return false;
+        }
+        let inherited_count = std::env::var_os("GIT_CONFIG_COUNT");
+        captured_destinations.iter().all(|destination| {
+            let Some(command) = self.push_endpoint_command(
+                worktree,
+                destination,
+                remote_ref,
+                inherited_count.as_deref(),
+            ) else {
+                return false;
+            };
+            let Ok(output) = self.executor.execute(&command, cancellation) else {
+                return false;
+            };
+            output.success
+                && matches!(parse_remote_ref_oid(&output.stdout, remote_ref),
+                    Ok(Some(oid)) if oid == *expected)
+        })
+    }
+
+    fn push_endpoint_command(
+        &self,
+        worktree: &Path,
+        endpoint: &OsStr,
+        remote_ref: &RemoteSideRef,
+        inherited_count: Option<&OsStr>,
+    ) -> Option<CommandSpec> {
+        let count = match inherited_count {
+            None => 0,
+            Some(value) => value.to_str()?.parse::<u32>().ok()?,
+        };
+        // Git's environment config count is bounded by a signed int. Leave
+        // existing entries inherited and append one without overflowing it.
+        if count >= i32::MAX as u32 {
+            return None;
+        }
+        let marker = format!("cagents-reconciliation-{}:", uuid::Uuid::new_v4().simple());
+        let mut key = OsString::from("url.");
+        key.push(endpoint);
+        key.push(".insteadOf");
+        // Passing an already resolved URL to ls-remote would apply insteadOf
+        // a second time. A fresh full-marker alias maps directly to this URL
+        // once, while retaining all inherited auth and transport configuration.
+        // Environment framing also preserves '=' and non-UTF8 endpoint bytes,
+        // and keeps credential-bearing URLs out of process arguments.
+        Some(
+            self.git_read(
+                worktree,
+                [
+                    "ls-remote",
+                    "--refs",
+                    "--exit-code",
+                    "--",
+                    &marker,
+                    remote_ref.as_str(),
+                ],
+            )
+            .env("GIT_CONFIG_COUNT", (count + 1).to_string())
+            .env(format!("GIT_CONFIG_KEY_{count}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{count}"), marker),
+        )
+    }
+
+    fn push_destinations(
+        &self,
+        worktree: &Path,
+        remote: &str,
+        cancellation: &CancellationToken,
+    ) -> Option<Vec<OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+        let values = |variable: &str| {
+            self.executor
+                .execute(
+                    &self.git_read(
+                        worktree,
+                        [
+                            "config",
+                            "--null",
+                            "--get-all",
+                            &format!("remote.{remote}.{variable}"),
+                        ],
+                    ),
+                    cancellation,
+                )
+                .ok()
+        };
+        let mut configured = values("pushurl")?;
+        if !configured.success && configured.exit_code == Some(1) {
+            configured = values("url")?;
+        }
+        if !configured.success || !configured.stdout.ends_with(&[0]) {
+            return None;
+        }
+        let raw = &configured.stdout[..configured.stdout.len() - 1];
+        let configured_count = raw.split(|byte| *byte == 0).count();
+        if raw
+            .split(|byte| *byte == 0)
+            .any(|value| value.is_empty() || value.contains(&b'\n'))
+        {
+            return None;
+        }
+        // Git can drop unmatched fetch URLs when pushInsteadOf produces a
+        // separate push list. Certify that no rewrite replacement base contains
+        // a newline, so get-url's line framing stays unambiguous even when its
+        // destination count is smaller than the configured fetch URL count.
+        let keys = self
+            .executor
+            .execute(
+                &self.git_read(worktree, ["config", "--name-only", "--null", "--list"]),
+                cancellation,
+            )
+            .ok()?;
+        if !keys.success || (!keys.stdout.is_empty() && !keys.stdout.ends_with(&[0])) {
+            return None;
+        }
+        for key in keys.stdout.split(|byte| *byte == 0) {
+            if !key
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"url."))
+            {
+                continue;
+            }
+            let variable = key.rsplit(|byte| *byte == b'.').next().unwrap_or_default();
+            if (variable.eq_ignore_ascii_case(b"insteadOf")
+                || variable.eq_ignore_ascii_case(b"pushInsteadOf"))
+                && key.contains(&b'\n')
+            {
+                return None;
+            }
+        }
+        // Delegate longest-prefix URL rewrites to Git; their raw keys, values,
+        // resolved destinations, and lookup stderr remain private evidence.
+        let output = self
+            .executor
+            .execute(
+                &self.git_read(
+                    worktree,
+                    ["remote", "get-url", "--push", "--all", "--", remote],
+                ),
+                cancellation,
+            )
+            .ok()?;
+        if !output.success || !output.stdout.ends_with(b"\n") {
+            return None;
+        }
+        let resolved = &output.stdout[..output.stdout.len() - 1];
+        let destinations: Vec<_> = resolved.split(|byte| *byte == b'\n').collect();
+        if destinations.len() > configured_count
+            || destinations
+                .iter()
+                .any(|value| value.is_empty() || value.contains(&0))
+        {
+            return None;
+        }
+        Some(
+            destinations
+                .into_iter()
+                .map(|value| OsString::from_vec(value.to_vec()))
+                .collect(),
+        )
+    }
+
     /// The object id a remote currently has for one ref, or `None` when the
     /// remote does not have it.
     ///
-    /// The ref is named the way the remote names it, because that is the only
-    /// name `ls-remote` can match: asking a remote for
-    /// `refs/remotes/origin/main` matches nothing there and reads back as
-    /// "the remote does not have it".
+    /// The ref is named the way the remote names it. Since ls-remote arguments
+    /// also match ref-name tails, only the exact advertised name is accepted;
+    /// a local `refs/remotes/origin/main` is not the remote's branch name.
     pub fn remote_ref_oid(
         &self,
         worktree: &Path,
@@ -5273,7 +5465,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             worktree,
             [
                 OsString::from("ls-remote"),
+                OsString::from("--refs"),
                 OsString::from("--exit-code"),
+                OsString::from("--"),
                 OsString::from(remote),
                 OsString::from(remote_ref.as_str()),
             ],
@@ -5288,22 +5482,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 Err(git_failure(&command, output).into())
             };
         }
-        let line = output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .next()
-            .unwrap_or_default();
-        let oid = line.split(|byte| *byte == b'\t').next().unwrap_or_default();
-        let oid = std::str::from_utf8(oid).map_err(|error| RepositoryError::InvalidOutput {
-            field: "ls_remote_oid",
-            reason: error.to_string(),
-        })?;
-        Oid::parse_object(oid)
-            .map(Some)
-            .map_err(|error| RepositoryError::InvalidOutput {
-                field: "ls_remote_oid",
-                reason: error.to_string(),
-            })
+        parse_remote_ref_oid(&output.stdout, remote_ref)
     }
 
     /// Runs one mutation command and classifies the outcome.
@@ -6080,6 +6259,43 @@ fn cleanup_whitespace(message: &str) -> String {
         cleaned.push_str(line);
     }
     cleaned
+}
+
+/// ls-remote arguments are suffix patterns, even when fully qualified. Only
+/// the exact advertised name proves presence; a matching tail in another ref
+/// must not select a branch or establish that a push reached its destination.
+fn parse_remote_ref_oid(
+    bytes: &[u8],
+    requested: &RemoteSideRef,
+) -> Result<Option<Oid>, RepositoryError> {
+    let invalid = |reason: &str| RepositoryError::InvalidOutput {
+        field: "ls_remote_oid",
+        reason: reason.to_owned(),
+    };
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut matched = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let mut fields = line.split(|byte| *byte == b'\t');
+        let object = fields.next().unwrap_or_default();
+        let name = fields
+            .next()
+            .ok_or_else(|| invalid("missing advertised ref name"))?;
+        if name.is_empty() || fields.next().is_some() {
+            return Err(invalid("malformed advertised ref record"));
+        }
+        let object = std::str::from_utf8(object).map_err(|_| invalid("object id is not UTF-8"))?;
+        let oid = Oid::parse_object(object).map_err(|_| invalid("invalid advertised object id"))?;
+        if name == requested.as_str().as_bytes() {
+            if matched.is_some() {
+                return Err(invalid("duplicate exact advertised ref"));
+            }
+            matched = Some(oid);
+        }
+    }
+    Ok(matched)
 }
 
 /// `<local ref>:<remote-side ref>`, both fully qualified.
@@ -8941,6 +9157,9 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             success(b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n"),
         ]);
         let outcome = service
@@ -8962,6 +9181,9 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             exit(
                 1,
                 b"To /origin\n!\trefs/heads/feature:refs/heads/feature\t[rejected] (fetch first)\nDone\n",
@@ -8972,8 +9194,8 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
-        // The remote is never consulted: `!` already proved the ref did not move.
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+        // No endpoint lookup follows rejection; only private preflight configuration reads run.
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 6);
     }
 
     #[test]
@@ -8981,6 +9203,9 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             Err(unstarted_failure()),
         ]);
         let outcome = service
@@ -8988,7 +9213,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 6);
     }
 
     #[test]
@@ -8996,7 +9221,13 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             Err(launched_failure(b"To /origin\n")),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             success(format!("{}\trefs/heads/feature\n", oid(4)).as_bytes()),
         ]);
         let cancelled = CancellationToken::new();
@@ -9012,8 +9243,19 @@ mod tests {
             }
         );
         let commands = service.executor.commands.lock().unwrap();
+        let count: u32 = commands[9].environment[OsStr::new("GIT_CONFIG_COUNT")]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let marker =
+            commands[9].environment[OsStr::new(&format!("GIT_CONFIG_VALUE_{}", count - 1))].clone();
         assert_eq!(
-            commands[3].arguments,
+            commands[9].environment[OsStr::new(&format!("GIT_CONFIG_KEY_{}", count - 1))],
+            OsString::from("url./origin.insteadOf")
+        );
+        assert_eq!(
+            commands[9].arguments,
             vec![
                 OsString::from("-C"),
                 OsString::from("/repo"),
@@ -9023,8 +9265,10 @@ mod tests {
                 OsString::from("-c"),
                 OsString::from("diff.autoRefreshIndex=false"),
                 OsString::from("ls-remote"),
+                OsString::from("--refs"),
                 OsString::from("--exit-code"),
-                OsString::from("origin"),
+                OsString::from("--"),
+                marker,
                 OsString::from("refs/heads/feature"),
             ]
         );
@@ -9035,7 +9279,13 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             Err(launched_failure(b"")),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             success(format!("{}\trefs/heads/feature\n", oid(5)).as_bytes()),
         ]);
         let outcome = service
@@ -9047,7 +9297,13 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             Err(launched_failure(b"")),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             exit(2, b""),
         ]);
         let outcome = service
@@ -9059,13 +9315,272 @@ mod tests {
         let service = fake_service(vec![
             success(b""),
             success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             Err(launched_failure(b"")),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
             exit(128, b""),
         ]);
         let outcome = service
             .push(&publish_request(), &CancellationToken::new())
             .unwrap();
         assert!(matches!(outcome, PushOutcome::OutcomeUnknown { .. }));
+    }
+
+    #[test]
+    fn failed_push_destination_capture_preserves_definitive_results_and_refuses_reconciliation() {
+        for definite_success in [true, false] {
+            let result = if definite_success {
+                success(
+                    b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n",
+                )
+            } else {
+                Err(launched_failure(b""))
+            };
+            let service = fake_service(vec![
+                success(b""),
+                success(format!("{}\n", oid(4)).as_bytes()),
+                Err(unstarted_failure()),
+                result,
+            ]);
+            let outcome = service
+                .push(&publish_request(), &CancellationToken::new())
+                .unwrap();
+            assert!(if definite_success {
+                matches!(outcome, PushOutcome::Pushed { .. })
+            } else {
+                matches!(outcome, PushOutcome::OutcomeUnknown { .. })
+            });
+            let commands = service.executor.commands.lock().unwrap();
+            assert_eq!(commands.len(), 4);
+            assert!(
+                commands[3]
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "push")
+            );
+            assert!(!commands.iter().any(|command| {
+                command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "ls-remote")
+            }));
+        }
+    }
+
+    #[test]
+    fn remote_ref_parser_refuses_malformed_or_duplicate_exact_records() {
+        let requested = RemoteSideRef::parse("refs/heads/main").unwrap();
+        for bytes in [
+            b"missing-tab\n".to_vec(),
+            format!("{}\t\n", oid(1)).into_bytes(),
+            b"not-an-object\trefs/heads/main\n".to_vec(),
+            format!("{}\trefs/heads/main\textra\n", oid(1)).into_bytes(),
+            format!("{}\trefs/heads/main\n{}\trefs/heads/main\n", oid(1), oid(2)).into_bytes(),
+        ] {
+            assert!(matches!(
+                parse_remote_ref_oid(&bytes, &requested),
+                Err(RepositoryError::InvalidOutput { .. })
+            ));
+        }
+        assert_eq!(parse_remote_ref_oid(b"", &requested).unwrap(), None);
+    }
+
+    #[test]
+    fn push_destination_resolution_refuses_ambiguous_framing_and_preserves_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let service = fake_service(vec![
+            exit(1, b""),
+            success(b"/first\0/second\0"),
+            success(b""),
+            success(b"/rewritten-first\n/rewritten-second\n"),
+        ]);
+        assert_eq!(
+            service.push_destinations(Path::new("/repo"), "origin", &CancellationToken::new()),
+            Some(vec![
+                OsString::from("/rewritten-first"),
+                OsString::from("/rewritten-second")
+            ])
+        );
+        for responses in [
+            vec![success(b"/first\n/second\0")],
+            vec![
+                success(b"/original\0"),
+                success(b""),
+                success(b"/first\n/second\n"),
+            ],
+            vec![success(b"\0")],
+            vec![
+                success(b"/original\0"),
+                success(b"UrL./bad\nbase.PushInsteadOf\0"),
+            ],
+            vec![success(b"/original\0"), success(b"malformed-key-list")],
+            vec![
+                success(b"/original\0"),
+                success(b""),
+                success(b"/embedded\0nul\n"),
+            ],
+        ] {
+            let service = fake_service(responses);
+            assert!(
+                service
+                    .push_destinations(Path::new("/repo"), "origin", &CancellationToken::new())
+                    .is_none()
+            );
+        }
+        let service = fake_service(vec![
+            success(b"/original\0"),
+            success(b""),
+            success(b"/non-utf8-\xff\n"),
+        ]);
+        let destinations = service
+            .push_destinations(Path::new("/repo"), "origin", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(destinations[0].as_os_str().as_bytes(), b"/non-utf8-\xff");
+    }
+
+    #[test]
+    fn push_endpoint_alias_preserves_bytes_and_appends_bounded_config_entries() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let service = fake_service(vec![]);
+        let endpoint = OsString::from_vec(b"/private=endpoint-\xff.git".to_vec());
+        let reference = RemoteSideRef::parse("refs/heads/main").unwrap();
+        let command = service
+            .push_endpoint_command(
+                Path::new("/repo"),
+                &endpoint,
+                &reference,
+                Some(OsStr::new("2")),
+            )
+            .unwrap();
+        assert_eq!(
+            command.environment[OsStr::new("GIT_CONFIG_COUNT")],
+            OsString::from("3")
+        );
+        assert_eq!(
+            command.environment[OsStr::new("GIT_CONFIG_KEY_2")].as_bytes(),
+            b"url./private=endpoint-\xff.git.insteadOf"
+        );
+        let marker = &command.environment[OsStr::new("GIT_CONFIG_VALUE_2")];
+        assert!(command.arguments.contains(marker));
+        assert!(!command.arguments.iter().any(|argument| {
+            argument
+                .as_bytes()
+                .windows(b"private=endpoint".len())
+                .any(|part| part == b"private=endpoint")
+        }));
+        assert!(
+            !command
+                .environment
+                .contains_key(OsStr::new("GIT_CONFIG_KEY_0"))
+        );
+        assert!(
+            !command
+                .environment
+                .contains_key(OsStr::new("GIT_CONFIG_KEY_1"))
+        );
+        assert!(
+            !command
+                .removed_environment
+                .iter()
+                .any(|name| name.as_bytes().starts_with(b"GIT_CONFIG_"))
+        );
+        for invalid in [
+            OsString::from("-1"),
+            OsString::from("not-a-count"),
+            OsString::from("2147483647"),
+            OsString::from("4294967296"),
+            OsString::from_vec(vec![0xff]),
+        ] {
+            assert!(
+                service
+                    .push_endpoint_command(
+                        Path::new("/repo"),
+                        &endpoint,
+                        &reference,
+                        Some(&invalid)
+                    )
+                    .is_none()
+            );
+        }
+        let default = service
+            .push_endpoint_command(Path::new("/repo"), &endpoint, &reference, None)
+            .unwrap();
+        assert_eq!(
+            default.environment[OsStr::new("GIT_CONFIG_COUNT")],
+            OsString::from("1")
+        );
+    }
+
+    #[test]
+    fn push_reconciliation_never_logs_resolved_credentials_or_lookup_stderr() {
+        if isolated_logging_test(
+            "push_reconciliation_never_logs_resolved_credentials_or_lookup_stderr",
+        ) {
+            return;
+        }
+        const SECRET: &str = "synthetic-secret-for-reconciliation-test";
+        let endpoint = format!("https://alice:{SECRET}@example.invalid/repository.git");
+        let sensitive_failure = || {
+            let mut failure = launched_failure(b"");
+            failure.kind = ProcessFailureKind::TimedOut;
+            failure.stderr = format!("lookup refused {endpoint}").into_bytes();
+            failure.message = endpoint.clone();
+            Err(failure)
+        };
+        let logs = captured_logs(|| {
+            for responses in [
+                vec![sensitive_failure()],
+                vec![
+                    success(format!("{endpoint}\0").as_bytes()),
+                    sensitive_failure(),
+                ],
+                vec![
+                    success(format!("{endpoint}\0").as_bytes()),
+                    success(b""),
+                    sensitive_failure(),
+                ],
+                vec![
+                    success(format!("{endpoint}\0").as_bytes()),
+                    success(b""),
+                    success(format!("{endpoint}\n").as_bytes()),
+                    sensitive_failure(),
+                ],
+                vec![
+                    success(format!("{endpoint}\0").as_bytes()),
+                    success(b""),
+                    success(format!("{endpoint}\n").as_bytes()),
+                    Ok(ProcessOutput {
+                        exit_code: Some(128),
+                        signal: None,
+                        success: false,
+                        stdout: Vec::new(),
+                        stderr: endpoint.as_bytes().to_vec(),
+                    }),
+                ],
+            ] {
+                let service = fake_service(responses);
+                assert!(!service.push_destinations_match(
+                    Path::new("/repo"),
+                    "origin",
+                    &[OsString::from(&endpoint)],
+                    &RemoteSideRef::parse("refs/heads/main").unwrap(),
+                    &oid(4),
+                    &CancellationToken::new()
+                ));
+            }
+        });
+        assert!(
+            !logs.contains(SECRET),
+            "resolved credentials must not appear in diagnostics"
+        );
+        assert!(
+            logs.is_empty(),
+            "lookup failures remain unknown without exposing their argv or stderr"
+        );
     }
 
     #[test]
