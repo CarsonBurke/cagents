@@ -1325,18 +1325,22 @@ mod tests {
             );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        assert_eq!(
-            client
-                .agent(
-                    Authority::default(),
-                    Operation::Inbox(Inbox {
-                        all: true,
-                        replies_to: None
-                    })
-                )
-                .unwrap(),
-            Reply::Inbox(expected)
-        );
+        let reply = client
+            .agent(
+                Authority::default(),
+                Operation::Inbox(Inbox {
+                    all: true,
+                    replies_to: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(reply, Reply::Inbox(expected));
+        let Reply::Inbox(messages) = reply else {
+            panic!("expected received inbox messages");
+        };
+        assert!(messages.iter().all(|message| {
+            !super::super::messages::message_lines(message).contains("Receipt not confirmed")
+        }));
         drop(client);
         server.join().unwrap();
     }
@@ -1400,6 +1404,13 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(reply, Reply::Inbox(vec![received]));
+            let Reply::Inbox(messages) = reply else {
+                panic!("expected received inbox messages");
+            };
+            assert!(
+                super::super::messages::message_lines(&messages[0])
+                    .contains("Receipt not confirmed; this message may appear again.")
+            );
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert!(
                 client

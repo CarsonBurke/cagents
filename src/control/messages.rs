@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, To, short},
+    mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short},
 };
 
 /// How often a waiting caller asks the daemon for a reply.
@@ -248,7 +248,11 @@ pub(super) fn message_lines(message: &Message) -> String {
         .lines()
         .map(|line| format!("  {}", printable(line)))
         .collect();
-    format!("{heading}\n{}", body.join("\n"))
+    let mut rendered = format!("{heading}\n{}", body.join("\n"));
+    if message.state == State::Pending {
+        rendered.push_str("\nReceipt not confirmed; this message may appear again.");
+    }
+    rendered
 }
 
 /// A line as a terminal may print it: control characters, which could
