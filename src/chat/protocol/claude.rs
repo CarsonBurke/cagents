@@ -300,6 +300,9 @@ struct Claude {
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
     attention_generation: u64,
+    /// Which result-delimited turn has already published its start. Busy may
+    /// stay true between turns while background permission decisions remain.
+    started_generation: Option<u64>,
     deferred_attention: HashMap<
         u64,
         (
@@ -355,8 +358,8 @@ struct Claude {
     /// with the task, oldest first: what stopping one subagent addresses,
     /// whether it runs in the foreground or the background.
     agent_task_calls: VecDeque<(String, String)>,
-    /// Agent tool calls whose agent was stopped in the foreground, oldest
-    /// first, so the refusal their call then returns does not read as failure.
+    /// Agent tool calls whose agent was stopped, oldest first, so a delayed
+    /// launch or refused result cannot overwrite the terminal outcome.
     stopped_agents: VecDeque<String>,
     models: Vec<Model>,
     selected: Option<String>,
@@ -414,6 +417,12 @@ impl Claude {
             // background agents run under, so it stops them with the turn.
             interrupt_stops_background: true,
             ..Capabilities::default()
+        }
+    }
+    fn start_turn(&mut self, step: &mut Step) {
+        if self.started_generation != Some(self.attention_generation) {
+            self.started_generation = Some(self.attention_generation);
+            step.events.push(Event::TurnStarted);
         }
     }
     fn status(&mut self, busy: bool, detail: impl Into<String>, step: &mut Step) {
@@ -586,7 +595,7 @@ impl Claude {
         }
         step.writes.push(frame);
         if !self.busy && mode == PromptMode::Send {
-            step.events.push(Event::TurnStarted);
+            self.start_turn(&mut step);
             self.status(true, "Claude is working", &mut step);
         }
         Ok(step)
@@ -1129,12 +1138,12 @@ impl Claude {
                                 }
                             }
                             let background = self.background_agents.contains(&tool_id);
-                            let status = if background
+                            let status = if self.stopped_agents.contains(&tool_id) {
+                                ToolStatus::Stopped
+                            } else if background
                                 && item.content.status() == Some(ToolStatus::Succeeded)
                             {
                                 ToolStatus::Running
-                            } else if self.stopped_agents.contains(&tool_id) {
-                                ToolStatus::Stopped
                             } else {
                                 item.content.status().unwrap_or(ToolStatus::Running)
                             };
@@ -1711,6 +1720,7 @@ impl Adapter for Claude {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
             }
             "conversation_reset" => {
+                self.started_generation = None;
                 self.session_id = None;
                 self.history = None;
                 self.pending.clear();
@@ -2088,8 +2098,8 @@ impl Adapter for Claude {
                             self.queued.push(message.preview.clone());
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
-                        if state == "started" && !self.busy && self.submissions.contains_key(id) {
-                            step.events.push(Event::TurnStarted);
+                        if state == "started" && self.submissions.contains_key(id) {
+                            self.start_turn(&mut step);
                             self.status(true, "Claude is working", &mut step);
                         }
                         self.queued.retain(|message| message.id != id);
@@ -3265,6 +3275,7 @@ impl Claude {
                     }
                 }
                 if parent.is_empty() {
+                    self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
                 }
@@ -3509,9 +3520,13 @@ impl Claude {
                 match state {
                     "idle" => self.status(false, "Claude is idle", step),
                     "requires_action" => {
+                        self.start_turn(step);
                         self.status(true, "Claude is waiting for your response", step)
                     }
-                    state => self.status(true, format!("Claude: {state}"), step),
+                    state => {
+                        self.start_turn(step);
+                        self.status(true, format!("Claude: {state}"), step);
+                    }
                 }
             }
             "status" => step.events.push(Event::Status {
@@ -3601,6 +3616,26 @@ impl Claude {
                             .find(|(agent, _)| agent == task)
                             .map(|(_, tool)| tool.clone())
                     });
+                // Keep task identity even after removing a stopped agent from
+                // the running set: its tool result can arrive afterwards.
+                let known_tool = parent.clone().or_else(|| {
+                    self.agent_task_calls
+                        .iter()
+                        .find(|(_, known)| known == task)
+                        .map(|(tool, _)| tool.clone())
+                });
+                if let Some(tool) = &known_tool {
+                    if string(frame, "subtype") == "task_started" {
+                        self.stopped_agents.retain(|known| known != tool);
+                    } else if ended == Some(ToolStatus::Stopped)
+                        && !self.stopped_agents.contains(tool)
+                    {
+                        self.stopped_agents.push_back(tool.clone());
+                        if self.stopped_agents.len() > MAX_TOOLS {
+                            self.stopped_agents.pop_front();
+                        }
+                    }
+                }
                 if let Some(parent) = parent {
                     let status = item.content.status().unwrap_or(ToolStatus::Running);
                     step.events.push(Event::Subagent {
@@ -3615,28 +3650,17 @@ impl Claude {
                     } else {
                         self.background_agents.remove(&parent);
                     }
-                } else if ended == Some(ToolStatus::Stopped)
-                    && let Some((tool, _)) = self
-                        .agent_task_calls
-                        .iter()
-                        .find(|(_, known)| known == task)
+                } else if (ended == Some(ToolStatus::Stopped)
+                    || string(frame, "subtype") == "task_started")
+                    && let Some(tool) = known_tool
                 {
-                    // An agent in the foreground ends with its call, whose
-                    // result reads as a refusal once the agent was stopped.
-                    let tool = tool.clone();
                     step.events.push(Event::Subagent {
-                        id: tool.clone(),
+                        id: tool,
                         kind: String::new(),
                         description: String::new(),
-                        status: Some(ToolStatus::Stopped),
+                        status: Some(ended.unwrap_or(ToolStatus::Running)),
                         background: None,
                     });
-                    if !self.stopped_agents.contains(&tool) {
-                        self.stopped_agents.push_back(tool);
-                        if self.stopped_agents.len() > MAX_TOOLS {
-                            self.stopped_agents.pop_front();
-                        }
-                    }
                 }
                 self.tool(item.clone());
                 step.events.push(Event::Item(item.clone()));
@@ -3816,8 +3840,8 @@ impl History {
         let mut agent_ids = HashMap::<String, String>::new();
         let mut agent_status = HashMap::new();
         let mut background_agent_tools = HashSet::new();
-        // Foreground agents whose task was stopped, whose refused result
-        // would otherwise read as a failure.
+        // Stopped agents whose delayed launch or refused result would
+        // otherwise overwrite their terminal outcome.
         let mut stopped_agent_tools = HashSet::<String>::new();
         let mut position = 0;
         let mut line = Vec::new();
@@ -3897,10 +3921,16 @@ impl History {
                     string(patch, "status"),
                     string(&value, "subtype") == "task_notification",
                 );
-                if background_agent_tools.contains(tool_id) {
-                    agent_status.insert(tool_id.into(), status.unwrap_or(ToolStatus::Running));
+                if string(&value, "subtype") == "task_started" {
+                    stopped_agent_tools.remove(tool_id);
                 } else if status == Some(ToolStatus::Stopped) {
                     stopped_agent_tools.insert(tool_id.into());
+                }
+                if background_agent_tools.contains(tool_id)
+                    || string(&value, "subtype") == "task_started"
+                {
+                    agent_status.insert(tool_id.into(), status.unwrap_or(ToolStatus::Running));
+                } else if status == Some(ToolStatus::Stopped) {
                     if let Some(status) = agent_status.get_mut(tool_id) {
                         *status = ToolStatus::Stopped;
                     }
@@ -3919,6 +3949,9 @@ impl History {
                             .map(|(tool, _)| tool.clone())
                     };
                     if let Some(tool) = tool {
+                        if status == ToolStatus::Stopped {
+                            stopped_agent_tools.insert(tool.clone());
+                        }
                         agent_status.insert(tool, status);
                     }
                 }
@@ -4862,6 +4895,70 @@ mod tests {
     }
     fn stream(event: Value) -> Value {
         json!({"type":"stream_event", "parent_tool_use_id":null, "event":event})
+    }
+
+    #[test]
+    fn autonomous_parent_turns_publish_one_start_even_with_pending_decisions() {
+        for pending in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                ..Claude::default()
+            };
+            adapter
+                .send_prompt("hello".into(), vec![], PromptMode::Send)
+                .unwrap();
+            if pending {
+                adapter
+                    .pending
+                    .insert("background-permission".into(), Value::Null);
+            }
+            adapter
+                .receive(json!({"type":"result","is_error":false}))
+                .unwrap();
+            assert_eq!(adapter.busy, pending);
+            let started = adapter
+                .receive(stream(
+                    json!({"type":"message_start","message":{"id":"autonomous"}}),
+                ))
+                .unwrap();
+            assert_eq!(
+                started
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::TurnStarted))
+                    .count(),
+                1
+            );
+            for next in [
+                json!({"type":"system","subtype":"session_state_changed","state":"working"}),
+                json!({"type":"system","subtype":"session_state_changed","state":"requires_action"}),
+                stream(json!({"type":"message_start","message":{"id":"another-message-in-turn"}})),
+            ] {
+                let repeated = adapter.receive(next).unwrap();
+                assert!(
+                    !repeated
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::TurnStarted))
+                );
+            }
+            adapter
+                .receive(json!({"type":"result","is_error":false}))
+                .unwrap();
+            let started = adapter
+                .receive(
+                    json!({"type":"system","subtype":"session_state_changed","state":"working"}),
+                )
+                .unwrap();
+            assert_eq!(
+                started
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::TurnStarted))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -6430,6 +6527,27 @@ mod tests {
         assert!(stopped.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "tool-foreground")));
         let returned = adapter.receive(json!({"type":"user","uuid":"foreground-result","message":{"content":[{"type":"tool_result","tool_use_id":"tool-foreground","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}})).unwrap();
         assert!(returned.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "tool-foreground")));
+        let restarted = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"a-foreground","tool_use_id":"tool-foreground","task_type":"local_agent"})).unwrap();
+        assert!(restarted.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Running), .. } if id == "tool-foreground")));
+        assert!(
+            !adapter
+                .stopped_agents
+                .contains(&"tool-foreground".to_owned())
+        );
+    }
+
+    #[test]
+    fn stopped_agents_survive_late_launch_results_but_can_restart() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        let started = json!({"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"tool-agent","task_type":"local_agent"});
+        adapter.receive(started.clone()).unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"tool-agent","status":"stopped"})).unwrap();
+        let late = adapter.receive(json!({"type":"user","uuid":"result","tool_use_result":{"status":"async_launched","agentId":"a1"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Launched"}]}})).unwrap();
+        assert!(late.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "tool-agent")));
+        let restarted = adapter.receive(started).unwrap();
+        assert!(restarted.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Running), .. } if id == "tool-agent")));
+        assert!(!adapter.stopped_agents.contains(&"tool-agent".to_owned()));
     }
 
     /// An agent resumed from a saved conversation has no task frame of its
@@ -6651,6 +6769,34 @@ mod tests {
             ("tool-failed", ToolStatus::Failed),
         ] {
             assert_eq!(history.agent_status.get(tool), Some(&status), "{tool}");
+        }
+    }
+
+    #[test]
+    fn replayed_stop_survives_late_launch_result_and_allows_restart() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        for (background, restart) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut file = tempfile::tempfile().unwrap();
+            for value in [
+                json!({"type":"assistant","uuid":"launch","sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":background}}]}}),
+                json!({"type":"system","subtype":"task_notification","uuid":"stopped","sessionId":session,"tool_use_id":"tool-agent","status":"stopped"}),
+                json!({"type":"user","uuid":"result","sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Launched"}]}}),
+            ] {
+                writeln!(file, "{value}").unwrap();
+            }
+            if restart {
+                writeln!(file, "{}", json!({"type":"system","subtype":"task_started","uuid":"restart","sessionId":session,"tool_use_id":"tool-agent","task_id":"a1","task_type":"local_agent"})).unwrap();
+            }
+            file.rewind().unwrap();
+            let history = History::index(file, session).unwrap();
+            assert_eq!(
+                history.agent_status.get("tool-agent"),
+                Some(&if restart {
+                    ToolStatus::Running
+                } else {
+                    ToolStatus::Stopped
+                })
+            );
         }
     }
 

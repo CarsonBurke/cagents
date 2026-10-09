@@ -740,6 +740,11 @@ pub struct Snapshot {
     #[serde(default)]
     pub sampled_at: Option<u64>,
     pub generation: u64,
+    /// Turn starts observed by this provider process. Unlike publication
+    /// generation, this changes only at a turn boundary, including queued
+    /// and autonomous turns, even when publications coalesce the idle state.
+    #[serde(default)]
+    pub turn_generation: u64,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,

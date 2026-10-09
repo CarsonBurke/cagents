@@ -3892,7 +3892,11 @@ mod tests {
         parent.thread = Some("parent".into());
         parent.turn = Some("parent-turn".into());
         parent.ready = true;
-        for (id, turn) in [("busy-child", Some("child-turn")), ("idle-child", None)] {
+        for (id, turn) in [
+            ("busy-child", Some("child-turn")),
+            ("sibling", Some("sibling-turn")),
+            ("idle-child", None),
+        ] {
             let mut child = adapter();
             child.thread = Some(id.into());
             child.is_child = true;
@@ -3932,6 +3936,24 @@ mod tests {
                     id: "unknown".into()
                 })
                 .is_err()
+        );
+        let stop = parent
+            .command(Command::StopSubagent {
+                id: "busy-child".into(),
+            })
+            .unwrap();
+        let acknowledged = parent
+            .receive(json!({"id":stop.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(acknowledged.events.is_empty());
+        assert_eq!(parent.turn.as_deref(), Some("parent-turn"));
+        assert_eq!(
+            parent.children["sibling"].turn.as_deref(),
+            Some("sibling-turn")
+        );
+        assert_eq!(
+            parent.children["busy-child"].turn.as_deref(),
+            Some("child-turn")
         );
         let cancel = parent.command(Command::Interrupt).unwrap();
         assert_eq!(

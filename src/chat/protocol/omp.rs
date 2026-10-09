@@ -1728,6 +1728,8 @@ mod tests {
             busy: true,
             ..Default::default()
         };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        assert_eq!(interrupt.writes[0]["type"], "abort");
         let started = adapter.receive(json!({"type":"subagent_lifecycle","payload":{"id":"child","status":"started","detached":true,"progress":{"id":"child","status":"running"}}})).unwrap();
         assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, background: Some(true), .. } if id == "child")));
         assert!(
@@ -2135,6 +2137,7 @@ mod tests {
             }
             let response = adapter.receive(json!({"type":"response", "command":"get_state", "id":request["id"], "success":true,"data":data})).unwrap();
             assert!(response.events.iter().any(|event| matches!(event, Event::Capabilities(caps) if caps.queue == contents.is_some())));
+            assert!(response.events.iter().any(|event| matches!(event, Event::Capabilities(caps) if !caps.stop_subagent && !caps.interrupt_stops_background)));
             if contents.is_some() {
                 assert!(response.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len()==3 && messages[0].text==messages[1].text && messages[2].text.is_empty())));
             }

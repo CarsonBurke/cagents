@@ -2228,7 +2228,7 @@ impl Runtime {
             self.note(error.clone());
         }
         // A cancel armed for one turn must not carry over to the next.
-        if !snapshot.busy {
+        if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
@@ -8208,6 +8208,7 @@ mod tests {
                 kind: "fixture".into(),
                 description: "Child".into(),
                 status: chat::ToolStatus::Succeeded,
+                background: false,
                 items: vec![child],
             });
         // Hidden child transcripts and the explicit parent request do not
@@ -10418,6 +10419,69 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.interrupt_stops_background = true;
+        snapshot.subagents.push(chat::Subagent {
+            id: "background".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: chat::ToolStatus::Running,
+            background: true,
+            items: Vec::new(),
+        });
+        let busy = (*runtime.snapshot).clone();
+        show_chat_snapshot_for_test(&mut app, card, busy);
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        let runtime = chat_runtime(&app, card);
+        let armed = runtime
+            .interrupt_armed
+            .expect("first cancel arms confirmation");
+        assert!(runtime.pending.is_none());
+        // An old timer cannot disarm a later confirmation.
+        drop(app.handle_chat_ui(Action::DisarmInterrupt(
+            target,
+            armed - Duration::from_secs(1),
+        )));
+        assert_eq!(chat_runtime(&app, card).interrupt_armed, Some(armed));
+        drop(app.handle_chat_ui(Action::DisarmInterrupt(target, armed)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+        assert!(chat_runtime(&app, card).pending.is_some());
+        settle(&mut app, card, Ok(()));
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.interrupt_armed.is_some());
+        let mut idle = (*runtime.snapshot).clone();
+        idle.busy = false;
+        show_chat_snapshot_for_test(&mut app, card, idle);
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+    }
+
+    #[test]
+    fn cancel_confirmation_does_not_cross_a_coalesced_turn_boundary() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        runtime.interrupt_armed = Some(Instant::now());
+        let mut next = (*runtime.snapshot).clone();
+        next.turn_generation = next.turn_generation.wrapping_add(1);
+        // No idle publication, user message, or transcript change is needed
+        // for a queued or autonomous turn to invalidate the confirmation.
+        show_chat_snapshot_for_test(&mut app, card, next);
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
     }
 
     /// Answers the command `card` is waiting on with `result`.
