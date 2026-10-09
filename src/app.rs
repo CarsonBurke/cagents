@@ -3915,7 +3915,7 @@ pub enum Message {
     /// the only authority on what the index holds is Git.
     SourceControlMutated {
         key: ActiveWorktreeKey,
-        kind: MutationKind,
+        operation: uuid::Uuid,
         report: Option<String>,
         /// A commit that succeeded clears the message input; one that did not
         /// must keep it, because the text is the user's work.
@@ -4654,6 +4654,13 @@ impl WorkspaceDestination {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SourceControlMutation {
+    id: uuid::Uuid,
+    kind: MutationKind,
+    commit_revision: Option<u64>,
+}
+
 pub struct Cagents {
     device_ui: device_ui::State,
     workspace: Workspace,
@@ -4783,6 +4790,7 @@ pub struct Cagents {
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
+    source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
     chrome_ui: chrome_ui::State,
@@ -9735,7 +9743,13 @@ impl Cagents {
         {
             self.context_tab = ContextTab::Files;
         }
-        self.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+        let mut source = SourceControlModel::loading(key.clone());
+        source.set_mutation(
+            self.source_control_mutations
+                .get(&key.canonical_path)
+                .map(|mutation| mutation.kind),
+        );
+        self.sidebar_model.source_control = Some(source);
         self.source_control_snapshot_task(key)
     }
 
@@ -10670,19 +10684,36 @@ impl Cagents {
     /// running: two `git add` runs against one index corrupt each other's
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
-    fn begin_mutation(&mut self, key: &ActiveWorktreeKey, kind: MutationKind) -> bool {
-        if !self.source_control_is_bound(key) || self.folder_scope(key) {
-            return false;
+    fn begin_mutation(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        kind: MutationKind,
+        commit_revision: Option<u64>,
+    ) -> Option<uuid::Uuid> {
+        if !self.source_control_is_bound(key)
+            || self.folder_scope(key)
+            || self
+                .source_control_mutations
+                .contains_key(&key.canonical_path)
+        {
+            return None;
         }
-        let Some(source) = self.sidebar_model.source_control.as_mut() else {
-            return false;
-        };
+        let source = self.sidebar_model.source_control.as_mut()?;
         if source.busy() {
-            return false;
+            return None;
         }
+        let id = uuid::Uuid::new_v4();
+        self.source_control_mutations.insert(
+            key.canonical_path.clone(),
+            SourceControlMutation {
+                id,
+                kind,
+                commit_revision,
+            },
+        );
         source.set_error(None);
         source.set_mutation(Some(kind));
-        true
+        Some(id)
     }
 
     /// The task one finished mutation turns into: report what Git did, then
@@ -10690,7 +10721,7 @@ impl Cagents {
     /// the mutation left behind.
     fn mutation_task(
         key: ActiveWorktreeKey,
-        kind: MutationKind,
+        operation: uuid::Uuid,
         run: impl FnOnce(&RepositoryService, &CancellationToken) -> (Option<String>, bool)
         + Send
         + 'static,
@@ -10707,7 +10738,7 @@ impl Cagents {
             };
             Message::SourceControlMutated {
                 key,
-                kind,
+                operation,
                 report,
                 committed,
             }
@@ -12455,6 +12486,7 @@ impl Application for Cagents {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            source_control_mutations: HashMap::new(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
@@ -13608,7 +13640,11 @@ impl Application for Cagents {
                 }
                 if matches!(&action, SidebarAction::FilesPage { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
-                    | SidebarAction::ToggleFilesFilter { key } if !self.source_control_is_bound(key))
+                    | SidebarAction::ToggleFilesFilter { key }
+                    | SidebarAction::CommitMessageChanged { key, .. }
+                    | SidebarAction::CommitSubjectEditorAction { key, .. }
+                    | SidebarAction::CommitEditorAction { key, .. }
+                    | SidebarAction::AmendChanged { key, .. } if !self.source_control_is_bound(key))
                 {
                     return Task::none();
                 }
@@ -13977,14 +14013,14 @@ impl Application for Cagents {
                         self.open_working_change(key, path, area)
                     }
                     SidebarAction::Stage { key, selection } => {
-                        if !self.begin_mutation(&key, MutationKind::Stage) {
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
                             return Task::none();
-                        }
+                        };
                         let request = StageRequest {
                             worktree: key.canonical_path.clone(),
                             selection,
                         };
-                        Self::mutation_task(key, MutationKind::Stage, move |service, cancel| {
+                        Self::mutation_task(key, operation, move |service, cancel| {
                             (
                                 mutation_report("Stage", service.stage(&request, cancel)),
                                 false,
@@ -13992,14 +14028,14 @@ impl Application for Cagents {
                         })
                     }
                     SidebarAction::Unstage { key, selection } => {
-                        if !self.begin_mutation(&key, MutationKind::Unstage) {
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Unstage, None) else {
                             return Task::none();
-                        }
+                        };
                         let request = UnstageRequest {
                             worktree: key.canonical_path.clone(),
                             selection,
                         };
-                        Self::mutation_task(key, MutationKind::Unstage, move |service, cancel| {
+                        Self::mutation_task(key, operation, move |service, cancel| {
                             (
                                 mutation_report("Unstage", service.unstage(&request, cancel)),
                                 false,
@@ -14012,10 +14048,10 @@ impl Application for Cagents {
                     // `confirmed: true`, and the service refuses an
                     // unconfirmed one outright.
                     SidebarAction::ConfirmDiscard { key, request } => {
-                        if !self.begin_mutation(&key, MutationKind::Discard) {
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Discard, None) else {
                             return Task::none();
-                        }
-                        Self::mutation_task(key, MutationKind::Discard, move |service, cancel| {
+                        };
+                        Self::mutation_task(key, operation, move |service, cancel| {
                             (
                                 mutation_report("Discard", service.discard(&request, cancel)),
                                 false,
@@ -14023,14 +14059,15 @@ impl Application for Cagents {
                         })
                     }
                     SidebarAction::Commit { key, message, amend } => {
-                        if !self.begin_mutation(&key, MutationKind::Commit) {
+                        let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
                             return Task::none();
-                        }
+                        };
                         let request = CommitRequest {
                             worktree: key.canonical_path.clone(),
                             message,
                         };
-                        Self::mutation_task(key, MutationKind::Commit, move |service, cancel| {
+                        Self::mutation_task(key, operation, move |service, cancel| {
                             commit_report(service.commit_with_amend(&request, amend, cancel))
                         })
                     }
@@ -14039,15 +14076,15 @@ impl Application for Cagents {
                         branch,
                         target,
                     } => {
-                        if !self.begin_mutation(&key, MutationKind::Push) {
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Push, None) else {
                             return Task::none();
-                        }
+                        };
                         let request = PushRequest {
                             worktree: key.canonical_path.clone(),
                             branch,
                             target,
                         };
-                        Self::mutation_task(key, MutationKind::Push, move |service, cancel| {
+                        Self::mutation_task(key, operation, move |service, cancel| {
                             (push_report(service.push(&request, cancel)), false)
                         })
                     }
@@ -15817,10 +15854,22 @@ impl Application for Cagents {
             }
             Message::SourceControlMutated {
                 key,
-                kind,
+                operation,
                 report,
                 committed,
             } => {
+                let Some(mutation) = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .copied()
+                    .filter(|mutation| mutation.id == operation)
+                else {
+                    return Task::none();
+                };
+                self.source_control_mutations.remove(&key.canonical_path);
+                if committed && let Some(revision) = mutation.commit_revision {
+                    self.sidebar_state.clear_submitted_commit(&key, revision);
+                }
                 let mut refreshes = Vec::new();
                 for (&card, runtime) in &mut self.cards {
                     if let CardRuntime::Repository(runtime) = runtime
@@ -15829,23 +15878,27 @@ impl Application for Cagents {
                         refreshes.push(repository_task(runtime.refresh_after_mutation(card)));
                     }
                 }
-                if !self.source_control_is_bound(&key) {
-                    return Task::batch(refreshes);
-                }
-                if committed {
-                    self.sidebar_state.clear_commit_message();
-                }
-                if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                    source.set_mutation(None);
-                    source.set_error(report.clone());
-                }
+                let bound = self
+                    .sidebar_model
+                    .source_control
+                    .as_mut()
+                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                    .map(|source| {
+                        source.set_mutation(None);
+                        source.set_error(report.clone());
+                        source.key.clone()
+                    });
                 if let Some(report) = report {
-                    self.status = Some(TransientNotice::error(report));
+                    self.status = Some(TransientNotice::error(format!(
+                        "{}: {report}",
+                        display_path(&key.canonical_path)
+                    )));
                 }
-                let _ = kind;
-                // Whatever Git did, the index is the authority on the result,
-                // so the panel re-reads rather than guessing.
-                refreshes.push(self.reload_source_control(&key));
+                // Navigation does not cancel Git. Only this exact completion
+                // releases the worktree, then the index is read afresh.
+                if let Some(bound) = bound {
+                    refreshes.push(self.reload_source_control(&bound));
+                }
                 Task::batch(refreshes)
             }
         };
@@ -23041,6 +23094,150 @@ mod tests {
     }
 
     #[test]
+    fn git_mutation_ownership_survives_navigation_and_fences_old_completions() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let sibling = app
+            .sidebar_model
+            .worktree_at(Path::new("/repo/fix-sidebar"))
+            .unwrap();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let first = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+        app.active_workspace = Some(sibling.canonical_path.clone());
+        drop(app.rebind_source_control());
+        assert!(!app.sidebar_model.source_control.as_ref().unwrap().busy());
+        let other = app
+            .begin_mutation(&sibling, MutationKind::Push, None)
+            .unwrap();
+        app.active_workspace = Some(key.canonical_path.clone());
+        drop(app.rebind_source_control());
+        assert!(app.sidebar_model.source_control.as_ref().unwrap().busy());
+        assert!(
+            app.begin_mutation(&key, MutationKind::Commit, None)
+                .is_none()
+        );
+        drop(app.update(Message::SourceControlMutated {
+            key: sibling,
+            operation: other,
+            report: None,
+            committed: false,
+        }));
+        assert!(
+            app.sidebar_model.source_control.as_ref().unwrap().busy(),
+            "another worktree's completion cannot release this command"
+        );
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: None,
+            committed: false,
+        }));
+        assert!(!app.sidebar_model.source_control.as_ref().unwrap().busy());
+        let newer = app
+            .begin_mutation(&key, MutationKind::Unstage, None)
+            .unwrap();
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: Some("stale failure".into()),
+            committed: true,
+        }));
+        assert!(app.sidebar_model.source_control.as_ref().unwrap().busy());
+        assert_eq!(app.source_control_mutations[&key.canonical_path].id, newer);
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn git_commit_completion_preserves_later_edits_and_settles_parked_drafts() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let sibling = app
+            .sidebar_model
+            .worktree_at(Path::new("/repo/fix-sidebar"))
+            .unwrap();
+        app.active_workspace = Some(key.canonical_path.clone());
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Submitted subject\n\nSubmitted body".into(),
+            })),
+        );
+        let revision = app
+            .sidebar_state
+            .submitted_commit_revision(&key, app.sidebar_state.commit_message(), false)
+            .unwrap();
+        let first = app
+            .begin_mutation(&key, MutationKind::Commit, Some(revision))
+            .unwrap();
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CommitEditorAction {
+                key: key.clone(),
+                action: iced::widget::text_editor::Action::Edit(
+                    iced::widget::text_editor::Edit::Paste(Arc::new("Later edit ".into())),
+                ),
+            })),
+        );
+        let later = app.sidebar_state.commit_message().to_owned();
+        app.active_workspace = Some(sibling.canonical_path.clone());
+        drop(app.rebind_source_control());
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CommitMessageChanged {
+                key: sibling.clone(),
+                message: "Sibling draft".into(),
+            })),
+        );
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Departed widget".into(),
+            })),
+        );
+        assert_eq!(app.sidebar_state.commit_message(), "Sibling draft");
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: None,
+            committed: true,
+        }));
+        app.active_workspace = Some(key.canonical_path.clone());
+        drop(app.rebind_source_control());
+        assert_eq!(app.sidebar_state.commit_message(), later);
+        let revision = app
+            .sidebar_state
+            .submitted_commit_revision(&key, &later, false)
+            .unwrap();
+        let second = app
+            .begin_mutation(&key, MutationKind::Commit, Some(revision))
+            .unwrap();
+        app.active_workspace = Some(sibling.canonical_path.clone());
+        drop(app.rebind_source_control());
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: second,
+            report: None,
+            committed: true,
+        }));
+        assert_eq!(app.sidebar_state.commit_message(), "Sibling draft");
+        app.active_workspace = Some(key.canonical_path.clone());
+        drop(app.rebind_source_control());
+        assert!(
+            app.sidebar_state.commit_message().is_empty(),
+            "an unchanged submitted draft clears even when success arrives elsewhere"
+        );
+    }
+
+    #[test]
     fn files_result_changes_reset_scroll_and_reject_departed_worktrees() {
         use iced::advanced::{
             Layout, layout,
@@ -23601,6 +23798,7 @@ mod tests {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            source_control_mutations: HashMap::new(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),

@@ -1403,7 +1403,7 @@ impl ChangesTab {
 /// Which source-control mutation is currently running.
 ///
 /// Exactly one runs at a time per worktree - the application serializes them
-/// per Git common directory - so this is an option, not a set.
+/// per canonical worktree - so this is an option, not a set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationKind {
     Stage,
@@ -2711,6 +2711,19 @@ impl PartialEq for CommitComposer {
 }
 impl Eq for CommitComposer {}
 
+/// The complete composer travels with its canonical worktree, including
+/// cursor and editor history. Revisions distinguish later edits from a commit
+/// that was submitted before navigation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CommitDraft {
+    message: String,
+    subject: String,
+    subject_composer: CommitComposer,
+    composer: CommitComposer,
+    amend: bool,
+    revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
     rows: selection::Selection,
@@ -2740,11 +2753,9 @@ pub struct SidebarState {
     /// after its updates, never while drawing, so each row's read is one
     /// lookup however many cards are open.
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
-    commit_message: String,
-    commit_subject: String,
-    commit_subject_composer: CommitComposer,
-    commit_composer: CommitComposer,
-    amend_commit: bool,
+    commit_draft: CommitDraft,
+    parked_commit_drafts: BTreeMap<PathBuf, CommitDraft>,
+    commit_generation: u64,
     /// File-tree folders the user opened. Everything else renders collapsed,
     /// so a fresh worktree shows its top level and loading a whole project
     /// tree stays cheap.
@@ -3012,7 +3023,7 @@ impl SidebarState {
     }
 
     pub fn commit_message(&self) -> &str {
-        &self.commit_message
+        &self.commit_draft.message
     }
 
     /// The discard awaiting confirmation, which the application mounts with
@@ -3028,11 +3039,45 @@ impl SidebarState {
     /// Clears the commit input. A successful commit calls this; a failed one
     /// must not, because the message is the user's work.
     pub fn clear_commit_message(&mut self) {
-        self.commit_message.clear();
-        self.commit_subject.clear();
-        self.commit_subject_composer = CommitComposer::default();
-        self.commit_composer = CommitComposer::default();
-        self.amend_commit = false;
+        self.commit_draft = CommitDraft::default();
+    }
+
+    pub fn submitted_commit_revision(
+        &self,
+        key: &ActiveWorktreeKey,
+        message: &str,
+        amend: bool,
+    ) -> Option<u64> {
+        (self
+            .active_worktree
+            .as_ref()
+            .is_some_and(|active| active.canonical_path == key.canonical_path)
+            && self.commit_draft.message == message
+            && self.commit_draft.amend == amend)
+            .then_some(self.commit_draft.revision)
+    }
+
+    /// Settle only the submitted draft, including while another tree is bound.
+    pub fn clear_submitted_commit(&mut self, key: &ActiveWorktreeKey, revision: u64) {
+        let draft = if self
+            .active_worktree
+            .as_ref()
+            .is_some_and(|active| active.canonical_path == key.canonical_path)
+        {
+            Some(&mut self.commit_draft)
+        } else {
+            self.parked_commit_drafts.get_mut(&key.canonical_path)
+        };
+        if let Some(draft) = draft
+            && draft.revision == revision
+        {
+            *draft = CommitDraft::default();
+        }
+    }
+
+    fn revise_commit_draft(&mut self) {
+        self.commit_generation = self.commit_generation.wrapping_add(1);
+        self.commit_draft.revision = self.commit_generation;
     }
 
     /// Rebinds the source-control panel after a focus or model change.
@@ -3070,11 +3115,21 @@ impl SidebarState {
         if self.active_worktree == next {
             return false;
         }
+        if let Some(previous) = &self.active_worktree {
+            let draft = std::mem::take(&mut self.commit_draft);
+            if draft.revision != 0 || !draft.message.is_empty() || draft.amend {
+                self.parked_commit_drafts
+                    .insert(previous.canonical_path.clone(), draft);
+            }
+        }
+        self.commit_draft = next
+            .as_ref()
+            .and_then(|key| self.parked_commit_drafts.remove(&key.canonical_path))
+            .unwrap_or_default();
         self.active_worktree = next;
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
         self.files_filter_open = false;
-        self.clear_commit_message();
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
         self.change_pages.clear();
@@ -3199,45 +3254,53 @@ impl SidebarState {
                 });
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
-                self.commit_message.clone_from(message);
+                self.revise_commit_draft();
+                self.commit_draft.message.clone_from(message);
                 let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
-                self.commit_subject = subject.to_owned();
-                self.commit_subject_composer = CommitComposer(
+                self.commit_draft.subject = subject.to_owned();
+                self.commit_draft.subject_composer = CommitComposer(
                     cosmic::iced::widget::text_editor::Content::with_text(subject),
                 );
-                self.commit_composer =
+                self.commit_draft.composer =
                     CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
                         description.trim_start_matches('\n'),
                     ));
             }
             SidebarAction::CommitSubjectEditorAction { action, .. } => {
-                self.commit_subject_composer.0.perform(action.clone());
+                self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
-                    let text = self.commit_subject_composer.0.text();
-                    self.commit_subject = text.lines().collect::<Vec<_>>().join(" ");
+                    self.revise_commit_draft();
+                    let text = self.commit_draft.subject_composer.0.text();
+                    self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
                     if text.trim_end_matches('\n').contains('\n') {
                         // A pasted message stays a single subject line.
-                        self.commit_subject_composer =
+                        self.commit_draft.subject_composer =
                             CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
-                                &self.commit_subject,
+                                &self.commit_draft.subject,
                             ));
                     }
-                    self.commit_message = compose_commit_message(
-                        &self.commit_subject,
-                        &self.commit_composer.0.text(),
+                    self.commit_draft.message = compose_commit_message(
+                        &self.commit_draft.subject,
+                        &self.commit_draft.composer.0.text(),
                     );
                 }
             }
             SidebarAction::CommitEditorAction { action, .. } => {
-                self.commit_composer.0.perform(action.clone());
+                self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
-                    self.commit_message = compose_commit_message(
-                        &self.commit_subject,
-                        &self.commit_composer.0.text(),
+                    self.revise_commit_draft();
+                    self.commit_draft.message = compose_commit_message(
+                        &self.commit_draft.subject,
+                        &self.commit_draft.composer.0.text(),
                     );
                 }
             }
-            SidebarAction::AmendChanged { amend, .. } => self.amend_commit = *amend,
+            SidebarAction::AmendChanged { amend, .. } => {
+                if self.commit_draft.amend != *amend {
+                    self.revise_commit_draft();
+                    self.commit_draft.amend = *amend;
+                }
+            }
             SidebarAction::ChangePage { scope, page, .. } => {
                 self.change_pages.insert(*scope, *page);
             }
@@ -8313,46 +8376,47 @@ fn changes_footer<'a>(
     let input_key = key.clone();
     let can_commit = !modal_open
         && !source.busy()
-        && !state.commit_subject.trim().is_empty()
-        && (source.staged_count > 0 || (state.amend_commit && source.head_oid.is_some()));
+        && !state.commit_draft.subject.trim().is_empty()
+        && (source.staged_count > 0 || (state.commit_draft.amend && source.head_oid.is_some()));
     let commit_action = SidebarAction::Commit {
         key: key.clone(),
         message: message.to_owned(),
-        amend: state.amend_commit,
+        amend: state.commit_draft.amend,
     };
     let submit = commit_action.clone();
     let subject_submit = commit_action.clone();
-    let mut subject_input = cosmic::iced::widget::text_editor(&state.commit_subject_composer.0)
-        .placeholder("Commit subject")
-        .id(chrome.commit_input_id.clone())
-        .font(cosmic::iced::Font::DEFAULT)
-        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-        .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
-        .size(design::TEXT_BODY)
-        .padding([space::S, 10.0])
-        .style(commit_description_style)
-        .key_binding(move |press| {
-            if !matches!(
-                press.status,
-                cosmic::iced::widget::text_editor::Status::Focused { .. }
-            ) {
-                return None;
-            }
-            if matches!(
-                press.key,
-                cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
-            ) {
-                if press.modifiers.control() && can_commit {
-                    Some(cosmic::iced::widget::text_editor::Binding::Custom(
-                        subject_submit.clone(),
-                    ))
-                } else {
-                    None
+    let mut subject_input =
+        cosmic::iced::widget::text_editor(&state.commit_draft.subject_composer.0)
+            .placeholder("Commit subject")
+            .id(chrome.commit_input_id.clone())
+            .font(cosmic::iced::Font::DEFAULT)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
+            .size(design::TEXT_BODY)
+            .padding([space::S, 10.0])
+            .style(commit_description_style)
+            .key_binding(move |press| {
+                if !matches!(
+                    press.status,
+                    cosmic::iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    return None;
                 }
-            } else {
-                cosmic::iced::widget::text_editor::Binding::from_key_press(press)
-            }
-        });
+                if matches!(
+                    press.key,
+                    cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
+                ) {
+                    if press.modifiers.control() && can_commit {
+                        Some(cosmic::iced::widget::text_editor::Binding::Custom(
+                            subject_submit.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    cosmic::iced::widget::text_editor::Binding::from_key_press(press)
+                }
+            });
     if !modal_open {
         let key = key.clone();
         subject_input =
@@ -8364,13 +8428,15 @@ fn changes_footer<'a>(
     let mut column = widget::column::with_capacity(5)
         .spacing(space::S)
         .push(subject_input);
-    let has_subject = !state.commit_subject.trim().is_empty();
+    let has_subject = !state.commit_draft.subject.trim().is_empty();
 
-    let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
+    let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_draft.composer.0)
         .placeholder("Description (optional)")
         .id(chrome.commit_description_id.clone())
         .height(Length::Fixed(
-            (state.commit_composer.0.line_count().clamp(2, 4) as f32) * design::TEXT_BODY * 1.3
+            (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
+                * design::TEXT_BODY
+                * 1.3
                 + 16.0,
         ))
         .font(cosmic::iced::Font::DEFAULT)
@@ -8403,7 +8469,7 @@ fn changes_footer<'a>(
         });
     }
 
-    let commit_label = if state.amend_commit {
+    let commit_label = if state.commit_draft.amend {
         "Amend commit"
     } else {
         "Commit"
@@ -8412,9 +8478,9 @@ fn changes_footer<'a>(
         "Enter a commit summary"
     } else if source.busy() {
         "Git operation in progress"
-    } else if source.staged_count == 0 && !state.amend_commit {
+    } else if source.staged_count == 0 && !state.commit_draft.amend {
         "Stage changes to commit"
-    } else if !can_commit && state.amend_commit && source.head_oid.is_none() {
+    } else if !can_commit && state.commit_draft.amend && source.head_oid.is_none() {
         "No commit to amend"
     } else {
         commit_label
@@ -8431,7 +8497,7 @@ fn changes_footer<'a>(
     if has_subject {
         column = column.push(commit_input);
     }
-    let amend = crate::ui_controls::field::checkbox(state.amend_commit)
+    let amend = crate::ui_controls::field::checkbox(state.commit_draft.amend)
         .label("Amend")
         .size(14)
         .text_size(design::TEXT_CAPTION)
@@ -10992,9 +11058,10 @@ pub(crate) mod tests {
         state
             .expanded_directories
             .insert(RepoPath::parse("src").unwrap());
-        state.commit_message = "message".into();
+        state.commit_draft.message = "message".into();
         state
-            .commit_composer
+            .commit_draft
+            .composer
             .0
             .perform(cosmic::iced::widget::text_editor::Action::Edit(
                 cosmic::iced::widget::text_editor::Edit::Insert('x'),
@@ -15914,8 +15981,8 @@ pub(crate) mod tests {
             key: key.clone(),
             message: "Original subject\n\nDescription paragraph\nAnother line".into(),
         });
-        assert_eq!(state.commit_subject, "Original subject");
-        let description = state.commit_composer.0.text();
+        assert_eq!(state.commit_draft.subject, "Original subject");
+        let description = state.commit_draft.composer.0.text();
         assert!(description.starts_with("Description paragraph\nAnother line"));
         state.apply(&SidebarAction::CommitSubjectEditorAction {
             key: key.clone(),
@@ -15929,7 +15996,7 @@ pub(crate) mod tests {
                 )),
             ),
         });
-        assert_eq!(state.commit_composer.0.text(), description);
+        assert_eq!(state.commit_draft.composer.0.text(), description);
         assert_eq!(
             state.commit_message(),
             compose_commit_message("Revised subject", &description)
@@ -15945,9 +16012,9 @@ pub(crate) mod tests {
         assert!(state.commit_message().starts_with("Revised subject\n\n"));
         assert!(state.commit_message().contains("Added detail "));
         state.clear_commit_message();
-        assert!(state.commit_subject.is_empty());
+        assert!(state.commit_draft.subject.is_empty());
         assert!(state.commit_message().is_empty());
-        assert!(state.commit_composer.0.text().trim().is_empty());
+        assert!(state.commit_draft.composer.0.text().trim().is_empty());
         assert_eq!(compose_commit_message("Subject only", "\n"), "Subject only");
         state.apply(&SidebarAction::CommitSubjectEditorAction {
             key: main_key(),
@@ -15957,10 +16024,14 @@ pub(crate) mod tests {
                 )),
             ),
         });
-        assert_eq!(state.commit_subject, "First line Second line Third line");
+        assert_eq!(
+            state.commit_draft.subject,
+            "First line Second line Third line"
+        );
         assert!(
             !state
-                .commit_subject_composer
+                .commit_draft
+                .subject_composer
                 .0
                 .text()
                 .trim_end_matches('\n')
@@ -15970,7 +16041,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rebinding_drops_every_draft_typed_for_the_worktree_being_left() {
+    fn rebinding_scopes_panel_drafts_and_restores_the_worktrees_commit_draft() {
         let model = panel_model();
         let mut state = SidebarState::default();
         assert!(state.sync_active_worktree(&model, &focus_on(&main_key())));
@@ -16022,6 +16093,79 @@ pub(crate) mod tests {
             state.pending_discard().is_none(),
             "a confirmation counted against the worktree that was left must not be answerable"
         );
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: fix_key(),
+            message: "Sibling subject\n\nSibling body".into(),
+        });
+        assert!(state.sync_active_worktree(&model, &focus_on(&main_key())));
+        assert_eq!(
+            state.commit_message(),
+            "wip",
+            "returning to the owner restores its input"
+        );
+        assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+        assert_eq!(state.commit_message(), "Sibling subject\n\nSibling body");
+    }
+
+    #[test]
+    fn submitted_commit_clears_only_its_revision_even_while_parked() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "First subject\n\nFirst body".into(),
+        });
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let submitted = state
+            .submitted_commit_revision(&key, state.commit_message(), true)
+            .unwrap();
+        assert_eq!(
+            state.submitted_commit_revision(&key, "Stale frame", true),
+            None
+        );
+        state.sync_active_worktree(&model, &focus_on(&fix_key()));
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: fix_key(),
+            message: "Other draft".into(),
+        });
+        state.clear_submitted_commit(&key, submitted);
+        assert_eq!(state.commit_message(), "Other draft");
+        state.sync_active_worktree(&model, &focus_on(&key));
+        assert!(state.commit_message().is_empty());
+        assert!(!state.commit_draft.amend);
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "New subject\n\nNew body".into(),
+        });
+        let next = state
+            .submitted_commit_revision(&key, state.commit_message(), false)
+            .unwrap();
+        state.apply(&SidebarAction::CommitEditorAction {
+            key: key.clone(),
+            action: cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(Arc::new("Later edit ".into())),
+            ),
+        });
+        let edited = state.commit_message().to_owned();
+        state.sync_active_worktree(&model, &focus_on(&fix_key()));
+        state.clear_submitted_commit(&key, next);
+        state.sync_active_worktree(&model, &focus_on(&key));
+        assert_eq!(
+            state.commit_message(),
+            edited,
+            "later edits survive the older commit's completion"
+        );
+        // Even replacing text with the same text is a newer editing intent.
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "New subject\n\nNew body".into(),
+        });
+        state.clear_submitted_commit(&key, next);
+        assert_eq!(state.commit_message(), "New subject\n\nNew body");
     }
 
     #[test]
