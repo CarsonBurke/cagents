@@ -445,6 +445,9 @@ fn read(root: &crate::fs_safety::Root, path: &std::path::Path) -> Result<String,
     }
     let bytes = crate::fs_safety::read_bounded(&mut file, MAX_TEXT_BYTES)
         .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_TEXT_BYTES {
+        return Err("text exceeds remote editor limit (512 KiB)".into());
+    }
     if bytes.contains(&0) {
         return Err("binary files cannot be edited".into());
     }
@@ -668,6 +671,112 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn remote_editor_never_saves_a_truncated_prefix_of_an_oversized_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("large.txt");
+        let mut original = "x".repeat(2 * 1024 * 1024);
+        original.push_str("unseen trailing content\n");
+        std::fs::write(directory.path().join(&path), &original).unwrap();
+        let read = execute(Operation::Read {
+            root: directory.path().into(),
+            path: path.clone(),
+        });
+        let expected = match read {
+            Ok(Reply::Text(text)) => text,
+            Err(error) => {
+                assert!(error.contains("512 KiB"));
+                // A window opened before the daemon was fixed can retain this old
+                // truncated baseline. The save recheck must reject it as well.
+                original[..MAX_TEXT_BYTES as usize + 1].to_owned()
+            }
+            other => panic!("unexpected remote read reply: {other:?}"),
+        };
+        let content = expected[..MAX_TEXT_BYTES as usize].to_owned();
+        let saved = execute(Operation::Write {
+            root: directory.path().into(),
+            path: path.clone(),
+            expected,
+            content,
+        });
+        assert!(saved.unwrap_err().contains("512 KiB"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(path)).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn remote_editor_enforces_encoded_byte_limit_at_read_and_save_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("boundary.txt");
+        let load = || {
+            execute(Operation::Read {
+                root: directory.path().into(),
+                path: path.clone(),
+            })
+        };
+        let exact = "x".repeat(MAX_TEXT_BYTES as usize);
+        std::fs::write(directory.path().join(&path), &exact).unwrap();
+        assert!(matches!(load(), Ok(Reply::Text(text)) if text == exact));
+        let replacement = "y".repeat(MAX_TEXT_BYTES as usize);
+        assert!(matches!(
+            execute(Operation::Write {
+                root: directory.path().into(),
+                path: path.clone(),
+                expected: exact.clone(),
+                content: replacement.clone()
+            }),
+            Ok(Reply::Saved)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(&path)).unwrap(),
+            replacement
+        );
+        let too_large = format!("{exact}z");
+        std::fs::write(directory.path().join(&path), &too_large).unwrap();
+        assert!(load().unwrap_err().contains("512 KiB"));
+        let utf8 = "é".repeat(MAX_TEXT_BYTES as usize / 2);
+        assert_eq!(utf8.len() as u64, MAX_TEXT_BYTES);
+        std::fs::write(directory.path().join(&path), &utf8).unwrap();
+        assert!(matches!(load(), Ok(Reply::Text(text)) if text == utf8));
+        std::fs::write(directory.path().join(&path), format!("{utf8}é")).unwrap();
+        // The sentinel byte cuts a multibyte character; size must be checked before UTF-8 decode.
+        assert!(load().unwrap_err().contains("512 KiB"));
+        std::fs::write(directory.path().join(&path), b"binary\0text").unwrap();
+        assert!(load().unwrap_err().contains("binary"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn remote_editor_refuses_save_after_file_grows_beyond_read_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("growing.txt");
+        std::fs::write(directory.path().join(&path), "loaded text").unwrap();
+        let Ok(Reply::Text(expected)) = execute(Operation::Read {
+            root: directory.path().into(),
+            path: path.clone(),
+        }) else {
+            panic!("small file must load")
+        };
+        let grown = format!("{}unseen trailing content", "x".repeat(2 * 1024 * 1024));
+        std::fs::write(directory.path().join(&path), &grown).unwrap();
+        let error = execute(Operation::Write {
+            root: directory.path().into(),
+            path: path.clone(),
+            expected,
+            content: "edited text".into(),
+        })
+        .unwrap_err();
+        assert!(error.contains("512 KiB"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(path)).unwrap(),
+            grown
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
