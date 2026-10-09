@@ -10,7 +10,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
             fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
             process::CommandExt,
@@ -66,6 +66,12 @@ pub enum UpdateError {
     Io(#[from] io::Error),
     #[error("invalid release metadata: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{operation}; streaming command cleanup is unconfirmed: {cleanup}")]
+    Cleanup {
+        #[source]
+        operation: Box<UpdateError>,
+        cleanup: io::Error,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1357,10 +1363,11 @@ fn bounded_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| invalid(format!("cannot start {operation}: {error}")))?;
-    let mut pipe = child.stdout.take().expect("piped stdout");
+    let mut child = StreamingChild::new(child)?;
+    let mut pipe = child.child.stdout.take().expect("piped stdout");
     let result = (|| {
         let fd = pipe.as_raw_fd();
         // SAFETY: flags are changed on the live stdout descriptor only.
@@ -1394,7 +1401,7 @@ fn bounded_command(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             }
-            if eof && let Some(status) = child.try_wait()? {
+            if eof && let Some(status) = child.observed_exit_status()? {
                 if !status.success() {
                     return Err(invalid(format!("{operation} failed ({status})")));
                 }
@@ -1406,16 +1413,189 @@ fn bounded_command(
         file.seek(SeekFrom::Start(0))?;
         Ok(())
     })();
-    if result.is_err() {
-        // SAFETY: this child created its own process group. Kill descendants too
-        // so cancellation/timeouts cannot strand a credential helper or pipe.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
-        let _ = child.wait();
+    // Keep the original leader unreaped through failed status and sealing/seek
+    // errors, since each still needs original-group cleanup. Success preserves
+    // the existing policy of leaving independently running descendants alone.
+    let cleanup = child.finish(result.is_err());
+    match (result, cleanup) {
+        (Err(operation), Err(cleanup)) => Err(UpdateError::Cleanup {
+            operation: Box::new(operation),
+            cleanup,
+        }),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(()), Ok(())) => Ok(file),
     }
-    result?;
-    Ok(file)
+}
+
+/// Sole owner of the streaming command. No observation releases its leader
+/// until every operation that can still fail and require group cleanup ends.
+struct StreamingChild {
+    child: std::process::Child,
+    identity: OwnedFd,
+    finished: bool,
+}
+
+impl StreamingChild {
+    fn new(child: std::process::Child) -> io::Result<Self> {
+        // Capture before the freshly spawned child can be reaped or handed off.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+        let identity = if raw < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: successful pidfd_open returns a new owned descriptor.
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        Self::with_identity(child, identity)
+    }
+
+    fn with_identity(
+        mut child: std::process::Child,
+        identity: io::Result<OwnedFd>,
+    ) -> io::Result<Self> {
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                // Capture failed before any reaping/handoff. The fresh leader
+                // still reserves its original group; no lifecycle fallback follows.
+                let group = if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+                    Ok(())
+                } else {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                };
+                // Never synchronously wait on a known-live, signal-denied child.
+                let cleanup = child
+                    .kill()
+                    .and_then(|()| child.wait().map(|_| ()))
+                    .and(group);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => io::Error::new(
+                        error.kind(),
+                        format!("{error}; streaming startup cleanup is unconfirmed: {cleanup}"),
+                    ),
+                });
+            }
+        };
+        Ok(Self {
+            child,
+            identity,
+            finished: false,
+        })
+    }
+
+    fn status(&self, flags: i32) -> io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: the captured original pidfd cannot select a recycled PID.
+            // Only finish omits WNOWAIT, after its last possible group signal.
+            if unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    self.identity.as_raw_fd() as libc::id_t,
+                    &mut information,
+                    flags,
+                )
+            } == 0
+            {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        let (pid, status) = unsafe { (information.si_pid(), information.si_status()) };
+        if pid == 0 {
+            return Ok(None);
+        }
+        if pid as u32 != self.child.id() {
+            return Err(io::Error::other(
+                "streaming child observation returned another process",
+            ));
+        }
+        let raw = match information.si_code {
+            libc::CLD_EXITED => status << 8,
+            libc::CLD_KILLED => status,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => {
+                return Err(io::Error::other(
+                    "streaming child observation returned an unexpected status",
+                ));
+            }
+        };
+        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    }
+
+    fn observed_exit_status(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.status(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
+    }
+
+    fn finish(&mut self, terminate_group: bool) -> io::Result<()> {
+        self.finish_with(terminate_group, |group| {
+            // SAFETY: the sole owner retains its original leader until final reap.
+            if unsafe { libc::kill(-(group as i32), libc::SIGKILL) } == 0 {
+                Ok(())
+            } else {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn finish_with(
+        &mut self,
+        terminate_group: bool,
+        signal: impl FnOnce(u32) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        // Ownership loss is final; Drop cannot retry a numeric signal later.
+        self.finished = true;
+        let observed = self.observed_exit_status()?;
+        let cleanup = if terminate_group {
+            signal(self.child.id())
+        } else {
+            Ok(())
+        };
+        // A failed signal must not leave a known-exited original leader as a
+        // zombie. Conversely, a known-live signal-denied child cannot be waited
+        // on indefinitely just to report cleanup uncertainty.
+        if cleanup.is_ok() || observed.is_some() {
+            let reap = self.status(libc::WEXITED).and_then(|status| {
+                status.ok_or_else(|| {
+                    io::Error::other("streaming child final reap returned no status")
+                })
+            });
+            if let Err(reap) = reap {
+                return Err(match cleanup {
+                    Err(cleanup) => io::Error::new(
+                        cleanup.kind(),
+                        format!("{cleanup}; final reap also failed: {reap}"),
+                    ),
+                    Ok(()) => reap,
+                });
+            }
+        }
+        cleanup
+    }
+}
+
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        let _ = self.finish(true);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1494,6 +1674,409 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+        assert!(raw >= 0);
+        let identity = unsafe { OwnedFd::from_raw_fd(raw) };
+        let error = match StreamingChild::with_identity(
+            child,
+            Err(io::Error::from_raw_os_error(libc::EMFILE)),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("injected identity capture failure must refuse startup"),
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    identity.as_raw_fd() as libc::id_t,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn bounded_stream_preserves_success_and_size_failure() {
+        let mut file = bounded_command(
+            Command::new("/bin/sh").args(["-c", "printf fixture"]),
+            "owned fixture",
+            7,
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"fixture");
+        assert!(
+            bounded_command(
+                Command::new("/bin/sh").args(["-c", "printf fixture"]),
+                "owned fixture",
+                6,
+                Duration::from_secs(2),
+                &CancellationToken::new()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("size limit")
+        );
+    }
+
+    #[test]
+    fn bounded_stream_keeps_live_timeout_and_cancellation_cleanup() {
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+        assert!(matches!(
+            bounded_command(
+                Command::new("/bin/sleep").arg("30"),
+                "owned fixture",
+                10,
+                Duration::from_millis(20),
+                &cancellation
+            ),
+            Err(UpdateError::Timeout("owned fixture"))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            signal.cancel();
+        });
+        let started = Instant::now();
+        let result = bounded_command(
+            Command::new("/bin/sleep").arg("30"),
+            "owned fixture",
+            10,
+            Duration::from_secs(2),
+            &cancellation,
+        );
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(UpdateError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn streaming_child_observation_keeps_leader_until_final_cleanup() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut child = StreamingChild::new(child).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.observed_exit_status().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(
+            child.observed_exit_status().unwrap().unwrap().code(),
+            Some(7)
+        );
+        // Mirrors any late sealing/seek error after EOF+failed/successful status.
+        child.finish(true).unwrap();
+        assert_eq!(
+            child.observed_exit_status().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(child.finish(true).is_ok(), "completion remains disarmed");
+    }
+
+    #[test]
+    fn streaming_signal_error_reaps_exited_leader_and_refuses_live_wait() {
+        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let mut child = StreamingChild::new(child).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.observed_exit_status().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            child
+                .finish_with(true, |_| Err(io::Error::from_raw_os_error(libc::EPERM)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            child.observed_exit_status().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut child = StreamingChild::new(child).unwrap();
+        struct OwnedCleanup(OwnedFd);
+        impl Drop for OwnedCleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                    let mut status: libc::siginfo_t = std::mem::zeroed();
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        self.0.as_raw_fd() as libc::id_t,
+                        &mut status,
+                        libc::WEXITED,
+                    );
+                }
+            }
+        }
+        let _cleanup = OwnedCleanup(child.identity.try_clone().unwrap());
+        let started = Instant::now();
+        assert_eq!(
+            child
+                .finish_with(true, |_| Err(io::Error::from_raw_os_error(libc::EPERM)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.observed_exit_status().unwrap().is_none());
+        // Own test-only cleanup uses the still-original capability, not a PGID.
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    child.identity.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            },
+            0
+        );
+        child.status(libc::WEXITED).unwrap().unwrap();
+
+        let error = UpdateError::Cleanup {
+            operation: Box::new(UpdateError::Cancelled),
+            cleanup: io::Error::from_raw_os_error(libc::EPERM),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled; streaming command cleanup is unconfirmed")
+        );
+        assert!(
+            matches!(error, UpdateError::Cleanup { operation, .. } if matches!(*operation, UpdateError::Cancelled))
+        );
+    }
+
+    #[test]
+    fn bounded_failed_stream_cleans_owned_descendants_after_exit() {
+        const MARKER: &str = "CAGENTS_UPDATE_DESCENDANT_CHILD";
+        const TEST: &str =
+            "update::tests::bounded_failed_stream_cleans_owned_descendants_after_exit";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}; {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("owned failed update stream descendant cleaned")
+            );
+            return;
+        }
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let pidfile = directory.path().join("descendant.pid");
+        let script = r#"import os,signal,sys
+r,w=os.pipe()
+pid=os.fork()
+if pid==0:
+ os.close(r); os.close(1)
+ with open(sys.argv[1],'w') as f: f.write(str(os.getpid()))
+ os.write(w,b'1'); os.close(w)
+ while True: signal.pause()
+os.close(w); os.read(r,1); os.close(r)
+print('partial',flush=True)
+sys.exit(7)
+"#;
+        let result = bounded_command(
+            Command::new("/usr/bin/python3")
+                .args(["-c", script])
+                .arg(&pidfile),
+            "owned fixture",
+            100,
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        );
+        assert!(result.unwrap_err().to_string().contains("failed"));
+        let pid: libc::pid_t = fs::read_to_string(pidfile).unwrap().parse().unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        assert!(raw >= 0);
+        struct Cleanup {
+            identity: OwnedFd,
+            pid: libc::pid_t,
+            reaped: bool,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            self.identity.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                        libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            identity: unsafe { OwnedFd::from_raw_fd(raw) },
+            pid,
+            reaped: false,
+        };
+        let mut poll = libc::pollfd {
+            fd: cleanup.identity.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        cleanup.reaped = true;
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            std::process::ExitStatus::from_raw(status).signal(),
+            Some(libc::SIGKILL)
+        );
+        println!("owned failed update stream descendant cleaned");
+    }
+
+    #[test]
+    #[ignore = "requires an owned user/PID namespace and namespace-local PID allocation control"]
+    fn streaming_child_refuses_a_kernel_reused_original_pid() {
+        const MARKER: &str = "CAGENTS_UPDATE_FIXED_REUSE_CHILD";
+        const NS: &str = "CAGENTS_UPDATE_FIXED_OUTER_NS";
+        const TEST: &str = "update::tests::streaming_child_refuses_a_kernel_reused_original_pid";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new("/usr/bin/unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    TEST,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(MARKER, "1")
+                .env(NS, fs::read_link("/proc/self/ns/pid").unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}; {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("original update pidfd refused recycled group")
+            );
+            return;
+        }
+        assert_eq!(std::process::id(), 1);
+        assert_ne!(
+            fs::read_link("/proc/self/ns/pid").unwrap().as_os_str(),
+            std::env::var_os(NS).unwrap()
+        );
+        fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
+        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        assert_eq!(child.id(), 200);
+        let mut original = StreamingChild::new(child).unwrap();
+        original.child.wait().unwrap(); // Deliberately violate sole-reaper ownership.
+        fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
+        let mut victim = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert_eq!(victim.id(), 200);
+        assert_eq!(unsafe { libc::getpgid(200) }, 200);
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, 200, 0) } as i32;
+        assert!(raw >= 0);
+        struct Cleanup(OwnedFd);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+        }
+        let cleanup = Cleanup(unsafe { OwnedFd::from_raw_fd(raw) });
+        assert_eq!(
+            original.finish(true).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        drop(original);
+        let mut poll = libc::pollfd {
+            fd: cleanup.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 250) }, 0);
+        assert!(victim.try_wait().unwrap().is_none());
+        println!("original update pidfd refused recycled group PID/PGID200");
+        drop(cleanup);
+        victim.wait().unwrap();
+    }
     use super::*;
 
     #[test]
