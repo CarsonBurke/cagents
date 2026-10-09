@@ -1958,6 +1958,7 @@ pub struct RepositoryRuntime {
     retained_viewports: VecDeque<(PathBuf, FileViewportAnchors)>,
     restored_navigation: Option<crate::model::RepositoryNavigation>,
     pending_editor_navigation: Option<(PathBuf, crate::model::EditorNavigation)>,
+    pending_editor_focus: Option<AsyncIdentity>,
     next_save_ticket: u64,
     next_diff_request: u64,
     /// Identity the application gave the open buffer at the LSP boundary, or
@@ -2115,6 +2116,7 @@ impl RepositoryRuntime {
             retained_viewports: VecDeque::new(),
             restored_navigation: None,
             pending_editor_navigation: None,
+            pending_editor_focus: None,
             next_save_ticket: 0,
             lsp_document: None,
             language: EditorLanguageState::default(),
@@ -3075,6 +3077,19 @@ impl RepositoryRuntime {
                 .pending_editor_navigation
                 .as_ref()
                 .is_some_and(|(path, _)| path == &identity.path)
+    }
+
+    /// The accepted restored buffer keeps its focus handoff until the app can
+    /// mount it. Reading the file can finish before the first viewport arrives.
+    pub fn take_restored_editor_focus(&mut self, card: CardId) -> Option<widget::Id> {
+        let identity = self.pending_editor_focus.as_ref()?;
+        if identity.card != card || !self.accepts_selected(identity) {
+            self.pending_editor_focus = None;
+            return None;
+        }
+        let target = self.editor_focus_target(card)?;
+        self.pending_editor_focus = None;
+        Some(target)
     }
 
     /// Whether the editable buffer is the surface actually on screen.
@@ -4769,6 +4784,9 @@ impl RepositoryRuntime {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
                 }
+                let restored_focus = self
+                    .restores_editor_navigation(&identity)
+                    .then(|| identity.clone());
                 self.document = match result {
                     Ok(LoadedFile {
                         source,
@@ -4862,6 +4880,7 @@ impl RepositoryRuntime {
                             position: position(editor.caret),
                             selection: editor.selection.map(position),
                         });
+                        self.pending_editor_focus = restored_focus;
                         self.viewports.editor = text_editor::ScrollPosition {
                             line: editor.scroll_line,
                             vertical: editor.scroll_vertical,
@@ -6051,6 +6070,7 @@ impl RepositoryRuntime {
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
         self.pending_fragment = None;
         self.pending_editor_navigation = None;
+        self.pending_editor_focus = None;
         if self.descriptor.selected_file.is_some() {
             self.descriptor.selected_file = Some(file.path.clone());
         }
@@ -10539,6 +10559,11 @@ mod tests {
             std::fs::read_to_string(root.join("notes.txt")).unwrap()
         );
         assert!(!reopened.is_dirty());
+        assert_eq!(
+            reopened.take_restored_editor_focus(card),
+            Some(editor_focus_id(card))
+        );
+        assert!(reopened.take_restored_editor_focus(card).is_none());
     }
 
     #[tokio::test]

@@ -7792,6 +7792,25 @@ impl Cagents {
             && !self.workspace_inputs_blocked()
     }
 
+    fn restore_repository_editor_focus(&mut self) -> Task<Message> {
+        let Some(card) = self
+            .workspace
+            .focused()
+            .filter(|card| self.card_holds_keyboard(*card))
+        else {
+            return Task::none();
+        };
+        let placeholder = self.card_header_widget_id(card);
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        runtime
+            .take_restored_editor_focus(card)
+            .map_or_else(Task::none, |target| {
+                workspace_widget::focus_after_loading(placeholder, target).map(cosmic::Action::App)
+            })
+    }
+
     /// Where keyboard focus for `card` lands.
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
         match self.cards.get(&card) {
@@ -7994,6 +8013,7 @@ impl Cagents {
             );
         }
         tasks.push(context_overlay_task);
+        tasks.push(self.restore_repository_editor_focus());
         reconcile_now |= self.take_passing_sweep();
         if reconcile_now {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
@@ -13658,9 +13678,6 @@ impl Application for Cagents {
                     _ => None,
                 };
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
-                let restores_editor = matches!(&action, RepositoryAction::FileLoaded { identity, .. }
-                    if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                        if runtime.restores_editor_navigation(identity)));
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
                 let saved = matches!(
                     &action,
@@ -13698,19 +13715,7 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
-                if restores_editor
-                    && self.card_holds_keyboard(card)
-                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
-                    && let Some(target) = runtime.editor_focus_target(card)
-                {
-                    tasks.push(
-                        workspace_widget::focus_after_loading(
-                            self.card_header_widget_id(card),
-                            target,
-                        )
-                        .map(cosmic::Action::App),
-                    );
-                }
+                tasks.push(self.restore_repository_editor_focus());
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
                     && self.lsp.completion_trigger(doc, character)
@@ -24085,6 +24090,66 @@ mod tests {
         let update = app.workspace.resize_viewport(1200.0);
         let ready = app.apply_viewport(update, false, false);
         assert!(!app.context_inspector_overlay_active);
+        assert_eq!(
+            focused(&app, ready),
+            Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_editor_focus_waits_for_a_viewport_after_loading() {
+        use futures_util::StreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "saved\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view.clone());
+        runtime.restore_navigation(&crate::model::RepositoryNavigation {
+            project: view.project,
+            worktree: view.worktree,
+            selected_file: Some("notes.txt".into()),
+            editor: Some(crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line: 0, column: 0 },
+                selection: None,
+                scroll_line: 0,
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            }),
+        });
+        let load = runtime.initial_load(pane);
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        let update = app.workspace.resize_viewport(1200.0);
+        let initial = app.apply_viewport(update, false, false);
+        assert_eq!(
+            focused(&app, initial),
+            Some(app.card_header_widget_id(pane))
+        );
+        app.window_width = 900.0;
+        app.context_inspector_open = true;
+        let update = app.workspace.resize_viewport(500.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(!app.card_holds_keyboard(pane));
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        while let Some(action) = messages.next().await {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                drop(app.update(Message::Repository(action)));
+            }
+        }
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        let ready = app.apply_viewport(update, false, false);
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
