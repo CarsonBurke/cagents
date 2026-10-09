@@ -4282,3 +4282,104 @@ fn ambiguous_push_refuses_evidence_from_a_retargeted_push_url() {
         fixture.origin().to_str().unwrap()
     );
 }
+/// A source advanced while Git starts cannot be reported as its previous OID.
+/// First-publish still records the requested configured remote and branch.
+#[test]
+fn successful_push_refuses_a_changed_source_oid_and_preserves_first_publish() {
+    struct MoveSourceBeforePush {
+        worktree: PathBuf,
+        before: Oid,
+        after: Oid,
+    }
+    impl ProcessExecutor for MoveSourceBeforePush {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let is_push = command.arguments.iter().any(|argument| argument == "push");
+            if is_push {
+                let update = CommandSpec::new(&command.program)
+                    .cwd(&self.worktree)
+                    .args([
+                        "update-ref",
+                        "refs/heads/main",
+                        self.after.as_str(),
+                        self.before.as_str(),
+                    ]);
+                let changed = SystemProcessExecutor.execute(&isolate(update), cancellation)?;
+                assert!(changed.success);
+            }
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if is_push {
+                assert!(
+                    output.success,
+                    "the actual push of the externally advanced branch succeeds"
+                );
+            }
+            Ok(output)
+        }
+    }
+    for sets_upstream in [false, true] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let before = publish_main(&fixture);
+        fixture.write("new-source.txt", b"externally advanced branch\n");
+        fixture.git_in_work(&["add", "new-source.txt"]);
+        let after = fixture.commit("external source advancement");
+        fixture.git_in_work(&["reset", "--hard", before.as_str()]);
+        let service = RepositoryService::new(
+            &fixture.git,
+            Arc::new(MoveSourceBeforePush {
+                worktree: fixture.work(),
+                before: before.clone(),
+                after: after.clone(),
+            }),
+        );
+        let outcome = service
+            .push(
+                &PushRequest {
+                    worktree: fixture.work(),
+                    branch: ValidatedBranchName::parse("main").unwrap(),
+                    target: if sets_upstream {
+                        PushTarget::SetUpstream {
+                            remote: "origin".into(),
+                            remote_branch: ValidatedBranchName::parse("published-race").unwrap(),
+                        }
+                    } else {
+                        PushTarget::Upstream {
+                            remote: "origin".into(),
+                            remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+                        }
+                    },
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                PushOutcome::OutcomeUnknown {
+                    failure: MutationFailure::Reconciliation { .. }
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_ne!(before, after);
+        let destination = if sets_upstream {
+            "refs/heads/published-race"
+        } else {
+            "refs/heads/main"
+        };
+        assert_eq!(remote_oid(&fixture, destination), after);
+        if sets_upstream {
+            assert_eq!(fixture.text(&["config", "branch.main.remote"]), "origin");
+            assert_eq!(fixture.text(&["config", "branch.main.merge"]), destination);
+        }
+        assert_eq!(
+            fixture.text(&["rev-parse", "refs/heads/main"]),
+            after.as_str()
+        );
+    }
+}
