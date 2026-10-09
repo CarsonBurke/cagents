@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -437,10 +437,77 @@ pub struct ControlClient {
     attached_chats: BTreeSet<TerminalId>,
 }
 
+/// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
+/// fresh nonblocking sockets within the same establishment deadline, rather
+/// than treating writability/SO_ERROR as evidence that EAGAIN completed.
+fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as _;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid daemon Unix socket path",
+        ));
+    }
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *byte as _;
+    }
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon socket connection deadline elapsed",
+            ));
+        }
+        // SAFETY: socket returns a new descriptor transferred to this stream.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        // SAFETY: address is initialized with its valid length and the
+        // descriptor belongs exclusively to this connection attempt.
+        let result = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as _,
+            )
+        };
+        if result == 0 {
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Err(error);
+        }
+        // EAGAIN has not queued a connection. Close this attempt before
+        // retrying, preserving bounded descriptor use and the selected endpoint.
+        drop(stream);
+        thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+        delay = (delay * 2).min(Duration::from_millis(20));
+    }
+}
+
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
-        let stream = UnixStream::connect(socket_path).map_err(ControlError::Connect)?;
+        let stream =
+            connect_control_socket(socket_path, IO_TIMEOUT).map_err(ControlError::Connect)?;
         Self::from_stream(stream)
     }
 
@@ -3571,6 +3638,98 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.details.unwrap()["outcome"], "inventory_changed");
+    }
+
+    fn saturated_control_listener(
+        path: &Path,
+    ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let pending = (0..2)
+            .map(|_| connect_control_socket(path, Duration::from_millis(100)).unwrap())
+            .collect();
+        (listener, pending)
+    }
+
+    #[test]
+    fn control_socket_backlog_pressure_times_out_without_replacing_the_endpoint() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let (_listener, _pending) = saturated_control_listener(&path);
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        let start = Instant::now();
+        let error = connect_control_socket(&path, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    }
+
+    #[test]
+    fn control_socket_retry_connects_and_handshakes_when_the_backlog_drains() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let (listener, pending) = saturated_control_listener(&path);
+        let expected = proof("backlog-session", "backlog-boot", "backlog-incarnation");
+        let response_proof = expected.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let accept = || {
+                let mut poll = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut poll, 1, 2000) },
+                    1,
+                    "owned fixture connection must arrive"
+                );
+                listener.accept().unwrap()
+            };
+            for _ in 0..pending.len() {
+                drop(accept());
+            }
+            let (mut stream, _) = accept();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Connect { .. }));
+            write_frame(
+                &mut stream,
+                &connected_envelope(request.request_id, response_proof.clone(), response_proof),
+            )
+            .unwrap();
+        });
+        let client = ControlClient::connect(&path).unwrap();
+        assert_eq!(client.proof(), &expected);
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn control_socket_connection_preserves_missing_and_refused_error_classification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        assert_eq!(
+            connect_control_socket(&path, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        assert_eq!(
+            connect_control_socket(&path, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionRefused
+        );
     }
 
     fn proof(session: &str, boot: &str, incarnation: &str) -> HostSessionProof {
