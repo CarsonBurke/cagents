@@ -538,6 +538,57 @@ pub fn focus_card<Message: 'static>(id: CardId) -> Task<Message> {
     widget::operation::focus(card_focus_id(id))
 }
 
+/// End-of-strip navigation returns the keyboard from chrome without taking
+/// it from a find bar, composer, or other control already inside the pane.
+pub fn focus_card_if_outside<Message: Send + 'static>(
+    container: widget::Id,
+    target: widget::Id,
+) -> Task<Message> {
+    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+
+    struct Restore {
+        query: Box<dyn Operation<focusable::Count>>,
+        target: widget::Id,
+    }
+
+    impl<Message: Send + 'static> Operation<Message> for Restore {
+        fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+            self.query.container(id, bounds);
+        }
+
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            self.query.focusable(id, bounds, state);
+        }
+
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            self.query.traverse(&mut |query| {
+                operate(&mut operation::black_box(query));
+            });
+        }
+
+        fn finish(&self) -> Outcome<Message> {
+            match self.query.finish() {
+                Outcome::Some(count) if count.total > 0 && count.focused.is_none() => {
+                    Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+                }
+                // An unmounted pane has no controls: do not blur the window
+                // by targeting an input that has not been rendered yet.
+                _ => Outcome::None,
+            }
+        }
+    }
+
+    cosmic::iced::advanced::widget::operate(Restore {
+        query: Box::new(operation::scoped(container, focusable::count())),
+        target,
+    })
+}
+
 pub fn focus_handoff<Message, F>(
     handoff: FocusHandoff,
     toolbar_focus_id: widget::Id,
@@ -794,6 +845,7 @@ where
         VirtualStrip::new(
             &projection,
             Arc::clone(workspace.card_indices()),
+            workspace.focused(),
             projection
                 .mounted
                 .iter()
@@ -1267,6 +1319,7 @@ impl<Message> VirtualCard<'_, Message> {
 struct VirtualStrip<'a, Message> {
     total_width: f32,
     retained: Arc<HashMap<CardId, usize>>,
+    focused: Option<CardId>,
     cards: Vec<VirtualCard<'a, Message>>,
 }
 
@@ -1274,6 +1327,7 @@ impl<'a, Message> VirtualStrip<'a, Message> {
     fn new(
         projection: &ViewportProjection,
         retained: Arc<HashMap<CardId, usize>>,
+        focused: Option<CardId>,
         cards: Vec<VirtualCard<'a, Message>>,
     ) -> Self {
         debug_assert_eq!(
@@ -1283,6 +1337,7 @@ impl<'a, Message> VirtualStrip<'a, Message> {
         Self {
             total_width: projection.total_width,
             retained,
+            focused,
             cards,
         }
     }
@@ -1292,6 +1347,7 @@ impl<'a, Message> VirtualStrip<'a, Message> {
 struct VirtualStripState {
     mounted: Vec<CardId>,
     detached: HashMap<CardId, Tree>,
+    unfocus_on_layout: std::collections::HashSet<CardId>,
     retained: Arc<HashMap<CardId, usize>>,
 }
 
@@ -1323,6 +1379,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         tree::State::new(VirtualStripState {
             mounted: self.cards.iter().map(|card| card.id).collect(),
             detached: HashMap::new(),
+            unfocus_on_layout: Default::default(),
             retained: Arc::clone(&self.retained),
         })
     }
@@ -1350,15 +1407,22 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             }
         } else {
             let mut children = mem::take(&mut tree.children);
-            for (id, mut child) in state.mounted.drain(..).zip(children.drain(..)) {
+            let previous_band = mem::take(&mut state.mounted);
+            for (id, mut child) in previous_band.iter().copied().zip(children.drain(..)) {
                 reclaim_named_states(&mut child);
                 state.detached.insert(id, child);
             }
             for card in &mut self.cards {
-                let mut child = state
-                    .detached
-                    .remove(&card.id)
-                    .unwrap_or_else(|| Tree::new(&card.content));
+                let parked = state.detached.remove(&card.id);
+                if parked.is_some()
+                    && !previous_band.contains(&card.id)
+                    && self.focused != Some(card.id)
+                {
+                    // A focus operation cannot visit a parked tree. Returning
+                    // an inactive pane must not revive its old input focus.
+                    state.unfocus_on_layout.insert(card.id);
+                }
+                let mut child = parked.unwrap_or_else(|| Tree::new(&card.content));
                 child.diff(&mut card.content);
                 children.push(child);
                 state.mounted.push(card.id);
@@ -1371,6 +1435,9 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             state
                 .detached
                 .retain(|id, _| self.retained.contains_key(id));
+            state
+                .unfocus_on_layout
+                .retain(|id| self.retained.contains_key(id));
             state.retained = Arc::clone(&self.retained);
         }
     }
@@ -1390,6 +1457,10 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             Length::Fill,
             Size::new(self.total_width, 0.0),
         );
+        let pending = &mut tree
+            .state
+            .downcast_mut::<VirtualStripState>()
+            .unfocus_on_layout;
         let children = self
             .cards
             .iter_mut()
@@ -1397,10 +1468,20 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             .map(|(card, state)| {
                 let child_size = Size::new(card.content_width, size.height);
                 let child_limits = layout::Limits::new(child_size, child_size);
-                card.content
+                let node = card
+                    .content
                     .as_widget_mut()
                     .layout(state, renderer, &child_limits)
-                    .move_to(Point::new(card.x, 0.0))
+                    .move_to(Point::new(card.x, 0.0));
+                if pending.remove(&card.id) {
+                    card.content.as_widget_mut().operate(
+                        state,
+                        Layout::new(&node),
+                        renderer,
+                        &mut cosmic::iced::advanced::widget::operation::focusable::unfocus::<()>(),
+                    );
+                }
+                node
             })
             .collect();
         layout::Node::with_children(size, children)
@@ -2418,6 +2499,7 @@ mod tests {
             VirtualStrip {
                 total_width: 320.0,
                 retained: retained.clone(),
+                focused: Some(ids[0]),
                 cards: vec![VirtualCard {
                     id: ids[index],
                     x: 0.0,
@@ -2466,6 +2548,142 @@ mod tests {
         drop(probe);
         assert!(matches!(focused.finish(), operation::Outcome::Some(id) if id == editor));
         tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[test]
+    fn remounting_a_retargeted_editor_does_not_restore_stale_focus() {
+        use cosmic::iced::advanced::{renderer::Headless, widget::operation};
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let ids = [CardId::new(), CardId::new()];
+        let editors = [
+            widget::Id::new("retarget-old"),
+            widget::Id::new("retarget-new"),
+        ];
+        let retained = Arc::new(HashMap::from([(ids[0], 0), (ids[1], 1)]));
+        let contents = [
+            cosmic::widget::text_editor::Content::with_text("old destination draft"),
+            cosmic::widget::text_editor::Content::with_text("new destination draft"),
+        ];
+        let make = |indices: &[usize], focused: usize| -> Element<'_, ()> {
+            VirtualStrip {
+                total_width: 640.0,
+                retained: retained.clone(),
+                focused: Some(ids[focused]),
+                cards: indices
+                    .iter()
+                    .map(|&index| VirtualCard {
+                        id: ids[index],
+                        x: index as f32 * 320.0,
+                        width: 320.0,
+                        content_width: 320.0,
+                        on_screen: true,
+                        content: cosmic::widget::id_container(
+                            widget::text_editor::TextEditor::new(&contents[index])
+                                .id(editors[index].clone())
+                                .on_action(|_| ()),
+                            widget::Id::new(format!("retarget-card-{index}")),
+                        )
+                        .into(),
+                    })
+                    .collect(),
+            }
+            .into()
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(640.0, 200.0));
+        let mut element = make(&[0], 0);
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editors[0].clone()),
+        );
+
+        // Retargeting parks the old destination before the focus operation
+        // visits the newly mounted destination. The parked tree is unreachable.
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(&[1], 1);
+        tree.diff(&mut element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editors[1].clone()),
+        );
+
+        // Camera movement brings the old destination back without requesting
+        // widget focus. Both editors are now traversable in the same strip.
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(&[0, 1], 1);
+        tree.diff(&mut element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut focus_count = FocusedWidgets::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focus_count);
+        assert_eq!(focus_count.0, vec![editors[1].clone()]);
+
+        // The diff implementation also temporarily parks cards that remain
+        // mounted while their neighbours leave. That storage shuffle must
+        // not blur a control that never left the traversable widget tree.
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editors[0].clone()),
+        );
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(&[0], 1);
+        tree.diff(&mut element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut focus_count = FocusedWidgets::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focus_count);
+        assert_eq!(focus_count.0, vec![editors[0].clone()]);
+        tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[derive(Default)]
+    struct FocusedWidgets(Vec<widget::Id>);
+
+    impl Operation for FocusedWidgets {
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+        ) {
+            if state.is_focused()
+                && let Some(id) = id
+            {
+                self.0.push(id.clone());
+            }
+        }
+
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
     }
 
     #[test]
@@ -3625,6 +3843,7 @@ mod tests {
         let make_strip = |retained, id, node| VirtualStrip {
             total_width: 200.0,
             retained,
+            focused: Some(id),
             cards: vec![VirtualCard {
                 id,
                 x: 0.0,
@@ -3685,6 +3904,7 @@ mod tests {
         let cards = [CardId::new(), CardId::new()];
         let strip = VirtualStrip {
             total_width: 200.0,
+            focused: Some(cards[0]),
             retained: Arc::new(
                 cards
                     .into_iter()

@@ -15513,7 +15513,20 @@ impl Application for Cagents {
                             self.latency.commit(crate::performance::Action::CardFocus);
                             self.latency_focus = self.workspace.focused();
                         }
-                        task
+                        if previous == self.workspace.focused()
+                            && let Some(card) = previous
+                        {
+                            Task::batch([
+                                task,
+                                workspace_widget::focus_card_if_outside(
+                                    workspace_widget::card_widget_id(card),
+                                    self.card_keyboard_focus(card),
+                                )
+                                .map(cosmic::Action::App),
+                            ])
+                        } else {
+                            task
+                        }
                     }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
@@ -20603,6 +20616,29 @@ mod tests {
     }
 
     #[test]
+    fn reordering_an_inactive_pane_preserves_the_users_tab_scroll() {
+        let mut app = context_inspector_test_app(false);
+        let cards: Vec<_> = (0..24).map(|_| terminal_card_state()).collect();
+        let active = cards[0].id;
+        let moved = cards[12].id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(active),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        app.chrome_ui.tabs_focus = Some(active);
+        let _ = app.update_chrome(chrome_ui::Action::TabsScrolled(1000.0));
+        assert!(tab_strip_scroll(app.reveal_active_tab()).is_some());
+        let task = app.reorder_pane(moved, None);
+        assert_eq!(app.workspace.order().last(), Some(moved));
+        assert_eq!(app.workspace.focused(), Some(active));
+        assert_eq!(tab_strip_scroll(task), None);
+        assert!(tab_strip_scroll(app.reveal_active_tab()).is_some());
+    }
+
+    #[test]
     fn a_sweep_that_left_a_passing_pane_cold_is_repeated_when_the_camera_rests_or_turns() {
         let mut app = context_inspector_test_app(false);
         let cards: Vec<_> = std::iter::repeat_with(terminal_card_state)
@@ -23425,12 +23461,18 @@ mod tests {
                 let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
                     continue;
                 };
-                element.as_widget_mut().operate(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &mut operation,
-                );
+                loop {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation,
+                    );
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
             }
         }
 
@@ -23474,6 +23516,84 @@ mod tests {
             Some(repository_widget::editor_focus_id(card)),
             "the jump left the editor unfocused, so its caret is invisible"
         );
+    }
+
+    #[test]
+    fn pane_navigation_past_an_end_returns_focus_from_its_tab() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        app.workspace.resize_viewport(1200.0);
+        let pane = app.workspace.focused().unwrap();
+        let title = app.card_header_widget_id(pane);
+        assert_eq!(
+            focused(
+                &app,
+                iced::widget::operation::focus(title.clone()).map(cosmic::Action::App)
+            ),
+            Some(title.clone()),
+            "the tab must be a real focusable control outside the pane body",
+        );
+        for direction in [
+            crate::workspace::FocusDirection::Left,
+            crate::workspace::FocusDirection::Right,
+        ] {
+            let navigation = app.update(Message::FocusAdjacent(direction));
+            let task = iced::widget::operation::focus(title.clone())
+                .map(cosmic::Action::App)
+                .chain(navigation);
+            assert_eq!(
+                focused(&app, task),
+                Some(crate::settings_widgets::search_id())
+            );
+            assert_eq!(app.workspace.focused(), Some(pane));
+        }
+    }
+
+    #[test]
+    fn pane_navigation_past_an_end_preserves_editor_and_find_focus() {
+        let (mut app, pane) = editing_repository_app();
+        app.workspace.resize_viewport(1200.0);
+        // Startup's default focus has already run before a user moves into
+        // the editor or its find bar. Do not replay that fixture-only request.
+        let _ = app.workspace.take_widget_focus_request();
+        let _ = app.update(Message::Repository(RepositoryAction::OpenFind {
+            card: pane,
+        }));
+        for target in [
+            repository_widget::editor_focus_id(pane),
+            repository_widget::find_focus_id(pane),
+        ] {
+            for direction in [
+                crate::workspace::FocusDirection::Left,
+                crate::workspace::FocusDirection::Right,
+            ] {
+                let navigation = app.update(Message::FocusAdjacent(direction));
+                let task = iced::widget::operation::focus(target.clone())
+                    .map(cosmic::Action::App)
+                    .chain(navigation);
+                assert_eq!(focused(&app, task), Some(target.clone()));
+                assert_eq!(app.workspace.focused(), Some(pane));
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmounted_pane_focus_query_does_not_blur_its_tab() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        app.workspace.resize_viewport(1200.0);
+        let pane = app.workspace.focused().unwrap();
+        let title = app.card_header_widget_id(pane);
+        let task = iced::widget::operation::focus(title.clone())
+            .map(cosmic::Action::App)
+            .chain(
+                workspace_widget::focus_card_if_outside(
+                    workspace_widget::card_widget_id(CardId::new()),
+                    app.card_keyboard_focus(pane),
+                )
+                .map(cosmic::Action::App),
+            );
+        assert_eq!(focused(&app, task), Some(title));
     }
 
     /// The same, for the jump that has to open a file first.
