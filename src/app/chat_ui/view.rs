@@ -1500,17 +1500,8 @@ impl Runtime {
         let mut attachment_chips = Vec::new();
         for (index, attachment) in self.attachments.iter().enumerate() {
             let chip = widget::row::with_children(vec![
-                if attachment
-                    .path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        chat::IMAGE_EXTENSIONS
-                            .iter()
-                            .any(|known| extension.eq_ignore_ascii_case(known))
-                    })
-                {
-                    iced::widget::image(iced::widget::image::Handle::from_path(&attachment.path))
+                if let Some(handle) = self.thumbnails.handle(&attachment.path) {
+                    iced::widget::image(handle.clone())
                         .width(design::DENSE_ROW_HEIGHT)
                         .height(design::DENSE_ROW_HEIGHT)
                         .content_fit(iced::ContentFit::Cover)

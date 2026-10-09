@@ -50,6 +50,9 @@ pub(in crate::app) enum Loaded {
     Deferred,
 }
 fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
+    bounded_handle_size(bytes, budget, None)
+}
+fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Loaded {
     if bytes.len() > chat::MAX_INLINE_IMAGE_BYTES {
         return Loaded::Unavailable;
     }
@@ -71,10 +74,14 @@ fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     else {
         return Loaded::Deferred;
     };
-    let Ok(pixels) = budget
+    // Reserve before decode so temporary budget pressure can retry without
+    // repeatedly spending the two workers on full-size pixel conversion. The
+    // thumbnail never upscales and fits inside edge², even after orientation.
+    let retained_pixels = edge.map_or(pixels, |edge| pixels.min(u64::from(edge).pow(2)));
+    let Ok(mut pixels) = budget
         .pixels
         .clone()
-        .try_acquire_many_owned((pixels * 4) as u32)
+        .try_acquire_many_owned((retained_pixels * 4) as u32)
     else {
         return Loaded::Deferred;
     };
@@ -119,8 +126,20 @@ fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     // for high-depth input. Both operations remain in the bounded worker.
     let mut decoded = image::DynamicImage::ImageRgba8(decoded.into_rgba8());
     decoded.apply_orientation(orientation);
-    let rgba = decoded.into_rgba8();
+    let rgba = if let Some(edge) = edge
+        && (decoded.width() > edge || decoded.height() > edge)
+    {
+        decoded.thumbnail(edge, edge).into_rgba8()
+    } else {
+        decoded.into_rgba8()
+    };
     let (width, height) = rgba.dimensions();
+    let Some(excess) = pixels.num_permits().checked_sub(rgba.len()) else {
+        return Loaded::Unavailable;
+    };
+    // Renderer clones retain exactly the actual thumbnail allocation, rather
+    // than its conservative square admission reservation.
+    drop(pixels.split(excess));
     drop(bytes);
     drop(encoded);
     let bytes = iced::advanced::graphics::core::Bytes::from_owner(Pixels {
@@ -129,7 +148,7 @@ fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     });
     Loaded::Ready(iced::widget::image::Handle::from_rgba(width, height, bytes))
 }
-fn read_file(path: &str) -> Option<Vec<u8>> {
+fn read_file(path: impl AsRef<Path>) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     // A provider can supply arbitrary paths, including FIFOs. Nonblocking open
@@ -195,26 +214,34 @@ impl std::hash::Hash for Source {
 fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let source = source.clone();
     Box::pin(iced::futures::stream::once(async move {
-        static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::OnceLock::new();
-        let workers = WORKERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)));
-        let permit = workers
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("image workers remain open");
         let item = source.item.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            // Cancellation cannot release the worker slot while its read is
-            // still running; the blocking worker owns it until completion.
-            let _permit = permit;
-            load(&item)
-        })
-        .await
-        .unwrap_or(Loaded::Unavailable);
+        let loaded = worker(move || load(&item)).await;
         action(Action::ImageLoaded(source.target, source.item, loaded))
     }))
 }
+/// Transcript previews and composer thumbnails share worker admission. A
+/// cancelled subscription cannot release a slot while its blocking work runs.
+pub(super) async fn worker(load: impl FnOnce() -> Loaded + Send + 'static) -> Loaded {
+    static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let workers = WORKERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)));
+    let permit = workers
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("image workers remain open");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        load()
+    })
+    .await
+    .unwrap_or(Loaded::Unavailable)
+}
+pub(super) fn thumbnail(path: &Path) -> Loaded {
+    read_file(path).map_or(Loaded::Unavailable, |bytes| {
+        bounded_handle_size(bytes, budget(), Some(128))
+    })
+}
+
 fn items(runtime: &Runtime) -> &[Arc<chat::Item>] {
     runtime
         .selected_subagent
@@ -511,6 +538,72 @@ mod tests {
         assert_eq!(actual.as_ref(), &[1, 2, 3, 255]);
     }
     #[test]
+    fn composer_thumbnail_retains_only_small_exact_rgba_and_immutable_pixels() {
+        let mut bytes = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut bytes),
+            &vec![127; 512 * 256 * 4],
+            512,
+            256,
+            image::ExtendedColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let budget = Budget::new(bytes.len(), 128 * 128 * 4);
+        let Loaded::Ready(handle) = bounded_handle_size(bytes.clone(), &budget, Some(128)) else {
+            panic!("thumbnail fits although full pixels do not fit retained budget")
+        };
+        let iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        } = &handle
+        else {
+            panic!("renderer must not open a path or decode bytes")
+        };
+        assert_eq!((*width, *height), (128, 64));
+        assert_eq!(pixels.as_ref().len(), 128 * 64 * 4);
+        assert!(pixels.as_ref().iter().all(|byte| *byte == 127));
+        assert_eq!(budget.pixels.available_permits(), 128 * 64 * 4);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        let retained = handle.clone();
+        drop(handle);
+        assert_eq!(budget.pixels.available_permits(), 128 * 64 * 4);
+        drop(retained);
+        assert_eq!(budget.pixels.available_permits(), 128 * 128 * 4);
+    }
+    #[test]
+    fn composer_thumbnail_rejects_fifo_and_preserves_non_utf8_file_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo.png");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || sender.send(thumbnail(&fifo)).unwrap());
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("FIFO thumbnail cannot block"),
+            Loaded::Unavailable
+        ));
+        task.join().unwrap();
+        let path = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"image-\xff.png".to_vec()));
+        std::fs::write(&path, png()).unwrap();
+        assert!(matches!(
+            thumbnail(&path),
+            Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width: 1,
+                height: 1,
+                ..
+            })
+        ));
+    }
+    #[test]
     fn image_budget_covers_every_handle_clone_and_releases_after_the_last() {
         let bytes = png();
         let budget = Budget::new(bytes.len(), 4);
@@ -574,7 +667,7 @@ mod tests {
                 height,
                 pixels,
                 ..
-            }) = bounded_handle(oriented, &Budget::new(1024, 24))
+            }) = bounded_handle(oriented.clone(), &Budget::new(1024, 24))
             else {
                 panic!("valid oriented JPEG must decode in the worker")
             };
@@ -588,6 +681,17 @@ mod tests {
                 expected.as_raw().as_ref(),
                 "orientation {orientation}"
             );
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle_size(oriented, &Budget::new(1024, 24), Some(128))
+            else {
+                panic!("small oriented thumbnail must fit without upscaling")
+            };
+            assert_eq!((width, height), expected.dimensions());
+            assert_eq!(pixels.as_ref(), expected.as_raw().as_ref());
         }
     }
     #[test]

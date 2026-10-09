@@ -26,6 +26,7 @@ mod scroll;
 mod selectable_prose;
 mod selection;
 mod step;
+mod thumbnails;
 mod tool_text;
 mod turn;
 mod view;
@@ -179,6 +180,8 @@ pub enum Action {
     OpenImage(Target, String),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, images::Loaded),
+    ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
+    RetryThumbnails(Target),
     CloseImage,
     ImageNext(bool),
     ImageFit,
@@ -266,6 +269,8 @@ impl Action {
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
+                | Self::ThumbnailLoaded(..)
+                | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
@@ -1327,6 +1332,7 @@ pub(super) struct Runtime {
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
+    thumbnails: thumbnails::Cache,
     /// Clipboard reads and image writes still destined for this draft.
     pastes_pending: usize,
     image_pastes_saving: usize,
@@ -1573,9 +1579,22 @@ impl Runtime {
                 self.attachments.push(Attachment { path });
             }
         }
+        self.thumbnails.sync(&self.attachments);
         if self.attachments.len() != before {
             self.revision = self.revision.wrapping_add(1);
         }
+    }
+
+    fn take_attachments(&mut self) -> Vec<Attachment> {
+        self.thumbnails.clear();
+        std::mem::take(&mut self.attachments)
+    }
+
+    fn replace_attachments(&mut self, attachments: Vec<Attachment>) -> Vec<Attachment> {
+        self.thumbnails.clear();
+        let old = std::mem::replace(&mut self.attachments, attachments);
+        self.thumbnails.sync(&self.attachments);
+        old
     }
 
     /// Puts a message that was waiting back in the composer, ahead of
@@ -1604,7 +1623,7 @@ impl Runtime {
         // The draft a walk through sent messages set aside is in `combined`.
         self.history_cursor = None;
         self.history_stash = None;
-        let later = std::mem::replace(&mut self.attachments, attachments);
+        let later = self.replace_attachments(attachments);
         self.attach(later.into_iter().map(|attachment| attachment.path));
     }
 
@@ -1827,6 +1846,7 @@ impl Runtime {
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
+            thumbnails: thumbnails::Cache::default(),
             pastes_pending: 0,
             image_pastes_saving: 0,
             submit_after_paste: None,
@@ -1904,7 +1924,7 @@ impl Runtime {
             format!("{}\n{written}", queued.text.trim_end())
         };
         self.replace_draft(text_editor::Content::with_text(&text));
-        let written = std::mem::replace(&mut self.attachments, queued.attachments);
+        let written = self.replace_attachments(queued.attachments);
         self.attach(written.into_iter().map(|attachment| attachment.path));
         Some(queued.draft)
     }
@@ -4111,6 +4131,9 @@ impl Cagents {
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
+                if runtime.visible.load(Ordering::Relaxed) {
+                    subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
+                }
             }
         }
         if self.cards.values().any(|card| {
@@ -4837,7 +4860,7 @@ impl Cagents {
         runtime.queued = Some(Queued {
             text,
             resolved_text,
-            attachments: std::mem::take(&mut runtime.attachments),
+            attachments: runtime.take_attachments(),
             model,
             draft: session.clone(),
             since: None,
@@ -6533,7 +6556,7 @@ impl Cagents {
                     let followup = Followup {
                         id,
                         text: runtime.composer.text().trim_end().to_owned(),
-                        attachments: std::mem::take(&mut runtime.attachments),
+                        attachments: runtime.take_attachments(),
                     };
                     runtime.followups.push(followup);
                     runtime.replace_draft(text_editor::Content::new());
@@ -6819,7 +6842,7 @@ impl Cagents {
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
-                            runtime.attachments.clear();
+                            runtime.take_attachments();
                         }
                         if let Some(sent) = pending.sent {
                             runtime.remember(sent);
@@ -7012,6 +7035,16 @@ impl Cagents {
                         cached.image_requested = true;
                         cached.image_unavailable = false;
                     }
+                }
+            }
+            Action::RetryThumbnails(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.thumbnails.retry_deferred();
+                }
+            }
+            Action::ThumbnailLoaded(target, path, loaded) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.thumbnails.complete(&path, loaded);
                 }
             }
             Action::ImageLoaded(target, item, loaded) => {
@@ -7234,6 +7267,7 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if index < runtime.attachments.len() {
                         runtime.attachments.remove(index);
+                        runtime.thumbnails.sync(&runtime.attachments);
                         runtime.revision = runtime.revision.wrapping_add(1);
                     }
                 }
@@ -7856,6 +7890,43 @@ mod tests {
         assert_eq!(runtime.attachments.len(), 1);
         assert!(runtime.pending.is_none());
         assert_eq!(runtime.snapshot.permission_denials.len(), 1);
+    }
+
+    #[test]
+    fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let path = PathBuf::from("/fixture/image.png");
+        runtime.attach([path.clone()]);
+        assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+        runtime.attach([path.clone()]);
+        assert_eq!(runtime.attachments.len(), 1);
+        let queued = runtime.take_attachments();
+        assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
+        runtime.take_back("queued", queued, PromptMode::Queue);
+        assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+        let target = runtime.target;
+        runtime.visible.store(true, Ordering::Relaxed);
+        let visible = app.chat_subscription().units();
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .visible
+            .store(false, Ordering::Relaxed);
+        assert_eq!(app.chat_subscription().units() + 1, visible);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .visible
+            .store(true, Ordering::Relaxed);
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.attachments.is_empty());
+        assert!(runtime.thumbnails.subscriptions(target).is_empty());
+        runtime.attach([path]);
+        assert_eq!(runtime.thumbnails.subscriptions(target).len(), 1);
     }
 
     #[test]
