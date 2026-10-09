@@ -220,17 +220,18 @@ impl Registry {
         let mut statement = self
             .db
             .prepare_cached(&format!(
-                "SELECT {COLUMNS} FROM (
-                     SELECT m.*, row_number() OVER (
-                         PARTITION BY m.recipient_lineage ORDER BY m.created_ms, m.rowid
-                     ) AS position
-                     FROM messages m
-                     LEFT JOIN messages asked ON asked.id = m.reply_to
-                     WHERE m.state = 'pending' AND m.recipient_lineage IS NOT NULL
-                       AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
+                "SELECT {COLUMNS} FROM messages WHERE rowid IN (
+                     SELECT message_rowid FROM (
+                         SELECT m.rowid AS message_rowid, row_number() OVER (
+                             PARTITION BY m.recipient_lineage ORDER BY m.created_ms, m.rowid
+                         ) AS position
+                         FROM messages m
+                         LEFT JOIN messages asked ON asked.id = m.reply_to
+                         WHERE m.state = 'pending' AND m.recipient_lineage IS NOT NULL
+                           AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
+                     ) WHERE position = 1
                  )
-                 WHERE position = 1
-                 ORDER BY created_ms"
+                 ORDER BY created_ms, recipient_lineage"
             ))
             .map_err(|error| error.to_string())?;
         let messages = statement
@@ -522,6 +523,61 @@ mod tests {
         };
         assert!(!ids(99).contains(&late.id));
         assert!(ids(100).contains(&late.id));
+    }
+
+    #[test]
+    fn courier_selection_preserves_timestamp_ties_and_held_reply_payloads() {
+        let (mut registry, _directory) = registry();
+        let mut lineages = [
+            Lineage(TerminalId::new()),
+            Lineage(TerminalId::new()),
+            Lineage(TerminalId::new()),
+        ];
+        lineages.sort_by_key(|lineage| lineage.to_string());
+        let [a, b, c] = lineages;
+        let mut question = message(party(a), Party::user(), 1);
+        question.wait_until_ms = Some(500);
+        registry.post_message(&question).unwrap();
+
+        // Insert the higher lineage first, so rowid order differs from the
+        // partition order for messages with identical creation timestamps.
+        let mut b_first = message(party(c), party(b), 100);
+        b_first.from.title = Some("Sender with metadata".into());
+        b_first.body = "The complete body survives selection: é\nsecond line".into();
+        registry.post_message(&b_first).unwrap();
+        let mut held = message(party(b), party(a), 100);
+        held.reply_to = Some(question.id);
+        held.body = "A held reply".into();
+        registry.post_message(&held).unwrap();
+        let next = message(party(c), party(a), 100);
+        registry.post_message(&next).unwrap();
+        let earlier = message(Party::user(), party(c), 99);
+        registry.post_message(&earlier).unwrap();
+
+        // Pending recipients have not yet received an authenticated session.
+        for item in [&mut b_first, &mut held] {
+            item.to.session = None;
+        }
+        let pending_copy = |mut item: Message| {
+            item.to.session = None;
+            item
+        };
+        assert_eq!(
+            registry.deliverable_messages(499).unwrap(),
+            (
+                vec![
+                    pending_copy(earlier.clone()),
+                    pending_copy(next),
+                    b_first.clone()
+                ],
+                Some(500)
+            )
+        );
+        // At release, the older rowid within a lineage wins the timestamp tie.
+        assert_eq!(
+            registry.deliverable_messages(500).unwrap(),
+            (vec![pending_copy(earlier), held, b_first], None)
+        );
     }
 
     #[test]
