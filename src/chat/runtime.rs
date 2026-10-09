@@ -4175,15 +4175,16 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires permitted user/PID namespaces and writable namespace ns_last_pid; run explicitly on Linux"]
     fn direct_provider_teardown_never_signals_a_reused_process_group() {
         use std::os::fd::{FromRawFd, OwnedFd};
         const MARKER: &str = "CAGENTS_AUDIT_PGID_REUSE_CHILD";
         if std::env::var_os(MARKER).is_none() {
-            for scenario in ["already-reaped", "retained-leader", "owned-descendants"] {
+            for scenario in ["already-reaped", "retained-leader"] {
                 let output = Process::new("/usr/bin/unshare")
                     .args(["--user", "--map-root-user", "--pid", "--fork", "--mount-proc"])
                     .arg(std::env::current_exe().unwrap())
-                    .args(["--exact", "chat::runtime::tests::direct_provider_teardown_never_signals_a_reused_process_group", "--nocapture"])
+                    .args(["--exact", "chat::runtime::tests::direct_provider_teardown_never_signals_a_reused_process_group", "--nocapture", "--ignored"])
                     .env(MARKER, scenario).output().unwrap();
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 assert!(
@@ -4207,92 +4208,6 @@ mod tests {
             1,
             "only the isolated namespace init may reset PID allocation"
         );
-        if scenario == "owned-descendants" {
-            use std::io::{BufRead, BufReader};
-            let script = "import os,signal,sys,time\npid=os.fork()\nif pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN)\n print(os.getpid(),flush=True)\n time.sleep(30)\n os._exit(0)\nsys.stdin.readline()\nos._exit(7)\n";
-            let child = Process::new("/usr/bin/python3")
-                .args(["-c", script])
-                .process_group(0)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard(child, false);
-            let mut line = String::new();
-            BufReader::new(provider.0.stdout.take().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            let descendant: i32 = line.trim().parse().unwrap();
-            assert_eq!(unsafe { libc::getpgid(descendant) }, provider.0.id() as i32);
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, descendant, 0) } as i32;
-            assert!(raw >= 0);
-            struct Descendant {
-                pid: i32,
-                pidfd: OwnedFd,
-                reaped: bool,
-            }
-            impl Drop for Descendant {
-                fn drop(&mut self) {
-                    if self.reaped {
-                        return;
-                    }
-                    // SAFETY: only the fixture child's pidfd is signalled; this
-                    // namespace init can reap that exact adopted child afterward.
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            self.pidfd.as_raw_fd(),
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                        libc::waitpid(self.pid, std::ptr::null_mut(), 0);
-                    }
-                }
-            }
-            let mut descendant = Descendant {
-                pid: descendant,
-                reaped: false,
-                // SAFETY: pidfd_open returned a new owned descriptor.
-                pidfd: unsafe { OwnedFd::from_raw_fd(raw) },
-            };
-            provider
-                .0
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(b"exit\n")
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Some(status) = provider.observed_exit_status().unwrap() {
-                    assert_eq!(status.code(), Some(7));
-                    break;
-                }
-                assert!(Instant::now() < deadline);
-                thread::sleep(Duration::from_millis(5));
-            }
-            provider.terminate().unwrap();
-            assert_eq!(provider.0.try_wait().unwrap().unwrap().code(), Some(7));
-            let mut poll = libc::pollfd {
-                fd: descendant.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert_eq!(
-                unsafe { libc::poll(&mut poll, 1, 1000) },
-                1,
-                "cleanup must retain its existing SIGKILL escalation for original group descendants"
-            );
-            let mut status = 0;
-            assert_eq!(
-                unsafe { libc::waitpid(descendant.pid, &mut status, 0) },
-                descendant.pid
-            );
-            descendant.reaped = true;
-            assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
-            return;
-        }
         std::fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
         let mut original = Process::new("/bin/true");
         // SAFETY: only the async-signal-safe setsid syscall runs after fork.
@@ -4402,6 +4317,146 @@ mod tests {
             "closing the original provider signalled its unrelated replacement process group"
         );
         assert!(status.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_provider_group_cleanup_retains_descendants_and_refuses_lost_ownership() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        const MARKER: &str = "CAGENTS_PROVIDER_GROUP_FIXTURE_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Process::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::runtime::tests::direct_provider_group_cleanup_retains_descendants_and_refuses_lost_ownership", "--nocapture"])
+                .env(MARKER, "1").output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("owned provider subreaper fixture started"),
+                "exact fixture must run: {stdout}"
+            );
+            assert!(
+                output.status.success(),
+                "owned provider cleanup fixture failed: {stdout}; {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // SAFETY: this isolated one-test process becomes the sole reaper of
+        // its own fixture descendants, without changing the parent test runner.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        println!("owned provider subreaper fixture started");
+        for already_reaped in [false, true] {
+            use std::io::{BufRead, BufReader};
+            let script = "import os,signal,sys,time\npid=os.fork()\nif pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_DFL if sys.argv[1]=='default' else signal.SIG_IGN)\n print(os.getpid(),flush=True)\n time.sleep(30)\n os._exit(0)\nsys.stdin.readline()\nos._exit(7)\n";
+            let child = Process::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    script,
+                    if already_reaped { "default" } else { "ignore" },
+                ])
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut provider = ChildGuard(child, false);
+            let mut line = String::new();
+            BufReader::new(provider.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let descendant: i32 = line.trim().parse().unwrap();
+            assert_eq!(unsafe { libc::getpgid(descendant) }, provider.0.id() as i32);
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, descendant, 0) } as i32;
+            assert!(raw >= 0);
+            struct Descendant {
+                pid: i32,
+                pidfd: OwnedFd,
+                reaped: bool,
+            }
+            impl Drop for Descendant {
+                fn drop(&mut self) {
+                    if self.reaped {
+                        return;
+                    }
+                    // SAFETY: only the fixture child's pidfd is signalled; this
+                    // isolated subreaper can reap that exact adopted child afterward.
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            self.pidfd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                        libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+            let mut descendant = Descendant {
+                pid: descendant,
+                reaped: false,
+                // SAFETY: pidfd_open returned a new owned descriptor.
+                pidfd: unsafe { OwnedFd::from_raw_fd(raw) },
+            };
+            provider
+                .0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"exit\n")
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = if already_reaped {
+                    provider.0.try_wait().unwrap()
+                } else {
+                    provider.observed_exit_status().unwrap()
+                } {
+                    assert_eq!(status.code(), Some(7));
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            if already_reaped {
+                assert_eq!(
+                    provider.terminate().unwrap_err().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                let mut poll = libc::pollfd {
+                    fd: descendant.pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut poll, 1, 100) },
+                    0,
+                    "lost leader ownership must refuse every group signal"
+                );
+                continue;
+            }
+            provider.terminate().unwrap();
+            assert_eq!(provider.0.try_wait().unwrap().unwrap().code(), Some(7));
+            let mut poll = libc::pollfd {
+                fd: descendant.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut poll, 1, 1000) },
+                1,
+                "cleanup must retain its existing SIGKILL escalation for original group descendants"
+            );
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(descendant.pid, &mut status, 0) },
+                descendant.pid
+            );
+            descendant.reaped = true;
+            assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        }
     }
 
     #[test]
