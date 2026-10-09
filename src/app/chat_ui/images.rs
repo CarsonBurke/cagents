@@ -3,26 +3,30 @@
 use super::*;
 mod canvas;
 
-// Keep leases in the encoded buffer itself: cached turns, galleries, detached
-// widget trees and renderer allocations all clone handles. Counting cache
+// Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
+// detached widget trees and renderer host buffers all clone it. Counting cache
 // entries alone would release their budget while those clones still exist.
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 const ENCODED_BUDGET: usize = 64 * 1024 * 1024;
-// Preview admission reserves the eventual RGBA size. Renderer decode scratch
-// buffers and its CPU/GPU cache follow iced's separate allocation lifecycle;
-// this reservation does not claim to cap total renderer memory.
+// Retained RGBA buffers share this budget, including renderer host clones. GPU
+// atlas allocations follow iced's separate lifecycle. Decoder-internal scratch
+// obeys its best-effort limit; this does not cap total process/renderer memory.
 const PIXEL_BUDGET: usize = 128 * 1024 * 1024;
+const DECODE_BUDGET: usize = 512 * 1024 * 1024;
+const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 16;
 const RECENT_IMAGES: usize = 8;
 
 struct Budget {
     encoded: Arc<tokio::sync::Semaphore>,
     pixels: Arc<tokio::sync::Semaphore>,
+    decode: Arc<tokio::sync::Semaphore>,
 }
 impl Budget {
     fn new(encoded: usize, pixels: usize) -> Self {
         Self {
             encoded: Arc::new(tokio::sync::Semaphore::new(encoded)),
             pixels: Arc::new(tokio::sync::Semaphore::new(pixels)),
+            decode: Arc::new(tokio::sync::Semaphore::new(DECODE_BUDGET)),
         }
     }
 }
@@ -30,12 +34,11 @@ fn budget() -> &'static Budget {
     static BUDGET: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
     BUDGET.get_or_init(|| Budget::new(ENCODED_BUDGET, PIXEL_BUDGET))
 }
-struct Encoded {
+struct Pixels {
     bytes: Box<[u8]>,
-    _encoded: tokio::sync::OwnedSemaphorePermit,
     _pixels: tokio::sync::OwnedSemaphorePermit,
 }
-impl AsRef<[u8]> for Encoded {
+impl AsRef<[u8]> for Pixels {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
     }
@@ -75,14 +78,56 @@ fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     else {
         return Loaded::Deferred;
     };
-    let bytes = iced::advanced::graphics::core::Bytes::from_owner(Encoded {
-        // Vec growth can leave unused capacity. Retain only the exact slice
-        // whose bytes the lease accounts for, across every handle clone.
-        bytes: bytes.into_boxed_slice(),
-        _encoded: encoded,
+    use image::ImageDecoder;
+    let mut reader =
+        match image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format() {
+            Ok(reader) => reader,
+            Err(_) => return Loaded::Unavailable,
+        };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(limits);
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return Loaded::Unavailable;
+    };
+    let decoded_bytes = decoder.total_bytes();
+    if decoder.dimensions() != (width, height) || decoded_bytes > MAX_DECODE_BYTES {
+        return Loaded::Unavailable;
+    }
+    // Account for the decoder's output and simultaneous RGBA conversion/rotation
+    // buffers. This bounds known pixel buffers across both workers, rather than
+    // assuming a four-byte pixel for 16-bit or floating-point source formats.
+    let rgba_bytes = u64::from(width) * u64::from(height) * 4;
+    let Some(decode_bytes) = decoded_bytes
+        .checked_add(rgba_bytes * 2)
+        .and_then(|total| u32::try_from(total).ok())
+    else {
+        return Loaded::Unavailable;
+    };
+    let Ok(_decode) = budget.decode.clone().try_acquire_many_owned(decode_bytes) else {
+        return Loaded::Deferred;
+    };
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let Ok(decoded) = image::DynamicImage::from_decoder(decoder) else {
+        return Loaded::Unavailable;
+    };
+    // Convert before rotating so orientation scratch always uses RGBA8, even
+    // for high-depth input. Both operations remain in the bounded worker.
+    let mut decoded = image::DynamicImage::ImageRgba8(decoded.into_rgba8());
+    decoded.apply_orientation(orientation);
+    let rgba = decoded.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    drop(bytes);
+    drop(encoded);
+    let bytes = iced::advanced::graphics::core::Bytes::from_owner(Pixels {
+        bytes: rgba.into_raw().into_boxed_slice(),
         _pixels: pixels,
     });
-    Loaded::Ready(iced::widget::image::Handle::from_bytes(bytes))
+    Loaded::Ready(iced::widget::image::Handle::from_rgba(width, height, bytes))
 }
 fn read_file(path: &str) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -453,13 +498,17 @@ mod tests {
         let bytes = read_file(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"different bytes after validation").unwrap();
-        let Loaded::Ready(iced::widget::image::Handle::Bytes(_, actual)) =
-            bounded_handle(bytes, &Budget::new(1024, 4))
+        let Loaded::Ready(iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels: actual,
+            ..
+        }) = bounded_handle(bytes, &Budget::new(1024, 4))
         else {
             panic!("file previews must retain bytes, never reopen paths")
         };
-        assert_eq!(actual.as_ref(), original.as_slice());
-        assert_eq!(image::load_from_memory(&actual).unwrap().width(), 1);
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(actual.as_ref(), &[1, 2, 3, 255]);
     }
     #[test]
     fn image_budget_covers_every_handle_clone_and_releases_after_the_last() {
@@ -474,7 +523,7 @@ mod tests {
             bounded_handle(bytes.clone(), &budget),
             Loaded::Deferred
         ));
-        assert_eq!(budget.encoded.available_permits(), 0);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 0);
         drop(retained);
         assert_eq!(budget.encoded.available_permits(), bytes.len());
@@ -491,6 +540,100 @@ mod tests {
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 3);
+    }
+    #[test]
+    fn decoded_preview_preserves_all_pinned_exif_orientations() {
+        let mut jpeg = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut jpeg),
+            &[
+                255, 0, 0, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 0, 255,
+            ],
+            2,
+            3,
+            image::ExtendedColorType::Rgb8,
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        for orientation in 1..=8 {
+            // APP1 Exif: little-endian TIFF with one SHORT Orientation entry.
+            let mut exif =
+                *b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+            exif[24] = orientation;
+            let mut oriented = jpeg[..2].to_vec();
+            oriented.extend_from_slice(&[0xff, 0xe1]);
+            oriented.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+            oriented.extend_from_slice(&exif);
+            oriented.extend_from_slice(&jpeg[2..]);
+            let expected = iced::advanced::graphics::image::load(
+                &iced::widget::image::Handle::from_bytes(oriented.clone()),
+            )
+            .unwrap();
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(oriented, &Budget::new(1024, 24))
+            else {
+                panic!("valid oriented JPEG must decode in the worker")
+            };
+            assert_eq!(
+                (width, height),
+                expected.dimensions(),
+                "orientation {orientation}"
+            );
+            assert_eq!(
+                pixels.as_ref(),
+                expected.as_raw().as_ref(),
+                "orientation {orientation}"
+            );
+        }
+    }
+    #[test]
+    fn decoded_preview_converts_high_depth_pixels_and_releases_transient_leases() {
+        let mut bytes = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut bytes),
+            &[65535u16, 0, 0, 65535]
+                .into_iter()
+                .flat_map(u16::to_ne_bytes)
+                .collect::<Vec<_>>(),
+            1,
+            1,
+            image::ExtendedColorType::Rgba16,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(iced::widget::image::Handle::Rgba { pixels, .. }) =
+            bounded_handle(bytes.clone(), &budget)
+        else {
+            panic!("16-bit PNG must produce an already decoded RGBA handle")
+        };
+        assert_eq!(pixels.as_ref(), &[255, 0, 0, 255]);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        drop(pixels);
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let mut budget = Budget::new(bytes.len(), 4);
+        budget.decode = Arc::new(tokio::sync::Semaphore::new(15));
+        assert!(matches!(
+            bounded_handle(bytes.clone(), &budget),
+            Loaded::Deferred
+        ));
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.pixels.available_permits(), 4);
+        assert_eq!(budget.decode.available_permits(), 15);
+        let budget = Budget::new(1024, 4);
+        assert!(matches!(
+            bounded_handle(png()[..40].to_vec(), &budget),
+            Loaded::Unavailable
+        ));
+        assert_eq!(budget.encoded.available_permits(), 1024);
+        assert_eq!(budget.pixels.available_permits(), 4);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
     }
     #[test]
     fn file_preview_rejects_compressed_bytes_over_the_bound() {
