@@ -2703,6 +2703,55 @@ mod tests {
         tree::NAMED.with(|cache| cache.borrow_mut().clear());
     }
 
+    #[test]
+    fn loading_focus_preserves_anonymous_and_sidebar_controls() {
+        use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+
+        struct Focus(bool);
+        impl Focusable for Focus {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+
+        for foreign_id in [None, Some(widget::Id::new("sidebar.search"))] {
+            let placeholder = widget::Id::new("loading-pane.header");
+            let target = widget::Id::new("loaded-pane.editor");
+            let mut header = Focus(false);
+            let mut foreign = Focus(true);
+            let mut editor = Focus(false);
+            let mut stream = cosmic::iced::runtime::task::into_stream(focus_after_loading::<()>(
+                placeholder.clone(),
+                target.clone(),
+            ))
+            .expect("loading handoff must issue a widget operation");
+            while let Some(action) = block_on(stream.next()) {
+                let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+                    continue;
+                };
+                loop {
+                    let bounds = Rectangle::default();
+                    operation.focusable(Some(&placeholder), bounds, &mut header);
+                    operation.focusable(foreign_id.as_ref(), bounds, &mut foreign);
+                    operation.focusable(Some(&target), bounds, &mut editor);
+                    match operation.finish() {
+                        Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+            assert!(foreign.0, "loading must preserve the chosen control");
+            assert!(!editor.0, "the loaded editor must not take its keyboard");
+        }
+    }
+
     #[derive(Default)]
     struct FocusedWidgets(Vec<widget::Id>);
 

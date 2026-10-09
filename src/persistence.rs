@@ -6221,6 +6221,7 @@ mod tests {
             selected_file: None,
         };
         first.cards[0].kind = CardKind::Repository(view.clone());
+        first.workspace_history = vec![WorkspaceDestination::Folder(view.project)];
         let raw_path = PathBuf::from(std::ffi::OsString::from_vec(b"file-\xff.txt".to_vec()));
         first.repository_navigation.insert(
             card,
@@ -6233,6 +6234,7 @@ mod tests {
         );
         let mut second = first.clone();
         second.id = WorkspaceId::new();
+        second.workspace_history.clear();
         second
             .repository_navigation
             .get_mut(&card)
@@ -6248,6 +6250,22 @@ mod tests {
         .unwrap();
         let mut second_lane = SaveLane::default();
         second_lane.save(&second_store, &second).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(first.id, None)
+                .unwrap()
+                .unwrap()
+                .workspace_history,
+            first.workspace_history
+        );
+        assert!(
+            second_store
+                .load_workspace(second.id, None)
+                .unwrap()
+                .unwrap()
+                .workspace_history
+                .is_empty()
+        );
         assert_eq!(
             store
                 .load_workspace(first.id, None)
