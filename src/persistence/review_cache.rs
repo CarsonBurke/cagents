@@ -98,17 +98,32 @@ impl Store for StateStore {
         if previous.is_some_and(|(boot, previous)| order.superseded_by(&boot, previous)) {
             return Ok(());
         }
+        // Reinsert an accepted snapshot at the newest rowid while holding the
+        // transaction. The parent deletion cascades its old file rows; neither
+        // readers nor competing writers can observe an intermediate absence.
+        // Recency follows commits and remains independent of wall-clock jumps.
         tx.execute(
-            "DELETE FROM review_cache_files WHERE repository = ?1 AND number = ?2",
+            "DELETE FROM review_cache WHERE repository = ?1 AND number = ?2",
             params![repository, snapshot.key.number],
         )
         .map_err(|error| error.to_string())?;
+        // SQLite chooses a random rowid when the largest one is i64::MAX.
+        // Allocate explicitly so an exhausted/imported database cannot make a
+        // fresh record appear older. Failure rolls the entire transaction back.
+        let latest: i64 = tx
+            .query_row(
+                "SELECT coalesce(max(rowid), 0) FROM review_cache",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let recency = latest
+            .checked_add(1)
+            .ok_or("Review-cache recency is exhausted")?;
         tx.execute(
-            "INSERT INTO review_cache(repository, number, head, viewer, record, saved_ms, write_epoch, write_order, byte_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(repository, number) DO UPDATE SET head=excluded.head, viewer=excluded.viewer,
-                 record=excluded.record, saved_ms=excluded.saved_ms, write_epoch=excluded.write_epoch, write_order=excluded.write_order, byte_size=excluded.byte_size",
-            params![repository, snapshot.key.number, snapshot.range.head.as_str(), snapshot.viewer, record, snapshot.saved_ms, order.epoch.as_str(), order.tick, byte_size],
+            "INSERT INTO review_cache(rowid, repository, number, head, viewer, record, saved_ms, write_epoch, write_order, byte_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![recency, repository, snapshot.key.number, snapshot.range.head.as_str(), snapshot.viewer, record, snapshot.saved_ms, order.epoch.as_str(), order.tick, byte_size],
         ).map_err(|error| error.to_string())?;
         {
             let mut insert = tx.prepare(
@@ -133,8 +148,8 @@ impl Store for StateStore {
         tx.execute(
             "DELETE FROM review_cache WHERE rowid IN
                 (SELECT rowid FROM (
-                    SELECT rowid, row_number() OVER (ORDER BY saved_ms DESC, rowid DESC) AS rank,
-                        sum(byte_size) OVER (ORDER BY saved_ms DESC, rowid DESC) AS bytes
+                    SELECT rowid, row_number() OVER (ORDER BY rowid DESC) AS rank,
+                        sum(byte_size) OVER (ORDER BY rowid DESC) AS bytes
                     FROM review_cache
                  ) WHERE rank > ?1 OR bytes > ?2)",
             params![cache::MAX_CACHED_REVIEWS, cache::MAX_CACHE_BYTES],
@@ -147,6 +162,109 @@ impl Store for StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_eviction_tracks_commits_and_repeated_updates_after_clock_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        let snapshot_for = |number| {
+            let mut snapshot = cache::fixture();
+            snapshot.key.number = number;
+            snapshot.range.number = number;
+            snapshot.pull_request = crate::pull_request_review::tests::pull_request(number);
+            snapshot.saved_ms = 10_000 + number;
+            snapshot
+        };
+        for number in 1..=32 {
+            store
+                .save(&snapshot_for(number), &cache::WriteOrder::fixture(number))
+                .unwrap();
+        }
+        let mut refreshed = snapshot_for(1);
+        refreshed.saved_ms = 1;
+        refreshed.files[0].viewed = false;
+        store
+            .save(&refreshed, &cache::WriteOrder::fixture(100))
+            .unwrap();
+        let mut latest = snapshot_for(33);
+        latest.saved_ms = 0;
+        for order in 101..=103 {
+            latest.files[0].viewed = order % 2 == 0;
+            store
+                .save(&latest, &cache::WriteOrder::fixture(order))
+                .unwrap();
+            assert_eq!(store.load(&latest.key).unwrap(), Some(latest.clone()));
+        }
+        assert_eq!(store.load(&refreshed.key).unwrap(), Some(refreshed));
+        assert!(
+            store.load(&snapshot_for(2).key).unwrap().is_none(),
+            "least recent commit is evicted despite future wall time"
+        );
+        assert!(store.load(&snapshot_for(3).key).unwrap().is_some());
+        let inner = store.lock_inner().unwrap();
+        assert_eq!(
+            inner
+                .connection
+                .query_row("SELECT count(*) FROM review_cache", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            inner
+                .connection
+                .query_row("SELECT count(*) FROM review_cache_files", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            inner
+                .connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn exhausted_sqlite_cache_recency_preserves_existing_snapshot_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        let original = cache::fixture();
+        store
+            .save(&original, &cache::WriteOrder::fixture(1))
+            .unwrap();
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute("UPDATE review_cache SET rowid = ?1", params![i64::MAX])
+            .unwrap();
+        let mut other = original.clone();
+        other.key.number = 2;
+        other.range.number = 2;
+        other.pull_request = crate::pull_request_review::tests::pull_request(2);
+        assert!(store.save(&other, &cache::WriteOrder::fixture(2)).is_err());
+        assert_eq!(store.load(&original.key).unwrap(), Some(original.clone()));
+        assert!(store.load(&other.key).unwrap().is_none());
+        // Refreshing the only record removes the exhausted rowid in the same
+        // transaction and can safely restart recency from one.
+        other = original;
+        other.files[0].viewed = false;
+        store.save(&other, &cache::WriteOrder::fixture(3)).unwrap();
+        assert_eq!(store.load(&other.key).unwrap(), Some(other));
+    }
 
     #[test]
     fn cache_keeps_unfetched_viewed_states_distinct_from_unviewed() {
