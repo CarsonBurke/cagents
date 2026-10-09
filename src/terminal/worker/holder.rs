@@ -316,7 +316,7 @@ pub(super) fn adopt_recoverable(
     let evidence = registry::evidence(socket)?;
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
-    let control = UnixStream::connect(socket).map_err(failed)?;
+    let control = crate::daemon::holder_registry::connect(socket).map_err(failed)?;
     let peer = peer_credentials(&control).map_err(failed)?;
     if evidence.as_ref().is_some_and(|record| {
         peer.pid != record.holder.pid || !record.holder.is_current() || recovery.is_none()
@@ -961,7 +961,8 @@ impl Residence {
             root: registry::Process::read(pid).map_err(|error| error.to_string())?,
         };
         let socket = registry::socket(&directory, record.terminal);
-        let listener = UnixListener::bind(&socket).map_err(|error| error.to_string())?;
+        let listener =
+            crate::daemon::holder_registry::bind(&socket).map_err(|error| error.to_string())?;
         let metadata = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
         if let Err(error) = record.create(&directory) {
             let _ = std::fs::remove_file(socket);
@@ -1179,7 +1180,7 @@ fn serve(control: UnixStream) -> i32 {
                 io::ErrorKind::PermissionDenied,
                 "holder endpoint cannot change",
             )),
-            None => UnixListener::bind(&socket),
+            None => crate::daemon::holder_registry::bind(&socket),
         };
         let listener = match listener {
             Ok(listener) => listener,
@@ -1555,7 +1556,8 @@ pub(crate) fn inspect(
     expected: &Record,
     proof: &crate::model::HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
-    let control = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    let control =
+        crate::daemon::holder_registry::connect(socket).map_err(|error| error.to_string())?;
     let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
     if peer.uid != crate::daemon::current_uid()
         || peer.pid != expected.holder.pid
@@ -2116,7 +2118,7 @@ mod tests {
             // and actual exclusive lease. Isolate the whole coordinator rather
             // than changing process-global environment in a parallel test.
             let directory = tempfile::Builder::new()
-                .prefix("cagents-holder-close-")
+                .prefix("cagents-holder-close-long-runtime-xxxxxxxxxx-")
                 .tempdir_in("/var/tmp")
                 .unwrap();
             let status = Command::new(std::env::current_exe().unwrap())

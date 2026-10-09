@@ -114,11 +114,9 @@ impl HostState {
         let holders = holder_directory()
             .ok()
             .filter(|directory| crate::secure_file::prepare_private_directory(directory).is_ok());
-        let can_carry = |id| {
-            holders
-                .as_ref()
-                .is_some_and(|directory| holder_socket_fits(&holder_socket(directory, id)))
-        };
+        // Holder transport resolves long addresses through a private directory
+        // FD; the full UUID endpoint need not fit directly in sockaddr_un.
+        let can_carry = holders.is_some();
         if !self.native_closing.is_empty() {
             impact
                 .blockers
@@ -145,7 +143,7 @@ impl HostState {
             let source = self.descriptor(0, id)?.session;
             let (disposition, reason) = if record.execution_environment.is_none()
                 && record.handle.holder_identity().is_some()
-                && can_carry(id)
+                && can_carry
             {
                 (
                     Disposition::Continues,
@@ -226,7 +224,7 @@ impl HostState {
             } else if durable
                 && self.terminals.get(&id).is_some_and(|terminal| {
                     !terminal.handle.is_completed()
-                        && (!can_carry(id) || terminal.handle.holder_identity().is_none())
+                        && (!can_carry || terminal.handle.holder_identity().is_none())
                 })
             {
                 (
