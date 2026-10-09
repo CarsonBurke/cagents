@@ -4599,7 +4599,14 @@ mod tests {
             vec![restoration, restoration],
         );
         runtime.flush(timeout).unwrap();
-        assert!(latest_health(&health).quarantined.is_empty());
+        // A successful idempotent checkpoint does not change save health, so
+        // the lane need not publish another event. The barrier still refuses
+        // quarantined writes and errors, and disk assertions below verify it.
+        assert!(runtime.last_error().is_none());
+        while let Ok(event) = health.try_recv() {
+            assert_eq!(event.health, SessionSaveHealth::Healthy);
+            assert!(event.quarantined.is_empty());
+        }
         runtime.shutdown();
         let store = StateStore::open(&path, boot).unwrap();
         assert!(!store.recovery_report().dirty_shutdown);
