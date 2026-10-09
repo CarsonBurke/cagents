@@ -146,6 +146,7 @@ fn uncertain_private_startup_can_retry_exact_cleanup_without_losing_capacity() {
         .unwrap()
         .execution_startups
         .insert(accepted.agent.id, (source.clone(), context));
+    super::super::finish_chat_shutdown(&host).unwrap();
     assert!(
         close(&host, &Authority::default(), accepted.agent.id)
             .unwrap_err()
@@ -962,6 +963,121 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
 }
 
 #[test]
+fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery() {
+    if isolated("graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let source = agent.session.as_ref().unwrap().clone();
+    let token = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(source.id())
+        .unwrap();
+    assert!(!agent.closed);
+
+    super::super::finish_chat_shutdown(&host).unwrap();
+    assert!(!host.lock().unwrap().chats[&source.id()].handle.owns_work());
+    drop(host);
+    let mut state = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new("restarted-execution-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("restarted-incarnation"),
+    });
+    state.install_model(Registry::at(&path).unwrap());
+    let restarted = Arc::new(crate::host::state::HostLock::new(state));
+    // The close command remains idempotent even though the old actor is gone
+    // and any UI resume would carry the new daemon's proof.
+    assert!(
+        close(&restarted, &Authority::default(), agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(
+        registry(&restarted)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agents(None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        status(&restarted, &Authority::default(), agent.id)
+            .unwrap()
+            .1
+            .state,
+        State::Succeeded
+    );
+    assert!(origin(&restarted, &token).is_err());
+    let root = path.parent().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns")).unwrap(),
+        "spawn\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts")).unwrap(),
+        "prompt\n"
+    );
+}
+
+#[test]
+fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved() {
+    if isolated("failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let fault = rusqlite::Connection::open(path).unwrap();
+    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
+    assert!(
+        super::super::finish_chat_shutdown(&host)
+            .unwrap_err()
+            .contains("fixture retirement unavailable")
+    );
+    let retained = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    assert!(!retained.closed);
+    let source = retained.session.as_ref().unwrap();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_authority_source(source.id())
+            .unwrap()
+            .is_some()
+    );
+    fault
+        .execute_batch("DROP TRIGGER refuse_shutdown_retirement")
+        .unwrap();
+    super::super::finish_chat_shutdown(&host).unwrap();
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+}
+
+#[test]
 fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     if isolated("fresh_codex_execution_uses_owned_listener_and_correlated_provider_result")
         .is_some()
@@ -1099,6 +1215,25 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
         !submit(&host, &Authority::default(), request)
             .unwrap()
             .created
+    );
+    super::super::finish_chat_shutdown(&host).unwrap();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_authority_source(session.id)
+            .unwrap()
+            .is_none()
     );
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
     assert_eq!(server.join().unwrap(), 1);

@@ -71,6 +71,23 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             proof: cleanup_proof.clone(),
         };
         wait_durable(&handle);
+        // A committed upgrade transfers delegated capability ownership; the
+        // normal-shutdown retirement hook must not erase this live source.
+        host.lock().unwrap().install_model(
+            crate::host::model::Registry::at(
+                &root.join(format!("ownership-{fail_final_save}.sqlite3")),
+            )
+            .unwrap(),
+        );
+        let execution = super::super::agent_execution::registry(&host).unwrap();
+        let source = crate::agent_execution::HostedSession::Chat(
+            host.lock().unwrap().chats[&id].session.clone(),
+        );
+        execution
+            .lock()
+            .unwrap()
+            .fresh_agent_authority(&source)
+            .unwrap();
         let socket = registry::socket(&registry::directory(Kind::Native).unwrap(), id);
         let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
         assert!(record.root.is_current());
@@ -119,6 +136,14 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
         let result = super::super::finish_chat_shutdown(&host);
         assert_eq!(result.is_err(), fail_final_save, "{result:?}");
         assert!(!host.lock().unwrap().has_committed_upgrade());
+        assert_eq!(
+            execution
+                .lock()
+                .unwrap()
+                .retained_agent_authority_source(id)
+                .unwrap(),
+            Some(source)
+        );
         assert!(
             record.root.is_current(),
             "upgrade shutdown killed retained provider (save failure={fail_final_save})"
