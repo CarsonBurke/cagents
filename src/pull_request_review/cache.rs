@@ -15,8 +15,10 @@ pub const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// An ordering observation captured before a cache task enters the blocking pool.
 /// Updated clients on the same kernel boot and Linux time namespace share this
-/// clock domain. Cross-container clocks and older executables are outside this
-/// ordering contract. The boot identity and clock observation are inseparable.
+/// clock domain. Cross-container clocks and older SQLite writers are outside
+/// this ordering contract. JsonStore separately fences older version-one JSON
+/// writers after committing a version-two document. The boot identity and clock
+/// observation are inseparable.
 /// Equal clock ticks keep the already committed snapshot; clock resolution
 /// bounds ordering precision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +342,45 @@ mod tests {
     }
 
     #[test]
+    fn json_cache_reads_legacy_records_and_commits_the_new_writer_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(directory.path()).unwrap();
+        let path = directory.path().join("review.json");
+        let legacy = fixture();
+        let document = Document {
+            version: 1,
+            reviews: vec![Record {
+                snapshot: legacy.clone(),
+                epoch: uuid::Uuid::new_v4().to_string(),
+                order: 99,
+            }],
+        };
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&document).unwrap())
+            .unwrap();
+        drop(file);
+        let store = JsonStore::new(path.clone());
+        assert_eq!(store.load(&legacy.key).unwrap(), Some(legacy.clone()));
+        let mut current = legacy;
+        current.files[0].viewed = false;
+        store.save(&current, &WriteOrder::fixture(1)).unwrap();
+        let written: Document = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            written.version, 2,
+            "the old reader's version != 1 gate refuses subsequent writes"
+        );
+        assert_eq!(written.reviews.len(), 1);
+        assert_eq!(written.reviews[0].snapshot, current);
+        assert_eq!(store.load(&current.key).unwrap(), Some(current));
+    }
+
+    #[test]
     fn invalid_identity_and_selection_are_not_persisted() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonStore::new(dir.path().join("review.json"));
@@ -354,6 +395,9 @@ mod tests {
 
 /// Ceditor's bounded, atomic review.json lane. A private advisory lock
 /// serializes read/modify/write across editor processes as well as tabs.
+/// Version-one documents remain readable. Accepted writes publish version two:
+/// older version-one readers refuse that format before modifying the cache, so
+/// they cannot replace an already committed boot-ordered document.
 pub struct JsonStore {
     path: std::path::PathBuf,
 }
@@ -382,7 +426,7 @@ impl JsonStore {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Document {
-                    version: 1,
+                    version: 2,
                     reviews: Vec::new(),
                 });
             }
@@ -396,7 +440,7 @@ impl JsonStore {
             return Err("Review cache exceeds the size limit".into());
         }
         let document: Document = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if document.version != 1 || document.reviews.len() > MAX_CACHED_REVIEWS {
+        if !matches!(document.version, 1 | 2) || document.reviews.len() > MAX_CACHED_REVIEWS {
             return Err("Unsupported review cache format or size".into());
         }
         for record in &document.reviews {
@@ -468,6 +512,7 @@ impl Store for JsonStore {
         {
             return Ok(());
         }
+        document.version = 2;
         document.reviews.retain(|record| !same_key(record));
         document.reviews.insert(
             0,
