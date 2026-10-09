@@ -9691,6 +9691,74 @@ mod tests {
     }
 
     #[test]
+    fn permission_approval_popup_and_transcript_keep_distinct_named_widget_state() {
+        use cosmic::iced::advanced::{Layout, layout, mouse, renderer, widget::Tree};
+        use cosmic::iced::{Rectangle, Size};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("permissions"));
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        runtime.session.launch.provider = Provider::Claude;
+        Arc::make_mut(&mut runtime.snapshot).requests = vec![chat::Request {
+            id: "approval".into(),
+            title: "Allow Bash?".into(),
+            description: String::new(),
+            fields: vec![],
+            actions: ["deny", "allow", "allowForSession"]
+                .map(|id| chat::Choice {
+                    id: id.into(),
+                    label: id.into(),
+                    description: String::new(),
+                })
+                .to_vec(),
+        }];
+        let runtime = chat_runtime(&app, card);
+        let render = || -> Element<'_, Message> {
+            widget::column::with_children(vec![
+                view::request_view(
+                    runtime.target,
+                    &runtime.snapshot.requests[0],
+                    &runtime.answers,
+                    true,
+                    view::RequestSurface::Transcript,
+                ),
+                runtime.permissions_view(true, 520.0),
+            ])
+            .into()
+        };
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(render().as_widget());
+        let viewport = Rectangle::with_size(Size::new(520.0, 1600.0));
+        // Native UI extracts named states globally between frames. Duplicate
+        // transcript/popup answer IDs previously left one copy stateless and
+        // crashed its next button draw despite a correct initial tree.
+        for _ in 0..3 {
+            cosmic::iced::advanced::widget::tree::NAMED.with(|named| {
+                *named.borrow_mut() = tree.take_all_named();
+            });
+            let mut element = render();
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::theme::Theme::default(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+        }
+        cosmic::iced::advanced::widget::tree::NAMED.with(|named| named.borrow_mut().clear());
+    }
+
+    #[test]
     fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_ways() {
         use crate::workspace_widget::GlobalShortcut;
         let mut app = crate::app::tests::context_inspector_test_app(false);

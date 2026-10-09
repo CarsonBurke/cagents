@@ -1360,7 +1360,13 @@ impl Runtime {
                                 .requests
                                 .iter()
                                 .map(|request| {
-                                    request_view(self.target, request, &self.answers, available)
+                                    request_view(
+                                        self.target,
+                                        request,
+                                        &self.answers,
+                                        available,
+                                        RequestSurface::Transcript,
+                                    )
                                 })
                                 .collect::<Vec<_>>(),
                         )
@@ -3563,11 +3569,18 @@ pub(super) type Answers = HashMap<(String, String), Vec<String>>;
 /// blob of JSON, a stray text field and the decisions themselves all had
 /// the same weight, so the one thing the reader had to do was the hardest
 /// thing on it to find.
+#[derive(Clone, Copy)]
+pub(super) enum RequestSurface {
+    Transcript,
+    Permissions,
+}
+
 pub(super) fn request_view<'a>(
     target: Target,
     request: &'a chat::Request,
     answers: &'a Answers,
     available: bool,
+    surface: RequestSurface,
 ) -> Element<'a, Message> {
     let (question, context) = question_and_context(&request.description);
     let mut rows: Vec<Element<'a, Message>> = vec![
@@ -3606,7 +3619,7 @@ pub(super) fn request_view<'a>(
     for field in &request.fields {
         rows.push(field_view(target, request, field, answers, available));
     }
-    rows.push(answers_view(target, request, available));
+    rows.push(answers_view(target, request, available, surface));
     widget::container(
         widget::column::with_children(rows)
             .spacing(step::GAP_M)
@@ -3781,6 +3794,7 @@ fn answers_view<'a>(
     target: Target,
     request: &'a chat::Request,
     available: bool,
+    surface: RequestSurface,
 ) -> Element<'a, Message> {
     if request.actions.is_empty() {
         // A provider can ask something this surface has no answer for -
@@ -3804,16 +3818,20 @@ fn answers_view<'a>(
                     request.id.clone(),
                     choice.id.clone(),
                 )));
-                let control: Element<'a, Message> = if primary == Some(&choice.id) {
+                let control = if primary == Some(&choice.id) {
                     crate::ui_controls::button::primary(choice.label.as_str())
-                        .id(answer_control_id(target, request, choice))
-                        .on_press_maybe(message)
-                        .into()
                 } else {
                     crate::ui_controls::button::secondary(choice.label.as_str())
+                }
+                .on_press_maybe(message);
+                // Custom IDs retain state globally in iced. The transcript
+                // and popup render the same answers simultaneously, so only
+                // the popup copy receives its keyboard-navigation ID.
+                let control: Element<'a, Message> = match surface {
+                    RequestSurface::Permissions => control
                         .id(answer_control_id(target, request, choice))
-                        .on_press_maybe(message)
-                        .into()
+                        .into(),
+                    RequestSurface::Transcript => control.into(),
                 };
                 if choice.description.is_empty() {
                     control

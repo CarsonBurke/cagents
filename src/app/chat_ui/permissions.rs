@@ -203,7 +203,13 @@ impl Runtime {
             .filter(|request| request.fields.is_empty())
             .collect();
         for request in approvals {
-            content.push(view::request_view(target, request, &self.answers, enabled));
+            content.push(view::request_view(
+                target,
+                request,
+                &self.answers,
+                enabled,
+                view::RequestSurface::Permissions,
+            ));
         }
         for denial in snapshot.permission_denials.iter().rev() {
             let mut details = vec![
