@@ -3371,5 +3371,320 @@ fn discard_reports_restored_paths_when_untracked_classification_fails() {
             fs::read(fixture.work().join("second.txt")).unwrap(),
             b"second untracked\n"
         );
+        assert!(!fixture.work().join(".git/index.lock").exists());
+    }
+}
+
+/// Both main and linked worktrees must hold their own index lock, so an
+/// external Git client cannot stage a selected file after classification.
+#[test]
+fn discard_blocks_external_staging_under_the_correct_worktree_index_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TryStageDuringDiscard {
+        attempted: AtomicBool,
+        worktree: PathBuf,
+        index_lock: PathBuf,
+    }
+    impl ProcessExecutor for TryStageDuringDiscard {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if command.arguments.iter().any(|arg| arg == "ls-files")
+                && !self.attempted.swap(true, Ordering::Relaxed)
+            {
+                assert!(output.success);
+                assert!(output.stdout.is_empty());
+                assert!(
+                    self.index_lock.is_file(),
+                    "discard must hold this index lock"
+                );
+                let stage = CommandSpec::new(&command.program)
+                    .args([OsString::from("-C"), self.worktree.as_os_str().to_owned()])
+                    .args(["add", "--", "selected.txt"]);
+                let refused = SystemProcessExecutor.execute(&isolate(stage), cancellation)?;
+                assert!(
+                    !refused.success,
+                    "external staging crossed the classification/unlink fence"
+                );
+                assert!(String::from_utf8_lossy(&refused.stderr).contains("index.lock"));
+            }
+            Ok(output)
+        }
+    }
+
+    for linked in [false, true] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.write("tracked.txt", b"committed\n");
+        fixture.git_in_work(&["add", "tracked.txt"]);
+        fixture.commit("initial");
+        let worktree = if linked {
+            let linked = fixture.root.path().join("linked");
+            fixture.git_in_work(&[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("linked"),
+                linked.as_os_str(),
+            ]);
+            linked
+        } else {
+            fixture.work()
+        };
+        fs::write(
+            worktree.join("selected.txt"),
+            b"selected untracked content\n",
+        )
+        .unwrap();
+        let index = fixture.run(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        );
+        let index = PathBuf::from(String::from_utf8(index).unwrap().trim());
+        let index_lock = index.with_file_name("index.lock");
+        let foreign_main_lock = fixture.work().join(".git/index.lock");
+        if linked {
+            assert_ne!(index_lock, foreign_main_lock);
+            fs::write(&foreign_main_lock, b"main worktree writer").unwrap();
+        }
+        let executor = Arc::new(TryStageDuringDiscard {
+            attempted: AtomicBool::new(false),
+            worktree: worktree.clone(),
+            index_lock: index_lock.clone(),
+        });
+        let service = RepositoryService::new(&fixture.git, Arc::clone(&executor));
+        let outcome = service
+            .discard(
+                &DiscardRequest {
+                    worktree: worktree.clone(),
+                    tracked: Vec::new(),
+                    untracked: vec![path("selected.txt")],
+                    confirmed: true,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(executor.attempted.load(Ordering::Relaxed));
+        assert_eq!(
+            outcome,
+            MutationOutcome::Applied {
+                paths: vec![path("selected.txt")]
+            }
+        );
+        assert!(!worktree.join("selected.txt").exists());
+        assert!(!index_lock.exists(), "the owned lock must be released");
+        assert!(
+            !fs::read_dir(index.parent().unwrap())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cagents-tmp-"))
+        );
+        if linked {
+            assert_eq!(
+                fs::read(&foreign_main_lock).unwrap(),
+                b"main worktree writer"
+            );
+            fs::remove_file(&foreign_main_lock).unwrap();
+        }
+        fs::write(worktree.join("after.txt"), b"later stage\n").unwrap();
+        fixture.run(&worktree, &["add", "after.txt"]);
+    }
+}
+
+#[test]
+fn discard_refuses_foreign_index_lock_and_releases_its_lock_after_path_refusal() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("selected.txt", b"keep while locked\n");
+    let index_lock = fixture.work().join(".git/index.lock");
+    fs::write(&index_lock, b"foreign writer evidence").unwrap();
+    let request = DiscardRequest {
+        worktree: fixture.work(),
+        tracked: Vec::new(),
+        untracked: vec![path("selected.txt")],
+        confirmed: true,
+    };
+    let outcome = fixture
+        .service()
+        .discard(&request, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        matches!(&outcome, MutationOutcome::NotApplied { failure }
+            if failure.to_string().contains(index_lock.to_str().unwrap())),
+        "contention must identify the actual lock path: {outcome:?}"
+    );
+    assert_eq!(fs::read(&index_lock).unwrap(), b"foreign writer evidence");
+    assert_eq!(
+        fs::read(fixture.work().join("selected.txt")).unwrap(),
+        b"keep while locked\n"
+    );
+    fs::remove_file(&index_lock).unwrap();
+    fs::create_dir(fixture.work().join("directory")).unwrap();
+    let mut refused = request;
+    refused.untracked = vec![path("directory")];
+    let outcome = fixture
+        .service()
+        .discard(&refused, &CancellationToken::new())
+        .unwrap();
+    assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
+    assert!(fixture.work().join("directory").is_dir());
+    assert!(!index_lock.exists());
+    assert!(
+        !fs::read_dir(fixture.work().join(".git"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cagents-tmp-"))
+    );
+}
+
+#[test]
+fn discard_cancelled_after_classification_keeps_files_and_releases_the_index_lock() {
+    struct CancelAfterClassification;
+    impl ProcessExecutor for CancelAfterClassification {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if command.arguments.iter().any(|arg| arg == "ls-files") {
+                cancellation.cancel();
+            }
+            Ok(output)
+        }
+    }
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("first.txt", b"first untracked\n");
+    fixture.write("second.txt", b"second untracked\n");
+    let service = RepositoryService::new(&fixture.git, Arc::new(CancelAfterClassification));
+    let cancellation = CancellationToken::new();
+    let outcome = service
+        .discard(
+            &DiscardRequest {
+                worktree: fixture.work(),
+                tracked: Vec::new(),
+                untracked: vec![path("first.txt"), path("second.txt")],
+                confirmed: true,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    assert!(cancellation.is_cancelled());
+    assert!(
+        matches!(outcome, MutationOutcome::NotApplied { failure: MutationFailure::Path { reason, .. } } if reason.contains("cancelled"))
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("first.txt")).unwrap(),
+        b"first untracked\n"
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("second.txt")).unwrap(),
+        b"second untracked\n"
+    );
+    assert!(!fixture.work().join(".git/index.lock").exists());
+}
+
+#[test]
+fn mixed_discard_retains_accounting_and_foreign_lock_evidence() {
+    #[derive(Clone, Copy)]
+    enum Intervention {
+        AcquireAfterRestore,
+        ReplaceAfterClassification,
+        ModifyAfterClassification,
+    }
+    struct InterfereWithLock {
+        index_lock: PathBuf,
+        intervention: Intervention,
+    }
+    impl ProcessExecutor for InterfereWithLock {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            let trigger = match self.intervention {
+                Intervention::AcquireAfterRestore => "restore",
+                _ => "ls-files",
+            };
+            if output.success && command.arguments.iter().any(|arg| arg == trigger) {
+                if matches!(self.intervention, Intervention::ReplaceAfterClassification) {
+                    fs::remove_file(&self.index_lock).unwrap();
+                }
+                fs::write(&self.index_lock, b"foreign lock evidence").unwrap();
+            }
+            Ok(output)
+        }
+    }
+    for intervention in [
+        Intervention::AcquireAfterRestore,
+        Intervention::ReplaceAfterClassification,
+        Intervention::ModifyAfterClassification,
+    ] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.write("tracked.txt", b"committed\n");
+        fixture.git_in_work(&["add", "tracked.txt"]);
+        fixture.commit("initial");
+        fixture.write("tracked.txt", b"uncommitted tracked edits\n");
+        fixture.write("selected.txt", b"untracked content to keep\n");
+        let index_lock = fixture.work().join(".git/index.lock");
+        let service = RepositoryService::new(
+            &fixture.git,
+            Arc::new(InterfereWithLock {
+                index_lock: index_lock.clone(),
+                intervention,
+            }),
+        );
+        let outcome = service
+            .discard(
+                &DiscardRequest {
+                    worktree: fixture.work(),
+                    tracked: vec![PathSelection::new(path("tracked.txt"))],
+                    untracked: vec![path("selected.txt")],
+                    confirmed: true,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let MutationOutcome::PartiallyApplied { paths, failures } = outcome else {
+            panic!("tracked restore must stay known: {outcome:?}");
+        };
+        assert_eq!(paths, vec![path("tracked.txt")]);
+        assert!(failures.iter().any(|failure| matches!(failure,
+            MutationFailure::Path { path: refused, .. } if *refused == path("selected.txt"))));
+        assert_eq!(
+            fs::read(fixture.work().join("tracked.txt")).unwrap(),
+            b"committed\n"
+        );
+        assert_eq!(
+            fs::read(fixture.work().join("selected.txt")).unwrap(),
+            b"untracked content to keep\n"
+        );
+        assert_eq!(fs::read(&index_lock).unwrap(), b"foreign lock evidence");
+        assert!(
+            !fs::read_dir(fixture.work().join(".git"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cagents-tmp-"))
+        );
     }
 }
