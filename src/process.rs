@@ -328,8 +328,29 @@ pub struct CancellationToken(Arc<CancellationState>);
 #[derive(Debug, Default)]
 struct CancellationState {
     cancelled: AtomicBool,
-    wakers: Mutex<Vec<(u64, mpsc::Sender<WaitEvent>)>>,
+    wakers: Mutex<Vec<(u64, CancellationNotifier)>>,
     next_waker: AtomicU64,
+}
+
+/// The process runner needs a typed event; resource gates only need a wake.
+/// Bounded signals coalesce repeated notifications and never block cancellation.
+#[derive(Debug)]
+enum CancellationNotifier {
+    Process(mpsc::Sender<WaitEvent>),
+    Signal(mpsc::SyncSender<()>),
+}
+
+impl CancellationNotifier {
+    fn notify(&self) {
+        match self {
+            Self::Process(sender) => {
+                let _ = sender.send(WaitEvent::Cancelled);
+            }
+            Self::Signal(sender) => {
+                let _ = sender.try_send(());
+            }
+        }
+    }
 }
 
 impl CancellationToken {
@@ -344,7 +365,7 @@ impl CancellationToken {
             return;
         }
         for (_, waker) in lock_wakers(&self.0).iter() {
-            let _ = waker.send(WaitEvent::Cancelled);
+            waker.notify();
         }
     }
 
@@ -355,8 +376,19 @@ impl CancellationToken {
     /// Registers a waker for the duration of one blocking wait. The returned
     /// guard deregisters it, so a long-lived token does not accumulate senders.
     pub(crate) fn register(&self, waker: mpsc::Sender<WaitEvent>) -> CancellationWaker<'_> {
+        self.register_notifier(CancellationNotifier::Process(waker))
+    }
+
+    /// Registers a bounded wake signal for a blocking resource gate. Register
+    /// before checking cancellation, then recheck the flag after every wake.
+    /// A full channel already contains a wake, so cancelling never blocks.
+    pub(crate) fn register_signal(&self, waker: mpsc::SyncSender<()>) -> CancellationWaker<'_> {
+        self.register_notifier(CancellationNotifier::Signal(waker))
+    }
+
+    fn register_notifier(&self, notifier: CancellationNotifier) -> CancellationWaker<'_> {
         let id = self.0.next_waker.fetch_add(1, Ordering::Relaxed);
-        lock_wakers(&self.0).push((id, waker));
+        lock_wakers(&self.0).push((id, notifier));
         CancellationWaker { state: &self.0, id }
     }
 }
@@ -377,7 +409,7 @@ impl Drop for CancellationWaker<'_> {
 
 /// A panic elsewhere must never be able to disable cancellation, and the
 /// guarded vector has no invariant that a panic could leave broken.
-fn lock_wakers(state: &CancellationState) -> MutexGuard<'_, Vec<(u64, mpsc::Sender<WaitEvent>)>> {
+fn lock_wakers(state: &CancellationState) -> MutexGuard<'_, Vec<(u64, CancellationNotifier)>> {
     state
         .wakers
         .lock()
@@ -1291,6 +1323,39 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "cancellation took {elapsed:?}; the wait did not wake on it"
         );
+    }
+
+    #[test]
+    fn cancellation_signals_coalesce_and_deregister_without_blocking() {
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.try_send(()).unwrap();
+        let registration = cancellation.register_signal(sender);
+        // A full bounded channel must not block cancel or require a receiver.
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        receiver.try_recv().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(registration);
+        assert!(lock_wakers(&cancellation.0).is_empty());
+    }
+
+    #[test]
+    fn cancellation_signals_wake_and_tolerate_disconnected_receivers() {
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let registration = cancellation.register_signal(sender);
+        let (dead_sender, dead_receiver) = mpsc::sync_channel(1);
+        drop(dead_receiver);
+        let dead_registration = cancellation.register_signal(dead_sender);
+        cancellation.cancel();
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(registration);
+        drop(dead_registration);
+        assert!(lock_wakers(&cancellation.0).is_empty());
     }
 
     #[test]

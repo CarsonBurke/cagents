@@ -41,7 +41,8 @@ impl OwnerKey {
 
 /// Called once per owner by a blocking worker; handles retain decoded 64px RGBA.
 pub fn load(key: &OwnerKey) -> Option<Handle> {
-    let _permit = PERMITS.acquire();
+    let cancellation = CancellationToken::new();
+    let _permit = PERMITS.acquire(&cancellation)?;
     let cache = crate::instance::project_dirs()?
         .cache_dir()
         .join("github-avatars");
@@ -86,7 +87,7 @@ pub fn load(key: &OwnerKey) -> Option<Handle> {
         .timeout(Duration::from_secs(15))
         .output_limits(MAX_BYTES, 4096);
     let downloaded = SystemProcessExecutor
-        .execute(&command, &CancellationToken::default())
+        .execute(&command, &cancellation)
         .and_then(|output| output.require_success(&command.program))
         .ok()
         .and_then(|output| {

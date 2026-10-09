@@ -5,10 +5,10 @@
 //! a distinct process argument.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -61,7 +61,7 @@ const CHECKS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// refresh, so an instance-local cache would never see a second lookup.
 static CHECKS_CACHE: LazyLock<Mutex<HashMap<ChecksCacheKey, CachedChecks>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static CHECKS_FLIGHTS: LazyLock<Mutex<HashMap<ChecksCacheKey, Arc<Mutex<()>>>>> =
+static CHECKS_FLIGHTS: LazyLock<Mutex<HashMap<ChecksCacheKey, Arc<CheckPermits>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Permits shared by every `gh` invocation; see [`GH_PROCESS_CONCURRENCY`].
@@ -92,37 +92,103 @@ fn lock_checks_cache() -> MutexGuard<'static, HashMap<ChecksCacheKey, CachedChec
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A counting semaphore. `tokio`'s lives on the async side of the application,
-/// and this bound is taken by the blocking threads that run `gh`.
+/// A blocking counting semaphore whose waits wake on capacity or cancellation.
+/// Both signals share a bounded channel, while availability and waiter order
+/// are protected by one mutex. A canceled selected waiter forwards free capacity.
 struct CheckPermits {
-    available: Mutex<usize>,
-    released: Condvar,
+    state: Mutex<PermitState>,
+}
+
+struct PermitState {
+    available: usize,
+    waiters: VecDeque<Arc<mpsc::SyncSender<()>>>,
+}
+
+impl PermitState {
+    fn wake_next(&mut self) {
+        if self.available == 0 {
+            return;
+        }
+        while let Some(waiter) = self.waiters.front() {
+            match waiter.try_send(()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(())) => break,
+                Err(mpsc::TrySendError::Disconnected(())) => {
+                    self.waiters.pop_front();
+                }
+            }
+        }
+    }
 }
 
 impl CheckPermits {
     fn new(limit: usize) -> Self {
         Self {
-            available: Mutex::new(limit),
-            released: Condvar::new(),
+            state: Mutex::new(PermitState {
+                available: limit,
+                waiters: VecDeque::new(),
+            }),
         }
     }
 
-    /// Blocks until a permit is free. A holder never waits for anything but the
-    /// subprocess it launched, and every permit is returned on drop, so waiting
-    /// here cannot deadlock.
-    fn acquire(&self) -> CheckPermit<'_> {
-        let mut available = self
-            .available
+    fn lock(&self) -> MutexGuard<'_, PermitState> {
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *available == 0 {
-            available = self
-                .released
-                .wait(available)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn acquire(&self, cancellation: &CancellationToken) -> Option<CheckPermit<'_>> {
+        if cancellation.is_cancelled() {
+            return None;
         }
-        *available -= 1;
-        CheckPermit(self)
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _cancellation_waker = cancellation.register_signal(sender.clone());
+        let sender = Arc::new(sender);
+        let waiter = {
+            let mut state = self.lock();
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if state.available > 0 && state.waiters.is_empty() {
+                state.available -= 1;
+                return Some(CheckPermit(self));
+            }
+            state.waiters.push_back(sender.clone());
+            state.wake_next();
+            PermitWaiter { pool: self, sender }
+        };
+        loop {
+            receiver.recv().ok()?;
+            let mut state = self.lock();
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if state.available > 0
+                && state
+                    .waiters
+                    .front()
+                    .is_some_and(|first| Arc::ptr_eq(first, &waiter.sender))
+            {
+                state.available -= 1;
+                return Some(CheckPermit(self));
+            }
+        }
+    }
+}
+
+/// Removal is also required on cancellation/unwind: a signaled waiter must not
+/// leave the next request asleep while capacity is available.
+struct PermitWaiter<'pool> {
+    pool: &'pool CheckPermits,
+    sender: Arc<mpsc::SyncSender<()>>,
+}
+
+impl Drop for PermitWaiter<'_> {
+    fn drop(&mut self) {
+        let mut state = self.pool.lock();
+        state
+            .waiters
+            .retain(|sender| !Arc::ptr_eq(sender, &self.sender));
+        state.wake_next();
     }
 }
 
@@ -130,12 +196,9 @@ struct CheckPermit<'pool>(&'pool CheckPermits);
 
 impl Drop for CheckPermit<'_> {
     fn drop(&mut self) {
-        *self
-            .0
-            .available
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
-        self.0.released.notify_one();
+        let mut state = self.0.lock();
+        state.available += 1;
+        state.wake_next();
     }
 }
 
@@ -1960,6 +2023,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         pr: &PullRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequestCheck>, String> {
+        if cancellation.is_cancelled() {
+            return Err("Checks request cancelled.".into());
+        }
         let key = ChecksCacheKey {
             pull_request: PullRequestKey {
                 repository: repository.clone(),
@@ -1975,13 +2041,12 @@ impl<E: ProcessExecutor> GitHubService<E> {
             flights.retain(|_, flight| Arc::strong_count(flight) > 1);
             flights
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .or_insert_with(|| Arc::new(CheckPermits::new(1)))
                 .clone()
         };
-        let _flight = flight.lock().unwrap_or_else(|error| error.into_inner());
-        if cancellation.is_cancelled() {
-            return Err("Checks request cancelled.".into());
-        }
+        let _flight = flight
+            .acquire(cancellation)
+            .ok_or_else(|| "Checks request cancelled.".to_owned())?;
         {
             let now = Instant::now();
             let mut cache = lock_checks_cache();
@@ -2093,7 +2158,18 @@ impl<E: ProcessExecutor> GitHubService<E> {
         command: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessFailure> {
-        let _permit = GH_PERMITS.acquire();
+        let _permit = GH_PERMITS
+            .acquire(cancellation)
+            .ok_or_else(|| ProcessFailure {
+                kind: ProcessFailureKind::Cancelled,
+                program: command.program.clone(),
+                exit_code: None,
+                signal: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                message: "operation was cancelled before launch".into(),
+                started: false,
+            })?;
         self.executor.execute(command, cancellation)
     }
 
@@ -2992,6 +3068,181 @@ fn parse_warning(program: &Path, output: ProcessOutput, message: String) -> Proc
 mod tests {
     use super::*;
     use std::{ffi::OsStr, sync::Mutex};
+
+    fn wait_for_permit_waiters(pool: &CheckPermits, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.lock().waiters.len() != count {
+            assert!(Instant::now() < deadline, "permit waiter did not register");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn cancelled_github_command_never_reaches_executor() {
+        let fake = Arc::new(FakeExecutor::default());
+        let service = GitHubService::new("custom-gh", fake.clone());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let failure = service
+            .execute(&CommandSpec::new("custom-gh"), &cancellation)
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert_eq!(failure.program, PathBuf::from("custom-gh"));
+        assert!(!failure.started);
+        assert!(fake.commands.lock().unwrap().is_empty());
+        let pool = CheckPermits::new(1);
+        assert!(pool.acquire(&cancellation).is_none());
+        assert_eq!(pool.lock().available, 1);
+        assert!(pool.lock().waiters.is_empty());
+    }
+
+    #[test]
+    fn github_permit_cancellation_wakes_without_releasing_capacity() {
+        let pool = Arc::new(CheckPermits::new(1));
+        let active = CancellationToken::new();
+        let held = pool.acquire(&active).unwrap();
+        let cancellation = CancellationToken::new();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = {
+            let pool = pool.clone();
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                finished_tx
+                    .send(pool.acquire(&cancellation).is_none())
+                    .unwrap();
+            })
+        };
+        wait_for_permit_waiters(&pool, 1);
+        cancellation.cancel();
+        let cancelled = finished_rx.recv_timeout(Duration::from_secs(2));
+        // Release even if the assertion fails, so a regression cannot strand the worker.
+        drop(held);
+        worker.join().unwrap();
+        assert!(cancelled.unwrap());
+        assert_eq!(pool.lock().available, 1);
+        assert!(pool.lock().waiters.is_empty());
+    }
+
+    #[test]
+    fn cancelled_notified_github_waiter_passes_available_capacity() {
+        let pool = CheckPermits::new(1);
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        let (second_tx, second_rx) = mpsc::sync_channel(1);
+        let first = PermitWaiter {
+            pool: &pool,
+            sender: Arc::new(first_tx),
+        };
+        let second = PermitWaiter {
+            pool: &pool,
+            sender: Arc::new(second_tx),
+        };
+        {
+            let mut state = pool.lock();
+            state
+                .waiters
+                .extend([first.sender.clone(), second.sender.clone()]);
+            state.wake_next();
+            // Repeated releases/notifications never block behind a full signal.
+            state.wake_next();
+        }
+        first_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        // This is the cancellation/unwind deregistration path after selection.
+        drop(first);
+        second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(pool.lock().available, 1);
+        drop(second);
+        assert!(pool.lock().waiters.is_empty());
+        // Disconnected registration cannot absorb a capacity notification.
+        let (dead_tx, dead_rx) = mpsc::sync_channel(1);
+        drop(dead_rx);
+        let mut state = pool.lock();
+        state.waiters.push_back(Arc::new(dead_tx));
+        state.wake_next();
+        assert!(state.waiters.is_empty());
+    }
+
+    #[test]
+    fn github_permits_preserve_concurrency_bound_and_release_after_unwind() {
+        let pool = Arc::new(CheckPermits::new(2));
+        let active = CancellationToken::new();
+        let first = pool.acquire(&active).unwrap();
+        let second = pool.acquire(&active).unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = {
+            let pool = pool.clone();
+            thread::spawn(move || {
+                let _permit = pool.acquire(&CancellationToken::new()).unwrap();
+                acquired_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        wait_for_permit_waiters(&pool, 1);
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(pool.lock().available, 0);
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(pool.lock().available, 0);
+        drop(second);
+        assert_eq!(pool.lock().available, 1);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(pool.lock().available, 2);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = pool.acquire(&active).unwrap();
+            panic!("injected holder unwind");
+        }));
+        assert_eq!(pool.lock().available, 2);
+        assert!(pool.lock().waiters.is_empty());
+    }
+
+    #[test]
+    fn cancelled_checks_flight_waiter_finishes_while_original_flight_is_held() {
+        let repository = repository();
+        let pr = parse_pull_request(
+            br#"{"number":9859,"title":"Cancellation fixture","state":"OPEN","headRefName":"permit-flight","headRefOid":"permit-flight-unique","baseRefName":"main","updatedAt":"permit-flight-unique","url":"https://github.com/owner/repo/pull/9859"}"#,
+            &repository,
+        ).unwrap();
+        let key = ChecksCacheKey {
+            pull_request: PullRequestKey::new(repository.clone(), pr.number).unwrap(),
+            updated_at: pr.updated_at.clone(),
+            head_oid: pr.head_ref_oid.clone(),
+        };
+        let flight = Arc::new(CheckPermits::new(1));
+        CHECKS_FLIGHTS
+            .lock()
+            .unwrap()
+            .insert(key.clone(), flight.clone());
+        let held = flight.acquire(&CancellationToken::new()).unwrap();
+        let fake = Arc::new(FakeExecutor::default());
+        let service = GitHubService::new("gh", fake.clone());
+        let cancellation = CancellationToken::new();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = {
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                finished_tx
+                    .send(service.cached_checks(&repository, &pr, &cancellation))
+                    .unwrap();
+            })
+        };
+        wait_for_permit_waiters(&flight, 1);
+        cancellation.cancel();
+        let result = finished_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        worker.join().unwrap();
+        CHECKS_FLIGHTS.lock().unwrap().remove(&key);
+        assert_eq!(result.unwrap().unwrap_err(), "Checks request cancelled.");
+        assert!(fake.commands.lock().unwrap().is_empty());
+        assert_eq!(flight.lock().available, 1);
+    }
 
     #[derive(Default)]
     struct FakeExecutor {
