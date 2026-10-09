@@ -24,7 +24,7 @@ use cagents::{
         SourceControlModel, WorktreePanel,
     },
     splitter::{self, Splitter},
-    ui_controls::{icon_control, popover, symbolic_icon, toolbar_actions},
+    ui_controls::{Icon, icon_button, popover, toolbar_actions},
     workspace_widget,
 };
 use cosmic::app::ApplicationExt;
@@ -961,7 +961,7 @@ fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_
 fn find_bar(editor: &Editor) -> Element<'_, Message> {
     widget::container(
         widget::row::with_children(vec![
-            cagents::ui_controls::passive_icon(symbolic_icon("system-search-symbolic"), 16),
+            cagents::ui_controls::passive_icon(Icon::Search, 16),
             widget::text_input("Find in file", &editor.find_query)
                 .id(widget::Id::new("ceditor.find.query"))
                 .on_input(Message::FindQueryChanged)
@@ -979,30 +979,15 @@ fn find_bar(editor: &Editor) -> Element<'_, Message> {
                 )
             })
             .into(),
-            icon_control(
-                symbolic_icon("go-up-symbolic"),
-                "Previous match (Shift+Enter)",
-                false,
-                true,
-                Some(Message::FindPrevious),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("go-down-symbolic"),
-                "Next match (Enter)",
-                false,
-                true,
-                Some(Message::FindNext),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("window-close-symbolic"),
-                "Close find",
-                false,
-                true,
-                Some(Message::CloseFind),
-            )
-            .into(),
+            icon_button(Icon::ChevronUp, "Previous match (Shift+Enter)")
+                .on_press(Message::FindPrevious)
+                .into(),
+            icon_button(Icon::ChevronDown, "Next match (Enter)")
+                .on_press(Message::FindNext)
+                .into(),
+            icon_button(Icon::Close, "Close find")
+                .on_press(Message::CloseFind)
+                .into(),
         ])
         .spacing(8)
         .align_y(iced::Alignment::Center),
@@ -1057,22 +1042,16 @@ impl Editor {
 
     fn settings_footer(&self) -> Element<'_, Message> {
         widget::row::with_children(vec![
-            icon_control(
-                symbolic_icon("git-branch-symbolic"),
-                "Worktrees",
-                self.checkout_history_open,
-                !self.modal_open(),
-                Some(Message::Checkout(checkout::Action::History)),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("emblem-system-symbolic"),
-                "Settings",
-                self.settings_open,
-                !self.modal_open(),
-                Some(Message::Settings),
-            )
-            .into(),
+            icon_button(Icon::Branch, "Worktrees")
+                .selected(self.checkout_history_open)
+                .on_press_maybe(
+                    (!self.modal_open()).then_some(Message::Checkout(checkout::Action::History)),
+                )
+                .into(),
+            icon_button(Icon::Settings, "Settings")
+                .selected(self.settings_open)
+                .on_press_maybe((!self.modal_open()).then_some(Message::Settings))
+                .into(),
         ])
         .padding(cosmic::theme::spacing().space_xxxs)
         .width(Length::Fill)
@@ -2168,21 +2147,20 @@ impl Editor {
         if !has_notices && !self.notices_open {
             return None;
         }
-        let anchor = icon_control(
-            symbolic_icon(if has_notices {
-                "dialog-warning-symbolic"
+        let anchor = icon_button(
+            if has_notices {
+                Icon::Warning
             } else {
-                "dialog-information-symbolic"
-            }),
+                Icon::Info
+            },
             if has_notices {
                 "Notices — errors need attention"
             } else {
                 "Notices"
             },
-            self.notices_open,
-            self.notices_open || !self.modal_open(),
-            Some(Message::Notices),
-        );
+        )
+        .selected(self.notices_open)
+        .on_press_maybe((self.notices_open || !self.modal_open()).then_some(Message::Notices));
         let content = self.notices_open.then(|| {
             let mut details = Vec::new();
             if let Some(notice) = &self.notice {
@@ -2213,15 +2191,10 @@ impl Editor {
             widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     widget::text::title3("Notices").width(Length::Fill).into(),
-                    icon_control(
-                        symbolic_icon("window-close-symbolic"),
-                        "Close notices (Escape)",
-                        false,
-                        true,
-                        Some(Message::CloseNotices),
-                    )
-                    .id(widget::Id::new("ceditor.notices.close"))
-                    .into(),
+                    icon_button(Icon::Close, "Close notices (Escape)")
+                        .on_press(Message::CloseNotices)
+                        .id(widget::Id::new("ceditor.notices.close"))
+                        .into(),
                 ])
                 .align_y(iced::Alignment::Center)
                 .into(),
@@ -2843,15 +2816,12 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
                                 ),
                                 title,
                             ),
-                            icon_control(
-                                symbolic_icon("window-close-symbolic"),
-                                "Close tab",
-                                false,
-                                !editor.modal_open(),
-                                Some(Message::CloseTab(tab.id)),
-                            )
-                            .id(widget::Id::new(format!("ceditor.tab.{}.close", tab.id)))
-                            .into(),
+                            icon_button(Icon::Close, "Close tab")
+                                .on_press_maybe(
+                                    (!editor.modal_open()).then_some(Message::CloseTab(tab.id)),
+                                )
+                                .id(widget::Id::new(format!("ceditor.tab.{}.close", tab.id)))
+                                .into(),
                         ])
                         .align_y(iced::Alignment::Center)
                         .spacing(2)
@@ -2884,15 +2854,10 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
     // Keep the tab strip on the same fixed baseline as the app header.
     let mut tab_row = tabs;
     tab_row.push(
-        icon_control(
-            symbolic_icon("list-add-symbolic"),
-            "New tab (Ctrl+T)",
-            false,
-            !editor.modal_open(),
-            Some(Message::NewTab),
-        )
-        .id(widget::Id::new("ceditor.tabs.new"))
-        .into(),
+        icon_button(Icon::Plus, "New tab (Ctrl+T)")
+            .on_press_maybe((!editor.modal_open()).then_some(Message::NewTab))
+            .id(widget::Id::new("ceditor.tabs.new"))
+            .into(),
     );
     cagents::tab_strip::reorderable(
         widget::Id::new("ceditor.tabs"),
@@ -4563,34 +4528,23 @@ impl Application for Editor {
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
         vec![
-            icon_control(
-                symbolic_icon("view-sidebar-start-symbolic"),
+            icon_button(
+                Icon::Sidebar,
                 if self.sidebar_open {
                     "Hide sidebar"
                 } else {
                     "Show sidebar"
                 },
-                self.sidebar_open,
-                !self.modal_open(),
-                Some(Message::ToggleSidebar),
             )
+            .selected(self.sidebar_open)
+            .on_press_maybe((!self.modal_open()).then_some(Message::ToggleSidebar))
             .into(),
-            icon_control(
-                symbolic_icon("document-open-symbolic"),
-                "Open file (Ctrl+O)",
-                false,
-                !self.modal_open(),
-                Some(Message::Choose(false)),
-            )
-            .into(),
-            icon_control(
-                symbolic_icon("folder-open-symbolic"),
-                "Open folder (Ctrl+Shift+O)",
-                false,
-                !self.modal_open(),
-                Some(Message::Choose(true)),
-            )
-            .into(),
+            icon_button(Icon::OpenFile, "Open file (Ctrl+O)")
+                .on_press_maybe((!self.modal_open()).then_some(Message::Choose(false)))
+                .into(),
+            icon_button(Icon::OpenFolder, "Open folder (Ctrl+Shift+O)")
+                .on_press_maybe((!self.modal_open()).then_some(Message::Choose(true)))
+                .into(),
         ]
     }
     fn header_end(&self) -> Vec<Element<'_, Message>> {
@@ -4629,35 +4583,21 @@ impl Application for Editor {
             if tab.runtime.lsp_document().is_some() {
                 toolbar_controls.push(
                     toolbar_actions(vec![
-                        icon_control(
-                            symbolic_icon("insert-text-symbolic"),
-                            "Complete (Ctrl+Space)",
-                            false,
-                            !self.modal_open(),
-                            Some(Message::Complete),
-                        )
-                        .into(),
-                        icon_control(
-                            symbolic_icon("dialog-information-symbolic"),
-                            "Show symbol information",
-                            false,
-                            !self.modal_open(),
-                            Some(Message::Hover),
-                        )
-                        .into(),
+                        icon_button(Icon::InsertText, "Complete (Ctrl+Space)")
+                            .on_press_maybe((!self.modal_open()).then_some(Message::Complete))
+                            .into(),
+                        icon_button(Icon::Info, "Show symbol information")
+                            .on_press_maybe((!self.modal_open()).then_some(Message::Hover))
+                            .into(),
                     ])
                     .into(),
                 );
             }
             toolbar_controls.push(
-                icon_control(
-                    symbolic_icon("system-search-symbolic"),
-                    "Find in file (Ctrl+F)",
-                    self.find_open,
-                    !self.modal_open(),
-                    Some(Message::FindInFile),
-                )
-                .into(),
+                icon_button(Icon::Search, "Find in file (Ctrl+F)")
+                    .selected(self.find_open)
+                    .on_press_maybe((!self.modal_open()).then_some(Message::FindInFile))
+                    .into(),
             );
             if !toolbar_controls.is_empty() {
                 editor.push(
@@ -5117,16 +5057,11 @@ impl Editor {
                             "Interface scale",
                             "Size of text and controls.",
                             widget::row::with_children(vec![
-                                icon_control(
-                                    symbolic_icon("list-remove-symbolic"),
-                                    "Decrease scale",
-                                    false,
-                                    self.settings.ui_scale > 0.75,
-                                    (self.settings.ui_scale > 0.75).then_some(Message::Scale(
-                                        (self.settings.ui_scale - 0.1).max(0.75),
-                                    )),
-                                )
-                                .into(),
+                                icon_button(Icon::Minus, "Decrease scale")
+                                    .on_press_maybe((self.settings.ui_scale > 0.75).then_some(
+                                        Message::Scale((self.settings.ui_scale - 0.1).max(0.75)),
+                                    ))
+                                    .into(),
                                 widget::container(design::body(format!(
                                     "{:.0}%",
                                     self.settings.ui_scale * 100.0
@@ -5134,16 +5069,11 @@ impl Editor {
                                 .center_x(64)
                                 .center_y(design::PRIMARY_CONTROL_SIZE)
                                 .into(),
-                                icon_control(
-                                    symbolic_icon("list-add-symbolic"),
-                                    "Increase scale",
-                                    false,
-                                    self.settings.ui_scale < 2.0,
-                                    (self.settings.ui_scale < 2.0).then_some(Message::Scale(
-                                        (self.settings.ui_scale + 0.1).min(2.0),
-                                    )),
-                                )
-                                .into(),
+                                icon_button(Icon::Plus, "Increase scale")
+                                    .on_press_maybe((self.settings.ui_scale < 2.0).then_some(
+                                        Message::Scale((self.settings.ui_scale + 0.1).min(2.0)),
+                                    ))
+                                    .into(),
                             ])
                             .spacing(design::GRID_UNIT)
                             .align_y(iced::Alignment::Center)
@@ -5333,14 +5263,9 @@ impl Editor {
             widget::text::title3("Editor settings")
                 .width(Length::Fill)
                 .into(),
-            icon_control(
-                symbolic_icon("window-close-symbolic"),
-                "Close settings",
-                false,
-                true,
-                Some(Message::Settings),
-            )
-            .into(),
+            icon_button(Icon::Close, "Close settings")
+                .on_press(Message::Settings)
+                .into(),
         ]))
         .padding([2.0 * design::GRID_UNIT, 4.0 * design::GRID_UNIT])
         .align_y(iced::Alignment::Center)
