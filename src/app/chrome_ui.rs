@@ -685,6 +685,9 @@ impl Cagents {
                 if health.is_some_and(SaveHealthState::offers_retry) {
                     ring.push(Cow::Borrowed("session-save.retry"));
                 }
+                if self.refused_terminal_recovery_target().is_some() {
+                    ring.push(Cow::Borrowed("session-recovery.open"));
+                }
                 ring
             }
         }

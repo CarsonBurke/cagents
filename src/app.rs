@@ -766,17 +766,23 @@ fn save_quarantine_view<'a>(
             .align_y(Alignment::Center)
             .into()
     });
+    let mut body = vec![
+        notice_body(title),
+        notice_surface_detail(NoticeSeverity::Error, detail.join("\n")),
+        notice_surface_detail(NoticeSeverity::Error, guidance),
+    ];
+    // Keep the explanation readable in the bounded Notices popover. Multiple
+    // actions alongside it would reserve almost the entire text width.
+    if let Some(action) = action {
+        body.push(action);
+    }
     Some(notice_surface(
         NoticeSeverity::Error,
-        widget::column::with_children(vec![
-            notice_body(title),
-            notice_surface_detail(NoticeSeverity::Error, detail.join("\n")),
-            notice_surface_detail(NoticeSeverity::Error, guidance),
-        ])
-        .spacing(space::XS)
-        .width(Length::Fill)
-        .into(),
-        action,
+        widget::column::with_children(body)
+            .spacing(space::XS)
+            .width(Length::Fill)
+            .into(),
+        None,
         false,
     ))
 }

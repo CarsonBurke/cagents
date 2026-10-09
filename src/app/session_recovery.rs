@@ -75,7 +75,7 @@ pub enum Action {
 }
 
 impl Cagents {
-    fn refused_terminal_recovery_target(&self) -> Option<CardId> {
+    pub(super) fn refused_terminal_recovery_target(&self) -> Option<CardId> {
         let health = self.save_health.as_ref()?;
         if !matches!(
             health.health,
@@ -434,6 +434,66 @@ mod tests {
         app.save_health = Some(save_health);
         app.core.set_keyboard_nav(true);
         (directory, app, card)
+    }
+
+    #[test]
+    fn notices_keyboard_traversal_reaches_the_eligible_ownership_recovery_control() {
+        let (_directory, mut app, _card) = fixture();
+        drop(app.update_chrome(chrome_ui::Action::ToggleNotices));
+        let recovery = widget::Id::new("session-recovery.open");
+        let mut reached = false;
+        for _ in 0..10 {
+            let task = app
+                .chrome_key_event(&key(keyboard::key::Named::Tab, false))
+                .unwrap();
+            if super::super::tests::focused_element(app.session_recovery_action().unwrap(), task)
+                == Some(recovery.clone())
+            {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "the popup's keyboard ring must reach its rendered recovery button"
+        );
+    }
+
+    #[test]
+    fn ownership_recovery_notice_stays_readable_at_the_real_popover_width() {
+        let (_directory, app, _card) = fixture();
+        let mut element = save_health_views(
+            app.save_health.as_ref().unwrap(),
+            |card| app.card_state(card).map(|card| card.title.as_str()),
+            app.session_recovery_action(),
+        )
+        .pop()
+        .unwrap();
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        use iced::advanced::renderer::Headless;
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                iced::Font::default(),
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(
+                iced::Size::ZERO,
+                iced::Size::new(design::NOTICE_POPOVER_WIDTH - 12.0, f32::INFINITY),
+            ),
+        );
+        assert!(
+            node.size().height < 408.0,
+            "the quarantine notice must fit the popover instead of losing its text width: {:?}",
+            node.size()
+        );
     }
 
     fn reply(task: Task<Message>) -> Message {
