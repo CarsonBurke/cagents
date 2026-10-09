@@ -84,18 +84,75 @@ pub(super) fn notice(snapshot: &Snapshot) -> Option<String> {
     }
 }
 
+fn page_control_id(card: CardId, page: Page) -> widget::Id {
+    card_control_id(card, &format!("chat-permission-page-{page:?}"))
+}
+
+fn denial_control_id(card: CardId, tool: &str, retry: bool) -> widget::Id {
+    card_control_id(
+        card,
+        &format!(
+            "chat-permission-{}-{tool}",
+            if retry { "retry" } else { "dismiss" }
+        ),
+    )
+}
+
 impl Runtime {
+    /// The enabled controls in the Blocked page's visual order. Settings
+    /// pages use ordinary traversal through their editable fields instead.
+    pub(super) fn permission_controls(&self, enabled: bool) -> Vec<widget::Id> {
+        let card = self.target.card;
+        let mut controls = vec![card_control_id(card, "chat-permission-close")];
+        if self.session.launch.provider == Provider::Claude && !self.is_draft() {
+            controls.extend(
+                [Page::Blocked, Page::Rules, Page::Environment]
+                    .map(|page| page_control_id(card, page)),
+            );
+        }
+        if enabled {
+            for request in self
+                .snapshot
+                .requests
+                .iter()
+                .filter(|request| request.fields.is_empty())
+            {
+                controls.extend(
+                    view::ordered_answers(request)
+                        .into_iter()
+                        .map(|choice| view::answer_control_id(self.target, request, choice)),
+                );
+            }
+            for denial in self.snapshot.permission_denials.iter().rev() {
+                if denial.tool_input.is_some() {
+                    controls.push(denial_control_id(card, &denial.tool_use_id, true));
+                }
+                controls.push(denial_control_id(card, &denial.tool_use_id, false));
+            }
+            if !(self.session.launch.provider == Provider::Codex && self.snapshot.busy) {
+                controls.extend(
+                    self.snapshot
+                        .capabilities
+                        .permission_modes
+                        .iter()
+                        .map(|mode| card_control_id(card, &format!("chat-permission-mode-{mode}"))),
+                );
+            }
+        }
+        controls
+    }
     pub(super) fn permissions_view(&self, enabled: bool, width: f32) -> Element<'_, Message> {
         let target = self.target;
         let snapshot = &self.snapshot;
         let mut content = vec![
             widget::row::with_children(vec![
                 design::body("Permissions").width(Length::Fill).into(),
-                small_icon(
-                    Icon::Close,
-                    "Close permissions",
-                    Action::PermissionPicker(target, false),
-                ),
+                crate::ui_controls::icon_button(Icon::Close, "Close permissions")
+                    .compact()
+                    .id(card_control_id(target.card, "chat-permission-close"))
+                    .on_press(action(Action::PermissionPicker(target, false)))
+                    .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
+                    .into(),
             ])
             .align_y(Alignment::Center)
             .into(),
@@ -121,6 +178,7 @@ impl Runtime {
                     .into_iter()
                     .map(|(page, label)| {
                         widget::button::custom(design::caption(label))
+                            .id(page_control_id(target.card, page))
                             .class(crate::ui_controls::control_style(
                                 self.permissions_form.page == page,
                                 None,
@@ -137,7 +195,7 @@ impl Runtime {
         }
         if self.permissions_form.page != Page::Blocked {
             content.extend(self.permission_settings_view(enabled));
-            return permissions_surface(content, width);
+            return permissions_surface(content, width, target.card);
         }
         let approvals: Vec<_> = snapshot
             .requests
@@ -145,7 +203,13 @@ impl Runtime {
             .filter(|request| request.fields.is_empty())
             .collect();
         for request in approvals {
-            content.push(view::request_view(target, request, &self.answers, enabled));
+            content.push(view::request_view(
+                target,
+                request,
+                &self.answers,
+                enabled,
+                view::RequestSurface::Permissions,
+            ));
         }
         for denial in snapshot.permission_denials.iter().rev() {
             let mut details = vec![
@@ -171,12 +235,14 @@ impl Runtime {
             details.push(
                 widget::row::with_children(vec![
                     widget::button::custom(design::caption("Review retry"))
+                        .id(denial_control_id(target.card, &denial.tool_use_id, true))
                         .class(crate::ui_controls::control_style(false, None))
                         .on_press_maybe((enabled && denial.tool_input.is_some()).then(|| {
                             action(Action::PermissionRetry(target, denial.tool_use_id.clone()))
                         }))
                         .into(),
                     widget::button::custom(design::caption("Dismiss"))
+                        .id(denial_control_id(target.card, &denial.tool_use_id, false))
                         .class(crate::ui_controls::control_style(false, None))
                         .on_press_maybe(enabled.then(|| {
                             action(Action::PermissionDismiss(
@@ -230,7 +296,7 @@ impl Runtime {
                 );
             }
         }
-        permissions_surface(content, width)
+        permissions_surface(content, width, target.card)
     }
 
     fn permission_settings_view(&self, enabled: bool) -> Vec<Element<'_, Message>> {
@@ -396,7 +462,11 @@ impl Runtime {
     }
 }
 
-fn permissions_surface(content: Vec<Element<'_, Message>>, width: f32) -> Element<'_, Message> {
+fn permissions_surface(
+    content: Vec<Element<'_, Message>>,
+    width: f32,
+    card: CardId,
+) -> Element<'_, Message> {
     widget::container(
         widget::scrollable(
             widget::column::with_children(content)
@@ -407,6 +477,7 @@ fn permissions_surface(content: Vec<Element<'_, Message>>, width: f32) -> Elemen
             design::scrollbar(),
         )),
     )
+    .id(card_control_id(card, "chat-permissions-surface"))
     .width(width.clamp(1.0, 520.0))
     .max_height(440)
     .into()
