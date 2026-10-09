@@ -119,6 +119,16 @@ candidates can attach to the preserved daemon, so reviewed reopening adopts the
 new UI without replacing a compatible daemon. The application handoff remains a
 separate reviewed operation, including its save checks.
 
+If that incompatible daemon crashes while its old UI survives, the public
+launcher verifies each window's exact kernel flock, process lifetime and matched
+installation before restoring the old daemon. Recovery holds the launch fence
+against an update handoff and verifies the restored daemon before routing the
+command. A marker alone never authorizes recovery; once no window or daemon owns
+the old runtime, the candidate may start normally. Ambiguous or legacy window
+ownership refuses recovery instead of selecting an incompatible host. Status,
+preflight and stop commands route to the old CLI without starting a stopped
+daemon. Unsaved windows are neither closed nor rewritten by this recovery.
+
 The application shows available updates above the workspace. Dismissing the
 notice moves it into the notices popover; it remains available there. Release
 downloads are checksum verified before the candidate's own CLI reports its

@@ -22,6 +22,49 @@ use std::{
 // another fixture. Serialize the complete OS fixture, not product execution.
 static OS_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct OwnedProcess(std::process::Child);
+impl OwnedProcess {
+    fn window(executable: &Path, runtime: &Path, ready: &Path) -> Self {
+        fs::copy(std::env::current_exe().unwrap(), executable).unwrap();
+        let child = Command::new(executable)
+            .args(["--exact", "staged_window_lease_fixture", "--nocapture"])
+            .env("CAGENTS_TEST_UI_LEASE", ready)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let fixture = Self(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "installed fixture UI must acquire its actual lease"
+        );
+        fixture
+    }
+}
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn staged_window_lease_fixture() {
+    use std::io::Read;
+    let Some(ready) = std::env::var_os("CAGENTS_TEST_UI_LEASE") else {
+        return;
+    };
+    let _lease = cagents::instance::WindowLease::acquire(false, None).unwrap();
+    fs::write(ready, "ready").unwrap();
+    let _ = std::io::stdin().read(&mut [0]);
+}
+
 fn verify(runtime: &Path, lease: Option<&File>) -> Output {
     verify_mode(runtime, lease, false)
 }
@@ -294,7 +337,7 @@ fn inherited_fence_requires_exact_locked_description_and_closed_windows() {
 fn staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel() {
     let _fixture = OS_FIXTURE.lock().unwrap();
     for status in ["0", "7", "cancel"] {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let runtime = root.path().join("runtime");
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
@@ -303,11 +346,6 @@ fn staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel() {
         } else {
             "cagents-ui"
         };
-        let window = file(&runtime.join(format!("{name}.lock.primary")));
-        assert_eq!(
-            unsafe { libc::flock(window.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
         let listener = UnixListener::bind(runtime.join(format!("{name}.activate"))).unwrap();
         listener.set_nonblocking(true).unwrap();
         let prefix = root.path().join("install");
@@ -328,6 +366,11 @@ fn staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel() {
             "cagents install root\n",
         )
         .unwrap();
+        let _window = OwnedProcess::window(
+            &prefix.join("versions/old/bin/cagents-ui"),
+            &runtime,
+            &root.path().join("window-ready"),
+        );
         std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
         let script = root.path().join("installer");
         fs::write(&script, r#"#!/bin/sh
@@ -405,7 +448,7 @@ esac
 #[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
     let _fixture = OS_FIXTURE.lock().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let prefix = root.path().join("install");
     let old = prefix.join("versions/old/bin");
     let new = prefix.join("versions/new/bin");
@@ -563,6 +606,83 @@ fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() 
     owner.kill().unwrap();
     owner.wait().unwrap();
     drop(lock);
+    // A real installed old UI survives its daemon. Read-only public commands
+    // select its CLI without invoking daemon start; autostart attempts exactly
+    // the old CLI, never silently falls through to the incompatible candidate.
+    let actions = root.path().join("recovery-actions");
+    fs::write(
+        old.join("cagents"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CAGENTS_TEST_RECOVERY_ACTIONS"
+printf '%s\n' "$*"
+"#,
+    )
+    .unwrap();
+    let window = OwnedProcess::window(
+        &old.join("cagents-ui"),
+        &runtime,
+        &root.path().join("surviving-ui-ready"),
+    );
+    for args in [
+        vec!["--json", "daemon", "status"],
+        vec!["daemon", "preflight"],
+        vec!["daemon", "stop"],
+    ] {
+        let output = Command::new(new.join("cagents"))
+            .args(&args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("CAGENTS_TEST_RECOVERY_ACTIONS", &actions)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            args.join(" ")
+        );
+    }
+    assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 3);
+    let handoff = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            runtime.join(if cfg!(any(debug_assertions, feature = "development")) {
+                "cagents-development-ui.lock.update"
+            } else {
+                "cagents-ui.lock.update"
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(handoff.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let output = Command::new(new.join("cagents"))
+        .args(["daemon", "start"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("CAGENTS_TEST_RECOVERY_ACTIONS", &actions)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an update handoff vetoes recovery"
+    );
+    assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 3);
+    drop(handoff);
+    let output = Command::new(new.join("cagents"))
+        .args(["daemon", "start"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("CAGENTS_TEST_RECOVERY_ACTIONS", &actions)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a success exit alone cannot authenticate the restored daemon"
+    );
+    assert_eq!(
+        fs::read_to_string(&actions).unwrap(),
+        "--json daemon status\ndaemon preflight\ndaemon stop\ndaemon start\n"
+    );
+    drop(window);
     // A stopped owner does not authorize stale routing: the candidate reports
     // normal daemon status instead of invoking the old fixture CLI.
     let output = Command::new(new.join("cagents"))
@@ -576,6 +696,49 @@ fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() 
             .unwrap()
             .contains("\"running\":false")
     );
+    // A candidate that started with no previous owner must remain usable. Its
+    // own verified kernel daemon identity makes the old unknown marker stale.
+    fs::write(&marker, r#"{"version":1,"owner_version":null}"#).unwrap();
+    let candidate_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(daemon_dir.join("cagentsd.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(candidate_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let fd = candidate_lock.as_raw_fd();
+    let mut command = Command::new(new.join("cagentsd"));
+    command.arg("30");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let candidate = OwnedProcess(command.spawn().unwrap());
+    fs::write(
+        daemon_dir.join("cagentsd.lock"),
+        format!("{{\"pid\":{}}}", candidate.0.id()),
+    )
+    .unwrap();
+    let output = Command::new(new.join("cagents"))
+        .args(["--json", "daemon", "status"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("\"running\":true")
+    );
+    drop(candidate);
+    drop(candidate_lock);
 }
 
 #[test]

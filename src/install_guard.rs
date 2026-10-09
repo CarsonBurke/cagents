@@ -330,6 +330,27 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
             "daemon ownership changed during compatibility verification; installation was not changed",
         ));
     }
+    let windows = crate::instance::verified_staged_windows()?;
+    let window_owner = window_owner_bin(prefix, &windows)?;
+    if owner
+        .as_ref()
+        .zip(window_owner.as_ref())
+        .is_some_and(|(daemon, ui)| daemon != ui)
+    {
+        return Err(io::Error::other(
+            "daemon does not match the live window while staging",
+        ));
+    }
+    let after_windows = crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .map(|exe| running_owner_bin(prefix, &exe))
+        .transpose()?;
+    if after_windows != owner {
+        return Err(io::Error::other(
+            "daemon ownership changed while verifying live windows",
+        ));
+    }
+    let owner = owner.or(window_owner);
     let owner_version = owner
         .as_ref()
         .map(|bin| {
@@ -363,9 +384,13 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
 }
 
 /// A marker only selects a complete same-prefix tree while the kernel still
-/// identifies that exact daemon as the live lease owner. It conveys no authority
-/// to stop a daemon, close windows or replace an installation.
-pub(crate) fn staged_owner_bin(executable: &Path) -> io::Result<Option<std::path::PathBuf>> {
+/// identifies that exact daemon or matching live windows as the runtime owner.
+/// Recovery can restart only their matched daemon under the launch fence; the
+/// marker conveys no authority to stop a daemon, close windows or replace files.
+pub(crate) fn staged_owner_bin(
+    executable: &Path,
+    recover: bool,
+) -> io::Result<Option<std::path::PathBuf>> {
     use std::os::unix::fs::OpenOptionsExt;
     // Sealed update probes execute from anonymous FDs. Their kernel exe path
     // has no filesystem entry to canonicalize and carries no install routing.
@@ -412,6 +437,18 @@ pub(crate) fn staged_owner_bin(executable: &Path) -> io::Result<Option<std::path
             "unsupported staged installation ownership marker",
         ));
     }
+    if owner.owner_version.as_ref().is_some_and(|version| {
+        version.is_empty()
+            || !matches!(
+                (
+                    Path::new(version).components().next(),
+                    Path::new(version).components().nth(1)
+                ),
+                (Some(std::path::Component::Normal(_)), None)
+            )
+    }) {
+        return Err(io::Error::other("invalid staged daemon version"));
+    }
     if owner.daemon_compatible && owner.candidate_protocol != crate::terminal_ipc::PROTOCOL_VERSION
     {
         return Err(io::Error::other(
@@ -421,32 +458,140 @@ pub(crate) fn staged_owner_bin(executable: &Path) -> io::Result<Option<std::path
     if owner.daemon_compatible {
         return Ok(None);
     }
+    // Shared with every UI launch, exclusive against reviewed update/close.
+    // Keep it through synchronous daemon recovery and ownership revalidation.
+    let _launch = crate::instance::recovery_launch_fence()?;
+    let windows = crate::instance::verified_running_windows()?;
+    let running = crate::daemon::running_executable().map_err(io::Error::other)?;
+    let window_bin = window_owner_bin(&layout.prefix, &windows)?;
+    if running.as_ref() == Some(&layout.version_root.join("bin/cagentsd")) && windows.is_empty() {
+        return Ok(None);
+    }
+    // A marker from an earlier installation is obsolete once its candidate is
+    // itself the live UI owner. This also prevents recursive recovery through
+    // an older CLI that once had its own deferred update.
+    if window_bin.as_ref() == Some(&layout.version_root.join("bin")) {
+        if running
+            .as_ref()
+            .is_some_and(|exe| exe != &layout.version_root.join("bin/cagentsd"))
+        {
+            return Err(io::Error::other("daemon does not match the live window"));
+        }
+        return Ok(None);
+    }
+    if windows.is_empty() && running.is_none() {
+        return Ok(None);
+    }
     let Some(version) = owner.owner_version else {
+        if !windows.is_empty() || running.is_some() {
+            return Err(io::Error::other(
+                "staged installation has no authenticated previous version; close it through a reviewed handoff",
+            ));
+        }
         return Ok(None);
     };
-    if version.is_empty()
-        || !matches!(
-            (
-                Path::new(&version).components().next(),
-                Path::new(&version).components().nth(1)
-            ),
-            (Some(std::path::Component::Normal(_)), None)
-        )
-        || matches!(version.as_str(), "." | "..")
-    {
-        return Err(io::Error::other("invalid staged daemon version"));
+    let expected = layout.prefix.join("versions").join(version).join("bin");
+    crate::update::locate(&expected.join("cagents")).map_err(io::Error::other)?;
+    for window in &windows {
+        if window.executable != expected.join("cagents-ui") {
+            return Err(io::Error::other(
+                "live window belongs to another installation version; finish its reviewed handoff",
+            ));
+        }
     }
-    let Some(exe) = crate::daemon::running_executable().map_err(io::Error::other)? else {
-        return Ok(None);
-    };
-    let bin = running_owner_bin(&layout.prefix, &exe)?;
-    if bin != layout.prefix.join("versions").join(version).join("bin")
-        || bin == layout.version_root.join("bin")
-    {
+    if let Some(executable) = running {
+        let bin = running_owner_bin(&layout.prefix, &executable)?;
+        if bin == layout.version_root.join("bin") && windows.is_empty() {
+            return Ok(None);
+        }
+        if bin != expected {
+            return Err(io::Error::other(
+                "daemon does not match the deferred runtime owner",
+            ));
+        }
+        return Ok((bin != layout.version_root.join("bin")).then_some(bin));
+    }
+    if windows.is_empty() {
         return Ok(None);
     }
-    crate::update::locate(&bin.join("cagents")).map_err(io::Error::other)?;
-    Ok(Some(bin))
+    // Starting through the old public CLI uses its own protocol and recovery
+    // contract. Never ask the incompatible candidate to restore an old host.
+    if !recover {
+        return Ok(Some(expected));
+    }
+    restore_window_daemon(&expected)?;
+    if crate::daemon::running_executable().map_err(io::Error::other)?
+        != Some(expected.join("cagentsd"))
+        || windows
+            .iter()
+            .any(|window| !window.still_owns_lease().unwrap_or(false))
+    {
+        return Err(io::Error::other(
+            "window or daemon ownership changed during recovery",
+        ));
+    }
+    Ok(Some(expected))
+}
+
+fn window_owner_bin(
+    prefix: &Path,
+    windows: &[crate::instance::VerifiedWindow],
+) -> io::Result<Option<std::path::PathBuf>> {
+    let prefix = prefix.canonicalize()?;
+    let mut owner = None;
+    for window in windows {
+        if window
+            .executable
+            .file_name()
+            .is_none_or(|name| name != "cagents-ui")
+            || !window.still_owns_lease()?
+        {
+            return Err(io::Error::other(
+                "live window identity is not an authenticated UI",
+            ));
+        }
+        let layout = crate::update::locate(&window.executable).map_err(io::Error::other)?;
+        let bin = layout.version_root.join("bin");
+        if layout.prefix != prefix || owner.as_ref().is_some_and(|owner| owner != &bin) {
+            return Err(io::Error::other(
+                "live windows belong to different installation versions",
+            ));
+        }
+        owner = Some(bin);
+    }
+    Ok(owner)
+}
+
+fn restore_window_daemon(bin: &Path) -> io::Result<()> {
+    let mut command = Command::new(bin.join("cagents"));
+    command
+        .args(["daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    sanitize_child_environment(&mut command);
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "the surviving window's matched daemon could not be restored",
+                ))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "matched daemon recovery timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::PathBuf> {
