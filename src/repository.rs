@@ -1297,7 +1297,7 @@ pub struct PushRequest {
     pub target: PushTarget,
 }
 
-/// Why a mutation did not complete, keeping the raw evidence.
+/// Why a mutation failed or its result could not be confirmed, keeping the raw evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MutationFailure {
@@ -1306,6 +1306,11 @@ pub enum MutationFailure {
     /// pre-delete validation.
     Path {
         path: RepoPath,
+        reason: String,
+    },
+    /// Git completed the mutation, but a subsequent observation could not
+    /// establish the specific repository state this operation would report.
+    Reconciliation {
         reason: String,
     },
     /// The request itself was not runnable, e.g. nothing staged to commit.
@@ -1319,7 +1324,9 @@ impl fmt::Display for MutationFailure {
         match self {
             Self::Process(failure) => write!(formatter, "{failure}"),
             Self::Path { path, reason } => write!(formatter, "{path}: {reason}"),
-            Self::Rejected { reason } => formatter.write_str(reason),
+            Self::Rejected { reason } | Self::Reconciliation { reason } => {
+                formatter.write_str(reason)
+            }
         }
     }
 }
@@ -5185,7 +5192,29 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let destinations =
             self.push_destinations(&request.worktree, request.target.remote(), cancellation);
         let failure = match self.run(&command, cancellation) {
-            Ok(output) if output.success => return Ok(pushed(local_oid)),
+            Ok(output) if output.success => {
+                // The refspec names the branch so Git can retain first-publish
+                // --set-upstream behavior. Another Git client may advance it
+                // after our preflight read: never report that earlier OID as
+                // published unless the observed source remains the same.
+                // This observes endpoints of the attempt; it does not prevent
+                // an external change or detect an A -> B -> A transition.
+                let observation = CancellationToken::new();
+                let reason = match self.resolve_optional_revision(
+                    &request.worktree,
+                    &local_ref,
+                    &observation,
+                ) {
+                    Ok(Some(after)) if after == local_oid => return Ok(pushed(local_oid)),
+                    Ok(_) => "The source branch changed during the push",
+                    Err(_) => "The source branch could not be verified after the push",
+                };
+                return Ok(PushOutcome::OutcomeUnknown {
+                    failure: MutationFailure::Reconciliation {
+                        reason: reason.into(),
+                    },
+                });
+            }
             Ok(output) => {
                 let rejected = push_ref_flag(&output.stdout, &refspec) == Some(b'!');
                 let failure = git_failure(&command, output);
@@ -9161,6 +9190,7 @@ mod tests {
             success(b""),
             success(b"/origin\n"),
             success(b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n"),
+            success(format!("{}\n", oid(4)).as_bytes()),
         ]);
         let outcome = service
             .push(&publish_request(), &CancellationToken::new())
@@ -9340,12 +9370,16 @@ mod tests {
             } else {
                 Err(launched_failure(b""))
             };
-            let service = fake_service(vec![
+            let mut responses = vec![
                 success(b""),
                 success(format!("{}\n", oid(4)).as_bytes()),
                 Err(unstarted_failure()),
                 result,
-            ]);
+            ];
+            if definite_success {
+                responses.push(success(format!("{}\n", oid(4)).as_bytes()));
+            }
+            let service = fake_service(responses);
             let outcome = service
                 .push(&publish_request(), &CancellationToken::new())
                 .unwrap();
@@ -9355,7 +9389,7 @@ mod tests {
                 matches!(outcome, PushOutcome::OutcomeUnknown { .. })
             });
             let commands = service.executor.commands.lock().unwrap();
-            assert_eq!(commands.len(), 4);
+            assert_eq!(commands.len(), if definite_success { 5 } else { 4 });
             assert!(
                 commands[3]
                     .arguments
@@ -9368,6 +9402,49 @@ mod tests {
                     .iter()
                     .any(|argument| argument == "ls-remote")
             }));
+        }
+    }
+
+    #[test]
+    fn successful_push_requires_a_readable_unchanged_source_observation() {
+        for after in [
+            success(format!("{}\n", oid(5)).as_bytes()),
+            exit(1, b""),
+            Err(unstarted_failure()),
+        ] {
+            let service = fake_service(vec![
+                success(b""),
+                success(format!("{}\n", oid(4)).as_bytes()),
+                success(b"/origin\0"),
+                success(b""),
+                success(b"/origin\n"),
+                success(
+                    b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n",
+                ),
+                after,
+            ]);
+            let outcome = service
+                .push(&publish_request(), &CancellationToken::new())
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                PushOutcome::OutcomeUnknown {
+                    failure: MutationFailure::Reconciliation { .. }
+                }
+            ));
+            let commands = service.executor.commands.lock().unwrap();
+            assert_eq!(commands.len(), 7);
+            assert!(
+                commands[6]
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "rev-parse")
+            );
+            assert!(
+                commands[6]
+                    .arguments
+                    .contains(&OsString::from("refs/heads/feature^{commit}"))
+            );
         }
     }
 

@@ -2417,6 +2417,11 @@ fn push_report(outcome: Result<PushOutcome, crate::repository::RepositoryError>)
     match outcome {
         Ok(PushOutcome::Pushed { .. }) => None,
         Ok(PushOutcome::NotPushed { failure }) => Some(format!("Push failed: {failure}")),
+        Ok(PushOutcome::OutcomeUnknown {
+            failure: crate::repository::MutationFailure::Reconciliation { reason },
+        }) => Some(format!(
+            "Push completed, but its published commit is uncertain: {reason}. Refresh to see what Git holds."
+        )),
         Ok(PushOutcome::OutcomeUnknown { failure }) => Some(format!(
             "Push may or may not have reached the remote: {failure}. Refresh to see what Git holds."
         )),
@@ -17121,6 +17126,19 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_push_observation_warning_preserves_known_completion() {
+        let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
+            failure: crate::repository::MutationFailure::Reconciliation {
+                reason: "The source branch changed during the push".into(),
+            },
+        }))
+        .unwrap();
+        assert!(notice.starts_with("Push completed,"));
+        assert!(notice.contains("published commit is uncertain"));
+        assert!(!notice.contains("may or may not have reached"));
+    }
+
     use super::*;
     use crate::model::WorktreeId;
     use cosmic::iced::futures::StreamExt;
