@@ -552,6 +552,19 @@ folder, without copying prompts or output. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
 
+If the daemon stops replying, a persistent banner shows when the interruption
+began and how long the reply was allowed to take. Repeated transport notices
+are replaced by that banner, and background notification retries slow down.
+Any verified reply restores the connection state. An idle subscription is not
+a failed request.
+
+For a local daemon, **Restart daemon** opens a confirmation describing the loss
+of active native turns and background subagents. It verifies and pins the exact
+process before enabling confirmation; a replacement daemon cannot inherit the
+approval. The confirmed process gets five seconds to stop gracefully before
+forced termination. Saved files and drafts remain; non-durable conversations
+cannot be resumed. An unresponsive daemon is never restarted automatically.
+
 The daemon delivers alerts even with every window closed. Clicking one opens its
 owning window and selects the session. Review-request alerts bring their window
 forward while preserving the current pane; open the review explicitly from

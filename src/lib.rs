@@ -22,6 +22,8 @@ pub mod chat;
 pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
+pub(crate) mod daemon_health;
+#[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
 pub mod device_service;

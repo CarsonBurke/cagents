@@ -7,6 +7,7 @@ mod browser_import_ui;
 mod channel_ui;
 mod chat_ui;
 mod chrome_ui;
+mod daemon_health_ui;
 mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
@@ -4225,6 +4226,8 @@ pub enum Message {
     ReviewRequests(review_request_ui::Action),
     GitUi(git_ui::Action),
     NotificationUi(notification_ui::Action),
+    DaemonHealth(crate::daemon_health::State),
+    DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
@@ -4737,6 +4740,7 @@ pub struct Cagents {
     workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
+    daemon_health_ui: daemon_health_ui::State,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
     settings: AppSettings,
@@ -10840,6 +10844,9 @@ impl Cagents {
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.daemon_health_ui.confirmation {
+            return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
+        }
         if self.transient_work_close.is_some() {
             return cosmic::task::message(Message::CancelTransientWorkClose);
         }
@@ -10878,7 +10885,8 @@ impl Cagents {
         if self.browser_import.open() {
             return true;
         }
-        self.dirty_repository_close.is_some()
+        self.daemon_health_ui.confirmation
+            || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
             || self.chat_ui.image_viewer.is_some()
@@ -12446,6 +12454,7 @@ impl Application for Cagents {
             workspace_model_tx,
             activation_rx,
             notification_ui: notification_ui::State::default(),
+            daemon_health_ui: daemon_health_ui::State::default(),
             session,
             save_health,
             settings_base: settings.clone(),
@@ -15198,6 +15207,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if let Some(task) = self.daemon_health_key_event(&event, captured) {
+                    return task;
+                }
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
@@ -15724,6 +15736,16 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
+            Message::DaemonHealth(health) => {
+                self.daemon_health_ui.health = health;
+                if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
+                {
+                    self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
+                } else {
+                    Task::none()
+                }
+            }
             Message::AcknowledgeSessionRecovery => {
                 if let Some(health) = &mut self.save_health {
                     health.acknowledge_recovery();
@@ -15911,7 +15933,9 @@ impl Application for Cagents {
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
         self.sync_popup_keyboard_nav();
-        if let Some(notice) = self.status.take() {
+        if let Some(notice) = self.status.take()
+            && !crate::daemon_health::replaces_notice(&notice.message)
+        {
             match notice.severity {
                 NoticeSeverity::Error => {
                     tracing::error!(message = %notice.message, "application notice")
@@ -15963,6 +15987,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.notification_subscription(),
+            Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             self.refresh_subscription(),
             self.review_request_subscription(),
             self.git_subscription(),
@@ -16141,6 +16166,9 @@ impl Application for Cagents {
         }
         #[cfg(feature = "integrated-browser")]
         if let Some(dialog) = self.browser_import_dialog() {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.daemon_health_dialog() {
             return Some(dialog);
         }
         if let Some(dialog) = self.update_dialog() {
@@ -16763,10 +16791,11 @@ impl Application for Cagents {
         let bar = self
             .status_bar()
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
-        let surface: Element<'_, Message> = widget::column::with_children(vec![surface, bar])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let surface: Element<'_, Message> =
+            widget::column::with_children(vec![surface, self.daemon_health_banner(), bar])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -23364,14 +23393,20 @@ mod tests {
     /// Focus arrives as a widget operation rather than a message, so it is
     /// read the way the runtime reads one: run the task's operations over the
     /// tree the frame actually built, then ask that tree who holds focus.
-    fn focused(app: &Cagents, task: Task<Message>) -> Option<widget::Id> {
+    pub(super) fn focused(app: &Cagents, task: Task<Message>) -> Option<widget::Id> {
+        focused_element(cosmic::Application::view(app), task)
+    }
+
+    pub(super) fn focused_element(
+        mut element: Element<'_, Message>,
+        task: Task<Message>,
+    ) -> Option<widget::Id> {
         use cosmic::iced::advanced::layout;
         use cosmic::iced::advanced::widget::Tree;
         use cosmic::iced::advanced::widget::{Operation, operation};
         use cosmic::iced::{Size, advanced::Layout};
 
         let renderer = headless_renderer();
-        let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
         let mut tree = Tree::new(element.as_widget_mut());
         let node = element.as_widget_mut().layout(
             &mut tree,
@@ -23749,6 +23784,7 @@ mod tests {
             workspace_model_tx: async_channel::unbounded().0,
             activation_rx: async_channel::unbounded().1,
             notification_ui: notification_ui::State::default(),
+            daemon_health_ui: daemon_health_ui::State::default(),
             session: None,
             save_health: None,
             settings_draft: SettingsDraft::from_settings(&settings),

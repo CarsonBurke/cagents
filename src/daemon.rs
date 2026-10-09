@@ -610,6 +610,133 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
     Ok(true)
 }
 
+/// A confirmation pins the process before it is displayed. A successor cannot
+/// inherit the person's approval merely by acquiring the same lock pathname.
+#[cfg(feature = "ui")]
+#[derive(Debug)]
+pub(crate) struct RestartTarget {
+    process: File,
+    proof: HostSessionProof,
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn restart_target() -> Result<RestartTarget, PlatformError> {
+    restart_target_at(&RuntimePaths::discover()?)
+}
+
+#[cfg(feature = "ui")]
+fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformError> {
+    #[derive(Deserialize)]
+    struct Metadata {
+        pid: u32,
+        proof: HostSessionProof,
+    }
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .custom_flags(LOCK_OPEN_FLAGS)
+        .open(&paths.lock)?;
+    let _discovered = daemon_pidfd_from_lock(&mut lock, paths)?
+        .ok_or_else(|| io::Error::other("the daemon has already stopped"))?;
+    lock.seek(SeekFrom::Start(0))?;
+    let metadata: Metadata = serde_json::from_reader(&mut lock)?;
+    let process = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
+    if lease_owner(&paths.lock, &metadata.proof)? != metadata.pid {
+        return Err(io::Error::other("daemon ownership changed while opening confirmation").into());
+    }
+    Ok(RestartTarget {
+        process,
+        proof: metadata.proof,
+    })
+}
+
+#[cfg(feature = "ui")]
+impl RestartTarget {
+    /// Try graceful termination, then finish the same confirmed process if it
+    /// cannot respond. The kernel descriptor fences PID reuse throughout.
+    pub(crate) fn terminate(&self) -> Result<(), PlatformError> {
+        self.terminate_at(
+            &RuntimePaths::discover()?,
+            std::time::Duration::from_secs(5),
+        )
+    }
+    fn terminate_at(
+        &self,
+        paths: &RuntimePaths,
+        grace: std::time::Duration,
+    ) -> Result<(), PlatformError> {
+        lease_owner(&paths.lock, &self.proof)?;
+        signal_process(&self.process, libc::SIGTERM)?;
+        if !wait_process(&self.process, grace)? {
+            // If ownership changed during the wait, do not kill anything on
+            // behalf of an obsolete confirmation.
+            lease_owner(&paths.lock, &self.proof)?;
+            signal_process(&self.process, libc::SIGKILL)?;
+            if !wait_process(&self.process, std::time::Duration::from_secs(5))? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the confirmed daemon did not exit",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ui")]
+fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
+    // SAFETY: the owned descriptor is a validated pidfd; the caller supplies
+    // SIGTERM or SIGKILL. No PID lookup occurs after authentication.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } == -1
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ui")]
+fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll is a live single-element writable array; a pidfd becomes
+        // readable after its pinned process exits.
+        let result = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        if result > 0 {
+            return Ok(poll.revents & libc::POLLIN != 0);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 fn daemon_pidfd_from_lock(
     lock: &mut File,
     paths: &RuntimePaths,
@@ -1313,6 +1440,82 @@ mod tests {
         ));
         assert_eq!(fs::read(&not_directory).unwrap(), b"untouched");
         assert_eq!(fs::read(&lock).unwrap(), b"untouched");
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn confirmed_restart_refuses_changed_proof_and_terminates_only_its_pinned_process() {
+        use std::{
+            io::BufRead,
+            process::{Command, Stdio},
+            time::Duration,
+        };
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().to_path_buf());
+        let mut original = proof();
+        original.boot_id = read_boot_id().unwrap();
+        let script = r#"import fcntl,json,os,signal,sys,time
+f=open(sys.argv[1], 'w+')
+os.chmod(sys.argv[1], 0o600)
+fcntl.flock(f, fcntl.LOCK_EX)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+json.dump({'pid':os.getpid(), 'proof':json.loads(sys.argv[2])}, f)
+f.flush()
+print('ready', flush=True)
+while True: time.sleep(1)
+"#;
+        let mut child = Child(
+            Command::new("python3")
+                .args(["-c", script])
+                .arg(&paths.lock)
+                .arg(serde_json::to_string(&original).unwrap())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let target = restart_target_at(&paths).unwrap();
+        let mut replacement = original.clone();
+        replacement.host_incarnation = crate::model::HostIncarnation::new("different-incarnation");
+        fs::write(
+            &paths.lock,
+            serde_json::to_vec(&serde_json::json!({ "pid": child.0.id(), "proof": replacement }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            target
+                .terminate_at(&paths, Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "obsolete consent cannot signal a changed owner"
+        );
+        fs::write(
+            &paths.lock,
+            serde_json::to_vec(&serde_json::json!({ "pid": child.0.id(), "proof": original }))
+                .unwrap(),
+        )
+        .unwrap();
+        target
+            .terminate_at(&paths, Duration::from_millis(20))
+            .unwrap();
+        assert!(
+            !child.0.wait().unwrap().success(),
+            "the exact process that ignored graceful stop was terminated"
+        );
     }
 
     #[cfg(feature = "ui")]

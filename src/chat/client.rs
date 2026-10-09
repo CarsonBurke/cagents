@@ -27,7 +27,16 @@ use std::{
 // and a busy desktop scheduler.
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
-fn frame_read_error(error: ipc::FrameError) -> String {
+fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
+    #[cfg(feature = "ui")]
+    let health_request = crate::daemon_health::begin();
+    let result = UnixStream::connect(path);
+    #[cfg(feature = "ui")]
+    crate::daemon_health::connection_io(path, &result, health_request);
+    result
+}
+
+fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String {
     match &error {
         ipc::FrameError::Io(io_error)
             if matches!(
@@ -35,7 +44,15 @@ fn frame_read_error(error: ipc::FrameError) -> String {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ) =>
         {
-            "Timed out waiting for the daemon response".into()
+            timeout.map_or_else(
+                || "Timed out waiting for the daemon response".into(),
+                |timeout| {
+                    format!(
+                        "the daemon did not answer within {} s",
+                        timeout.as_secs_f64()
+                    )
+                },
+            )
         }
         _ => format!("Cannot decode matched daemon protocol: {error}"),
     }
@@ -231,22 +248,38 @@ fn receive(
     request_id: u64,
     proof: Option<&HostSessionProof>,
 ) -> Result<ServerResponse, String> {
-    let envelope: ServerEnvelope = codec
-        .read(stream)
-        .map_err(frame_read_error)?
+    #[cfg(feature = "ui")]
+    let health_request = crate::daemon_health::begin();
+    let frame = codec.read(stream);
+    #[cfg(feature = "ui")]
+    match &frame {
+        Err(error) => crate::daemon_health::frame(stream, Some(error), health_request),
+        Ok(None) => crate::daemon_health::disconnected(stream, health_request),
+        _ => {}
+    }
+    let envelope: ServerEnvelope = frame
+        .map_err(|error| frame_read_error(error, stream.read_timeout().ok().flatten()))?
         .ok_or("Daemon disconnected")?;
     if envelope.version != PROTOCOL_VERSION {
         return Err("Daemon version mismatch; use matched cagents executables".into());
     }
-    if proof.is_some_and(|proof| proof != &envelope.proof) {
+    if !envelope.proof.is_complete() || proof.is_some_and(|proof| proof != &envelope.proof) {
         return Err("Daemon proof changed".into());
     }
     if envelope.request_id != Some(request_id) {
         return Err("Unexpected daemon response ordering".into());
     }
     match envelope.message {
-        ServerMessage::Response { response } => Ok(response),
-        ServerMessage::Error(error) => Err(error.message),
+        ServerMessage::Response { response } => {
+            #[cfg(feature = "ui")]
+            crate::daemon_health::frame(stream, None, health_request);
+            Ok(response)
+        }
+        ServerMessage::Error(error) => {
+            #[cfg(feature = "ui")]
+            crate::daemon_health::frame(stream, None, health_request);
+            Err(error.message)
+        }
         _ => Err("Unexpected daemon handshake frame".into()),
     }
 }
@@ -516,7 +549,7 @@ impl ClientHandle {
         source: HostSessionProof,
     ) -> Result<super::BindingPreview, String> {
         let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|error| error.to_string())?;
@@ -569,7 +602,7 @@ impl ClientHandle {
         source: HostSessionProof,
     ) -> Result<Vec<super::BindingCandidate>, String> {
         let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|error| error.to_string())?;
@@ -627,7 +660,7 @@ impl ClientHandle {
         // daemon it is about to ask for, so it starts one for the same reason a
         // new conversation does instead of failing on an absent socket.
         let socket = crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?;
-        let stream = UnixStream::connect(socket)
+        let stream = connect_daemon(&socket)
             .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}"))?;
         Self::connect_on(
             stream,
@@ -650,7 +683,7 @@ impl ClientHandle {
             return Err("Account recovery changed the saved conversation".into());
         }
         let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-        let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
             replacement,
@@ -673,7 +706,7 @@ impl ClientHandle {
             return Err("Account switch changed the saved conversation".into());
         }
         let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-        let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
             replacement,
@@ -793,9 +826,17 @@ impl ClientHandle {
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
         let (session, initial) = loop {
-            let envelope: ServerEnvelope = codec
-                .read(&mut stream)
-                .map_err(frame_read_error)?
+            #[cfg(feature = "ui")]
+            let health_request = crate::daemon_health::begin();
+            let frame = codec.read(&mut stream);
+            #[cfg(feature = "ui")]
+            match &frame {
+                Err(error) => crate::daemon_health::frame(&stream, Some(error), health_request),
+                Ok(None) => crate::daemon_health::disconnected(&stream, health_request),
+                _ => {}
+            }
+            let envelope: ServerEnvelope = frame
+                .map_err(|error| frame_read_error(error, stream.read_timeout().ok().flatten()))?
                 .ok_or("Daemon disconnected")?;
             if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
                 return Err("Daemon identity/version changed during native chat attachment".into());
@@ -823,9 +864,13 @@ impl ClientHandle {
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
                 } if session.id == id && envelope.request_id == Some(attach_request) => {
+                    #[cfg(feature = "ui")]
+                    crate::daemon_health::frame(&stream, None, health_request);
                     break (session, snapshot);
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
+                    #[cfg(feature = "ui")]
+                    crate::daemon_health::frame(&stream, None, health_request);
                     return Err(StartFailure {
                         message: error.message,
                         recovery: if error.code == ipc::ProtocolErrorCode::AccountRemoved {
