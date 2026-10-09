@@ -24096,8 +24096,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn restored_editor_focus_waits_for_a_viewport_after_loading() {
+    #[test]
+    fn restored_editor_focus_waits_for_a_viewport_after_loading() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("notes.txt"), "saved\n").unwrap();
         let (mut app, pane) = editing_repository_app();
@@ -24141,7 +24141,11 @@ mod tests {
         drop(app.apply_viewport(update, false, false));
         assert!(!app.card_holds_keyboard(pane));
         let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
-        while let Some(action) = messages.next().await {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        while let Some(action) = executor.block_on(messages.next()) {
             if let cosmic::iced::runtime::Action::Output(action) = action {
                 drop(app.update(Message::Repository(action)));
             }
