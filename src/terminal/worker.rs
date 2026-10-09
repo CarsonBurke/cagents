@@ -710,12 +710,9 @@ impl TerminalHandle {
                     }
                     Err(error) => {
                         let _ = startup_tx.send(Err(error));
+                        completion.completed.store(true, Ordering::Release);
                     }
                 }
-                // Only completed teardown is evidence that no worker/PTY
-                // remains. An unexpected panic conservatively retains live
-                // inventory rather than certifying unobserved cleanup.
-                completion.completed.store(true, Ordering::Release);
             })
             .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
 
@@ -849,7 +846,8 @@ impl TerminalHandle {
         self.inner.published.set_agent_activity(None);
     }
 
-    /// True only after final capture, PTY teardown and reader/reaper cleanup.
+    /// True only after final capture, PTY/emulator teardown and reader/reaper cleanup.
+    /// Published before the final `Completed` event.
     /// Foreground-process exit alone does not imply completion.
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
@@ -1692,7 +1690,22 @@ impl Worker {
         })
     }
 
-    fn run(mut self) {
+    fn run(self) {
+        let published = Arc::clone(&self.published);
+        let events = self.events.clone();
+        // Returning from the consuming frame drops the emulator, encoders and
+        // render state after final capture and PTY cleanup. Only then may a
+        // completion observer rely on ended continuity or retire the result.
+        // A panic during teardown skips both publications and retains live
+        // inventory rather than certifying unobserved cleanup.
+        let completion = self.run_to_completion();
+        published.completed.store(true, Ordering::Release);
+        if let Some(completion) = completion {
+            let _ = events.send(completion);
+        }
+    }
+
+    fn run_to_completion(mut self) -> Option<TerminalEvent> {
         // An adopted terminal's title, set by drawing its screen again.
         self.drain_effects();
         if self.visibility == Visibility::Visible {
@@ -1898,11 +1911,9 @@ impl Worker {
         }
         drop(self.writer);
         drop(self.master);
-        if let Some(completion) = completion {
-            let _ = self.events.send(completion);
-        }
         // Terminal, render state, and every Ghostty encoder drop here, on the
         // same OS thread on which they were constructed and used.
+        completion
     }
 
     fn handle_child_exit(&mut self, exited: &mut bool, result: ChildExit) {
@@ -3789,6 +3800,39 @@ mod tests {
     }
 
     #[test]
+    fn completion_event_certifies_ended_worker_without_polling() {
+        let handle = TerminalHandle::spawn(
+            shell_session("printf 'final output'; exit 7"),
+            TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
+        let events = handle.events();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match events.recv_deadline(deadline).unwrap() {
+                TerminalEvent::Completed { exit_code, .. } => {
+                    assert_eq!(exit_code, 7);
+                    assert!(
+                        handle.is_completed(),
+                        "a completion observer must immediately see ended continuity"
+                    );
+                    assert!(handle.snapshot().lines.iter().any(|line| {
+                        line.cells
+                            .iter()
+                            .map(|cell| cell.text.as_str())
+                            .collect::<String>()
+                            .contains("final output")
+                    }));
+                    break;
+                }
+                TerminalEvent::Error { operation, message } => panic!("{operation}: {message}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn completed_pty_retains_search_copy_scroll_theme_and_resize_without_a_worker() {
         let handle = TerminalHandle::spawn(shell_session("i=0; while [ $i -lt 80 ]; do printf 'row%03d\\r\\n' \"$i\"; i=$((i+1)); done; printf '\\033[?2027h👩‍💻hit É Straße'; exit 7"), TerminalConfig { columns: 32, rows: 3, ..TerminalConfig::default() }, |_| {}).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -5198,6 +5242,7 @@ mod tests {
     #[test]
     fn leader_exit_does_not_end_output_capture_or_redraw_credit() {
         let (mut worker, events) = capture_worker();
+        let published = Arc::clone(&worker.published);
         worker.publish_snapshot(true);
         let mut exited = false;
         worker.handle_child_exit(&mut exited, Ok(ExitStatus::with_exit_code(0)));
@@ -5229,6 +5274,10 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, TerminalEvent::Completed { .. })),
             "worker teardown publishes the distinct final completion event"
+        );
+        assert!(
+            published.completed.load(Ordering::Acquire),
+            "observing final completion must also certify ended continuity"
         );
     }
 
