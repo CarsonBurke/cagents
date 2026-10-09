@@ -427,7 +427,8 @@ pub trait ProcessExecutor: Send + Sync {
 /// Runs commands as real child processes.
 ///
 /// The wait path blocks rather than polls: a dedicated thread owns the `Child`
-/// and blocks in `wait`, the pipe readers announce their own completion, and
+/// and observes exit without reaping until group cleanup finishes; pipe readers
+/// announce their own completion, and
 /// cancellation arrives through [`CancellationToken`]. A `git` or `gh`
 /// invocation therefore pays no polling latency and causes no timer wakeups,
 /// which matters because a single sidebar refresh issues dozens of them back to
@@ -470,10 +471,14 @@ impl ProcessExecutor for SystemProcessExecutor {
             started: false,
         })?;
 
+        // Capture the original process capability before any exit observation.
+        // Reopening a pidfd later could identify a recycled replacement instead.
+        let identity = child_identity(&child);
+
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                let status = terminate_process_tree(child);
+                let status = terminate_process_tree(child, identity);
                 return Err(ProcessFailure {
                     kind: ProcessFailureKind::Io,
                     program: spec.program.clone(),
@@ -489,7 +494,7 @@ impl ProcessExecutor for SystemProcessExecutor {
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                let status = terminate_process_tree(child);
+                let status = terminate_process_tree(child, identity);
                 return Err(ProcessFailure {
                     kind: ProcessFailureKind::Io,
                     program: spec.program.clone(),
@@ -518,7 +523,7 @@ impl ProcessExecutor for SystemProcessExecutor {
         let (stop, stop_signal) = match stop_pipe() {
             Ok(pair) => pair,
             Err(error) => {
-                let status = terminate_process_tree(child);
+                let status = terminate_process_tree(child, identity);
                 return Err(ProcessFailure {
                     kind: ProcessFailureKind::Io,
                     program: spec.program.clone(),
@@ -572,18 +577,10 @@ impl ProcessExecutor for SystemProcessExecutor {
             _ => None,
         };
 
-        // The child moves into a thread that blocks in `wait`, which is what
-        // removes the polling latency. Termination below signals the process
-        // *group* by pid and therefore needs no access to the `Child`.
-        let process_group = child.id();
-        let (exit, exit_source) = mpsc::channel();
-        let waiter = thread::spawn(move || {
-            let status = child.wait();
-            // The status is queued before the wakeup, so whoever observes
-            // `Exited` can take it without blocking.
-            let _ = exit.send(status);
-            let _ = events.send(WaitEvent::Exited);
-        });
+        // Observe exit without releasing the leader's PID. The waiter only
+        // reaps after every possible group signal and pipe cleanup is finished.
+        let mut waiter = GroupWaiter::new(child, identity, Some(events.clone()));
+        let exit_source = &waiter.exit_source;
 
         let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
         let mut status = None;
@@ -603,7 +600,7 @@ impl ProcessExecutor for SystemProcessExecutor {
             }
 
             if terminal_kind.is_some() {
-                status = terminate_process_group(process_group, status, &exit_source);
+                status = terminate_process_group(&waiter, status);
                 break;
             }
 
@@ -625,13 +622,13 @@ impl ProcessExecutor for SystemProcessExecutor {
                     Ok(Err(error)) => {
                         wait_error = Some(error.to_string());
                         terminal_kind = Some(ProcessFailureKind::Io);
-                        status = terminate_process_group(process_group, None, &exit_source);
+                        status = terminate_process_group(&waiter, None);
                         break;
                     }
                     Err(_) => {
                         wait_error = Some("process waiter reported no exit status".into());
                         terminal_kind = Some(ProcessFailureKind::Io);
-                        status = terminate_process_group(process_group, None, &exit_source);
+                        status = terminate_process_group(&waiter, None);
                         break;
                     }
                 },
@@ -687,19 +684,17 @@ impl ProcessExecutor for SystemProcessExecutor {
         let (stdout_read, stderr_read, pipe_error) = join_readers(stdout_reader, stderr_reader);
         let output_limit_exceeded = stdout_read.limit_exceeded || stderr_read.limit_exceeded;
         if output_limit_exceeded && terminal_kind.is_none() {
-            status = terminate_process_group(process_group, status, &exit_source);
+            status = terminate_process_group(&waiter, status);
             terminal_kind = Some(ProcessFailureKind::OutputLimit);
         }
-        // Joined only once the child has actually been reaped. When the kernel
-        // has not reported the exit within the grace above, this leaves the
-        // waiter thread running and the child unreaped until that exit finally
-        // arrives: one thread and one zombie per command that reaches this
-        // state, which is a bounded leak rather than a free choice. It is the
-        // deliberate price of not reintroducing the unbounded wait this
-        // cleanup exists to remove — the thread owns nothing but the `Child`
-        // and ends by itself at the reap.
-        if status.is_some() {
-            let _ = waiter.join();
+        // Reaping permission is released only after the final output-limit
+        // cleanup above. An uninterruptible child still leaves one bounded
+        // waiter thread until its eventual exit; no polling or unbounded join.
+        if let Some(error) = waiter.finish(status.is_some()) {
+            wait_error = Some(error);
+            if terminal_kind.is_none() {
+                terminal_kind = Some(ProcessFailureKind::Io);
+            }
         }
 
         let stdout = stdout_read.output;
@@ -793,8 +788,8 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 
 /// Signals the process group led by `process_group`.
 ///
-/// Killing by pid rather than through `&mut Child` is what lets the `Child`
-/// live in the thread that blocks on `wait`. Crate-internal so that
+/// Callers must retain original process identity and keep the group leader
+/// unreaped through every signal. Crate-internal so that
 /// `crate::lsp` reuses this single implementation — and its single `unsafe`
 /// block — instead of declaring `kill` a second time; it is not public API.
 #[cfg(unix)]
@@ -817,56 +812,250 @@ pub(crate) fn signal_process_group(process_group: u32, signal: i32) {
 #[cfg(not(unix))]
 pub(crate) fn signal_process_group(_process_group: u32, _signal: i32) {}
 
-/// Terminates a process group whose `Child` is owned by a waiter thread.
-///
-/// `reaped` is the exit status already observed, if any; otherwise the status
-/// arrives on `exit_source`. The SIGTERM grace period is a blocking receive
-/// rather than a polling loop, so a process that exits promptly is not made to
-/// wait for the next poll tick.
+/// A sole-reaper waiter keeps the leader unreaped through every group signal.
+/// Exit observation wakes the executor immediately; final reaping requires the
+/// executor's permission after bounded pipe cleanup and output-limit checks.
+struct GroupWaiter {
+    group: u32,
+    exit_source: mpsc::Receiver<io::Result<ExitStatus>>,
+    release: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<io::Result<ExitStatus>>>,
+    ownership: Arc<Mutex<bool>>,
+    identity: Option<Arc<OwnedFd>>,
+}
+
+impl GroupWaiter {
+    fn new(
+        mut child: std::process::Child,
+        identity: io::Result<OwnedFd>,
+        events: Option<mpsc::Sender<WaitEvent>>,
+    ) -> Self {
+        let group = child.id();
+        // Establish authority before the caller can signal. An already reaped
+        // Child may retain a cached status but no longer owns its numeric PID.
+        let (identity, initial) = match identity {
+            Ok(identity) => {
+                let identity = Arc::new(identity);
+                let initial = observe_child_exit(&identity, group, true);
+                (Some(identity), initial)
+            }
+            Err(error) => {
+                // Capture failed before this fresh Child was handed off or
+                // reaped. Its still-reserved leader authorizes startup-only
+                // cleanup; no later lifecycle signal may use numeric fallback.
+                signal_process_group(group, SIGKILL);
+                (None, Err(error))
+            }
+        };
+        let observed_identity = identity.clone();
+        let ownership = Arc::new(Mutex::new(initial.is_ok()));
+        let authority = Arc::clone(&ownership);
+        let (exit, exit_source) = mpsc::channel();
+        let (release, permission) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let status = initial.and_then(|status| match status {
+                Some(status) => Ok(status),
+                None => observe_child_exit(
+                    observed_identity.as_ref().expect("pinned child identity"),
+                    group,
+                    false,
+                )?
+                .ok_or_else(|| {
+                    io::Error::other("blocking child exit observation returned no status")
+                }),
+            });
+            if status.is_err() {
+                *authority
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = false;
+            }
+            // Queue status before wakeup. WNOWAIT still pins the leader here.
+            let _ = exit.send(status);
+            if let Some(events) = events {
+                let _ = events.send(WaitEvent::Exited);
+            }
+            let _ = permission.recv();
+            // Reaping and signalling share this lock, and permission only
+            // arrives after the executor gives up all remaining group signals.
+            let mut owned = authority
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *owned = false;
+            drop(child.stdin.take());
+            match observed_identity.as_ref() {
+                Some(identity) => child_exit_status(identity, group, libc::WEXITED)?
+                    .ok_or_else(|| io::Error::other("final child reap returned no status")),
+                // Only initial capture failure reaches this branch. The fresh
+                // Child has never been observed/reaped elsewhere, and startup
+                // cleanup already sent its sole signal before spawning us.
+                None => child.wait(),
+            }
+        });
+        Self {
+            group,
+            exit_source,
+            release: Some(release),
+            worker: Some(worker),
+            ownership,
+            identity,
+        }
+    }
+
+    fn signal(&self, signal: i32) -> bool {
+        if self.release.is_none() {
+            return false;
+        }
+        let mut owned = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !*owned {
+            return false;
+        }
+        // Check the original capability, never whichever process currently has
+        // this number. The sole reaper cannot run while this lock is held.
+        if self
+            .identity
+            .as_ref()
+            .is_none_or(|identity| observe_child_exit(identity, self.group, true).is_err())
+        {
+            *owned = false;
+            return false;
+        }
+        signal_process_group(self.group, signal);
+        true
+    }
+
+    fn finish(&mut self, observed_exit: bool) -> Option<String> {
+        drop(self.release.take());
+        if observed_exit {
+            match self.worker.take().expect("owned child waiter").join() {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(format!("final child reap failed: {error}")),
+                Err(_) => Some("child waiter panicked".into()),
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for GroupWaiter {
+    fn drop(&mut self) {
+        if self.release.is_some() {
+            // Unwinding cannot release reaping authority ahead of a remaining
+            // group kill. Ordinary completion disarms this through finish.
+            self.signal(SIGKILL);
+            drop(self.release.take());
+        }
+    }
+}
+
+fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open returns a new close-on-exec descriptor for our newly
+    // spawned, unreaped child. The guard never recreates it after reaping.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+}
+
+fn observe_child_exit(
+    identity: &OwnedFd,
+    pid: u32,
+    nonblocking: bool,
+) -> io::Result<Option<ExitStatus>> {
+    child_exit_status(
+        identity,
+        pid,
+        libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 },
+    )
+}
+
+fn child_exit_status(identity: &OwnedFd, pid: u32, flags: i32) -> io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: P_PIDFD identifies the captured original child, including
+        // when its old numeric ID has been reused. All observations use WNOWAIT;
+        // only the worker's final call reaps after group signals are disarmed.
+        if unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                identity.as_raw_fd() as libc::id_t,
+                &mut information,
+                flags,
+            )
+        } == 0
+        {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let (observed, status) = unsafe { (information.si_pid(), information.si_status()) };
+    if observed == 0 {
+        return Ok(None);
+    }
+    if observed as u32 != pid {
+        return Err(io::Error::other(
+            "child exit observation returned another process",
+        ));
+    }
+    let raw = match information.si_code {
+        libc::CLD_EXITED => status << 8,
+        libc::CLD_KILLED => status,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => {
+            return Err(io::Error::other(
+                "child exit observation returned an unexpected status",
+            ));
+        }
+    };
+    Ok(Some(ExitStatus::from_raw(raw)))
+}
+
+/// Group signals finish before the owned waiter's final reap permission.
 fn terminate_process_group(
-    process_group: u32,
-    reaped: Option<ExitStatus>,
-    exit_source: &mpsc::Receiver<io::Result<ExitStatus>>,
+    waiter: &GroupWaiter,
+    observed: Option<ExitStatus>,
 ) -> Option<ExitStatus> {
-    signal_process_group(process_group, SIGTERM);
-    let status = reaped.or_else(|| {
-        exit_source
+    if !waiter.signal(SIGTERM) {
+        return observed;
+    }
+    let status = observed.or_else(|| {
+        waiter
+            .exit_source
             .recv_timeout(TERMINATION_GRACE)
             .ok()
             .and_then(Result::ok)
     });
-    // Send SIGKILL even if the group leader exited; descendants may still be
-    // alive in the process group.
-    signal_process_group(process_group, SIGKILL);
-    // Bounded: a killed process is normally reaped at once, but a task parked
-    // in an uninterruptible kernel wait would otherwise hold this caller — and
-    // the repository mutation lock above it — for as long as it lasted.
+    waiter.signal(SIGKILL);
     status.or_else(|| {
-        exit_source
+        waiter
+            .exit_source
             .recv_timeout(CLEANUP_GRACE)
             .ok()
             .and_then(Result::ok)
     })
 }
 
-/// Terminates a process group whose `Child` the caller still owns, used only on
-/// the cold paths that fail before the main waiter thread exists.
-///
-/// The child is handed to a short-lived waiter so that this reuses exactly the
-/// blocking termination the hot path uses; there is no `try_wait` polling loop
-/// anywhere in this executor.
-fn terminate_process_tree(mut child: std::process::Child) -> Option<ExitStatus> {
-    let process_group = child.id();
-    let (exit, exit_source) = mpsc::channel();
-    let waiter = thread::spawn(move || {
-        let _ = exit.send(child.wait());
-    });
-    let status = terminate_process_group(process_group, None, &exit_source);
-    // Joined only once the child was reaped, for the reason given above.
-    if status.is_some() {
-        let _ = waiter.join();
+/// Cold setup failures use the same pinned identity and bounded exit waiter.
+fn terminate_process_tree(
+    child: std::process::Child,
+    identity: io::Result<OwnedFd>,
+) -> Option<ExitStatus> {
+    let mut waiter = GroupWaiter::new(child, identity, None);
+    let status = terminate_process_group(&waiter, None);
+    if waiter.finish(status.is_some()).is_some() {
+        None
+    } else {
+        status
     }
-    status
 }
 
 struct PipeRead {
@@ -1103,6 +1292,288 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn group_waiter_capture_failure_cleans_only_fresh_startup_child() {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let original = child_identity(&child).unwrap();
+        let mut waiter =
+            GroupWaiter::new(child, Err(io::Error::from_raw_os_error(libc::EMFILE)), None);
+        assert_eq!(
+            waiter
+                .exit_source
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        assert!(!waiter.signal(SIGTERM));
+        assert!(waiter.finish(true).is_none());
+        assert_eq!(
+            observe_child_exit(&original, waiter.group, true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn group_waiter_retains_leader_and_cleans_owned_descendants() {
+        use std::io::BufRead;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        const MARKER: &str = "CAGENTS_EXECUTOR_GROUP_CHILD";
+        const TEST: &str =
+            "process::tests::group_waiter_retains_leader_and_cleans_owned_descendants";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}; {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("owned executor descendant cases completed")
+            );
+            return;
+        }
+        // Only this exact subprocess becomes a subreaper; parallel libtest
+        // siblings retain their ordinary process-wide child ownership.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        struct Descendant {
+            identity: OwnedFd,
+            pid: libc::pid_t,
+            reaped: bool,
+        }
+        impl Drop for Descendant {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            self.identity.as_raw_fd(),
+                            SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                        libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+        for lost in [false, true] {
+            let script = r#"import os,signal,sys
+r,w=os.pipe()
+pid=os.fork()
+if pid==0:
+ os.close(r)
+ if sys.argv[1]=='normal': signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ os.write(w,b'1'); os.close(w)
+ while True: signal.pause()
+os.close(w); os.read(r,1); os.close(r)
+print(pid,flush=True)
+sys.stdin.buffer.read(1)
+sys.exit(7)
+"#;
+            let mut command = std::process::Command::new("/usr/bin/python3");
+            command
+                .args(["-c", script, if lost { "lost" } else { "normal" }])
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let identity = child_identity(&child).unwrap();
+            let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let pid: libc::pid_t = line.trim().parse().unwrap();
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+            assert!(raw >= 0);
+            let mut descendant = Descendant {
+                identity: unsafe { OwnedFd::from_raw_fd(raw) },
+                pid,
+                reaped: false,
+            };
+            child.stdin.take().unwrap().write_all(b"x").unwrap();
+            if lost {
+                assert_eq!(child.wait().unwrap().code(), Some(7));
+            }
+            let mut waiter = GroupWaiter::new(child, Ok(identity), None);
+            let observed = waiter
+                .exit_source
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            if lost {
+                assert_eq!(observed.unwrap_err().raw_os_error(), Some(libc::ECHILD));
+                assert!(terminate_process_group(&waiter, None).is_none());
+                let mut poll = libc::pollfd {
+                    fd: descendant.identity.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut poll, 1, 100) },
+                    0,
+                    "lost authority must send neither TERM nor KILL"
+                );
+                assert!(waiter.finish(true).is_some());
+            } else {
+                let observed = observed.unwrap();
+                assert_eq!(observed.code(), Some(7));
+                assert_eq!(
+                    observe_child_exit(waiter.identity.as_ref().unwrap(), waiter.group, true)
+                        .unwrap()
+                        .unwrap()
+                        .code(),
+                    Some(7),
+                    "exit event must retain the unreaped leader"
+                );
+                assert_eq!(
+                    terminate_process_group(&waiter, Some(observed))
+                        .unwrap()
+                        .code(),
+                    Some(7)
+                );
+                assert!(waiter.finish(true).is_none());
+                assert_eq!(
+                    observe_child_exit(waiter.identity.as_ref().unwrap(), waiter.group, true)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+                assert!(
+                    !waiter.signal(SIGKILL),
+                    "final reap disarms all later signals"
+                );
+                let mut poll = libc::pollfd {
+                    fd: descendant.identity.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+                let mut raw_status = 0;
+                assert_eq!(unsafe { libc::waitpid(pid, &mut raw_status, 0) }, pid);
+                descendant.reaped = true;
+                assert_eq!(ExitStatus::from_raw(raw_status).signal(), Some(SIGKILL));
+            }
+        }
+        println!("owned executor descendant cases completed");
+    }
+
+    #[test]
+    #[ignore = "requires an owned user/PID namespace and namespace-local PID allocation control"]
+    fn group_waiter_refuses_a_kernel_reused_original_pid() {
+        use std::os::unix::process::CommandExt;
+        const MARKER: &str = "CAGENTS_EXECUTOR_REUSE_CHILD";
+        const NAMESPACE: &str = "CAGENTS_EXECUTOR_OUTER_NAMESPACE";
+        const TEST: &str = "process::tests::group_waiter_refuses_a_kernel_reused_original_pid";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new("/usr/bin/unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    TEST,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(MARKER, "1")
+                .env(NAMESPACE, fs::read_link("/proc/self/ns/pid").unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}; {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("original executor pidfd rejected recycled group")
+            );
+            return;
+        }
+        assert_eq!(std::process::id(), 1);
+        assert_ne!(
+            fs::read_link("/proc/self/ns/pid").unwrap().as_os_str(),
+            std::env::var_os(NAMESPACE).unwrap()
+        );
+        fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
+        let mut original = std::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert_eq!(original.id(), 200);
+        let identity = child_identity(&original).unwrap();
+        assert!(original.wait().unwrap().success());
+        fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
+        let mut victim = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert_eq!(victim.id(), 200);
+        assert_eq!(unsafe { libc::getpgid(200) }, 200);
+        let victim_identity = child_identity(&victim).unwrap();
+        struct Cleanup(OwnedFd);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+        }
+        let cleanup = Cleanup(victim_identity);
+        let mut waiter = GroupWaiter::new(original, Ok(identity), None);
+        assert_eq!(
+            waiter
+                .exit_source
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(terminate_process_group(&waiter, None).is_none());
+        assert!(waiter.finish(true).is_some());
+        let mut poll = libc::pollfd {
+            fd: cleanup.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 100) }, 0);
+        assert!(victim.try_wait().unwrap().is_none());
+        println!("original executor pidfd rejected recycled group PID/PGID=200");
+        drop(cleanup);
+        victim.wait().unwrap();
+    }
 
     #[test]
     fn command_specs_have_finite_resource_defaults() {
