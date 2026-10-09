@@ -6677,6 +6677,9 @@ impl Cagents {
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
+        if let Some(navigation) = self.durable.repository_navigation.get(&card) {
+            runtime.restore_navigation(navigation);
+        }
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -7789,6 +7792,25 @@ impl Cagents {
             && !self.workspace_inputs_blocked()
     }
 
+    fn restore_repository_editor_focus(&mut self) -> Task<Message> {
+        let Some(card) = self
+            .workspace
+            .focused()
+            .filter(|card| self.card_holds_keyboard(*card))
+        else {
+            return Task::none();
+        };
+        let placeholder = self.card_header_widget_id(card);
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        runtime
+            .take_restored_editor_focus(card)
+            .map_or_else(Task::none, |target| {
+                workspace_widget::focus_after_loading(placeholder, target).map(cosmic::Action::App)
+            })
+    }
+
     /// Where keyboard focus for `card` lands.
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
         match self.cards.get(&card) {
@@ -7798,6 +7820,11 @@ impl Cagents {
                 .map(|chrome| chrome.focus_id.clone())
                 .unwrap_or_else(|| workspace_widget::card_focus_id(card)),
             Some(CardRuntime::Chat(runtime)) => card_control_id(card, runtime.focus_control()),
+            Some(CardRuntime::Repository(runtime)) => match runtime.editor_focus_target(card) {
+                Some(_) if runtime.find_is_open() => repository_widget::find_focus_id(card),
+                Some(target) => target,
+                None => self.card_header_widget_id(card),
+            },
             // Arriving at settings means looking for one, so the keyboard
             // lands in its search field.
             Some(CardRuntime::Settings) => crate::settings_widgets::search_id(),
@@ -7977,8 +8004,8 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
-        if let Some(card) = self.workspace.take_widget_focus_request()
-            && !self.context_inspector_overlay_active
+        if !self.context_inspector_overlay_active
+            && let Some(card) = self.workspace.take_widget_focus_request()
         {
             tasks.push(
                 iced::widget::operation::focus(self.card_keyboard_focus(card))
@@ -7986,6 +8013,7 @@ impl Cagents {
             );
         }
         tasks.push(context_overlay_task);
+        tasks.push(self.restore_repository_editor_focus());
         reconcile_now |= self.take_passing_sweep();
         if reconcile_now {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
@@ -13687,6 +13715,7 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                tasks.push(self.restore_repository_editor_focus());
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
                     && self.lsp.completion_trigger(doc, character)
@@ -13720,6 +13749,19 @@ impl Application for Cagents {
                 {
                     state.kind = CardKind::Repository(view);
                     self.persist();
+                }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) {
+                    let navigation = runtime.navigation();
+                    let stored = self.durable.repository_navigation.get(&card);
+                    if stored != navigation.as_ref() {
+                        let saved = &mut Arc::make_mut(&mut self.durable).repository_navigation;
+                        if let Some(navigation) = navigation {
+                            saved.insert(card, navigation);
+                        } else {
+                            saved.remove(&card);
+                        }
+                        tasks.push(self.save_focus_soon());
+                    }
                 }
                 // A queued refresh discards this result and advances the list
                 // generation. Keep navigation parked until its replacement
@@ -19817,6 +19859,109 @@ mod tests {
         (app, card)
     }
 
+    #[tokio::test]
+    async fn reviewed_update_prepare_flushes_folder_editor_selection_before_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window.sqlite3");
+        let boot = crate::model::BootId::new("editor-update-test");
+        let (writer, _) = SessionRuntime::open(&path, boot).unwrap();
+        let store = writer.operation_store();
+        let (mut app, card) = editing_repository_app();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved");
+        let expected = runtime.navigation().unwrap();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.session = Some(writer);
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Prepare,
+            response,
+        }));
+        let mut stream = iced::runtime::task::into_stream(task).expect("update flush");
+        let mut flushed = false;
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                let finished = matches!(message, Message::UiUpdateFlushed { .. });
+                drop(app.update(message));
+                if finished {
+                    flushed = true;
+                    break;
+                }
+            }
+        }
+        assert!(flushed);
+        assert_eq!(receiver.try_recv().unwrap(), "ok");
+        let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(restored.repository_navigation.get(&card), Some(&expected));
+        assert!(
+            matches!(&restored.cards.iter().find(|state| state.id == card).unwrap().kind, CardKind::Repository(view) if view.selected_file.is_none())
+        );
+        let (response, _) = std::sync::mpsc::sync_channel(1);
+        drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Cancel,
+            response,
+        })));
+        assert!(!app.update_prepared);
+    }
+
+    #[test]
+    fn window_snapshots_capture_editor_selection_without_changing_shared_recipe() {
+        let (mut app, card) = editing_repository_app();
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            panic!("editor");
+        };
+        let expected = runtime.navigation().unwrap();
+        let descriptor = runtime.descriptor.clone();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.repository_navigation.get(&card), Some(&expected));
+        let CardKind::Repository(view) = &saved
+            .cards
+            .iter()
+            .find(|state| state.id == card)
+            .unwrap()
+            .kind
+        else {
+            panic!("repository");
+        };
+        assert!(
+            view.selected_file.is_none(),
+            "the shared pane remains a repository browser"
+        );
+        let mut second_window = (*saved).clone();
+        second_window.id = crate::model::WorkspaceId::new();
+        second_window
+            .repository_navigation
+            .get_mut(&card)
+            .unwrap()
+            .selected_file = Some("other.txt".into());
+        assert_eq!(
+            app.persistent_workspace().repository_navigation[&card],
+            expected
+        );
+        let close = crate::model::Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap()
+            .existence = close;
+        assert!(
+            !app.persistent_workspace()
+                .repository_navigation
+                .contains_key(&card)
+        );
+    }
+
     #[test]
     fn reordered_panes_keep_runtime_focus_and_restore_the_saved_order() {
         let (mut app, editor) = editing_repository_app();
@@ -23899,6 +24044,148 @@ mod tests {
                 Some(crate::settings_widgets::search_id())
             );
             assert_eq!(app.workspace.focused(), Some(pane));
+        }
+    }
+
+    #[test]
+    fn restored_editor_startup_focus_follows_the_loaded_surface() {
+        let (mut app, pane) = editing_repository_app();
+        let update = app.workspace.resize_viewport(1200.0);
+        assert_eq!(
+            app.card_keyboard_focus(pane),
+            repository_widget::editor_focus_id(pane)
+        );
+        let startup = app.apply_viewport(update, false, false);
+        assert_eq!(
+            focused(&app, startup),
+            Some(repository_widget::editor_focus_id(pane))
+        );
+        let _ = app.update(Message::Repository(RepositoryAction::OpenFind {
+            card: pane,
+        }));
+        assert_eq!(
+            app.card_keyboard_focus(pane),
+            repository_widget::find_focus_id(pane)
+        );
+        let _ = app.update(Message::Repository(RepositoryAction::ApplyMarkdownMode {
+            card: pane,
+            preview: true,
+        }));
+        assert_eq!(
+            app.card_keyboard_focus(pane),
+            app.card_header_widget_id(pane)
+        );
+    }
+
+    #[test]
+    fn restored_editor_startup_focus_survives_an_initial_inspector_overlay() {
+        let (mut app, pane) = editing_repository_app();
+        app.window_width = 900.0;
+        app.context_inspector_open = true;
+        let update = app.workspace.resize_viewport(500.0);
+        let initial = app.apply_viewport(update, false, false);
+        assert!(app.context_inspector_overlay_active);
+        assert_eq!(focused(&app, initial), Some(context_inspector_toggle_id()));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        let ready = app.apply_viewport(update, false, false);
+        assert!(!app.context_inspector_overlay_active);
+        assert_eq!(
+            focused(&app, ready),
+            Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn restored_editor_focus_waits_for_a_viewport_after_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "saved\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view.clone());
+        runtime.restore_navigation(&crate::model::RepositoryNavigation {
+            project: view.project,
+            worktree: view.worktree,
+            selected_file: Some("notes.txt".into()),
+            editor: Some(crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line: 0, column: 0 },
+                selection: None,
+                scroll_line: 0,
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            }),
+        });
+        let load = runtime.initial_load(pane);
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        let update = app.workspace.resize_viewport(1200.0);
+        let initial = app.apply_viewport(update, false, false);
+        assert_eq!(
+            focused(&app, initial),
+            Some(app.card_header_widget_id(pane))
+        );
+        app.window_width = 900.0;
+        app.context_inspector_open = true;
+        let update = app.workspace.resize_viewport(500.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(!app.card_holds_keyboard(pane));
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        while let Some(action) = executor.block_on(messages.next()) {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                drop(app.update(Message::Repository(action)));
+            }
+        }
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        let ready = app.apply_viewport(update, false, false);
+        assert_eq!(
+            focused(&app, ready),
+            Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn restored_editor_focus_preserves_controls_chosen_during_loading() {
+        let (mut app, pane) = editing_repository_app();
+        app.workspace.resize_viewport(1200.0);
+        let _ = app.workspace.take_widget_focus_request();
+        let _ = app.update(Message::Repository(RepositoryAction::OpenFind {
+            card: pane,
+        }));
+        let editor = repository_widget::editor_focus_id(pane);
+        let placeholder = app.card_header_widget_id(pane);
+        for current in [
+            None,
+            Some(placeholder.clone()),
+            Some(editor.clone()),
+            Some(repository_widget::find_focus_id(pane)),
+        ] {
+            let initial = current.as_ref().map_or_else(Task::none, |id| {
+                iced::widget::operation::focus(id.clone()).map(cosmic::Action::App)
+            });
+            let task = initial.chain(
+                workspace_widget::focus_after_loading(placeholder.clone(), editor.clone())
+                    .map(cosmic::Action::App),
+            );
+            let expected = current
+                .filter(|id| *id != placeholder)
+                .unwrap_or_else(|| editor.clone());
+            assert_eq!(focused(&app, task), Some(expected));
         }
     }
 

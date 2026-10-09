@@ -888,7 +888,9 @@ the source for resumed history.
   to open an editor beside the current pane. A visible clean file editor is
   reused; unsaved buffers stay open. HTML opens as source; **Preview HTML**
   opens the saved file in the integrated browser, or the system browser in
-  browserless builds. The selected file is restored with the workspace.
+  browserless builds. Each window restores its selected file, caret, selection,
+  and editor scroll position after reopening or an application update. This also
+  applies to files selected inside a folder or repository pane.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
   focused; Cancel or Escape keeps the pane. The close button and

@@ -3873,11 +3873,37 @@ impl Cagents {
                 }
             }
         }
-        if defaults.is_empty() && chat_drafts == self.durable.chat_drafts {
+        let editors = self
+            .durable
+            .cards
+            .iter()
+            .filter(|state| {
+                open_cards.contains(&state.id) && matches!(state.kind, CardKind::Repository(_))
+            })
+            .map(|state| state.id)
+            .collect::<HashSet<_>>();
+        let mut repository_navigation = self.durable.repository_navigation.clone();
+        repository_navigation.retain(|card, _| editors.contains(card));
+        for (card, runtime) in &self.cards {
+            if let CardRuntime::Repository(runtime) = runtime
+                && open_cards.contains(card)
+            {
+                if let Some(navigation) = runtime.navigation() {
+                    repository_navigation.insert(*card, navigation);
+                } else {
+                    repository_navigation.remove(card);
+                }
+            }
+        }
+        if defaults.is_empty()
+            && chat_drafts == self.durable.chat_drafts
+            && repository_navigation == self.durable.repository_navigation
+        {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
+        saved.repository_navigation = repository_navigation;
         if defaults.is_empty() {
             return Arc::new(saved);
         }

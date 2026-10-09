@@ -1956,6 +1956,9 @@ pub struct RepositoryRuntime {
     preview_scroll_id: widget::Id,
     viewports: FileViewportAnchors,
     retained_viewports: VecDeque<(PathBuf, FileViewportAnchors)>,
+    restored_navigation: Option<crate::model::RepositoryNavigation>,
+    pending_editor_navigation: Option<(PathBuf, crate::model::EditorNavigation)>,
+    pending_editor_focus: Option<AsyncIdentity>,
     next_save_ticket: u64,
     next_diff_request: u64,
     /// Identity the application gave the open buffer at the LSP boundary, or
@@ -2111,6 +2114,9 @@ impl RepositoryRuntime {
             preview_scroll_id: widget::Id::new(format!("repository.preview.{identity}")),
             viewports: FileViewportAnchors::default(),
             retained_viewports: VecDeque::new(),
+            restored_navigation: None,
+            pending_editor_navigation: None,
+            pending_editor_focus: None,
             next_save_ticket: 0,
             lsp_document: None,
             language: EditorLanguageState::default(),
@@ -2669,7 +2675,87 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Apply only navigation for this exact pane recipe. Shared projections can
+    /// replace the recipe but cannot replace another window's local selection.
+    pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
+        if navigation.project != self.descriptor.project
+            || navigation.worktree != self.descriptor.worktree
+            || navigation
+                .selected_file
+                .as_ref()
+                .is_none_or(|path| crate::repository::RepoPath::parse(path).is_err())
+            || self
+                .descriptor
+                .selected_file
+                .as_ref()
+                .is_some_and(|path| Some(path) != navigation.selected_file.as_ref())
+        {
+            return;
+        }
+        self.restored_navigation = Some(navigation.clone());
+    }
+
+    pub(crate) fn navigation(&self) -> Option<crate::model::RepositoryNavigation> {
+        if self.committed_selection.is_some() {
+            return None;
+        }
+        let file = self.selected.as_ref()?;
+        let editor = if let DocumentState::Editable(document) = &self.document {
+            let cursor = document.content.cursor();
+            let position = |position: text_editor::Position| crate::model::EditorPosition {
+                line: position.line,
+                column: position.column,
+            };
+            let scroll = if self.editable_surface_visible() {
+                document.content.scroll_position()
+            } else {
+                self.viewports.editor
+            };
+            Some(crate::model::EditorNavigation {
+                caret: position(cursor.position),
+                selection: cursor.selection.map(position),
+                scroll_line: scroll.line,
+                scroll_vertical: scroll.vertical,
+                scroll_horizontal: scroll.horizontal,
+            })
+        } else {
+            self.pending_editor_navigation
+                .as_ref()
+                .filter(|(path, _)| *path == file.path)
+                .map(|(_, editor)| *editor)
+        };
+        Some(crate::model::RepositoryNavigation {
+            project: self.descriptor.project,
+            worktree: self.descriptor.worktree.clone(),
+            selected_file: Some(file.path.clone()),
+            editor,
+        })
+    }
+
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if let Some(navigation) = self.restored_navigation.take() {
+            let listing = if self.descriptor.selected_file.is_none() {
+                // The direct file read can precede the initial Git listing.
+                // Install that listing's current status without replacing the buffer.
+                self.mutation_refresh_pending = true;
+                self.initial_load(card)
+            } else {
+                self.files = FileListState::Ready(Vec::new());
+                Task::none()
+            };
+            if let Some(path) = navigation.selected_file {
+                let load = self.open_file_entry(
+                    card,
+                    RepositoryFile {
+                        path: path.clone(),
+                        ..RepositoryFile::default()
+                    },
+                );
+                self.pending_editor_navigation = navigation.editor.map(|editor| (path, editor));
+                return Task::batch([listing, load]);
+            }
+            return listing;
+        }
         if let Some(path) = self.descriptor.selected_file.clone() {
             return if self.blocks_navigation() {
                 Task::none()
@@ -2983,6 +3069,27 @@ impl RepositoryRuntime {
     pub fn editor_focus_target(&self, card: CardId) -> Option<widget::Id> {
         self.editable_surface_visible()
             .then(|| editor_focus_id(card))
+    }
+
+    pub fn restores_editor_navigation(&self, identity: &AsyncIdentity) -> bool {
+        self.accepts_selected(identity)
+            && self
+                .pending_editor_navigation
+                .as_ref()
+                .is_some_and(|(path, _)| path == &identity.path)
+    }
+
+    /// The accepted restored buffer keeps its focus handoff until the app can
+    /// mount it. Reading the file can finish before the first viewport arrives.
+    pub fn take_restored_editor_focus(&mut self, card: CardId) -> Option<widget::Id> {
+        let identity = self.pending_editor_focus.as_ref()?;
+        if identity.card != card || !self.accepts_selected(identity) {
+            self.pending_editor_focus = None;
+            return None;
+        }
+        let target = self.editor_focus_target(card)?;
+        self.pending_editor_focus = None;
+        Some(target)
     }
 
     /// Whether the editable buffer is the surface actually on screen.
@@ -4677,6 +4784,9 @@ impl RepositoryRuntime {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
                 }
+                let restored_focus = self
+                    .restores_editor_navigation(&identity)
+                    .then(|| identity.clone());
                 self.document = match result {
                     Ok(LoadedFile {
                         source,
@@ -4758,6 +4868,25 @@ impl RepositoryRuntime {
                     },
                 };
                 if let DocumentState::Editable(document) = &mut self.document {
+                    if let Some((path, editor)) = self.pending_editor_navigation.take()
+                        && self.selected.as_ref().is_some_and(|file| file.path == path)
+                    {
+                        let position =
+                            |position: crate::model::EditorPosition| text_editor::Position {
+                                line: position.line,
+                                column: position.column,
+                            };
+                        document.content.set_cursor(text_editor::Cursor {
+                            position: position(editor.caret),
+                            selection: editor.selection.map(position),
+                        });
+                        self.pending_editor_focus = restored_focus;
+                        self.viewports.editor = text_editor::ScrollPosition {
+                            line: editor.scroll_line,
+                            vertical: editor.scroll_vertical,
+                            horizontal: editor.scroll_horizontal,
+                        };
+                    }
                     document
                         .content
                         .restore_scroll_position(self.viewports.editor);
@@ -5940,6 +6069,8 @@ impl RepositoryRuntime {
 
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
         self.pending_fragment = None;
+        self.pending_editor_navigation = None;
+        self.pending_editor_focus = None;
         if self.descriptor.selected_file.is_some() {
             self.descriptor.selected_file = Some(file.path.clone());
         }
@@ -10321,6 +10452,270 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
+        use cosmic::iced::futures::StreamExt;
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    drop(runtime.update(action));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_editor_navigation_survives_saved_file_and_sqlite_restart() {
+        use crate::model::{CardKind, CardState, WorkspaceState};
+        use crate::persistence::{SnapshotBase, StateStore};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "first\nsecond\nthird\n").unwrap();
+        let card = CardId::new();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: root.clone(),
+            worktree: root.clone(),
+            selected_file: None,
+        };
+        let mut runtime = RepositoryRuntime::new_directory(view.clone());
+        let task = runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: "notes.txt".into(),
+        });
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        });
+        drop(task);
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(!runtime.is_dirty());
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("editable file");
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 2, column: 3 },
+            selection: Some(text_editor::Position { line: 1, column: 2 }),
+        });
+        document
+            .content
+            .restore_scroll_position(text_editor::ScrollPosition {
+                line: 1,
+                vertical: 2.5,
+                horizontal: 7.0,
+            });
+        let navigation = runtime.navigation().unwrap();
+        assert!(
+            runtime.descriptor.selected_file.is_none(),
+            "folder mode remains a browser"
+        );
+        let mut workspace = WorkspaceState::default();
+        workspace.cards.push(CardState {
+            id: card,
+            generation: 0,
+            title: "Folder".into(),
+            width_fraction: 1.0,
+            existence: crate::model::Existence::Open,
+            exposure: crate::model::Exposure::Visible,
+            residency: crate::model::Residency::Cold,
+            kind: CardKind::Repository(view.clone()),
+        });
+        workspace
+            .repository_navigation
+            .insert(card, navigation.clone());
+        let store = StateStore::open(
+            root.join("navigation.sqlite3"),
+            crate::model::BootId::new("editor-navigation-test"),
+        )
+        .unwrap();
+        store
+            .save_workspace(
+                &workspace,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.repository_navigation[&card], navigation);
+        let mut reopened = RepositoryRuntime::new_directory(view);
+        reopened.restore_navigation(&restored.repository_navigation[&card]);
+        let task = reopened.initial_load(card);
+        assert_eq!(
+            reopened.navigation(),
+            Some(navigation.clone()),
+            "a snapshot during hydration retains the pending caret"
+        );
+        finish_navigation_task(&mut reopened, task).await;
+        assert_eq!(reopened.selected_path(), Some(Path::new("notes.txt")));
+        assert_eq!(reopened.navigation(), Some(navigation));
+        let DocumentState::Editable(document) = &reopened.document else {
+            panic!("restored editor");
+        };
+        assert_eq!(
+            document.content.text(),
+            std::fs::read_to_string(root.join("notes.txt")).unwrap()
+        );
+        assert!(!reopened.is_dirty());
+        assert_eq!(
+            reopened.take_restored_editor_focus(card),
+            Some(editor_focus_id(card))
+        );
+        assert!(reopened.take_restored_editor_focus(card).is_none());
+    }
+
+    #[tokio::test]
+    async fn restored_repository_navigation_installs_initial_git_status_without_losing_caret() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        run_git(root, ["init", "-q"]);
+        std::fs::write(root.join("notes.txt"), "before\n").unwrap();
+        run_git(root, ["add", "notes.txt"]);
+        run_git(
+            root,
+            [
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        std::fs::write(root.join("notes.txt"), "after\n").unwrap();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: root.join(".git"),
+            worktree: root.into(),
+            selected_file: None,
+        };
+        let navigation = crate::model::RepositoryNavigation {
+            project: view.project,
+            worktree: view.worktree.clone(),
+            selected_file: Some("notes.txt".into()),
+            editor: Some(crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line: 0, column: 3 },
+                selection: None,
+                scroll_line: 0,
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            }),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        runtime.restore_navigation(&navigation);
+        let task = runtime.initial_load(CardId::new());
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.selected.as_ref().unwrap().unstaged);
+        assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
+        assert_eq!(
+            runtime.navigation().unwrap().editor.unwrap().caret,
+            navigation.editor.unwrap().caret
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_file_navigation_restore_finishes_loading_without_a_file_list() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "saved").unwrap();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: Some("notes.txt".into()),
+        };
+        let navigation = crate::model::RepositoryNavigation {
+            project: view.project,
+            worktree: view.worktree.clone(),
+            selected_file: view.selected_file.clone(),
+            editor: None,
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        runtime.restore_navigation(&navigation);
+        let task = runtime.initial_load(CardId::new());
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(runtime.files, FileListState::Ready(_)));
+        assert!(matches!(runtime.document, DocumentState::Editable(_)));
+        assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn restored_editor_navigation_rejects_other_recipes_and_escaping_paths() {
+        let card = CardId::new();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved");
+        let navigation = runtime.navigation().unwrap();
+        for variant in 0..4 {
+            let mut changed = navigation.clone();
+            match variant {
+                0 => changed.project = ProjectId::new(),
+                1 => changed.worktree = "/other".into(),
+                2 => changed.selected_file = Some("../outside".into()),
+                _ => changed.selected_file = Some("/outside".into()),
+            }
+            let mut reopened = RepositoryRuntime::new(runtime.descriptor.clone());
+            reopened.restore_navigation(&changed);
+            assert!(reopened.restored_navigation.is_none());
+        }
+        let mut dedicated = runtime.descriptor.clone();
+        dedicated.selected_file = Some("other.txt".into());
+        let mut reopened = RepositoryRuntime::new(dedicated);
+        reopened.restore_navigation(&navigation);
+        assert!(reopened.restored_navigation.is_none());
+    }
+
+    #[tokio::test]
+    async fn restored_editor_caret_clamps_to_changed_file_and_never_applies_to_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "é").unwrap();
+        let card = CardId::new();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: root.clone(),
+            worktree: root.clone(),
+            selected_file: None,
+        };
+        let navigation = crate::model::RepositoryNavigation {
+            project: view.project,
+            worktree: root,
+            selected_file: Some("notes.txt".into()),
+            editor: Some(crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition {
+                    line: 99,
+                    column: 99,
+                },
+                selection: None,
+                scroll_line: 0,
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            }),
+        };
+        let mut runtime = RepositoryRuntime::new_directory(view.clone());
+        runtime.restore_navigation(&navigation);
+        let task = runtime.initial_load(card);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(
+            runtime.navigation().unwrap().editor.unwrap().caret,
+            crate::model::EditorPosition { line: 0, column: 2 }
+        );
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        runtime.restore_navigation(&navigation);
+        let stale = runtime.initial_load(card);
+        let replacement = runtime.open_file_entry(
+            card,
+            RepositoryFile {
+                path: "missing.txt".into(),
+                ..RepositoryFile::default()
+            },
+        );
+        finish_navigation_task(&mut runtime, stale).await;
+        finish_navigation_task(&mut runtime, replacement).await;
+        assert_eq!(runtime.selected_path(), Some(Path::new("missing.txt")));
+        assert!(runtime.pending_editor_navigation.is_none());
+    }
+
     #[test]
     fn shell_toolbar_actions_stay_in_the_header_when_find_is_open() {
         use cosmic::iced::Size;

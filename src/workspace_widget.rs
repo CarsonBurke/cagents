@@ -538,6 +538,45 @@ pub fn focus_card<Message: 'static>(id: CardId) -> Task<Message> {
     widget::operation::focus(card_focus_id(id))
 }
 
+/// Complete a loading pane's focus handoff without taking focus from a
+/// control the user chose while the content was arriving.
+pub fn focus_after_loading<Message: Send + 'static>(
+    placeholder: widget::Id,
+    target: widget::Id,
+) -> Task<Message> {
+    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+    struct Restore {
+        foreign_focus: bool,
+        placeholder: widget::Id,
+        target: widget::Id,
+    }
+    impl<Message: Send + 'static> Operation<Message> for Restore {
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            self.foreign_focus |= state.is_focused() && id != Some(&self.placeholder);
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            operate(self);
+        }
+        fn finish(&self) -> Outcome<Message> {
+            if self.foreign_focus {
+                Outcome::None
+            } else {
+                Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+            }
+        }
+    }
+    cosmic::iced::advanced::widget::operate(Restore {
+        foreign_focus: false,
+        placeholder,
+        target,
+    })
+}
+
 /// End-of-strip navigation returns the keyboard from chrome without taking
 /// it from a find bar, composer, or other control already inside the pane.
 pub fn focus_card_if_outside<Message: Send + 'static>(
@@ -2662,6 +2701,55 @@ mod tests {
             .operate(&mut tree, Layout::new(&node), &renderer, &mut focus_count);
         assert_eq!(focus_count.0, vec![editors[0].clone()]);
         tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[test]
+    fn loading_focus_preserves_anonymous_and_sidebar_controls() {
+        use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+
+        struct Focus(bool);
+        impl Focusable for Focus {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+
+        for foreign_id in [None, Some(widget::Id::new("sidebar.search"))] {
+            let placeholder = widget::Id::new("loading-pane.header");
+            let target = widget::Id::new("loaded-pane.editor");
+            let mut header = Focus(false);
+            let mut foreign = Focus(true);
+            let mut editor = Focus(false);
+            let mut stream = cosmic::iced::runtime::task::into_stream(focus_after_loading::<()>(
+                placeholder.clone(),
+                target.clone(),
+            ))
+            .expect("loading handoff must issue a widget operation");
+            while let Some(action) = block_on(stream.next()) {
+                let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+                    continue;
+                };
+                loop {
+                    let bounds = Rectangle::default();
+                    operation.focusable(Some(&placeholder), bounds, &mut header);
+                    operation.focusable(foreign_id.as_ref(), bounds, &mut foreign);
+                    operation.focusable(Some(&target), bounds, &mut editor);
+                    match operation.finish() {
+                        Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+            assert!(foreign.0, "loading must preserve the chosen control");
+            assert!(!editor.0, "the loaded editor must not take its keyboard");
+        }
     }
 
     #[derive(Default)]

@@ -1146,6 +1146,31 @@ pub enum WorkspaceDestination {
     Channel(ChannelId),
 }
 
+/// Editor navigation belongs to a window, independently of a shared pane's recipe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryNavigation {
+    pub project: ProjectId,
+    pub worktree: PathBuf,
+    #[serde(with = "crate::selected_file_path")]
+    pub selected_file: Option<PathBuf>,
+    pub editor: Option<EditorNavigation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EditorPosition {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EditorNavigation {
+    pub caret: EditorPosition,
+    pub selection: Option<EditorPosition>,
+    pub scroll_line: usize,
+    pub scroll_vertical: f32,
+    pub scroll_horizontal: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
@@ -1182,6 +1207,9 @@ pub struct WorkspaceState {
     /// identities are pruned when navigation opens; this grants no ownership.
     #[serde(default)]
     pub workspace_history: Vec<WorkspaceDestination>,
+    /// Current file, caret and viewport for each editor in this window.
+    #[serde(default)]
+    pub repository_navigation: HashMap<CardId, RepositoryNavigation>,
     /// The shared registry this window last reconciled against.
     ///
     /// Paired with [`ProjectChannel::shared`]: a flag only means anything
@@ -1215,6 +1243,7 @@ impl Default for WorkspaceState {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_history: Vec::new(),
+            repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
