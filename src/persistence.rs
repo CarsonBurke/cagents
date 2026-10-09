@@ -21,8 +21,8 @@ use crate::{
         BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
         Existence, Exposure, HostSessionProof, OperationId, ProjectChannel, ProjectId,
         ProjectState, Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
-        TranscriptMetadata, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
-        normalize_project_channels,
+        TranscriptMetadata, WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId,
+        WorktreeState, normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
@@ -261,6 +261,7 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub workspace_history: Vec<WorkspaceDestination>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
     pub pending_terminal_creations: HashSet<CardId>,
@@ -1661,6 +1662,7 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            workspace_history: manifest.workspace_history,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
             pending_terminal_creations: manifest.pending_terminal_creations,
@@ -3143,6 +3145,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:workspace_history"),
+        &to_json(&state.workspace_history)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
         &to_json(&state.chat_drafts)?,
     )?;
@@ -4470,6 +4477,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace card scopes", &value))
         .transpose()?
         .unwrap_or_default(),
+        workspace_history: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:workspace_history"),
+        )?
+        .map(|value| from_json("workspace history", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_drafts: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_drafts"),
@@ -5098,6 +5112,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            workspace_history: Vec::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
@@ -5721,6 +5736,67 @@ mod tests {
             self.cards.clone_from(&commit.card_generations);
             Ok(commit)
         }
+    }
+
+    #[test]
+    fn workspace_history_commits_restores_and_defaults_for_legacy_navigation() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("history.sqlite3");
+        let boot_id = boot("history-boot");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        workspace.workspace_history = vec![
+            WorkspaceDestination::Channel(ChannelId::new()),
+            WorkspaceDestination::Worktree(WorktreeId::new()),
+            WorkspaceDestination::Folder(ProjectId::new()),
+        ];
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .workspace_history,
+            workspace.workspace_history
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .workspace_history,
+            workspace.workspace_history
+        );
+        drop(store);
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "DELETE FROM metadata WHERE key=?1",
+            [format!(
+                "workspace:{}:navigation:workspace_history",
+                workspace.id
+            )],
+        )
+        .unwrap();
+        drop(db);
+        let store = StateStore::open(&database, boot("history-boot")).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .workspace_history
+                .is_empty()
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy.as_object_mut().unwrap().remove("workspace_history");
+        assert!(
+            serde_json::from_value::<WorkspaceState>(legacy)
+                .unwrap()
+                .workspace_history
+                .is_empty()
+        );
     }
 
     #[test]

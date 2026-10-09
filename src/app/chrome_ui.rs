@@ -20,6 +20,7 @@ pub(super) struct State {
     /// Where the switcher's list was last scrolled to, so following the
     /// selection moves it no further than the selection requires.
     pub(super) workspace_switcher_scroll: f32,
+    pub(super) workspace_switcher_rows: Vec<WorkspaceSwitcherRow>,
     pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
     focus_index: usize,
