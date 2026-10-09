@@ -82,6 +82,7 @@ pub mod repository;
 #[cfg(feature = "ui")]
 pub mod repository_widget;
 mod secure_file;
+mod selected_file_path;
 #[cfg(feature = "ui")]
 mod separator;
 #[cfg(feature = "ui")]

@@ -1025,7 +1025,11 @@ pub struct RepositoryView {
     pub worktree: PathBuf,
     /// A dedicated file editor, rooted at `worktree`, rather than a repository
     /// browser. The relative path survives restore without requiring a file list.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "crate::selected_file_path",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub selected_file: Option<PathBuf>,
 }
 

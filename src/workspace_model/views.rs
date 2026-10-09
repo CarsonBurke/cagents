@@ -305,6 +305,7 @@ mod wire_kind {
             project: ProjectId,
             repository: PathBuf,
             worktree: PathBuf,
+            #[serde(with = "crate::selected_file_path")]
             selected_file: Option<PathBuf>,
         },
         Settings,
@@ -385,6 +386,7 @@ mod wire_tests {
     use crate::model::*;
     #[test]
     fn nonempty_views_round_trip_through_ipc_and_persistent_json() {
+        use std::os::unix::ffi::OsStringExt;
         let recipe = LaunchRecipe {
             program: "/bin/sh".into(),
             arguments: vec![],
@@ -421,6 +423,14 @@ mod wire_tests {
                 repository: "/repo/.git".into(),
                 worktree: "/repo".into(),
                 selected_file: None,
+            }),
+            CardKind::Repository(RepositoryView {
+                project: ProjectId::new(),
+                repository: "/repo/.git".into(),
+                worktree: "/repo".into(),
+                selected_file: Some(PathBuf::from(std::ffi::OsString::from_vec(
+                    b"raw-\xff.txt".to_vec(),
+                ))),
             }),
             CardKind::PullRequests(PullRequestView {
                 repository: "/repo/.git".into(),
