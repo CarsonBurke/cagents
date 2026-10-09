@@ -66,6 +66,74 @@ pub(crate) fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
     directory.join(terminal.to_string())
 }
 
+/// A Unix address includes its terminating NUL. Filesystem paths have no such
+/// small limit; Linux can resolve a long endpoint through a held directory FD.
+pub(crate) fn socket_fits(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: sockaddr_un is plain data and only its field length is read.
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    path.as_os_str().as_bytes().len() < capacity
+}
+
+fn with_socket_address<T>(
+    path: &Path,
+    operation: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    use std::os::fd::AsRawFd;
+    if socket_fits(path) {
+        return operation(path);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "holder endpoint has no directory",
+            )
+        })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "holder endpoint has no filename",
+        )
+    })?;
+    crate::secure_file::reject_symlink_components(parent)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe holder socket directory",
+        ));
+    }
+    // Hold the FD until bind/connect completes. The endpoint remains at its
+    // original filesystem path, so discovery, authentication, and inode-based
+    // retirement retain their existing identity and survive daemon upgrades.
+    let address = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+    operation(&address)
+}
+
+pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    with_socket_address(path, |address| {
+        std::os::unix::net::UnixListener::bind(address)
+    })
+}
+
+pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    with_socket_address(path, |address| {
+        std::os::unix::net::UnixStream::connect(address)
+    })
+}
+
 impl Record {
     fn supported_version(&self) -> bool {
         match self.kind {
@@ -225,6 +293,78 @@ mod tests {
             holder: process.clone(),
             root: process,
         }
+    }
+
+    fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let prefix = root.as_os_str().as_bytes().len() + 1;
+        // A multibyte component makes byte accounting distinct from characters.
+        let directory = root.join(format!("é{}", "x".repeat(length - prefix - 2 - 1 - 36)));
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let endpoint = socket(&directory, TerminalId::new());
+        assert_eq!(endpoint.as_os_str().as_bytes().len(), length);
+        endpoint
+    }
+
+    #[test]
+    fn unix_address_boundary_preserves_full_endpoint_and_discovery_identity() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        // SAFETY: plain data, only the array length is used.
+        let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len();
+        for length in [capacity - 1, capacity, capacity + 1, capacity + 100] {
+            let endpoint = endpoint_with_byte_length(root.path(), length);
+            assert_eq!(socket_fits(&endpoint), length < capacity);
+            let listener = bind(&endpoint).unwrap();
+            assert!(std::os::unix::fs::FileTypeExt::is_socket(
+                &fs::symlink_metadata(&endpoint).unwrap().file_type()
+            ));
+            let client = connect(&endpoint).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            assert!(client.peer_addr().unwrap().as_pathname().is_some());
+            drop((client, server, listener));
+            let mut proof = record();
+            proof.terminal = endpoint
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            proof.create(endpoint.parent().unwrap()).unwrap();
+            assert_eq!(
+                evidence(&endpoint, Kind::Terminal).unwrap(),
+                Some(proof.clone())
+            );
+            assert_eq!(
+                discover(endpoint.parent().unwrap(), &proof.boot, Kind::Terminal).unwrap(),
+                vec![proof.clone()]
+            );
+            proof.remove(endpoint.parent().unwrap());
+            assert!(!endpoint.exists());
+        }
+    }
+
+    #[test]
+    fn long_endpoints_reject_public_or_symlinked_directories() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let endpoint = endpoint_with_byte_length(root.path(), 160);
+        let parent = endpoint.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            bind(&endpoint).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.path().join("l".repeat(100));
+        std::os::unix::fs::symlink(parent, &link).unwrap();
+        assert_eq!(
+            bind(&link.join(endpoint.file_name().unwrap()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

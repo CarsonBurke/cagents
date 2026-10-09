@@ -1754,7 +1754,7 @@ fn prepare_upgrade_with_carry_policy(
                     crate::chat::NativeContinuity::Durable { .. }
                 )
             }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
-                && holders.is_some_and(|holders| holder_socket_fits(&holder_socket(holders, *id)))
+                && holders.is_some()
         };
         let carried = state
             .terminals
@@ -2090,24 +2090,11 @@ fn upgrade_recipe(
 /// Where carried terminals' holders wait for the next daemon: this daemon's
 /// private runtime directory, which the next one shares.
 fn holder_directory() -> Result<std::path::PathBuf, String> {
-    crate::daemon::RuntimePaths::discover()
-        .map(|paths| paths.directory.join("holders"))
-        .map_err(|error| error.to_string())
+    crate::terminal::holder::directory()
 }
 
 fn holder_socket(holders: &std::path::Path, terminal: TerminalId) -> std::path::PathBuf {
-    holders.join(terminal.to_string())
-}
-
-/// Whether a Unix socket can be bound at `socket`, whose path must fit in
-/// `sockaddr_un` with its terminating NUL.
-fn holder_socket_fits(socket: &std::path::Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    // SAFETY: sockaddr_un is plain old data; only its field's size is read.
-    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
-        .sun_path
-        .len();
-    socket.as_os_str().as_bytes().len() < capacity
+    crate::terminal::holder::socket(holders, terminal)
 }
 
 /// Provider close must succeed before Ready can authorize another writer.

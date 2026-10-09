@@ -465,7 +465,8 @@ fn connect(record: &Record) -> Result<UnixStream, String> {
     {
         return Err("Native holder discovery evidence changed".into());
     }
-    let control = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    let control =
+        crate::daemon::holder_registry::connect(&socket).map_err(|error| error.to_string())?;
     let credentials = peer(&control)?;
     if credentials.uid != crate::daemon::current_uid()
         || credentials.pid != record.holder.pid
@@ -814,7 +815,8 @@ struct Listener {
 
 impl Listener {
     fn bind(path: PathBuf) -> Result<Self, String> {
-        let socket = UnixListener::bind(&path).map_err(|error| error.to_string())?;
+        let socket =
+            crate::daemon::holder_registry::bind(&path).map_err(|error| error.to_string())?;
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
