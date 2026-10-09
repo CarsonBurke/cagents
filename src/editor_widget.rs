@@ -167,19 +167,40 @@ fn find_in_lines<T: AsRef<str>>(
             boundaries[start] = Some(offset);
         }
         boundaries.push(Some(text.len()));
-        for (index, (offset, _)) in folded.match_indices(&query).enumerate() {
-            if index % 1024 == 0 && cancelled() {
+        let mut cursor = 0;
+        let mut candidates = 0;
+        while cursor + query.len() <= folded.len() {
+            if candidates % 1024 == 0 && cancelled() {
                 return None;
             }
-            if let (Some(start), Some(end)) = (boundaries[offset], boundaries[offset + query.len()])
-            {
+            candidates += 1;
+            // Reject impossible source boundaries before building a substring
+            // searcher, including repeated partial expansion hits on long lines.
+            if boundaries[cursor].is_none() || boundaries[cursor + query.len()].is_none() {
+                cursor += folded[cursor..].chars().next().unwrap().len_utf8();
+                continue;
+            }
+            let Some(found) = folded[cursor..].find(&query) else {
+                break;
+            };
+            let offset = cursor + found;
+            let end = offset + query.len();
+            if let (Some(start), Some(end_column)) = (boundaries[offset], boundaries[end]) {
                 matches.push((
                     Position {
                         line,
                         column: start,
                     },
-                    Position { line, column: end },
+                    Position {
+                        line,
+                        column: end_column,
+                    },
                 ));
+                cursor = end;
+            } else {
+                // Rejected partial case-fold expansions must not consume a
+                // later whole-character match that overlaps their folded bytes.
+                cursor = offset + folded[offset..].chars().next().unwrap().len_utf8();
             }
         }
     }
@@ -3977,6 +3998,29 @@ mod tests {
         ] {
             assert!(snapshot.replace_matches(&matches, "x").is_none());
         }
+    }
+
+    #[test]
+    fn find_skips_partial_fold_hits_without_losing_overlapping_source_matches() {
+        let source = "sß\nß\nsﬃ\niss";
+        let content: Content = Content::with_text(source);
+        let at = |line, column| Position { line, column };
+        let expected = vec![
+            (at(0, 1), at(0, 3)),
+            (at(1, 0), at(1, 2)),
+            (at(3, 1), at(3, 3)),
+        ];
+        assert_eq!(content.find_matches("ss"), expected);
+        assert_eq!(
+            content.search_snapshot().find_matches("ss", || false),
+            Some(expected)
+        );
+        assert_eq!(content.find_matches("ffi"), vec![(at(2, 1), at(2, 4))]);
+        assert!(Content::with_text("ß").find_matches("s").is_empty());
+        assert_eq!(
+            Content::with_text("sss").find_matches("ss"),
+            vec![(at(0, 0), at(0, 2))]
+        );
     }
 
     #[test]
