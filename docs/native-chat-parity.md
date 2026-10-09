@@ -19,6 +19,7 @@ app-server 0.159.3, and Oh My Pi 18.2.9.
 | Child transcripts and lifecycle | Supported | Supported, including nested children | Supported |
 | Child approvals | Provider permission requests | Explicit, labeled child requests | Provider input dialogs |
 | Direct child messaging, stop and restart controls | No native controls | Remaining native UI gap | RPC unavailable |
+| Suggested next prompt | Optional SDK suggestion | Optional experimental prediction API | API unavailable |
 | Model, reasoning, attachments, skills, compaction | Supported where provider advertises them | Supported | Supported |
 | Runtime permission policy | Provider modes; source-labelled rules and Auto context with live-session edits | Common policy presets | Launch/settings configuration |
 | Permission recovery | Footer notice, denied input/reason, explicit retry drafts, pending approvals | Pending approvals | Pending approvals |
@@ -64,3 +65,34 @@ Protocol references: [Codex app-server documentation](https://learn.chatgpt.com/
 and [Claude Agent SDK streaming input](https://platform.claude.com/docs/en/agent-sdk/streaming-vs-single-mode).
 Installed Codex-generated JSON schemas and the installed Claude SDK type
 declarations were also checked for the exact wire fields used by the adapters.
+
+## Suggested next prompts
+
+When the provider offers a suggested next prompt, native chat displays it in
+an empty composer with a Tab hint. Tab places the whole suggestion in the
+composer; Enter sends it only after acceptance. Typing dismisses the suggestion
+for that turn, including suggestions that arrive after the draft was typed and
+cleared. Suggestions never replace a draft, enter the transcript, or survive a
+provider restart. A key pressed against an older suggestion cannot accept a
+replacement suggestion or overwrite newer input.
+
+Claude is opted in through the SDK initialize request's `promptSuggestions`
+field. An older provider that rejects that optional field receives one retry of
+the same handshake without it. Provider settings and
+`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` continue to control delivery.
+The [Claude documentation](https://code.claude.com/docs/en/interactive-mode#prompt-suggestions)
+explains that suggestions may be skipped and can consume provider usage.
+The official [Claude Agent SDK 0.3.296 declaration](https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.296/sdk.d.ts) describes at most one
+`prompt_suggestion` following an eligible `result`, carrying `session_id`,
+`suggestion`, and `uuid`. Claude supplies no source-turn ID, so its adapter
+relies on that ordered stream contract and accepts only the current completed
+idle generation in the exact session. New input or a new turn invalidates it.
+
+Codex uses the optional experimental
+[`thread/prediction/request` and `thread/prediction/updated` API](https://github.com/openai/codex/blob/4bc83aa5f7ebfec8492bb5747affe0fc8433fcad/codex-rs/app-server-protocol/src/protocol/v2/thread_prediction.rs).
+Requests name the exact completed source turn. Notifications from another
+session or turn are ignored, and no more than one optional prediction request
+is retained at a time. Missing methods, prediction failures, and empty results
+are quiet and do not affect the conversation. An older Codex server without
+this experimental method continues to work without suggestions. Prediction
+requests are made only for the main conversation, never for observed subagents.

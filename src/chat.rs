@@ -732,6 +732,28 @@ pub struct BindingCandidate {
     pub working_directory: std::path::PathBuf,
 }
 
+/// An optional next prompt from the current provider process. This is not a
+/// draft or transcript entry and is never sent until the user accepts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSuggestion {
+    pub session_id: String,
+    pub source: String,
+    pub turn_generation: u64,
+    pub text: String,
+}
+
+impl PromptSuggestion {
+    pub const MAX_BYTES: usize = 4096;
+
+    pub fn valid_text(text: &str) -> bool {
+        !text.trim().is_empty()
+            && text.len() <= Self::MAX_BYTES
+            && !text
+                .chars()
+                .any(|character| character.is_control() && character != '\n' && character != '\t')
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
@@ -777,6 +799,8 @@ pub struct Snapshot {
     pub has_earlier: bool,
     pub has_later: bool,
     pub composer: Option<String>,
+    #[serde(default)]
+    pub prompt_suggestion: Option<PromptSuggestion>,
     pub open_url: Option<(String, String)>,
     /// Provider-confirmed user attention, including requests not yet delivered.
     pub waiting: bool,
@@ -1576,6 +1600,15 @@ pub enum PlanState {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Event {
+    /// Providers correlate this to their latest completed turn before emitting
+    /// it. The actor adds its monotonic turn generation at publication.
+    PromptSuggestion {
+        session_id: String,
+        source: String,
+        text: String,
+    },
+    PromptSuggestionCleared,
+
     /// A provider-confirmed conversation reset. The next Session event supplies
     /// its authoritative identity; never infer an ID from a reset hint.
     Reset {

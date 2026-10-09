@@ -233,6 +233,7 @@ pub enum Action {
     /// chose it, the key does what it does without the list: the action
     /// given, if any.
     Complete(Target, String, Option<Box<Action>>),
+    AcceptSuggestion(Target, chat::PromptSuggestion),
     /// Moves the completion highlight down, or up when `false`.
     CompletionMove(Target, bool),
     /// Sends the completion list away until the reader types again.
@@ -316,6 +317,7 @@ impl Action {
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
+            | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
@@ -1428,6 +1430,7 @@ pub(super) struct Runtime {
     model_picker: Option<String>,
     /// The composer's completion list.
     completion: completion::State,
+    suggestion_dismissed: Option<(Option<String>, u64)>,
 }
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
@@ -1832,6 +1835,52 @@ impl Runtime {
             .text()
     }
 
+    /// An empty draft can show a suggestion only for its exact current turn.
+    fn prompt_suggestion(&self) -> Option<&chat::PromptSuggestion> {
+        let suggestion = self.snapshot.prompt_suggestion.as_ref()?;
+        if self.disconnected
+            || self.pending.is_some()
+            || self.queued.is_some()
+            || self.handle().is_none()
+            || self.snapshot.busy
+            || !self.snapshot.ready
+            || self.snapshot.exited
+            || !self.composer.text().trim_end_matches('\n').is_empty()
+            || !self.attachments.is_empty()
+            || self.snapshot.session_id.as_deref() != Some(suggestion.session_id.as_str())
+            || self.snapshot.turn_generation != suggestion.turn_generation
+            || self
+                .suggestion_dismissed
+                .as_ref()
+                .is_some_and(|(session, generation)| {
+                    session == &self.snapshot.session_id
+                        && *generation == self.snapshot.turn_generation
+                })
+            || !chat::PromptSuggestion::valid_text(&suggestion.text)
+        {
+            return None;
+        }
+        Some(suggestion)
+    }
+
+    fn dismiss_suggestion(&mut self) {
+        self.suggestion_dismissed = Some((
+            self.snapshot.session_id.clone(),
+            self.snapshot.turn_generation,
+        ));
+    }
+
+    fn accept_suggestion(&mut self, expected: &chat::PromptSuggestion) -> bool {
+        if self.prompt_suggestion() != Some(expected) {
+            return false;
+        }
+        self.dismiss_suggestion();
+        self.replace_draft(text_editor::Content::with_text(&expected.text));
+        self.history_cursor = None;
+        self.history_stash = None;
+        true
+    }
+
     /// Puts a whole new draft in the composer. Whatever the completion list
     /// was doing belonged to the old one.
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
@@ -1921,6 +1970,7 @@ impl Runtime {
             later_asked: None,
             model_picker: None,
             completion: completion::State::default(),
+            suggestion_dismissed: None,
         };
         runtime.refresh();
         runtime
@@ -6380,6 +6430,7 @@ impl Cagents {
                 let mut files = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
+                        runtime.dismiss_suggestion();
                         runtime.revision = runtime.revision.wrapping_add(1);
                         // Typing into a recalled message makes it the draft,
                         // so the next Up starts again from the newest.
@@ -7547,6 +7598,12 @@ impl Cagents {
                     false,
                 );
             }
+            Action::AcceptSuggestion(target, suggestion) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.accept_suggestion(&suggestion);
+                }
+                return Task::none();
+            }
             Action::Complete(target, insertion, otherwise) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -7914,6 +7971,81 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepting_next_prompt_suggestion_preserves_newer_user_input_and_requires_exact_observation()
+    {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("session"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let suggestion = chat::PromptSuggestion {
+            session_id: "session".into(),
+            source: "turn".into(),
+            turn_generation: 3,
+            text: "Run the focused tests\nThen inspect the diff".into(),
+        };
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.session_id = Some("session".into());
+        state.turn_generation = 3;
+        state.busy = false;
+        state.ready = true;
+        state.prompt_suggestion = Some(suggestion.clone());
+        assert_eq!(runtime.prompt_suggestion(), Some(&suggestion));
+        let mut stale = suggestion.clone();
+        stale.source = "older".into();
+        assert!(!runtime.accept_suggestion(&stale));
+        assert!(runtime.composer.text().trim().is_empty());
+        runtime.disconnected = true;
+        assert!(!runtime.accept_suggestion(&suggestion));
+        runtime.disconnected = false;
+        let revision = runtime.revision;
+        assert!(runtime.accept_suggestion(&suggestion));
+        assert_eq!(runtime.revision, revision.wrapping_add(1));
+        assert_eq!(runtime.composer.text().trim_end(), suggestion.text);
+        assert!(!runtime.accept_suggestion(&suggestion));
+        runtime.replace_draft(text_editor::Content::with_text("My own newer prompt"));
+        assert!(!runtime.accept_suggestion(&suggestion));
+        assert_eq!(runtime.composer.text().trim_end(), "My own newer prompt");
+    }
+
+    #[test]
+    fn typing_and_clearing_before_delayed_suggestion_keeps_it_dismissed_for_that_turn() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("session"));
+        let target = chat_runtime(&app, card).target;
+        show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            chat::Snapshot {
+                session_id: Some("session".into()),
+                turn_generation: 7,
+                ready: true,
+                ..Default::default()
+            },
+        );
+        write(&mut app, card, "Typed before the prediction");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::new());
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.ready = true;
+        state.busy = false;
+        state.prompt_suggestion = Some(chat::PromptSuggestion {
+            session_id: "session".into(),
+            source: "turn7".into(),
+            turn_generation: 7,
+            text: "A delayed prediction".into(),
+        });
+        assert!(runtime.prompt_suggestion().is_none());
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.turn_generation = 8;
+        let suggestion = state.prompt_suggestion.as_mut().unwrap();
+        suggestion.turn_generation = 8;
+        suggestion.source = "turn8".into();
+        assert!(runtime.prompt_suggestion().is_some());
+        Arc::make_mut(&mut runtime.snapshot).session_id = Some("other-session".into());
+        assert!(runtime.prompt_suggestion().is_none());
+    }
+
     #[test]
     fn native_permissions_opens_locally_even_while_busy_and_preserves_attachments() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

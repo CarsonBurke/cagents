@@ -368,6 +368,9 @@ fn create_inner(
             turn: None,
             busy: false,
             lifecycle_revision: 0,
+            suggestion_turn: None,
+            prediction_turn: None,
+            predictions_unsupported: false,
             subagent_status: None,
             ready: false,
             attached: false,
@@ -423,6 +426,7 @@ enum Pending {
     /// Interrupting one child's turn, which leaves the parent and the other
     /// children running.
     StopChild,
+    Prediction,
     Fork,
 }
 
@@ -486,6 +490,9 @@ struct Codex {
     turn: Option<String>,
     busy: bool,
     lifecycle_revision: u64,
+    suggestion_turn: Option<String>,
+    prediction_turn: Option<String>,
+    predictions_unsupported: bool,
     subagent_status: Option<ToolStatus>,
     ready: bool,
     attached: bool,
@@ -1408,6 +1415,9 @@ impl Adapter for Codex {
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision })?;
+                        self.suggestion_turn = None;
+                        self.prediction_turn = None;
+                        step.events.push(Event::PromptSuggestionCleared);
                     }
                     PromptMode::Steer => {
                         let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to steer")?;
@@ -1560,6 +1570,13 @@ impl Adapter for Codex {
                             self.child_step(id, content, &mut step)?;
                         }
                     }
+                    return Ok(step);
+                }
+                if matches!(pending, Pending::Prediction) {
+                    if error["code"].as_i64() == Some(-32601) {
+                        self.predictions_unsupported = true;
+                    }
+                    // Predictions are optional. Failure cannot affect chat.
                     return Ok(step);
                 }
                 if matches!(pending, Pending::ChildList) {
@@ -2061,7 +2078,7 @@ impl Adapter for Codex {
                 }
                 Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
                 // The child's own turn completion reports how it ended.
-                Pending::StopChild => {}
+                Pending::StopChild | Pending::Prediction => {}
                 Pending::Other => {
                     if result["thread"].is_object() {
                         self.thread_state(&result["thread"], &mut step)?;
@@ -2174,6 +2191,24 @@ impl Adapter for Codex {
                     detail: status_detail(&params["status"]),
                 });
             }
+            "thread/prediction/updated" => {
+                if !self.busy
+                    && params["sourceTurnId"].as_str() == self.suggestion_turn.as_deref()
+                    && self.suggestion_turn.is_some()
+                {
+                    self.suggestion_turn = None;
+                    if params["result"]["type"] == "completed"
+                        && let Some(text) = params["result"]["text"].as_str()
+                        && chat::PromptSuggestion::valid_text(text)
+                    {
+                        step.events.push(Event::PromptSuggestion {
+                            session_id: self.thread.clone().unwrap(),
+                            source: string(params, "sourceTurnId")?.into(),
+                            text: text.into(),
+                        });
+                    }
+                }
+            }
             "thread/name/updated" => step.events.push(Event::Session {
                 id: self.thread.clone().ok_or("Missing Codex thread")?,
                 title: params["threadName"].as_str().map(str::to_owned),
@@ -2197,6 +2232,7 @@ impl Adapter for Codex {
             }
             "turn/started" | "turn/completed" => {
                 if method == "turn/started" {
+                    self.suggestion_turn = None;
                     step.events.push(Event::TurnStarted);
                 }
                 self.materialized = true;
@@ -2221,6 +2257,14 @@ impl Adapter for Codex {
                     }
                 }
                 let turn_id = string(turn, "id")?;
+                if method == "turn/started" {
+                    self.prediction_turn = Some(turn_id.into());
+                }
+                let prediction_turn =
+                    method == "turn/completed" && self.prediction_turn.as_deref() == Some(turn_id);
+                if prediction_turn {
+                    self.prediction_turn = None;
+                }
                 let current =
                     method == "turn/started" || self.turn.as_deref().is_none_or(|id| id == turn_id);
                 if current {
@@ -2274,6 +2318,25 @@ impl Adapter for Codex {
                 }
                 if method == "turn/completed" {
                     self.finish_execution(turn, &mut step)?;
+                    if current
+                        && prediction_turn
+                        && turn["status"] == "completed"
+                        && !self.is_child
+                        && !self.predictions_unsupported
+                        && self.pending.len() < MAX_PENDING
+                        && !self
+                            .pending
+                            .values()
+                            .any(|pending| matches!(pending, Pending::Prediction))
+                    {
+                        self.suggestion_turn = Some(turn_id.into());
+                        self.call(
+                            &mut step,
+                            "thread/prediction/request",
+                            json!({"threadId":self.thread,"sourceTurnId":turn_id}),
+                            Pending::Prediction,
+                        )?;
+                    }
                 }
             }
             "item/started" | "item/completed" => {
@@ -3318,6 +3381,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn absent_or_failed_predictions_and_observed_child_turns_never_produce_prompts() {
+        for result in [
+            json!({"type":"failed"}),
+            json!({"type":"completed","text":null}),
+            json!({"type":"completed","text":""}),
+            json!({"type":"completed","text":"x".repeat(chat::PromptSuggestion::MAX_BYTES + 1)}),
+        ] {
+            let mut current = adapter();
+            current.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
+            current.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"completed","items":[]}}})).unwrap();
+            let absent = current.receive(json!({"method":"thread/prediction/updated","params":{"threadId":"thread-exact","sourceTurnId":"turn","result":result}})).unwrap();
+            assert!(absent.events.is_empty());
+            assert!(absent.writes.is_empty());
+            assert!(current.ready);
+        }
+        let mut child = adapter();
+        child.is_child = true;
+        child.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
+        let finished = child.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"completed","items":[]}}})).unwrap();
+        assert!(
+            !finished
+                .writes
+                .iter()
+                .any(|frame| frame["method"] == "thread/prediction/request")
+        );
+    }
+
+    #[test]
+    fn next_prompt_prediction_is_correlated_and_legacy_errors_are_quiet() {
+        let mut current = adapter();
+        let completion = |id: &str| json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":id,"status":"completed","items":[]}}});
+        let start = |id: &str| json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":id,"status":"inProgress","items":[]}}});
+        current.receive(start("turn-one")).unwrap();
+        let finished = current.receive(completion("turn-one")).unwrap();
+        let request = finished
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/prediction/request")
+            .unwrap();
+        assert_eq!(request["params"]["sourceTurnId"], "turn-one");
+        let prediction = |thread: &str, turn: &str| json!({"method":"thread/prediction/updated","params":{"threadId":thread,"sourceTurnId":turn,"result":{"type":"completed","text":"Check the resulting diff"}}});
+        assert!(
+            current
+                .receive(prediction("another-thread", "turn-one"))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            current
+                .receive(prediction("thread-exact", "old-turn"))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            matches!(current.receive(prediction("thread-exact", "turn-one")).unwrap().events.as_slice(), [Event::PromptSuggestion { text, .. }] if text == "Check the resulting diff")
+        );
+        current
+            .receive(json!({"id":request["id"],"result":{}}))
+            .unwrap();
+        assert!(
+            !current
+                .receive(completion("old-turn"))
+                .unwrap()
+                .writes
+                .iter()
+                .any(|frame| frame["method"] == "thread/prediction/request")
+        );
+        current.receive(start("turn-two")).unwrap();
+        current.receive(completion("turn-two")).unwrap();
+        current
+            .command(Command::Prompt {
+                text: "My next message".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(
+            current
+                .receive(prediction("thread-exact", "turn-two"))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
+        let mut legacy = adapter();
+        legacy.receive(start("turn-one")).unwrap();
+        let finished = legacy.receive(completion("turn-one")).unwrap();
+        let request = finished
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/prediction/request")
+            .unwrap();
+        let error = legacy
+            .receive(
+                json!({"id":request["id"],"error":{"code":-32601,"message":"Method not found"}}),
+            )
+            .unwrap();
+        assert!(error.events.is_empty());
+        assert!(error.writes.is_empty());
+        assert!(
+            !legacy
+                .receive(completion("turn-two"))
+                .unwrap()
+                .writes
+                .iter()
+                .any(|frame| frame["method"] == "thread/prediction/request")
+        );
+    }
+
+    #[test]
     fn attention_requires_explicit_settlement_of_the_bound_thread() {
         use crate::notifications::Kind;
         for (status, expected) in [
@@ -3514,6 +3689,9 @@ mod tests {
             turn: None,
             busy: false,
             lifecycle_revision: 0,
+            suggestion_turn: None,
+            prediction_turn: None,
+            predictions_unsupported: false,
             subagent_status: None,
             ready: true,
             attached: true,
