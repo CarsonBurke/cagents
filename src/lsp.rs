@@ -1235,7 +1235,16 @@ impl ChildProcess {
     }
 
     async fn settled(child: &mut tokio::process::Child, grace: Duration) -> bool {
-        matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)))
+        let exited = matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)));
+        #[cfg(all(test, target_os = "linux"))]
+        if exited {
+            tests::LSP_AFTER_REAP.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
+        exited
     }
 }
 
@@ -6148,6 +6157,159 @@ mod tests {
     #[cfg(unix)]
     fn published_group(child: &ChildProcess) -> AtomicU32 {
         AtomicU32::new(child.process_group)
+    }
+
+    // Private audit seam: a real scheduler may pause the stop task after its
+    // successful wait reaps the leader. Only the exact isolated namespace test
+    // installs this one-shot hook; production and ordinary tests never do.
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        pub(super) static LSP_AFTER_REAP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "private PID-namespace scheduler-window audit; baseline is expected to fail"]
+    fn lsp_stop_never_signals_a_kernel_reused_group_after_reaping() {
+        use std::cell::RefCell;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::rc::Rc;
+
+        const MARKER: &str = "CAGENTS_AUDIT_LSP_REUSE_CHILD";
+        const PARENT_NAMESPACE: &str = "CAGENTS_AUDIT_LSP_PARENT_PID_NAMESPACE";
+        const TEST: &str = "lsp::tests::lsp_stop_never_signals_a_kernel_reused_group_after_reaping";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new("/usr/bin/unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    TEST,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(MARKER, "1")
+                .env(
+                    PARENT_NAMESPACE,
+                    std::fs::read_link("/proc/self/ns/pid").unwrap(),
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("owned LSP PID-reuse scheduler fixture started"),
+                "the exact namespace test must run: {stdout}; {stderr}"
+            );
+            assert!(
+                output.status.success(),
+                "owned LSP scheduler-window audit failed: {stdout}; {stderr}"
+            );
+            return;
+        }
+        println!("owned LSP PID-reuse scheduler fixture started");
+        assert_eq!(
+            std::process::id(),
+            1,
+            "only owned namespace init may reset PIDs"
+        );
+
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/pid").unwrap().as_os_str(),
+            std::env::var_os(PARENT_NAMESPACE).expect("outer namespace identity"),
+            "PID allocation must be changed only inside a new owned namespace"
+        );
+
+        struct Replacement {
+            child: std::process::Child,
+            pidfd: OwnedFd,
+        }
+        impl Drop for Replacement {
+            fn drop(&mut self) {
+                // SAFETY: the descriptor identifies only our replacement child,
+                // including after the numeric PID has become available again.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = self.child.wait();
+            }
+        }
+        block_on(async {
+            // Runtime initialization precedes PID allocation. It cannot create
+            // another worker thread while the synchronous hook runs.
+            std::fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
+            let child = tokio::process::Command::new("/bin/true")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let group = child.id().unwrap();
+            assert_eq!(group, 200);
+            let child = ChildProcess {
+                child,
+                process_group: group,
+            };
+            let published = published_group(&child);
+            let replacement = Rc::new(RefCell::new(None::<Replacement>));
+            let captured = Rc::clone(&replacement);
+            LSP_AFTER_REAP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    assert!(
+                        !Path::new(&format!("/proc/{group}")).exists(),
+                        "the actual grace wait must have reaped the original leader"
+                    );
+                    std::fs::write("/proc/sys/kernel/ns_last_pid", (group - 1).to_string())
+                        .unwrap();
+                    let child = std::process::Command::new("/bin/sleep")
+                        .arg("30")
+                        .process_group(0)
+                        .spawn()
+                        .unwrap();
+                    assert_eq!(child.id(), group, "kernel must really reuse the PID");
+                    assert_eq!(unsafe { libc::getpgid(group as i32) }, group as i32);
+                    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) } as i32;
+                    assert!(raw >= 0);
+                    *captured.borrow_mut() = Some(Replacement {
+                        child,
+                        // SAFETY: pidfd_open returned a new owned descriptor.
+                        pidfd: unsafe { OwnedFd::from_raw_fd(raw) },
+                    });
+                }));
+            });
+            assert_eq!(child.stop(&published).await, ChildStop::Exited);
+            assert_eq!(published.load(Ordering::Acquire), 0);
+            let mut replacement = replacement.borrow_mut();
+            let replacement = replacement.as_mut().expect("after-reap hook ran");
+            let mut poll = libc::pollfd {
+                fd: replacement.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let exited = unsafe { libc::poll(&mut poll, 1, 250) };
+            let status = replacement.child.try_wait().unwrap();
+            println!(
+                "actual stop reaped original then reused PID/PGID={group}; replacement readiness={exited}; status={status:?}"
+            );
+            assert_eq!(
+                exited, 0,
+                "actual stop killed the unrelated replacement group"
+            );
+            assert!(status.is_none());
+        });
     }
 
     #[test]
