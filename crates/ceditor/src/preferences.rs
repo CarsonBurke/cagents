@@ -10,6 +10,7 @@ const fn default_sidebar_open() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
+    #[serde(with = "session_paths")]
     pub paths: Vec<PathBuf>,
     pub active: Option<usize>,
     #[serde(default = "default_sidebar_open")]
@@ -18,6 +19,66 @@ pub struct Session {
     /// else renders collapsed, so whole project trees stay cheap to load.
     #[serde(default)]
     pub expanded_directories: BTreeMap<String, Vec<String>>,
+}
+
+// UTF-8 paths retain the legacy JSON string representation. Unix filenames
+// that cannot be represented as text carry their original bytes explicitly.
+mod session_paths {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::{OsStrExt, OsStringExt},
+        path::PathBuf,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnixPath<T> {
+        unix_bytes: T,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SavedPath {
+        Text(String),
+        Unix(UnixPath<Vec<u8>>),
+    }
+
+    pub fn serialize<S: Serializer>(paths: &[PathBuf], serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(paths.len()))?;
+        for path in paths {
+            let bytes = path.as_os_str().as_bytes();
+            if bytes.contains(&0) {
+                return Err(serde::ser::Error::custom(
+                    "session path contains a NUL byte",
+                ));
+            }
+            if let Some(text) = path.to_str() {
+                sequence.serialize_element(text)?;
+            } else {
+                sequence.serialize_element(&UnixPath { unix_bytes: bytes })?;
+            }
+        }
+        sequence.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<PathBuf>, D::Error> {
+        Vec::<SavedPath>::deserialize(deserializer)?
+            .into_iter()
+            .map(|path| {
+                let bytes = match path {
+                    SavedPath::Text(text) => text.into_bytes(),
+                    SavedPath::Unix(path) => path.unix_bytes,
+                };
+                if bytes.contains(&0) {
+                    return Err(serde::de::Error::custom("session path contains a NUL byte"));
+                }
+                Ok(PathBuf::from(OsString::from_vec(bytes)))
+            })
+            .collect()
+    }
 }
 
 impl Default for Session {
@@ -308,6 +369,98 @@ mod tests {
             serde_json::from_reader::<_, Session>(previous_reader).unwrap(),
             session
         );
+    }
+
+    #[test]
+    fn legacy_session_paths_remain_strings_and_preserve_no_selection() {
+        let document = r#"{"paths":["/project/z\nλ.txt","/project/a.txt"],"active":null}"#;
+        let session: Session = serde_json::from_str(document).unwrap();
+        assert_eq!(session.active, None);
+        assert_eq!(
+            session.paths,
+            vec![PathBuf::from("/project/z\nλ.txt"), "/project/a.txt".into()]
+        );
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            encoded["paths"],
+            serde_json::from_str::<serde_json::Value>(document).unwrap()["paths"]
+        );
+        assert!(
+            session
+                .startup_paths(Vec::new())
+                .iter()
+                .all(|(_, focus)| !focus)
+        );
+    }
+
+    #[test]
+    fn raw_byte_session_paths_save_order_selection_and_atomic_replacement() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.toml");
+        let raw = directory
+            .path()
+            .join(OsString::from_vec(b"raw-\xff.txt".to_vec()));
+        let normal = directory.path().join("normal.txt");
+        let mut session = Session {
+            paths: vec![normal.clone(), raw.clone()],
+            active: Some(1),
+            ..Session::default()
+        };
+        save_session(&settings, &session).unwrap();
+        assert_eq!(load_session(&settings).unwrap(), session);
+        let mut previous_reader =
+            std::fs::File::open(settings.with_file_name("session.json")).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_reader(previous_reader.try_clone().unwrap()).unwrap();
+        assert_eq!(document["paths"][0], normal.to_str().unwrap());
+        assert_eq!(
+            document["paths"][1]["unix_bytes"],
+            serde_json::json!(raw.as_os_str().as_encoded_bytes())
+        );
+        session.paths.swap(0, 1);
+        session.active = None;
+        save_session(&settings, &session).unwrap();
+        assert_eq!(load_session(&settings).unwrap(), session);
+        // A reader of the old inode still sees the complete prior snapshot.
+        std::io::Seek::rewind(&mut previous_reader).unwrap();
+        let previous: Session = serde_json::from_reader(previous_reader).unwrap();
+        assert_eq!(previous.paths, vec![normal, raw]);
+        assert_eq!(previous.active, Some(1));
+    }
+
+    #[test]
+    fn invalid_session_paths_do_not_replace_a_saved_snapshot() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.toml");
+        let original = Session {
+            paths: vec!["/project/a.txt".into()],
+            active: Some(0),
+            ..Session::default()
+        };
+        save_session(&settings, &original).unwrap();
+        let invalid = Session {
+            paths: vec![OsString::from_vec(b"bad\0path".to_vec()).into()],
+            ..Session::default()
+        };
+        assert!(save_session(&settings, &invalid).is_err());
+        assert_eq!(load_session(&settings).unwrap(), original);
+    }
+
+    #[test]
+    fn malformed_session_paths_are_rejected() {
+        for paths in [
+            r#"[{"unix_bytes":[256]}]"#,
+            r#"[{"unix_bytes":[0]}]"#,
+            r#"["bad\u0000path"]"#,
+            r#"[{"unix_bytes":[255],"extra":true}]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Session>(&format!(r#"{{"paths":{paths},"active":null}}"#))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

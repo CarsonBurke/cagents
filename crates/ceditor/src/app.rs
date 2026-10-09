@@ -6577,6 +6577,55 @@ mod tests {
     }
 
     #[test]
+    fn opened_raw_byte_tabs_persist_and_restore_real_session_files() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let normal = root.join("normal.txt");
+        let raw = root.join(OsString::from_vec(b"raw-\xff.txt".to_vec()));
+        std::fs::write(&normal, "normal contents\n").unwrap();
+        std::fs::write(&raw, "raw contents\n").unwrap();
+        let mut app = configured(&directory);
+        for (path, contents) in [(&normal, "normal contents\n"), (&raw, "raw contents\n")] {
+            drop(app.update(Message::DocumentOpened(
+                0,
+                None,
+                Editor::resolve_open(path.clone()),
+            )));
+            let id = app.active.unwrap();
+            load_selected(&mut app, id);
+            assert_eq!(
+                app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                Some(contents)
+            );
+            flush_session(&mut app);
+        }
+        let saved = crate::preferences::load_session(&app.settings_path).unwrap();
+        assert_eq!(saved.paths, vec![normal, raw]);
+        assert_eq!(saved.active, Some(1));
+        let opened = saved
+            .startup_paths(Vec::new())
+            .into_iter()
+            .map(|(path, focus)| (focus, Editor::resolve_open(path)))
+            .collect();
+        let mut restored = configured(&directory);
+        restored.restoring_session = true;
+        drop(restored.update(Message::SessionOpened(0, opened)));
+        assert_eq!(restored.session(), saved);
+        let id = restored.active.unwrap();
+        load_selected(&mut restored, id);
+        assert_eq!(
+            restored.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("raw contents\n")
+        );
+        flush_session(&mut restored);
+        assert_eq!(
+            crate::preferences::load_session(&restored.settings_path).unwrap(),
+            saved
+        );
+    }
+
+    #[test]
     fn explicit_startup_file_is_selected_without_duplicating_a_restored_tab() {
         let mut app = editor();
         let opened = |file: &str| {
