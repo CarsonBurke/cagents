@@ -926,7 +926,7 @@ impl Cagents {
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
             // local runtime available in the destination view.
-            match self.cards.get(&id) {
+            match self.cards.get_mut(&id) {
                 Some(CardRuntime::Terminal(surface)) => {
                     let _ = surface.focus(false);
                     let _ = surface.hide();

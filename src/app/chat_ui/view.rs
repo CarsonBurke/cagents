@@ -2719,7 +2719,8 @@ impl Runtime {
                         cached.token,
                         cached.image.as_ref().map(iced::widget::image::Handle::id),
                         cached.image_source.is_some(),
-                        cached.image_requested,
+                        self.preview_request.as_deref() == Some(item.id.as_str()),
+                        cached.image_wait.is_some(),
                         cached.image_unavailable,
                     )
                 })

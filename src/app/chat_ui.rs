@@ -188,7 +188,7 @@ pub enum Action {
     OpenDocument(Target, String),
     OpenImage(Target, String),
     LoadImage(Target, String),
-    ImageLoaded(Target, Arc<chat::Item>, images::Loaded),
+    ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
@@ -856,8 +856,10 @@ struct CachedItem {
     image: Option<iced::widget::image::Handle>,
     image_source: Option<Arc<chat::Item>>,
     image_item: Option<Arc<chat::Item>>,
-    image_requested: bool,
     image_unavailable: bool,
+    image_attempt: u64,
+    image_wait: Option<images::Pressure>,
+    image_evicted: bool,
 }
 impl CachedItem {
     #[cfg(test)]
@@ -873,7 +875,15 @@ impl CachedItem {
         expanded: bool,
         growing: bool,
     ) -> Self {
-        let (image, image_source, image_item, image_requested, image_unavailable) = previous
+        let (
+            image,
+            image_source,
+            image_item,
+            image_unavailable,
+            image_attempt,
+            image_wait,
+            image_evicted,
+        ) = previous
             .as_ref()
             .filter(|cached| cached.token == ChangeToken::of(content))
             .map(|cached| {
@@ -881,8 +891,10 @@ impl CachedItem {
                     cached.image.clone(),
                     cached.image_source.clone(),
                     cached.image_item.clone(),
-                    cached.image_requested,
                     cached.image_unavailable,
+                    cached.image_attempt,
+                    cached.image_wait.clone(),
+                    cached.image_evicted,
                 )
             })
             .unwrap_or_default();
@@ -946,8 +958,10 @@ impl CachedItem {
             image,
             image_source,
             image_item,
-            image_requested,
             image_unavailable,
+            image_attempt,
+            image_wait,
+            image_evicted,
         };
         match content {
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
@@ -1316,6 +1330,8 @@ pub(super) struct Runtime {
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
     cache: HashMap<String, CachedItem>,
+    /// Only the latest explicitly requested preview is retained outside recency.
+    preview_request: Option<String>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
     /// The snapshot's items grouped into stretches of work, rebuilt only when
@@ -1853,6 +1869,7 @@ impl Runtime {
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
+            preview_request: None,
             syntax_theme,
             turns: Vec::new(),
             selected_subagent: None,
@@ -2232,6 +2249,7 @@ impl Runtime {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
+        images::sync(self);
         self.refresh_find();
     }
 
@@ -2278,8 +2296,9 @@ impl Runtime {
                     .min(self.find_matches.len().saturating_sub(1))
             });
     }
-    pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
+    pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        images::sync(self);
         self.present()
     }
     /// Tells the connection whether to keep the card's snapshot current.
@@ -7015,6 +7034,7 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    images::sync(runtime);
                 }
             }
             Action::Copy(target, id, part) => {
@@ -7067,30 +7087,7 @@ impl Cagents {
             }
             Action::LoadImage(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let item = runtime
-                        .snapshot
-                        .items
-                        .iter()
-                        .chain(
-                            runtime
-                                .snapshot
-                                .subagents
-                                .iter()
-                                .flat_map(|agent| &agent.items),
-                        )
-                        .find(|item| {
-                            item.id == id && matches!(item.content, ItemContent::Image { .. })
-                        })
-                        .cloned();
-                    if let Some(cached) = runtime.cache.get_mut(&id)
-                        && let Some(item) = item
-                    {
-                        cached.image_item = Some(item.clone());
-                        cached.image_source = Some(item);
-                        cached.image = None;
-                        cached.image_requested = true;
-                        cached.image_unavailable = false;
-                    }
+                    images::request(runtime, &id);
                 }
             }
             Action::RetryThumbnails(target) => {
@@ -7103,37 +7100,24 @@ impl Cagents {
                     runtime.thumbnails.complete(&path, loaded);
                 }
             }
-            Action::ImageLoaded(target, item, loaded) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && runtime
-                        .snapshot
-                        .items
-                        .iter()
-                        .chain(
-                            runtime
-                                .snapshot
-                                .subagents
-                                .iter()
-                                .flat_map(|agent| &agent.items),
-                        )
-                        .any(|current| current.id == item.id && current.content == item.content)
-                    && let Some(cached) = runtime.cache.get_mut(&item.id)
-                    && cached
-                        .image_item
-                        .as_ref()
-                        .is_some_and(|current| current.content == item.content)
-                    && cached
-                        .image_source
-                        .as_ref()
-                        .is_some_and(|source| Arc::ptr_eq(source, &item))
-                {
-                    cached.image_source = None;
-                    cached.image_requested = false;
-                    cached.image_unavailable = matches!(loaded, images::Loaded::Unavailable);
-                    cached.image = match loaded {
-                        images::Loaded::Ready(handle) => Some(handle),
-                        _ => None,
-                    };
+            Action::ImageLoaded(target, item, attempt, loaded) => {
+                let explicit_pressure = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| images::complete(runtime, &item, attempt, loaded));
+                if let Some(mut missing) = explicit_pressure {
+                    // Explicit reader interest outranks automatic previews in
+                    // other panes too. Their live widget/gallery clones keep
+                    // their leases until redraw or close actually retires them.
+                    for card in self.cards.values_mut() {
+                        if let CardRuntime::Chat(runtime) = card
+                            && runtime.target != target
+                        {
+                            missing = images::evict_ready(runtime, missing);
+                            if missing == 0 {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             Action::OpenImage(target, id) => {
@@ -8118,6 +8102,7 @@ mod tests {
             CardRuntime::Chat(runtime) => runtime,
             _ => unreachable!(),
         };
+        runtime.visible.store(true, Ordering::Relaxed);
         let mut cached = CachedItem::new(&current.content, runtime.syntax_theme);
         cached.image_source = Some(current.clone());
         cached.image_item = Some(current.clone());
@@ -8128,6 +8113,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::ImageLoaded(
             target,
             old,
+            0,
             images::Loaded::Ready(handle()),
         )));
         assert!(chat_runtime(&app, card).cache["image"].image.is_none());
@@ -8138,12 +8124,14 @@ mod tests {
         drop(app.handle_chat_ui(Action::ImageLoaded(
             retired,
             current.clone(),
+            0,
             images::Loaded::Ready(handle()),
         )));
         assert!(chat_runtime(&app, card).cache["image"].image.is_none());
         drop(app.handle_chat_ui(Action::ImageLoaded(
             target,
             current,
+            0,
             images::Loaded::Ready(handle()),
         )));
         assert!(chat_runtime(&app, card).cache["image"].image.is_some());
@@ -8153,7 +8141,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            Action::ImageLoaded(target, image("/unused"), images::Loaded::Unavailable)
+            Action::ImageLoaded(target, image("/unused"), 0, images::Loaded::Unavailable)
                 .allowed_while_modal()
         );
     }
@@ -8199,6 +8187,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::ImageLoaded(
             target,
             old,
+            0,
             images::Loaded::Ready(iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4])),
         )));
         assert!(chat_runtime(&app, card).cache["image"].image.is_none());
@@ -8211,6 +8200,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::ImageLoaded(
             target,
             changed.clone(),
+            0,
             images::Loaded::Ready(iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4])),
         )));
         assert!(chat_runtime(&app, card).cache["image"].image.is_some());
@@ -8229,6 +8219,357 @@ mod tests {
                 .is_some()
         );
     }
+    fn preview_item(id: &str) -> Arc<chat::Item> {
+        Arc::new(chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Image {
+                path: format!("/{id}.png"),
+                description: id.into(),
+            },
+            started_at: None,
+            at: None,
+        })
+    }
+    fn preview_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut bytes),
+            &[1, 2, 3, 255],
+            1,
+            1,
+            image::ExtendedColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        bytes
+    }
+    fn preview_items(runtime: &mut Runtime, items: &[Arc<chat::Item>]) {
+        Arc::make_mut(&mut runtime.snapshot).items = items.to_vec();
+        for item in items {
+            runtime.cache.entry(item.id.clone()).or_insert_with(|| {
+                let mut cached = CachedItem::new(&item.content, runtime.syntax_theme);
+                cached.image_item = Some(item.clone());
+                cached.image_source = Some(item.clone());
+                cached
+            });
+        }
+        runtime.visible.store(true, Ordering::Relaxed);
+        images::sync(runtime);
+    }
+    fn finish_preview(runtime: &mut Runtime, item: &Arc<chat::Item>, loaded: images::Loaded) {
+        let attempt = runtime.cache[&item.id].image_attempt;
+        images::complete(runtime, item, attempt, loaded);
+    }
+    #[test]
+    fn preview_pressure_admits_newer_images_only_after_retained_trees_release_pixels() {
+        use iced::advanced::{layout, widget::Tree};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let items: Vec<_> = (0..3)
+            .map(|index| preview_item(&format!("image-{index}")))
+            .collect();
+        let bytes = preview_png();
+        let budget = images::Budget::new(1024, 8);
+        preview_items(runtime, &items[..2]);
+        for item in items[..2].iter().rev() {
+            finish_preview(
+                runtime,
+                item,
+                images::bounded_handle(bytes.clone(), &budget),
+            );
+        }
+        let gallery = images::Gallery::new(runtime, &items[0].id).unwrap();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut trees = Vec::new();
+        for item in &items[..2] {
+            let handle = runtime.cache[&item.id].image.clone().unwrap();
+            // Exercise the real Memo's retained content, not just a handle
+            // variable: dropping the frame leaves its tree owning pixels.
+            let mut frame = retained::kept(1, move || iced::widget::image(handle.clone()).into());
+            let mut tree = Tree::new(frame.as_widget());
+            frame.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 200.0)),
+            );
+            drop(frame);
+            trees.push(tree);
+        }
+        preview_items(runtime, &items);
+        let deferred = images::bounded_handle(bytes.clone(), &budget);
+        assert!(matches!(deferred, images::Loaded::Deferred(_)));
+        finish_preview(runtime, &items[2], deferred);
+        let pressure = runtime.cache[&items[2].id].image_wait.clone().unwrap();
+        assert!(runtime.cache[&items[0].id].image.is_none());
+        assert!(runtime.cache[&items[0].id].image_source.is_none());
+        assert!(runtime.cache[&items[0].id].image_evicted);
+        assert!(
+            runtime.cache[&items[1].id].image.is_some(),
+            "only the oldest owner needs eviction"
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        assert!(
+            executor
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(10), pressure.available()).await
+                })
+                .is_err(),
+            "evicting application handles does not retire retained pixels"
+        );
+        drop(gallery);
+        assert!(
+            executor
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(10), pressure.available()).await
+                })
+                .is_err(),
+            "retained Memo trees still own the released gallery's pixels"
+        );
+        for _ in 0..10 {
+            images::sync(runtime);
+            assert_eq!(images::subscriptions(runtime).len(), 1);
+            assert!(runtime.cache[&items[0].id].image_source.is_none());
+        }
+        drop(trees.remove(0));
+        executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), pressure.available())
+                .await
+                .unwrap();
+        });
+        finish_preview(
+            runtime,
+            &items[2],
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        assert!(runtime.cache[&items[2].id].image.is_some());
+        assert!(images::subscriptions(runtime).is_empty());
+        // Even after the other stale tree goes away, pressure-evicted recent
+        // candidates do not automatically recreate an eviction/decode loop.
+        drop(trees);
+        images::sync(runtime);
+        assert!(images::subscriptions(runtime).is_empty());
+        images::request(runtime, &items[0].id);
+        finish_preview(
+            runtime,
+            &items[0],
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        let pressure = runtime.cache[&items[0].id].image_wait.clone().unwrap();
+        executor.block_on(pressure.available());
+        finish_preview(runtime, &items[0], images::bounded_handle(bytes, &budget));
+        assert!(runtime.cache[&items[0].id].image.is_some());
+        assert_eq!(
+            runtime.preview_request.as_deref(),
+            Some(items[0].id.as_str())
+        );
+    }
+    #[test]
+    fn preview_interest_bounds_manual_requests_and_suppresses_over_budget_recent_candidates() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let items: Vec<_> = (0..20)
+            .map(|index| preview_item(&format!("image-{index}")))
+            .collect();
+        preview_items(runtime, &items);
+        let bytes = preview_png();
+        let budget = images::Budget::new(1024, 8);
+        // Newest first: two fit, the third cannot displace higher-priority
+        // previews and does not keep retrying just because it remains recent.
+        for item in items.iter().rev().take(3) {
+            finish_preview(
+                runtime,
+                item,
+                images::bounded_handle(bytes.clone(), &budget),
+            );
+        }
+        assert!(runtime.cache[&items[17].id].image_evicted);
+        assert!(runtime.cache[&items[17].id].image_source.is_none());
+        for item in items.iter().take(12) {
+            images::request(runtime, &item.id);
+            assert_eq!(runtime.preview_request.as_deref(), Some(item.id.as_str()));
+            assert!(
+                runtime
+                    .cache
+                    .values()
+                    .filter(|cached| cached.image_source.is_some())
+                    .count()
+                    <= 9
+            );
+        }
+        assert!(runtime.cache[&items[0].id].image_source.is_none());
+        assert_eq!(images::subscriptions(runtime).len(), 1);
+        let requested = &items[11];
+        finish_preview(
+            runtime,
+            requested,
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        let pressure = runtime.cache[&requested.id].image_wait.clone().unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(pressure.available());
+        finish_preview(runtime, requested, images::bounded_handle(bytes, &budget));
+        assert!(runtime.cache[&requested.id].image.is_some());
+        assert!(runtime.cache[&items[19].id].image_source.is_none());
+    }
+    #[test]
+    fn preview_transient_pressure_retries_without_retiring_ready_images() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let items: Vec<_> = (0..3)
+            .map(|index| preview_item(&format!("image-{index}")))
+            .collect();
+        let bytes = preview_png();
+        let budget = images::Budget::new(1024, 12);
+        preview_items(runtime, &items[..2]);
+        for item in &items[..2] {
+            finish_preview(
+                runtime,
+                item,
+                images::bounded_handle(bytes.clone(), &budget),
+            );
+        }
+        preview_items(runtime, &items);
+        let decoder = budget.block_decoder();
+        finish_preview(
+            runtime,
+            &items[2],
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        assert!(runtime.cache[&items[0].id].image.is_some());
+        assert!(runtime.cache[&items[1].id].image.is_some());
+        assert!(!runtime.cache[&items[2].id].image_evicted);
+        let pressure = runtime.cache[&items[2].id].image_wait.clone().unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        assert!(
+            executor
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(10), pressure.available()).await
+                })
+                .is_err()
+        );
+        drop(decoder);
+        executor.block_on(pressure.available());
+        finish_preview(runtime, &items[2], images::bounded_handle(bytes, &budget));
+        assert!(runtime.cache[&items[2].id].image.is_some());
+    }
+
+    #[test]
+    fn preview_hide_and_subagent_switch_release_owners_and_fence_late_attempts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let parent = preview_item("parent");
+        let child = preview_item("child-image");
+        let bytes = preview_png();
+        let budget = images::Budget::new(1024, 4);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        preview_items(runtime, &[parent.clone()]);
+        let parent_attempt = runtime.cache[&parent.id].image_attempt;
+        finish_preview(
+            runtime,
+            &parent,
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        let mut cached = CachedItem::new(&child.content, runtime.syntax_theme);
+        cached.image_item = Some(child.clone());
+        runtime.cache.insert(child.id.clone(), cached);
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                background: false,
+                items: vec![child.clone()],
+            });
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        assert!(chat_runtime(&app, card).cache[&parent.id].image.is_none());
+        // The real lease can now be acquired for the selected transcript.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let child_attempt = runtime.cache[&child.id].image_attempt;
+        finish_preview(
+            runtime,
+            &child,
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        assert!(runtime.cache[&child.id].image.is_some());
+        runtime.set_visible(false).unwrap();
+        assert!(runtime.cache[&child.id].image.is_none());
+        runtime.set_visible(true).unwrap();
+        assert_ne!(runtime.cache[&child.id].image_attempt, child_attempt);
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            child.clone(),
+            child_attempt,
+            images::bounded_handle(bytes.clone(), &budget),
+        )));
+        assert!(chat_runtime(&app, card).cache[&child.id].image.is_none());
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            parent.clone(),
+            parent_attempt,
+            images::bounded_handle(bytes.clone(), &budget),
+        )));
+        assert!(chat_runtime(&app, card).cache[&parent.id].image.is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        finish_preview(runtime, &child, images::bounded_handle(bytes, &budget));
+        assert!(runtime.cache[&child.id].image.is_some());
+    }
+    #[test]
+    fn explicit_preview_pressure_can_retire_automatic_owners_in_other_panes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let owner = draft_chat(&mut app);
+        let owner_target = chat_runtime(&app, owner).target;
+        let requested_card = draft_chat(&mut app);
+        let target = chat_runtime(&app, requested_card).target;
+        let old = preview_item("old");
+        let requested = preview_item("requested");
+        let bytes = preview_png();
+        let budget = images::Budget::new(1024, 4);
+        let runtime = app.chat_runtime_mut(owner_target).unwrap();
+        preview_items(runtime, &[old.clone()]);
+        finish_preview(
+            runtime,
+            &old,
+            images::bounded_handle(bytes.clone(), &budget),
+        );
+        preview_items(app.chat_runtime_mut(target).unwrap(), &[requested.clone()]);
+        drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
+        let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            requested.clone(),
+            attempt,
+            images::bounded_handle(bytes.clone(), &budget),
+        )));
+        assert!(chat_runtime(&app, owner).cache[&old.id].image.is_none());
+        assert!(chat_runtime(&app, owner).cache[&old.id].image_evicted);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let pressure = runtime.cache[&requested.id].image_wait.clone().unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(pressure.available());
+        finish_preview(runtime, &requested, images::bounded_handle(bytes, &budget));
+        assert!(runtime.cache[&requested.id].image.is_some());
+    }
+
     #[test]
     fn image_loading_only_subscribes_recent_visible_images_and_explicit_older_requests() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -8258,9 +8599,9 @@ mod tests {
         }
         Arc::make_mut(&mut runtime.snapshot).items = items;
         runtime.visible.store(true, Ordering::Relaxed);
-        assert_eq!(images::subscriptions(runtime).len(), 8);
-        runtime.cache.get_mut("image-0").unwrap().image_requested = true;
-        assert_eq!(images::subscriptions(runtime).len(), 9);
+        assert_eq!(images::subscriptions(runtime).len(), 1);
+        images::request(runtime, "image-0");
+        assert_eq!(images::subscriptions(runtime).len(), 1);
         let child = Arc::new(chat::Item {
             id: "child-image".into(),
             role: chat::Role::Assistant,
@@ -8286,11 +8627,11 @@ mod tests {
             });
         // Hidden child transcripts and the explicit parent request do not
         // consume worker slots while another transcript is selected.
-        assert_eq!(images::subscriptions(runtime).len(), 9);
+        assert_eq!(images::subscriptions(runtime).len(), 1);
         runtime.selected_subagent = Some("child".into());
         assert_eq!(images::subscriptions(runtime).len(), 1);
         runtime.selected_subagent = None;
-        assert_eq!(images::subscriptions(runtime).len(), 9);
+        assert_eq!(images::subscriptions(runtime).len(), 1);
         runtime.visible.store(false, Ordering::Relaxed);
         assert!(images::subscriptions(runtime).is_empty());
     }
@@ -8343,9 +8684,8 @@ mod tests {
     fn local_followups_stay_separate_and_are_taken_back_or_removed_one_at_a_time() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("followup"));
-        let runtime = app
-            .chat_runtime_mut(chat_runtime(&app, card).target)
-            .unwrap();
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
         Arc::make_mut(&mut runtime.snapshot).busy = true;
         Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
         let target = runtime.target;
@@ -12740,7 +13080,7 @@ mod tests {
         handle.replace_snapshot_for_test(Snapshot::default());
         answer_start(&mut app, target, Ok(handle.clone()));
         assert_eq!(pending_step(&app, card), None);
-        let runtime = chat_runtime(&app, card);
+        let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.queued.is_some());
         let _ = runtime.set_visible(false);
         assert!(

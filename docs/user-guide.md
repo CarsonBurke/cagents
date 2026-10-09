@@ -627,6 +627,14 @@ the conversation available and explains the refusal without starting a writer.
 
 ### Messages, branches, and child agents
 
+Chat loads recent image previews first. **Load preview** gives the selected image
+priority, including older images. When preview memory is full, older previews
+return to that button so newer or explicitly requested images can load. A
+preview waiting for memory resumes when its previous owners are released;
+closing an image gallery or switching away from its transcript can release
+that memory. Only the latest explicit older-image request is kept alongside
+recent previews.
+
 **Steer** delivers a correction during the current turn; **Queue** schedules a
 later turn. While an agent works, the send key (Enter, or `Ctrl+Enter` when
 Enter is set to break the line) steers where the provider can and queues
