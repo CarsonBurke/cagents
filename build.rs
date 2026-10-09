@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA");
     let base = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
     let metadata = match std::env::var("CAGENTS_BUILD_METADATA") {

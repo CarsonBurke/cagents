@@ -135,6 +135,23 @@ with standard Cargo controls: `CARGO_BUILD_JOBS` also applies to the runner,
 and `-j` takes precedence for a single invocation. Run the isolated feature
 lanes sequentially, not as concurrent cold builds.
 
+Worktrees can share Cargo's target and build directories. Cargo makes path
+packages relocatable and compares source timestamps, so an older checkout can
+otherwise reuse another checkout's code and version stamp. The local Cargo
+configuration supplies `CAGENTS_CHECKOUT_ROOT`; our workspace crates track it
+in compiler dep-info, and the version build script watches it as well. Switching
+checkouts rebuilds owned code while keeping the third-party cache warm. Keep
+this identity reference in new owned workspace crates. Cargo must run from
+this checkout or its descendants so it reads the local configuration.
+
+`python3 scripts/qualify-checkout-cache.py` verifies the boundary using a small,
+offline workspace in `/var/tmp`: an unfixed control reproduces stale reuse,
+then the actual configuration and build script follow A → B → A with the same
+commit, different dirty sources, and old timestamps. It also verifies that an
+unchanged dependency remains cached. Pass `--evidence PATH` to retain the
+fixture and Cargo logs in a new directory. Run it sequentially with other Cargo
+workloads.
+
 ```sh
 # Reduce compilation concurrency further on a memory-constrained host.
 CARGO_BUILD_JOBS=1 scripts/run-development --browserless

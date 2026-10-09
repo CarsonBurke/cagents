@@ -1,3 +1,7 @@
+// Track the configured checkout identity in compiler dep-info, including when
+// another worktree's source mtimes predate the shared cached artifact.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 /// The version this build reports about itself: the product version plus the
 /// build metadata `build.rs` resolved (`0.1.3+local.3d80e6d`), or the bare
 /// product version for a release build. Use this to verify an installed build's
