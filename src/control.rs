@@ -207,7 +207,7 @@ pub enum DaemonCommand {
         /// Approve the displayed impact without an interactive prompt.
         #[arg(long)]
         yes: bool,
-        /// Permit interruption of active native turns that cannot stay alive.
+        /// Permit active native turns and their background subagents to stop.
         #[arg(long)]
         interrupt: bool,
     },
@@ -228,7 +228,7 @@ pub enum DaemonCommand {
     Preflight,
     /// Checkpoint resumable sessions and stop for a full application upgrade.
     PrepareUpgrade {
-        /// Authorize interruption and resumption of all supported hosted sessions.
+        /// Restart hosted sessions, stopping their turns and background subagents.
         #[arg(long)]
         yes: bool,
         /// Relaunch identified agents without an exact resume ID into their resume picker.
@@ -249,7 +249,11 @@ pub enum DaemonCommand {
     ProtocolVersion,
     /// Stop any development daemon without relying on its wire protocol.
     #[command(hide = true)]
-    StopForRebuild,
+    StopForRebuild {
+        /// Confirm that every development job, including background subagents, stops.
+        #[arg(long)]
+        including_subagents: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1990,7 +1994,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::UpdateWorker { .. }
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
-                command: DaemonCommand::ProtocolVersion | DaemonCommand::StopForRebuild
+                command: DaemonCommand::ProtocolVersion | DaemonCommand::StopForRebuild { .. }
             }
     )
 }
@@ -2486,8 +2490,9 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     }
                     let preflight = client.shutdown_preflight().map_err(protocol_error)?;
                     eprint!(
-                        "Stop daemon and terminate {} hosted terminal/chat sessions (including pending spawns and unconfirmed provider work)? Type yes to confirm: ",
-                        preflight.capability.live_terminals
+                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                        preflight.capability.live_terminals,
+                        preflight.capability.background_subagents
                     );
                     io::stderr()
                         .flush()
@@ -2535,7 +2540,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             if !yes {
                 return Err(AppError::new(
                     "confirmation_required",
-                    "full upgrade restarts the daemon: terminals are carried across where the running daemon supports it, and other sessions resume in new processes, which interrupts their jobs; pass --yes to proceed",
+                    "full upgrade restarts the daemon: terminals are carried across where supported; other sessions resume in new processes, stopping their active turns and background subagents. Background work will not resume automatically; pass --yes to proceed",
                 ));
             }
             let relaunch_agents = if relaunch_agents || no_relaunch_agents {
@@ -2586,7 +2591,15 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 ),
             })
         }
-        DaemonCommand::StopForRebuild => {
+        DaemonCommand::StopForRebuild {
+            including_subagents,
+        } => {
+            if !including_subagents {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "Rebuilding stops all development terminal/chat jobs and their background subagents; pass --including-subagents to permit this.",
+                ));
+            }
             let stopped = crate::daemon::terminate_daemon_from_lock()
                 .map_err(|error| AppError::new("daemon_process", error))?;
             Ok(CommandOutput {
@@ -2695,9 +2708,9 @@ pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
 /// confirmation, which have room for a sentence rather than the CLI's full
 /// account of what was and was not requested.
 pub fn shutdown_outcome_summary(outcome: &ShutdownOutcome) -> String {
-    let terminals = |count: u64| match count {
-        1 => "1 terminal".to_owned(),
-        count => format!("{count} terminals"),
+    let sessions = |count: u64| match count {
+        1 => "1 hosted session".to_owned(),
+        count => format!("{count} hosted sessions"),
     };
     match *outcome {
         ShutdownOutcome::Accepted {
@@ -2707,13 +2720,13 @@ pub fn shutdown_outcome_summary(outcome: &ShutdownOutcome) -> String {
         ShutdownOutcome::Accepted {
             live_terminals_before,
             ..
-        } => format!("Stopping… {} will close", terminals(live_terminals_before)),
+        } => format!("Stopping… {} will close", sessions(live_terminals_before)),
         ShutdownOutcome::EmptyRequired { current_count }
         | ShutdownOutcome::ConfirmationRequired { current_count } => {
-            format!("Stop needs confirmation: {} open", terminals(current_count))
+            format!("Stop needs confirmation: {} open", sessions(current_count))
         }
         ShutdownOutcome::InventoryChanged { current_count } => format!(
-            "Not stopped: the open terminals changed ({} now). Try again.",
+            "Not stopped: hosted sessions or background tasks changed ({} sessions now). Refresh and try again.",
             current_count
         ),
         ShutdownOutcome::Expired => "Not stopped: the confirmation expired. Try again.".into(),
@@ -3458,6 +3471,32 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
+        let error = execute_daemon(DaemonCommand::StopForRebuild {
+            including_subagents: false,
+        })
+        .err()
+        .expect("unconfirmed rebuild must refuse before process lookup");
+        assert_eq!(error.kind, "confirmation_required");
+        assert!(error.message.contains("--including-subagents"));
+        let cli = Cli::try_parse_from([
+            "cagents",
+            "daemon",
+            "stop-for-rebuild",
+            "--including-subagents",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::StopForRebuild {
+                    including_subagents: true
+                }
+            }
+        ));
+    }
+
     #[cfg(feature = "ui")]
     #[test]
     fn remote_ui_launch_does_not_read_a_local_daemon_handoff() {

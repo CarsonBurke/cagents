@@ -87,7 +87,7 @@ scripts/run-development                 # with the embedded browser
 | --- | --- |
 | `--browserless` | Build without Servo and open saved browser URLs in the system browser |
 | `--debug` | Enable Rust backtraces and `cagents=debug,cagentsd=debug,warn` tracing; an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
-| `--fresh-daemon` | Stop the existing development daemon after all three builds succeed, before launching |
+| `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
@@ -101,7 +101,9 @@ Use `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or
 process-lifecycle code, so the UI cannot reconnect to an older development
 daemon. It compiles a feature-matched control CLI, pins and validates the
 isolated daemon through a Linux pidfd, and signals it without depending on the
-old wire protocol. Stopping it terminates its hosted development terminals.
+old wire protocol. Selecting `--fresh-daemon` explicitly permits stopping every hosted development
+terminal/chat job and its background subagents. Background work will not resume
+automatically. The runner prints this impact before signaling the daemon.
 
 How the runner works:
 

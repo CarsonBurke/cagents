@@ -37,6 +37,22 @@ cagents agent interrupt 1a2b
 cagents agent close 1a2b
 ```
 
+An interrupt may also stop the provider's running background subagents (Claude
+does this). The daemon refuses that interrupt unless you pass
+`--including-subagents`. It checks the current tasks at provider dispatch, so a
+background task that starts after your status check remains protected. To stop
+just one task, use its subagent Stop action in chat instead. The provider console
+uses `/interrupt` with the same safeguard; `/interrupt --including-subagents`
+explicitly permits stopping the background work. Stopped background tasks do not
+resume automatically. Closing an agent stops the entire owned conversation and
+its background tasks.
+
+Daemon Stop confirmation counts running background subagents as well as hosted
+sessions. If those tasks change before confirmation is accepted, refresh the
+preview and confirm again. An update with **When idle** waits for background work
+to finish; **Interrupt** previews which background tasks will stop. New affected
+tasks require fresh update confirmation.
+
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
 Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status and single-handle wait return `data.agent`, `data.run`, and `data.timed_out`; a multi-handle wait returns `data.results` (each with `agent` and `run`) and `data.timed_out`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
@@ -107,7 +123,7 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 `--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console streams a bounded transcript, structured usage, run outcomes, approvals, and questions.
 
 - Ordinary input submits a new durable run.
-- `/interrupt` requests interruption through the native adapter.
+- `/interrupt` requests interruption through the native adapter. It refuses an interruption that would stop running background subagents; `/interrupt --including-subagents` permits that wider impact. A successful interrupt takes the agent over; a refusal leaves its owner in control.
 - `/answer REQUEST_ID ACTION [ANSWERS_JSON]` answers only the explicit displayed request/action. The optional JSON is an array of `{"field":"FIELD_ID","values":["VALUE"]}` objects. Unlike `cagents agent answer`, console input is a person at the agent's controls, so it takes the agent over.
 - `/quit` detaches the console; the provider remains hosted.
 - Closing the terminal card follows normal active-work confirmation and retires the exact paired actor.

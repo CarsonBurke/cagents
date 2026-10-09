@@ -398,7 +398,7 @@ pub enum Operation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Control {
     /// Interrupt the latest run while it is active.
-    Interrupt,
+    Interrupt { including_subagents: bool },
     /// Answer one displayed request with one of its explicit actions.
     Answer {
         request_id: String,
@@ -409,6 +409,9 @@ pub enum Control {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleCommand {
+    Interrupt {
+        including_subagents: bool,
+    },
     Read {
         after_generation: Option<u64>,
         after_run: Option<(RunId, u64)>,

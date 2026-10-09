@@ -483,7 +483,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
     use std::io::IsTerminal;
     if !yes && !io::stdin().is_terminal() {
         return Err(invalid(
-            "Review the update in the app, or pass --yes to approve its displayed impact; --interrupt additionally permits active native turns to stop.",
+            "Review the update in the app, or pass --yes to approve its displayed impact; --interrupt additionally permits active native turns and their background subagents to stop.",
         ));
     }
     let layout = locate(&std::env::current_exe()?)?;

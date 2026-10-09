@@ -126,7 +126,9 @@ use crate::{
 /// and whether the provider's interrupt stops them, reports a stopped one,
 /// and carries process-scoped turn generations for cancellation confirmation.
 /// Version 61 carries owner-scoped agent names and directory channel membership.
-pub const PROTOCOL_VERSION: u16 = 61;
+/// Version 62 guards non-UI interrupts and binds stop/update consent to
+/// the running background subagents it would terminate.
+pub const PROTOCOL_VERSION: u16 = 62;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -783,6 +785,9 @@ pub struct ShutdownCapability {
     pub token: String,
     pub inventory_generation: u64,
     pub live_terminals: u64,
+    pub background_subagents: u64,
+    /// Exact running background tasks, independent of transcript tokens.
+    pub background_identity: String,
     pub expires_at_unix_ms: i64,
 }
 

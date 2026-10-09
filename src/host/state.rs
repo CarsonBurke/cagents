@@ -1400,16 +1400,50 @@ impl HostState {
             self.shutdown_capabilities.pop_front();
         }
         let live_terminals = self.inventory_count();
+        let (background_subagents, background_identity) = self.background_impact();
         let capability = ShutdownCapability {
             proof: (*self.proof).clone(),
             token: uuid::Uuid::new_v4().to_string(),
             inventory_generation: self.inventory_generation,
             live_terminals,
+            background_subagents,
+            background_identity,
             expires_at_unix_ms: unix_time_ms() + SHUTDOWN_CONFIRMATION_TTL.as_millis() as i64,
         };
         self.shutdown_capabilities
             .push_back((capability.clone(), now + SHUTDOWN_CONFIRMATION_TTL));
         Ok(ShutdownPreflight { capability })
+    }
+
+    fn background_impact(&self) -> (u64, String) {
+        use sha2::{Digest, Sha256};
+        let mut tasks: Vec<_> = self
+            .chats
+            .iter()
+            .filter(|(_, record)| record.handle.owns_work())
+            .flat_map(|(&session, record)| {
+                record
+                    .handle
+                    .background_subagents()
+                    .into_iter()
+                    .map(move |id| (session, id))
+            })
+            .collect();
+        tasks.sort_unstable();
+        let mut digest = Sha256::new();
+        for (session, task) in &tasks {
+            // Session IDs have a fixed UUID spelling. Length-prefix task IDs
+            // so provider-controlled separators cannot alias another task.
+            digest.update(session.to_string().as_bytes());
+            digest.update((task.len() as u64).to_le_bytes());
+            digest.update(task.as_bytes());
+        }
+        let identity = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (tasks.len() as u64, identity)
     }
 
     fn validate_upgrade_capability(
@@ -1436,6 +1470,10 @@ impl HostState {
         }
         if capability.inventory_generation != self.inventory_generation
             || capability.live_terminals != count
+            || (
+                capability.background_subagents,
+                capability.background_identity.clone(),
+            ) != self.background_impact()
         {
             return Err("Daemon inventory changed; obtain a new upgrade preflight".into());
         }
@@ -1496,6 +1534,15 @@ impl HostState {
                 }
                 if now >= *deadline {
                     return ShutdownOutcome::Expired;
+                }
+                if (
+                    capability.background_subagents,
+                    capability.background_identity.clone(),
+                ) != self.background_impact()
+                {
+                    return ShutdownOutcome::InventoryChanged {
+                        current_count: count,
+                    };
                 }
                 (false, Some(capability.inventory_generation))
             }
@@ -6172,6 +6219,205 @@ for line in sys.stdin:
             );
             assert!(!state.shutting_down);
         }
+    }
+
+    #[test]
+    fn background_task_replacement_invalidates_stop_and_update_consent() {
+        use crate::{
+            agent::Provider,
+            chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+            chat::{self, Command, Event, ToolStatus},
+            model::LaunchRecipe,
+            update::impact::{Disposition, Policy},
+        };
+        const CONVERSATION: &str = "12345678-1234-4234-8234-123456789abc";
+        struct BackgroundAdapter;
+        impl BackgroundAdapter {
+            fn task(id: &str, status: ToolStatus) -> Event {
+                Event::Subagent {
+                    id: id.into(),
+                    kind: "Explore".into(),
+                    description: id.into(),
+                    status: Some(status),
+                    background: Some(true),
+                }
+            }
+        }
+        impl Adapter for BackgroundAdapter {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![serde_json::json!({})],
+                    events: vec![
+                        Event::Session {
+                            id: CONVERSATION.into(),
+                            title: None,
+                        },
+                        Event::Ready(true),
+                        Event::Capabilities(chat::Capabilities {
+                            interrupt_stops_background: true,
+                            ..Default::default()
+                        }),
+                        Self::task("first", ToolStatus::Running),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let events = match command {
+                    Command::Compact => vec![
+                        Self::task("first", ToolStatus::Succeeded),
+                        Self::task("replacement", ToolStatus::Running),
+                    ],
+                    Command::Interrupt => vec![Self::task("replacement", ToolStatus::Stopped)],
+                    _ => vec![],
+                };
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: CONVERSATION.into(),
+                        title: None,
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("claude-config");
+        let project: String = directory
+            .path()
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let transcript = config
+            .join("projects")
+            .join(project)
+            .join(format!("{CONVERSATION}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(transcript, "").unwrap();
+        let selected = BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".into(),
+            config.to_string_lossy().into_owned(),
+        )]);
+        let mut environment =
+            crate::model::agent_recovery::fresh_native_environment(Provider::Claude, false);
+        environment.extend(selected.clone());
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment,
+        };
+        let mut adapter = BackgroundAdapter;
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.confirmed_session_id().as_deref() != Some(CONVERSATION) {
+            assert!(
+                Instant::now() < deadline,
+                "provider identity was not confirmed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            chat::runtime::UpdateReadiness::Busy
+        );
+        let mut state = test_host();
+        let session = chat::Session {
+            id: TerminalId::new(),
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            terminal: None,
+            proof: Some(state.proof().clone()),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some(CONVERSATION.into()),
+                recipe: LaunchRecipe {
+                    unset_environment: Default::default(),
+                    program: "claude".into(),
+                    arguments: vec!["--resume".into(), CONVERSATION.into()],
+                    working_directory: directory.path().into(),
+                    environment: selected,
+                },
+            },
+        };
+        state.chats.insert(
+            session.id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                console_recipe: None,
+                paired_terminal: None,
+                session,
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let waiting = state.upgrade_impact(Policy::WhenIdle).unwrap();
+        assert_eq!(
+            waiting.sessions[0].disposition,
+            Disposition::WaitsForIdle,
+            "{}",
+            waiting.sessions[0].reason
+        );
+        assert!(waiting.sessions[0].interrupted_subagents.is_empty());
+        let interrupt = state.upgrade_impact(Policy::Interrupt).unwrap();
+        assert_eq!(interrupt.sessions[0].disposition, Disposition::Interrupted);
+        assert_eq!(interrupt.sessions[0].interrupted_subagents, ["first"]);
+        assert!(
+            interrupt.sessions[0]
+                .reason
+                .contains("1 running background")
+        );
+        let now = Instant::now();
+        let capability = state.shutdown_preflight(now).unwrap().capability;
+        assert_eq!(capability.background_subagents, 1);
+        handle.command(Command::Compact).unwrap();
+        let changed = state.upgrade_impact(Policy::Interrupt).unwrap();
+        assert!(!interrupt.preserves_consent(&changed));
+        assert_eq!(changed.capability.background_subagents, 1);
+        assert_ne!(
+            changed.capability.background_identity,
+            capability.background_identity
+        );
+        assert!(
+            state
+                .validate_upgrade_capability(&capability, now)
+                .unwrap_err()
+                .contains("inventory changed")
+        );
+        assert_eq!(
+            state.shutdown(ShutdownOperation::Confirm { capability }, now),
+            ShutdownOutcome::InventoryChanged { current_count: 1 }
+        );
+        assert!(!state.shutting_down);
+        let capability = state.shutdown_preflight(now).unwrap().capability;
+        assert_eq!(
+            state.shutdown(ShutdownOperation::Confirm { capability }, now),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 1,
+                termination_requested: true
+            }
+        );
+        handle.interrupt_owned(None, true).unwrap();
+        handle.close().unwrap();
     }
 
     #[test]

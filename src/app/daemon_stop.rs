@@ -33,7 +33,7 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming this request terminates the counted hosted terminals. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
+        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
     }
     fn core(&self) -> &Core {
         &self.core
@@ -147,8 +147,8 @@ impl Application for DaemonStop {
             widget::column::with_children(vec![
                 crate::design::display("Stop daemon?").into(),
                 crate::design::title(format!(
-                    "Terminate exactly {} live terminal(s)",
-                    self.capability.live_terminals
+                    "Stop {} hosted terminal/chat sessions and {} running background subagents",
+                    self.capability.live_terminals, self.capability.background_subagents
                 ))
                 .into(),
                 crate::design::body(&self.detail).into(),
@@ -244,6 +244,8 @@ mod tests {
             token: "bounded-capability".into(),
             inventory_generation: 4,
             live_terminals: count,
+            background_subagents: 0,
+            background_identity: String::new(),
             expires_at_unix_ms: i64::MAX,
         };
         DaemonStop::init(
@@ -312,7 +314,7 @@ mod tests {
             termination_requested: true,
         };
         let _ = app.update(StopMessage::Finished(Ok(accepted.clone())));
-        assert_eq!(app.detail, "Stopping… 3 terminals will close");
+        assert_eq!(app.detail, "Stopping… 3 hosted sessions will close");
         assert_eq!(app.report, Some(StopReport::Finished { outcome: accepted }));
         let line = serde_json::to_string(app.report.as_ref().unwrap()).unwrap();
         assert_eq!(

@@ -169,6 +169,7 @@ impl HostState {
                 identity: identity(&(self.inventory_generation, &source))?,
                 disposition,
                 reason: reason.into(),
+                interrupted_subagents: Vec::new(),
             });
         }
         for (&id, record) in &self.chats {
@@ -176,6 +177,7 @@ impl HostState {
                 continue;
             }
             let (busy, ready) = record.handle.update_activity();
+            let interrupted_subagents = record.handle.interrupt_subagents();
             let confirmed = record.handle.confirmed_session_id();
             let mut launch = record.session.launch.clone();
             launch.session_id = confirmed.clone();
@@ -252,6 +254,16 @@ impl HostState {
                     "The saved conversation will reopen with a new provider process.",
                 )
             };
+            let reason = if disposition == Disposition::Interrupted
+                && !interrupted_subagents.is_empty()
+            {
+                format!(
+                    "The active turn and {} running background subagent(s) will stop; background work will not resume automatically.",
+                    interrupted_subagents.len()
+                )
+            } else {
+                reason.into()
+            };
             impact.sessions.push(SessionImpact {
                 id,
                 kind: SessionKind::NativeChat,
@@ -270,7 +282,12 @@ impl HostState {
                     record.handle.native_continuity(),
                 ))?,
                 disposition,
-                reason: reason.into(),
+                reason,
+                interrupted_subagents: if disposition == Disposition::Interrupted {
+                    interrupted_subagents
+                } else {
+                    Vec::new()
+                },
             });
         }
         impact

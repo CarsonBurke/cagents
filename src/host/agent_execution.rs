@@ -947,8 +947,10 @@ fn control(
         ));
     }
     let answered = match command {
-        Control::Interrupt => {
-            handle.interrupt_run(run.id)?;
+        Control::Interrupt {
+            including_subagents,
+        } => {
+            handle.interrupt_owned(Some(run.id), including_subagents)?;
             None
         }
         Control::Answer {
@@ -1217,6 +1219,15 @@ fn console(
             .ok_or("The exact paired provider console is unavailable")?;
         record.handle.clone()
     };
+    // Older console clients expressed interruption as a generic control.
+    // Normalize it before claiming interactive ownership so a refused request
+    // does not take over the agent or bypass the same dispatch safeguard.
+    let command = match command {
+        ConsoleCommand::Control(Command::Interrupt) => ConsoleCommand::Interrupt {
+            including_subagents: false,
+        },
+        command => command,
+    };
     match command {
         ConsoleCommand::Submit {
             prompt,
@@ -1244,11 +1255,22 @@ fn console(
             dispatch_accepted(host, accepted.clone())?;
             Ok(Reply::Accepted(accepted))
         }
+        ConsoleCommand::Interrupt {
+            including_subagents,
+        } => {
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            handle.interrupt_owned(None, including_subagents)?;
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .claim_agent_interaction(id, None)?;
+            Ok(Reply::Console(None))
+        }
         ConsoleCommand::Control(command) => {
             if !matches!(
                 command,
                 Command::Answer { .. }
-                    | Command::Interrupt
                     | Command::SetModel { .. }
                     | Command::SetPermissionMode { .. }
             ) {

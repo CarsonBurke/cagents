@@ -33,7 +33,7 @@ Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
 Options:
   --browserless    Build without Servo and open saved browser URLs externally
   --debug          Enable cagents debug logs and Rust backtraces
-  --fresh-daemon   Stop the existing development daemon after building
+  --fresh-daemon   Stop development sessions and background subagents after building
   --log-file PATH  Write UI tracing output to PATH (relative to caller)
   --help           Show this help
 USAGE
@@ -113,7 +113,8 @@ fi
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
 if [ "$fresh_daemon" = true ]; then
-    run_cli daemon stop-for-rebuild >/dev/null
+    printf '%s\n' "Restarting the development daemon stops its terminal/chat jobs and all their background subagents." >&2
+    run_cli daemon stop-for-rebuild --including-subagents >/dev/null
     socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
     remaining=100
     while [ -e "$socket" ]; do
