@@ -38,9 +38,10 @@ use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
 use std::ops::{ControlFlow, Range};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -1178,64 +1179,229 @@ enum ChildStop {
     Terminated,
     /// Needed `SIGKILL` to the process group.
     Killed,
+    /// The original child identity or final reap could not be confirmed.
+    Unconfirmed,
+}
+
+/// Shared shutdown authority. Claiming closes publication permanently, and a
+/// fallback keeps the lock through its signal so the child owner cannot reap
+/// the leader while a claimed numeric signal is still pending.
+#[derive(Debug, Default)]
+struct PublishedGroup(Mutex<GroupPublication>);
+
+#[derive(Debug, Default)]
+enum GroupPublication {
+    #[default]
+    Empty,
+    Live(u32),
+    Closed,
+}
+
+impl PublishedGroup {
+    fn publish(&self, group: u32) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*state, GroupPublication::Empty) {
+            return false;
+        }
+        *state = GroupPublication::Live(group);
+        true
+    }
+
+    fn claim(&self) -> Option<u32> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match std::mem::replace(&mut *state, GroupPublication::Closed) {
+            GroupPublication::Live(group) => Some(group),
+            GroupPublication::Empty | GroupPublication::Closed => None,
+        }
+    }
+
+    fn kill(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let GroupPublication::Live(group) =
+            std::mem::replace(&mut *state, GroupPublication::Closed)
+        {
+            // Keep the lock through the syscall. A losing child owner must
+            // observe the completed signal before its final wait can reap.
+            signal_process_group(group, SIGKILL);
+        }
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> u32 {
+        match *self.0.lock().unwrap() {
+            GroupPublication::Live(group) => group,
+            GroupPublication::Empty | GroupPublication::Closed => 0,
+        }
+    }
 }
 
 /// A spawned server process that leads its own process group.
 #[derive(Debug)]
 struct ChildProcess {
     child: tokio::process::Child,
+    identity: tokio::io::unix::AsyncFd<OwnedFd>,
+    published: Option<Arc<PublishedGroup>>,
     /// Process-group id, captured at spawn because `Child::id` is cleared by
     /// the first successful wait.
     process_group: u32,
 }
 
 impl ChildProcess {
-    /// Gives the child a grace period to exit, ends the process group it
-    /// leads, and reaps it. Always waits, so no zombie is left behind.
-    ///
-    /// `published` is the cell this group id is advertised in, for the sake of
-    /// an exit path that has stopped waiting for the task doing the stopping.
-    /// Taking the id out of that cell is a claim, and only the claimant
-    /// signals: a reaped leader's id is one the kernel is free to hand to
-    /// something else, so two parties signalling the same id — one of them
-    /// possibly after the other has reaped it — is how an unrelated process
-    /// group gets killed. Losing the claim means the other party is already
-    /// ending this group, and this call then owes only the reap.
-    async fn stop(mut self, published: &AtomicU32) -> ChildStop {
-        let group = (published.swap(0, Ordering::AcqRel) != 0).then_some(self.process_group);
+    /// Capture the original child before publishing it or polling Tokio's
+    /// reaping wait. The child still reserves its numeric PID even if exited.
+    fn new(mut child: tokio::process::Child) -> io::Result<Self> {
+        let process_group = child
+            .id()
+            .ok_or_else(|| io::Error::other("Child already reaped"))?;
+        let identity = (|| {
+            // SAFETY: this is our freshly spawned, still-unreaped child.
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process_group, 0) };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: pidfd_open returned a new descriptor owned here.
+            let identity = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+            tokio::io::unix::AsyncFd::new(identity)
+        })();
+        match identity {
+            Ok(identity) => Ok(Self {
+                child,
+                identity,
+                published: None,
+                process_group,
+            }),
+            Err(error) => {
+                // No other owner has received this child. Its unreaped leader
+                // reserves the original group until Tokio's drop reaper runs.
+                signal_process_group(process_group, SIGKILL);
+                if let Err(cleanup) = child.start_kill() {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("{error}; child cleanup is unconfirmed: {cleanup}"),
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn publish(&mut self, published: Arc<PublishedGroup>) -> bool {
+        if !published.publish(self.process_group) {
+            return false;
+        }
+        self.published = Some(published);
+        true
+    }
+
+    /// Observe the original child without reaping. A numeric wait target could
+    /// instead observe another direct child after the old PID was recycled.
+    fn observed_exit(&self) -> io::Result<bool> {
+        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: the owned pidfd identifies the original child. WNOWAIT
+            // keeps its zombie reserved until all group signals are finished.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    self.identity.get_ref().as_raw_fd() as libc::id_t,
+                    &mut information,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful waitid initialized this status field.
+                return Ok(unsafe { information.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Give the child time to exit, end its original group, then reap it.
+    /// Taking the published id is a claim against other shutdown callers;
+    /// retaining the unreaped leader additionally reserves the kernel ID.
+    async fn stop(mut self, published: &PublishedGroup) -> ChildStop {
+        let group = published.claim();
+        // Preserve Child::wait's stdin-close behavior without polling its
+        // reaping future until all group signals have finished.
+        drop(self.child.stdin.take());
         let signal = |number: i32| {
             if let Some(group) = group {
                 signal_process_group(group, number);
             }
         };
-        let outcome = if Self::settled(&mut self.child, TERMINATION_GRACE).await {
-            ChildStop::Exited
-        } else {
-            signal(SIGTERM);
-            if Self::settled(&mut self.child, TERMINATION_GRACE).await {
-                ChildStop::Terminated
-            } else {
-                ChildStop::Killed
+        let outcome = match self.settled(TERMINATION_GRACE).await {
+            Ok(true) => ChildStop::Exited,
+            Ok(false) => {
+                signal(SIGTERM);
+                match self.settled(TERMINATION_GRACE).await {
+                    Ok(true) => ChildStop::Terminated,
+                    Ok(false) => ChildStop::Killed,
+                    Err(error) => {
+                        tracing::warn!(%error, "language-server child identity is unconfirmed");
+                        return ChildStop::Unconfirmed;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "language-server child identity is unconfirmed");
+                return ChildStop::Unconfirmed;
             }
         };
-        // The group outlives its leader: `rust-analyzer` starts a proc-macro
-        // server that goes on running after `exit`, and every descendant is in
-        // this group because the leader was spawned as the leader of one. So
-        // the group is killed even when the leader left on its own, exactly as
-        // `repository::terminate_process_group` does for a git process tree.
-        // A leader's id stays reserved while the group still holds a member,
-        // which is the only case in which this signal reaches anything.
+        // The original leader remains unreaped while ending proc-macro servers
+        // and other descendants, even when the leader itself exited promptly.
         signal(SIGKILL);
-        // Only the give-up path above still has an unreaped leader; the others
-        // were reaped by the grace wait that saw them exit.
-        if outcome == ChildStop::Killed {
-            let _ = self.child.wait().await;
+        if let Err(error) = self.child.wait().await {
+            tracing::warn!(%error, "language-server final reap is unconfirmed");
+            return ChildStop::Unconfirmed;
         }
+        #[cfg(all(test, target_os = "linux"))]
+        tests::LSP_AFTER_REAP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         outcome
     }
 
-    async fn settled(child: &mut tokio::process::Child, grace: Duration) -> bool {
-        matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)))
+    async fn settled(&self, grace: Duration) -> io::Result<bool> {
+        if self.observed_exit()? {
+            return Ok(true);
+        }
+        // pidfd readiness is terminal and never needs clearing. No blocking
+        // wait or periodic polling occupies the shared Tokio runtime.
+        match tokio::time::timeout(grace, self.identity.readable()).await {
+            Ok(Ok(_ready)) => self.observed_exit(),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        // Disarm fallback authority before Tokio's Child drop can reap. Taking
+        // the lock also waits for any already-claimed fallback signal to finish.
+        if let Some(published) = &self.published {
+            published.claim();
+        }
+        // Cancellation may occur before stop, or while its grace future waits.
+        // Preserve cleanup without ever signalling after the final reap.
+        if self.observed_exit().is_ok() {
+            signal_process_group(self.process_group, SIGKILL);
+        }
+        // Tokio retains its original kill_on_drop and asynchronous orphan reap.
     }
 }
 
@@ -1493,25 +1659,27 @@ fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, String> {
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+    let child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             format!("`{program}` was not found on PATH")
         } else {
             format!("`{program}` could not be started: {error}")
         }
     })?;
-    let process_group = child
-        .id()
-        .ok_or_else(|| format!("`{program}` exited before it could be addressed"))?;
+    let mut child = ChildProcess::new(child)
+        .map_err(|error| format!("`{program}` process identity could not be retained: {error}"))?;
     let stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| format!("`{program}` has no stdout pipe"))?;
     let stdin = child
+        .child
         .stdin
         .take()
         .ok_or_else(|| format!("`{program}` has no stdin pipe"))?;
     let stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| format!("`{program}` has no stderr pipe"))?;
@@ -1519,10 +1687,7 @@ fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, String> {
         reader: Box::new(stdout),
         writer: Box::new(stdin),
         stderr: Some(Box::new(stderr)),
-        child: Some(ChildProcess {
-            child,
-            process_group,
-        }),
+        child: Some(child),
     })
 }
 
@@ -1740,12 +1905,11 @@ struct SessionContext {
     /// replacement now owns.
     retired: Arc<AtomicBool>,
     retirement: Arc<tokio::sync::Notify>,
-    /// Process group of the running server, published so an exit path that
-    /// stops waiting for this task can still end the tree it owns. Zero if
-    /// this session never had a process of its own, and zeroed by whichever
-    /// party takes the id in order to signal it: see
-    /// [`ChildProcess::stop`] for why exactly one of them may.
-    process_group: Arc<AtomicU32>,
+    /// Shutdown authority shared with exit paths that stop awaiting this task.
+    /// The group is published once, and closing the authority prevents both
+    /// later signals and late publication after retirement. Fallback claims
+    /// hold the lock through their signal before the child owner may reap.
+    process_group: Arc<PublishedGroup>,
     stderr: Arc<StderrTail>,
 }
 
@@ -2021,10 +2185,14 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
         stderr,
         child,
     } = transport;
-    if let Some(child) = &child {
-        context
-            .process_group
-            .store(child.process_group, Ordering::Release);
+    let mut child = child;
+    if let Some(child) = &mut child
+        && (context.retired.load(Ordering::Acquire)
+            || !child.publish(Arc::clone(&context.process_group)))
+    {
+        // Retirement may have claimed the empty slot while synchronous spawn
+        // was finishing. Never republish a group after the fallback has closed.
+        return;
     }
     // Retained rather than detached: a fatal message a server writes just
     // before closing stdout is exactly the evidence a `Failed` status
@@ -2251,7 +2419,7 @@ async fn teardown(
     protocol: tokio::task::JoinHandle<Result<(), async_lsp::Error>>,
     child: Option<ChildProcess>,
     stderr_drain: Option<tokio::task::JoinHandle<()>>,
-    process_group: &AtomicU32,
+    process_group: &PublishedGroup,
 ) {
     protocol.abort();
     if let Some(child) = child {
@@ -3164,7 +3332,7 @@ fn discover_root(path: &Path, worktree: &Path, markers: &[String]) -> PathBuf {
 /// A session that has been told to stop, kept until its process is reaped.
 struct RetiringSession {
     task: tokio::task::JoinHandle<()>,
-    process_group: Arc<AtomicU32>,
+    process_group: Arc<PublishedGroup>,
 }
 
 #[derive(Clone)]
@@ -3177,7 +3345,7 @@ struct SessionHandle {
     retired: Arc<AtomicBool>,
     retirement: Arc<tokio::sync::Notify>,
     /// Shared with the session task; see [`SessionContext::process_group`].
-    process_group: Arc<AtomicU32>,
+    process_group: Arc<PublishedGroup>,
     /// The session task, so teardown can be awaited to completion.
     task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -3226,14 +3394,9 @@ async fn reap_sessions(sessions: Vec<RetiringSession>) {
         if tokio::time::timeout_at(deadline, &mut task).await.is_ok() {
             continue;
         }
-        // Taken rather than read: the session task takes the same id before it
-        // signals or reaps anything, so at most one of the two ends this group
-        // and neither can signal an id the other has already let go. See
-        // [`ChildProcess::stop`].
-        let group = process_group.swap(0, Ordering::AcqRel);
-        if group != 0 {
-            signal_process_group(group, SIGKILL);
-        }
+        // Serialize the fallback's claim and signal with the child owner's
+        // claim. The owner cannot reap while this signal is still pending.
+        process_group.kill();
         task.abort();
     }
 }
@@ -3694,10 +3857,7 @@ impl LspManager {
     /// signalled at all.
     pub fn kill_retired_now(&mut self) {
         for session in std::mem::take(&mut self.retiring) {
-            let group = session.process_group.swap(0, Ordering::AcqRel);
-            if group != 0 {
-                signal_process_group(group, SIGKILL);
-            }
+            session.process_group.kill();
             session.task.abort();
         }
         if let Some(flusher) = self.flusher.take() {
@@ -3854,7 +4014,7 @@ impl LspManager {
             completion_triggers: Arc::new(Mutex::new(None)),
             retired: Arc::new(AtomicBool::new(false)),
             retirement: Arc::new(tokio::sync::Notify::new()),
-            process_group: Arc::new(AtomicU32::new(0)),
+            process_group: Arc::new(PublishedGroup::default()),
             task: Arc::new(Mutex::new(None)),
         };
         let context = SessionContext {
@@ -6136,18 +6296,317 @@ mod tests {
             }
         }
         let child = command.spawn().expect("spawn the test executable");
-        let process_group = child.id().expect("a freshly spawned child has a pid");
-        ChildProcess {
-            child,
-            process_group,
-        }
+        ChildProcess::new(child).expect("capture freshly spawned child identity")
     }
 
     /// The cell [`ChildProcess::stop`] takes its group id out of, for a test
     /// that stops a child without a session task around it.
     #[cfg(unix)]
-    fn published_group(child: &ChildProcess) -> AtomicU32 {
-        AtomicU32::new(child.process_group)
+    fn published_group(child: &ChildProcess) -> PublishedGroup {
+        PublishedGroup(Mutex::new(GroupPublication::Live(child.process_group)))
+    }
+
+    // A scheduler may pause shutdown after its final wait reaps the leader.
+    // Only the explicit isolated namespace regression installs this one-shot
+    // hook; production and ordinary tests never do.
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        pub(super) static LSP_AFTER_REAP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires permitted user/PID namespaces; explicit kernel PID-reuse regression"]
+    fn lsp_stop_never_signals_a_kernel_reused_group_after_reaping() {
+        use std::cell::RefCell;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::rc::Rc;
+
+        const MARKER: &str = "CAGENTS_AUDIT_LSP_REUSE_CHILD";
+        const PARENT_NAMESPACE: &str = "CAGENTS_AUDIT_LSP_PARENT_PID_NAMESPACE";
+        const TEST: &str = "lsp::tests::lsp_stop_never_signals_a_kernel_reused_group_after_reaping";
+        if std::env::var_os(MARKER).is_none() {
+            for scenario in ["post-reap", "already-reaped"] {
+                let output = std::process::Command::new("/usr/bin/unshare")
+                    .args([
+                        "--user",
+                        "--map-root-user",
+                        "--pid",
+                        "--fork",
+                        "--mount-proc",
+                    ])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        TEST,
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(MARKER, scenario)
+                    .env(
+                        PARENT_NAMESPACE,
+                        std::fs::read_link("/proc/self/ns/pid").unwrap(),
+                    )
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stdout.contains("owned LSP PID-reuse scheduler fixture started"),
+                    "the exact namespace test must run: {stdout}; {stderr}"
+                );
+                assert!(
+                    output.status.success(),
+                    "owned LSP scheduler-window audit failed: {stdout}; {stderr}"
+                );
+            }
+            return;
+        }
+        let already_reaped = std::env::var(MARKER).unwrap() == "already-reaped";
+        println!("owned LSP PID-reuse scheduler fixture started");
+        assert_eq!(
+            std::process::id(),
+            1,
+            "only owned namespace init may reset PIDs"
+        );
+
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/pid").unwrap().as_os_str(),
+            std::env::var_os(PARENT_NAMESPACE).expect("outer namespace identity"),
+            "PID allocation must be changed only inside a new owned namespace"
+        );
+
+        struct Replacement {
+            child: std::process::Child,
+            pidfd: OwnedFd,
+        }
+        impl Drop for Replacement {
+            fn drop(&mut self) {
+                // SAFETY: the descriptor identifies only our replacement child,
+                // including after the numeric PID has become available again.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = self.child.wait();
+            }
+        }
+        block_on(async {
+            // Runtime initialization precedes PID allocation. It cannot create
+            // another worker thread while the synchronous hook runs.
+            std::fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
+            let child = tokio::process::Command::new("/bin/true")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let group = child.id().unwrap();
+            assert_eq!(group, 200);
+            let mut child = ChildProcess::new(child).unwrap();
+            let published = published_group(&child);
+            let replacement = Rc::new(RefCell::new(None::<Replacement>));
+            let captured = Rc::clone(&replacement);
+            let replace = move || {
+                assert!(
+                    !Path::new(&format!("/proc/{group}")).exists(),
+                    "the actual grace wait must have reaped the original leader"
+                );
+                std::fs::write("/proc/sys/kernel/ns_last_pid", (group - 1).to_string()).unwrap();
+                let child = std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap();
+                assert_eq!(child.id(), group, "kernel must really reuse the PID");
+                assert_eq!(unsafe { libc::getpgid(group as i32) }, group as i32);
+                let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) } as i32;
+                assert!(raw >= 0);
+                *captured.borrow_mut() = Some(Replacement {
+                    child,
+                    // SAFETY: pidfd_open returned a new owned descriptor.
+                    pidfd: unsafe { OwnedFd::from_raw_fd(raw) },
+                });
+            };
+            if already_reaped {
+                child.child.wait().await.unwrap();
+                replace();
+            } else {
+                LSP_AFTER_REAP.with(|hook| *hook.borrow_mut() = Some(Box::new(replace)));
+            }
+            assert_eq!(
+                child.stop(&published).await,
+                if already_reaped {
+                    ChildStop::Unconfirmed
+                } else {
+                    ChildStop::Exited
+                }
+            );
+            assert_eq!(published.current(), 0);
+            let mut replacement = replacement.borrow_mut();
+            let replacement = replacement.as_mut().expect("after-reap hook ran");
+            let mut poll = libc::pollfd {
+                fd: replacement.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let exited = unsafe { libc::poll(&mut poll, 1, 250) };
+            let status = replacement.child.try_wait().unwrap();
+            println!(
+                "actual stop scenario already_reaped={already_reaped}; reused PID/PGID={group}; replacement readiness={exited}; status={status:?}"
+            );
+            assert_eq!(
+                exited, 0,
+                "actual stop killed the unrelated replacement group"
+            );
+            assert!(status.is_none());
+        });
+    }
+
+    #[test]
+    fn retired_lsp_authority_refuses_late_publication_and_restart_uses_a_new_slot() {
+        let retired = PublishedGroup::default();
+        retired.kill();
+        assert!(!retired.publish(123));
+        let replacement = PublishedGroup::default();
+        assert!(replacement.publish(456));
+        assert!(!replacement.publish(789));
+        assert_eq!(replacement.claim(), Some(456));
+        assert!(!replacement.publish(789));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dropping_an_lsp_child_disarms_its_published_group_before_tokio_reaps() {
+        block_on(async {
+            let mut child = spawn_test_child(
+                &["--exact", CHILD_HELPER_TEST, "--test-threads=1"],
+                Helper::Sleeps,
+                true,
+            );
+            let group = child.process_group;
+            let published = Arc::new(PublishedGroup::default());
+            assert!(child.publish(Arc::clone(&published)));
+            drop(child);
+            assert_eq!(published.current(), 0);
+            assert!(!published.publish(group));
+            assert!(wait_until_gone(group).await);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn losing_lsp_shutdown_claim_waits_for_the_fallback_signal_before_reaping() {
+        block_on(async {
+            let mut child = spawn_test_child(&["--list"], Helper::None, true);
+            assert!(child.settled(WAIT).await.unwrap());
+            let group = child.process_group;
+            let published = Arc::new(PublishedGroup::default());
+            assert!(child.publish(Arc::clone(&published)));
+            let completed = Arc::new(AtomicBool::new(false));
+            let check = Arc::clone(&completed);
+            LSP_AFTER_REAP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    assert!(
+                        check.load(Ordering::Acquire),
+                        "fallback signal must precede final reap"
+                    );
+                }));
+            });
+            let fallback = Arc::clone(&published);
+            let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+            let (starting_tx, starting_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                // Model preemption between the fallback's claim and syscall,
+                // retaining the exact production authority mutex throughout.
+                let mut state = fallback.0.lock().unwrap();
+                assert!(
+                    matches!(std::mem::replace(&mut *state, GroupPublication::Closed), GroupPublication::Live(id) if id == group)
+                );
+                claimed_tx.send(()).unwrap();
+                starting_rx.recv_timeout(WAIT).unwrap();
+                signal_process_group(group, SIGKILL);
+                completed.store(true, Ordering::Release);
+            });
+            claimed_rx.recv_timeout(WAIT).unwrap();
+            assert!(
+                published.0.try_lock().is_err(),
+                "pending claimed signal owns the authority lock"
+            );
+            starting_tx.send(()).unwrap();
+            assert_eq!(child.stop(&published).await, ChildStop::Exited);
+            thread.join().unwrap();
+            assert!(wait_until_gone(group).await);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn observing_lsp_exit_preserves_the_original_leader_until_group_cleanup() {
+        block_on(async {
+            let child = spawn_test_child(&["--list"], Helper::None, true);
+            let group = child.process_group;
+            assert!(child.settled(WAIT).await.unwrap());
+            assert!(child.observed_exit().unwrap());
+            assert_eq!(child.child.id(), Some(group));
+            let stat = std::fs::read_to_string(format!("/proc/{group}/stat")).unwrap();
+            assert_eq!(
+                stat.rsplit_once(") ").unwrap().1.split_whitespace().next(),
+                Some("Z")
+            );
+            let published = published_group(&child);
+            assert_eq!(child.stop(&published).await, ChildStop::Exited);
+            assert!(
+                wait_until_gone(group).await,
+                "final shutdown must reap the leader"
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reaped_lsp_identity_refuses_group_shutdown() {
+        block_on(async {
+            let mut child = spawn_test_child(&["--list"], Helper::None, true);
+            let published = published_group(&child);
+            child.child.wait().await.unwrap();
+            assert_eq!(
+                child.observed_exit().unwrap_err().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert_eq!(child.stop(&published).await, ChildStop::Unconfirmed);
+            assert_eq!(published.current(), 0);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cancelling_lsp_shutdown_preserves_tokio_drop_cleanup() {
+        block_on(async {
+            let child = spawn_test_child(
+                &["--exact", CHILD_HELPER_TEST, "--test-threads=1"],
+                Helper::Sleeps,
+                true,
+            );
+            let group = child.process_group;
+            let published = published_group(&child);
+            assert!(
+                tokio::time::timeout(TERMINATION_GRACE / 2, child.stop(&published))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(published.current(), 0);
+            assert!(
+                wait_until_gone(group).await,
+                "Tokio must still kill and reap a cancelled shutdown child"
+            );
+        });
     }
 
     #[test]
@@ -6189,7 +6648,7 @@ mod tests {
                 true,
             );
             let group = child.process_group;
-            let published = AtomicU32::new(group);
+            let published = PublishedGroup(Mutex::new(GroupPublication::Live(group)));
             let mut stop = std::pin::pin!(child.stop(&published));
             // This child ignores everything, so `stop` is still inside its
             // first grace period here — and the id must already be gone from
@@ -6198,7 +6657,7 @@ mod tests {
             // the id after that has no way to tell.
             let observed = tokio::select! {
                 _ = &mut stop => panic!("a sleeping child cannot be stopped within the grace period"),
-                _ = tokio::time::sleep(TERMINATION_GRACE / 2) => published.load(Ordering::Acquire),
+                _ = tokio::time::sleep(TERMINATION_GRACE / 2) => published.current(),
             };
             assert!(
                 PathBuf::from(format!("/proc/{group}")).exists(),
