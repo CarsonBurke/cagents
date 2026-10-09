@@ -6750,6 +6750,10 @@ impl Cagents {
                         draft.push_str("\n\n");
                     }
                     draft.push_str(&retry);
+                    // Preparing a retry edits the recalled prompt into the
+                    // real unsent draft, just like typing in the composer.
+                    runtime.history_cursor = None;
+                    runtime.history_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
                     return iced::widget::operation::focus(card_control_id(
@@ -7942,6 +7946,75 @@ mod tests {
         assert_eq!(runtime.attachments.len(), 1);
         assert!(runtime.pending.is_none());
         assert_eq!(runtime.snapshot.permission_denials.len(), 1);
+    }
+
+    #[test]
+    fn permission_retry_promotes_recalled_text_for_navigation_and_persistence() {
+        for recalled_steps in [1, 2] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("permissions"));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["older sent prompt".into(), "newest sent prompt".into()];
+            runtime.replace_draft(text_editor::Content::with_text("original unsent draft"));
+            runtime.attachments.push(Attachment {
+                path: "retained.png".into(),
+            });
+            Arc::make_mut(&mut runtime.snapshot)
+                .permission_denials
+                .push(chat::PermissionDenial {
+                    tool_use_id: "blocked".into(),
+                    tool_name: "Bash".into(),
+                    tool_input: Some(r#"{"command":"git status"}"#.into()),
+                    reason: "Auto denied".into(),
+                    reason_type: None,
+                    agent_id: None,
+                });
+            for _ in 0..recalled_steps {
+                drop(app.handle_chat_ui(Action::HistoryOlder(target)));
+            }
+            let recalled = chat_runtime(&app, card).composer.text();
+            assert_eq!(
+                chat_runtime(&app, card).unsent_text(),
+                "original unsent draft"
+            );
+            // A stale denial does not promote a merely browsed prompt.
+            drop(app.handle_chat_ui(Action::PermissionRetry(target, "stale".into())));
+            assert_eq!(
+                chat_runtime(&app, card).unsent_text(),
+                "original unsent draft"
+            );
+            assert!(chat_runtime(&app, card).history_cursor.is_some());
+
+            drop(app.handle_chat_ui(Action::PermissionRetry(target, "blocked".into())));
+            let runtime = chat_runtime(&app, card);
+            let prepared = runtime.composer.text();
+            assert!(prepared.starts_with(&format!("{recalled}\n\nI authorize")));
+            assert!(prepared.contains("git status"));
+            assert_eq!(runtime.unsent_text(), prepared);
+            assert!(runtime.history_cursor.is_none());
+            assert!(runtime.history_stash.is_none());
+            assert_eq!(runtime.attachments.len(), 1);
+            assert!(runtime.pending.is_none());
+            assert!(runtime.followups.is_empty());
+            assert_eq!(app.persistent_workspace().chat_drafts[&card], prepared);
+
+            // Down cannot recover the pre-retry stash, including after a
+            // fresh Up/Down visit to the sent history.
+            drop(app.handle_chat_ui(Action::HistoryNewer(target)));
+            assert_eq!(chat_runtime(&app, card).composer.text(), prepared);
+            drop(app.handle_chat_ui(Action::HistoryOlder(target)));
+            drop(app.handle_chat_ui(Action::HistoryNewer(target)));
+            assert_eq!(chat_runtime(&app, card).composer.text(), prepared);
+
+            let session = chat_runtime(&app, card).session.clone();
+            app.chat_forget(card);
+            assert_eq!(app.chat_ui.drafts[&card], prepared);
+            let saved = app.persistent_workspace();
+            app.chat_ui = State::with_drafts(saved.chat_drafts.clone());
+            drop(app.open_chat_draft(card, session));
+            assert_eq!(chat_runtime(&app, card).composer.text(), prepared);
+        }
     }
 
     #[test]
