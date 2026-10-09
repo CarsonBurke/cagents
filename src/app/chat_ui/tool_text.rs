@@ -172,11 +172,13 @@ impl ToolText {
             language
         };
         // The key reads a bounded tail of the text, as an item's change token
-        // does, rather than hashing all of it: a running command's output is
-        // updated on every refresh, and grows for as long as it runs.
+        // does. It is only a cheap rejection filter: exact text equality is
+        // still required before retaining the previous presentation.
         let key = tail_digest(language as u64, text);
         if let Some(previous) = previous
             && previous.key == key
+            && previous.language == language
+            && previous.text.as_ref() == text
         {
             return previous;
         }

@@ -2741,6 +2741,7 @@ impl Runtime {
                 .map(|cached| {
                     (
                         cached.token,
+                        cached.revision,
                         cached.image.as_ref().map(iced::widget::image::Handle::id),
                         cached.image_source.is_some(),
                         self.preview_request.as_deref() == Some(item.id.as_str()),
@@ -4589,6 +4590,105 @@ mod tests {
             ..Snapshot::default()
         });
         runtime.refresh();
+    }
+
+    #[test]
+    fn refresh_reparses_tail_colliding_rewrites_and_invalidates_retained_turns() {
+        let body =
+            |prefix: &str| format!("```text\n{}{}\n```\n", prefix.repeat(80), "z".repeat(80));
+        let mut items = vec![chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: body("a"),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        }];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let before = fingerprints(&runtime, true);
+        let token = runtime.cache["answer"].token;
+        let revision = runtime.cache["answer"].revision;
+        // A new immutable Arc with identical content keeps its prepared presentation.
+        publish(&mut runtime, &handle, &items, 1);
+        assert_eq!(revision, runtime.cache["answer"].revision);
+        assert_eq!(before, fingerprints(&runtime, true));
+        items[0].content = ItemContent::Text {
+            text: body("b"),
+            thinking: false,
+            phase: chat::Phase::Final,
+        };
+        assert_eq!(token, super::super::ChangeToken::of(&items[0].content));
+        publish(&mut runtime, &handle, &items, 2);
+        assert_ne!(before, fingerprints(&runtime, true));
+        let codes = |runtime: &Runtime| {
+            let mut codes = Vec::new();
+            super::super::for_each_fence(
+                runtime.cache["answer"].markdown.items(),
+                &mut |_, code| {
+                    codes.push(code.to_owned());
+                },
+            );
+            codes
+        };
+        assert_eq!(
+            codes(&runtime),
+            vec![format!("{}{}\n", "b".repeat(80), "z".repeat(80))]
+        );
+        // Rewriting an earlier prefix and appending is not an incremental append either.
+        items[0].content = ItemContent::Text {
+            text: format!("{}\nMore", body("c")),
+            thinking: false,
+            phase: chat::Phase::Final,
+        };
+        publish(&mut runtime, &handle, &items, 3);
+        assert_eq!(
+            codes(&runtime),
+            vec![format!("{}{}\n", "c".repeat(80), "z".repeat(80))]
+        );
+    }
+
+    #[test]
+    fn refresh_replaces_expanded_tool_text_after_a_tail_colliding_rewrite() {
+        let mut items = vec![chat::Item {
+            id: "tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "shell".into(),
+                input: "ls".into(),
+                output: format!("{}{}", "a".repeat(80), "z".repeat(80)),
+                status: chat::ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        }];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        runtime.expanded.insert("tool".into());
+        // First update creates the expanded presentation.
+        if let ItemContent::Tool { input, .. } = &mut items[0].content {
+            *input = "pwd".into();
+        }
+        publish(&mut runtime, &handle, &items, 1);
+        let token = runtime.cache["tool"].token;
+        let before = fingerprints(&runtime, true);
+        let expected = format!("{}{}", "b".repeat(80), "z".repeat(80));
+        if let ItemContent::Tool { output, .. } = &mut items[0].content {
+            *output = expected.clone();
+        }
+        assert_eq!(token, super::super::ChangeToken::of(&items[0].content));
+        publish(&mut runtime, &handle, &items, 2);
+        assert_eq!(
+            runtime.cache["tool"]
+                .tool_output
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref(),
+            expected
+        );
+        assert_ne!(before, fingerprints(&runtime, true));
     }
 
     #[test]
