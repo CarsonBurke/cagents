@@ -3688,3 +3688,170 @@ fn mixed_discard_retains_accounting_and_foreign_lock_evidence() {
         );
     }
 }
+
+/// A configured slash name names the remote, while an unconfigured slash
+/// argument must never fall through to Git's local-path interpretation (#835).
+#[test]
+fn configured_slash_remotes_support_publish_upstream_and_ref_lookup() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("a.txt", b"initial\n");
+    fixture.git_in_work(&["add", "a.txt"]);
+    let initial = fixture.commit("initial");
+    let origin = fixture.origin();
+    fixture.git_in_work(&[
+        OsStr::new("remote"),
+        OsStr::new("add"),
+        OsStr::new("te/am"),
+        origin.as_os_str(),
+    ]);
+    let service = fixture.service();
+    let cancellation = CancellationToken::new();
+    let branch = ValidatedBranchName::parse("main").unwrap();
+    let first = service
+        .push(
+            &PushRequest {
+                worktree: fixture.work(),
+                branch: branch.clone(),
+                target: PushTarget::SetUpstream {
+                    remote: "te/am".into(),
+                    remote_branch: branch.clone(),
+                },
+            },
+            &cancellation,
+        )
+        .unwrap();
+    assert!(matches!(first, PushOutcome::Pushed { oid, .. } if oid == initial));
+    let upstream = service
+        .upstream_push_target(&fixture.work(), &branch, &cancellation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(upstream.remote(), "te/am");
+    fixture.write("a.txt", b"second\n");
+    fixture.git_in_work(&["add", "a.txt"]);
+    let second = fixture.commit("second");
+    let pushed = service
+        .push(
+            &PushRequest {
+                worktree: fixture.work(),
+                branch,
+                target: upstream,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    assert!(matches!(pushed, PushOutcome::Pushed { oid, .. } if oid == second));
+    assert_eq!(
+        service
+            .remote_ref_oid(
+                &fixture.work(),
+                "te/am",
+                &RemoteSideRef::parse("refs/heads/main").unwrap(),
+                &cancellation,
+            )
+            .unwrap(),
+        Some(second.clone())
+    );
+    fixture.run(
+        &origin,
+        &["update-ref", "refs/pull/1/head", second.as_str()],
+    );
+    let range = service
+        .fetch_pull_request_range(
+            &fixture.work(),
+            "te/am",
+            1,
+            &ValidatedBranchName::parse("main").unwrap(),
+            &second,
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(range.head, second);
+    let intent = service
+        .resolve_worktree_request(
+            &cagents::repository::WorktreeInput {
+                repository: fixture.work(),
+                input: "new-topic".into(),
+                base: String::new(),
+                managed_directory: "worktrees".into(),
+                destination: String::new(),
+                operation_id: cagents::model::OperationId::new(),
+            },
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(
+        intent.base,
+        cagents::repository::BaseRevision::remote_ref("refs/remotes/te/am/main").unwrap()
+    );
+    let store = cagents::persistence::StateStore::open(
+        &fixture.root.path().join("state.sqlite3"),
+        cagents::model::BootId::new("slash-remote-test"),
+    )
+    .unwrap();
+    let (progress, _receiver) = async_channel::bounded(8);
+    let report = service.create_worktree_journaled(&store, &intent, 1, &cancellation, &progress);
+    assert_eq!(
+        report.state,
+        cagents::repository::WorktreeOperationState::Created,
+        "{}",
+        report.detail
+    );
+    let created_head = fixture.run(&intent.destination, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        String::from_utf8(created_head).unwrap().trim(),
+        second.as_str()
+    );
+}
+
+#[test]
+fn slash_path_without_configured_fetch_url_is_not_a_remote_argument() {
+    for push_url in [None, Some("https://example.invalid/push.git")] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.write("a.txt", b"initial\n");
+        fixture.git_in_work(&["add", "a.txt"]);
+        fixture.commit("initial");
+        // A pushurl alone does not configure a fetch destination: Git still
+        // falls back to interpreting the remote name as a local path.
+        if let Some(push_url) = push_url {
+            fixture.git_in_work(&["config", "remote.te/am.pushurl", push_url]);
+        }
+        // This is a real bare repository Git would accept as a relative target.
+        fixture.run(&fixture.work(), &["init", "--bare", "te/am"]);
+        let service = fixture.service();
+        let cancellation = CancellationToken::new();
+        let request = PushRequest {
+            worktree: fixture.work(),
+            branch: ValidatedBranchName::parse("main").unwrap(),
+            target: PushTarget::SetUpstream {
+                remote: "te/am".into(),
+                remote_branch: ValidatedBranchName::parse("main").unwrap(),
+            },
+        };
+        assert!(matches!(
+            service.push(&request, &cancellation),
+            Err(cagents::repository::RepositoryError::Validation(
+                cagents::repository::ValidationError::InvalidRemote(_)
+            ))
+        ));
+        assert!(matches!(
+            service.remote_ref_oid(
+                &fixture.work(),
+                "te/am",
+                &RemoteSideRef::parse("refs/heads/main").unwrap(),
+                &cancellation,
+            ),
+            Err(cagents::repository::RepositoryError::Validation(
+                cagents::repository::ValidationError::InvalidRemote(_)
+            ))
+        ));
+        assert!(
+            fixture
+                .run(&fixture.work().join("te/am"), &["for-each-ref"])
+                .is_empty()
+        );
+    }
+}
