@@ -21,6 +21,9 @@ pub enum AgentCommand {
     Spawn {
         #[command(flatten)]
         prompt: PromptArgs,
+        /// Unique lowercase handle among your open agents, such as reviewer.
+        #[arg(long)]
+        name: Option<String>,
         /// claude, codex, or omp. Defaults to the calling session's provider.
         #[arg(long, value_parser = parse_provider)]
         provider: Option<Provider>,
@@ -32,6 +35,8 @@ pub enum AgentCommand {
         /// given, and otherwise the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
+        /// Defaults to the calling session's channel in the same project;
+        /// otherwise creates a fresh channel.
         #[arg(long)]
         channel: Option<ChannelId>,
         #[arg(long)]
@@ -482,6 +487,18 @@ impl ControlClient {
     }
 }
 
+fn spawn_channel(
+    explicit: Option<ChannelId>,
+    caller: Option<&crate::agent_execution::directory::Entry>,
+    repository: &std::path::Path,
+) -> Option<ChannelId> {
+    explicit.or_else(|| {
+        caller
+            .filter(|caller| caller.channel_repository.as_deref() == Some(repository))
+            .and_then(|caller| caller.channel)
+    })
+}
+
 /// What a handle names among the caller's agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handle {
@@ -490,13 +507,20 @@ enum Handle {
 }
 
 /// Resolves a typed handle against the caller's agents and their latest
-/// runs: a whole ID, or a prefix that names exactly one of them. `None` for
+/// runs: an exact name, a whole ID, or a prefix that names exactly one of
+/// them. `None` for
 /// a whole ID that names none of them, which the caller may still know as an
 /// older run or a closed agent.
 fn resolve(summaries: &[Summary], handle: &str) -> Result<Option<Handle>, AppError> {
     let wanted = handle.trim().to_ascii_lowercase();
     if wanted.is_empty() {
         return Err(AppError::new("handle", "An agent or run handle is empty"));
+    }
+    if let Some(summary) = summaries
+        .iter()
+        .find(|summary| summary.agent.name.as_deref() == Some(&wanted))
+    {
+        return Ok(Some(Handle::Agent(summary.agent.id)));
     }
     let mut matches: Vec<(Handle, String)> = Vec::new();
     for summary in summaries {
@@ -664,9 +688,18 @@ impl Session {
         }
     }
 
-    /// The open project `scope` names, and the calling session's provider,
-    /// which a spawned agent defaults to.
-    fn context(&mut self, scope: Scope) -> Result<(Option<PathBuf>, Option<Provider>), AppError> {
+    /// The open project `scope` names and the calling session,
+    /// which a spawned agent defaults to, plus its channel membership.
+    fn context(
+        &mut self,
+        scope: Scope,
+    ) -> Result<
+        (
+            Option<PathBuf>,
+            Option<crate::agent_execution::directory::Entry>,
+        ),
+        AppError,
+    > {
         let Reply::Directory(directory) = self.call(Operation::Directory(scope))? else {
             return Err(AppError::new("sessions", "Unexpected directory response"));
         };
@@ -674,7 +707,7 @@ impl Session {
             Scope::Project(project) => Some(project),
             _ => None,
         };
-        Ok((project, directory.caller.and_then(|caller| caller.provider)))
+        Ok((project, directory.caller))
     }
 }
 
@@ -687,6 +720,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
         AgentCommand::Spawn {
             prompt,
+            name,
             provider,
             repository,
             directory,
@@ -732,6 +766,9 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 }
             };
             let (containing, caller) = session.context(Scope::Containing(here.clone()))?;
+            // Keep explicit launch paths byte-for-byte for durable retry, but
+            // compare channel ownership using the daemon's resolved project.
+            let mut channel_repository = containing.clone();
             let (repository, directory) = match repository {
                 None => {
                     let repository = containing.ok_or_else(|| {
@@ -758,6 +795,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                                     )
                                 })
                             });
+                    channel_repository = named.as_ref().ok().cloned();
                     match given {
                         // A target given in full is sent as given, so retrying
                         // it stays exact even after its directory has moved;
@@ -801,10 +839,18 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                     }
                 }
             };
-            let provider = provider.or(caller).ok_or_else(|| {
-                AppError::new("agent_request", "Choose --provider claude, codex, or omp")
-            })?;
+            let channel = channel.or_else(|| {
+                channel_repository
+                    .as_deref()
+                    .and_then(|repository| spawn_channel(None, caller.as_ref(), repository))
+            });
+            let provider = provider
+                .or(caller.and_then(|caller| caller.provider))
+                .ok_or_else(|| {
+                    AppError::new("agent_request", "Choose --provider claude, codex, or omp")
+                })?;
             let request = Submit {
+                name,
                 destination: Destination::New(Spec {
                     provider,
                     account,
@@ -836,6 +882,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         } => {
             let prompt = prompt.read()?;
             let request = Submit {
+                name: None,
                 destination: Destination::Existing(session.agent(&agent)?),
                 prompt,
                 idempotency_key: retry.key(),
@@ -862,12 +909,18 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                     .iter()
                     .map(|summary| {
                         format!(
-                            "{}  {:<6} {:<11} run {}  {}",
+                            "{}  {:<6} {:<11} run {}  {}{}",
                             short(summary.agent.id),
                             summary.agent.spec.provider.executable(),
                             format!("{:?}", summary.state),
                             short(summary.run),
-                            summary.agent.spec.target.directory.display()
+                            summary.agent.spec.target.directory.display(),
+                            summary
+                                .agent
+                                .name
+                                .as_ref()
+                                .map(|name| format!("  {name}"))
+                                .unwrap_or_default()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1190,6 +1243,7 @@ mod tests {
     fn running() -> (RunId, Reply) {
         use crate::agent_execution::{Agent, Origin, Run, State};
         let agent = Agent {
+            name: None,
             id: AgentId::new(),
             origin: Origin::User,
             channel: crate::model::ChannelId::new(),
@@ -1811,6 +1865,7 @@ mod tests {
     fn summary(agent: &str, run: &str) -> Summary {
         Summary {
             agent: Agent {
+                name: None,
                 id: agent.parse().unwrap(),
                 origin: crate::agent_execution::Origin::User,
                 channel: ChannelId::new(),
@@ -1835,6 +1890,93 @@ mod tests {
             run: run.parse().unwrap(),
             state: crate::agent_execution::State::Running,
         }
+    }
+
+    #[test]
+    fn exact_names_win_over_prefixes_and_spawn_accepts_a_name() {
+        let mut summaries = [
+            summary(
+                "abcdef00-0000-4000-8000-000000000001",
+                "12345678-0000-4000-8000-000000000001",
+            ),
+            summary(
+                "98765432-0000-4000-8000-000000000002",
+                "abcdef11-0000-4000-8000-000000000002",
+            ),
+        ];
+        summaries[1].agent.name = Some("abcdef".into());
+        assert_eq!(
+            resolve(&summaries, "ABCDEF").unwrap(),
+            Some(Handle::Agent(summaries[1].agent.id))
+        );
+        assert!(
+            resolve(&summaries, "abcde").is_err(),
+            "names are exact, ID prefixes remain ambiguous"
+        );
+        assert_eq!(
+            resolve(&summaries, &summaries[0].agent.id.to_string()).unwrap(),
+            Some(Handle::Agent(summaries[0].agent.id))
+        );
+        assert!(
+            matches!(parse(&["spawn", "--name", "reviewer", "Review this"]), AgentCommand::Spawn { name: Some(name), .. } if name == "reviewer")
+        );
+    }
+
+    #[test]
+    fn spawn_channel_uses_only_same_project_membership_and_explicit_choice_wins() {
+        use crate::agent_execution::directory::{Entry, Relation, Surface};
+        let channel = ChannelId::new();
+        let explicit = ChannelId::new();
+        let mut caller = Entry {
+            id: crate::model::TerminalId::new(),
+            surface: Surface::Chat,
+            provider: Some(Provider::Claude),
+            title: None,
+            channel: Some(channel),
+            channel_repository: Some("/repo".into()),
+            state: crate::agent::ActivityState::Idle,
+            directory: Some("/repo".into()),
+            worktree: Some("/repo".into()),
+            project: Some("/repo".into()),
+            project_name: None,
+            delegation: None,
+            relation: Relation::Myself,
+            lineage: crate::agent_execution::Lineage(crate::model::TerminalId::new()),
+        };
+        assert_eq!(
+            spawn_channel(None, Some(&caller), std::path::Path::new("/repo")),
+            Some(channel)
+        );
+        assert_eq!(
+            spawn_channel(Some(explicit), Some(&caller), std::path::Path::new("/repo")),
+            Some(explicit)
+        );
+        assert_eq!(
+            spawn_channel(None, Some(&caller), std::path::Path::new("/other")),
+            None
+        );
+        assert_eq!(
+            spawn_channel(None, None, std::path::Path::new("/repo")),
+            None
+        );
+        caller.project = Some("/other-cwd-project".into());
+        assert_eq!(
+            spawn_channel(None, Some(&caller), std::path::Path::new("/repo")),
+            Some(channel),
+            "channel ownership is independent of cwd placement"
+        );
+        caller.channel = None;
+        assert_eq!(
+            spawn_channel(None, Some(&caller), std::path::Path::new("/repo")),
+            None
+        );
+        let mut legacy = serde_json::to_value(&caller).unwrap();
+        legacy.as_object_mut().unwrap().remove("channel");
+        legacy.as_object_mut().unwrap().remove("channel_repository");
+        assert_eq!(
+            serde_json::from_value::<Entry>(legacy).unwrap().channel,
+            None
+        );
     }
 
     #[test]

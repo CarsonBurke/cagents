@@ -137,6 +137,9 @@ pub enum Destination {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submit {
+    /// Optional owner-scoped handle for a newly spawned agent.
+    #[serde(default)]
+    pub name: Option<String>,
     pub destination: Destination,
     pub prompt: String,
     /// Stable within the authenticated origin. Retrying an identical request
@@ -146,6 +149,25 @@ pub struct Submit {
 
 impl Submit {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.name {
+            if !matches!(&self.destination, Destination::New(_)) {
+                return Err("Only a new agent can be named".into());
+            }
+            if uuid::Uuid::parse_str(name).is_ok() {
+                return Err("Whole UUIDs are reserved for agent and run IDs".into());
+            }
+            if name.is_empty()
+                || name.len() > 64
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+                || !name.as_bytes()[0].is_ascii_lowercase()
+            {
+                return Err("An agent name must start with a lowercase letter and contain at most 64 lowercase letters, digits, hyphens or underscores".into());
+            }
+        }
         if self.prompt.trim().is_empty() || self.prompt.len() > MAX_PROMPT_BYTES {
             return Err(format!(
                 "A prompt must contain text and be at most {MAX_PROMPT_BYTES} bytes"
@@ -232,6 +254,9 @@ impl HostedSession {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
+    /// Unique among this owner's open agents.
+    #[serde(default)]
+    pub name: Option<String>,
     pub id: AgentId,
     pub origin: Origin,
     pub spec: Spec,
@@ -500,6 +525,24 @@ mod tests {
     }
 
     #[test]
+    fn named_requests_roundtrip_wire_and_followups_cannot_rename_agents() {
+        let mut request = Submit {
+            name: Some("reviewer".into()),
+            destination: Destination::New(spec()),
+            prompt: "Review this".into(),
+            idempotency_key: "review".into(),
+        };
+        request.validate().unwrap();
+        let decoded: Submit =
+            postcard::from_bytes(&postcard::to_allocvec(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        request.destination = Destination::Existing(AgentId::new());
+        assert!(request.validate().unwrap_err().contains("Only a new agent"));
+        request.name = None;
+        request.validate().unwrap();
+    }
+
+    #[test]
     fn specs_saved_before_reasoning_effort_keep_the_provider_default() {
         let saved = serde_json::json!({
             "provider": "Codex",
@@ -522,6 +565,7 @@ mod tests {
     #[test]
     fn reasoning_effort_is_a_single_provider_word() {
         let submit = |effort: &str| Submit {
+            name: None,
             destination: Destination::New(Spec {
                 reasoning_effort: Some(effort.into()),
                 ..spec()

@@ -313,6 +313,7 @@ mod tests {
             })
             .unwrap();
         let request = Submit {
+            name: None,
             destination: Destination::New(Spec {
                 provider: Provider::Claude,
                 account: None,

@@ -84,6 +84,12 @@ pub struct Entry {
     /// Absent only for the caller's own plain shell.
     pub provider: Option<Provider>,
     pub title: Option<String>,
+    /// Daemon-owned channel membership, when this session belongs to one.
+    #[serde(default)]
+    pub channel: Option<crate::model::ChannelId>,
+    /// The channel's owning repository, independent of this session's cwd.
+    #[serde(default)]
+    pub channel_repository: Option<PathBuf>,
     pub state: ActivityState,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.

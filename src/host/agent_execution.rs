@@ -1230,6 +1230,7 @@ fn console(
                 .submit_agent(
                     &agent.origin,
                     &Submit {
+                        name: None,
                         destination: Destination::Existing(id),
                         prompt,
                         idempotency_key,

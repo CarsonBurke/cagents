@@ -111,11 +111,13 @@ pub(super) fn read(
         }
     };
 
+    let channels = session_channels(&model);
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
-        let (delegation, channel) = delegations.get(&live.id).cloned().unzip();
+        let (delegation, delegated_channel) = delegations.get(&live.id).cloned().unzip();
+        let channel = channels.get(&live.id).copied().unwrap_or(delegated_channel);
         let relation = if Some(live.id) == caller {
             Relation::Myself
         } else if Some(lineage(live.id)) == parent {
@@ -135,8 +137,12 @@ pub(super) fn read(
         let entry = Entry {
             id: live.id,
             surface: live.surface,
+            channel,
+            channel_repository: channel
+                .and_then(|id| model.channel(id))
+                .map(|channel| channel.repository.clone()),
             provider: live.provider,
-            // A delegated agent is named by the channel its prompt titled.
+            // Channel metadata supplies a fallback when the provider has no title.
             title: live.title.or_else(|| {
                 channel
                     .and_then(|channel| model.channel(channel))
@@ -250,4 +256,107 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         });
     }
     live
+}
+
+/// Multiple channel placements have no unambiguous default. Worktree strips
+/// do not contribute a channel; cwd and window focus grant no membership.
+fn session_channels(
+    model: &crate::workspace_model::WorkspaceModel,
+) -> BTreeMap<TerminalId, Option<crate::model::ChannelId>> {
+    let mut channels = BTreeMap::new();
+    for view in &model.views {
+        let crate::workspace_model::views::Scope::Channel(channel) = view.scope else {
+            continue;
+        };
+        for pane in &view.panes {
+            let id = match &pane.kind {
+                crate::model::CardKind::Chat(session) => session.id,
+                crate::model::CardKind::Terminal(session) => session.id,
+                _ => continue,
+            };
+            channels
+                .entry(id)
+                .and_modify(|known| {
+                    if *known != Some(channel) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(channel));
+        }
+    }
+    channels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_membership_ignores_worktree_strips_and_ambiguous_channels() {
+        use crate::{
+            model::{
+                CardId, CardKind, ChannelId, LaunchRecipe, TerminalContinuity, TerminalSession,
+            },
+            workspace_model::{
+                WorkspaceModel,
+                views::{Pane, Scope, View},
+            },
+        };
+        let id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "sh".into(),
+            arguments: vec![],
+            working_directory: "/repo".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Shell".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            scope: None,
+            kind: CardKind::Terminal(TerminalSession {
+                id,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                launch: recipe.clone(),
+                transcript_path: None,
+                resume_hint: None,
+                continuity: TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+            }),
+        };
+        let mut model = WorkspaceModel::default();
+        let mut strip = View::empty(Scope::Worktree {
+            repository: "/repo".into(),
+            path: "/repo".into(),
+        });
+        strip.panes.push(pane.clone());
+        model.views.push(strip);
+        assert!(!session_channels(&model).contains_key(&id));
+        let channel = ChannelId::new();
+        let mut first = View::empty(Scope::Channel(channel));
+        first.panes.push(pane.clone());
+        model.views.push(first.clone());
+        assert_eq!(session_channels(&model)[&id], Some(channel));
+        model.views.push(first);
+        assert_eq!(
+            session_channels(&model)[&id],
+            Some(channel),
+            "duplicate same-channel metadata is unambiguous"
+        );
+        let mut other = View::empty(Scope::Channel(ChannelId::new()));
+        other.panes.push(pane);
+        model.views.push(other);
+        assert_eq!(
+            session_channels(&model)[&id],
+            None,
+            "conflicting legacy descriptors choose no channel"
+        );
+    }
 }
