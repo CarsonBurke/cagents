@@ -721,6 +721,7 @@ impl Cagents {
                 // it owns Tab now: hand it the reader's real choice instead.
                 if !self.adopt_terminal_close_keyboard_nav(restore)
                     && !self.adopt_daemon_health_keyboard_nav(restore)
+                    && !self.adopt_automation_approval_keyboard_nav(restore)
                     && !self.adopt_session_recovery_keyboard_nav(restore)
                 {
                     self.core.set_keyboard_nav(restore);

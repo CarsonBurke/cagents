@@ -20,8 +20,9 @@ pub const DEFAULT_PRECHECK_SECONDS: u32 = 30;
 pub const MAX_PRECHECK_SECONDS: u32 = 300;
 pub const MISFIRE_GRACE_MS: u64 = 15 * 60 * 1000;
 
-/// Management calls are user-authorized, never inherited from an agent's
-/// child-execution capability. Revisions fence stale editors and confirmations.
+/// Active schedule management requires user authority. Hosted conversations
+/// may inspect their own project and prepare immutable requests for approval.
+/// Revisions fence stale editors and confirmations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     List {
@@ -71,6 +72,40 @@ pub enum Request {
     ShowRun {
         run: RunId,
     },
+    /// Prepare an immutable request for user approval. This confers no
+    /// authority to edit an existing schedule or execute unattended work.
+    Propose {
+        request: Uuid,
+        definition: Definition,
+    },
+    Proposal {
+        id: Uuid,
+    },
+    PendingProposals {
+        repository: std::path::PathBuf,
+        after: Option<Uuid>,
+        limit: usize,
+    },
+    ResolveProposal {
+        id: Uuid,
+        revision: u64,
+        approved: bool,
+    },
+}
+
+impl Request {
+    pub fn allowed_from_hosted_conversation(&self) -> bool {
+        matches!(
+            self,
+            Self::List { .. }
+                | Self::Show { .. }
+                | Self::History { .. }
+                | Self::ShowFiring { .. }
+                | Self::ShowRun { .. }
+                | Self::Propose { .. }
+                | Self::Proposal { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +117,54 @@ pub enum Response {
     Detail(RunDetail),
     Removed,
     CancellationRequested,
+    Proposal(Box<Proposal>),
+    Proposals(Vec<ProposalSummary>),
+}
+
+/// A saved execution configuration, separate from active scheduler records.
+/// Its request ID is immutable: changed settings require another proposal,
+/// never reuse the approval of the previous configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: Uuid,
+    pub revision: u64,
+    pub owner: agent_execution::Origin,
+    pub requested: Definition,
+    pub definition: Definition,
+    pub target_identity: DirectoryIdentity,
+    pub channel_title: Option<String>,
+    pub created_ms: u64,
+    pub state: ProposalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProposalState {
+    Pending,
+    Approved {
+        automation: Uuid,
+        execution_revision: u64,
+    },
+    Declined,
+}
+
+/// Pending lists do not load or transfer every saved prompt and precheck.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalSummary {
+    pub id: Uuid,
+    pub revision: u64,
+    pub repository: std::path::PathBuf,
+    pub name: String,
+}
+
+impl From<&Proposal> for ProposalSummary {
+    fn from(proposal: &Proposal) -> Self {
+        Self {
+            id: proposal.id,
+            revision: proposal.revision,
+            repository: proposal.definition.agent.target.repository.clone(),
+            name: proposal.definition.name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,12 +297,6 @@ impl Definition {
             || self.schedule.timezone.chars().any(char::is_control)
         {
             return Err("Choose an explicit IANA timezone, such as America/Vancouver".into());
-        }
-        if self.agent.target.channel.is_some() {
-            return Err(
-                "Automations create their own channel; they cannot take over an existing channel"
-                    .into(),
-            );
         }
         if let Some(precheck) = &self.precheck {
             if precheck.command.trim().is_empty()

@@ -754,41 +754,11 @@ impl Registry {
         now_ms: u64,
         target_identity: crate::automations::DirectoryIdentity,
     ) -> Result<Automation, String> {
-        definition.validate()?;
-        let automation = Automation {
-            id: Uuid::new_v4(),
-            revision: 1,
-            execution_revision: 1,
-            definition,
-            target_identity,
-            enabled: false,
-            created_ms: now_ms,
-            updated_ms: now_ms,
-            next: None,
-            active_firing: None,
-            reuse_agent: None,
-            channel: None,
-            blocked: None,
-        };
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        require_project(&tx, &automation.definition)?;
-        tx.execute(
-            "INSERT INTO automations(id,revision,record,summary,enabled,next_due_ms,updated_ms,repository)
-                    VALUES(?1,?2,?3,?4,0,NULL,?5,?6)",
-            params![
-                automation.id.to_string(),
-                automation.revision,
-                encode(&automation)?,
-                encode(&automation.summary(None))?,
-                now_ms,
-                super::repository_key(&automation.definition.agent.target.repository)?,
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        write_revision(&tx, &automation)?;
+        let automation = create_automation_in(&tx, definition, now_ms, target_identity, None)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
     }
@@ -816,6 +786,33 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
         records.into_iter().map(|record| decode(&record)).collect()
+    }
+
+    pub(crate) fn project_automations(
+        &self,
+        repository: &std::path::Path,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Summary>, String> {
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT summary FROM automations WHERE deleted_ms IS NULL
+            AND repository=?1 AND (?2 IS NULL OR id>?2) ORDER BY id LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map(
+                params![
+                    super::repository_key(repository)?,
+                    after.map(|id| id.to_string()),
+                    limit.clamp(1, MAX_HISTORY_PAGE)
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| decode(&row.map_err(|error| error.to_string())?))
+            .collect()
     }
 
     /// Every material edit pauses execution until the user reviews it again.
@@ -874,7 +871,7 @@ impl Registry {
                 automation.reuse_agent = None;
             }
             if new_target {
-                automation.channel = None;
+                automation.channel = automation.definition.agent.target.channel;
             }
         }
         write_revision(&tx, &automation)?;
@@ -1002,6 +999,44 @@ impl Registry {
     }
 }
 
+/// The proposal receipt and activation use the same transaction as creation.
+pub(super) fn create_automation_in(
+    tx: &Transaction<'_>,
+    definition: Definition,
+    now_ms: u64,
+    target_identity: crate::automations::DirectoryIdentity,
+    next: Option<Occurrence>,
+) -> Result<Automation, String> {
+    definition.validate()?;
+    require_project(tx, &definition)?;
+    let channel = definition.agent.target.channel;
+    let automation = Automation {
+        id: Uuid::new_v4(),
+        revision: 1,
+        execution_revision: 1,
+        definition,
+        target_identity,
+        enabled: next.is_some(),
+        created_ms: now_ms,
+        updated_ms: now_ms,
+        next,
+        active_firing: None,
+        reuse_agent: None,
+        channel,
+        blocked: None,
+    };
+    tx.execute(
+        "INSERT INTO automations(id,revision,record,summary,enabled,next_due_ms,updated_ms,repository)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![automation.id.to_string(), automation.revision, encode(&automation)?,
+            encode(&automation.summary(None))?, automation.enabled,
+            automation.next.as_ref().map(|next| next.due_ms), now_ms,
+            super::repository_key(&automation.definition.agent.target.repository)?],
+    ).map_err(|error| error.to_string())?;
+    write_revision(tx, &automation)?;
+    Ok(automation)
+}
+
 fn read_automation(db: &Connection, id: Uuid) -> Result<Automation, String> {
     let record = db
         .query_row(
@@ -1065,7 +1100,7 @@ fn require_revision(automation: &Automation, expected: u64) -> Result<(), String
     Ok(())
 }
 
-fn require_project(tx: &Transaction<'_>, definition: &Definition) -> Result<(), String> {
+pub(super) fn require_project(tx: &Transaction<'_>, definition: &Definition) -> Result<(), String> {
     let repository = super::repository_key(&definition.agent.target.repository)?;
     let exists: bool = tx
         .query_row(
@@ -1076,6 +1111,23 @@ fn require_project(tx: &Transaction<'_>, definition: &Definition) -> Result<(), 
         .map_err(|error| error.to_string())?;
     if !exists {
         return Err("The automation's project is no longer open".into());
+    }
+    if let Some(channel) = definition.agent.target.channel {
+        let owned: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM channels WHERE id=?1 AND repository=?2)",
+                params![
+                    channel.to_string(),
+                    super::repository_key(&definition.agent.target.repository)?
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !owned {
+            return Err(
+                "The automation's selected channel no longer belongs to its project".into(),
+            );
+        }
     }
     Ok(())
 }

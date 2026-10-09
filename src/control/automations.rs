@@ -8,6 +8,26 @@ const MAX_DEFINITION_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum AutomationCommand {
+    /// Save exact launch settings for approval in cagents, without creating a schedule.
+    Propose {
+        #[arg(long)]
+        request_id: Uuid,
+        #[arg(long)]
+        definition: PathBuf,
+        /// Wait for the user's decision so the requesting tool call resumes.
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        wait_seconds: u64,
+    },
+    /// Read only this conversation's immutable approval request.
+    Proposal {
+        id: Uuid,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        wait_seconds: u64,
+    },
     /// Create a disabled automation from a JSON definition (use - for stdin).
     Create {
         #[arg(long)]
@@ -88,12 +108,25 @@ impl ControlClient {
         operation: Request,
     ) -> Result<Response, ControlError> {
         // Editing launch settings and removal can await an exact idle close.
+        self.automation_until(
+            authority,
+            operation,
+            Instant::now() + CHAT_CLOSE_TIMEOUT + Duration::from_secs(35),
+        )
+    }
+
+    fn automation_until(
+        &mut self,
+        authority: crate::agent_execution::Authority,
+        operation: Request,
+        deadline: Instant,
+    ) -> Result<Response, ControlError> {
         let response = self.request_with_deadline(
             ClientRequest::Automation {
                 authority,
                 operation,
             },
-            Instant::now() + CHAT_CLOSE_TIMEOUT + Duration::from_secs(35),
+            deadline,
         )?;
         match response {
             ServerResponse::Automation(response) => Ok(response),
@@ -104,20 +137,80 @@ impl ControlClient {
 
 pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppError> {
     let authority = crate::agent_execution::Authority::from_environment();
-    if authority.token().is_some() {
+    let wait = match &command {
+        AutomationCommand::Propose {
+            wait: true,
+            wait_seconds,
+            ..
+        }
+        | AutomationCommand::Proposal {
+            wait: true,
+            wait_seconds,
+            ..
+        } => Some(*wait_seconds),
+        _ => None,
+    };
+    let (name, request) = request(command)?;
+    if authority.token().is_some() && !request.allowed_from_hosted_conversation() {
         return Err(AppError::new(
             "automation_authority",
-            "An inherited agent capability cannot manage automations; use an explicit user session",
+            "An inherited agent capability cannot alter unattended schedules; use automation propose for user approval",
         ));
     }
-    let (name, request) = request(command)?;
     let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-    let reply = client
-        .automation(authority, request)
+    let mut reply = client
+        .automation(authority.clone(), request)
         .map_err(protocol_error)?;
+    if let Some(seconds) = wait {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        while let Response::Proposal(proposal) = &reply {
+            if proposal.state != crate::automations::ProposalState::Pending
+                || Instant::now() >= deadline
+            {
+                break;
+            }
+            let id = proposal.id;
+            std::thread::sleep(
+                Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            reply = client
+                .automation_until(
+                    authority.clone(),
+                    Request::Proposal { id },
+                    deadline.min(Instant::now() + IO_TIMEOUT),
+                )
+                .map_err(protocol_error)?;
+        }
+    }
     let (data, human) = match reply {
+        Response::Proposal(proposal) => {
+            let human = match &proposal.state {
+                crate::automations::ProposalState::Pending => format!(
+                    "{}\tAwaiting user approval in cagents. No schedule is enabled.",
+                    proposal.id
+                ),
+                crate::automations::ProposalState::Approved {
+                    automation,
+                    execution_revision,
+                } => format!(
+                    "{}\tApproved automation {automation}, execution revision {execution_revision}",
+                    proposal.id
+                ),
+                crate::automations::ProposalState::Declined => {
+                    format!("{}\tUser declined. No schedule was created.", proposal.id)
+                }
+            };
+            (json!({"proposal":proposal}), human)
+        }
+        Response::Proposals(proposals) => (
+            json!({"proposals":proposals}),
+            "Automation approval requests".into(),
+        ),
         Response::Listed(entries) => {
             let human = entries
                 .iter()
@@ -192,6 +285,18 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
 
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
     Ok(match command {
+        AutomationCommand::Propose {
+            request_id,
+            definition,
+            ..
+        } => (
+            "automation.propose",
+            Request::Propose {
+                request: request_id,
+                definition: read_definition(&definition)?,
+            },
+        ),
+        AutomationCommand::Proposal { id, .. } => ("automation.proposal", Request::Proposal { id }),
         AutomationCommand::Create { definition } => (
             "automation.create",
             Request::Create {
@@ -414,6 +519,57 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("exceeds 2 MiB")
+        );
+    }
+
+    #[test]
+    fn automation_proposals_require_a_stable_retry_identity_and_bound_waits() {
+        assert!(parse(&["cagents", "automation", "propose", "--definition", "-"]).is_err());
+        let id = Uuid::new_v4().to_string();
+        let parsed = parse(&[
+            "cagents",
+            "automation",
+            "propose",
+            "--request-id",
+            &id,
+            "--definition",
+            "-",
+            "--wait",
+            "--wait-seconds",
+            "30",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed,AutomationCommand::Propose {request_id,wait:true,wait_seconds:30,..}
+            if request_id.to_string()==id)
+        );
+        assert!(
+            parse(&[
+                "cagents",
+                "automation",
+                "proposal",
+                &id,
+                "--wait-seconds",
+                "0"
+            ])
+            .is_err()
+        );
+        let (_, request) =
+            request(parse(&["cagents", "automation", "proposal", &id, "--wait"]).unwrap()).unwrap();
+        assert_eq!(
+            request,
+            Request::Proposal {
+                id: id.parse().unwrap()
+            }
+        );
+        assert!(request.allowed_from_hosted_conversation());
+        assert!(
+            !Request::ResolveProposal {
+                id: id.parse().unwrap(),
+                revision: 1,
+                approved: true
+            }
+            .allowed_from_hosted_conversation()
         );
     }
 }

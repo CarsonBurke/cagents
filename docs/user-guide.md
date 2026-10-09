@@ -422,12 +422,13 @@ exact saved launch settings before confirmation; changing those settings or the
 schedule pauses future runs until you confirm again. Renaming preserves the
 existing execution settings.
 
-The first accepted run creates the automation’s own channel, named after the
+Unless an existing channel was explicitly chosen and approved, the first accepted run creates the automation’s own channel, named after the
 automation. Later runs keep that channel and its title; provider-generated
 conversation titles do not replace it. You can rename the channel separately.
 Renaming the automation keeps its existing channel title, so its execution name
 and channel name can be managed independently. If it has not run yet, its first
-channel uses the automation’s current name.
+channel uses the automation’s current name. An explicitly selected existing channel
+keeps its title and project membership.
 
 The daemon runs enabled schedules with every window closed. It must itself be
 running: cagents does not install a system scheduler. On startup it considers
@@ -508,8 +509,26 @@ chat composer does.
 
 An omitted account selection resolves once when the definition is saved and is
 then pinned in the saved definition. Review that account before enabling. Agent
-child capabilities cannot create or modify unattended schedules; use an
-explicit user CLI session for automation management.
+child capabilities cannot create or modify unattended schedules. A hosted
+conversation can inspect automations in its project and prepare an approval
+request:
+
+```sh
+cagents automation propose --request-id UUID --definition automation.json --wait
+```
+
+The definition is saved separately from schedules. In a focused cagents window
+showing that project's workspace, **Review request** opens **Approve scheduled work?** with the saved prompt,
+schedule and timezone, directory, channel, account, model, permissions, and any
+shell precheck. **Approve and enable** atomically creates the schedule and its
+approval receipt; **Decline** creates no schedule. The waiting conversation
+receives that decision without asking you to copy a terminal command.
+Defaults are resolved when preparing the request, and approval verifies the
+saved account, directory identity, and channel membership again. Reusing the
+same request ID returns the same definition and receipt; use a new ID for
+changed settings. After a wait ends, `cagents automation proposal UUID --wait`
+can resume reading that conversation's request. Neither approval nor inspection
+gives a delegated agent permission to change an active schedule.
 
 ## Settings
 
