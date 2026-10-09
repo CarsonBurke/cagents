@@ -1926,6 +1926,98 @@ fn a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own() {
 }
 
 #[test]
+fn disconnected_blocked_inbox_poll_keeps_mail_pending() {
+    use crate::{
+        agent_execution::{
+            Lineage,
+            mailbox::{Inbox, Message, Party, Receipt, State as Delivery},
+        },
+        model::MessageId,
+        terminal_ipc::{read_frame, write_frame},
+    };
+    use std::{os::unix::net::UnixStream, sync::mpsc};
+
+    if isolated("disconnected_blocked_inbox_poll_keeps_mail_pending").is_some() {
+        return;
+    }
+    let (host, _, _) = fixture();
+    let registry = registry(&host).unwrap();
+    let message = Message {
+        id: MessageId::new(),
+        from: Party {
+            lineage: Some(Lineage(TerminalId::new())),
+            session: None,
+            title: None,
+        },
+        to: Party::user(),
+        reply_to: None,
+        body: "Do not lose this delayed reply".into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms: now(),
+    };
+    let mut blocked = registry.lock().unwrap();
+    blocked.post_message(&message).unwrap();
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let server_host = Arc::clone(&host);
+    let handler = std::thread::spawn(move || {
+        let operation: Operation = read_frame(&mut server).unwrap().unwrap();
+        started_tx.send(()).unwrap();
+        // The registry lock above delays processing until after the polling
+        // client disconnects, as a slow daemon request would.
+        let reply = process(&server_host, Authority::default(), operation).unwrap();
+        assert!(write_frame(&mut server, &reply).is_err());
+    });
+    let query = Inbox {
+        all: false,
+        replies_to: None,
+    };
+    write_frame(&mut client, &Operation::PeekInbox(query.clone())).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    drop(client);
+    drop(blocked);
+    handler.join().unwrap();
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .message(message.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        Delivery::Pending
+    );
+    let Reply::Inbox(retried) =
+        process(&host, Authority::default(), Operation::PeekInbox(query)).unwrap()
+    else {
+        panic!("inbox reply");
+    };
+    assert_eq!(retried, vec![message.clone()]);
+    assert_eq!(
+        process(
+            &host,
+            Authority::default(),
+            Operation::AcknowledgeInbox(Receipt {
+                ids: vec![message.id]
+            })
+        )
+        .unwrap(),
+        Reply::InboxAcknowledged
+    );
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .message(message.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        Delivery::Read
+    );
+}
+
+#[test]
 fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_askers() {
     use crate::agent_execution::{
         Lineage,

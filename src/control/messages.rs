@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, To, short},
+    mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short},
 };
 
 /// How often a waiting caller asks the daemon for a reply.
@@ -248,7 +248,11 @@ pub(super) fn message_lines(message: &Message) -> String {
         .lines()
         .map(|line| format!("  {}", printable(line)))
         .collect();
-    format!("{heading}\n{}", body.join("\n"))
+    let mut rendered = format!("{heading}\n{}", body.join("\n"));
+    if message.state == State::Pending {
+        rendered.push_str("\nReceipt not confirmed; this message may appear again.");
+    }
+    rendered
 }
 
 /// A line as a terminal may print it: control characters, which could
@@ -298,31 +302,46 @@ impl Mailbox {
     }
 
     fn read(&mut self, query: Inbox) -> Result<Vec<Message>, AppError> {
-        match self
+        let reply = self
             .client
             .agent(self.authority.clone(), Operation::Inbox(query))
-            .map_err(protocol_error)?
-        {
-            Reply::Inbox(messages) => Ok(messages),
-            _ => Err(AppError::new("inbox", "Unexpected inbox response")),
-        }
+            .map_err(protocol_error)?;
+        inbox_messages(reply)
     }
 
     /// Reads until something matches `query`, or returns `None` once
-    /// `timeout` seconds pass first.
+    /// `timeout` seconds pass first. Every poll shares the wait's deadline,
+    /// including time spent waiting for the daemon to answer.
     fn wait(&mut self, query: Inbox, timeout: f64) -> Result<Option<Vec<Message>>, AppError> {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout);
-        loop {
-            let messages = self.read(query.clone())?;
+        while Instant::now() < deadline {
+            let reply = match self.client.agent_before(
+                self.authority.clone(),
+                Operation::Inbox(query.clone()),
+                Some(deadline),
+            ) {
+                Ok(reply) => reply,
+                Err(error) if is_timeout_error(&error) => return Ok(None),
+                Err(error) => return Err(protocol_error(error)),
+            };
+            let messages = inbox_messages(reply)?;
             if !messages.is_empty() {
                 return Ok(Some(messages));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(None);
+                break;
             }
             thread::sleep(REPLY_POLL.min(remaining));
         }
+        Ok(None)
+    }
+}
+
+fn inbox_messages(reply: Reply) -> Result<Vec<Message>, AppError> {
+    match reply {
+        Reply::Inbox(messages) => Ok(messages),
+        _ => Err(AppError::new("inbox", "Unexpected inbox response")),
     }
 }
 
@@ -357,6 +376,73 @@ mod tests {
         assert!(reply.wait && reply.message.file.is_some());
         assert!(parse(&["inbox", "--all", "--wait"]).is_err());
         assert!(matches!(parse(&["inbox"]).unwrap(), TopCommand::Inbox(_)));
+    }
+
+    #[test]
+    fn waiting_mailbox_bounds_stalled_poll_io_and_restores_socket_timeout() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Connect { .. }));
+            let proof = HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("mailbox-deadline"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+            };
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(
+                request.request,
+                ClientRequest::Agent {
+                    operation: Operation::PeekInbox(_),
+                    ..
+                }
+            ));
+            // Hold the response until the caller returns; no timing-sensitive
+            // sleep or late reply can make the deadline assertion pass.
+            released.recv().unwrap();
+        });
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut mailbox = Mailbox {
+            authority: Authority::default(),
+            client,
+        };
+        let result = mailbox.wait(
+            Inbox {
+                all: false,
+                replies_to: None,
+            },
+            0.02,
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(result, Ok(None)),
+            "a stalled poll must end as the requested wait timeout: {result:?}"
+        );
+        assert_eq!(
+            mailbox.client.stream.read_timeout().unwrap(),
+            Some(IO_TIMEOUT)
+        );
     }
 
     #[test]

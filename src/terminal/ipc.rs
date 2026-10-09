@@ -119,7 +119,8 @@ use crate::{
 /// Version 55 carries the delivery and attachments of queued chat messages.
 /// Version 56 shares manually arranged worktree and channel navigation.
 /// Version 57 distinguishes published device saves with unconfirmed durability.
-pub const PROTOCOL_VERSION: u16 = 57;
+/// Version 58 acknowledges inbox messages after clients receive their bodies.
+pub const PROTOCOL_VERSION: u16 = 58;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

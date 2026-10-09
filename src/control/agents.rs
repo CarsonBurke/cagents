@@ -280,12 +280,75 @@ impl ControlClient {
         self.agent_before(authority, operation, None)
     }
 
-    fn agent_before(
+    pub(super) fn agent_before(
         &mut self,
         authority: Authority,
         operation: Operation,
         deadline: Option<Instant>,
     ) -> Result<Reply, ControlError> {
+        let Operation::Inbox(query) = operation else {
+            return self.agent_request_before(authority, operation, deadline);
+        };
+        let reply =
+            self.agent_request_before(authority.clone(), Operation::PeekInbox(query), deadline)?;
+        let Reply::Inbox(mut messages) = reply else {
+            return Ok(reply);
+        };
+        use crate::agent_execution::mailbox::{MAX_PENDING, Receipt, State};
+        let ids: Vec<_> = messages
+            .iter()
+            .filter(|message| message.state == State::Pending)
+            .map(|message| message.id)
+            .collect();
+        for chunk in ids.chunks(MAX_PENDING) {
+            let receipt = self.agent_request_before(
+                authority.clone(),
+                Operation::AcknowledgeInbox(Receipt {
+                    ids: chunk.to_vec(),
+                }),
+                deadline,
+            );
+            match receipt {
+                Ok(Reply::InboxAcknowledged) => {
+                    for message in &mut messages {
+                        if chunk.contains(&message.id) {
+                            message.state = State::Read;
+                        }
+                    }
+                }
+                result => {
+                    // The bodies have arrived. A failed receipt must allow
+                    // redelivery rather than discard them. Retire this socket
+                    // so a late receipt cannot become a later request's reply.
+                    match result {
+                        Err(error) => {
+                            tracing::debug!(%error, "mailbox receipt not confirmed; messages may be redelivered")
+                        }
+                        Ok(_) => tracing::debug!(
+                            "unexpected mailbox receipt response; messages may be redelivered"
+                        ),
+                    }
+                    let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+            }
+        }
+        Ok(Reply::Inbox(messages))
+    }
+
+    fn agent_request_before(
+        &mut self,
+        authority: Authority,
+        operation: Operation,
+        deadline: Option<Instant>,
+    ) -> Result<Reply, ControlError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(FrameError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "agent request deadline elapsed",
+            ))
+            .into());
+        }
         let closing = matches!(&operation, Operation::Close(_));
         let request = ClientRequest::Agent {
             authority,
@@ -1189,6 +1252,180 @@ mod tests {
         }
     }
 
+    fn inbox_message(
+        state: crate::agent_execution::mailbox::State,
+    ) -> crate::agent_execution::mailbox::Message {
+        use crate::agent_execution::mailbox::{Message, Party};
+        Message {
+            id: crate::model::MessageId::new(),
+            from: Party::user(),
+            to: Party {
+                lineage: None,
+                session: Some(crate::model::TerminalId::new()),
+                title: None,
+            },
+            reply_to: None,
+            body: "Received body and recipient session must survive receipt handling".into(),
+            wait_until_ms: None,
+            state,
+            created_ms: 1,
+        }
+    }
+
+    #[test]
+    fn inbox_receipts_chunk_pending_ids_and_preserve_historical_state_and_session() {
+        use crate::agent_execution::mailbox::{Inbox, MAX_PENDING, State};
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut messages: Vec<_> = (0..MAX_PENDING + 6)
+            .map(|_| inbox_message(State::Pending))
+            .collect();
+        messages.insert(3, inbox_message(State::Read));
+        messages.insert(9, inbox_message(State::Delivered));
+        let ids: Vec<_> = messages
+            .iter()
+            .filter(|message| message.state == State::Pending)
+            .map(|message| message.id)
+            .collect();
+        let mut expected = messages.clone();
+        for message in &mut expected {
+            if message.state == State::Pending {
+                message.state = State::Read;
+            }
+        }
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(
+                        request,
+                        ClientRequest::Agent {
+                            operation: Operation::PeekInbox(Inbox {
+                                all: true,
+                                replies_to: None
+                            }),
+                            ..
+                        }
+                    )
+                },
+                ServerResponse::Agent(Reply::Inbox(messages)),
+            );
+            for chunk in ids.chunks(MAX_PENDING) {
+                answer(
+                    &mut server_stream,
+                    |request| matches!(request, ClientRequest::Agent { operation: Operation::AcknowledgeInbox(receipt), .. } if receipt.ids == chunk),
+                    ServerResponse::Agent(Reply::InboxAcknowledged),
+                );
+            }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none(),
+                "historical messages must not generate receipts"
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let reply = client
+            .agent(
+                Authority::default(),
+                Operation::Inbox(Inbox {
+                    all: true,
+                    replies_to: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(reply, Reply::Inbox(expected));
+        let Reply::Inbox(messages) = reply else {
+            panic!("expected received inbox messages");
+        };
+        assert!(messages.iter().all(|message| {
+            !super::super::messages::message_lines(message).contains("Receipt not confirmed")
+        }));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lost_or_stalled_inbox_receipts_return_received_bodies_and_retire_the_socket() {
+        use crate::agent_execution::mailbox::{Inbox, State};
+        use std::sync::mpsc;
+        for stalled in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let message = inbox_message(State::Pending);
+            let received = message.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                answer(
+                    &mut server_stream,
+                    |request| {
+                        matches!(
+                            request,
+                            ClientRequest::Agent {
+                                operation: Operation::PeekInbox(_),
+                                ..
+                            }
+                        )
+                    },
+                    ServerResponse::Agent(Reply::Inbox(vec![message.clone()])),
+                );
+                let receipt: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(
+                    matches!(receipt.request, ClientRequest::Agent { operation: Operation::AcknowledgeInbox(ref receipt), .. } if receipt.ids == vec![message.id])
+                );
+                if stalled {
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        write_frame(
+                            &mut server_stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(receipt.request_id),
+                                proof: proof(),
+                                message: ServerMessage::Response {
+                                    response: ServerResponse::Agent(Reply::InboxAcknowledged)
+                                },
+                            }
+                        )
+                        .is_err(),
+                        "a late receipt must not reach a reusable socket"
+                    );
+                }
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let reply = client
+                .agent_before(
+                    Authority::default(),
+                    Operation::Inbox(Inbox {
+                        all: false,
+                        replies_to: None,
+                    }),
+                    Some(Instant::now() + Duration::from_millis(250)),
+                )
+                .unwrap();
+            assert_eq!(reply, Reply::Inbox(vec![received]));
+            let Reply::Inbox(messages) = reply else {
+                panic!("expected received inbox messages");
+            };
+            assert!(
+                super::super::messages::message_lines(&messages[0])
+                    .contains("Receipt not confirmed; this message may appear again.")
+            );
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+            assert!(
+                client
+                    .agent(Authority::default(), Operation::Run(RunId::new()))
+                    .is_err(),
+                "the retired socket must reject later requests"
+            );
+            if stalled {
+                release_tx.send(()).unwrap();
+            }
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn bounded_wait_returns_last_known_run_without_polling_after_deadline() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
@@ -1246,7 +1483,7 @@ mod tests {
             matches!(
                 request,
                 ClientRequest::Agent {
-                    operation: Operation::Inbox(Inbox {
+                    operation: Operation::PeekInbox(Inbox {
                         all: false,
                         replies_to: None
                     }),

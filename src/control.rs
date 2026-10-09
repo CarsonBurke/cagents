@@ -1338,9 +1338,13 @@ impl ControlClient {
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
         let result = self.request_inner(request, None, Some(deadline));
-        let restored = self.restore_read_timeout();
-        // Preserve the actual teardown/transport error if restoring also fails.
-        result.and_then(|response| restored.map(|()| response))
+        let read_restored = self.restore_read_timeout();
+        let write_restored = self
+            .stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure);
+        // Restore both directions even when the request or either restoration fails.
+        result.and_then(|response| read_restored.and(write_restored).map(|()| response))
     }
 
     fn request_inner(
@@ -1354,15 +1358,23 @@ impl ControlClient {
         if self.next_request_id == 0 {
             self.next_request_id = 1;
         }
-        write_frame(
-            &mut self.stream,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id,
-                proof: Some(self.proof.clone()),
-                request,
-            },
-        )?;
+        let envelope = ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id,
+            proof: Some(self.proof.clone()),
+            request,
+        };
+        if let Some(deadline) = deadline {
+            write_frame(
+                &mut DeadlineWriter {
+                    stream: &mut self.stream,
+                    deadline,
+                },
+                &envelope,
+            )?;
+        } else {
+            write_frame(&mut self.stream, &envelope)?;
+        }
 
         loop {
             let envelope = match deadline {
@@ -1495,6 +1507,30 @@ impl Read for DeadlineReader<'_> {
         }
         self.stream.set_read_timeout(Some(remaining))?;
         self.stream.read(buffer)
+    }
+}
+
+/// Bound every partial write of a request against the same overall deadline.
+struct DeadlineWriter<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon request deadline expired",
+            ));
+        }
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -4922,8 +4958,43 @@ mod tests {
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn request_deadline_bounds_a_full_socket_write_buffer() {
+        let (mut client_stream, _held_server) = UnixStream::pair().unwrap();
+        client_stream.set_nonblocking(true).unwrap();
+        loop {
+            match client_stream.write(&[0; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        client_stream.set_nonblocking(false).unwrap();
+        let started = Instant::now();
+        let error = write_frame(
+            &mut DeadlineWriter {
+                stream: &mut client_stream,
+                deadline: started + Duration::from_millis(20),
+            },
+            &ClientRequest::Agent {
+                authority: crate::agent_execution::Authority::default(),
+                operation: crate::agent_execution::Operation::PeekInbox(
+                    crate::agent_execution::mailbox::Inbox {
+                        all: false,
+                        replies_to: None,
+                    },
+                ),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, FrameError::Io(error)
+            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

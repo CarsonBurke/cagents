@@ -13,7 +13,7 @@ use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
         Authority, Lineage, Origin,
-        mailbox::{Inbox, Message, Outgoing, Party, Reach, Seal, Sent, State, To},
+        mailbox::{Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To},
     },
     chat::{self, Command, PromptMode, runtime::Rejection},
     model::{MessageId, TerminalId},
@@ -152,6 +152,51 @@ pub(in crate::host) fn inbox(
         })
         .transpose()?;
     registry.read_messages(lineage, session, &query, super::now())
+}
+
+pub(in crate::host) fn peek(
+    host: &SharedHost,
+    authority: &Authority,
+    query: Inbox,
+) -> Result<Vec<Message>, String> {
+    let (_, session) = caller(host, authority)?;
+    let registry = registry(host)?;
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let lineage = session
+        .map(|session| {
+            registry
+                .session_lineage(session)
+                .map(|lineage| lineage.unwrap_or(Lineage(session)))
+        })
+        .transpose()?;
+    let mut messages = registry.peek_messages(lineage, &query)?;
+    for message in &mut messages {
+        if message.state == State::Pending {
+            // This returned copy is addressed to the authenticated reader.
+            // Persisting delivery waits for its explicit receipt.
+            message.to.session = session;
+        }
+    }
+    Ok(messages)
+}
+
+pub(in crate::host) fn acknowledge(
+    host: &SharedHost,
+    authority: &Authority,
+    receipt: Receipt,
+) -> Result<(), String> {
+    receipt.validate()?;
+    let (_, session) = caller(host, authority)?;
+    let registry = registry(host)?;
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let lineage = session
+        .map(|session| {
+            registry
+                .session_lineage(session)
+                .map(|lineage| lineage.unwrap_or(Lineage(session)))
+        })
+        .transpose()?;
+    registry.acknowledge_messages(lineage, session, &receipt, super::now())
 }
 
 /// The one lineage `handle` names among live agent sessions: by session ID,

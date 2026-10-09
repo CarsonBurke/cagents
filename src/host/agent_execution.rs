@@ -862,6 +862,10 @@ pub(super) fn process(
             mailbox::send(host, &authority, outgoing).map(Reply::Sent)
         }
         Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
+        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
+        Operation::AcknowledgeInbox(receipt) => {
+            mailbox::acknowledge(host, &authority, receipt).map(|()| Reply::InboxAcknowledged)
+        }
     }
 }
 
