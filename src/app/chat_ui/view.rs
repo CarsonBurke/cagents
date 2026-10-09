@@ -1006,10 +1006,35 @@ impl Runtime {
                     Self::short_description(&agent.description, 160),
                 )
             };
+            let heading = design::caption(heading)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .width(Length::Fill);
             transcript.push(
-                design::caption(heading)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
+                if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
+                {
+                    widget::row::with_children(vec![
+                        heading.into(),
+                        crate::ui_controls::button::quiet("Stop")
+                            .icon(Icon::Stop)
+                            .name(
+                                "Stop this subagent; the conversation and other subagents carry on",
+                            )
+                            .on_press_maybe(available.then(|| {
+                                action(Action::Command(
+                                    target,
+                                    Command::StopSubagent {
+                                        id: agent.id.clone(),
+                                    },
+                                ))
+                            }))
+                            .into(),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center)
+                    .into()
+                } else {
+                    heading.into()
+                },
             );
             if agent.items.is_empty() {
                 transcript.push(transcript_body(
@@ -1394,6 +1419,7 @@ impl Runtime {
                     chat::ToolStatus::Succeeded => "Completed",
                     chat::ToolStatus::Failed => "Failed",
                     chat::ToolStatus::Denied => "Denied",
+                    chat::ToolStatus::Stopped => "Stopped",
                 };
                 tabs.push(crate::ui_controls::view_tab(
                     crate::ui_controls::ViewTab {
@@ -1704,9 +1730,8 @@ impl Runtime {
                         && !self.permission_picker
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
                     {
-                        return Some(text_editor::Binding::Custom(action(Action::Command(
+                        return Some(text_editor::Binding::Custom(action(Action::Interrupt(
                             target,
-                            Command::Interrupt,
                         ))));
                     }
                     if let Some(mode) =
@@ -1795,12 +1820,40 @@ impl Runtime {
         // permanently present for something used occasionally.
         let mut submissions = Vec::new();
         if snapshot.busy {
-            submissions.push(icon(
-                Icon::Stop,
-                "Cancel active turn (Esc)",
-                available,
-                Action::Command(target, Command::Interrupt),
-            ));
+            // A provider whose interrupt does not spare background subagents
+            // takes them down with the turn. Saying so on the control is not
+            // enough for Esc, which is pressed without reading it, so such a
+            // cancel waits for a second press that names what it stops.
+            let at_stake = self.interrupt_casualties();
+            let subagents = if at_stake == 1 {
+                "subagent"
+            } else {
+                "subagents"
+            };
+            submissions.push(if self.interrupt_armed.is_some() && at_stake > 0 {
+                crate::ui_controls::button::destructive(format!(
+                    "Stop turn and {at_stake} {subagents}"
+                ))
+                .icon(Icon::Stop)
+                .name(format!(
+                    "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc)"
+                ))
+                .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
+                .into()
+            } else {
+                icon(
+                    Icon::Stop,
+                    if at_stake > 0 {
+                        Cow::Owned(format!(
+                            "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
+                        ))
+                    } else {
+                        Cow::Borrowed("Cancel active turn (Esc)")
+                    },
+                    available,
+                    Action::Interrupt(target),
+                )
+            });
         }
         // The primary action anchors the trailing edge. Tooltips and
         // accessible names carry the delivery mode and keyboard chord.

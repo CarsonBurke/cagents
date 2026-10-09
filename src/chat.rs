@@ -740,6 +740,11 @@ pub struct Snapshot {
     #[serde(default)]
     pub sampled_at: Option<u64>,
     pub generation: u64,
+    /// Turn starts observed by this provider process. Unlike publication
+    /// generation, this changes only at a turn boundary, including queued
+    /// and autonomous turns, even when publications coalesce the idle state.
+    #[serde(default)]
+    pub turn_generation: u64,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
@@ -890,7 +895,21 @@ pub struct Subagent {
     pub kind: String,
     pub description: String,
     pub status: ToolStatus,
+    /// Whether it runs apart from the turn that started it, so that the turn
+    /// ending, or being cancelled, does not of itself end it.
+    #[serde(default)]
+    pub background: bool,
     pub items: Vec<std::sync::Arc<Item>>,
+}
+
+impl Subagent {
+    /// Running delegated work that cancelling the parent's turn would also
+    /// stop, where the provider's interrupt does not spare it.
+    pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
+        self.status == ToolStatus::Running
+            && self.background
+            && capabilities.interrupt_stops_background
+    }
 }
 
 /// Route transcript content without letting child status, identity or usage
@@ -974,6 +993,11 @@ pub enum Command {
         mode: PromptMode,
     },
     Interrupt,
+    /// Stops one subagent, addressed by [`Subagent::id`], and nothing else:
+    /// the parent's turn and the other subagents carry on.
+    StopSubagent {
+        id: String,
+    },
     Answer {
         request_id: String,
         action: String,
@@ -1109,6 +1133,9 @@ pub enum ToolStatus {
     Succeeded,
     Failed,
     Denied,
+    /// Ended before it finished because it was asked to stop: cancelled by
+    /// the user, or interrupted with the work that started it.
+    Stopped,
 }
 
 /// What a shell command was actually for.
@@ -1487,6 +1514,13 @@ pub struct Capabilities {
     pub interrupt_modes: Vec<String>,
     #[serde(default)]
     pub branch: bool,
+    /// Whether [`Command::StopSubagent`] is carried by the provider.
+    #[serde(default)]
+    pub stop_subagent: bool,
+    /// Whether the provider's interrupt also stops subagents running in the
+    /// background, rather than only the turn and the work inside it.
+    #[serde(default)]
+    pub interrupt_stops_background: bool,
 }
 /// Which of the skills a message names the provider loads with it.
 ///
@@ -1569,11 +1603,13 @@ pub enum Event {
         offset: usize,
         delta: String,
     },
+    /// A sparse update: empty text and `None` leave what is known in place.
     Subagent {
         id: String,
         kind: String,
         description: String,
         status: Option<ToolStatus>,
+        background: Option<bool>,
     },
     SubagentItem {
         id: String,
@@ -1701,6 +1737,7 @@ mod tests {
             kind: String::new(),
             description: String::new(),
             status: super::ToolStatus::Running,
+            background: false,
             items: Vec::new(),
         });
         assert!(!snapshot.busy);

@@ -2249,10 +2249,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 }
             }
         }
-        Event::TurnStarted
-        | Event::TurnSettled
-        | Event::TurnFinished { .. }
-        | Event::Execution { .. } => {}
+        Event::TurnStarted => {
+            state.turn_generation = state.turn_generation.wrapping_add(1);
+        }
+        Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -2400,8 +2400,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             kind,
             description,
             status,
+            background,
         } => {
             let agent = subagent(state, &id);
+            if let Some(background) = background {
+                agent.background = background;
+            }
             if !kind.is_empty() {
                 agent.kind = kind;
             }
@@ -2625,6 +2629,7 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
         kind: String::new(),
         description: String::new(),
         status: ToolStatus::Running,
+        background: false,
         items: Vec::new(),
     });
     state.subagents.last_mut().expect("subagent was inserted")
@@ -2907,6 +2912,7 @@ mod tests {
                 kind: "Explore".into(),
                 description: "Inspect".into(),
                 status: None,
+                background: Some(true),
             },
         );
         apply_event(
@@ -2952,10 +2958,26 @@ mod tests {
                 kind: String::new(),
                 description: String::new(),
                 status: Some(ToolStatus::Succeeded),
+                background: None,
             },
         );
         assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
+        // An update that does not say leaves what is known in place.
+        assert!(state.subagents[0].background);
     }
+    #[test]
+    fn turn_generation_retains_boundaries_across_coalesced_publications() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        for _ in 0..2 {
+            apply_event(&mut state, &mut indices, Event::TurnStarted);
+            apply_event(&mut state, &mut indices, Event::TurnSettled);
+        }
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert_eq!(state.turn_generation, 3);
+        assert_eq!(state.generation, 0, "publication generation is independent");
+    }
+
     /// Readiness is what a sender waits on, so it ends with the provider.
     #[test]
     fn a_snapshot_is_ready_from_its_providers_word_until_it_exits() {

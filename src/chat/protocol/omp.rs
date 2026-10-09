@@ -303,7 +303,8 @@ impl Omp {
         }
         let status = match text(progress, "status") {
             "completed" => ToolStatus::Succeeded,
-            "failed" | "aborted" => ToolStatus::Failed,
+            "failed" => ToolStatus::Failed,
+            "aborted" => ToolStatus::Stopped,
             _ => ToolStatus::Running,
         };
         if status == ToolStatus::Running {
@@ -323,6 +324,9 @@ impl Omp {
                 .unwrap_or_default()
                 .into(),
             status: Some(status),
+            // A subagent run as a background job carries on past the turn,
+            // and past `abort`, until its job is cancelled.
+            background: payload["detached"].as_bool(),
         });
         self.read_child(id, step);
     }
@@ -733,6 +737,9 @@ impl Adapter for Omp {
                 step.writes.push(request);
             }
             Command::Interrupt => step.writes.push(self.request("abort")),
+            // OMP cancels one background job only through the model's own
+            // `hub` tool; its RPC offers no command that stops one subagent.
+            Command::StopSubagent { .. } => return Err("This OMP protocol cannot stop a single subagent".into()),
             Command::SetInterruptMode { mode } => {
                 if !matches!(mode.as_str(), "immediate" | "wait") {
                     return Err("Choose immediate or wait for OMP steering".into());
@@ -837,7 +844,7 @@ impl Adapter for Omp {
                         }
                         step.events.push(Event::Subagent {
                             id: child_id, kind: String::new(),
-                            description: "Earlier child history exceeds the display limit; live activity remains available".into(), status: None,
+                            description: "Earlier child history exceeds the display limit; live activity remains available".into(), status: None, background: None,
                         });
                         return Ok(step);
                     }
@@ -1712,6 +1719,28 @@ mod tests {
         assert!(state.events.contains(&Event::InterruptMode("wait".into())));
     }
 
+    /// `abort` spares a subagent run as a background job, and OMP's RPC has
+    /// no command that stops one, so neither is offered.
+    #[test]
+    fn a_background_job_is_neither_stopped_by_abort_nor_stoppable_alone() {
+        let mut adapter = Omp {
+            ready: true,
+            busy: true,
+            ..Default::default()
+        };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        assert_eq!(interrupt.writes[0]["type"], "abort");
+        let started = adapter.receive(json!({"type":"subagent_lifecycle","payload":{"id":"child","status":"started","detached":true,"progress":{"id":"child","status":"running"}}})).unwrap();
+        assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, background: Some(true), .. } if id == "child")));
+        assert!(
+            adapter
+                .command(Command::StopSubagent { id: "child".into() })
+                .is_err()
+        );
+        let aborted = adapter.receive(json!({"type":"subagent_progress","payload":{"progress":{"id":"child","status":"aborted"}}})).unwrap();
+        assert!(aborted.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "child")));
+    }
+
     #[test]
     fn oversized_optional_child_history_preserves_parent_control() {
         let mut adapter = Omp {
@@ -2108,6 +2137,7 @@ mod tests {
             }
             let response = adapter.receive(json!({"type":"response", "command":"get_state", "id":request["id"], "success":true,"data":data})).unwrap();
             assert!(response.events.iter().any(|event| matches!(event, Event::Capabilities(caps) if caps.queue == contents.is_some())));
+            assert!(response.events.iter().any(|event| matches!(event, Event::Capabilities(caps) if !caps.stop_subagent && !caps.interrupt_stops_background)));
             if contents.is_some() {
                 assert!(response.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len()==3 && messages[0].text==messages[1].text && messages[2].text.is_empty())));
             }

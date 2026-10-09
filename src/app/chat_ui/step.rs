@@ -70,6 +70,10 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
             Icon::Unavailable,
             Some(design::Tone::Themed(design::muted_color)),
         ),
+        ToolStatus::Stopped => glyph(
+            Icon::Cancel,
+            Some(design::Tone::Themed(design::muted_color)),
+        ),
     }
 }
 

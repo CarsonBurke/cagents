@@ -39,6 +39,10 @@ fn action(action: Action) -> Message {
     Message::ChatUi(action)
 }
 
+/// How long a cancel that would also stop background subagents waits for
+/// its second press.
+const INTERRUPT_CONFIRMATION: Duration = Duration::from_secs(4);
+
 /// One icon control on the chat surface.
 ///
 /// Shared by the transcript and the composer so a control means the same
@@ -167,6 +171,11 @@ pub enum Action {
     HistoryNewer(Target),
     AppendProviderDraft(Target),
     Command(Target, Command),
+    /// Cancels the active turn, or, where that would also stop subagents
+    /// running in the background, asks for the cancel to be pressed again.
+    Interrupt(Target),
+    /// Lets a cancel waiting for its second press lapse, if it is that one.
+    DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
     Toggle(Target, String),
     /// Opens or closes one group's step strip, addressed by the id of the item
@@ -278,6 +287,7 @@ impl Action {
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
+                | Self::DisarmInterrupt(..)
                 | Self::Files(..)
                 | Self::Tick
                 | Self::AccountPicker(_, false)
@@ -309,6 +319,7 @@ impl Action {
             | Self::Submit(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
+            | Self::Interrupt(target)
             | Self::Attach(target)
             | Self::Paste(target)
             | Self::Dropped(target, _)
@@ -538,6 +549,7 @@ impl ChangeToken {
             chat::ToolStatus::Succeeded => 1,
             chat::ToolStatus::Failed => 2,
             chat::ToolStatus::Denied => 3,
+            chat::ToolStatus::Stopped => 4,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -584,7 +596,7 @@ impl ChangeToken {
                 ),
             },
             ItemContent::Changes { changes, status } => Self {
-                shape: 8 + Self::status_offset(*status),
+                shape: 9 + Self::status_offset(*status),
                 body: changes.last().map_or(0, |change| change.diff.len()),
                 digest: changes.iter().fold(
                     Self::mix(0, changes.len() as u64),
@@ -612,7 +624,7 @@ impl ChangeToken {
                 ),
             },
             ItemContent::WebSearch { query, results } => Self {
-                shape: 12,
+                shape: 14,
                 body: results.len(),
                 digest: results
                     .iter()
@@ -629,12 +641,12 @@ impl ChangeToken {
                 output,
                 status,
             } => Self {
-                shape: 13 + Self::status_offset(*status),
+                shape: 15 + Self::status_offset(*status),
                 body: output.len(),
                 digest: tail_digest(tail_digest(tail_digest(0, name), input), output),
             },
             ItemContent::Image { path, description } => Self {
-                shape: 17,
+                shape: 20,
                 body: path.len(),
                 digest: tail_digest(tail_digest(0, path), description),
             },
@@ -646,9 +658,9 @@ impl ChangeToken {
                 body,
             } => Self {
                 shape: match kind {
-                    chat::DeliveryKind::Report => 18,
-                    chat::DeliveryKind::Message => 19,
-                    chat::DeliveryKind::Notice => 20,
+                    chat::DeliveryKind::Report => 21,
+                    chat::DeliveryKind::Message => 22,
+                    chat::DeliveryKind::Notice => 23,
                 },
                 body: body.len(),
                 digest: [from, sender, summary, body]
@@ -704,6 +716,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Succeeded => "Completed",
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
+        chat::ToolStatus::Stopped => "Stopped",
     }
 }
 
@@ -1275,6 +1288,9 @@ pub(super) struct Runtime {
     find_matches: Vec<String>,
     find_index: usize,
     copied: Option<(String, Instant)>,
+    /// When a cancel that would also stop background subagents was pressed,
+    /// until it is pressed again or lapses.
+    pub(super) interrupt_armed: Option<Instant>,
     drop_hover: bool,
     files: Option<Arc<Vec<String>>>,
     pub(super) target: Target,
@@ -1834,6 +1850,7 @@ impl Runtime {
             find_matches: Vec::new(),
             find_index: 0,
             copied: None,
+            interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
             syntax_theme,
@@ -2210,8 +2227,21 @@ impl Runtime {
         {
             self.note(error.clone());
         }
+        // A cancel armed for one turn must not carry over to the next.
+        if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
+            self.interrupt_armed = None;
+        }
         self.snapshot = snapshot;
         self.refresh_find();
+    }
+
+    /// How many running subagents cancelling the turn would also stop.
+    pub(super) fn interrupt_casualties(&self) -> usize {
+        self.snapshot
+            .subagents
+            .iter()
+            .filter(|agent| agent.stopped_by_interrupt(&self.snapshot.capabilities))
+            .count()
     }
 
     fn refresh_find(&mut self) {
@@ -6802,6 +6832,28 @@ impl Cagents {
                 }
                 return self.chat_send(target, command, false);
             }
+            Action::Interrupt(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.interrupt_casualties() > 0 && runtime.interrupt_armed.is_none() {
+                    let at = Instant::now();
+                    runtime.interrupt_armed = Some(at);
+                    return cosmic::task::future(async move {
+                        tokio::time::sleep(INTERRUPT_CONFIRMATION).await;
+                        Message::ChatUi(Action::DisarmInterrupt(target, at))
+                    });
+                }
+                runtime.interrupt_armed = None;
+                return self.chat_send(target, Command::Interrupt, false);
+            }
+            Action::DisarmInterrupt(target, at) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.interrupt_armed == Some(at)
+                {
+                    runtime.interrupt_armed = None;
+                }
+            }
             Action::BranchPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.branch_picker = open;
@@ -8156,6 +8208,7 @@ mod tests {
                 kind: "fixture".into(),
                 description: "Child".into(),
                 status: chat::ToolStatus::Succeeded,
+                background: false,
                 items: vec![child],
             });
         // Hidden child transcripts and the explicit parent request do not
@@ -10366,6 +10419,69 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.interrupt_stops_background = true;
+        snapshot.subagents.push(chat::Subagent {
+            id: "background".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: chat::ToolStatus::Running,
+            background: true,
+            items: Vec::new(),
+        });
+        let busy = (*runtime.snapshot).clone();
+        show_chat_snapshot_for_test(&mut app, card, busy);
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        let runtime = chat_runtime(&app, card);
+        let armed = runtime
+            .interrupt_armed
+            .expect("first cancel arms confirmation");
+        assert!(runtime.pending.is_none());
+        // An old timer cannot disarm a later confirmation.
+        drop(app.handle_chat_ui(Action::DisarmInterrupt(
+            target,
+            armed - Duration::from_secs(1),
+        )));
+        assert_eq!(chat_runtime(&app, card).interrupt_armed, Some(armed));
+        drop(app.handle_chat_ui(Action::DisarmInterrupt(target, armed)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+        assert!(chat_runtime(&app, card).pending.is_some());
+        settle(&mut app, card, Ok(()));
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.interrupt_armed.is_some());
+        let mut idle = (*runtime.snapshot).clone();
+        idle.busy = false;
+        show_chat_snapshot_for_test(&mut app, card, idle);
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+    }
+
+    #[test]
+    fn cancel_confirmation_does_not_cross_a_coalesced_turn_boundary() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        runtime.interrupt_armed = Some(Instant::now());
+        let mut next = (*runtime.snapshot).clone();
+        next.turn_generation = next.turn_generation.wrapping_add(1);
+        // No idle publication, user message, or transcript change is needed
+        // for a queued or autonomous turn to invalidate the confirmation.
+        show_chat_snapshot_for_test(&mut app, card, next);
+        assert!(chat_runtime(&app, card).interrupt_armed.is_none());
     }
 
     /// Answers the command `card` is waiting on with `result`.
