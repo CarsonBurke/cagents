@@ -13653,6 +13653,9 @@ impl Application for Cagents {
                     _ => None,
                 };
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
+                let restores_editor = matches!(&action, RepositoryAction::FileLoaded { identity, .. }
+                    if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                        if runtime.restores_editor_navigation(identity)));
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
                 let saved = matches!(
                     &action,
@@ -13690,6 +13693,19 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                if restores_editor
+                    && self.card_holds_keyboard(card)
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    && let Some(target) = runtime.editor_focus_target(card)
+                {
+                    tasks.push(
+                        workspace_widget::focus_after_loading(
+                            self.card_header_widget_id(card),
+                            target,
+                        )
+                        .map(cosmic::Action::App),
+                    );
+                }
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
                     && self.lsp.completion_trigger(doc, character)
@@ -24018,6 +24034,36 @@ mod tests {
                 Some(crate::settings_widgets::search_id())
             );
             assert_eq!(app.workspace.focused(), Some(pane));
+        }
+    }
+
+    #[test]
+    fn restored_editor_focus_preserves_controls_chosen_during_loading() {
+        let (mut app, pane) = editing_repository_app();
+        app.workspace.resize_viewport(1200.0);
+        let _ = app.workspace.take_widget_focus_request();
+        let _ = app.update(Message::Repository(RepositoryAction::OpenFind {
+            card: pane,
+        }));
+        let editor = repository_widget::editor_focus_id(pane);
+        let placeholder = app.card_header_widget_id(pane);
+        for current in [
+            None,
+            Some(placeholder.clone()),
+            Some(editor.clone()),
+            Some(repository_widget::find_focus_id(pane)),
+        ] {
+            let initial = current.as_ref().map_or_else(Task::none, |id| {
+                iced::widget::operation::focus(id.clone()).map(cosmic::Action::App)
+            });
+            let task = initial.chain(
+                workspace_widget::focus_after_loading(placeholder.clone(), editor.clone())
+                    .map(cosmic::Action::App),
+            );
+            let expected = current
+                .filter(|id| *id != placeholder)
+                .unwrap_or_else(|| editor.clone());
+            assert_eq!(focused(&app, task), Some(expected));
         }
     }
 

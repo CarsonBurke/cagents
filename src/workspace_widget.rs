@@ -538,6 +538,45 @@ pub fn focus_card<Message: 'static>(id: CardId) -> Task<Message> {
     widget::operation::focus(card_focus_id(id))
 }
 
+/// Complete a loading pane's focus handoff without taking focus from a
+/// control the user chose while the content was arriving.
+pub fn focus_after_loading<Message: Send + 'static>(
+    placeholder: widget::Id,
+    target: widget::Id,
+) -> Task<Message> {
+    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+    struct Restore {
+        foreign_focus: bool,
+        placeholder: widget::Id,
+        target: widget::Id,
+    }
+    impl<Message: Send + 'static> Operation<Message> for Restore {
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            self.foreign_focus |= state.is_focused() && id != Some(&self.placeholder);
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            operate(self);
+        }
+        fn finish(&self) -> Outcome<Message> {
+            if self.foreign_focus {
+                Outcome::None
+            } else {
+                Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+            }
+        }
+    }
+    cosmic::iced::advanced::widget::operate(Restore {
+        foreign_focus: false,
+        placeholder,
+        target,
+    })
+}
+
 /// End-of-strip navigation returns the keyboard from chrome without taking
 /// it from a find bar, composer, or other control already inside the pane.
 pub fn focus_card_if_outside<Message: Send + 'static>(

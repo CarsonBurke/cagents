@@ -3069,6 +3069,14 @@ impl RepositoryRuntime {
             .then(|| editor_focus_id(card))
     }
 
+    pub fn restores_editor_navigation(&self, identity: &AsyncIdentity) -> bool {
+        self.accepts_selected(identity)
+            && self
+                .pending_editor_navigation
+                .as_ref()
+                .is_some_and(|(path, _)| path == &identity.path)
+    }
+
     /// Whether the editable buffer is the surface actually on screen.
     ///
     /// Only Edit mounts it. The comparison surface renders the diff model, and
