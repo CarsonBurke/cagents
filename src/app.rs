@@ -7906,7 +7906,7 @@ impl Cagents {
                 .iter()
                 .find(|card| card.id == transition.id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Browser(_)));
-            match self.cards.get(&transition.id) {
+            match self.cards.get_mut(&transition.id) {
                 Some(CardRuntime::Terminal(handle)) => {
                     if transition.to == VisibilityClass::Visible && surfaces_visible {
                         let _ = handle.reveal();
@@ -10712,7 +10712,7 @@ impl Cagents {
             .map(|card| card.id)
             .collect::<HashSet<_>>();
         let mut failure = None;
-        for (id, runtime) in &self.cards {
+        for (id, runtime) in &mut self.cards {
             let visible = workspace_visible && visible_cards.contains(id);
             let result = match runtime {
                 CardRuntime::Terminal(surface) => if visible {

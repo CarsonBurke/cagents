@@ -16,18 +16,25 @@ const DECODE_BUDGET: usize = 512 * 1024 * 1024;
 const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 16;
 const RECENT_IMAGES: usize = 8;
 
-struct Budget {
+pub(super) struct Budget {
     encoded: Arc<tokio::sync::Semaphore>,
     pixels: Arc<tokio::sync::Semaphore>,
     decode: Arc<tokio::sync::Semaphore>,
 }
 impl Budget {
-    fn new(encoded: usize, pixels: usize) -> Self {
+    pub(super) fn new(encoded: usize, pixels: usize) -> Self {
         Self {
             encoded: Arc::new(tokio::sync::Semaphore::new(encoded)),
             pixels: Arc::new(tokio::sync::Semaphore::new(pixels)),
             decode: Arc::new(tokio::sync::Semaphore::new(DECODE_BUDGET)),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn block_decoder(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.decode
+            .clone()
+            .try_acquire_many_owned(DECODE_BUDGET as u32)
+            .unwrap()
     }
 }
 fn budget() -> &'static Budget {
@@ -38,6 +45,52 @@ struct Pixels {
     bytes: Box<[u8]>,
     _pixels: tokio::sync::OwnedSemaphorePermit,
 }
+/// The exact resource that prevented admission. Waiting does not occupy an
+/// image worker, and only real permit release (including last widget/gallery
+/// owners) can satisfy it. Semaphore admission remains the memory authority.
+#[derive(Clone)]
+pub(in crate::app) struct Pressure {
+    resource: Arc<tokio::sync::Semaphore>,
+    permits: u32,
+    retained: bool,
+}
+impl Pressure {
+    pub(super) async fn available(&self) {
+        let permit = self.resource.clone().acquire_many_owned(self.permits).await;
+        drop(permit);
+    }
+}
+impl PartialEq for Pressure {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.resource, &other.resource)
+            && self.permits == other.permits
+            && self.retained == other.retained
+    }
+}
+impl Eq for Pressure {}
+impl std::hash::Hash for Pressure {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.resource).hash(state);
+        self.permits.hash(state);
+        self.retained.hash(state);
+    }
+}
+fn reserve(
+    resource: &Arc<tokio::sync::Semaphore>,
+    permits: u32,
+    retained: bool,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Loaded> {
+    resource
+        .clone()
+        .try_acquire_many_owned(permits)
+        .map_err(|_| {
+            Loaded::Deferred(Pressure {
+                resource: resource.clone(),
+                permits,
+                retained,
+            })
+        })
+}
 impl AsRef<[u8]> for Pixels {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
@@ -47,9 +100,9 @@ impl AsRef<[u8]> for Pixels {
 pub(in crate::app) enum Loaded {
     Ready(iced::widget::image::Handle),
     Unavailable,
-    Deferred,
+    Deferred(Pressure),
 }
-fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
+pub(super) fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     bounded_handle_size(bytes, budget, None)
 }
 fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Loaded {
@@ -67,23 +120,17 @@ fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Lo
     if width == 0 || height == 0 || pixels > MAX_PIXELS {
         return Loaded::Unavailable;
     }
-    let Ok(encoded) = budget
-        .encoded
-        .clone()
-        .try_acquire_many_owned(bytes.len() as u32)
-    else {
-        return Loaded::Deferred;
+    let encoded = match reserve(&budget.encoded, bytes.len() as u32, false) {
+        Ok(permit) => permit,
+        Err(deferred) => return deferred,
     };
     // Reserve before decode so temporary budget pressure can retry without
     // repeatedly spending the two workers on full-size pixel conversion. The
     // thumbnail never upscales and fits inside edge², even after orientation.
     let retained_pixels = edge.map_or(pixels, |edge| pixels.min(u64::from(edge).pow(2)));
-    let Ok(mut pixels) = budget
-        .pixels
-        .clone()
-        .try_acquire_many_owned((retained_pixels * 4) as u32)
-    else {
-        return Loaded::Deferred;
+    let mut pixels = match reserve(&budget.pixels, (retained_pixels * 4) as u32, true) {
+        Ok(permit) => permit,
+        Err(deferred) => return deferred,
     };
     use image::ImageDecoder;
     let mut reader =
@@ -113,8 +160,9 @@ fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Lo
     else {
         return Loaded::Unavailable;
     };
-    let Ok(_decode) = budget.decode.clone().try_acquire_many_owned(decode_bytes) else {
-        return Loaded::Deferred;
+    let _decode = match reserve(&budget.decode, decode_bytes, false) {
+        Ok(permit) => permit,
+        Err(deferred) => return deferred,
     };
     let orientation = decoder
         .orientation()
@@ -197,10 +245,15 @@ fn bytes_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
 pub(super) struct Source {
     target: Target,
     item: Arc<chat::Item>,
+    attempt: u64,
+    wait: Option<Pressure>,
 }
 impl PartialEq for Source {
     fn eq(&self, other: &Self) -> bool {
-        self.target == other.target && Arc::ptr_eq(&self.item, &other.item)
+        self.target == other.target
+            && Arc::ptr_eq(&self.item, &other.item)
+            && self.attempt == other.attempt
+            && self.wait == other.wait
     }
 }
 impl Eq for Source {}
@@ -209,14 +262,24 @@ impl std::hash::Hash for Source {
         std::any::TypeId::of::<Self>().hash(state);
         self.target.hash(state);
         Arc::as_ptr(&self.item).hash(state);
+        self.attempt.hash(state);
+        self.wait.hash(state);
     }
 }
 fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let source = source.clone();
     Box::pin(iced::futures::stream::once(async move {
+        if let Some(pressure) = source.wait {
+            pressure.available().await;
+        }
         let item = source.item.clone();
         let loaded = worker(move || load(&item)).await;
-        action(Action::ImageLoaded(source.target, source.item, loaded))
+        action(Action::ImageLoaded(
+            source.target,
+            source.item,
+            source.attempt,
+            loaded,
+        ))
     }))
 }
 /// Transcript previews and composer thumbnails share worker admission. A
@@ -264,31 +327,208 @@ fn recent(runtime: &Runtime) -> Vec<&Arc<chat::Item>> {
         .take(RECENT_IMAGES)
         .collect()
 }
-pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
+/// One explicit request outranks the newest automatic candidates. Keeping
+/// this interest bounded prevents browsing old images from pinning the whole
+/// conversation, and one worker per transcript admits recent images in order.
+fn interest(runtime: &Runtime) -> Vec<&Arc<chat::Item>> {
     if !runtime.visible.load(Ordering::Relaxed) {
         return Vec::new();
     }
-    let recent = recent(runtime);
-    runtime
-        .cache
-        .values()
-        .filter_map(|cached| {
-            let item = cached.image_source.as_ref()?;
-            (items(runtime)
-                .iter()
-                .any(|candidate| candidate.id == item.id)
-                && (cached.image_requested
-                    || recent.iter().any(|candidate| candidate.id == item.id)))
-            .then(|| {
-                Subscription::run_with(
-                    Source {
-                        target: runtime.target,
-                        item: item.clone(),
-                    },
-                    stream,
-                )
-            })
+    let requested = runtime
+        .preview_request
+        .as_deref()
+        .and_then(|id| items(runtime).iter().find(|item| item.id == id));
+    requested
+        .into_iter()
+        .chain(
+            recent(runtime)
+                .into_iter()
+                .filter(|item| requested.is_none_or(|requested| requested.id != item.id)),
+        )
+        .collect()
+}
+fn retire(cached: &mut CachedItem, evicted: bool) {
+    cached.image = None;
+    cached.image_source = None;
+    cached.image_wait = None;
+    cached.image_evicted = evicted;
+    cached.image_attempt = cached.image_attempt.wrapping_add(1);
+}
+pub(super) fn sync(runtime: &mut Runtime) {
+    if !runtime.visible.load(Ordering::Relaxed)
+        || runtime
+            .preview_request
+            .as_deref()
+            .is_some_and(|id| !items(runtime).iter().any(|item| item.id == id))
+    {
+        runtime.preview_request = None;
+    }
+    let interested: HashSet<_> = interest(runtime)
+        .into_iter()
+        .map(|item| item.id.clone())
+        .collect();
+    for (id, cached) in &mut runtime.cache {
+        if cached.image_item.is_none() && cached.image_source.is_none() && cached.image.is_none() {
+            continue;
+        }
+        if !interested.contains(id) {
+            retire(cached, false);
+        } else if cached.image.is_none()
+            && cached.image_source.is_none()
+            && !cached.image_unavailable
+            && !cached.image_evicted
+        {
+            cached.image_source = cached.image_item.clone();
+            cached.image_attempt = cached.image_attempt.wrapping_add(1);
+        }
+    }
+}
+pub(super) fn request(runtime: &mut Runtime, id: &str) {
+    if !runtime.visible.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(item) = items(runtime)
+        .iter()
+        .find(|item| item.id == id && matches!(item.content, ItemContent::Image { .. }))
+        .cloned()
+    else {
+        return;
+    };
+    if !runtime.cache.contains_key(id) {
+        return;
+    }
+    runtime.preview_request = Some(id.to_owned());
+    if let Some(cached) = runtime.cache.get_mut(id) {
+        cached.image_item = Some(item.clone());
+        if cached.image.is_none() {
+            cached.image_source = Some(item);
+        }
+        cached.image_attempt = cached.image_attempt.wrapping_add(1);
+        cached.image_wait = None;
+        cached.image_evicted = false;
+        cached.image_unavailable = false;
+    }
+    sync(runtime);
+}
+fn pixel_bytes(cached: &CachedItem) -> usize {
+    match cached.image.as_ref() {
+        Some(iced::widget::image::Handle::Rgba { pixels, .. }) => pixels.as_ref().len(),
+        _ => 0,
+    }
+}
+/// Retire the oldest application owners only until the requested admission
+/// can fit. Retained trees may still hold those bytes; the waiter observes the
+/// actual semaphore rather than treating this estimate as released capacity.
+pub(super) fn evict_ready(runtime: &mut Runtime, mut missing: usize) -> usize {
+    let order: Vec<_> = interest(runtime)
+        .into_iter()
+        .map(|item| item.id.clone())
+        .collect();
+    for id in order.iter().rev() {
+        if missing == 0 {
+            break;
+        }
+        if let Some(cached) = runtime.cache.get_mut(id)
+            && cached.image.is_some()
+        {
+            missing = missing.saturating_sub(pixel_bytes(cached));
+            retire(cached, true);
+        }
+    }
+    missing
+}
+pub(super) fn complete(
+    runtime: &mut Runtime,
+    item: &Arc<chat::Item>,
+    attempt: u64,
+    loaded: Loaded,
+) -> Option<usize> {
+    let interested = interest(runtime);
+    if !interested
+        .iter()
+        .any(|current| current.id == item.id && current.content == item.content)
+    {
+        return None;
+    }
+    let order: Vec<_> = interested.into_iter().map(|item| item.id.clone()).collect();
+    let Some(priority) = order.iter().position(|id| *id == item.id) else {
+        return None;
+    };
+    let Some(cached) = runtime.cache.get(&item.id) else {
+        return None;
+    };
+    if cached.image_attempt != attempt
+        || cached
+            .image_source
+            .as_ref()
+            .is_none_or(|source| !Arc::ptr_eq(source, item))
+        || cached
+            .image_item
+            .as_ref()
+            .is_some_and(|current| current.content != item.content)
+    {
+        return None;
+    }
+    let explicit = runtime.preview_request.as_deref() == Some(item.id.as_str());
+    if let Loaded::Deferred(pressure) = loaded {
+        let mut missing =
+            (pressure.permits as usize).saturating_sub(pressure.resource.available_permits());
+        let mut evicted = false;
+        if pressure.retained {
+            for id in order[priority + 1..].iter().rev() {
+                if missing == 0 {
+                    break;
+                }
+                if let Some(cached) = runtime.cache.get_mut(id)
+                    && cached.image.is_some()
+                {
+                    missing = missing.saturating_sub(pixel_bytes(cached));
+                    retire(cached, true);
+                    evicted = true;
+                }
+            }
+        }
+        let cached = runtime.cache.get_mut(&item.id).unwrap();
+        if !pressure.retained || explicit || evicted || cached.image_wait.is_some() {
+            cached.image_wait = Some(pressure);
+            cached.image_attempt = cached.image_attempt.wrapping_add(1);
+        } else {
+            // Lower-priority automatic candidates cannot displace the images
+            // already admitted. They stay available through Load preview.
+            retire(cached, true);
+        }
+        return (explicit
+            && missing > 0
+            && cached.image_wait.as_ref().is_some_and(|wait| wait.retained))
+        .then_some(missing);
+    }
+    let cached = runtime.cache.get_mut(&item.id).unwrap();
+    cached.image_source = None;
+    cached.image_wait = None;
+    cached.image_unavailable = matches!(loaded, Loaded::Unavailable);
+    cached.image = match loaded {
+        Loaded::Ready(handle) => Some(handle),
+        _ => None,
+    };
+    None
+}
+pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
+    interest(runtime)
+        .into_iter()
+        .find_map(|item| {
+            let cached = runtime.cache.get(&item.id)?;
+            let source = cached.image_source.as_ref()?;
+            Some(Subscription::run_with(
+                Source {
+                    target: runtime.target,
+                    item: source.clone(),
+                    attempt: cached.image_attempt,
+                    wait: cached.image_wait.clone(),
+                },
+                stream,
+            ))
         })
+        .into_iter()
         .collect()
 }
 
@@ -427,9 +667,12 @@ impl Runtime {
         let Some(handle) = &cached.image else {
             return if cached.image_unavailable {
                 design::caption(format!("{label} · Preview unavailable")).into()
+            } else if cached.image_wait.is_some() {
+                design::caption(format!("{label} · Waiting for preview memory…")).into()
             } else if cached.image_source.is_some()
-                && (cached.image_requested
-                    || recent(self).iter().any(|candidate| candidate.id == item.id))
+                && interest(self)
+                    .iter()
+                    .any(|candidate| candidate.id == item.id)
             {
                 design::caption(format!("{label} · Loading preview…")).into()
             } else {
@@ -460,6 +703,15 @@ impl Runtime {
         .width(Length::Fill)
         .into()
     }
+}
+
+#[cfg(test)]
+pub(super) fn deferred_for_test() -> Loaded {
+    Loaded::Deferred(Pressure {
+        resource: Arc::new(tokio::sync::Semaphore::new(0)),
+        permits: 1,
+        retained: true,
+    })
 }
 
 #[cfg(test)]
@@ -614,7 +866,7 @@ mod tests {
         drop(handle);
         assert!(matches!(
             bounded_handle(bytes.clone(), &budget),
-            Loaded::Deferred
+            Loaded::Deferred(_)
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 0);
@@ -629,7 +881,7 @@ mod tests {
         let budget = Budget::new(bytes.len(), 3);
         assert!(matches!(
             bounded_handle(bytes.clone(), &budget),
-            Loaded::Deferred
+            Loaded::Deferred(_)
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 3);
@@ -725,7 +977,7 @@ mod tests {
         budget.decode = Arc::new(tokio::sync::Semaphore::new(15));
         assert!(matches!(
             bounded_handle(bytes.clone(), &budget),
-            Loaded::Deferred
+            Loaded::Deferred(_)
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 4);

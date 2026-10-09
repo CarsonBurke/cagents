@@ -54,7 +54,7 @@ impl Cache {
     }
     pub(super) fn retry_deferred(&mut self) {
         for (path, entry) in &mut self.0 {
-            if matches!(entry.loaded, Some(images::Loaded::Deferred)) {
+            if matches!(entry.loaded, Some(images::Loaded::Deferred(_))) {
                 entry.source = Arc::new(path.clone());
                 entry.loaded = None;
             }
@@ -81,7 +81,7 @@ impl Cache {
         if self
             .0
             .values()
-            .any(|entry| matches!(entry.loaded, Some(images::Loaded::Deferred)))
+            .any(|entry| matches!(entry.loaded, Some(images::Loaded::Deferred(_))))
         {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(2))
@@ -183,7 +183,7 @@ mod tests {
             .unwrap()
             .source
             .clone();
-        cache.complete(&deferred, images::Loaded::Deferred);
+        cache.complete(&deferred, images::deferred_for_test());
         cache.complete(&invalid, images::Loaded::Unavailable);
         cache.retry_deferred();
         let retry = &cache.0.get(deferred.as_path()).unwrap().source;
