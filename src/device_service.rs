@@ -102,6 +102,11 @@ pub enum Reply {
     Text(String),
     Saved,
     ProjectNavigation(Navigation),
+    /// The replacement is published, but its directory entry could not be
+    /// synced. Callers must advance their disk baseline and show this warning.
+    SavedUnconfirmed {
+        error: String,
+    },
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -157,7 +162,7 @@ mod wire_json {
 #[cfg(feature = "host")]
 pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
-    use std::{fs, io::Write};
+    use std::fs;
     match operation {
         Operation::ProjectNavigation { repository, kind } => {
             navigation(repository, kind).map(Reply::ProjectNavigation)
@@ -276,57 +281,71 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             path,
             expected,
             content,
-        } => {
-            let canonical_root = std::fs::canonicalize(&root).map_err(|error| error.to_string())?;
-            let lock = mutation_lock(canonical_root.join(&path));
-            let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
-            if content.len() as u64 > MAX_TEXT_BYTES {
-                return Err("text exceeds remote editor limit (512 KiB)".into());
-            }
-            let root = fs_safety::Root::open(&root).map_err(|error| error.to_string())?;
-            if read(&root, &path)? != expected {
-                return Err("file changed on the device; reload before saving".into());
-            }
-            let original =
-                fs_safety::open_beneath(&root, &path).map_err(|error| error.to_string())?;
-            let metadata = original.metadata().map_err(|error| error.to_string())?;
-            let (parent, target) =
-                fs_safety::open_parent_beneath(&root, &path).map_err(|error| error.to_string())?;
-            let (mut file, temporary) = fs_safety::create_temporary_in(&parent, 0o600)
-                .map_err(|error| error.to_string())?;
-            let saved = (|| {
-                // Keep the replacement private until the source's access rules
-                // are installed, before writing any sensitive content.
-                fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
-                file.write_all(content.as_bytes())
-                    .map_err(|error| error.to_string())?;
-                // Creation applies the daemon's umask and writing can clear
-                // set-ID bits. Restore the exact source mode after writing,
-                // then its ACL because chmod rewrites the ACL mask.
-                file.set_permissions(metadata.permissions())
-                    .map_err(|error| error.to_string())?;
-                fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
-                if !fs_safety::copy_extended_attributes(&original, &file).is_empty() {
-                    return Err(
-                        "remote save cannot preserve this file's extended attributes".into(),
-                    );
-                }
-                file.sync_all().map_err(|error| error.to_string())?;
-                // Recheck after writing the temporary, before replacing disk bytes.
-                if read(&root, &path)? != expected {
-                    return Err("file changed on the device; reload before saving".into());
-                }
-                fs_safety::rename_within(&parent, &temporary, &target)
-                    .map_err(|error| error.to_string())?;
-                fs_safety::sync_directory(&parent).map_err(|error| error.to_string())
-            })();
-            if saved.is_err() {
-                let _ = fs_safety::unlink_within(&parent, &temporary);
-            }
-            saved.map(|_| Reply::Saved)
-        }
+        } => write_with_sync(&root, &path, &expected, &content, fs_safety::sync_directory),
         Operation::Git { root, operation } => git(root, operation).map(Reply::Text),
     }
+}
+
+#[cfg(feature = "host")]
+fn write_with_sync(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    expected: &str,
+    content: &str,
+    sync_parent: impl FnOnce(&crate::fs_safety::Root) -> std::io::Result<()>,
+) -> Result<Reply, String> {
+    use crate::fs_safety;
+    use std::io::Write;
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let lock = mutation_lock(canonical_root.join(path));
+    let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    if content.len() as u64 > MAX_TEXT_BYTES {
+        return Err("text exceeds remote editor limit (512 KiB)".into());
+    }
+    let root = fs_safety::Root::open(root).map_err(|error| error.to_string())?;
+    if read(&root, path)? != expected {
+        return Err("file changed on the device; reload before saving".into());
+    }
+    let original = fs_safety::open_beneath(&root, path).map_err(|error| error.to_string())?;
+    let metadata = original.metadata().map_err(|error| error.to_string())?;
+    let (parent, target) =
+        fs_safety::open_parent_beneath(&root, path).map_err(|error| error.to_string())?;
+    let (mut file, temporary) =
+        fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
+    let published = (|| {
+        // Keep the replacement private until the source's access rules
+        // are installed, before writing any sensitive content.
+        fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
+        file.write_all(content.as_bytes())
+            .map_err(|error| error.to_string())?;
+        // Creation applies the daemon's umask and writing can clear set-ID bits.
+        // Restore the exact source mode after writing, then its ACL because
+        // chmod rewrites the ACL mask.
+        file.set_permissions(metadata.permissions())
+            .map_err(|error| error.to_string())?;
+        fs_safety::copy_access_acl(&original, &file).map_err(|error| error.to_string())?;
+        if !fs_safety::copy_extended_attributes(&original, &file).is_empty() {
+            return Err("remote save cannot preserve this file's extended attributes".into());
+        }
+        file.sync_all().map_err(|error| error.to_string())?;
+        // Recheck after writing the temporary, before replacing disk bytes.
+        if read(&root, path)? != expected {
+            return Err("file changed on the device; reload before saving".into());
+        }
+        fs_safety::rename_within(&parent, &temporary, &target).map_err(|error| error.to_string())
+    })();
+    if let Err(error) = published {
+        let _ = fs_safety::unlink_within(&parent, &temporary);
+        return Err(error);
+    }
+    // The new bytes are visible after rename. A directory-sync failure cannot
+    // undo publication or leave callers comparing against their old baseline.
+    Ok(match sync_parent(&parent) {
+        Ok(()) => Reply::Saved,
+        Err(error) => Reply::SavedUnconfirmed {
+            error: error.to_string(),
+        },
+    })
 }
 #[cfg(feature = "host")]
 fn navigation(repository: PathBuf, kind: crate::model::ProjectKind) -> Result<Navigation, String> {
@@ -753,6 +772,60 @@ mod tests {
     }
 
     #[test]
+    fn published_save_reports_unconfirmed_durability_and_accepts_the_new_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        std::fs::write(&path, "before").unwrap();
+        let reply = write_with_sync(
+            directory.path(),
+            std::path::Path::new("file"),
+            "before",
+            "after",
+            |_| {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
+                Err(std::io::Error::other("injected directory sync failure"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reply,
+            Reply::SavedUnconfirmed {
+                error: "injected directory sync failure".into(),
+            }
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            execute(Operation::Write {
+                root: directory.path().to_owned(),
+                path: "file".into(),
+                expected: "after".into(),
+                content: "next edit".into(),
+            })
+            .unwrap(),
+            Reply::Saved,
+        );
+    }
+
+    #[test]
+    fn conflicting_save_does_not_publish_or_sync_the_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        std::fs::write(&path, "current").unwrap();
+        assert!(
+            write_with_sync(
+                directory.path(),
+                std::path::Path::new("file"),
+                "stale",
+                "overwrite",
+                |_| panic!("a refused save must not reach the directory sync"),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "current");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn writes_remote_file_and_refuses_conflicts_and_escape() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
@@ -1044,6 +1117,14 @@ mod wire_tests {
         assert_eq!(&decoded, value);
         let json = serde_json::to_value(value).unwrap();
         assert_eq!(serde_json::from_value::<T>(json).unwrap(), *value);
+    }
+
+    #[test]
+    fn published_save_outcomes_roundtrip_on_binary_and_json_wires() {
+        roundtrip(&Reply::Saved);
+        roundtrip(&Reply::SavedUnconfirmed {
+            error: "directory sync failed".into(),
+        });
     }
 
     #[test]
