@@ -90,8 +90,8 @@ use crate::{
     model::{
         CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
         ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
-        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceState,
-        WorktreeState,
+        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
+        WorkspaceState, WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -1205,6 +1205,7 @@ const FOCUS_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// How long the modifier is held before the workspace switcher is drawn. A
 /// tap that toggles between the two most recent workspaces ends sooner, and
 /// would otherwise flash a list nobody reads.
+const WORKSPACE_HISTORY_LIMIT: usize = 128;
 const WORKSPACE_SWITCHER_DELAY: Duration = Duration::from_millis(120);
 const WORKSPACE_SWITCHER_SCROLL_ID: &str = "workspace-switcher.rows";
 /// Rows have one height so the list can be scrolled to a row by its index.
@@ -1216,6 +1217,7 @@ const WORKSPACE_SWITCHER_LIST_HEIGHT: f32 = WORKSPACE_SWITCHER_VISIBLE_ROWS
     + (WORKSPACE_SWITCHER_VISIBLE_ROWS - 1.0) * WORKSPACE_SWITCHER_ROW_GAP;
 
 /// One destination in the workspace switcher, in the order it is listed.
+#[derive(Debug)]
 struct WorkspaceSwitcherRow {
     destination: WorkspaceDestination,
     action: SidebarAction,
@@ -4067,6 +4069,14 @@ pub enum Message {
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
+    WorkspaceSwitcherSelected {
+        since: Instant,
+        index: usize,
+    },
+    WorkspaceSwitcherActivate {
+        since: Instant,
+        index: usize,
+    },
     /// The modifier holding the workspace switcher open since this instant
     /// was released.
     WorkspaceSwitcherReleased(Instant),
@@ -4637,13 +4647,6 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
         (Some(published), Some(document)) => published == document,
         _ => false,
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum WorkspaceDestination {
-    Folder(ProjectId),
-    Worktree(crate::model::WorktreeId),
-    Channel(crate::model::ChannelId),
 }
 
 impl WorkspaceDestination {
@@ -9367,7 +9370,6 @@ impl Cagents {
         if self.workspace_inputs_blocked() || self.focused_repository_is_saving() {
             return Task::none();
         }
-        let previous_history = self.workspace_history.clone();
         let Some(action) = self.next_workspace(direction) else {
             return Task::none();
         };
@@ -9375,7 +9377,7 @@ impl Cagents {
             .sidebar_entered_directory(&action)
             .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
         {
-            self.workspace_history = previous_history;
+            self.cancel_workspace_preview();
             return Task::none();
         }
         let first = self.chrome_ui.workspace_preview.replace(action).is_none();
@@ -9404,19 +9406,27 @@ impl Cagents {
         // terminal or conversation its default pane.
         let task = action
             .filter(|action| {
-                WorkspaceDestination::from_action(action) != self.active_workspace_destination()
+                let destination = WorkspaceDestination::from_action(action);
+                destination != self.active_workspace_destination()
+                    && sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state)
+                        .iter()
+                        .any(|available| available == action)
             })
             .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
         self.workspace_history
             .finish(self.active_workspace_destination());
+        self.workspace_history
+            .truncate_recent(WORKSPACE_HISTORY_LIMIT);
+        self.persist();
         task
     }
 
     fn cancel_workspace_preview(&mut self) {
-        if self.close_workspace_preview().is_some() {
-            self.workspace_history
-                .finish(self.active_workspace_destination());
-        }
+        self.close_workspace_preview();
+        self.workspace_history
+            .finish(self.active_workspace_destination());
+        self.workspace_history
+            .truncate_recent(WORKSPACE_HISTORY_LIMIT);
     }
 
     fn close_workspace_preview(&mut self) -> Option<SidebarAction> {
@@ -9424,6 +9434,7 @@ impl Cagents {
         self.chrome_ui.workspace_preview_since = None;
         self.chrome_ui.workspace_switcher_shown = false;
         self.chrome_ui.workspace_switcher_scroll = 0.0;
+        self.chrome_ui.workspace_switcher_rows.clear();
         self.chrome_ui.workspace_preview.take()
     }
 
@@ -9441,6 +9452,21 @@ impl Cagents {
                 Task::none()
             }
             keyboard::Key::Named(Named::Enter) => self.commit_workspace_preview(),
+            keyboard::Key::Named(Named::Tab) => self.cycle_workspace(
+                if modifiers.shift() {
+                    crate::workspace::FocusDirection::Left
+                } else {
+                    crate::workspace::FocusDirection::Right
+                },
+                self.workspace_cycle_modifiers,
+            ),
+            keyboard::Key::Named(Named::Home) => self.select_workspace_preview(0),
+            keyboard::Key::Named(Named::End) => self.select_workspace_preview(
+                self.chrome_ui
+                    .workspace_switcher_rows
+                    .len()
+                    .saturating_sub(1),
+            ),
             keyboard::Key::Named(Named::ArrowDown | Named::ArrowRight) => self.cycle_workspace(
                 crate::workspace::FocusDirection::Right,
                 self.workspace_cycle_modifiers,
@@ -9464,15 +9490,33 @@ impl Cagents {
 
     /// The switcher's rows: recently used workspaces first, then the rest in
     /// the sidebar's order.
-    fn workspace_switcher_rows(&self) -> Vec<WorkspaceSwitcherRow> {
-        let Some(order) = self.workspace_history.cycle_order() else {
-            return Vec::new();
-        };
-        let mut destinations: HashMap<_, _> =
-            sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state)
-                .into_iter()
-                .filter_map(|action| Some((WorkspaceDestination::from_action(&action)?, action)))
-                .collect();
+    fn build_workspace_switcher_rows(
+        &self,
+        order: &[WorkspaceDestination],
+        actions: Vec<SidebarAction>,
+    ) -> Vec<WorkspaceSwitcherRow> {
+        let projects: HashMap<_, _> = self
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|p| (p.id, p))
+            .collect();
+        let worktrees: HashMap<_, _> = self
+            .sidebar_model
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter().map(move |w| (w.id, (p, w))))
+            .collect();
+        let channels: HashMap<_, _> = self
+            .sidebar_model
+            .projects
+            .iter()
+            .flat_map(|p| p.channels.iter().map(move |c| (c.id, (p, c))))
+            .collect();
+        let mut destinations: HashMap<_, _> = actions
+            .into_iter()
+            .filter_map(|action| Some((WorkspaceDestination::from_action(&action)?, action)))
+            .collect();
         let status = |activity, unread: bool| match activity {
             Some(crate::agent::ActivityState::Waiting) => Some("Waiting for input"),
             Some(crate::agent::ActivityState::Working) => Some("Working"),
@@ -9492,7 +9536,7 @@ impl Cagents {
                         project_id,
                         repository,
                     } => (
-                        self.sidebar_model.project(*project_id).map_or_else(
+                        projects.get(project_id).map_or_else(
                             || repository.display().to_string(),
                             |project| project.name.clone(),
                         ),
@@ -9502,12 +9546,9 @@ impl Cagents {
                         project_id,
                         worktree_id,
                         path,
+                        ..
                     } => {
-                        let project = self.sidebar_model.project(*project_id)?;
-                        let worktree = project
-                            .worktrees
-                            .iter()
-                            .find(|worktree| worktree.id == *worktree_id)?;
+                        let (project, worktree) = worktrees.get(worktree_id)?;
                         (
                             format!("{} · {}", project.name, worktree.label()),
                             described(
@@ -9521,14 +9562,7 @@ impl Cagents {
                         )
                     }
                     SidebarAction::OpenChannel { channel_id } => {
-                        let (project, channel) =
-                            self.sidebar_model.projects.iter().find_map(|project| {
-                                let channel = project
-                                    .channels
-                                    .iter()
-                                    .find(|channel| channel.id == *channel_id)?;
-                                Some((project, channel))
-                            })?;
+                        let (project, channel) = channels.get(channel_id)?;
                         (
                             format!("{} · {}", project.name, channel.title),
                             described(
@@ -9556,13 +9590,18 @@ impl Cagents {
             .workspace_preview
             .as_ref()
             .and_then(WorkspaceDestination::from_action);
-        let Some(index) = self
-            .workspace_switcher_rows()
-            .iter()
-            .position(|row| Some(row.destination) == selected)
-        else {
+        let Some(index) = self.workspace_history.cycle_index() else {
             return Task::none();
         };
+        if self
+            .chrome_ui
+            .workspace_switcher_rows
+            .get(index)
+            .map(|row| row.destination)
+            != selected
+        {
+            return Task::none();
+        }
         let top = index as f32 * (WORKSPACE_SWITCHER_ROW_HEIGHT + WORKSPACE_SWITCHER_ROW_GAP);
         let bottom = top + WORKSPACE_SWITCHER_ROW_HEIGHT;
         let scroll = &mut self.chrome_ui.workspace_switcher_scroll;
@@ -9582,15 +9621,19 @@ impl Cagents {
                 iced::widget::Space::new(),
             ));
         }
+        let since = self.chrome_ui.workspace_preview_since?;
         let rows = self
-            .workspace_switcher_rows()
-            .into_iter()
-            .map(|row| {
+            .chrome_ui
+            .workspace_switcher_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
                 let active = Some(row.destination) == selected;
                 let content = widget::container(
                     widget::column::with_children(vec![
-                        design::body(row.title).into(),
-                        design::caption(row.detail).into(),
+                        design::body(format!("{}{}", if active { "› " } else { "  " }, row.title))
+                            .into(),
+                        design::caption(&row.detail).into(),
                     ])
                     .spacing(space::XXS),
                 )
@@ -9616,9 +9659,20 @@ impl Cagents {
                         ..Default::default()
                     }
                 }));
-                widget::mouse_area(crate::interaction::hover(content))
-                    .interaction(iced::mouse::Interaction::Pointer)
-                    .on_press(Message::Sidebar(row.action))
+                let button = widget::button::custom(content)
+                    .name(format!(
+                        "{} workspace: {} · {}",
+                        if active { "Selected" } else { "Open" },
+                        row.title,
+                        row.detail
+                    ))
+                    .selected(active)
+                    .class(crate::ui_controls::control_style(active, None))
+                    .padding(0)
+                    .width(Length::Fill)
+                    .on_press(Message::WorkspaceSwitcherActivate { since, index });
+                widget::mouse_area(button)
+                    .on_enter(Message::WorkspaceSwitcherSelected { since, index })
                     .into()
             })
             .collect::<Vec<Element<'_, Message>>>();
@@ -9638,7 +9692,7 @@ impl Cagents {
                         .max_height(WORKSPACE_SWITCHER_LIST_HEIGHT)
                         .into(),
                         design::caption(
-                            "Tab or arrows to choose · Release to open · Escape to cancel",
+                            "Tab, arrows, Home or End to choose · Release or Enter to open · Escape to cancel",
                         )
                         .into(),
                     ])
@@ -9651,25 +9705,62 @@ impl Cagents {
         ))
     }
 
+    /// Record only actual navigation at the workspace's save boundary.
+    /// Frames and preview steps never scan the project model or become visits.
+    fn capture_workspace_history(&mut self) {
+        if self.chrome_ui.workspace_preview.is_none() {
+            self.workspace_history
+                .observe(self.active_workspace_destination());
+        }
+        self.workspace_history
+            .truncate_recent(WORKSPACE_HISTORY_LIMIT);
+        let history = self.workspace_history.recent().to_vec();
+        if self.durable.workspace_history != history {
+            Arc::make_mut(&mut self.durable).workspace_history = history;
+        }
+    }
+
+    fn select_workspace_preview(&mut self, index: usize) -> Task<Message> {
+        let Some(destination) = self.workspace_history.select_index(index) else {
+            return Task::none();
+        };
+        let Some(row) = self.chrome_ui.workspace_switcher_rows.get(index) else {
+            return Task::none();
+        };
+        if row.destination != destination {
+            return Task::none();
+        }
+        self.chrome_ui.workspace_preview = Some(row.action.clone());
+        self.reveal_workspace_selection()
+    }
+
     fn next_workspace(
         &mut self,
         direction: crate::workspace::FocusDirection,
     ) -> Option<SidebarAction> {
-        let mut destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
-        let available: Vec<_> = destinations
-            .iter()
-            .filter_map(WorkspaceDestination::from_action)
-            .collect();
-        self.workspace_history.retain(|id| available.contains(&id));
-        let selected = self.workspace_history.step(
-            &available,
-            self.active_workspace_destination(),
-            direction == crate::workspace::FocusDirection::Left,
-        )?;
-        let index = destinations
-            .iter()
-            .position(|action| WorkspaceDestination::from_action(action) == Some(selected))?;
-        Some(destinations.swap_remove(index))
+        let backwards = direction == crate::workspace::FocusDirection::Left;
+        if self.workspace_history.cycle_order().is_some() {
+            self.workspace_history.advance(backwards)?;
+        } else {
+            let destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
+            let available: Vec<_> = destinations
+                .iter()
+                .filter_map(WorkspaceDestination::from_action)
+                .collect();
+            let live: HashSet<_> = available.iter().copied().collect();
+            self.workspace_history.retain(|id| live.contains(&id));
+            self.workspace_history.step(
+                &available,
+                self.active_workspace_destination(),
+                backwards,
+            )?;
+            self.chrome_ui.workspace_switcher_rows = self
+                .build_workspace_switcher_rows(self.workspace_history.cycle_order()?, destinations);
+        }
+        self.chrome_ui
+            .workspace_switcher_rows
+            .get(self.workspace_history.cycle_index()?)
+            .map(|row| row.action.clone())
     }
 
     /// The focused card, reduced to what binding the source-control panel
@@ -12416,6 +12507,13 @@ impl Application for Cagents {
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
         let shared_views = shared_views::State::for_workspace(&durable);
+        let workspace_history = crate::tab_history::TabHistory::from_recent(
+            durable
+                .workspace_history
+                .iter()
+                .copied()
+                .take(WORKSPACE_HISTORY_LIMIT),
+        );
         let mut app = Self {
             core,
             workspace,
@@ -12571,7 +12669,7 @@ impl Application for Cagents {
             settings_category: SettingsCategory::Appearance,
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
-            workspace_history: crate::tab_history::TabHistory::default(),
+            workspace_history,
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
@@ -12753,10 +12851,6 @@ impl Application for Cagents {
                 || self.chat_ui.image_viewer.is_some())
         {
             self.cancel_workspace_preview();
-        }
-        if self.chrome_ui.workspace_preview.is_none() {
-            self.workspace_history
-                .observe(self.active_workspace_destination());
         }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
@@ -14711,6 +14805,22 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::WorkspaceSwitcherSelected { since, index } => {
+                if self.chrome_ui.workspace_preview_since == Some(since) {
+                    self.select_workspace_preview(index)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::WorkspaceSwitcherActivate { since, index } => {
+                if self.chrome_ui.workspace_preview_since != Some(since)
+                    || index >= self.chrome_ui.workspace_switcher_rows.len()
+                {
+                    return Task::none();
+                }
+                drop(self.select_workspace_preview(index));
+                self.commit_workspace_preview()
+            }
             Message::WorkspaceSwitcherReleased(since) => {
                 if self.chrome_ui.workspace_preview_since == Some(since) {
                     self.commit_workspace_preview()
@@ -22142,6 +22252,219 @@ mod tests {
         drop(app.update(next(alt)));
         assert_eq!(preview(&app), None);
         assert_eq!(app.active_workspace_destination(), Some(root));
+    }
+
+    fn workspace_switcher_test_app(count: usize) -> Cagents {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model.projects = (0..count)
+            .map(|index| {
+                SidebarProject::new(
+                    ProjectId::new(),
+                    RepositoryId::new(),
+                    format!("Folder {index}"),
+                    format!("/folder-{index}").into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_kind(ProjectKind::Folder)
+            })
+            .collect();
+        app.active_workspace = Some("/folder-0".into());
+        app
+    }
+
+    #[test]
+    fn workspace_switcher_home_end_hover_and_stale_actions_use_the_frozen_hold() {
+        let mut app = workspace_switcher_test_app(20);
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        let first_hold = app.chrome_ui.workspace_preview_since.unwrap();
+        assert_eq!(app.chrome_ui.workspace_switcher_rows.len(), 20);
+        let key = |key: keyboard::key::Named| Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key.clone()),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::End),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::ALT,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        };
+        drop(app.update(key(keyboard::key::Named::End)));
+        assert_eq!(app.workspace_history.cycle_index(), Some(19));
+        assert!(app.chrome_ui.workspace_switcher_scroll > WORKSPACE_SWITCHER_LIST_HEIGHT);
+        drop(app.update(key(keyboard::key::Named::Home)));
+        assert_eq!(app.workspace_history.cycle_index(), Some(0));
+        assert_eq!(app.chrome_ui.workspace_switcher_scroll, 0.0);
+        drop(app.update(Message::WorkspaceSwitcherSelected {
+            since: first_hold,
+            index: 15,
+        }));
+        assert_eq!(app.workspace_history.cycle_index(), Some(15));
+        assert!(app.chrome_ui.workspace_switcher_scroll > 0.0);
+        let current_scope = app.active_workspace_destination().unwrap();
+        let saved_during_preview = app.persistent_workspace();
+        assert_eq!(
+            saved_during_preview.workspace_history.first(),
+            Some(&current_scope)
+        );
+        assert_eq!(app.workspace_history.cycle_index(), Some(15));
+        // Rows describe the same destinations throughout this hold, even if
+        // an unrelated sidebar refresh updates their titles.
+        app.sidebar_model.projects[15].name = "Changed during hold".into();
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        assert_eq!(app.chrome_ui.workspace_switcher_rows[15].title, "Folder 15");
+        app.cancel_workspace_preview();
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        let current = app.chrome_ui.workspace_preview.clone();
+        drop(app.update(Message::WorkspaceSwitcherActivate {
+            since: first_hold,
+            index: 15,
+        }));
+        assert_eq!(app.chrome_ui.workspace_preview, current);
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/folder-0"))
+        );
+    }
+
+    #[test]
+    fn workspace_switcher_tab_steers_a_compositor_safe_fallback_hold() {
+        let mut app = workspace_switcher_test_app(3);
+        let event = |key, physical| Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Code(physical),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        };
+        drop(app.update(event(
+            keyboard::key::Named::PageDown,
+            keyboard::key::Code::PageDown,
+        )));
+        assert_eq!(app.workspace_history.cycle_index(), Some(1));
+        drop(app.update(event(keyboard::key::Named::Tab, keyboard::key::Code::Tab)));
+        assert_eq!(app.workspace_history.cycle_index(), Some(2));
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/folder-0"))
+        );
+    }
+
+    #[test]
+    fn workspace_switcher_cannot_reopen_a_destination_retired_during_the_hold() {
+        let mut app = workspace_switcher_test_app(2);
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        assert_eq!(app.workspace_history.cycle_index(), Some(1));
+        app.sidebar_model.projects.remove(1);
+        drop(app.commit_workspace_preview());
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/folder-0"))
+        );
+        assert!(
+            app.durable.cards.is_empty(),
+            "retired or current scopes must not acquire a default pane"
+        );
+        assert!(app.chrome_ui.workspace_preview.is_none());
+        assert!(app.chrome_ui.workspace_switcher_rows.is_empty());
+    }
+
+    #[test]
+    fn workspace_switcher_does_not_commit_an_old_path_for_a_retargeted_identity() {
+        let mut app = workspace_switcher_test_app(2);
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        app.sidebar_model.projects[1].repository = "/new-folder-1".into();
+        drop(app.commit_workspace_preview());
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/folder-0"))
+        );
+        assert!(app.durable.cards.is_empty());
+    }
+
+    #[test]
+    fn persisted_workspace_history_keeps_the_current_scope_and_bounds_old_visits() {
+        let mut app = workspace_switcher_test_app(1);
+        let active = app.active_workspace_destination().unwrap();
+        app.workspace_history = crate::tab_history::TabHistory::from_recent(
+            (0..300).map(|_| WorkspaceDestination::Folder(ProjectId::new())),
+        );
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.workspace_history.len(), WORKSPACE_HISTORY_LIMIT);
+        assert_eq!(
+            app.workspace_history.recent().len(),
+            WORKSPACE_HISTORY_LIMIT
+        );
+        assert_eq!(saved.workspace_history[0], active);
+        let restarted =
+            crate::tab_history::TabHistory::from_recent(saved.workspace_history.iter().copied());
+        assert_eq!(restarted.recent(), saved.workspace_history);
+    }
+
+    #[test]
+    fn workspace_switcher_rows_expose_actions_and_the_selected_workspace() {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut app = workspace_switcher_test_app(3);
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        app.chrome_ui.workspace_switcher_shown = true;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = app.workspace_switcher().unwrap();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0)),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let buttons = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 3);
+        assert_eq!(
+            buttons
+                .iter()
+                .filter(|node| node
+                    .node()
+                    .label()
+                    .is_some_and(|label| label.starts_with("Selected workspace:")))
+                .count(),
+            1
+        );
+        assert!(buttons.iter().all(|node| {
+            node.node()
+                .supports_action(iced_accessibility::accesskit::Action::Click)
+        }));
     }
 
     #[test]

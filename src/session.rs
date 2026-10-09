@@ -2676,6 +2676,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            workspace_history: Vec::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),

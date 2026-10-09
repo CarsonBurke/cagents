@@ -3818,6 +3818,7 @@ impl Cagents {
     /// Placeholders never reach storage. Once a pane contains work, promote
     /// it before saving so later snapshots cannot silently drop a saved card.
     pub(super) fn persistent_workspace(&mut self) -> Arc<WorkspaceState> {
+        self.capture_workspace_history();
         self.settle_focus();
         let used = self
             .chat_ui

@@ -91,7 +91,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Find in the focused pane / search projects | `Ctrl+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Alt+R` |
-| Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
+| Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
 | Next unviewed review file | `Alt+Shift+Down` |
@@ -138,13 +138,15 @@ determine which models and permission modes are available.
   pane under the pointer after a 300 ms dwell; typing cancels a pending activation.
 - Hold **Alt+Tab** to switch workspace. Recently used worktrees and channels
   come first, then the rest in sidebar order; a quick tap goes back to the
-  previous one. **Tab**, **Shift+Tab** and the arrow keys move the selection,
-  and a click picks a row. Release **Alt** or press **Enter** to open the
+  previous one. **Tab**, **Shift+Tab** and the arrow keys move the selection;
+  **Home** and **End** choose the first and last row. Hover selects a row,
+  and a click opens it. Release **Alt** or press **Enter** to open the
   highlighted workspace; **Escape**, leaving the window, or releasing on the
   workspace already open cancels. Keys pressed while the list is open go to it,
   not to the pane underneath, and previewing does not start panes in the
-  workspaces you pass. If your desktop takes **Alt+Tab** itself, bind another
-  chord to **Next workspace** in **Settings → Keyboard**.
+  workspaces you pass. The 128 most recently visited workspaces survive restart.
+  If your desktop takes **Alt+Tab** itself, use **Ctrl+Alt+PageDown** / **Ctrl+Alt+PageUp**, or
+  bind another chord in **Settings → Keyboard**.
 - Switching worktrees remembers each strip's scroll position and focused
   pane. Hidden terminals release their presentation while their PTYs keep
   running, and editor buffers stay intact. Scroll positions, worktree
