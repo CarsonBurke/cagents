@@ -542,6 +542,49 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    struct ForkChild(libc::pid_t);
+
+    impl ForkChild {
+        fn assert_success(mut self) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let mut status = 0;
+                let result = unsafe { libc::waitpid(self.0, &mut status, libc::WNOHANG) };
+                if result == self.0 {
+                    self.0 = 0;
+                    assert!(libc::WIFEXITED(status));
+                    assert_eq!(libc::WEXITSTATUS(status), 0);
+                    return;
+                }
+                assert!(
+                    result >= 0,
+                    "waiting for the inherited-descriptor child failed"
+                );
+                assert!(Instant::now() < deadline, "the gated child did not exit");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for ForkChild {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                // This unreaped child cannot have its PID reused.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+                loop {
+                    let result = unsafe { libc::waitpid(self.0, std::ptr::null_mut(), 0) };
+                    if result >= 0
+                        || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn a_running_daemon_with_partial_restore_is_not_success() {
         assert!(
@@ -579,8 +622,61 @@ mod tests {
             0
         );
         assert!(!lock_available(&path).unwrap());
+        assert!(
+            !lock_available(&path).unwrap(),
+            "probing must leave the original owner's lease held"
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut gate = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let reader = unsafe { fs::File::from_raw_fd(gate[0]) };
+        let mut writer = unsafe { fs::File::from_raw_fd(gate[1]) };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // After fork in a multithreaded test process, use only
+            // async-signal-safe calls until exec (or _exit on failure).
+            unsafe {
+                libc::close(gate[1]);
+                let mut byte = 0u8;
+                if libc::read(gate[0], (&mut byte as *mut u8).cast(), 1) != 1 {
+                    libc::_exit(1);
+                }
+                libc::execl(
+                    c"/bin/true".as_ptr(),
+                    c"true".as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+                libc::_exit(2);
+            }
+        }
+        let child = ForkChild(pid);
+        drop(reader);
         drop(file);
-        assert!(lock_available(&path).unwrap());
+        assert!(
+            !lock_available(&path).unwrap(),
+            "the gated child must retain the inherited open file description"
+        );
+        writer.write_all(&[1]).unwrap();
+        drop(writer);
+        // A concurrent Command::spawn can retain this CLOEXEC descriptor in
+        // its forked child until exec. Closing the parent's copy is not the
+        // same as retiring every reference to the open file description.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !lock_available(&path).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "the probe leaked a lease after inherited descriptors should have retired"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        child.assert_success();
     }
     #[test]
     fn maintenance_timeout_is_bounded_and_success_output_is_captured() {
