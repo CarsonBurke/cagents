@@ -1,3 +1,7 @@
+// Keep this owned workspace binary fresh when switching a shared Cargo cache
+// between worktrees, without invalidating third-party dependencies.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 mod app;
 mod preferences;
 

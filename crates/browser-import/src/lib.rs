@@ -2,6 +2,8 @@
 //! discovery or scanning. Values never implement Debug or serialization and
 //! are erased when the import batch is dropped.
 
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 mod chromium;
 mod database;
 mod discovery;
