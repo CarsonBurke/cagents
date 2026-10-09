@@ -167,6 +167,10 @@ request**, and **Details**; the sidebar toggle hides or reveals it.
   parent, or the empty tree for an initial commit). Changes and Branch show
   their file counts.
   The commit form has separate subject and optional description fields.
+  Drafts stay with their worktree when you navigate elsewhere. You can edit the
+  next draft while a commit runs; success clears only the submitted draft.
+  A running Git command keeps its progress and blocks another command in that
+  worktree until it finishes, including after leaving and returning.
   `Ctrl+Enter` commits when either field is focused and staged changes are ready.
 - **Pull request** inspects the worktree's matching PR, grouping description,
   checks, and discussion in collapsible sections.
