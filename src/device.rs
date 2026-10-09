@@ -70,13 +70,29 @@ pub fn configuration_path() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("configuration directory unavailable"))
 }
 pub fn list() -> io::Result<Vec<Device>> {
-    let path = configuration_path()?;
-    use std::io::Read;
-    let bytes = fs::File::open(&path).and_then(|file| {
-        let mut bytes = Vec::new();
-        file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
-        Ok(bytes)
-    });
+    list_from_path(&configuration_path()?)
+}
+
+fn list_from_path(path: &Path) -> io::Result<Vec<Device>> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    // A configuration source must be a regular file. Open nonblocking before
+    // checking the descriptor so a FIFO cannot wait for a writer; ordinary
+    // symlinks to regular configurations retain their existing behavior.
+    let bytes = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .and_then(|file| {
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "devices.json must be a regular file",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
     match bytes {
         Ok(bytes) => {
             if bytes.len() > 64 * 1024 {
@@ -699,6 +715,102 @@ fn copy_flushed_notifying(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_configuration_rejects_a_fifo_without_a_writer() {
+        const CHILD: &str = "CAGENTS_TEST_DEVICE_CONFIG_FIFO";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = PathBuf::from(path);
+            let before = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                list_from_path(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let after = fs::symlink_metadata(&path).unwrap();
+            assert!(after.file_type().is_fifo());
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            fs::write(path.with_extension("verified"), b"FIFO refused").unwrap();
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        // The parent retains the fixture even if a regressed child is killed.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a live NUL-terminated path in the owned fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // Bound a regression in open itself without leaving a blocked test
+        // thread or changing this process's environment.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "device::tests::device_configuration_rejects_a_fifo_without_a_writer",
+                "--nocapture",
+            ])
+            .env(CHILD, &path)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "isolated FIFO reader failed: {status}");
+                assert_eq!(
+                    fs::read(path.with_extension("verified")).unwrap(),
+                    b"FIFO refused"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("device configuration reader waited for a FIFO writer");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn device_configuration_preserves_regular_symlink_missing_and_bounds_contracts() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        assert!(list_from_path(&path).unwrap().is_empty());
+        let document = br#"{"devices":[{"name":"fixture","host":"offline"}]}"#;
+        fs::write(&path, document).unwrap();
+        let loaded = list_from_path(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "fixture");
+        assert_eq!(loaded[0].executable, "cagents");
+        let link = directory.path().join("linked.json");
+        symlink(&path, &link).unwrap();
+        assert_eq!(list_from_path(&link).unwrap()[0].host, "offline");
+        let mut exact = document.to_vec();
+        exact.resize(64 * 1024, b' ');
+        fs::write(&path, &exact).unwrap();
+        assert_eq!(list_from_path(&link).unwrap().len(), 1);
+        exact.push(b' ');
+        fs::write(&path, &exact).unwrap();
+        assert!(
+            list_from_path(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("64 KiB")
+        );
+        fs::write(&path, br#"{"devices":[{"name":"fixture","host":"offline"},{"name":"fixture","host":"offline"}]}"#).unwrap();
+        assert!(
+            list_from_path(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        fs::write(&path, br#"{"devices":[{"name":"local","host":"offline"}]}"#).unwrap();
+        assert!(list_from_path(&path).is_err());
+        assert_eq!(
+            list_from_path(directory.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
     #[test]
     fn bridge_runtime_fallback_requires_owned_private_real_directory() {
         use std::os::unix::fs::symlink;
