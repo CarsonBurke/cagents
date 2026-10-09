@@ -53,12 +53,12 @@ for artifact in "${artifacts[@]}"; do
     [[ -f $DIST_DIR/$artifact && ! -L $DIST_DIR/$artifact ]] || fail "missing regular artifact: $artifact"
 done
 for artifact in "${artifacts[@]}"; do
-    mkdir "$WORK/rootfs"
+    mkdir "$WORK/rootfs" "$WORK/scratch"
     cp -a --reflink=auto -- "$BASE_ROOT/." "$WORK/rootfs/"
     # Even an interrupted developer build must not provide persisted user data
     # to shipped executables. These paths are empty private mounts, not host data.
     timeout --signal=TERM --kill-after=5s 120s bwrap --unshare-all --uid 0 --gid 0 --die-with-parent --new-session --clearenv \
-        --bind "$WORK/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+        --bind "$WORK/rootfs" / --proc /proc --dev /dev --bind "$WORK/scratch" /tmp --tmpfs /run \
         --tmpfs /root --tmpfs /home \
         --ro-bind "$DIST_DIR/$artifact" /artifact --ro-bind "$WORK/smoke" /smoke \
         --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv LANG C.UTF-8 \
@@ -67,6 +67,6 @@ for artifact in "${artifacts[@]}"; do
         --setenv XDG_CACHE_HOME /root/cache --setenv XDG_STATE_HOME /root/state \
         --setenv XDG_RUNTIME_DIR /run/fixture --chdir / \
         -- /bin/bash /smoke "$artifact" "$VERSION"
-    rm -rf -- "$WORK/rootfs"
+    rm -rf -- "$WORK/rootfs" "$WORK/scratch"
     printf 'Artifact smoke passed: %s\n' "$artifact"
 done

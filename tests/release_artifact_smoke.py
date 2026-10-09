@@ -99,18 +99,22 @@ class SmokeBoundary(unittest.TestCase):
             self.assertEqual(arguments[arguments.index("--gid") + 1], "0")
             binds = [(arguments[i], arguments[i + 1], arguments[i + 2])
                      for i, argument in enumerate(arguments) if argument in ("--bind", "--ro-bind")]
-            self.assertEqual(len(binds), 3)
-            writable, frozen_artifact, frozen_script = binds
+            self.assertEqual(len(binds), 4)
+            writable, scratch, frozen_artifact, frozen_script = binds
             self.assertEqual(writable[0], "--bind")
             self.assertEqual(writable[2], "/")
             self.assertTrue(Path(writable[1]).is_relative_to(self.work))
             self.assertNotEqual(Path(writable[1]), self.base)
+            self.assertEqual(scratch[0], "--bind")
+            self.assertEqual(scratch[2], "/tmp")
+            self.assertTrue(Path(scratch[1]).is_relative_to(self.work))
+            self.assertNotEqual(Path(scratch[1]), Path(writable[1]))
             self.assertEqual(frozen_artifact, ("--ro-bind", str(self.dist / artifact), "/artifact"))
             self.assertEqual(frozen_script[0], "--ro-bind")
             self.assertTrue(Path(frozen_script[1]).is_relative_to(self.work))
             self.assertEqual(frozen_script[2], "/smoke")
             private = [arguments[i + 1] for i, argument in enumerate(arguments) if argument == "--tmpfs"]
-            self.assertCountEqual(private, ["/tmp", "/run", "/root", "/home"])
+            self.assertCountEqual(private, ["/run", "/root", "/home"])
             self.assertEqual(arguments[arguments.index("--proc") + 1], "/proc")
             forwarded = {arguments[i + 1]: arguments[i + 2]
                          for i, argument in enumerate(arguments) if argument == "--setenv"}
