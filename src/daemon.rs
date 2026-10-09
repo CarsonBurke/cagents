@@ -48,6 +48,8 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(any(feature = "host", test))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
+// Validate the opened descriptor without blocking on an invalid special file.
+const LOCK_OPEN_FLAGS: c_int = O_NOFOLLOW | libc::O_NONBLOCK;
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
@@ -283,7 +285,7 @@ impl RecoveryLease {
             libc::openat(
                 directory.as_raw_fd(),
                 c"cagentsd.recovery.lock".as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK | O_NOFOLLOW,
+                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | LOCK_OPEN_FLAGS,
                 0o600 as libc::mode_t,
             )
         };
@@ -357,7 +359,7 @@ impl HostLease {
             // `write_lock_metadata` truncates after exclusive ownership is proven.
             .truncate(false)
             .mode(PRIVATE_FILE_MODE)
-            .custom_flags(O_NOFOLLOW)
+            .custom_flags(LOCK_OPEN_FLAGS)
             .open(&paths.lock)?;
         validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
         lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
@@ -389,7 +391,7 @@ impl HostLease {
     fn is_lock_held(path: &Path) -> Result<bool, PlatformError> {
         let lock = match OpenOptions::new()
             .read(true)
-            .custom_flags(O_NOFOLLOW)
+            .custom_flags(LOCK_OPEN_FLAGS)
             .open(path)
         {
             Ok(lock) => lock,
@@ -420,7 +422,7 @@ impl HostLease {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(O_NOFOLLOW)
+            .custom_flags(LOCK_OPEN_FLAGS)
             .open(&paths.lock)?;
         validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
         // SAFETY: the validated descriptor is owned through the guard lifetime.
@@ -483,7 +485,7 @@ pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
     let paths = RuntimePaths::discover()?;
     let mut lock = match OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(LOCK_OPEN_FLAGS)
         .open(&paths.lock)
     {
         Ok(lock) => lock,
@@ -544,7 +546,7 @@ pub(crate) fn lease_owner(
 
     let lock = OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(LOCK_OPEN_FLAGS)
         .open(lock_path)?;
     validate_lock_file(lock_path, &lock.metadata()?, current_uid())?;
     // SAFETY: flock receives a live descriptor and no pointers.
@@ -573,7 +575,7 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
     let paths = RuntimePaths::discover()?;
     let mut lock = match OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(LOCK_OPEN_FLAGS)
         .open(&paths.lock)
     {
         Ok(lock) => lock,
@@ -867,10 +869,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    #[cfg(feature = "host")]
     use crate::model::{HostIncarnation, HostSessionId};
 
-    #[cfg(feature = "host")]
     fn proof() -> HostSessionProof {
         HostSessionProof {
             host_session_id: HostSessionId::new("session"),
@@ -885,6 +885,140 @@ mod tests {
             lock: directory.join("cagentsd.lock"),
             #[cfg(feature = "host")]
             directory,
+        }
+    }
+
+    #[test]
+    fn special_daemon_locks_are_rejected_before_blocking_open() {
+        use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CASE: &str = "CAGENTS_DAEMON_FIFO_CHECK";
+        const TEST: &str = "daemon::tests::special_daemon_locks_are_rejected_before_blocking_open";
+        if let Ok(case) = std::env::var(CASE) {
+            let paths = RuntimePaths::discover().unwrap();
+            assert!(
+                fs::symlink_metadata(&paths.lock)
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+            eprintln!("owned daemon FIFO validation case={case}");
+            let result = match case.as_str() {
+                "held" => HostLease::is_held(&paths).map(|_| ()),
+                "executable" => running_executable().map(|_| ()),
+                "owner" => lease_owner(&paths.lock, &proof()).map(|_| ()),
+                "terminate" => terminate_daemon_from_lock().map(|_| ()),
+                #[cfg(feature = "host")]
+                "acquire" => HostLease::acquire(&paths, &proof()).map(|_| ()),
+                #[cfg(feature = "host")]
+                "maintenance" => HostLease::acquire_for_maintenance(&paths).map(|_| ()),
+                #[cfg(feature = "ui")]
+                "recovery" => {
+                    RecoveryLease::acquire(&paths.socket, Duration::from_millis(50)).map(|_| ())
+                }
+                _ => panic!("unknown daemon lock fixture case"),
+            };
+            let expected = if case == "recovery" {
+                paths.lock.with_file_name("cagentsd.recovery.lock")
+            } else {
+                paths.lock
+            };
+            assert!(
+                matches!(result, Err(PlatformError::UnsafeLockPath { path }) if path == expected)
+            );
+            return;
+        }
+
+        // XDG_RUNTIME_DIR is process-global. Each real API runs in an exact
+        // subprocess, where a blocking regression is bounded and cleaned up
+        // through its original pidfd rather than stranding a libtest thread.
+        let runtime = tempdir().unwrap();
+        let directory = runtime.path().join(instance::RUNTIME_SUBDIRECTORY);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["cagentsd.lock", "cagentsd.recovery.lock"] {
+            let path = directory.join(name);
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+        for case in [
+            "held",
+            "executable",
+            "owner",
+            "terminate",
+            "acquire",
+            "maintenance",
+            "recovery",
+        ]
+        .into_iter()
+        .filter(|case| match *case {
+            "acquire" | "maintenance" => cfg!(feature = "host"),
+            "recovery" => cfg!(feature = "ui"),
+            _ => true,
+        }) {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CASE, case)
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+            if raw < 0 {
+                let error = io::Error::last_os_error();
+                // Still the sole owner of this fresh, unreaped fixture child.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cannot capture fixture process identity: {error}");
+            }
+            let identity = unsafe { File::from_raw_fd(raw as i32) };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut timed_out = false;
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    assert_eq!(
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                identity.as_raw_fd(),
+                                libc::SIGKILL,
+                                std::ptr::null::<libc::siginfo_t>(),
+                                0,
+                            )
+                        },
+                        0
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!("owned daemon FIFO validation case={case}")),
+                "exact fixture must run: {stdout}; {stderr}"
+            );
+            assert!(
+                !timed_out && output.status.success(),
+                "{case}: {stdout}; {stderr}"
+            );
+            assert!(
+                fs::symlink_metadata(directory.join("cagentsd.lock"))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+            assert!(
+                fs::symlink_metadata(directory.join("cagentsd.recovery.lock"))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
         }
     }
 
