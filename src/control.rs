@@ -1936,7 +1936,11 @@ where
         return ExitCode::FAILURE;
     }
     if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
-        match crate::install_guard::staged_owner_bin(&std::env::current_exe().unwrap_or_default()) {
+        let recover = staged_command_requires_daemon(&cli.command);
+        match crate::install_guard::staged_owner_bin(
+            &std::env::current_exe().unwrap_or_default(),
+            recover,
+        ) {
             Ok(Some(bin)) => {
                 use std::os::unix::process::CommandExt;
                 let mut command = Command::new(bin.join("cagents"));
@@ -1985,6 +1989,29 @@ where
     }
 }
 
+fn staged_command_requires_daemon(command: &TopCommand) -> bool {
+    match command {
+        TopCommand::Daemon {
+            command: DaemonCommand::Start,
+        }
+        | TopCommand::Ui { .. }
+        | TopCommand::Terminal { .. }
+        | TopCommand::Project { .. }
+        | TopCommand::Channel { .. }
+        | TopCommand::Automation { .. }
+        | TopCommand::Whoami
+        | TopCommand::Sessions(_)
+        | TopCommand::Send(_)
+        | TopCommand::Ask(_)
+        | TopCommand::Reply(_)
+        | TopCommand::Inbox(_) => true,
+        TopCommand::Agent { command } => !matches!(command, AgentCommand::Console { .. }),
+        // These paths do not call ensure_daemon_ready. Internal helpers and new
+        // commands remain non-recovering until their actual contract requires it.
+        _ => false,
+    }
+}
+
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
     !matches!(
         command,
@@ -2002,7 +2029,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
 /// Desktop launches need the same matched owner as CLI launches while a staged
 /// update is pending. Internal helpers and remote devices do not use this route.
 pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
-    crate::install_guard::staged_owner_bin(&std::env::current_exe()?)
+    crate::install_guard::staged_owner_bin(&std::env::current_exe()?, true)
         .map(|bin| bin.map(|bin| bin.join("cagents-ui")))
 }
 

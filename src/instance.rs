@@ -714,6 +714,187 @@ fn running_window_slots(runtime: &Path) -> io::Result<Vec<String>> {
     Ok(slots)
 }
 
+/// A shared launch fence prevents a reviewed handoff from committing while a
+/// public launcher authenticates and restores the surviving window's daemon.
+pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
+    owned_lock(
+        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("an update is in progress: {error}")))
+}
+
+pub(crate) struct VerifiedWindow {
+    pub executable: PathBuf,
+    pidfd: File,
+    pid: u32,
+    lease: File,
+    lease_path: PathBuf,
+}
+
+impl VerifiedWindow {
+    pub fn still_owns_lease(&self) -> io::Result<bool> {
+        let expected = self.lease.metadata()?;
+        let actual = fs::symlink_metadata(&self.lease_path)?;
+        Ok(actual.is_file()
+            && actual.dev() == expected.dev()
+            && actual.ino() == expected.ino()
+            && self.is_alive()
+            && process_owns_slot(
+                &Path::new("/proc").join(self.pid.to_string()),
+                self.pid,
+                &expected,
+            )?
+            && fs::read_link(Path::new("/proc").join(self.pid.to_string()).join("exe"))?
+                == self.executable)
+    }
+
+    fn is_alive(&self) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized descriptor and does not block.
+        unsafe { libc::poll(&mut poll, 1, 0) == 0 }
+    }
+}
+
+/// Contention alone is not ownership: require the exact exclusive flock in the
+/// process's fdinfo, then pin its lifetime before trusting its executable.
+/// The caller must hold the update launch fence throughout use of this proof.
+pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
+    verified_windows_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+/// A staged installer itself holds the shared legacy fence. Its validated
+/// exclusive launch guard already rules out a legacy exclusive UI owner.
+pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
+    validate_stage_guard()?;
+    verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() != 8
+        || fields[1..4] != ["FLOCK", "ADVISORY", "WRITE"]
+        || fields[6..8] != ["0", "EOF"]
+    {
+        return None;
+    }
+    let identity: Vec<_> = fields[5].split(':').collect();
+    if identity.len() != 3
+        || u64::from_str_radix(identity[0], 16).is_err()
+        || u64::from_str_radix(identity[1], 16).is_err()
+        || identity[2].parse::<u64>().ok() != Some(metadata.ino())
+    {
+        return None;
+    }
+    fields[4].parse::<u32>().ok().filter(|pid| *pid > 1)
+}
+
+fn fdinfo_owns_slot(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
+    info.lines()
+        .filter_map(|line| line.strip_prefix("lock:"))
+        .any(|line| flock_owner(line, metadata) == Some(pid))
+}
+
+fn verified_windows_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
+    let owners = verified_window_lease_owners_in(runtime, proc_root)?;
+    // A legacy exclusive owner cannot be interpreted as absence. Stage-only
+    // callers use their authenticated inherited guard instead of this probe.
+    if owners.is_empty() {
+        owned_lock(
+            &runtime.join(APPLICATION_LOCK_FILE),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .map_err(|error| io::Error::new(error.kind(), "cannot authenticate legacy UI ownership"))?;
+    }
+    Ok(owners)
+}
+
+fn verified_window_lease_owners_in(
+    runtime: &Path,
+    proc_root: &Path,
+) -> io::Result<Vec<VerifiedWindow>> {
+    use std::os::fd::FromRawFd;
+    let slots = running_window_slots(runtime)?;
+    let mut owners = Vec::new();
+    let kernel_locks = fs::read_to_string(proc_root.join("locks"))?;
+    for slot in slots {
+        let lease_path = runtime.join(slot_lock_name(&slot));
+        let lock = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lease_path)?;
+        let expected = lock.metadata()?;
+        if !expected.is_file() || expected.uid() != current_uid() || expected.nlink() != 1 {
+            return Err(io::Error::other("invalid live window lease"));
+        }
+        // /proc/locks is only an index into processes; fdinfo below proves
+        // ownership. Avoid scanning every descriptor of every agent per window.
+        // Btrfs subvolume st_dev can differ from the superblock device printed
+        // in /proc/locks. Index by inode, then disambiguate using the actual
+        // locked descriptor's stat device and inode, not a mere open descriptor.
+        let pids: std::collections::BTreeSet<_> = kernel_locks
+            .lines()
+            .filter_map(|line| flock_owner(line, &expected))
+            .collect();
+        let mut matches = Vec::new();
+        for pid in pids {
+            let process = proc_root.join(pid.to_string());
+            if !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == current_uid())
+                || !process_owns_slot(&process, pid, &expected)?
+            {
+                continue;
+            }
+            // SAFETY: pidfd_open returns a fresh owned descriptor or -1.
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if raw == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful pidfd_open transferred ownership to us.
+            let pidfd = unsafe { File::from_raw_fd(raw as i32) };
+            let executable = fs::read_link(process.join("exe"))?;
+            let verified = VerifiedWindow {
+                executable,
+                pidfd,
+                pid,
+                lease: lock.try_clone()?,
+                lease_path: lease_path.clone(),
+            };
+            if !verified.still_owns_lease()? {
+                return Err(io::Error::other(
+                    "window ownership changed during verification",
+                ));
+            }
+            matches.push(verified);
+        }
+        if matches.len() != 1 {
+            return Err(io::Error::other(format!(
+                "cannot authenticate live window {slot}"
+            )));
+        }
+        owners.push(matches.pop().unwrap());
+    }
+    Ok(owners)
+}
+
+fn process_owns_slot(process: &Path, pid: u32, expected: &fs::Metadata) -> io::Result<bool> {
+    Ok(fs::read_dir(process.join("fdinfo"))?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let descriptor = process.join("fd").join(entry.file_name());
+            let matches = |actual: fs::Metadata| {
+                actual.dev() == expected.dev() && actual.ino() == expected.ino()
+            };
+            fs::metadata(&descriptor).is_ok_and(&matches)
+                && fs::read_to_string(entry.path())
+                    .is_ok_and(|info| fdinfo_owns_slot(&info, pid, expected))
+                && fs::metadata(&descriptor).is_ok_and(matches)
+        }))
+}
+
 pub fn update_in_progress() -> bool {
     runtime_directory()
         .and_then(|runtime| {
@@ -1708,6 +1889,90 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn verified_window_requires_its_exact_kernel_flock_not_an_open_descriptor() {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().join(slot_lock_name(PRIMARY_WINDOW));
+        let held = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let merely_open = File::open(&path).unwrap();
+        let expected = held.metadata().unwrap();
+        let info =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", merely_open.as_raw_fd())).unwrap();
+        assert!(!fdinfo_owns_slot(&info, std::process::id(), &expected));
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", held.as_raw_fd())).unwrap();
+        assert!(
+            fdinfo_owns_slot(&info, std::process::id(), &expected),
+            "{info:?}, pid={}, dev={}, ino={}",
+            std::process::id(),
+            expected.dev(),
+            expected.ino()
+        );
+        assert!(!fdinfo_owns_slot(&info, std::process::id() + 1, &expected));
+        let owners = verified_windows_in(runtime.path(), Path::new("/proc")).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].executable, env::current_exe().unwrap());
+        assert!(owners[0].still_owns_lease().unwrap());
+        drop(held);
+        assert!(!owners[0].still_owns_lease().unwrap());
+        assert!(
+            verified_windows_in(runtime.path(), Path::new("/proc"))
+                .unwrap()
+                .is_empty()
+        );
+        let held = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let owners = verified_windows_in(runtime.path(), Path::new("/proc")).unwrap();
+        fs::rename(&path, runtime.path().join("replaced-lease")).unwrap();
+        let replacement = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        assert!(
+            !owners[0].still_owns_lease().unwrap(),
+            "an old lock cannot authenticate a replacement slot inode"
+        );
+        drop(replacement);
+        drop(held);
+    }
+
+    #[test]
+    fn window_ownership_cannot_combine_different_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let held = owned_lock(&root.path().join("lease"), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let expected = held.metadata().unwrap();
+        let locked_info =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", held.as_raw_fd())).unwrap();
+        let process = root.path().join("process");
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::create_dir(process.join("fdinfo")).unwrap();
+        // One descriptor names the right file but has no flock. Another has
+        // the expected lock record but names a different file: combining the
+        // two observations would falsely authenticate this process.
+        fs::write(root.path().join("other"), "unrelated").unwrap();
+        symlink(root.path().join("lease"), process.join("fd/1")).unwrap();
+        symlink(root.path().join("other"), process.join("fd/2")).unwrap();
+        fs::write(process.join("fdinfo/1"), "pos: 0\n").unwrap();
+        fs::write(process.join("fdinfo/2"), &locked_info).unwrap();
+        assert!(!process_owns_slot(&process, std::process::id(), &expected).unwrap());
+        fs::write(process.join("fdinfo/1"), locked_info).unwrap();
+        assert!(process_owns_slot(&process, std::process::id(), &expected).unwrap());
+    }
+
+    #[test]
+    fn recovery_rejects_unknown_legacy_ownership_and_pending_handoff() {
+        let runtime = tempfile::tempdir().unwrap();
+        let legacy = owned_lock(
+            &runtime.path().join(APPLICATION_LOCK_FILE),
+            libc::LOCK_SH | libc::LOCK_NB,
+        )
+        .unwrap();
+        assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
+        drop(legacy);
+        let update = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let handoff = owned_lock(&update, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        assert!(owned_lock(&update, libc::LOCK_SH | libc::LOCK_NB).is_err());
+        drop(handoff);
+        assert!(owned_lock(&update, libc::LOCK_SH | libc::LOCK_NB).is_ok());
+    }
 
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
