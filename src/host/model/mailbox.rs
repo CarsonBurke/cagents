@@ -115,23 +115,35 @@ fn message(row: &Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+// Leave room for the correlated server envelope and the authenticated
+// recipient session added to pending copies after selection. The body and
+// metadata are measured together, so large historical titles also fit safely.
+const INBOX_MESSAGE_BYTES: usize = crate::terminal::ipc::MAX_FRAME_BYTES - 4096;
+
 fn select_messages(
     db: &Connection,
     recipient: Option<Lineage>,
     query: &Inbox,
 ) -> Result<Vec<Message>, String> {
+    let recent = query.all && query.replies_to.is_none();
     let (filter, limit) = match (&query.replies_to, query.all) {
-        (Some(_), _) => ("AND reply_to = ?2 AND state = 'pending'", -1),
+        (Some(_), _) => (
+            "AND reply_to = ?2 AND state = 'pending'",
+            MAX_PENDING as i64,
+        ),
         (None, true) => ("AND ?2 IS NULL", RECENT as i64),
-        (None, false) => ("AND ?2 IS NULL AND state = 'pending'", -1),
+        (None, false) => ("AND ?2 IS NULL AND state = 'pending'", MAX_PENDING as i64),
     };
+    // Pending batches start with the oldest records so new arrivals cannot
+    // displace messages between reads. History still selects the newest first.
+    let order = if recent { "DESC" } else { "ASC" };
     let mut statement = db
         .prepare_cached(&format!(
             "SELECT {COLUMNS} FROM messages WHERE recipient_lineage IS ?1 {filter}
-             ORDER BY created_ms DESC, rowid DESC LIMIT ?3"
+             ORDER BY created_ms {order}, rowid {order} LIMIT ?3"
         ))
         .map_err(|error| error.to_string())?;
-    let mut messages: Vec<Message> = statement
+    let rows = statement
         .query_map(
             params![
                 Recipient(recipient),
@@ -140,9 +152,28 @@ fn select_messages(
             ],
             message,
         )
-        .and_then(Iterator::collect)
         .map_err(|error| error.to_string())?;
-    messages.reverse();
+    let mut messages = Vec::new();
+    let mut bytes = 0;
+    for row in rows {
+        let message = row.map_err(|error| error.to_string())?;
+        let size =
+            postcard::experimental::serialized_size(&message).map_err(|error| error.to_string())?;
+        if size > INBOX_MESSAGE_BYTES - bytes {
+            if messages.is_empty() {
+                return Err(format!(
+                    "Message {} cannot fit in an inbox reply; its state is unchanged",
+                    message.id
+                ));
+            }
+            break;
+        }
+        bytes += size;
+        messages.push(message);
+    }
+    if recent {
+        messages.reverse();
+    }
     Ok(messages)
 }
 
@@ -448,6 +479,187 @@ mod tests {
             state: State::Pending,
             created_ms,
         }
+    }
+
+    fn assert_inbox_fits_wire(messages: &[Message]) {
+        use crate::{
+            model::HostSessionProof,
+            terminal::ipc::{ServerEnvelope, ServerMessage, ServerResponse},
+        };
+        let session = TerminalId::new();
+        let projected: Vec<_> = messages
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if entry.state == State::Pending {
+                    entry.to.session = Some(session);
+                }
+                entry
+            })
+            .collect();
+        let envelope = ServerEnvelope {
+            version: crate::terminal::ipc::PROTOCOL_VERSION,
+            request_id: Some(u64::MAX),
+            proof: HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+                boot_id: crate::model::BootId::new(uuid::Uuid::new_v4().to_string()),
+                host_incarnation: crate::model::HostIncarnation::new(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+            },
+            message: ServerMessage::Response {
+                response: ServerResponse::Agent(crate::agent_execution::Reply::Inbox(projected)),
+            },
+        };
+        crate::terminal::ipc::write_frame(&mut Vec::new(), &envelope).unwrap();
+    }
+
+    #[test]
+    fn wire_bounded_user_inbox_batches_drain_every_body_in_oldest_order() {
+        let (mut registry, _directory) = registry();
+        let query = Inbox {
+            all: false,
+            replies_to: None,
+        };
+        let mut expected = Vec::new();
+        for sender in 0..3 {
+            let from = party(Lineage(TerminalId::new()));
+            for index in 0..MAX_PENDING {
+                let mut entry = message(
+                    from.clone(),
+                    Party::user(),
+                    (sender * MAX_PENDING + index) as u64,
+                );
+                entry.body = format!("message {}: ", entry.id);
+                entry.body.extend(std::iter::repeat_n(
+                    'x',
+                    crate::agent_execution::mailbox::MAX_MESSAGE_BYTES - entry.body.len(),
+                ));
+                registry.post_message(&entry).unwrap();
+                expected.push(entry.id);
+            }
+        }
+        let history = registry
+            .peek_messages(
+                None,
+                &Inbox {
+                    all: true,
+                    replies_to: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            history.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            expected[expected.len() - RECENT..]
+        );
+        assert_inbox_fits_wire(&history);
+        let mut received = Vec::new();
+        loop {
+            let batch = registry.peek_messages(None, &query).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= MAX_PENDING);
+            assert_inbox_fits_wire(&batch);
+            for entry in &batch {
+                assert_eq!(entry.state, State::Pending);
+                assert_eq!(
+                    entry.body.len(),
+                    crate::agent_execution::mailbox::MAX_MESSAGE_BYTES
+                );
+                let stored = registry.message(entry.id).unwrap().unwrap();
+                assert_eq!(stored.state, State::Pending);
+                assert_eq!(entry.body, stored.body);
+                assert!(entry.body.starts_with(&format!("message {}: ", entry.id)));
+            }
+            if received.is_empty() {
+                let mut later = message(party(Lineage(TerminalId::new())), Party::user(), 1000);
+                later.body = format!("message {}: ", later.id);
+                later.body.extend(std::iter::repeat_n(
+                    'x',
+                    crate::agent_execution::mailbox::MAX_MESSAGE_BYTES - later.body.len(),
+                ));
+                registry.post_message(&later).unwrap();
+                expected.push(later.id);
+            }
+            let ids: Vec<_> = batch.iter().map(|entry| entry.id).collect();
+            registry
+                .acknowledge_messages(None, None, &Receipt { ids: ids.clone() }, 2000)
+                .unwrap();
+            received.extend(ids);
+        }
+        assert_eq!(received, expected);
+        for id in received {
+            assert_eq!(registry.message(id).unwrap().unwrap().state, State::Read);
+        }
+    }
+
+    #[test]
+    fn wire_bounded_inbox_counts_metadata_before_settling_legacy_reads() {
+        let (mut registry, _directory) = registry();
+        let mut from = party(Lineage(TerminalId::new()));
+        from.title = Some("t".repeat(128 * 1024));
+        let mut expected = Vec::new();
+        for index in 0..MAX_PENDING {
+            let mut entry = message(from.clone(), Party::user(), index as u64);
+            entry.body = "x".repeat(crate::agent_execution::mailbox::MAX_MESSAGE_BYTES);
+            registry.post_message(&entry).unwrap();
+            expected.push(entry.id);
+        }
+        let query = Inbox {
+            all: false,
+            replies_to: None,
+        };
+        let first = registry.read_messages(None, None, &query, 1000).unwrap();
+        assert!(
+            !first.is_empty() && first.len() < MAX_PENDING,
+            "a row cap alone cannot bound a reply with large metadata"
+        );
+        assert_inbox_fits_wire(&first);
+        for entry in &first {
+            assert_eq!(entry.state, State::Read);
+            assert_eq!(entry.from.title.as_ref().unwrap().len(), 128 * 1024);
+        }
+        for id in &expected[first.len()..] {
+            assert_eq!(
+                registry.message(*id).unwrap().unwrap().state,
+                State::Pending
+            );
+        }
+        let second = registry.read_messages(None, None, &query, 1001).unwrap();
+        assert_inbox_fits_wire(&second);
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(registry.peek_messages(None, &query).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wire_bounded_inbox_preserves_an_individually_oversized_record() {
+        let (mut registry, _directory) = registry();
+        let mut entry = message(Party::user(), Party::user(), 0);
+        entry.from.title = Some("t".repeat(crate::terminal::ipc::MAX_FRAME_BYTES));
+        registry.post_message(&entry).unwrap();
+        let query = Inbox {
+            all: false,
+            replies_to: None,
+        };
+        assert!(
+            registry
+                .peek_messages(None, &query)
+                .unwrap_err()
+                .contains("state is unchanged")
+        );
+        assert!(registry.read_messages(None, None, &query, 1).is_err());
+        assert_eq!(
+            registry.message(entry.id).unwrap().unwrap().state,
+            State::Pending
+        );
     }
 
     #[test]
