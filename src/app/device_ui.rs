@@ -665,9 +665,14 @@ impl Cagents {
                             self.device_ui.output = text;
                         }
                     }
-                    Ok(Reply::Saved) => {
+                    Ok(reply @ (Reply::Saved | Reply::SavedUnconfirmed { .. })) => {
                         self.device_ui.original = self.device_ui.content.text();
-                        self.device_ui.notice = Some("Saved on device".into());
+                        self.device_ui.notice = Some(match reply {
+                            Reply::SavedUnconfirmed { error } => format!(
+                                "Saved on device; durability could not be confirmed: {error}"
+                            ),
+                            _ => "Saved on device".into(),
+                        });
                     }
                     Ok(Reply::Project { path, key, kind }) => {
                         self.device_ui.path = path.display().to_string();
@@ -1876,6 +1881,35 @@ mod tests {
         assert!(
             matches!(&app.device_ui.pending, Some(Operation::Read { path, .. }) if path == &PathBuf::from("second"))
         );
+    }
+
+    #[test]
+    fn unconfirmed_save_advances_baseline_and_shows_a_durability_warning() {
+        let mut app = loaded_file();
+        drop(app.update_device(Action::Save));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::SavedUnconfirmed {
+                error: "directory sync failed".into(),
+            }),
+        }));
+        assert!(!app.device_ui.busy);
+        assert!(
+            !app.device_ui.dirty(),
+            "published bytes are the saved baseline"
+        );
+        assert_eq!(app.device_ui.original, "unsaved draft");
+        assert!(
+            app.device_ui.notice.as_deref().unwrap().contains(
+                "Saved on device; durability could not be confirmed: directory sync failed"
+            )
+        );
+        app.device_ui.content = text_editor::Content::with_text("next edit");
+        drop(app.update_device(Action::Save));
+        assert!(matches!(&app.device_ui.pending,
+            Some(Operation::Write { expected, content, .. })
+                if expected == "unsaved draft" && content == "next edit"
+        ));
     }
 
     #[test]

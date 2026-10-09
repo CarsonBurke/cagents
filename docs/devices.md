@@ -62,7 +62,11 @@ in `.gitignore` or `.git/info/exclude` before creation.
 **Use directory** selects the working directory for new remote terminals and
 conversations and publishes the project to the remote daemon. Saves compare the
 loaded content and serialize with other cagents saves; a changed file requires a
-reload. File operations refuse symlink traversal outside their chosen directory.
+reload. If the replacement is published but syncing its directory fails, the
+editor reports that the file was saved with unconfirmed durability. The new
+content becomes the saved baseline; the warning means crash durability could
+not be confirmed. File operations refuse symlink traversal outside their chosen
+directory.
 Git subprocesses have output bounds and a 30-second timeout.
 
 On Linux, an SSH login without `XDG_RUNTIME_DIR` uses the existing
