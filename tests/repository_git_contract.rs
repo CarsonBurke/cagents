@@ -3988,10 +3988,11 @@ fn ambiguous_push_reconciliation_uses_push_urls_and_git_url_rewrites() {
 
         // The fetch endpoint now has the desired commit, while the push
         // endpoint is missing. That fetch evidence cannot prove a push.
+        // The mixed-rewrite fixture has multiple fetch URLs: reset all of them.
         fixture.git_in_work(&[
-            "remote",
-            "set-url",
-            "origin",
+            "config",
+            "--replace-all",
+            "remote.origin.url",
             fixture.origin().to_str().unwrap(),
         ]);
         fixture.git_in_work(&[
@@ -4194,5 +4195,90 @@ fn ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config(
     assert_eq!(
         fixture.text(&["config", "--get", "protocol.file.allow"]),
         "always"
+    );
+}
+/// Configuration changes after the actual failed push must not be
+/// mistaken for evidence from the destination that command tried to update.
+#[test]
+fn ambiguous_push_refuses_evidence_from_a_retargeted_push_url() {
+    struct RetargetAfterFailedPush {
+        destination: PathBuf,
+        worktree: PathBuf,
+    }
+    impl ProcessExecutor for RetargetAfterFailedPush {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if command.arguments.iter().any(|argument| argument == "push") {
+                assert!(
+                    !output.success,
+                    "the actual missing-destination push must fail"
+                );
+                let retarget = CommandSpec::new(&command.program)
+                    .cwd(&self.worktree)
+                    .args(["remote", "set-url", "--push", "origin"])
+                    .arg(&self.destination);
+                let changed =
+                    SystemProcessExecutor.execute(&isolate(retarget), &CancellationToken::new())?;
+                assert!(changed.success);
+                return Err(ProcessFailure {
+                    kind: ProcessFailureKind::Cancelled,
+                    program: command.program.clone(),
+                    exit_code: None,
+                    signal: None,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    message: "injected uncertainty after failed push and external config update"
+                        .into(),
+                    started: true,
+                });
+            }
+            Ok(output)
+        }
+    }
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let expected = publish_main(&fixture);
+    let missing = fixture.root.path().join("actual-missing-push.git");
+    fixture.git_in_work(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        missing.to_str().unwrap(),
+    ]);
+    let service = RepositoryService::new(
+        &fixture.git,
+        Arc::new(RetargetAfterFailedPush {
+            destination: fixture.origin(),
+            worktree: fixture.work(),
+        }),
+    );
+    let outcome = service
+        .push(
+            &PushRequest {
+                worktree: fixture.work(),
+                branch: ValidatedBranchName::parse("main").unwrap(),
+                target: PushTarget::Upstream {
+                    remote: "origin".into(),
+                    remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+                },
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, PushOutcome::OutcomeUnknown { .. }),
+        "{outcome:?}"
+    );
+    assert!(!missing.exists());
+    assert_eq!(remote_oid(&fixture, "refs/heads/main"), expected);
+    assert_eq!(
+        fixture.text(&["remote", "get-url", "--push", "origin"]),
+        fixture.origin().to_str().unwrap()
     );
 }
