@@ -24098,7 +24098,6 @@ mod tests {
 
     #[tokio::test]
     async fn restored_editor_focus_waits_for_a_viewport_after_loading() {
-        use futures_util::StreamExt;
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("notes.txt"), "saved\n").unwrap();
         let (mut app, pane) = editing_repository_app();
