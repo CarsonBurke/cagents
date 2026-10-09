@@ -13,9 +13,71 @@ pub const MAX_CACHED_REVIEWS: usize = 32;
 pub const MAX_CACHED_FILES: usize = 10_000;
 pub const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
-pub(crate) fn write_epoch() -> &'static str {
-    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
+/// An ordering observation captured before a cache task enters the blocking pool.
+/// Updated clients on the same kernel boot and Linux time namespace share this
+/// clock domain. Cross-container clocks and older executables are outside this
+/// ordering contract. The boot identity and clock observation are inseparable.
+/// Equal clock ticks keep the already committed snapshot; clock resolution
+/// bounds ordering precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOrder {
+    pub(crate) epoch: String,
+    pub(crate) tick: u64,
+}
+
+impl WriteOrder {
+    pub fn capture() -> Result<Self, String> {
+        static EPOCH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+        let epoch = EPOCH
+            .get_or_init(|| {
+                let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .map_err(|error| format!("Cannot identify the review-cache clock: {error}"))?;
+                let boot = uuid::Uuid::parse_str(boot.trim())
+                    .map_err(|error| format!("Invalid review-cache boot identity: {error}"))?;
+                Ok(format!("boottime-v1:{boot}"))
+            })
+            .clone()?;
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: time is a valid writable timespec for the duration of the call.
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
+            return Err(format!(
+                "Cannot read the review-cache clock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            epoch,
+            tick: Self::checked_tick(time.tv_sec, time.tv_nsec)?,
+        })
+    }
+
+    fn checked_tick(seconds: libc::time_t, nanos: libc::c_long) -> Result<u64, String> {
+        let tick = u64::try_from(seconds)
+            .ok()
+            .zip(
+                u64::try_from(nanos)
+                    .ok()
+                    .filter(|nanos| *nanos < 1_000_000_000),
+            )
+            .and_then(|(seconds, nanos)| seconds.checked_mul(1_000_000_000)?.checked_add(nanos))
+            .filter(|tick| *tick <= i64::MAX as u64);
+        tick.ok_or_else(|| "Review-cache clock is outside its supported range".into())
+    }
+
+    pub(crate) fn superseded_by(&self, epoch: &str, tick: u64) -> bool {
+        epoch == self.epoch && tick >= self.tick
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(tick: u64) -> Self {
+        Self {
+            epoch: "boottime-v1:fixture".into(),
+            tick,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +132,11 @@ impl Snapshot {
 
 /// Shell-specific persistence runs on the blocking pool. The write order is
 /// captured on the UI thread; stores reject older writes for the same PR even
-/// when their tasks finish later. A new process starts a new ordering epoch.
+/// when their tasks finish later, including writes from other UI processes on
+/// the same boot. Legacy epochs and earlier boots remain readable.
 pub trait Store: Send + Sync {
     fn load(&self, key: &PullRequestKey) -> Result<Option<Snapshot>, String>;
-    fn save(&self, snapshot: &Snapshot, order: u64) -> Result<(), String>;
+    fn save(&self, snapshot: &Snapshot, order: &WriteOrder) -> Result<(), String>;
 }
 
 #[cfg(test)]
@@ -100,16 +163,167 @@ pub(crate) fn fixture() -> Snapshot {
 mod tests {
     use super::*;
 
+    fn store_for_lane(directory: &std::path::Path, lane: &str) -> Box<dyn Store> {
+        match lane {
+            "sqlite" => Box::new(
+                crate::persistence::StateStore::open(
+                    directory.join("state.sqlite3"),
+                    crate::model::BootId::new("same-boot"),
+                )
+                .unwrap(),
+            ),
+            "json" => Box::new(JsonStore::new(directory.join("review.json"))),
+            _ => panic!("unknown cache lane"),
+        }
+    }
+
+    #[test]
+    fn crossprocess_cache_writes_keep_the_newer_capture_in_both_stores() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        const ROLE: &str = "CAGENTS_REVIEW_CACHE_ORDER_ROLE";
+        const DIRECTORY: &str = "CAGENTS_REVIEW_CACHE_ORDER_DIRECTORY";
+        const LANE: &str = "CAGENTS_REVIEW_CACHE_ORDER_LANE";
+        const NAME: &str = "pull_request_review::cache::tests::crossprocess_cache_writes_keep_the_newer_capture_in_both_stores";
+        if let Some(role) = std::env::var_os(ROLE) {
+            let directory = std::path::PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+            let store = store_for_lane(&directory, &std::env::var(LANE).unwrap());
+            let mut snapshot = fixture();
+            let order = WriteOrder::capture().unwrap();
+            if role == "old" {
+                snapshot.saved_ms = 200; // Wall time deliberately moves backwards in the newer writer.
+                snapshot.files[0].viewed = true;
+                std::fs::write(directory.join("old-ready"), order.tick.to_string()).unwrap();
+                let mut release = [0];
+                std::io::Read::read_exact(&mut std::io::stdin(), &mut release).unwrap();
+            } else {
+                assert_eq!(role, "new");
+                let earlier: u64 = std::fs::read_to_string(directory.join("old-ready"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(order.tick > earlier);
+                snapshot.saved_ms = 100;
+                snapshot.files[0].viewed = false;
+            }
+            store.save(&snapshot, &order).unwrap();
+            if role == "new" {
+                std::fs::write(directory.join("new-saved"), "committed").unwrap();
+            }
+            return;
+        }
+        for lane in ["sqlite", "json"] {
+            let directory = tempfile::tempdir().unwrap();
+            let child = |role| {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env(ROLE, role)
+                    .env(DIRECTORY, directory.path())
+                    .env(LANE, lane);
+                command
+            };
+            let mut old = child("old").stdin(Stdio::piped()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !directory.path().join("old-ready").exists() {
+                if Instant::now() >= deadline || old.try_wait().unwrap().is_some() {
+                    let _ = old.kill();
+                    let _ = old.wait();
+                    panic!("old process did not capture its snapshot");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let newer = child("new").status().unwrap();
+            assert!(
+                directory.path().join("new-saved").exists(),
+                "new child must execute its exact test and commit"
+            );
+            old.stdin.take().unwrap().write_all(&[1]).unwrap();
+            let older = old.wait().unwrap();
+            assert!(newer.success() && older.success());
+            let store = store_for_lane(directory.path(), lane);
+            let snapshot = store.load(&fixture().key).unwrap().unwrap();
+            assert_eq!(
+                snapshot.saved_ms, 100,
+                "{lane}: later capture survives clock rollback"
+            );
+            assert!(
+                !snapshot.files[0].viewed,
+                "{lane}: late old writer was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_order_bounds_equal_ticks_and_legacy_epochs_in_both_stores() {
+        assert_eq!(WriteOrder::checked_tick(1, 3).unwrap(), 1_000_000_003);
+        for (seconds, nanos) in [
+            (-1, 0),
+            (0, -1),
+            (0, 1_000_000_000),
+            (i64::MAX, 0),
+            (9_223_372_036, 854_775_808),
+        ] {
+            assert!(WriteOrder::checked_tick(seconds, nanos).is_err());
+        }
+        assert_eq!(
+            WriteOrder::checked_tick(9_223_372_036, 854_775_807).unwrap(),
+            i64::MAX as u64
+        );
+        for lane in ["sqlite", "json"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = store_for_lane(directory.path(), lane);
+            let mut snapshot = fixture();
+            let legacy = WriteOrder {
+                epoch: uuid::Uuid::new_v4().to_string(),
+                tick: 99,
+            };
+            store.save(&snapshot, &legacy).unwrap();
+            snapshot.files[0].viewed = false;
+            let first = WriteOrder::fixture(10);
+            store.save(&snapshot, &first).unwrap();
+            let saved = snapshot.clone();
+            snapshot.files[0].viewed = true;
+            store.save(&snapshot, &first).unwrap();
+            assert_eq!(
+                store.load(&snapshot.key).unwrap(),
+                Some(saved.clone()),
+                "equal ticks keep committed state"
+            );
+            drop(store);
+            let store = store_for_lane(directory.path(), lane);
+            store.save(&snapshot, &WriteOrder::fixture(9)).unwrap();
+            assert_eq!(
+                store.load(&snapshot.key).unwrap(),
+                Some(saved),
+                "restart preserves same-boot order"
+            );
+            let next_boot = WriteOrder {
+                epoch: "boottime-v1:next-boot".into(),
+                tick: 1,
+            };
+            store.save(&snapshot, &next_boot).unwrap();
+            assert_eq!(
+                store.load(&snapshot.key).unwrap(),
+                Some(snapshot),
+                "new boot accepts its reset clock"
+            );
+        }
+    }
+
     #[test]
     fn json_reopen_retains_selection_and_rejects_stale_same_key_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("review.json");
         let store = JsonStore::new(path.clone());
         let mut current = fixture();
-        store.save(&current, 2).unwrap();
+        store.save(&current, &WriteOrder::fixture(2)).unwrap();
         let saved = current.clone();
         current.files[0].viewed = false;
-        store.save(&current, 1).unwrap();
+        store.save(&current, &WriteOrder::fixture(1)).unwrap();
         assert_eq!(
             JsonStore::new(path.clone()).load(&saved.key).unwrap(),
             Some(saved.clone())
@@ -117,11 +331,11 @@ mod tests {
         current.key.number = 2;
         current.pull_request = super::super::tests::pull_request(2);
         current.range.number = 2;
-        store.save(&current, 1).unwrap();
+        store.save(&current, &WriteOrder::fixture(1)).unwrap();
         assert_eq!(store.load(&current.key).unwrap(), Some(current));
         assert_eq!(store.load(&saved.key).unwrap(), Some(saved));
         std::fs::write(&path, br#"{"version":999,"reviews":[]}"#).unwrap();
-        assert!(store.save(&fixture(), 3).is_err());
+        assert!(store.save(&fixture(), &WriteOrder::fixture(3)).is_err());
         assert!(std::fs::read_to_string(path).unwrap().contains("999"));
     }
 
@@ -131,10 +345,10 @@ mod tests {
         let store = JsonStore::new(dir.path().join("review.json"));
         let mut snapshot = fixture();
         snapshot.pull_request.head_ref_oid = "d".repeat(40);
-        assert!(store.save(&snapshot, 1).is_err());
+        assert!(store.save(&snapshot, &WriteOrder::fixture(1)).is_err());
         let mut snapshot = fixture();
         snapshot.selected = Some(RepoPath::parse("missing.rs").unwrap());
-        assert!(store.save(&snapshot, 2).is_err());
+        assert!(store.save(&snapshot, &WriteOrder::fixture(2)).is_err());
     }
 }
 
@@ -210,7 +424,7 @@ impl Store for JsonStore {
             .map(|record| record.snapshot))
     }
 
-    fn save(&self, snapshot: &Snapshot, order: u64) -> Result<(), String> {
+    fn save(&self, snapshot: &Snapshot, order: &WriteOrder) -> Result<(), String> {
         use std::{
             fs::{File, OpenOptions},
             io::Write,
@@ -238,7 +452,6 @@ impl Store for JsonStore {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let epoch = write_epoch();
         let mut document = self.read()?;
         let same_key = |record: &Record| {
             record.snapshot.key.number == snapshot.key.number
@@ -251,7 +464,7 @@ impl Store for JsonStore {
         if document
             .reviews
             .iter()
-            .any(|record| same_key(record) && record.epoch == epoch && record.order >= order)
+            .any(|record| same_key(record) && order.superseded_by(&record.epoch, record.order))
         {
             return Ok(());
         }
@@ -260,8 +473,8 @@ impl Store for JsonStore {
             0,
             Record {
                 snapshot: snapshot.clone(),
-                epoch: epoch.to_owned(),
-                order,
+                epoch: order.epoch.clone(),
+                order: order.tick,
             },
         );
         document.reviews.truncate(MAX_CACHED_REVIEWS);

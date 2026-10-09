@@ -435,8 +435,6 @@ pub struct StateStore {
     path: PathBuf,
     boot_id: BootId,
     recovery: RecoveryReport,
-    #[cfg(feature = "ui")]
-    review_cache_epoch: String,
 }
 
 impl StateStore {
@@ -550,8 +548,6 @@ impl StateStore {
             path: path.to_path_buf(),
             boot_id,
             recovery,
-            #[cfg(feature = "ui")]
-            review_cache_epoch: crate::pull_request_review::cache::write_epoch().to_owned(),
         })
     }
 

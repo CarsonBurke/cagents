@@ -68,7 +68,7 @@ impl Store for StateStore {
         Ok(Some(snapshot))
     }
 
-    fn save(&self, snapshot: &Snapshot, order: u64) -> Result<(), String> {
+    fn save(&self, snapshot: &Snapshot, order: &cache::WriteOrder) -> Result<(), String> {
         snapshot.validate()?;
         let repository = snapshot.key.repository.gh_selector().to_ascii_lowercase();
         let mut metadata = snapshot.clone();
@@ -95,9 +95,7 @@ impl Store for StateStore {
             "SELECT write_epoch, write_order FROM review_cache WHERE repository = ?1 AND number = ?2",
             params![repository, snapshot.key.number], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        if previous.is_some_and(|(boot, previous)| {
-            boot == self.review_cache_epoch.as_str() && previous >= order
-        }) {
+        if previous.is_some_and(|(boot, previous)| order.superseded_by(&boot, previous)) {
             return Ok(());
         }
         tx.execute(
@@ -110,7 +108,7 @@ impl Store for StateStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(repository, number) DO UPDATE SET head=excluded.head, viewer=excluded.viewer,
                  record=excluded.record, saved_ms=excluded.saved_ms, write_epoch=excluded.write_epoch, write_order=excluded.write_order, byte_size=excluded.byte_size",
-            params![repository, snapshot.key.number, snapshot.range.head.as_str(), snapshot.viewer, record, snapshot.saved_ms, self.review_cache_epoch.as_str(), order, byte_size],
+            params![repository, snapshot.key.number, snapshot.range.head.as_str(), snapshot.viewer, record, snapshot.saved_ms, order.epoch.as_str(), order.tick, byte_size],
         ).map_err(|error| error.to_string())?;
         {
             let mut insert = tx.prepare(
@@ -164,7 +162,9 @@ mod tests {
             .insert(snapshot.files[0].entry.path.clone());
         snapshot.files[0].viewed = false;
         snapshot.files[0].unverified = true;
-        store.save(&snapshot, 1).unwrap();
+        store
+            .save(&snapshot, &cache::WriteOrder::fixture(1))
+            .unwrap();
         assert_eq!(store.load(&snapshot.key).unwrap(), Some(snapshot));
     }
 
@@ -195,7 +195,9 @@ mod tests {
             snapshot.range.number = number;
             snapshot.pull_request = crate::pull_request_review::tests::pull_request(number);
             snapshot.saved_ms = number;
-            store.save(&snapshot, number).unwrap();
+            store
+                .save(&snapshot, &cache::WriteOrder::fixture(number))
+                .unwrap();
         }
         assert!(store.load(&cache::fixture().key).unwrap().is_none());
         let inner = store.lock_inner().unwrap();
@@ -218,18 +220,22 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_cache_reopens_with_a_new_write_epoch_on_the_same_boot() {
+    fn sqlite_cache_accepts_legacy_write_epoch_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite3");
         let mut snapshot = cache::fixture();
         {
             let store = StateStore::open(&path, crate::model::BootId::new("boot")).unwrap();
-            store.save(&snapshot, 5).unwrap();
+            store
+                .save(&snapshot, &cache::WriteOrder::fixture(5))
+                .unwrap();
             let saved = snapshot.clone();
             snapshot.files[0].viewed = false;
-            store.save(&snapshot, 4).unwrap();
+            store
+                .save(&snapshot, &cache::WriteOrder::fixture(4))
+                .unwrap();
             assert_eq!(store.load(&snapshot.key).unwrap(), Some(saved));
-            // Model a different UI process while keeping the OS boot ID.
+            // Model the process-scoped epoch written by an older application.
             store
                 .lock_inner()
                 .unwrap()
@@ -241,7 +247,9 @@ mod tests {
                 .unwrap();
         }
         let store = StateStore::open(&path, crate::model::BootId::new("boot")).unwrap();
-        store.save(&snapshot, 1).unwrap();
+        store
+            .save(&snapshot, &cache::WriteOrder::fixture(1))
+            .unwrap();
         assert_eq!(store.load(&snapshot.key).unwrap(), Some(snapshot));
     }
 }
