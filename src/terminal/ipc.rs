@@ -130,7 +130,8 @@ use crate::{
 /// the running background subagents it would terminate.
 /// Version 63 carries the daemon-observed completion time of a native turn.
 /// Version 64 carries immutable hosted automation proposals and user decisions.
-pub const PROTOCOL_VERSION: u16 = 64;
+/// Version 65 carries ephemeral provider prompt suggestions in native snapshots.
+pub const PROTOCOL_VERSION: u16 = 65;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

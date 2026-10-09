@@ -300,6 +300,7 @@ struct Claude {
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
     attention_generation: u64,
+    suggestion_turn: Option<(u64, String)>,
     /// Which result-delimited turn has already published its start. Busy may
     /// stay true between turns while background permission decisions remain.
     started_generation: Option<u64>,
@@ -421,6 +422,8 @@ impl Claude {
     }
     fn start_turn(&mut self, step: &mut Step) {
         if self.started_generation != Some(self.attention_generation) {
+            self.suggestion_turn = None;
+            step.events.push(Event::PromptSuggestionCleared);
             self.started_generation = Some(self.attention_generation);
             step.events.push(Event::TurnStarted);
         }
@@ -547,6 +550,8 @@ impl Claude {
         } else {
             0
         };
+        self.suggestion_turn = None;
+        step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
         if self.async_input {
             let mut preview = chat::QueuedMessage::new(id.clone(), text);
@@ -1424,7 +1429,7 @@ impl Adapter for Claude {
     }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = self.control(
-            json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[]}),
+            json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[], "promptSuggestions":true}),
         )?;
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
@@ -1795,6 +1800,17 @@ impl Adapter for Claude {
                             removed: false,
                         }));
                     }
+                    if string(&request, "subtype") == "initialize"
+                        && request.get("promptSuggestions").is_some()
+                    {
+                        // Older CLIs may reject the optional SDK field. Retry
+                        // the identical handshake once without suggestions.
+                        let mut request = request.clone();
+                        request.as_object_mut().unwrap().remove("promptSuggestions");
+                        let retry = self.control(request)?;
+                        step.writes.extend(retry.writes);
+                        return Ok(step);
+                    }
                     step.events.push(Event::Error {
                         message: format!(
                             "Claude {}: {}",
@@ -1953,6 +1969,11 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
+                let can_suggest = frame["parent_tool_use_id"].is_null()
+                    && frame["is_error"] != true
+                    && frame["subtype"] == "success"
+                    && self.interruption.is_none()
+                    && self.started_generation == Some(self.attention_generation);
                 for denial in frame["permission_denials"]
                     .as_array()
                     .into_iter()
@@ -2004,6 +2025,12 @@ impl Adapter for Claude {
                     }
                 }
                 self.attention_generation = self.attention_generation.wrapping_add(1);
+                self.suggestion_turn = (can_suggest && self.pending.is_empty()).then(|| {
+                    (
+                        self.attention_generation,
+                        format!("claude:{}", self.attention_generation),
+                    )
+                });
                 // Background agents have their own status. They must not
                 // prevent new input once the main turn has ended.
                 let busy = !self.pending.is_empty();
@@ -2155,6 +2182,25 @@ impl Adapter for Claude {
                     step.events.push(Event::Status {
                         busy: self.busy,
                         detail,
+                    });
+                }
+            }
+            "prompt_suggestion" => {
+                // Claude's SDK emits at most one suggestion after each result,
+                // with session identity but no turn ID. Accept only the current
+                // result-delimited idle generation; new input invalidates it.
+                if !self.busy
+                    && frame["session_id"].as_str() == self.session_id.as_deref()
+                    && self.session_id.is_some()
+                    && let Some((generation, source)) = self.suggestion_turn.take()
+                    && generation == self.attention_generation
+                    && let Some(text) = frame["suggestion"].as_str()
+                    && chat::PromptSuggestion::valid_text(text)
+                {
+                    step.events.push(Event::PromptSuggestion {
+                        session_id: self.session_id.clone().unwrap(),
+                        source,
+                        text: text.into(),
                     });
                 }
             }
@@ -4517,6 +4563,86 @@ mod tests {
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
+
+    #[test]
+    fn prompt_suggestion_follows_only_current_completed_session_without_transcript_items() {
+        let mut adapter = Claude {
+            session_id: Some("exact-session".into()),
+            ready: true,
+            ..Default::default()
+        };
+        adapter.start_turn(&mut Step::default());
+        adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false,"uuid":"result"}))
+            .unwrap();
+        let suggestion = |session: &str| json!({"type":"prompt_suggestion","session_id":session,"uuid":"suggestion","suggestion":"Run the focused tests"});
+        assert!(
+            adapter
+                .receive(suggestion("other-session"))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let accepted = adapter.receive(suggestion("exact-session")).unwrap();
+        assert!(
+            matches!(accepted.events.as_slice(), [Event::PromptSuggestion { text, .. }] if text == "Run the focused tests")
+        );
+        assert!(accepted.writes.is_empty());
+        assert!(
+            adapter
+                .receive(suggestion("exact-session"))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        adapter.start_turn(&mut Step::default());
+        adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        adapter
+            .command(Command::Prompt {
+                text: "My own next prompt".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(
+            !adapter
+                .receive(suggestion("exact-session"))
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PromptSuggestion { .. }))
+        );
+    }
+
+    #[test]
+    fn legacy_initialize_retries_optional_suggestions_once_without_weakening_other_options() {
+        let mut adapter = Claude::default();
+        let first = adapter.initialize().unwrap();
+        assert_eq!(first.writes[0]["request"]["promptSuggestions"], true);
+        let failed = |id: Value| json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"Unsupported initialize option"}});
+        let retry = adapter
+            .receive(failed(first.writes[0]["request_id"].clone()))
+            .unwrap();
+        assert!(retry.events.is_empty());
+        assert!(
+            retry.writes[0]["request"]
+                .get("promptSuggestions")
+                .is_none()
+        );
+        assert_eq!(retry.writes[0]["request"]["forwardSubagentText"], true);
+        let final_error = adapter
+            .receive(failed(retry.writes[0]["request_id"].clone()))
+            .unwrap();
+        assert!(final_error.writes.is_empty());
+        assert!(
+            final_error
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: true, .. }))
+        );
+    }
 
     #[test]
     fn permission_settings_changes_wait_for_provider_confirmation_and_preserve_reasoning() {

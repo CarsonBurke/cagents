@@ -2348,6 +2348,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
         }
         Event::TurnStarted => {
+            state.prompt_suggestion = None;
             state.turn_generation = state.turn_generation.wrapping_add(1);
             state.finished_at = None;
         }
@@ -2382,6 +2383,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Forked(id) => state.forked = Some(id),
         Event::Reset { reason } => {
             state.finished_at = None;
+            state.prompt_suggestion = None;
             state.branch_points.clear();
             state.forked = None;
             state.interrupt_mode = None;
@@ -2407,6 +2409,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.permission_denials.clear();
         }
         Event::Session { id, title } => {
+            if state.session_id.as_deref() != Some(id.as_str()) {
+                state.prompt_suggestion = None;
+            }
             state.session_id = Some(id);
             state.title = title;
         }
@@ -2672,6 +2677,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::RequestResolved { id } => state.requests.retain(|request| request.id != id),
         Event::Waiting(waiting) => state.waiting = waiting,
         Event::Status { busy, detail } => {
+            if busy {
+                state.prompt_suggestion = None;
+            }
             state.busy = busy;
             state.detail = detail;
         }
@@ -2692,23 +2700,49 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 state.usage.cost_microusd = value.cost_microusd;
             }
         }
+        Event::PromptSuggestion {
+            session_id,
+            source,
+            text,
+        } => {
+            if !state.busy
+                && !state.exited
+                && state.session_id.as_deref() == Some(session_id.as_str())
+                && crate::chat::PromptSuggestion::valid_text(&text)
+            {
+                state.prompt_suggestion = Some(crate::chat::PromptSuggestion {
+                    session_id,
+                    source,
+                    turn_generation: state.turn_generation,
+                    text,
+                });
+            }
+        }
+        Event::PromptSuggestionCleared => state.prompt_suggestion = None,
         Event::Composer { text } => state.composer = Some(text),
         Event::OpenUrl { url, instructions } => state.open_url = Some((url, instructions)),
         Event::Error { message, fatal } => {
             state.error = Some(message);
             if fatal {
+                state.prompt_suggestion = None;
                 state.busy = false;
                 state.history_loading = false;
             }
         }
         Event::Exited { .. } => {
+            state.prompt_suggestion = None;
             state.exited = true;
             state.waiting = false;
             state.busy = false;
             state.ready = false;
             state.history_loading = false;
         }
-        Event::Ready(ready) => state.ready = ready,
+        Event::Ready(ready) => {
+            if !ready {
+                state.prompt_suggestion = None;
+            }
+            state.ready = ready;
+        }
     }
     if child_changed {
         trim_subagents(state);
@@ -2776,6 +2810,62 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
+        let mut state = Snapshot {
+            session_id: Some("session".into()),
+            ready: true,
+            ..Default::default()
+        };
+        let mut indices = BTreeMap::new();
+        let suggestion = || Event::PromptSuggestion {
+            session_id: "session".into(),
+            source: "turn-one".into(),
+            text: "Run tests".into(),
+        };
+        apply_event(&mut state, &mut indices, suggestion());
+        assert_eq!(state.prompt_suggestion.as_ref().unwrap().turn_generation, 0);
+        assert!(state.items.is_empty());
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert!(state.prompt_suggestion.is_none());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Status {
+                busy: true,
+                detail: "working".into(),
+            },
+        );
+        apply_event(&mut state, &mut indices, suggestion());
+        assert!(state.prompt_suggestion.is_none());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Status {
+                busy: false,
+                detail: "idle".into(),
+            },
+        );
+        apply_event(&mut state, &mut indices, suggestion());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "different".into(),
+                title: None,
+            },
+        );
+        assert!(state.prompt_suggestion.is_none());
+        apply_event(&mut state, &mut indices, suggestion());
+        assert!(state.prompt_suggestion.is_none());
+        state.session_id = Some("session".into());
+        apply_event(&mut state, &mut indices, suggestion());
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        assert!(state.prompt_suggestion.is_none());
+        apply_event(&mut state, &mut indices, suggestion());
+        assert!(state.prompt_suggestion.is_none());
+    }
+
     #[test]
     fn incomplete_stdio_frames_only_scan_the_new_suffix() {
         let mut bytes = Vec::new();

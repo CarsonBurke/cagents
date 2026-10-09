@@ -1672,6 +1672,20 @@ impl Runtime {
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
         let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let suggestion = if available && !transitioning {
+            self.prompt_suggestion()
+        } else {
+            None
+        };
+        let key_suggestion = suggestion.cloned();
+        let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
+        let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
+            widget::text("Tab to use suggestion")
+                .size(design::TEXT_CAPTION)
+                .into()
+        } else {
+            iced::widget::Space::new().height(0).into()
+        };
         let editor: Element<'_, Message> = if transitioning {
             // The reservation belongs inside the scroll viewport. An inset on
             // the outer container moves the viewport itself, and the thumb
@@ -1745,6 +1759,13 @@ impl Runtime {
                         )
                     {
                         return Some(text_editor::Binding::Custom(action(choice)));
+                    }
+                    if let Some(suggestion) = &key_suggestion
+                        && matches!(completion_key(&press), Some(CompletionKey::Choose))
+                    {
+                        return Some(text_editor::Binding::Custom(action(
+                            Action::AcceptSuggestion(target, suggestion.clone()),
+                        )));
                     }
                     if snapshot.busy
                         && available
@@ -1941,6 +1962,7 @@ impl Runtime {
                     .spacing(step::GAP_XS)
                     .into(),
                     editor,
+                    suggestion_hint,
                     widget::container(toolbar)
                         .padding(
                             iced::Padding::from([0.0, COMPOSER_TOOLBAR_PADDING]).bottom(space::S),
