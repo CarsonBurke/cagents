@@ -326,8 +326,8 @@ fn settings_category_controls<'a>(
                 "The build you are running and how it stays current.",
                 vec![
                     setting_field(
-                        "Version",
-                        "The terminal service and every window run this same build.",
+                        "Window version",
+                        "The application build running in this window.",
                         design::body(version).into(),
                     ),
                     setting_field(
