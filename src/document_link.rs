@@ -49,6 +49,9 @@ pub fn resolve(source: &Path, target: &str) -> Result<DocumentLink, String> {
             let path = url
                 .to_file_path()
                 .map_err(|()| "The link is not a local file path")?;
+            if path.as_os_str().as_encoded_bytes().contains(&0) {
+                return Err("The link contains an invalid file path".into());
+            }
             // Decode fragments using the URL path decoder, without giving '#' or
             // '?' within the heading a second interpretation as URL syntax.
             let fragment = url.fragment().map(|fragment| {

@@ -314,6 +314,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nul_file_links_refuse_editor_creation_and_preserve_workspace_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.txt");
+        std::fs::write(&valid, "existing editor content").unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.editor_auto_save = false;
+        app.workspace.resize_viewport(1200.0);
+        let task = app.open_document_link(None, Url::from_file_path(&valid).unwrap().as_str());
+        settle(&mut app, task).await;
+        let editor = app.workspace.focused().unwrap();
+        let before = Arc::clone(&app.durable);
+        let store = crate::persistence::StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("owned-invalid-link-proof"),
+        )
+        .unwrap();
+        let empty = std::collections::BTreeMap::new();
+        let committed = store
+            .save_workspace(
+                &before,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &empty,
+                },
+            )
+            .unwrap();
+        let task = app.open_document_link(None, "file:///owned/bad%00.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.cards().len(), 1);
+        assert_eq!(app.workspace.focused(), Some(editor));
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("existing editor content")
+        );
+        assert_eq!(app.durable, before);
+        let committed = store
+            .save_workspace(
+                &app.durable,
+                crate::persistence::SnapshotBase {
+                    workspace: committed.generation,
+                    cards: &committed.card_generations,
+                },
+            )
+            .unwrap();
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(saved.generation, committed.generation);
+        assert_eq!(saved.cards.len(), 1);
+        let CardKind::Repository(view) = &saved.cards[0].kind else {
+            panic!("existing editor missing")
+        };
+        assert_eq!(view.selected_file.as_deref(), Some(Path::new("valid.txt")));
+    }
+
+    #[tokio::test]
+    async fn non_utf8_file_link_persists_and_restores_the_exact_selected_file() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"byte-\xff.txt".to_vec());
+        let path = directory.path().join(&name);
+        std::fs::write(&path, "owned raw filename content").unwrap();
+        let target = Url::from_file_path(&path).unwrap().to_string();
+        assert!(target.contains("%FF"));
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.editor_auto_save = false;
+        app.workspace.resize_viewport(1200.0);
+        let store = crate::persistence::StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("owned-byte-path-proof"),
+        )
+        .unwrap();
+        let empty = std::collections::BTreeMap::new();
+        let before = store
+            .save_workspace(
+                &app.durable,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &empty,
+                },
+            )
+            .unwrap();
+        let task = app.open_document_link(None, &target);
+        settle(&mut app, task).await;
+        let editor = app
+            .workspace
+            .focused()
+            .expect("real file link opened an editor");
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("owned raw filename content")
+        );
+        assert_eq!(
+            runtime(&app, editor).descriptor.selected_file.as_deref(),
+            Some(Path::new(&name))
+        );
+        let result = store.save_workspace(
+            &app.durable,
+            crate::persistence::SnapshotBase {
+                workspace: before.generation,
+                cards: &before.card_generations,
+            },
+        );
+        let committed =
+            result.expect("raw selected filenames must not reject the workspace snapshot");
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(saved.generation, committed.generation);
+        let CardKind::Repository(view) = saved
+            .cards
+            .iter()
+            .find(|card| card.id == editor)
+            .unwrap()
+            .kind
+            .clone()
+        else {
+            panic!("saved editor missing")
+        };
+        assert_eq!(view.selected_file.as_deref(), Some(Path::new(&name)));
+        let mut restored = RepositoryRuntime::new(view);
+        let task = repository_task(restored.initial_load(editor));
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(restored)));
+        settle(&mut app, task).await;
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("owned raw filename content")
+        );
+        println!("actual nonUTF8 file link persisted and restored byte-exact selected_file");
+    }
+
+    #[tokio::test]
     async fn file_links_open_source_beside_the_terminal_reuse_and_restore_the_file() {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("report one.html");
