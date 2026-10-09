@@ -37,6 +37,16 @@ recognisable.
 - `packaging/io.github.cagents.ceditor.svg` is the ceditor icon, embedded in
   the UI directly.
 
+From the repository root, regenerate the PNG with librsvg's `rsvg-convert`:
+
+```sh
+rsvg-convert --width 128 --height 128 \
+  --output packaging/dev.cagents.Cagents.png packaging/dev.cagents.Cagents.svg
+```
+
+Keep the transparent background; the window and tray loaders expect a 128×128
+RGBA PNG.
+
 ## Alternates
 
 Kept for reference; not shipped.
