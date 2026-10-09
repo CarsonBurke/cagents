@@ -33,7 +33,7 @@ mod navigation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -610,8 +610,11 @@ fn migrate(db: &Connection) -> Result<(), String> {
         views::migrate(db)?;
     }
     if version < 9 {
-        db.pragma_update(None, "user_version", SCHEMA_VERSION)
+        db.pragma_update(None, "user_version", 9)
             .map_err(|error| error.to_string())?;
+    }
+    if version < 10 {
+        execution::migrate_names(db)?;
     }
     Ok(())
 }

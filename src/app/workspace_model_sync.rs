@@ -1276,6 +1276,7 @@ mod tests {
             },
         };
         let mut agent = Agent {
+            name: None,
             id: crate::model::AgentId::new(),
             origin: Origin::User,
             spec: Spec {

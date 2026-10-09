@@ -273,6 +273,7 @@ done
         &host,
         &Authority::default(),
         Submit {
+            name: None,
             destination: Destination::Existing(accepted.agent.id),
             prompt: "follow-up".into(),
             idempotency_key: "omp-followup".into(),
@@ -639,6 +640,7 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
         .submit_agent(
             &owner,
             &Submit {
+                name: None,
                 destination: Destination::Existing(accepted.agent.id),
                 prompt: "automatic prompt must not run".into(),
                 idempotency_key: "after-takeover".into(),
@@ -821,6 +823,7 @@ fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     });
     state.install_model(registry);
     let request = Submit {
+        name: None,
         destination: Destination::New(Spec {
             provider: Provider::Claude,
             account: None,
@@ -1328,6 +1331,7 @@ fn unavailable_console_keeps_failed_idle_provider_bound_and_explicitly_closeable
         &host,
         &Authority::default(),
         Submit {
+            name: None,
             destination: Destination::Existing(agent.id),
             prompt: "A follow-up".into(),
             idempotency_key: "second".into(),
@@ -1640,6 +1644,8 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     assert_eq!((me.id, me.relation), (child_session, Relation::Myself));
     assert_eq!(me.project.as_deref(), Some(key.as_path()));
     assert_eq!(me.project_name.as_deref(), Some("Service fixture"));
+    assert_eq!(me.channel, Some(child.agent.channel));
+    assert_eq!(me.channel_repository.as_deref(), Some(key.as_path()));
     let delegation = me.delegation.unwrap();
     assert_eq!(
         delegation.owner,
@@ -1682,6 +1688,57 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
             Operation::Directory(Scope::Project(elsewhere))
         )
         .is_err()
+    );
+
+    // Shared pane membership overrides the original delegated placement.
+    // The registry refuses a duplicate placement of this same resource.
+    let HostedSession::Chat(parent_source) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(parent.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        panic!("chat");
+    };
+    let pane = |id| crate::workspace_model::views::Pane {
+        id,
+        title: "Parent".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: crate::model::CardKind::Chat(parent_source.clone()),
+        scope: None,
+    };
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: child.agent.channel.into(),
+            panes: vec![pane(crate::model::CardId::new())],
+            closed: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        read(&parent_authority, Scope::All).caller.unwrap().channel,
+        Some(child.agent.channel)
+    );
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: parent.agent.channel.into(),
+            panes: vec![pane(crate::model::CardId::new())],
+            closed: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        read(&parent_authority, Scope::All).caller.unwrap().channel,
+        Some(child.agent.channel)
     );
 
     // Seeing a session confers no control over it.
@@ -1844,6 +1901,7 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
         &host,
         &owner,
         Submit {
+            name: None,
             destination: Destination::Existing(agent),
             prompt: "ASK_PERMISSION again".into(),
             idempotency_key: "second".into(),

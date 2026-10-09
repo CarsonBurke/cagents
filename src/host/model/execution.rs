@@ -62,6 +62,20 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+/// Legacy records omit the name, so SQLite's NULL uniqueness semantics allow
+/// them all. The index also fences writes outside the acceptance helper.
+pub(super) fn migrate_names(db: &Connection) -> Result<(), String> {
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS agents_by_name
+        ON agents(origin, json_extract(record, '$.name')) WHERE closed = 0;
+        PRAGMA user_version = 10;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
 impl Registry {
     /// Accepted work can be queued behind the daemon's update write gate before
     /// it owns a hosted actor. Do not lose it from impact merely because there
@@ -749,6 +763,15 @@ impl Registry {
                 if children >= MAX_CHILDREN {
                     return Err("Agent child limit reached; close an existing child first".into());
                 }
+                if let Some(name) = &request.name {
+                    let used: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agents WHERE origin=?1 AND closed=0 AND json_extract(record, '$.name')=?2)",
+                        params![origin_json, name], |row| row.get(0),
+                    ).map_err(|error| error.to_string())?;
+                    if used {
+                        return Err(format!("You already have an open agent named {name}"));
+                    }
+                }
                 let repository = repository_key(&spec.target.repository)?;
                 let exists: bool = tx
                     .query_row(
@@ -776,6 +799,7 @@ impl Registry {
                     }
                 };
                 let agent = Agent {
+                    name: request.name.clone(),
                     id: AgentId::new(),
                     origin: origin.clone(),
                     spec: spec.clone(),
@@ -1640,6 +1664,7 @@ mod tests {
             })
             .unwrap();
         let request = Submit {
+            name: None,
             destination: Destination::New(Spec {
                 provider: Provider::Claude,
                 account: None,
@@ -1657,6 +1682,116 @@ mod tests {
             idempotency_key: "first-request".into(),
         };
         (registry, directory, request)
+    }
+
+    #[test]
+    fn legacy_registry_migrates_names_and_enforces_uniqueness_at_the_store() {
+        let (mut registry, directory, request) = fixture();
+        let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let mut legacy = serde_json::to_value(&first.agent).unwrap();
+        legacy.as_object_mut().unwrap().remove("name");
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![first.agent.id.to_string(), legacy.to_string()],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute_batch("DROP INDEX agents_by_name; PRAGMA user_version=9;")
+            .unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agent(first.agent.id).unwrap().name, None);
+        let mut named = request;
+        named.name = Some("reviewer".into());
+        named.idempotency_key = "named".into();
+        let named = registry.submit_agent(&Origin::User, &named, 2).unwrap();
+        let mut changed = first.agent;
+        changed.name = named.agent.name;
+        assert!(
+            registry
+                .db
+                .execute(
+                    "UPDATE agents SET record=?2 WHERE id=?1",
+                    params![changed.id.to_string(), encode(&changed).unwrap()]
+                )
+                .is_err()
+        );
+        assert_eq!(registry.agent(changed.id).unwrap().name, None);
+    }
+
+    #[test]
+    fn invalid_names_are_rejected_before_acceptance() {
+        let (mut registry, _directory, mut request) = fixture();
+        for name in [
+            "",
+            "Reviewer",
+            "1reviewer",
+            "two words",
+            "équipe",
+            "../reviewer",
+            "abcdef00-0000-4000-8000-000000000001",
+            &"x".repeat(65),
+        ] {
+            request.name = Some(name.into());
+            assert!(
+                registry.submit_agent(&Origin::User, &request, 1).is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(registry.agents(None).unwrap().is_empty());
+        request.name = Some("reviewer-2_api".into());
+        assert!(registry.submit_agent(&Origin::User, &request, 2).is_ok());
+    }
+
+    #[test]
+    fn names_are_durable_owner_scoped_retry_stable_and_reusable_after_close() {
+        let (mut registry, directory, mut request) = fixture();
+        request.name = Some("reviewer".into());
+        let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert_eq!(first.agent.name.as_deref(), Some("reviewer"));
+        assert_eq!(
+            registry
+                .submit_agent(&Origin::User, &request, 2)
+                .unwrap()
+                .agent
+                .id,
+            first.agent.id
+        );
+        request.idempotency_key = "second".into();
+        let before = registry.model().unwrap();
+        assert!(
+            registry
+                .submit_agent(&Origin::User, &request, 3)
+                .unwrap_err()
+                .contains("named reviewer")
+        );
+        assert_eq!(
+            registry.model().unwrap(),
+            before,
+            "name rejection reserves no channel or capacity"
+        );
+        let other = Origin::Automation {
+            id: uuid::Uuid::new_v4(),
+        };
+        assert!(registry.submit_agent(&other, &request, 4).is_ok());
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agent(first.agent.id).unwrap().name, request.name);
+        assert!(registry.submit_agent(&Origin::User, &request, 5).is_err());
+        registry.interrupt_unproven_agent_runs(6).unwrap();
+        registry.close_agent(&Origin::User, first.agent.id).unwrap();
+        let replacement = registry.submit_agent(&Origin::User, &request, 7).unwrap();
+        assert_ne!(replacement.agent.id, first.agent.id);
+        assert_eq!(replacement.agent.name, request.name);
+        let mut legacy = serde_json::to_value(&request).unwrap();
+        legacy.as_object_mut().unwrap().remove("name");
+        assert_eq!(serde_json::from_value::<Submit>(legacy).unwrap().name, None);
+        let mut legacy = serde_json::to_value(&first.agent).unwrap();
+        legacy.as_object_mut().unwrap().remove("name");
+        assert_eq!(serde_json::from_value::<Agent>(legacy).unwrap().name, None);
     }
 
     #[test]
@@ -1850,6 +1985,7 @@ mod tests {
             )
             .unwrap();
         let followup = Submit {
+            name: None,
             destination: Destination::Existing(accepted.agent.id),
             prompt: "Next".into(),
             idempotency_key: "next".into(),

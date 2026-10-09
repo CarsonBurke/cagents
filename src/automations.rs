@@ -201,6 +201,7 @@ impl Definition {
             ));
         }
         agent_execution::Submit {
+            name: None,
             destination: agent_execution::Destination::New(self.agent.clone()),
             prompt: self.prompt.clone(),
             idempotency_key: "validate-automation".into(),

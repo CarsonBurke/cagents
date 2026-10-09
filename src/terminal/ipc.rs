@@ -125,7 +125,8 @@ use crate::{
 /// Version 60 stops one subagent, says which subagents run in the background
 /// and whether the provider's interrupt stops them, reports a stopped one,
 /// and carries process-scoped turn generations for cancellation confirmation.
-pub const PROTOCOL_VERSION: u16 = 60;
+/// Version 61 carries owner-scoped agent names and directory channel membership.
+pub const PROTOCOL_VERSION: u16 = 61;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

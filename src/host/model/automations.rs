@@ -1335,6 +1335,7 @@ fn accept_firing(
         Destination::New(spec)
     };
     let request = Submit {
+        name: None,
         destination,
         prompt: definition.prompt.clone(),
         idempotency_key: key.to_owned(),
