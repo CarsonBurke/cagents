@@ -351,6 +351,11 @@ enum ConversionCheckpoint {
     },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
+    TerminalOwnershipRecovery {
+        snapshot: Arc<WorkspaceState>,
+        recovery: crate::persistence::TerminalPaneAdoption,
+        reply: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    },
 }
 
 #[derive(Debug)]
@@ -614,6 +619,43 @@ impl SessionRuntime {
                 });
             changed.notify_one();
         }
+    }
+
+    /// Queue a reviewed ownership repair after every already-offered write.
+    /// The receipt succeeds only after the full snapshot commits; neither
+    /// enqueueing nor a failed attempt retires its save quarantine.
+    pub fn recover_terminal_ownership(
+        &self,
+        snapshot: Arc<WorkspaceState>,
+        recovery: crate::persistence::TerminalPaneAdoption,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
+        }
+        queue.ordered_identities = true;
+        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        }
+        if let Some(previous) = queue.latest.take() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::Snapshot(previous));
+        }
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                snapshot,
+                recovery,
+                reply,
+            });
+        changed.notify_one();
+        Ok(receiver)
     }
 
     pub fn save_project(&self, project: ProjectState) {
@@ -1268,6 +1310,16 @@ impl Quarantine {
 }
 
 trait SessionStore {
+    fn recover_terminal_ownership(
+        &self,
+        _state: &WorkspaceState,
+        _base: SnapshotBase<'_>,
+        _recovery: crate::persistence::TerminalPaneAdoption,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support terminal ownership recovery".into(),
+        ))
+    }
     fn rebind_chat_upgrade(
         &self,
         _card_id: CardId,
@@ -1349,6 +1401,14 @@ trait SessionStore {
 }
 
 impl SessionStore for StateStore {
+    fn recover_terminal_ownership(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        recovery: crate::persistence::TerminalPaneAdoption,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
     fn rebind_chat_upgrade(
         &self,
         card_id: CardId,
@@ -1438,6 +1498,14 @@ impl SessionStore for StateStore {
 }
 
 impl SessionStore for Arc<StateStore> {
+    fn recover_terminal_ownership(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        recovery: crate::persistence::TerminalPaneAdoption,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
     fn rebind_chat_upgrade(
         &self,
         card_id: CardId,
@@ -1624,7 +1692,10 @@ impl PendingWrites {
             .iter()
             .find_map(|checkpoint| match checkpoint {
                 ConversionCheckpoint::Snapshot(snapshot)
-                | ConversionCheckpoint::PaneAdoptions { snapshot, .. } => Some(snapshot.id),
+                | ConversionCheckpoint::PaneAdoptions { snapshot, .. }
+                | ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, .. } => {
+                    Some(snapshot.id)
+                }
                 ConversionCheckpoint::IdentityReplacement(_)
                 | ConversionCheckpoint::ChatRecovery(_) => None,
             })
@@ -1701,6 +1772,21 @@ impl PendingWrites {
         Ok(())
     }
 
+    fn translate_chat_rebindings(&self, snapshot: &mut Arc<WorkspaceState>) {
+        let needs_translation = |state: &crate::model::CardState| {
+            self.chat_rebindings.get(&state.id).is_some_and(
+                |(source, _)| matches!(&state.kind, CardKind::Chat(session) if session == source),
+            )
+        };
+        if !self.chat_rebindings.is_empty() && snapshot.cards.iter().any(needs_translation) {
+            for state in &mut Arc::make_mut(snapshot).cards {
+                if needs_translation(state) {
+                    state.kind = CardKind::Chat(self.chat_rebindings[&state.id].1.clone());
+                }
+            }
+        }
+    }
+
     /// Writes the conversion checkpoints in order, then the coalesced
     /// autosave, stopping at the first write that failed for a reason that may
     /// clear. That write goes back where it came from, so neither a retry nor
@@ -1734,6 +1820,58 @@ impl PendingWrites {
             };
             match checkpoint {
                 ConversionCheckpoint::PaneAdoptions { .. } => unreachable!(),
+                ConversionCheckpoint::TerminalOwnershipRecovery {
+                    mut snapshot,
+                    recovery,
+                    reply,
+                } => {
+                    self.translate_chat_rebindings(&mut snapshot);
+                    let refused = self.quarantine.workspace.as_ref().filter(|(state, card, _)| {
+                        state.id == snapshot.id
+                            && *card == Some(recovery.canonical)
+                            && state.cards.iter().any(|card| {
+                                card.id == recovery.canonical
+                                    && card.existence.is_open()
+                                    && matches!(&card.kind, CardKind::Terminal(session) if session.id == recovery.terminal)
+                            })
+                    }).map(|(state, _, _)| Arc::clone(state));
+                    let result = match refused {
+                        None => Err("The exact refused terminal pane changed; review the current save notice.".into()),
+                        Some(refused) => match store.recover_terminal_ownership(
+                            &snapshot,
+                            SnapshotBase {
+                                workspace: self.workspace_generation,
+                                cards: &self.card_generations,
+                            },
+                            recovery,
+                        ) {
+                            Ok(commit) => {
+                                self.workspace_generation = commit.generation;
+                                self.card_generations = commit.card_generations;
+                                // An explicit Retry may have rearmed this old
+                                // refused snapshot while the repair was queued.
+                                // Retire only that offer, preserving a newer
+                                // autosave that arrived during the repair.
+                                if self.workspace.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &refused)) {
+                                    self.workspace = None;
+                                }
+                                self.quarantine.snapshot_landed(&snapshot);
+                                Ok(())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        },
+                    };
+                    if result.is_err() {
+                        // Preserve the work captured by the reviewed action,
+                        // but let ordinary identity validation guard every
+                        // later retry. Only a new reviewed action can transfer.
+                        self.conversions
+                            .push_front(ConversionCheckpoint::Snapshot(snapshot));
+                    }
+                    // A failed reviewed action is one-shot. It cannot become
+                    // an unreviewed later transfer after an I/O retry.
+                    let _ = reply.send(result);
+                }
                 ConversionCheckpoint::ChatRecovery(recovery) => {
                     let result = match recovery.kind {
                         ChatRecoveryKind::Account => store.rebind_chat_account(
@@ -1773,21 +1911,7 @@ impl PendingWrites {
                     }
                 }
                 ConversionCheckpoint::Snapshot(mut snapshot) => {
-                    let needs_translation = |state: &crate::model::CardState| {
-                        self.chat_rebindings.get(&state.id).is_some_and(|(source, _)| {
-                            matches!(&state.kind, CardKind::Chat(session) if session == source)
-                        })
-                    };
-                    if !self.chat_rebindings.is_empty()
-                        && snapshot.cards.iter().any(needs_translation)
-                    {
-                        for state in &mut Arc::make_mut(&mut snapshot).cards {
-                            if needs_translation(state) {
-                                state.kind =
-                                    CardKind::Chat(self.chat_rebindings[&state.id].1.clone());
-                            }
-                        }
-                    }
+                    self.translate_chat_rebindings(&mut snapshot);
                     match store.save_workspace_with_terminal_panes(
                         &snapshot,
                         SnapshotBase {
@@ -1829,6 +1953,20 @@ impl PendingWrites {
         }
     }
 
+    fn reject_queued_terminal_recoveries(&mut self, error: &StoreError) {
+        self.conversions = std::mem::take(&mut self.conversions).into_iter().map(|checkpoint| {
+            match checkpoint {
+                ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, reply, .. } => {
+                    let _ = reply.send(Err(format!(
+                        "Recovery could not begin because an earlier session write failed: {error}. Retry save, then review recovery again."
+                    )));
+                    ConversionCheckpoint::Snapshot(snapshot)
+                }
+                other => other,
+            }
+        }).collect();
+    }
+
     /// Applies everything still pending. A write that failed for a reason that
     /// may clear stays queued for a later attempt and is returned; one storage
     /// refused by construction moves to the quarantine instead, so it cannot
@@ -1855,6 +1993,9 @@ impl PendingWrites {
             && let Err(error) = self.flush_checkpoints(store)
         {
             errors.push(error);
+        }
+        if let Some(error) = errors.first() {
+            self.reject_queued_terminal_recoveries(error);
         }
 
         for (id, mut project) in std::mem::take(&mut self.projects) {
@@ -2474,7 +2615,7 @@ mod tests {
 
     use crate::model::{
         CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, WorkspaceId,
+        TerminalContinuity, TerminalId, TerminalSession, Tombstone, WorkspaceId,
     };
 
     use super::*;
@@ -4498,6 +4639,276 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|project| project.id == unrelated.id)
+        );
+    }
+
+    #[test]
+    fn ownership_recovery_unblocks_the_actual_update_flush_without_losing_unsaved_work() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ownership.sqlite3");
+        let boot = BootId::new("ownership-recovery");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 773,
+                reason: Some("closed by user".into()),
+            },
+        };
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        let mut live = state.cards[0].clone();
+        live.id = CardId::new();
+        live.title = "Unsaved terminal".into();
+        live.existence = Existence::Open;
+        let CardKind::Terminal(terminal) = &live.kind else {
+            unreachable!()
+        };
+        let recovery = crate::persistence::TerminalPaneAdoption {
+            alias: state.cards[0].id,
+            canonical: live.id,
+            terminal: terminal.id,
+        };
+        state.focused = Some(live.id);
+        state.chat_drafts.insert(live.id, "refused draft".into());
+        state.cards.push(live);
+        runtime.snapshot(Arc::new(state.clone()));
+        assert!(
+            runtime
+                .flush(timeout)
+                .unwrap_err()
+                .contains("refused part of the window")
+        );
+        let refused = latest_health(&health).quarantined;
+        assert_eq!(
+            refused[0].subject,
+            WriteSubject::Workspace {
+                card: Some(recovery.canonical)
+            }
+        );
+        assert!(runtime.retry_save());
+        assert!(runtime.flush(timeout).is_err());
+        assert_eq!(latest_health(&health).quarantined, refused);
+        state.chat_drafts.insert(
+            recovery.canonical,
+            "latest unsaved draft\nkept exactly".into(),
+        );
+        let receipt = runtime
+            .recover_terminal_ownership(Arc::new(state.clone()), recovery)
+            .unwrap();
+        receipt.recv_timeout(timeout).unwrap().unwrap();
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.shutdown();
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+        let restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.chat_drafts, state.chat_drafts);
+        assert_eq!(restored.focused, state.focused);
+        assert_eq!(
+            store.load_card(recovery.alias, None).unwrap().unwrap().kind,
+            state.cards[0].kind
+        );
+        assert!(
+            store
+                .load_card(recovery.canonical, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+    }
+
+    fn refused_ownership_writes(
+        store: &StateStore,
+    ) -> (
+        PendingWrites,
+        Arc<WorkspaceState>,
+        crate::persistence::TerminalPaneAdoption,
+    ) {
+        let mut writes = empty_writes();
+        let mut state = workspace();
+        writes.workspace = Some(Arc::new(state.clone()));
+        assert!(writes.flush(store).is_empty());
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 773,
+                reason: None,
+            },
+        };
+        writes.workspace = Some(Arc::new(state.clone()));
+        assert!(writes.flush(store).is_empty());
+        let mut live = state.cards[0].clone();
+        live.id = CardId::new();
+        live.existence = Existence::Open;
+        let CardKind::Terminal(terminal) = &live.kind else {
+            unreachable!()
+        };
+        let recovery = crate::persistence::TerminalPaneAdoption {
+            alias: state.cards[0].id,
+            canonical: live.id,
+            terminal: terminal.id,
+        };
+        state.focused = Some(live.id);
+        state.cards.push(live);
+        let snapshot = Arc::new(state);
+        writes.workspace = Some(Arc::clone(&snapshot));
+        assert!(writes.flush(store).is_empty());
+        assert!(writes.quarantine.workspace.is_some());
+        (writes, snapshot, recovery)
+    }
+
+    #[test]
+    fn ownership_recovery_retires_only_the_old_rearmed_snapshot_and_preserves_newer_work() {
+        for newer in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = StateStore::open(
+                directory.path().join("state.sqlite3"),
+                BootId::new("rearmed"),
+            )
+            .unwrap();
+            let (mut writes, refused, recovery) = refused_ownership_writes(&store);
+            writes.rearm_quarantine();
+            let unrelated = project("unrelated refusal");
+            writes
+                .quarantine
+                .refuse_project(unrelated, &StoreError::InvalidState("unrelated".into()));
+            let mut reviewed = (*refused).clone();
+            reviewed
+                .chat_drafts
+                .insert(recovery.canonical, "reviewed draft".into());
+            if newer {
+                let mut latest = reviewed.clone();
+                latest.chat_drafts.insert(
+                    recovery.canonical,
+                    "newer draft arriving during recovery".into(),
+                );
+                writes.workspace = Some(Arc::new(latest));
+            }
+            let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+            writes
+                .conversions
+                .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                    snapshot: Arc::new(reviewed),
+                    recovery,
+                    reply,
+                });
+            assert!(writes.flush(&store).is_empty());
+            receipt.recv().unwrap().unwrap();
+            assert!(writes.quarantine.workspace.is_none());
+            assert_eq!(writes.quarantine.projects.len(), 1);
+            let saved = store.load_workspace(refused.id, None).unwrap().unwrap();
+            assert_eq!(
+                saved.chat_drafts[&recovery.canonical],
+                if newer {
+                    "newer draft arriving during recovery"
+                } else {
+                    "reviewed draft"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_ownership_recovery_is_acknowledged_without_a_later_unreviewed_transfer() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let store = StateStore::open_with_options(
+            &path,
+            BootId::new("one-shot-recovery"),
+            crate::persistence::StoreOptions {
+                busy_timeout: Duration::from_millis(10),
+            },
+        )
+        .unwrap();
+        let (mut writes, snapshot, recovery) = refused_ownership_writes(&store);
+        let refused = writes.quarantined();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                snapshot: Arc::clone(&snapshot),
+                recovery,
+                reply,
+            });
+        assert!(!writes.flush(&store).is_empty());
+        assert!(receipt.recv().unwrap().is_err());
+        assert_eq!(writes.quarantined(), refused);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(writes.flush(&store).is_empty());
+        assert_eq!(writes.quarantined(), refused);
+        assert!(store.load_card(recovery.canonical, None).unwrap().is_none());
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                snapshot,
+                recovery,
+                reply,
+            });
+        assert!(writes.flush(&store).is_empty());
+        receipt.recv().unwrap().unwrap();
+        assert!(writes.quarantine.workspace.is_none());
+    }
+
+    #[test]
+    fn an_earlier_io_failure_rejects_queued_recovery_but_retains_its_current_work() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("queued-recovery.sqlite3");
+        let store = StateStore::open_with_options(
+            &path,
+            BootId::new("queued-recovery"),
+            crate::persistence::StoreOptions {
+                busy_timeout: Duration::from_millis(10),
+            },
+        )
+        .unwrap();
+        let (mut writes, refused, recovery) = refused_ownership_writes(&store);
+        let mut current = (*refused).clone();
+        current
+            .chat_drafts
+            .insert(recovery.canonical, "new work captured by the review".into());
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::Snapshot(Arc::clone(&refused)));
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                snapshot: Arc::new(current),
+                recovery,
+                reply,
+            });
+        assert!(!writes.flush(&store).is_empty());
+        assert!(
+            receipt
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .contains("earlier session write failed")
+        );
+        assert!(writes.conversions.iter().all(|checkpoint| !matches!(
+            checkpoint,
+            ConversionCheckpoint::TerminalOwnershipRecovery { .. }
+        )));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(writes.flush(&store).is_empty());
+        assert!(store.load_card(recovery.canonical, None).unwrap().is_none());
+        let (latest, card, _) = writes.quarantine.workspace.as_ref().unwrap();
+        assert_eq!(*card, Some(recovery.canonical));
+        assert_eq!(
+            latest.chat_drafts[&recovery.canonical],
+            "new work captured by the review"
         );
     }
 

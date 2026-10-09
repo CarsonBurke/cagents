@@ -685,6 +685,9 @@ impl Cagents {
                 if health.is_some_and(SaveHealthState::offers_retry) {
                     ring.push(Cow::Borrowed("session-save.retry"));
                 }
+                if self.refused_terminal_recovery_target().is_some() {
+                    ring.push(Cow::Borrowed("session-recovery.open"));
+                }
                 ring
             }
         }
@@ -718,6 +721,7 @@ impl Cagents {
                 // it owns Tab now: hand it the reader's real choice instead.
                 if !self.adopt_terminal_close_keyboard_nav(restore)
                     && !self.adopt_daemon_health_keyboard_nav(restore)
+                    && !self.adopt_session_recovery_keyboard_nav(restore)
                 {
                     self.core.set_keyboard_nav(restore);
                 }
@@ -1125,9 +1129,11 @@ impl Cagents {
                     ));
                 }
                 if let Some(health) = &self.save_health {
-                    notices.extend(save_health_views(health, |card| {
-                        self.card_state(card).map(|card| card.title.as_str())
-                    }));
+                    notices.extend(save_health_views(
+                        health,
+                        |card| self.card_state(card).map(|card| card.title.as_str()),
+                        self.session_recovery_action(),
+                    ));
                 }
                 let mut heading_children = vec![
                     design::heading("Application notices")
