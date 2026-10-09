@@ -182,8 +182,7 @@ fn consume(
     }
     // Publication precedes discovery retirement. Wait for that final step so
     // acknowledging cleanup also permits immediate same-session replacement.
-    let socket = registry::socket(&registry::directory(Kind::Native)?, terminal);
-    if registry::evidence(&socket, Kind::Native)?.as_ref() == Some(&receipt.record) {
+    if registry::retirement_pending(&receipt.record).map_err(|error| error.to_string())? {
         return Ok(false);
     }
     if retain {

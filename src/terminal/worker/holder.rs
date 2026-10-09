@@ -2495,12 +2495,27 @@ mod tests {
 
     #[test]
     fn a_detached_terminal_keeps_running_for_a_successor_with_its_output() {
-        let directory = tempfile::tempdir().unwrap();
-        let (socket, root) = detached(
-            "echo ready; sleep 0.2; echo while-away; read line; echo got:$line; exit 6",
-            directory.path(),
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let gate = directory.path().join("detached-ready");
+        let ready = directory.path().join("while-away-ready");
+        let script = format!(
+            "echo ready; while [ ! -f {} ]; do sleep 0.01; done; echo while-away; : > {}; read line; echo got:$line; exit 6",
+            gate.display(),
+            ready.display()
         );
-        thread::sleep(Duration::from_millis(600));
+        let (socket, root) = detached(&script, directory.path());
+        // The initial PTY read cannot accidentally consume while-away output.
+        std::fs::write(gate, b"").unwrap();
+        // The marker follows the PTY write. The holder drains readable output
+        // before answering adoption; elapsed wall time is not readiness.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not emit detached output"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(alive(root));
 
         let (exits, exited) = crossbeam_channel::bounded(1);

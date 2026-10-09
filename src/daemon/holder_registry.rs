@@ -199,11 +199,15 @@ fn read(path: &Path) -> io::Result<Record> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    read_file(file, false)
+}
+
+fn read_file(file: std::fs::File, allow_unlinked: bool) -> io::Result<Record> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != crate::daemon::current_uid()
         || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
+        || (metadata.nlink() != 1 && !(allow_unlinked && metadata.nlink() == 0))
         || metadata.len() > 4096
     {
         return Err(io::Error::new(
@@ -214,6 +218,24 @@ fn read(path: &Path) -> io::Result<Record> {
     let mut bytes = Vec::new();
     file.take(4097).read_to_end(&mut bytes)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+/// Check discovery retirement only after the caller authenticated an exact
+/// teardown receipt. A just-opened record may already be unlinked when fstat
+/// runs; reading that held inode still reports pending until the next poll.
+/// It never grants adoption authority or turns unsafe evidence into absence.
+pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
+    let path = expected.path(&directory(expected.kind).map_err(io::Error::other)?);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    read_file(file, true).map(|actual| actual == *expected)
 }
 
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
@@ -363,6 +385,41 @@ mod tests {
             bind(&link.join(endpoint.file_name().unwrap()))
                 .unwrap_err()
                 .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn authenticated_retirement_tolerates_only_a_just_unlinked_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let proof = record();
+        proof.create(directory.path()).unwrap();
+        let path = proof.path(directory.path());
+        let held = fs::File::open(&path).unwrap();
+        // Deterministically retire after open and before metadata inspection.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(held.metadata().unwrap().nlink(), 0);
+        assert_eq!(
+            read_file(held.try_clone().unwrap(), false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(read_file(held, true).unwrap(), proof);
+        proof.create(directory.path()).unwrap();
+        fs::hard_link(&path, directory.path().join("extra-link")).unwrap();
+        assert_eq!(
+            read_file(fs::File::open(&path).unwrap(), true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::remove_file(directory.path().join("extra-link")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let unsafe_held = fs::File::open(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            read_file(unsafe_held, true).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
     }
