@@ -189,6 +189,17 @@ fn join_launched(
     }
 }
 
+fn startup_halt_reason(child: Option<&ChildGuard>, cancelled: bool) -> Option<&'static str> {
+    if cancelled {
+        return Some("Provider startup cancelled");
+    }
+    match child.map(ChildGuard::observed_exit_status) {
+        Some(Ok(Some(_))) => Some("Codex server exited before opening its local socket"),
+        Some(Err(_)) => Some("Cannot verify Codex server process identity during startup"),
+        Some(Ok(None)) | None => None,
+    }
+}
+
 impl Actor {
     /// Serve the listener this conversation's own server is bringing up.
     pub(super) fn run_launched_websocket(
@@ -197,17 +208,7 @@ impl Actor {
         path: &Path,
     ) -> Result<(), String> {
         let socket = join_launched(path, || {
-            if self.stop.load(Ordering::Acquire) {
-                Some("Provider startup cancelled")
-            } else if self
-                .child
-                .as_mut()
-                .is_some_and(|child| child.0.try_wait().ok().flatten().is_some())
-            {
-                Some("Codex server exited before opening its local socket")
-            } else {
-                None
-            }
+            startup_halt_reason(self.child.as_ref(), self.stop.load(Ordering::Acquire))
         })?;
         self.serve_websocket(initial, socket)
     }
@@ -567,6 +568,40 @@ mod tests {
         });
         assert!(joined.is_ok(), "{joined:?}");
         assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn launched_server_exit_observation_preserves_original_child_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.sock");
+        let child = Process::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut provider = ChildGuard::new(child).unwrap();
+        assert_eq!(
+            join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
+            "Codex server exited before opening its local socket"
+        );
+        assert_eq!(
+            provider.observed_exit_status().unwrap().unwrap().code(),
+            Some(7)
+        );
+        provider.terminate().unwrap();
+        assert_eq!(provider.child.try_wait().unwrap().unwrap().code(), Some(7));
+
+        let child = Process::new("/bin/true").process_group(0).spawn().unwrap();
+        let mut provider = ChildGuard::new(child).unwrap();
+        provider.child.wait().unwrap();
+        assert_eq!(
+            join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
+            "Cannot verify Codex server process identity during startup"
+        );
+        assert_eq!(
+            provider.terminate().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
