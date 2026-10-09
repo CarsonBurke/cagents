@@ -361,7 +361,7 @@ pub fn run() -> Result<(), HostError> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .graceful_shutdown();
     if let Err(error) = finish_chat_shutdown(&host) {
-        tracing::error!(%error, "upgrade handoff remains unconfirmed; checkpoint retained");
+        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
         runtime_error = Some(io::Error::other(error));
     }
     for delivery in &deliveries {
@@ -392,13 +392,13 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
             state
                 .chats
                 .values()
-                .map(|record| record.handle.clone())
+                .map(|record| (record.session.clone(), record.handle.clone()))
                 .collect::<Vec<_>>(),
             state.has_committed_upgrade(),
         )
     };
-    let result = state::finish_upgrade(host);
-    for chat in chats {
+    let mut result = state::finish_upgrade(host);
+    for (session, chat) in chats {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
@@ -411,8 +411,20 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         } else {
             chat.close()
         };
-        if let Err(error) = closed {
-            tracing::warn!(%error, "provider shutdown was not confirmed");
+        match closed {
+            Ok(()) if !upgrading => {
+                // Ordinary shutdown proved this exact provider stopped. Retire
+                // its delegated record before a new daemon can resume the UI
+                // descriptor with another proof; absence alone cannot do this.
+                if let Err(error) = agent_execution::retired(host, &session) {
+                    tracing::warn!(%error, "delegated provider retirement was not saved");
+                    if result.is_ok() {
+                        result = Err(error);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "provider shutdown was not confirmed"),
+            Ok(()) => {}
         }
     }
     result
