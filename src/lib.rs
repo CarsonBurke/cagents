@@ -62,6 +62,7 @@ pub mod interaction;
 pub mod latency_fixture;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
+pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;

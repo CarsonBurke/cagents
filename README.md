@@ -39,6 +39,9 @@ you close the window or restart the UI.
   channels with human-readable or JSON output. [Hosted agent execution](docs/agent-execution.md)
   submits durable prompts and reads structured results without an open window,
   and lets sessions message one another.
+- **Linear CLI.** Read, search, create, and update tickets with `cagents linear`,
+  attach PR links, and link each worktree's ticket for `--current` commands.
+  Uses a personal API key and works without an open window.
 
 ## Install
 

@@ -25,6 +25,8 @@ mod sessions;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{AskArgs, InboxArgs, ReplyArgs, SendArgs};
+mod linear;
+pub use linear::LinearCommand;
 
 use crate::{
     agent_execution::Authority,
@@ -87,6 +89,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Read and update Linear tickets, or link a ticket to this Git worktree.
+    Linear(LinearCommand),
     /// Show this session, its parent and agents, and peers in the same checkout.
     Whoami,
     /// List live agent sessions in this project, whoever started them.
@@ -1871,6 +1875,16 @@ where
         emit_error(cli.json, &AppError::new("device", error));
         return ExitCode::FAILURE;
     }
+    if crate::device::is_remote() && matches!(cli.command, TopCommand::Linear(_)) {
+        emit_error(
+            cli.json,
+            &AppError::new(
+                "linear_remote_unsupported",
+                "Run Linear commands on the device containing the worktree and API key; --device is not supported for Linear",
+            ),
+        );
+        return ExitCode::FAILURE;
+    }
     if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
         match crate::install_guard::staged_owner_bin(&std::env::current_exe().unwrap_or_default()) {
             Ok(Some(bin)) => {
@@ -1944,6 +1958,7 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Linear(command) => linear::execute(command),
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
