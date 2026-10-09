@@ -3793,10 +3793,7 @@ fn answers_view<'a>(
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .into();
     }
-    let mut answers: Vec<&chat::Choice> = request.actions.iter().collect();
-    // A stable sort, so answers of equal stake keep the order the
-    // provider offered them in.
-    answers.sort_by_key(|choice| stake(choice));
+    let answers = ordered_answers(request);
     let primary = submit_answer(request).map(|choice| &choice.id);
     widget::row::with_children(
         answers
@@ -3809,10 +3806,12 @@ fn answers_view<'a>(
                 )));
                 let control: Element<'a, Message> = if primary == Some(&choice.id) {
                     crate::ui_controls::button::primary(choice.label.as_str())
+                        .id(answer_control_id(target, request, choice))
                         .on_press_maybe(message)
                         .into()
                 } else {
                     crate::ui_controls::button::secondary(choice.label.as_str())
+                        .id(answer_control_id(target, request, choice))
                         .on_press_maybe(message)
                         .into()
                 };
@@ -3835,6 +3834,24 @@ fn answers_view<'a>(
     // answer a reader cannot see is an answer they do not have.
     .wrap()
     .into()
+}
+
+pub(super) fn ordered_answers(request: &chat::Request) -> Vec<&chat::Choice> {
+    let mut answers: Vec<_> = request.actions.iter().collect();
+    // A stable sort keeps equal-stake answers in the provider's order.
+    answers.sort_by_key(|choice| stake(choice));
+    answers
+}
+
+pub(super) fn answer_control_id(
+    target: Target,
+    request: &chat::Request,
+    choice: &chat::Choice,
+) -> widget::Id {
+    card_control_id(
+        target.card,
+        &format!("chat-answer-{}-{}", request.id, choice.id),
+    )
 }
 
 /// One row of the model list: a model, or a provider's default where it has
