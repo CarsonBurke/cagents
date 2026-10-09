@@ -6677,6 +6677,9 @@ impl Cagents {
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
+        if let Some(navigation) = self.durable.repository_navigation.get(&card) {
+            runtime.restore_navigation(navigation);
+        }
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -13721,6 +13724,19 @@ impl Application for Cagents {
                     state.kind = CardKind::Repository(view);
                     self.persist();
                 }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) {
+                    let navigation = runtime.navigation();
+                    let stored = self.durable.repository_navigation.get(&card);
+                    if stored != navigation.as_ref() {
+                        let saved = &mut Arc::make_mut(&mut self.durable).repository_navigation;
+                        if let Some(navigation) = navigation {
+                            saved.insert(card, navigation);
+                        } else {
+                            saved.remove(&card);
+                        }
+                        tasks.push(self.save_focus_soon());
+                    }
+                }
                 // A queued refresh discards this result and advances the list
                 // generation. Keep navigation parked until its replacement
                 // lands, rather than opening a file without its Git status.
@@ -19815,6 +19831,109 @@ mod tests {
         state.diagnostics_version = Some(0);
         app.lsp_documents.insert(LspDocumentId(1), card);
         (app, card)
+    }
+
+    #[tokio::test]
+    async fn reviewed_update_prepare_flushes_folder_editor_selection_before_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window.sqlite3");
+        let boot = crate::model::BootId::new("editor-update-test");
+        let (writer, _) = SessionRuntime::open(&path, boot).unwrap();
+        let store = writer.operation_store();
+        let (mut app, card) = editing_repository_app();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved");
+        let expected = runtime.navigation().unwrap();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.session = Some(writer);
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Prepare,
+            response,
+        }));
+        let mut stream = iced::runtime::task::into_stream(task).expect("update flush");
+        let mut flushed = false;
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                let finished = matches!(message, Message::UiUpdateFlushed { .. });
+                drop(app.update(message));
+                if finished {
+                    flushed = true;
+                    break;
+                }
+            }
+        }
+        assert!(flushed);
+        assert_eq!(receiver.try_recv().unwrap(), "ok");
+        let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(restored.repository_navigation.get(&card), Some(&expected));
+        assert!(
+            matches!(&restored.cards.iter().find(|state| state.id == card).unwrap().kind, CardKind::Repository(view) if view.selected_file.is_none())
+        );
+        let (response, _) = std::sync::mpsc::sync_channel(1);
+        drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Cancel,
+            response,
+        })));
+        assert!(!app.update_prepared);
+    }
+
+    #[test]
+    fn window_snapshots_capture_editor_selection_without_changing_shared_recipe() {
+        let (mut app, card) = editing_repository_app();
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            panic!("editor");
+        };
+        let expected = runtime.navigation().unwrap();
+        let descriptor = runtime.descriptor.clone();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.repository_navigation.get(&card), Some(&expected));
+        let CardKind::Repository(view) = &saved
+            .cards
+            .iter()
+            .find(|state| state.id == card)
+            .unwrap()
+            .kind
+        else {
+            panic!("repository");
+        };
+        assert!(
+            view.selected_file.is_none(),
+            "the shared pane remains a repository browser"
+        );
+        let mut second_window = (*saved).clone();
+        second_window.id = crate::model::WorkspaceId::new();
+        second_window
+            .repository_navigation
+            .get_mut(&card)
+            .unwrap()
+            .selected_file = Some("other.txt".into());
+        assert_eq!(
+            app.persistent_workspace().repository_navigation[&card],
+            expected
+        );
+        let close = crate::model::Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap()
+            .existence = close;
+        assert!(
+            !app.persistent_workspace()
+                .repository_navigation
+                .contains_key(&card)
+        );
     }
 
     #[test]

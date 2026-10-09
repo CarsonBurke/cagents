@@ -170,6 +170,7 @@ fn scope_descriptor(
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
         workspace_history: Vec::new(),
+        repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,

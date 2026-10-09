@@ -262,6 +262,7 @@ pub struct WorkspaceManifest {
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
     pub workspace_history: Vec<WorkspaceDestination>,
+    pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
     pub pending_terminal_creations: HashSet<CardId>,
@@ -1743,6 +1744,7 @@ impl StateStore {
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
             workspace_history: manifest.workspace_history,
+            repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
             pending_terminal_creations: manifest.pending_terminal_creations,
@@ -3235,6 +3237,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:repository_navigation"),
+        &to_json(&state.repository_navigation)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:workspace_model_identity"),
         &to_json(&state.workspace_model_identity)?,
     )?;
@@ -4564,6 +4571,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace history", &value))
         .transpose()?
         .unwrap_or_default(),
+        repository_navigation: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:repository_navigation"),
+        )?
+        .map(|value| from_json("workspace editor navigation", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_drafts: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_drafts"),
@@ -5193,6 +5207,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_history: Vec::new(),
+            repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
@@ -6187,6 +6202,100 @@ mod tests {
             terminal: Some(source.clone()),
         };
         (workspace, chat)
+    }
+
+    #[test]
+    fn editor_navigation_is_window_local_and_legacy_metadata_defaults_empty() {
+        use crate::model::{RepositoryNavigation, RepositoryView};
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempdir().unwrap();
+        let boot_id = boot("editor-navigation");
+        let store =
+            StateStore::open(directory.path().join("editors.sqlite3"), boot_id.clone()).unwrap();
+        let mut first = workspace_with_terminal(&boot_id);
+        let card = first.cards[0].id;
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: "/repo/.git".into(),
+            worktree: "/repo".into(),
+            selected_file: None,
+        };
+        first.cards[0].kind = CardKind::Repository(view.clone());
+        let raw_path = PathBuf::from(std::ffi::OsString::from_vec(b"file-\xff.txt".to_vec()));
+        first.repository_navigation.insert(
+            card,
+            RepositoryNavigation {
+                project: view.project,
+                worktree: view.worktree.clone(),
+                selected_file: Some(raw_path.clone()),
+                editor: None,
+            },
+        );
+        let mut second = first.clone();
+        second.id = WorkspaceId::new();
+        second
+            .repository_navigation
+            .get_mut(&card)
+            .unwrap()
+            .selected_file = Some("different.txt".into());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &first).unwrap();
+        // Each window owns its storage while projecting the same shared pane.
+        let second_store = StateStore::open(
+            directory.path().join("second-window.sqlite3"),
+            boot_id.clone(),
+        )
+        .unwrap();
+        let mut second_lane = SaveLane::default();
+        second_lane.save(&second_store, &second).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(first.id, None)
+                .unwrap()
+                .unwrap()
+                .repository_navigation[&card]
+                .selected_file,
+            Some(raw_path)
+        );
+        assert_eq!(
+            second_store
+                .load_workspace(second.id, None)
+                .unwrap()
+                .unwrap()
+                .repository_navigation[&card]
+                .selected_file,
+            Some("different.txt".into())
+        );
+        let mut legacy = serde_json::to_value(&first).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("repository_navigation");
+        let restored: WorkspaceState = serde_json::from_value(legacy).unwrap();
+        assert!(restored.repository_navigation.is_empty());
+        let empty = workspace_with_terminal(&boot_id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &empty).unwrap();
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                [format!(
+                    "workspace:{}:navigation:repository_navigation",
+                    empty.id
+                )],
+            )
+            .unwrap();
+        assert!(
+            store
+                .load_workspace_manifest(empty.id)
+                .unwrap()
+                .unwrap()
+                .repository_navigation
+                .is_empty()
+        );
     }
 
     #[test]
