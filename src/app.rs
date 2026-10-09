@@ -7801,6 +7801,11 @@ impl Cagents {
                 .map(|chrome| chrome.focus_id.clone())
                 .unwrap_or_else(|| workspace_widget::card_focus_id(card)),
             Some(CardRuntime::Chat(runtime)) => card_control_id(card, runtime.focus_control()),
+            Some(CardRuntime::Repository(runtime)) => match runtime.editor_focus_target(card) {
+                Some(_) if runtime.find_is_open() => repository_widget::find_focus_id(card),
+                Some(target) => target,
+                None => self.card_header_widget_id(card),
+            },
             // Arriving at settings means looking for one, so the keyboard
             // lands in its search field.
             Some(CardRuntime::Settings) => crate::settings_widgets::search_id(),
@@ -24035,6 +24040,36 @@ mod tests {
             );
             assert_eq!(app.workspace.focused(), Some(pane));
         }
+    }
+
+    #[test]
+    fn restored_editor_startup_focus_follows_the_loaded_surface() {
+        let (mut app, pane) = editing_repository_app();
+        let update = app.workspace.resize_viewport(1200.0);
+        assert_eq!(
+            app.card_keyboard_focus(pane),
+            repository_widget::editor_focus_id(pane)
+        );
+        let startup = app.apply_viewport(update, false, false);
+        assert_eq!(
+            focused(&app, startup),
+            Some(repository_widget::editor_focus_id(pane))
+        );
+        let _ = app.update(Message::Repository(RepositoryAction::OpenFind {
+            card: pane,
+        }));
+        assert_eq!(
+            app.card_keyboard_focus(pane),
+            repository_widget::find_focus_id(pane)
+        );
+        let _ = app.update(Message::Repository(RepositoryAction::ApplyMarkdownMode {
+            card: pane,
+            preview: true,
+        }));
+        assert_eq!(
+            app.card_keyboard_focus(pane),
+            app.card_header_widget_id(pane)
+        );
     }
 
     #[test]
