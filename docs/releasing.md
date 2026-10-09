@@ -17,15 +17,28 @@ The builder runs locked release-profile tests for the isolated CLI, host,
 browserless UI, integrated UI, and editor boundaries, then packages and checks
 the shipped binaries and desktop metadata.
 
+Before exposing the bundle, the builder installs and removes each Debian
+package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
+image. This runtime checks actual package dependencies, shipped commands,
+matched daemon startup and safe shutdown, live-daemon removal guards, and
+preservation of unrelated files and saved app data. The compiler environment
+remains Ubuntu 22.04; runtime smoke does not replace the glibc baseline checks.
+The runtime image is prepared once with network access by
+`scripts/prepare-release-smoke-rootfs`; every artifact execution uses a separate
+networkless namespace with private user state. The runtime cache defaults to
+`$XDG_CACHE_HOME/cagents-release-smoke/ubuntu-24.04-amd64` (or under `~/.cache`),
+and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it.
+
 Install `bubblewrap`, `curl`, `git`, and the standard archive tools locally,
 then build:
 
 ```sh
-./scripts/build-release-linux --ref v0.1.2 --output /tmp/cagents-v0.1.2
+./scripts/build-release-linux --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
 ```
 
 Run `./scripts/build-release-linux --help` for the cache location and other
-details. `CARGO_BUILD_JOBS` defaults to 2 inside the builder.
+details. `CARGO_BUILD_JOBS` defaults to 2 inside the builder. Download and build
+temporary files stay in its private disk cache rather than a RAM-backed `/tmp`.
 
 ## Artifacts
 
@@ -53,9 +66,9 @@ the release tooling does not publish placeholder binaries for them.
 Verify first, then publish:
 
 ```sh
-./scripts/publish-release --version 0.1.2 --dist /tmp/cagents-v0.1.2 --verify-only
+./scripts/publish-release --version 0.1.2 --dist /var/tmp/cagents-v0.1.2 --verify-only
 gh auth login --hostname github.com
-./scripts/publish-release --version 0.1.2 --dist /tmp/cagents-v0.1.2
+./scripts/publish-release --version 0.1.2 --dist /var/tmp/cagents-v0.1.2
 ```
 
 Both manifests and the existing tag must agree on the release version. The
@@ -63,6 +76,13 @@ publisher verifies local and remote tag identity, uploads a private snapshot to
 its own draft, downloads and verifies the served bytes, then publishes. It
 never moves tags or overwrites a published release. Authentication stays in the
 local `gh` configuration, outside the build environment.
+
+Both publishing modes repeat the offline artifact smoke against the verified
+private bundle snapshot before any release upload or publication. To verify a
+bundle built elsewhere, prepare the runtime image first, or supply an existing
+Ubuntu 24.04 amd64 runtime image with `--smoke-rootfs DIR`. Missing dependencies,
+failed install/remove scripts, hanging commands, or a failed daemon handshake
+stop verification. No package is installed on the host.
 
 ## Comparing package variants
 

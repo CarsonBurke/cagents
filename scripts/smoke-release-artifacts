@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM=smoke-release-artifacts
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+DIST_DIR=
+VERSION=
+BASE_ROOT=${CAGENTS_RELEASE_SMOKE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64"}/rootfs
+fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+while (($#)); do
+    case $1 in
+        --dist|--version|--rootfs)
+            (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
+            case $1 in
+                --dist) DIST_DIR=$2 ;;
+                --version) VERSION=$2 ;;
+                --rootfs) BASE_ROOT=$2 ;;
+            esac
+            shift 2 ;;
+        --help)
+            printf '%s\n' 'Usage: scripts/smoke-release-artifacts --dist DIR --version VERSION [--rootfs DIR]' \
+                'Install, exercise and remove every shipped artifact in offline disposable Ubuntu root filesystems.' \
+                'Prepare the default runtime image with scripts/prepare-release-smoke-rootfs. No network or host installation is used by smoke runs.'
+            exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+[[ -n $DIST_DIR && $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+([+][-A-Za-z0-9.]+)?$ ]] || fail 'dist and a package version are required'
+for command in bwrap cp mktemp realpath stat rm id grep timeout; do
+    command -v "$command" >/dev/null || fail "required command not found: $command"
+done
+[[ -d $BASE_ROOT && ! -L $BASE_ROOT ]] || fail 'missing rootfs; run scripts/prepare-release-smoke-rootfs or provide --rootfs'
+BASE_ROOT=$(realpath -- "$BASE_ROOT")
+[[ $(stat -c %u "$BASE_ROOT") == "$(id -u)" ]] || fail 'rootfs must be caller-owned'
+[[ -x $BASE_ROOT/usr/bin/dpkg && -x $BASE_ROOT/usr/bin/jq ]] || fail 'rootfs requires dpkg and jq'
+grep -qx 'ID=ubuntu' "$BASE_ROOT/etc/os-release" || fail 'rootfs must be Ubuntu'
+grep -qx 'VERSION_ID="24.04"' "$BASE_ROOT/etc/os-release" || fail 'rootfs must be Ubuntu 24.04'
+DIST_DIR=$(realpath -- "$DIST_DIR")
+WORK=$(mktemp -d "${CAGENTS_SMOKE_WORK_DIR:-/var/tmp}/cagents-artifact-smoke.XXXXXX")
+cleanup() { rm -rf -- "$WORK"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+cp -- "$ROOT_DIR/packaging/smoke-release-artifact" "$WORK/smoke"
+
+artifacts=(
+    "cagents_${VERSION}_amd64.deb"
+    "cagents-browserless_${VERSION}_amd64.deb"
+    "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+    "cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+    "ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+)
+for artifact in "${artifacts[@]}"; do
+    [[ -f $DIST_DIR/$artifact && ! -L $DIST_DIR/$artifact ]] || fail "missing regular artifact: $artifact"
+done
+for artifact in "${artifacts[@]}"; do
+    mkdir "$WORK/rootfs"
+    cp -a --reflink=auto -- "$BASE_ROOT/." "$WORK/rootfs/"
+    # Even an interrupted developer build must not provide persisted user data
+    # to shipped executables. These paths are empty private mounts, not host data.
+    timeout --signal=TERM --kill-after=5s 120s bwrap --unshare-all --uid 0 --gid 0 --die-with-parent --new-session --clearenv \
+        --bind "$WORK/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+        --tmpfs /root --tmpfs /home \
+        --ro-bind "$DIST_DIR/$artifact" /artifact --ro-bind "$WORK/smoke" /smoke \
+        --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv LANG C.UTF-8 \
+        --setenv RUST_LOG warn,cagents_ui=info,cagentsd=info \
+        --setenv XDG_CONFIG_HOME /root/config --setenv XDG_DATA_HOME /root/data \
+        --setenv XDG_CACHE_HOME /root/cache --setenv XDG_STATE_HOME /root/state \
+        --setenv XDG_RUNTIME_DIR /run/fixture --chdir / \
+        -- /bin/bash /smoke "$artifact" "$VERSION"
+    rm -rf -- "$WORK/rootfs"
+    printf 'Artifact smoke passed: %s\n' "$artifact"
+done

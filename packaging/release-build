@@ -38,15 +38,24 @@ if [[ ${1:-} == --provision ]]; then
         done
     )
     # Apt sanitizes LD_PRELOAD before invoking dpkg, so wrap dpkg itself.
-    printf '#!/bin/sh\nexec /usr/bin/fakeroot-sysv -- /usr/bin/dpkg "$@"\n' \
+    # Unmapped namespace ownership returns EINVAL instead of EPERM; avoid
+    # fakeroot's real chown attempt and simulate only those ownership calls.
+    printf '#!/bin/sh\nexport FAKEROOTDONTTRYCHOWN=1\nexec /usr/bin/fakeroot-sysv -- /usr/bin/dpkg "$@"\n' \
         > /usr/local/sbin/cagents-dpkg
     chmod 0755 /usr/local/sbin/cagents-dpkg
+    FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv -- /bin/sh -ec '
+        touch /tmp/ownership-probe
+        chown 0:50 /tmp/ownership-probe
+        test "$(stat -c %u:%g /tmp/ownership-probe)" = 0:50
+    '
     apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
         ca-certificates build-essential clang cmake curl git libclang-dev \
         libdbus-1-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
         libgbm-dev libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
         libxkbcommon-dev ninja-build pkg-config python3 xz-utils \
         appstream desktop-file-utils dpkg-dev jq fakeroot libfakeroot libcurl4-openssl-dev
+    audit=$(dpkg --audit)
+    [[ -z $audit ]] || { printf '%s\n' "$audit" >&2; fail 'unfinished build dependencies'; }
     [[ -x /usr/bin/clang && -x /usr/bin/clang++ && -d /usr/lib/llvm-14/lib ]]
     # Install the three official, version-pinned Rust components directly;
     # no mutable rustup bootstrap or host toolchain is involved.

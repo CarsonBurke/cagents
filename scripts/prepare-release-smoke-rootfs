@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Prepare a runtime-only rootfs. Artifact smoke itself remains offline.
+set -euo pipefail
+
+PROGRAM=prepare-release-smoke-rootfs
+CACHE=${CAGENTS_RELEASE_SMOKE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64"}
+BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-amd64.tar.gz
+BASE_SHA256=6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9
+CACHE_ID="cagents-release-smoke-v1 ubuntu-24.04.3 amd64 $BASE_SHA256"
+PROVISION_MARKER=.cagents-release-smoke-provisioned-v1
+fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+while (($#)); do
+    case $1 in
+        --cache)
+            (($# >= 2)) && [[ -n $2 ]] || fail '--cache requires a value'
+            CACHE=$2; shift 2 ;;
+        --help)
+            printf '%s\n' 'Usage: scripts/prepare-release-smoke-rootfs [--cache DIR]' \
+                'Prepare an isolated Ubuntu 24.04 amd64 runtime with real package dependencies.' \
+                'Downloads the pinned official base and installs runtime packages using network-enabled bubblewrap.' \
+                'Prints the prepared rootfs path. Artifact smoke uses it offline and never installs on the host.' \
+                'DIR defaults to CAGENTS_RELEASE_SMOKE_CACHE or ${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64.'
+            exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Linux x86_64 is required'
+CALLER_UID=$(id -u)
+[[ $CALLER_UID != 0 ]] || fail 'run as your ordinary nonroot user'
+for command in bwrap curl tar sha256sum flock realpath stat mktemp cp mv rm timeout; do
+    command -v "$command" >/dev/null || fail "required command not found: $command"
+done
+umask 077
+[[ ! -L $CACHE ]] || fail 'cache root must not be a symlink'
+mkdir -p -- "$CACHE"
+CACHE=$(realpath -- "$CACHE")
+[[ $(stat -c %u "$CACHE") == "$CALLER_UID" && $(stat -c %a "$CACHE") == 700 ]] \
+    || fail 'cache root must be caller-owned with mode 0700'
+for path in .lock .cagents-release-smoke-cache ubuntu-base.tar.gz; do
+    [[ ! -L $CACHE/$path && ( ! -e $CACHE/$path || -f $CACHE/$path ) ]] \
+        || fail "unsafe cache entry: $path"
+done
+if [[ -e $CACHE/.cagents-release-smoke-cache ]]; then
+    [[ $(cat "$CACHE/.cagents-release-smoke-cache") == "$CACHE_ID" ]] \
+        || fail 'cache marker does not match this runtime; use a different cache'
+else
+    shopt -s nullglob dotglob
+    entries=("$CACHE"/*)
+    ((${#entries[@]} == 0)) || fail 'refusing to adopt an unmarked nonempty cache'
+    shopt -u nullglob dotglob
+fi
+exec 9>"$CACHE/.lock"
+flock -n 9 || fail 'another preparation owns this cache'
+printf '%s\n' "$CACHE_ID" > "$CACHE/.cagents-release-smoke-cache"
+WORK=$(mktemp -d "$CACHE/prepare.XXXXXX")
+trap 'rm -rf -- "$WORK"' EXIT
+trap 'exit 1' HUP INT TERM
+if [[ ! -f $CACHE/ubuntu-base.tar.gz ]]; then
+    curl --disable --proto '=https' --tlsv1.2 --fail --location --connect-timeout 20 --max-time 300 "$BASE_URL" \
+        --output "$WORK/ubuntu-base.tar.gz" >&2
+    printf '%s  %s\n' "$BASE_SHA256" "$WORK/ubuntu-base.tar.gz" | sha256sum --check --strict >&2
+    mv -- "$WORK/ubuntu-base.tar.gz" "$CACHE/ubuntu-base.tar.gz"
+fi
+printf '%s  %s\n' "$BASE_SHA256" "$CACHE/ubuntu-base.tar.gz" | sha256sum --check --strict >&2
+if [[ -e $CACHE/rootfs || -L $CACHE/rootfs ]]; then
+    [[ -d $CACHE/rootfs && ! -L $CACHE/rootfs && $(stat -c %u "$CACHE/rootfs") == "$CALLER_UID" ]] \
+        || fail 'unsafe cached rootfs'
+    [[ -f $CACHE/rootfs/opt/$PROVISION_MARKER && ! -L $CACHE/rootfs/opt/$PROVISION_MARKER \
+        && $(cat "$CACHE/rootfs/opt/$PROVISION_MARKER") == "$CACHE_ID" ]] \
+        || fail 'cached rootfs is not fully provisioned; use a different cache'
+else
+    mkdir "$WORK/rootfs"
+    tar --extract --gzip --file "$CACHE/ubuntu-base.tar.gz" --directory "$WORK/rootfs" \
+        --no-same-owner --exclude='dev/*' --exclude='./dev/*'
+    cp -- /etc/resolv.conf "$WORK/resolv.conf"
+    cat > "$WORK/provision" <<'PROVISION'
+#!/bin/bash
+set -euo pipefail
+. /etc/os-release
+[[ $ID == ubuntu && $VERSION_ID == 24.04 && $(dpkg --print-architecture) == amd64 ]]
+export DEBIAN_FRONTEND=noninteractive
+mkdir -p /etc/apt/apt.conf.d /opt /tmp/bootstrap
+printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99cagents-rootless
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+chmod 0755 /usr/sbin/policy-rc.d
+apt-get update
+(
+    cd /tmp/bootstrap
+    apt-get download fakeroot libfakeroot
+    for package in ./*.deb; do
+        dpkg-deb --fsys-tarfile "$package" | tar -x -C / --no-same-owner
+    done
+)
+# A single mapped UID cannot chown to package system accounts. Simulate only
+# ownership operations, while dpkg still enforces actual runtime dependencies.
+# In a user namespace unmapped chown returns EINVAL, not EPERM. Fakeroot must
+# skip the real syscall rather than relying on its normal EPERM fallback.
+printf '#!/bin/sh\nexport FAKEROOTDONTTRYCHOWN=1\nexec /usr/bin/fakeroot-sysv -- /usr/bin/dpkg "$@"\n' > /usr/local/sbin/cagents-dpkg
+chmod 0755 /usr/local/sbin/cagents-dpkg
+FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv -- /bin/sh -ec '
+    touch /tmp/ownership-probe
+    chown 0:50 /tmp/ownership-probe
+    test "$(stat -c %u:%g /tmp/ownership-probe)" = 0:50
+'
+apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
+    ca-certificates curl git libc6 libfontconfig1 libfreetype6 libgcc-s1 libstdc++6 \
+    libwayland-client0 libxkbcommon0 zlib1g xdg-utils jq fakeroot libfakeroot
+dpkg --compare-versions "$(dpkg-query -W -f='${Version}' git)" ge 2.36
+audit=$(dpkg --audit)
+[[ -z $audit ]] || { printf '%s\n' "$audit" >&2; exit 1; }
+printf '%s\n' "$CAGENTS_SMOKE_CACHE_ID" > "/opt/$CAGENTS_SMOKE_PROVISION_MARKER"
+PROVISION
+    timeout --signal=TERM --kill-after=10s 900s \
+        bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
+        --die-with-parent --new-session --clearenv \
+        --bind "$WORK/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+        --tmpfs /root --tmpfs /home \
+        --ro-bind "$WORK/resolv.conf" /etc/resolv.conf --ro-bind "$WORK/provision" /provision \
+        --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv LANG C.UTF-8 \
+        --setenv CAGENTS_SMOKE_CACHE_ID "$CACHE_ID" \
+        --setenv CAGENTS_SMOKE_PROVISION_MARKER "$PROVISION_MARKER" \
+        --chdir / -- /bin/bash /provision >&2
+    [[ $(cat "$WORK/rootfs/opt/$PROVISION_MARKER") == "$CACHE_ID" ]] || fail 'runtime provisioning did not complete'
+    mv -- "$WORK/rootfs" "$CACHE/rootfs"
+fi
+printf '%s\n' "$CACHE/rootfs"

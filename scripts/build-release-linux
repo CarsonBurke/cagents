@@ -115,6 +115,7 @@ assets=("$OUTPUT"/*)
 shopt -u nullglob dotglob
 
 WORK=$(mktemp -d "$CACHE/run.XXXXXX")
+mkdir "$WORK/provision-tmp" "$WORK/build-tmp"
 cleanup() {
     rm -rf -- "$WORK"
 }
@@ -144,7 +145,7 @@ fi
 if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v2 ]]; then
     bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
         --die-with-parent --new-session --clearenv \
-        --bind "$CACHE/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+        --bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/provision-tmp" /tmp --tmpfs /run \
         --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
         --ro-bind "$WORK/release-build" /release-build \
         --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv HOME /root \
@@ -167,7 +168,7 @@ printf 'root:x:0:\nbuilder:x:%s:\n' "$CALLER_GID" > "$WORK/group"
 printf 'Building %s (%s) locally in Ubuntu 22.04; assets: %s\n' "$REF" "$SOURCE_COMMIT" "$OUTPUT"
 bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --new-session --clearenv \
-    --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+    --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/build-tmp" /tmp --tmpfs /run \
     --tmpfs /home --dir /home/builder \
     --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
     --ro-bind "$WORK/passwd" /etc/passwd --ro-bind "$WORK/group" /etc/group \
@@ -187,6 +188,11 @@ bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --setenv SOURCE_DATE_EPOCH "$SOURCE_DATE_EPOCH" \
     --setenv CC /usr/bin/clang --setenv CXX /usr/bin/clang++ --setenv LIBCLANG_PATH /usr/lib/llvm-14/lib \
     --chdir /source -- /bin/bash /release-build
-# Build failures leave the public output empty. Only verified assets cross out.
+# Runtime image preparation can use the network; artifact execution below has
+# separate networkless namespaces and never mounts the host's home or credentials.
+SMOKE_ROOTFS=$("$ROOT_DIR/scripts/prepare-release-smoke-rootfs")
+VERSION=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
+"$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
+# Build or smoke failures leave public output empty. Only verified assets cross out.
 cp -- "$WORK/dist/"* "$OUTPUT/"
 printf 'Verified local release assets: %s\n' "$OUTPUT"
