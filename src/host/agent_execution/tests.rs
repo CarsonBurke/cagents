@@ -1771,7 +1771,9 @@ fn only_an_agents_owner_reads_its_requests_and_controls_it() {
         &owner,
         Operation::Control {
             agent,
-            command: Control::Interrupt,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
         },
     )
     .unwrap_err();
@@ -1806,7 +1808,9 @@ fn only_an_agents_owner_reads_its_requests_and_controls_it() {
         Operation::Requests(child.agent.id),
         Operation::Control {
             agent: child.agent.id,
-            command: Control::Interrupt,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
         },
     ] {
         let error = requests(&owner, operation).unwrap_err();
@@ -1892,7 +1896,10 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
         std::fs::read_to_string(root.join("decisions")).unwrap(),
         "allow\n"
     );
-    let error = control(Control::Interrupt).unwrap_err();
+    let error = control(Control::Interrupt {
+        including_subagents: false,
+    })
+    .unwrap_err();
     assert!(error.contains("no active run"), "{error}");
 
     // Once a person takes the agent over, the question its next turn raises
@@ -1915,7 +1922,12 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
         .unwrap()
         .claim_agent_interaction(agent, None)
         .unwrap();
-    for command in [answer(&asked[0].id, "deny", Vec::new()), Control::Interrupt] {
+    for command in [
+        answer(&asked[0].id, "deny", Vec::new()),
+        Control::Interrupt {
+            including_subagents: false,
+        },
+    ] {
         let error = control(command).unwrap_err();
         assert!(error.contains("took this agent over"), "{error}");
     }

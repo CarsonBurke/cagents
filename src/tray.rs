@@ -338,7 +338,7 @@ mod service {
             let stdout = format!("{report}\n");
             assert_eq!(
                 confirmation_outcome(false, stdout.as_bytes(), b"Gdk-WARNING: noise\n"),
-                Err("Not stopped: the open terminals changed (4 now). Try again.".into())
+                Err("Not stopped: hosted sessions or background tasks changed (4 sessions now). Refresh and try again.".into())
             );
             assert_eq!(
                 confirmation_outcome(true, stdout.as_bytes(), b"noise\n"),
@@ -362,7 +362,7 @@ mod service {
                         termination_requested: true,
                     },
                 })),
-                Ok("Stopping… 3 terminals will close".into())
+                Ok("Stopping… 3 hosted sessions will close".into())
             );
             assert_eq!(
                 confirmation_result(&line(StopReport::Cancelled)),
@@ -372,7 +372,7 @@ mod service {
                 confirmation_result(&line(StopReport::Finished {
                     outcome: ShutdownOutcome::InventoryChanged { current_count: 4 },
                 })),
-                Err("Not stopped: the open terminals changed (4 now). Try again.".into())
+                Err("Not stopped: hosted sessions or background tasks changed (4 sessions now). Refresh and try again.".into())
             );
             // No outcome is worded with the CLI's field names.
             for outcome in [

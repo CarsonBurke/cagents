@@ -49,7 +49,10 @@ enum ActorCommand {
         generation: u64,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
-    InterruptRun(crate::model::RunId),
+    Interrupt {
+        run: Option<crate::model::RunId>,
+        including_subagents: bool,
+    },
 }
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
 
@@ -628,7 +631,18 @@ impl Handle {
     }
 
     pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
-        self.ownership_command(ActorCommand::InterruptRun(run))
+        self.interrupt_owned(Some(run), false)
+    }
+
+    pub(crate) fn interrupt_owned(
+        &self,
+        run: Option<crate::model::RunId>,
+        including_subagents: bool,
+    ) -> Result<(), String> {
+        self.ownership_command(ActorCommand::Interrupt {
+            run,
+            including_subagents,
+        })
     }
 
     fn wake(&self) {
@@ -912,6 +926,25 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .requests
             .clone()
+    }
+    pub(crate) fn background_subagents(&self) -> Vec<String> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .subagents
+            .iter()
+            .filter(|agent| agent.background && agent.status == ToolStatus::Running)
+            .map(|agent| agent.id.clone())
+            .collect()
+    }
+
+    pub(crate) fn interrupt_subagents(&self) -> Vec<String> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .subagents
+            .iter()
+            .filter(|agent| agent.stopped_by_interrupt(&state.capabilities))
+            .map(|agent| agent.id.clone())
+            .collect()
     }
     /// The provider-reported title, read without loading the transcript.
     pub(crate) fn title(&self) -> Option<String> {
@@ -1754,12 +1787,35 @@ impl Actor {
                     }
                     continue;
                 }
-                ActorCommand::InterruptRun(run) => {
-                    if self.execution.active() != Some(run) {
+                ActorCommand::Interrupt {
+                    run,
+                    including_subagents,
+                } => {
+                    if run.is_some_and(|run| self.execution.active() != Some(run)) {
                         let _ = reply.send(Err(
                             "The requested run is no longer the provider's active turn".into(),
                         ));
                         continue;
+                    }
+                    if !including_subagents {
+                        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        let affected: Vec<_> = state
+                            .subagents
+                            .iter()
+                            .filter(|agent| agent.stopped_by_interrupt(&state.capabilities))
+                            .collect();
+                        if !affected.is_empty() {
+                            let names = affected
+                                .iter()
+                                .take(8)
+                                .map(|agent| agent.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let _ = reply.send(Err(format!(
+                                "Interrupt would stop {} running background subagent(s): {names}. Use --including-subagents to permit this, or stop one subagent separately.", affected.len()
+                            )));
+                            continue;
+                        }
                     }
                     (None, Command::Interrupt)
                 }
@@ -2231,6 +2287,14 @@ fn recover_history_error(
 
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     let latest_history = matches!(&event, Event::LatestHistory { .. });
+    let child_changed = matches!(
+        &event,
+        Event::Subagent { .. }
+            | Event::SubagentItem { .. }
+            | Event::SubagentTextDelta { .. }
+            | Event::SubagentOutputDelta { .. }
+            | Event::SubagentItemsRemoved { .. }
+    );
     match event {
         Event::OutputDelta { id, offset, delta } => {
             if let Some(&index) = indices.get(&id) {
@@ -2610,19 +2674,35 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::Ready(ready) => state.ready = ready,
     }
+    if child_changed {
+        trim_subagents(state);
+    }
+}
+
+/// Running task identities authorize interruption and idle waits. Retiring
+/// presentation history must never retire that ownership evidence. Keep only
+/// the newest 32 rich child transcripts, with older active entries remaining
+/// available for status and selective Stop.
+fn trim_subagents(state: &mut Snapshot) {
+    const RICH_HISTORY: usize = 32;
+    while state.subagents.len() > RICH_HISTORY {
+        let Some(finished) = state
+            .subagents
+            .iter()
+            .position(|agent| agent.status != ToolStatus::Running)
+        else {
+            break;
+        };
+        state.subagents.remove(finished);
+    }
+    for agent in state.subagents.iter_mut().rev().skip(RICH_HISTORY) {
+        agent.items.clear();
+    }
 }
 
 fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
     if let Some(index) = state.subagents.iter().position(|agent| agent.id == id) {
         return &mut state.subagents[index];
-    }
-    if state.subagents.len() >= 32 {
-        let oldest_finished = state
-            .subagents
-            .iter()
-            .position(|agent| agent.status != ToolStatus::Running)
-            .unwrap_or(0);
-        state.subagents.remove(oldest_finished);
     }
     state.subagents.push(Subagent {
         id: id.into(),
@@ -2874,6 +2954,183 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    #[test]
+    fn queued_interrupt_rechecks_background_tasks_at_provider_dispatch() {
+        struct GatedBackground {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            interrupts: Arc<std::sync::atomic::AtomicUsize>,
+            started: bool,
+        }
+        impl Adapter for GatedBackground {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::Capabilities(super::super::Capabilities {
+                            interrupt_stops_background: true,
+                            ..Default::default()
+                        }),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                match command {
+                    Command::Compact if self.started => Ok(Step {
+                        events: (8..40)
+                            .map(|index| Event::Subagent {
+                                id: format!("late-background-{index}"),
+                                kind: String::new(),
+                                description: String::new(),
+                                status: Some(ToolStatus::Succeeded),
+                                background: None,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }),
+                    Command::Compact => {
+                        self.entered.send(()).unwrap();
+                        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                        self.started = true;
+                        Ok(Step {
+                            events: (0..40)
+                                .map(|index| Event::Subagent {
+                                    id: format!("late-background-{index}"),
+                                    kind: "Explore".into(),
+                                    description: "Started after the caller observed idle".into(),
+                                    status: Some(ToolStatus::Running),
+                                    background: Some(true),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        })
+                    }
+                    Command::Interrupt => {
+                        self.interrupts.fetch_add(1, Ordering::Relaxed);
+                        Ok(Step {
+                            events: (0..40)
+                                .map(|index| Event::Subagent {
+                                    id: format!("late-background-{index}"),
+                                    kind: "Explore".into(),
+                                    description: String::new(),
+                                    status: Some(ToolStatus::Stopped),
+                                    background: Some(true),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        })
+                    }
+                    _ => Ok(Step::default()),
+                }
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter = GatedBackground {
+            entered: entered_tx,
+            release: release_rx,
+            interrupts: interrupts.clone(),
+            started: false,
+        };
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Idle
+        );
+        let (reply, compact) = crossbeam_channel::bounded(1);
+        handle
+            .0
+            .commands
+            .send((
+                ActorCommand::Provider {
+                    run: None,
+                    command: Command::Compact,
+                },
+                reply,
+            ))
+            .unwrap();
+        handle.wake();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            handle.interrupt_subagents().is_empty(),
+            "caller snapshot precedes task arrival"
+        );
+        let (reply, interrupt) = crossbeam_channel::bounded(1);
+        handle
+            .0
+            .commands
+            .send((
+                ActorCommand::Interrupt {
+                    run: None,
+                    including_subagents: false,
+                },
+                reply,
+            ))
+            .unwrap();
+        handle.wake();
+        release_tx.send(()).unwrap();
+        compact
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let refused = interrupt
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            refused.contains("40 running background")
+                && refused.contains("late-background-0")
+                && refused.contains("--including-subagents")
+        );
+        assert_eq!(interrupts.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.background_subagents().len(), 40);
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Busy,
+            "idle parent with background work must hold a When idle update"
+        );
+        handle.command(Command::Compact).unwrap();
+        assert_eq!(
+            handle.background_subagents().len(),
+            8,
+            "finishing the newest32 must leave the older8 authoritative"
+        );
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Busy
+        );
+        let refused = handle.interrupt_owned(None, false).unwrap_err();
+        assert!(refused.contains("8 running background") && refused.contains("late-background-0"));
+        assert_eq!(interrupts.load(Ordering::Relaxed), 0);
+        handle.interrupt_owned(None, true).unwrap();
+        assert_eq!(interrupts.load(Ordering::Relaxed), 1);
+        assert!(handle.background_subagents().is_empty());
+        handle.interrupt_owned(None, false).unwrap();
+        assert_eq!(
+            interrupts.load(Ordering::Relaxed),
+            2,
+            "completed tasks no longer require consent"
+        );
+        handle.close().unwrap();
+    }
+
     fn text(id: &str, value: &str) -> Item {
         Item {
             id: id.into(),
@@ -2965,6 +3222,109 @@ mod tests {
         // An update that does not say leaves what is known in place.
         assert!(state.subagents[0].background);
     }
+    #[test]
+    fn running_subagent_ownership_outlives_bounded_rich_history() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        for index in 0..40 {
+            let id = format!("child-{index}");
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Subagent {
+                    id: id.clone(),
+                    kind: "Explore".into(),
+                    description: "Background".into(),
+                    status: Some(ToolStatus::Running),
+                    background: Some(true),
+                },
+            );
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::SubagentItem {
+                    id,
+                    item: text("answer", "Retained child history"),
+                },
+            );
+        }
+        assert_eq!(state.subagents.len(), 40);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|agent| !agent.items.is_empty())
+                .count(),
+            32
+        );
+        assert_eq!(state.subagents[0].id, "child-0");
+        assert!(state.subagents[0].items.is_empty());
+        // Additional output from an old active child must not grow its rich
+        // history again merely because its identity remains live.
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::SubagentItem {
+                id: "child-0".into(),
+                item: text("new-answer", "More background output"),
+            },
+        );
+        assert!(state.subagents[0].items.is_empty());
+        for index in 8..40 {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Subagent {
+                    id: format!("child-{index}"),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(ToolStatus::Succeeded),
+                    background: None,
+                },
+            );
+        }
+        assert!(state.is_working(), "the eight older tasks still own work");
+        let running: Vec<_> = state
+            .subagents
+            .iter()
+            .filter(|agent| agent.status == ToolStatus::Running)
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(
+            running,
+            (0..8)
+                .map(|index| format!("child-{index}"))
+                .collect::<Vec<_>>()
+        );
+        let capabilities = super::super::Capabilities {
+            interrupt_stops_background: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|agent| agent.stopped_by_interrupt(&capabilities))
+                .count(),
+            8
+        );
+        for index in 0..8 {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Subagent {
+                    id: format!("child-{index}"),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(ToolStatus::Stopped),
+                    background: None,
+                },
+            );
+        }
+        assert!(!state.is_working());
+        assert!(state.subagents.len() <= 32);
+    }
+
     #[test]
     fn turn_generation_retains_boundaries_across_coalesced_publications() {
         let mut state = Snapshot::default();

@@ -107,8 +107,13 @@ pub enum AgentCommand {
         fields: Vec<String>,
     },
     /// Interrupt an owned agent's active run.
-    Interrupt { agent: String },
-    /// Stop and close an agent created by this caller.
+    Interrupt {
+        agent: String,
+        /// Permit the interrupt to stop the provider's running background subagents.
+        #[arg(long)]
+        including_subagents: bool,
+    },
+    /// Stop and close an agent, including its background subagents.
     Close { agent: String },
 }
 
@@ -1022,16 +1027,29 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 human,
             })
         }
-        AgentCommand::Interrupt { agent } => {
+        AgentCommand::Interrupt {
+            agent,
+            including_subagents,
+        } => {
             let agent = session.agent(&agent)?;
             let requests = requests_reply(session.call(Operation::Control {
                 agent,
-                command: Control::Interrupt,
+                command: Control::Interrupt {
+                    including_subagents,
+                },
             })?)?;
             Ok(CommandOutput {
                 command: "agent.interrupt",
-                data: json!({"agent": agent, "requests": requests}),
-                human: format!("Interrupted agent {}", short(agent)),
+                data: json!({"agent": agent, "requests": requests, "including_subagents": including_subagents}),
+                human: format!(
+                    "Interrupted agent {}{}",
+                    short(agent),
+                    if including_subagents {
+                        " including its background subagents"
+                    } else {
+                        ""
+                    }
+                ),
             })
         }
         AgentCommand::Close { agent } => {
@@ -1634,8 +1652,17 @@ mod tests {
         assert!(console_input("/allow-everything").is_err());
         assert!(matches!(
             console_input("/interrupt").unwrap(),
-            ConsoleCommand::Control(crate::chat::Command::Interrupt)
+            ConsoleCommand::Interrupt {
+                including_subagents: false
+            }
         ));
+        assert!(matches!(
+            console_input("/interrupt --including-subagents").unwrap(),
+            ConsoleCommand::Interrupt {
+                including_subagents: true
+            }
+        ));
+        assert!(console_input("/interrupt --unknown").is_err());
         assert!(
             matches!(console_input("ordinary follow-up").unwrap(), ConsoleCommand::Submit { prompt, .. } if prompt == "ordinary follow-up")
         );
@@ -1858,7 +1885,15 @@ mod tests {
         );
         assert!(answers(&["scope".into()]).is_err());
         assert!(
-            matches!(parse(&["interrupt", "1a2b"]), AgentCommand::Interrupt { agent } if agent == "1a2b")
+            matches!(parse(&["interrupt", "1a2b"]), AgentCommand::Interrupt { agent, including_subagents: false } if agent == "1a2b")
+        );
+    }
+
+    #[test]
+    fn interrupt_requires_explicit_background_permission() {
+        assert!(
+            matches!(parse(&["interrupt", "1a2b", "--including-subagents"]),
+            AgentCommand::Interrupt { agent, including_subagents: true } if agent == "1a2b")
         );
     }
 
@@ -2100,7 +2135,7 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         })
         .map_err(|e| AppError::new("console_input", e))?;
     println!(
-        "cagents provider console — agent {agent}\nPrompts create durable runs. /interrupt, /answer REQUEST ACTION [ANSWERS_JSON], /quit\nThis is a console over the hosted provider, not its stock TUI.\n"
+        "cagents provider console — agent {agent}\nPrompts create durable runs. /interrupt [--including-subagents], /answer REQUEST ACTION [ANSWERS_JSON], /quit\nThis is a console over the hosted provider, not its stock TUI.\n"
     );
     let startup = Instant::now() + Duration::from_secs(10);
     let mut generation = None;
@@ -2209,8 +2244,10 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
 
 fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, String> {
     use crate::{agent_execution::ConsoleCommand, chat::Command};
-    if line == "/interrupt" {
-        return Ok(ConsoleCommand::Control(Command::Interrupt));
+    if line == "/interrupt" || line == "/interrupt --including-subagents" {
+        return Ok(ConsoleCommand::Interrupt {
+            including_subagents: line != "/interrupt",
+        });
     }
     if let Some(answer) = line.strip_prefix("/answer ") {
         let mut words = answer.splitn(3, ' ');
@@ -2237,7 +2274,7 @@ fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, S
         }));
     }
     if line.starts_with('/') {
-        return Err("Commands: /interrupt, /answer REQUEST ACTION [ANSWERS_JSON], /quit".into());
+        return Err("Commands: /interrupt [--including-subagents], /answer REQUEST ACTION [ANSWERS_JSON], /quit".into());
     }
     Ok(ConsoleCommand::Submit {
         prompt: line.into(),

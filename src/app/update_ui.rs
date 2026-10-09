@@ -1264,6 +1264,8 @@ mod tests {
                         token: "token".into(),
                         inventory_generation: 1,
                         live_terminals: sessions.len() as u64,
+                        background_subagents: 0,
+                        background_identity: String::new(),
                         expires_at_unix_ms: i64::MAX,
                     },
                     policy: crate::update::impact::Policy::WhenIdle,
@@ -1286,6 +1288,7 @@ mod tests {
             identity: title.into(),
             disposition,
             reason: format!("Why {title} is {}", disposition.label()),
+            interrupted_subagents: Vec::new(),
         }
     }
 

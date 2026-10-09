@@ -2,7 +2,7 @@
 //! A count alone cannot authorize losing a different conversation or process.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{model::TerminalId, terminal_ipc::ShutdownCapability};
 
@@ -41,6 +41,9 @@ pub struct SessionImpact {
     pub identity: String,
     pub disposition: Disposition,
     pub reason: String,
+    /// Exact background tasks this interruption would stop. An idle wait or
+    /// live process carry never authorizes terminating these tasks.
+    pub interrupted_subagents: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +111,16 @@ impl DaemonImpact {
             && current.len() == observed.sessions.len()
             && previous.iter().all(|(key, previous)| {
                 current.get(key).is_some_and(|current| {
+                    let permitted: BTreeSet<_> = previous
+                        .interrupted_subagents
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
                     previous.identity == current.identity
+                        && current
+                            .interrupted_subagents
+                            .iter()
+                            .all(|id| permitted.contains(id.as_str()))
                         && (previous.disposition == current.disposition
                             || (self.policy == Policy::WhenIdle
                                 && previous.disposition == Disposition::WaitsForIdle
@@ -134,6 +146,8 @@ mod tests {
                 token: "one".into(),
                 inventory_generation: 1,
                 live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
                 expires_at_unix_ms: 100,
             },
             policy: Policy::WhenIdle,
@@ -144,6 +158,7 @@ mod tests {
                 identity: "exact-owned-conversation".into(),
                 disposition: Disposition::WaitsForIdle,
                 reason: "Finishing its turn".into(),
+                interrupted_subagents: Vec::new(),
             }],
             blockers: vec![],
         }
@@ -165,6 +180,32 @@ mod tests {
         assert!(!confirmed.preserves_consent(&current));
         current = confirmed.clone();
         current.capability.proof.host_incarnation = HostIncarnation::new("replacement");
+        assert!(!confirmed.preserves_consent(&current));
+    }
+
+    #[test]
+    fn interruption_consent_cannot_expand_to_new_background_tasks() {
+        let mut confirmed = waiting();
+        confirmed.policy = Policy::Interrupt;
+        confirmed.sessions[0].disposition = Disposition::Interrupted;
+        confirmed.sessions[0].interrupted_subagents = vec!["first".into(), "second".into()];
+        let mut current = confirmed.clone();
+        current.sessions[0].interrupted_subagents.remove(0);
+        assert!(
+            confirmed.preserves_consent(&current),
+            "a completed task reduces impact"
+        );
+        current.sessions[0]
+            .interrupted_subagents
+            .push("replacement".into());
+        assert!(
+            !confirmed.preserves_consent(&current),
+            "same count is not the same work"
+        );
+        current = confirmed.clone();
+        current.sessions[0]
+            .interrupted_subagents
+            .push("third".into());
         assert!(!confirmed.preserves_consent(&current));
     }
 
