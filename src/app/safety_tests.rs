@@ -197,6 +197,7 @@ fn confirmed_repository(app: &Cagents, project: ProjectId) -> Option<&GitHubRepo
 fn every_completed_degraded_github_refresh_revokes_prior_dialog_authority() {
     for unavailable in [
         GitHubAvailability::MissingCli,
+        GitHubAvailability::UnsupportedCli,
         GitHubAvailability::Unauthenticated,
         GitHubAvailability::NotAssociated,
         GitHubAvailability::Failed {

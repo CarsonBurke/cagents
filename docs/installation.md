@@ -37,11 +37,17 @@ distribution and authenticate as the same desktop user:
 
 ```sh
 gh auth login --hostname github.com
-gh auth status --hostname github.com
+gh auth status --active --hostname github.com --json hosts
 ```
 
 cagents delegates authentication to `gh`; it never asks for or stores a GitHub
 token itself.
+
+Pull-request features require the JSON authentication-status capability shown
+above. If the command reports `unknown flag: --json`, upgrade GitHub CLI using
+the [official installation instructions](https://cli.github.com/). Older
+distribution packages can authenticate successfully while lacking this
+capability; refreshing or signing in again does not add it.
 
 ## Install with the verified installer
 

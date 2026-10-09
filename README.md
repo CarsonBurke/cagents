@@ -47,7 +47,7 @@ you close the window or restart the UI.
 
 Requirements: Linux x86_64 with glibc 2.35 or newer, a Wayland session, Git
 2.36 or newer, and an authenticated [GitHub CLI](https://cli.github.com/)
-(`gh auth login`).
+(`gh auth login`) that supports `gh auth status --json hosts`.
 
 [docs/installation.md](docs/installation.md) has the recommended
 checksum-verified installer, a shorter convenience installer, the full and

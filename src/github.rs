@@ -1333,6 +1333,10 @@ pub enum GitHubError {
     Validation(#[from] GitHubValidationError),
     #[error(transparent)]
     Process(#[from] ProcessFailure),
+    #[error(
+        "GitHub CLI cannot report active accounts as JSON. Upgrade gh from https://cli.github.com, then refresh"
+    )]
+    UnsupportedAuthStatus { failure: Box<ProcessFailure> },
     #[error("GitHub authentication is required for {host}")]
     AuthenticationRequired {
         host: String,
@@ -1366,6 +1370,7 @@ pub enum GitHubError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitHubAvailability {
     MissingCli,
+    UnsupportedCli,
     Unauthenticated,
     NotAssociated,
     Loading {
@@ -1385,6 +1390,7 @@ impl GitHubAvailability {
     pub fn guidance(&self) -> String {
         match self {
             Self::MissingCli => "GitHub CLI was not found on PATH. Install it from https://cli.github.com, then refresh.".into(),
+            Self::UnsupportedCli => "This GitHub CLI does not support gh auth status --json hosts. Upgrade gh from https://cli.github.com, then refresh.".into(),
             Self::Unauthenticated => "GitHub CLI is not signed in. Run gh auth login in a terminal, then refresh.".into(),
             Self::NotAssociated => "This repository has no supported GitHub remote. Add a GitHub remote, then refresh.".into(),
             Self::Loading { .. } => "Connecting to GitHub…".into(),
@@ -1403,6 +1409,7 @@ impl GitHubAvailability {
     pub fn label(&self) -> &'static str {
         match self {
             Self::MissingCli => "Install GitHub CLI from cli.github.com, then refresh.",
+            Self::UnsupportedCli => "Upgrade GitHub CLI from cli.github.com, then refresh.",
             Self::Unauthenticated => "Sign in with gh auth login, then refresh.",
             Self::NotAssociated => "Add a GitHub remote to browse pull requests.",
             Self::Loading { .. } => "Refreshing GitHub.",
@@ -1418,6 +1425,7 @@ impl GitHubAvailability {
 
     pub fn from_error(error: GitHubError) -> Self {
         match error {
+            GitHubError::UnsupportedAuthStatus { .. } => Self::UnsupportedCli,
             GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Spawn => {
                 Self::MissingCli
             }
@@ -1505,6 +1513,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             &self.gh_command(["auth", "status", "--json", "hosts"]),
             cancellation,
         )?;
+        require_auth_status_json(&output, &self.gh)?;
         // gh can return a failing auth exit status while still reporting known
         // accounts as JSON; those hosts remain associated but cannot authorize.
         let envelope: GhAuthEnvelope = parse_json(&output.stdout)?;
@@ -1688,7 +1697,10 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<GhAuthStatus, GitHubError> {
         let command = self.auth_status_command(repository);
-        let output = self.run_checked(&command, repository, cancellation)?;
+        repository.validate()?;
+        let output = self.execute(&command, cancellation)?;
+        require_auth_status_json(&output, &self.gh)?;
+        let output = self.checked_output(output, repository)?;
         attach_process(
             parse_auth_status(&output.stdout, &repository.authority()),
             &output,
@@ -2181,6 +2193,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
         let output = self.execute(command, cancellation)?;
+        self.checked_output(output, repository)
+    }
+
+    fn checked_output(
+        &self,
+        output: ProcessOutput,
+        repository: &GitHubRepoKey,
+    ) -> Result<ProcessOutput, GitHubError> {
         if output.success {
             Ok(output)
         } else if output.exit_code == Some(4) {
@@ -2828,6 +2848,21 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     }
 }
 
+/// Only authentication probes classify unsupported JSON flags. An arbitrary
+/// API failure must retain its original authentication or connectivity error.
+fn require_auth_status_json(output: &ProcessOutput, gh: &Path) -> Result<(), GitHubError> {
+    if !output.success
+        && String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line.trim() == "unknown flag: --json")
+    {
+        return Err(GitHubError::UnsupportedAuthStatus {
+            failure: Box::new(output.clone().require_success(gh).unwrap_err()),
+        });
+    }
+    Ok(())
+}
+
 pub fn parse_auth_status(output: &[u8], host: &str) -> Result<GhAuthStatus, GitHubError> {
     let envelope: GhAuthEnvelope = parse_json(output)?;
     let accounts = envelope
@@ -3381,6 +3416,84 @@ mod tests {
         assert_eq!(status.login.as_deref(), Some("octo"));
         assert_eq!(status.state, GhAuthState::Authenticated);
         assert_eq!(status.scopes.as_deref(), Some("repo"));
+    }
+
+    fn unsupported_auth_json() -> Result<ProcessOutput, ProcessFailure> {
+        let mut output = failed(1, b"")?;
+        output.stderr = b"unknown flag: --json\n\nUsage: gh auth status [flags]\n".to_vec();
+        Ok(output)
+    }
+
+    #[test]
+    fn auth_status_reports_unsupported_json_without_authorizing_a_repository() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![unsupported_auth_json()]));
+        let service = GitHubService::new("gh", fake.clone());
+        let error = service
+            .auth_status(&repository(), &CancellationToken::new())
+            .unwrap_err();
+        assert!(
+            matches!(&error, GitHubError::UnsupportedAuthStatus { failure }
+            if failure.exit_code == Some(1) && failure.stderr.starts_with(b"unknown flag: --json"))
+        );
+        let availability = GitHubAvailability::from_error(error);
+        assert_eq!(availability, GitHubAvailability::UnsupportedCli);
+        assert!(availability.repository_key().is_none());
+        assert!(availability.guidance().contains("Upgrade gh"));
+        assert!(!availability.guidance().contains("connection"));
+        assert_eq!(fake.commands.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn enterprise_remote_probe_reports_unsupported_auth_json() {
+        let service = GitHubService::new(
+            "gh",
+            Arc::new(FakeExecutor::with_outputs(vec![unsupported_auth_json()])),
+        );
+        let error = service
+            .has_associated_remote(
+                &[remote("origin", "https://enterprise.example/owner/repo")],
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, GitHubError::UnsupportedAuthStatus { .. }));
+    }
+
+    #[test]
+    fn auth_json_capability_diagnosis_preserves_other_failures_and_valid_json() {
+        for (code, stderr, expected_authentication) in [
+            (4, "Sign in with gh auth login", true),
+            (1, "error connecting to api.github.com", false),
+            (1, "The API returned unknown flag: --json", false),
+        ] {
+            let mut output = failed(code, b"").unwrap();
+            output.stderr = stderr.as_bytes().to_vec();
+            let service =
+                GitHubService::new("gh", Arc::new(FakeExecutor::with_outputs(vec![Ok(output)])));
+            let error = service
+                .auth_status(&repository(), &CancellationToken::new())
+                .unwrap_err();
+            assert_eq!(
+                matches!(error, GitHubError::AuthenticationRequired { .. }),
+                expected_authentication,
+            );
+            assert!(!matches!(error, GitHubError::UnsupportedAuthStatus { .. }));
+        }
+        // Invalid accounts can still provide configured enterprise hosts.
+        let service = GitHubService::new(
+            "gh",
+            Arc::new(FakeExecutor::with_outputs(vec![failed(
+                1,
+                br#"{"hosts":{"enterprise.example":[]}}"#,
+            )])),
+        );
+        assert!(
+            service
+                .has_associated_remote(
+                    &[remote("origin", "https://enterprise.example/owner/repo")],
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+        );
     }
 
     #[test]
