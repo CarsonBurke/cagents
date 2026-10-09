@@ -30,6 +30,9 @@ use super::{
     },
 };
 
+// A last-frame placeholder only covers rapid navigation and the reveal
+// round trip. Cold terminals must release it even when no new output arrives.
+const RETAINED_FRAME_TTL: Duration = Duration::from_secs(5);
 const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 256;
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
@@ -168,6 +171,11 @@ struct OutputObservation {
     pending: bool,
 }
 
+struct RetainedFrame {
+    snapshot: Arc<RenderSnapshot>,
+    expires: Instant,
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
@@ -176,9 +184,9 @@ struct HostedPublishedState {
     /// view's visuals, so `snapshot` becomes a detached marker and the next
     /// frame is asked for whole. The picture itself is kept here, so a pane
     /// that comes back shows what it last showed until that frame lands
-    /// rather than an empty rectangle. It is one grid per hibernated terminal,
-    /// and is dropped as soon as a live one replaces it.
-    retained: ArcSwapOption<RenderSnapshot>,
+    /// rather than an empty rectangle. The worker releases it after a short
+    /// grace, or immediately when a live frame replaces it.
+    retained: ArcSwapOption<RetainedFrame>,
     generation: AtomicU64,
     event_sequence: AtomicU64,
     activity: Mutex<Option<crate::model::TerminalOutputActivity>>,
@@ -453,6 +461,10 @@ impl HostedPublishedState {
     }
 
     fn hibernate(&self) {
+        self.hibernate_at(Instant::now());
+    }
+
+    fn hibernate_at(&self, now: Instant) {
         self.set_visibility(TerminalVisibility::Hibernated);
         let generation = self.generation.load(Ordering::Acquire);
         // Kept before the marker replaces it, so no draw falls between the
@@ -460,7 +472,10 @@ impl HostedPublishedState {
         // frame arrived keeps the picture it already had.
         let last = self.snapshot.load_full();
         if !last.detached && last.rows > 0 {
-            self.retained.store(Some(Arc::clone(&last)));
+            self.retained.store(Some(Arc::new(RetainedFrame {
+                snapshot: Arc::clone(&last),
+                expires: now + RETAINED_FRAME_TTL,
+            })));
             // A failed attach replaces the grid and then drops the picture.
             // If it did the first before the store above, it did the second
             // before it too, and the picture must not outlive it.
@@ -470,6 +485,37 @@ impl HostedPublishedState {
         }
         self.snapshot
             .store(Arc::new(RenderSnapshot::detached(generation)));
+        // This channel is a data-free worker wake. The acknowledgement
+        // watermark is unchanged, so this does not return extra redraw credit.
+        // Wake after publication even if Hibernate was already drained before
+        // the UI stored the placeholder and its expiration deadline.
+        let _ = self.acknowledgement_tx.try_send(());
+    }
+
+    fn expire_retained(&self, now: Instant) {
+        if self
+            .retained
+            .load()
+            .as_ref()
+            .is_none_or(|frame| frame.expires > now)
+        {
+            return;
+        }
+        self.retained.rcu(|retained| {
+            retained
+                .as_ref()
+                .filter(|frame| frame.expires > now)
+                .cloned()
+        });
+    }
+
+    fn retained_expiration(&self) -> Receiver<Instant> {
+        match self.retained.load().as_ref() {
+            Some(frame) => {
+                crossbeam_channel::after(frame.expires.saturating_duration_since(Instant::now()))
+            }
+            None => crossbeam_channel::never(),
+        }
     }
 
     /// What the view draws: the live grid, or the last one this terminal
@@ -478,8 +524,9 @@ impl HostedPublishedState {
         let snapshot = self.snapshot.load_full();
         if snapshot.detached
             && let Some(retained) = self.retained.load_full()
+            && retained.expires > Instant::now()
         {
-            return retained;
+            return Arc::clone(&retained.snapshot);
         }
         snapshot
     }
@@ -1063,6 +1110,11 @@ impl HostedTerminalHandle {
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
         self.inner.published.hibernate();
+        // Stop can race the command's publication. A terminated worker cannot
+        // service the expiration, so do not leave a placeholder behind it.
+        if self.inner.stop.is_requested() {
+            self.inner.published.retained.store(None);
+        }
         Ok(())
     }
 
@@ -1423,6 +1475,7 @@ impl Drop for ConnectionIo {
 enum ClientWork {
     Stop,
     Acknowledge,
+    RetainedExpired,
     Command(ClientCommand),
     Server(Box<ServerEnvelope>),
     CommandsClosed,
@@ -1433,11 +1486,13 @@ fn wait_for_client_work(
     stop: &WorkerStop,
     commands: &Receiver<ClientCommand>,
     incoming: &Receiver<ServerRead>,
-    acknowledgements: &Receiver<()>,
+    published: &HostedPublishedState,
 ) -> ClientWork {
+    let expiration = published.retained_expiration();
     crossbeam_channel::select_biased! {
         recv(stop.notification()) -> _ => ClientWork::Stop,
-        recv(acknowledgements) -> _ => ClientWork::Acknowledge,
+        recv(published.acknowledgement_rx) -> _ => ClientWork::Acknowledge,
+        recv(expiration) -> _ => ClientWork::RetainedExpired,
         recv(commands) -> command => match command {
             Ok(command) => ClientWork::Command(command),
             Err(_) => ClientWork::CommandsClosed,
@@ -1446,9 +1501,16 @@ fn wait_for_client_work(
     }
 }
 
-fn wait_for_server_or_stop(stop: &WorkerStop, incoming: &Receiver<ServerRead>) -> ClientWork {
+fn wait_for_server_or_stop(
+    stop: &WorkerStop,
+    incoming: &Receiver<ServerRead>,
+    published: &HostedPublishedState,
+) -> ClientWork {
+    let expiration = published.retained_expiration();
     crossbeam_channel::select_biased! {
         recv(stop.notification()) -> _ => ClientWork::Stop,
+        recv(published.acknowledgement_rx) -> _ => ClientWork::Acknowledge,
+        recv(expiration) -> _ => ClientWork::RetainedExpired,
         recv(incoming) -> message => server_work(message),
     }
 }
@@ -1492,6 +1554,7 @@ fn client_loop(
         stop: &stop,
     };
     loop {
+        published.expire_retained(Instant::now());
         if stop.is_requested() {
             break;
         }
@@ -1532,6 +1595,7 @@ fn client_loop(
     // destruction otherwise disconnects `events` before `commands`, briefly
     // accepting input after consumers already observed permanent termination.
     stop.request();
+    published.retained.store(None);
     published.fail_attachment("hosted terminal connection stopped".to_owned());
 }
 
@@ -1653,6 +1717,7 @@ fn serve_connection(
     // timeout can interrupt either the length prefix or its payload.
     let mut handshake_codec = FrameCodec::new(MAX_FRAME_BYTES);
     let (proof, mut attached) = loop {
+        published.expire_retained(Instant::now());
         if stop.is_requested() {
             return ConnectionEnd::Stop;
         }
@@ -1838,6 +1903,7 @@ fn serve_connection(
     }
 
     loop {
+        published.expire_retained(Instant::now());
         if stop.is_requested() {
             connection.close();
             return ConnectionEnd::Stop;
@@ -1911,17 +1977,12 @@ fn serve_connection(
         }
 
         let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
-            wait_for_client_work(
-                stop,
-                commands,
-                connection.incoming(),
-                &published.acknowledgement_rx,
-            )
+            wait_for_client_work(stop, commands, connection.incoming(), published)
         } else {
-            wait_for_server_or_stop(stop, connection.incoming())
+            wait_for_server_or_stop(stop, connection.incoming(), published)
         };
         let envelope = match work {
-            ClientWork::Acknowledge => continue,
+            ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
             ClientWork::Stop => {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -3694,6 +3755,56 @@ mod tests {
     }
 
     #[test]
+    fn hibernated_grid_expires_releases_memory_and_reveals_from_a_full_snapshot() {
+        let (published, _) = published_state(true);
+        published.publish(published_grid(3, "before"));
+        let old = Arc::downgrade(&published.snapshot.load_full());
+        let now = Instant::now();
+        published.hibernate_at(now);
+        assert!(old.upgrade().is_some());
+        assert_eq!(frame_text(&published).as_deref(), Some("before"));
+        published.expire_retained(now + RETAINED_FRAME_TTL - Duration::from_nanos(1));
+        assert!(old.upgrade().is_some());
+        published.expire_retained(now + RETAINED_FRAME_TTL);
+        assert!(
+            old.upgrade().is_none(),
+            "the cold terminal still owns its old grid"
+        );
+        assert!(published.retained.load().is_none());
+        published.set_visible(true);
+        assert_eq!(published.snapshot_cursor(), 0);
+        assert!(published.frame().detached);
+        published.publish(published_grid(3, "after"));
+        assert_eq!(frame_text(&published).as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn idle_and_saturated_workers_wake_to_release_an_expired_grid() {
+        for saturated in [false, true] {
+            let (published, _) = published_state(true);
+            published.publish(published_grid(3, "before"));
+            let old = Arc::downgrade(&published.snapshot.load_full());
+            let stop = WorkerStop::default();
+            let (_command_tx, command_rx) = crossbeam_channel::bounded(COMMAND_CAPACITY);
+            let (_server_tx, server_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
+            published.hibernate_at(Instant::now() - RETAINED_FRAME_TTL);
+            // Publication wakes a worker that might already be waiting before
+            // the UI's Hibernate call finishes. It does not grant redraw credit.
+            assert_eq!(published.acknowledgement_rx.try_recv(), Ok(()));
+            assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 0);
+            let work = if saturated {
+                wait_for_server_or_stop(&stop, &server_rx, &published)
+            } else {
+                wait_for_client_work(&stop, &command_rx, &server_rx, &published)
+            };
+            assert!(matches!(work, ClientWork::RetainedExpired));
+            published.expire_retained(Instant::now());
+            assert!(old.upgrade().is_none());
+            assert!(published.retained.load().is_none());
+        }
+    }
+
+    #[test]
     fn a_view_with_nothing_to_show_keeps_nothing_when_hibernated() {
         // Never painted: there is no last grid.
         let (published, _wake_count) = published_state(true);
@@ -3753,7 +3864,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            wait_for_client_work(&stop, &command_rx, &server_rx, &published.acknowledgement_rx),
+            wait_for_client_work(&stop, &command_rx, &server_rx, &published),
             ClientWork::Command(ClientCommand::Input(bytes)) if bytes == *b"x"
         ));
     }
@@ -3769,12 +3880,7 @@ mod tests {
         published.acknowledge(2);
         published.acknowledge(1);
         assert!(matches!(
-            wait_for_client_work(
-                &stop,
-                &command_rx,
-                &server_rx,
-                &published.acknowledgement_rx
-            ),
+            wait_for_client_work(&stop, &command_rx, &server_rx, &published),
             ClientWork::Acknowledge
         ));
         assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 2);
@@ -3789,12 +3895,7 @@ mod tests {
         );
         published.acknowledge(3);
         assert!(matches!(
-            wait_for_client_work(
-                &stop,
-                &command_rx,
-                &server_rx,
-                &published.acknowledgement_rx
-            ),
+            wait_for_client_work(&stop, &command_rx, &server_rx, &published),
             ClientWork::Acknowledge
         ));
     }
@@ -4044,13 +4145,14 @@ mod tests {
 
     #[test]
     fn requested_stop_wakes_server_only_wait_at_request_saturation() {
+        let (published, _) = published_state(true);
         let stop = WorkerStop::default();
         let (_server_tx, server_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
 
         stop.request();
 
         assert!(matches!(
-            wait_for_server_or_stop(&stop, &server_rx),
+            wait_for_server_or_stop(&stop, &server_rx, &published),
             ClientWork::Stop
         ));
     }
