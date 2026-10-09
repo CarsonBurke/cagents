@@ -2670,7 +2670,15 @@ impl Runtime {
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
             self.cache
                 .get(&item.id)
-                .map(|cached| cached.token)
+                .map(|cached| {
+                    (
+                        cached.token,
+                        cached.image.as_ref().map(iced::widget::image::Handle::id),
+                        cached.image_source.is_some(),
+                        cached.image_requested,
+                        cached.image_unavailable,
+                    )
+                })
                 .hash(&mut hasher);
         }
         hasher.finish()
@@ -4483,6 +4491,28 @@ mod tests {
             ..Snapshot::default()
         });
         runtime.refresh();
+    }
+
+    #[test]
+    fn image_handle_changes_invalidate_retained_turns_even_without_a_loading_frame() {
+        let items = vec![chat::Item {
+            id: "image".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Image {
+                path: "/image.png".into(),
+                description: "Image".into(),
+            },
+            started_at: None,
+            at: None,
+        }];
+        let (mut runtime, _) = frame_cost::live_runtime(&items);
+        let cached = runtime.cache.get_mut("image").unwrap();
+        cached.image_source = None;
+        cached.image = Some(iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]));
+        let before = fingerprints(&runtime, true);
+        runtime.cache.get_mut("image").unwrap().image =
+            Some(iced::widget::image::Handle::from_rgba(1, 1, vec![255; 4]));
+        assert_ne!(before, fingerprints(&runtime, true));
     }
 
     #[test]

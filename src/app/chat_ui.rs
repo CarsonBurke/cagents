@@ -177,6 +177,8 @@ pub enum Action {
     OpenUrl(String),
     OpenDocument(Target, String),
     OpenImage(Target, String),
+    LoadImage(Target, String),
+    ImageLoaded(Target, Arc<chat::Item>, images::Loaded),
     CloseImage,
     ImageNext(bool),
     ImageFit,
@@ -263,6 +265,7 @@ impl Action {
                 | Self::PastedText(..)
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
+                | Self::ImageLoaded(..)
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
@@ -833,6 +836,10 @@ struct CachedItem {
     /// change rather than once per frame.
     detail: Option<String>,
     image: Option<iced::widget::image::Handle>,
+    image_source: Option<Arc<chat::Item>>,
+    image_item: Option<Arc<chat::Item>>,
+    image_requested: bool,
+    image_unavailable: bool,
 }
 impl CachedItem {
     #[cfg(test)]
@@ -848,6 +855,19 @@ impl CachedItem {
         expanded: bool,
         growing: bool,
     ) -> Self {
+        let (image, image_source, image_item, image_requested, image_unavailable) = previous
+            .as_ref()
+            .filter(|cached| cached.token == ChangeToken::of(content))
+            .map(|cached| {
+                (
+                    cached.image.clone(),
+                    cached.image_source.clone(),
+                    cached.image_item.clone(),
+                    cached.image_requested,
+                    cached.image_unavailable,
+                )
+            })
+            .unwrap_or_default();
         let (input, output, preview, patches) = previous
             .map(|cached| {
                 (
@@ -905,7 +925,11 @@ impl CachedItem {
             open: None,
             detail: None,
             stamp: None,
-            image: None,
+            image,
+            image_source,
+            image_item,
+            image_requested,
+            image_unavailable,
         };
         match content {
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
@@ -954,23 +978,7 @@ impl CachedItem {
             ItemContent::Tool { status, .. } => {
                 cached.detail = Some(status_word(*status).to_owned());
             }
-            ItemContent::Image { path, .. } => {
-                cached.image = match path {
-                    path if Path::new(path).is_absolute() => images::file_handle(path),
-                    path if path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES
-                        && path.starts_with("data:image/") =>
-                    {
-                        path.split_once(";base64,")
-                            .and_then(|(_, encoded)| {
-                                base64::engine::general_purpose::STANDARD
-                                    .decode(encoded)
-                                    .ok()
-                            })
-                            .and_then(images::bytes_handle)
-                    }
-                    _ => None,
-                };
-            }
+            ItemContent::Image { .. } => {}
         }
         cached
     }
@@ -2060,8 +2068,21 @@ impl Runtime {
             );
         for (item, growing) in items {
             let token = ChangeToken::of(&item.content);
+            let mut image_changed = false;
             if let Some(cached) = self.cache.get_mut(&item.id) {
-                if cached.token == token {
+                if matches!(item.content, ItemContent::Image { .. }) {
+                    // Snapshot items are immutable. A retained Arc makes the
+                    // common unchanged-item check constant-time; compare image
+                    // content only when a replacement Arc arrives. Tail tokens
+                    // alone can collide for different same-length image paths.
+                    image_changed = cached.image_item.as_ref().is_none_or(|previous| {
+                        !Arc::ptr_eq(previous, item) && previous.content != item.content
+                    });
+                    if !image_changed {
+                        cached.image_item = Some(item.clone());
+                    }
+                }
+                if cached.token == token && !image_changed {
                     if !growing {
                         cached.settle(&item.content, self.syntax_theme);
                     }
@@ -2073,17 +2094,19 @@ impl Runtime {
                     continue;
                 }
             }
-            let previous = self.cache.remove(&item.id);
-            self.cache.insert(
-                item.id.clone(),
-                CachedItem::updated(
-                    &item.content,
-                    self.syntax_theme,
-                    previous,
-                    self.expanded.contains(&item.id),
-                    growing,
-                ),
+            let previous = self.cache.remove(&item.id).filter(|_| !image_changed);
+            let mut cached = CachedItem::updated(
+                &item.content,
+                self.syntax_theme,
+                previous,
+                self.expanded.contains(&item.id),
+                growing,
             );
+            if matches!(item.content, ItemContent::Image { .. }) {
+                cached.image_source = Some(item.clone());
+                cached.image_item = Some(item.clone());
+            }
+            self.cache.insert(item.id.clone(), cached);
         }
         // Nothing streams into an idle conversation, so no block is waiting
         // to be continued.
@@ -4084,17 +4107,21 @@ impl Cagents {
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
         let wakes = Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)));
+        let mut subscriptions = vec![wakes];
+        for card in self.cards.values() {
+            if let CardRuntime::Chat(runtime) = card {
+                subscriptions.extend(images::subscriptions(runtime));
+            }
+        }
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
             if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
         }) {
-            Subscription::batch([
-                wakes,
+            subscriptions.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),
-            ])
-        } else {
-            wakes
+            );
         }
+        Subscription::batch(subscriptions)
     }
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
         let runtime = match self.cards.get(&card) {
@@ -6959,6 +6986,67 @@ impl Cagents {
                     return self.open_document_link(Some(target.card), &raw);
                 }
             }
+            Action::LoadImage(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let item = runtime
+                        .snapshot
+                        .items
+                        .iter()
+                        .chain(
+                            runtime
+                                .snapshot
+                                .subagents
+                                .iter()
+                                .flat_map(|agent| &agent.items),
+                        )
+                        .find(|item| {
+                            item.id == id && matches!(item.content, ItemContent::Image { .. })
+                        })
+                        .cloned();
+                    if let Some(cached) = runtime.cache.get_mut(&id)
+                        && let Some(item) = item
+                    {
+                        cached.image_item = Some(item.clone());
+                        cached.image_source = Some(item);
+                        cached.image = None;
+                        cached.image_requested = true;
+                        cached.image_unavailable = false;
+                    }
+                }
+            }
+            Action::ImageLoaded(target, item, loaded) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime
+                        .snapshot
+                        .items
+                        .iter()
+                        .chain(
+                            runtime
+                                .snapshot
+                                .subagents
+                                .iter()
+                                .flat_map(|agent| &agent.items),
+                        )
+                        .any(|current| current.id == item.id && current.content == item.content)
+                    && let Some(cached) = runtime.cache.get_mut(&item.id)
+                    && cached
+                        .image_item
+                        .as_ref()
+                        .is_some_and(|current| current.content == item.content)
+                    && cached
+                        .image_source
+                        .as_ref()
+                        .is_some_and(|source| Arc::ptr_eq(source, &item))
+                {
+                    cached.image_source = None;
+                    cached.image_requested = false;
+                    cached.image_unavailable = matches!(loaded, images::Loaded::Unavailable);
+                    cached.image = match loaded {
+                        images::Loaded::Ready(handle) => Some(handle),
+                        _ => None,
+                    };
+                }
+            }
             Action::OpenImage(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let gallery = images::Gallery::new(runtime, &id);
@@ -7811,6 +7899,203 @@ mod tests {
         assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
+    }
+    #[test]
+    fn image_loads_ignore_replaced_items_and_retired_runtime_generations() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let image = |path: &str| {
+            Arc::new(chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Image {
+                    path: path.into(),
+                    description: "Image".into(),
+                },
+                started_at: None,
+                at: None,
+            })
+        };
+        let old = image("/old.png");
+        let current = image("/current.png");
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let mut cached = CachedItem::new(&current.content, runtime.syntax_theme);
+        cached.image_source = Some(current.clone());
+        cached.image_item = Some(current.clone());
+        Arc::make_mut(&mut runtime.snapshot).items = vec![current.clone()];
+        runtime.cache.insert(current.id.clone(), cached);
+        let target = runtime.target;
+        let handle = || iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]);
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            old,
+            images::Loaded::Ready(handle()),
+        )));
+        assert!(chat_runtime(&app, card).cache["image"].image.is_none());
+        let retired = Target {
+            generation: target.generation.wrapping_add(1),
+            ..target
+        };
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            retired,
+            current.clone(),
+            images::Loaded::Ready(handle()),
+        )));
+        assert!(chat_runtime(&app, card).cache["image"].image.is_none());
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            current,
+            images::Loaded::Ready(handle()),
+        )));
+        assert!(chat_runtime(&app, card).cache["image"].image.is_some());
+        assert!(
+            chat_runtime(&app, card).cache["image"]
+                .image_source
+                .is_none()
+        );
+        assert!(
+            Action::ImageLoaded(target, image("/unused"), images::Loaded::Unavailable)
+                .allowed_while_modal()
+        );
+    }
+    #[test]
+    fn image_refresh_invalidates_tail_token_collisions_and_accepts_equal_content_replacements() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("images"));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let image = |prefix: &str| {
+            Arc::new(chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Image {
+                    path: format!("/{prefix}/{}.png", "same-tail".repeat(20)),
+                    description: "Image".into(),
+                },
+                started_at: None,
+                at: None,
+            })
+        };
+        let old = image("old");
+        let changed = image("new");
+        assert_eq!(
+            ChangeToken::of(&old.content),
+            ChangeToken::of(&changed.content)
+        );
+        let publish = |app: &mut Cagents, item: Arc<chat::Item>, generation| {
+            handle.replace_snapshot_for_test(Snapshot {
+                items: vec![item],
+                generation,
+                ready: true,
+                ..Snapshot::default()
+            });
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.visible.store(true, Ordering::Relaxed);
+            runtime.refresh();
+        };
+        publish(&mut app, old.clone(), 10);
+        publish(&mut app, changed.clone(), 11);
+        let cached = &chat_runtime(&app, card).cache["image"];
+        assert!(Arc::ptr_eq(cached.image_source.as_ref().unwrap(), &changed));
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            old,
+            images::Loaded::Ready(iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4])),
+        )));
+        assert!(chat_runtime(&app, card).cache["image"].image.is_none());
+        // A new Arc with identical content must not cancel/restart the worker.
+        let equal = image("new");
+        publish(&mut app, equal.clone(), 12);
+        let cached = &chat_runtime(&app, card).cache["image"];
+        assert!(Arc::ptr_eq(cached.image_item.as_ref().unwrap(), &equal));
+        assert!(Arc::ptr_eq(cached.image_source.as_ref().unwrap(), &changed));
+        drop(app.handle_chat_ui(Action::ImageLoaded(
+            target,
+            changed.clone(),
+            images::Loaded::Ready(iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4])),
+        )));
+        assert!(chat_runtime(&app, card).cache["image"].image.is_some());
+        publish(&mut app, image("new"), 13);
+        assert!(chat_runtime(&app, card).cache["image"].image.is_some());
+        assert!(
+            chat_runtime(&app, card).cache["image"]
+                .image_source
+                .is_none()
+        );
+        publish(&mut app, image("old"), 14);
+        assert!(chat_runtime(&app, card).cache["image"].image.is_none());
+        assert!(
+            chat_runtime(&app, card).cache["image"]
+                .image_source
+                .is_some()
+        );
+    }
+    #[test]
+    fn image_loading_only_subscribes_recent_visible_images_and_explicit_older_requests() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let items: Vec<Arc<chat::Item>> = (0..20)
+            .map(|index| {
+                Arc::new(chat::Item {
+                    id: format!("image-{index}"),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Image {
+                        path: format!("/image-{index}.png"),
+                        description: "Image".into(),
+                    },
+                    started_at: None,
+                    at: None,
+                })
+            })
+            .collect();
+        for item in &items {
+            let mut cached = CachedItem::new(&item.content, runtime.syntax_theme);
+            cached.image_source = Some(item.clone());
+            runtime.cache.insert(item.id.clone(), cached);
+        }
+        Arc::make_mut(&mut runtime.snapshot).items = items;
+        runtime.visible.store(true, Ordering::Relaxed);
+        assert_eq!(images::subscriptions(runtime).len(), 8);
+        runtime.cache.get_mut("image-0").unwrap().image_requested = true;
+        assert_eq!(images::subscriptions(runtime).len(), 9);
+        let child = Arc::new(chat::Item {
+            id: "child-image".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Image {
+                path: "/child.png".into(),
+                description: "Child".into(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let mut cached = CachedItem::new(&child.content, runtime.syntax_theme);
+        cached.image_source = Some(child.clone());
+        runtime.cache.insert(child.id.clone(), cached);
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                items: vec![child],
+            });
+        // Hidden child transcripts and the explicit parent request do not
+        // consume worker slots while another transcript is selected.
+        assert_eq!(images::subscriptions(runtime).len(), 9);
+        runtime.selected_subagent = Some("child".into());
+        assert_eq!(images::subscriptions(runtime).len(), 1);
+        runtime.selected_subagent = None;
+        assert_eq!(images::subscriptions(runtime).len(), 9);
+        runtime.visible.store(false, Ordering::Relaxed);
+        assert!(images::subscriptions(runtime).is_empty());
     }
     fn followup(id: u64, text: &str, paths: &[&str]) -> Followup {
         Followup {
