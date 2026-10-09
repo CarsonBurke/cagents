@@ -8,6 +8,7 @@ pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
 mod notifications;
+mod service;
 mod state;
 
 use std::{
