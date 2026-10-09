@@ -57,18 +57,29 @@ impl Fixture {
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         let daemon = Self::start(root.path());
-        let fixture = Self { root, daemon };
+        let mut fixture = Self { root, daemon };
         fixture.ready();
         fixture
     }
 
-    fn ready(&self) {
+    fn ready_status(response: &Value) -> bool {
+        // `running` includes a live process that has not bound its endpoint.
+        // A version reply proves both the control handshake and a request.
+        response["data"]["running"] == true
+            && response["data"]["daemon_version"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty())
+    }
+
+    fn ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let output = self.output(&["daemon", "status"]);
+            self.assert_daemon_alive();
+            let output = self.output_until(&["daemon", "status"], deadline);
+            self.assert_daemon_alive();
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout)
-                    .is_ok_and(|v| v["data"]["running"] == true)
+                    .is_ok_and(|v| Self::ready_status(&v))
             {
                 return;
             }
@@ -81,7 +92,19 @@ impl Fixture {
         }
     }
 
+    fn assert_daemon_alive(&mut self) {
+        assert!(
+            self.daemon.try_wait().unwrap().is_none(),
+            "fixture daemon exited before readiness: {}",
+            fs::read_to_string(self.root.path().join("daemon.log")).unwrap()
+        );
+    }
+
     fn output(&self, arguments: &[&str]) -> Output {
+        self.output_until(arguments, Instant::now() + Duration::from_secs(20))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
         let mut child = Self::command(self.root.path(), env!("CARGO_BIN_EXE_cagents"))
             .arg("--json")
             .args(arguments)
@@ -89,7 +112,6 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -121,6 +143,17 @@ impl Fixture {
         self.daemon = Self::start(self.root.path());
         self.ready();
     }
+}
+
+#[test]
+fn a_live_process_without_a_control_reply_is_not_ready() {
+    // This is the status response during the real pre-bind startup window.
+    let mut status = json!({"ok":true,"data":{"running":true,"daemon_version":null}});
+    assert!(!Fixture::ready_status(&status));
+    status["data"]["daemon_version"] = "verified-daemon-build".into();
+    assert!(Fixture::ready_status(&status));
+    status["data"]["running"] = false.into();
+    assert!(!Fixture::ready_status(&status));
 }
 
 #[test]
