@@ -9,7 +9,7 @@ use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 mod clipboard_image;
@@ -503,10 +503,8 @@ impl State {
 /// FNV-1a over the last bytes of `text`, seeded with `seed` and the text's
 /// byte length.
 ///
-/// The digest is what makes a change token trustworthy without reading a whole
-/// message: the length alone would miss a same-length rewrite of a tool's
-/// output, and an append whose earlier bytes were rewritten would otherwise be
-/// handed to the incremental parser as if it were a plain suffix.
+/// This bounded digest is a hint, not proof of complete content identity.
+/// Earlier bytes may differ while length and trailing bytes remain identical.
 fn tail_digest(seed: u64, text: &str) -> u64 {
     const WINDOW: usize = 64;
     let bytes = text.as_bytes();
@@ -518,13 +516,11 @@ fn tail_digest(seed: u64, text: &str) -> u64 {
     hash
 }
 
-/// A constant-size stand-in for an item's content.
+/// A bounded hint describing an item's shape, length and trailing bytes.
 ///
-/// The daemon coalesces presentation at 50 ms, so `Runtime::refresh` runs about
-/// twenty times a second for the whole of a turn. Deciding whether an item
-/// changed must therefore not touch its body: the window holds up to 128 items
-/// and a long answer is megabytes. The content's shape, its field lengths, and
-/// a bounded tail digest answer that question in constant time.
+/// Different complete contents can have the same token. Reusing a presentation
+/// requires immutable item identity or exact content equality; extending its
+/// parser additionally requires the exact previous text prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ChangeToken {
     /// The content variant plus the flags that sit beside its text.
@@ -671,7 +667,7 @@ impl ChangeToken {
     }
     /// The item's body when the only change since this token was taken is bytes
     /// appended to it, so the cached parse can be extended instead of redone.
-    fn appended<'a>(&self, content: &'a ItemContent) -> Option<&'a str> {
+    fn appended<'a>(&self, previous: &str, content: &'a ItemContent) -> Option<&'a str> {
         let ItemContent::Text {
             text,
             thinking,
@@ -685,7 +681,7 @@ impl ChangeToken {
         }
         // `get` also rejects a rewrite that left the old length mid-character.
         let parsed = text.get(..self.body)?;
-        (tail_digest(0, parsed) == self.digest).then_some(text.as_str())
+        (parsed == previous).then_some(text.as_str())
     }
 }
 
@@ -827,9 +823,8 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
 
 /// One transcript item's presentation, retained across refreshes.
 ///
-/// The body is never copied in: what an item looked like when it was parsed is
-/// recorded as a `ChangeToken`, and the authoritative text stays in the
-/// snapshot the runtime already holds.
+/// Retain the immutable item without copying its body. Tail tokens are cheap
+/// hints; exact content comparisons authorize parser and presentation reuse.
 struct CachedItem {
     stamp: Option<(u64, String, String)>,
     preview: tool_text::Preview,
@@ -837,6 +832,9 @@ struct CachedItem {
     tool_output: Option<tool_text::ToolText>,
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
+    item: Option<Arc<chat::Item>>,
+    /// Unique presentation identity for retained turns, including tail collisions.
+    revision: u64,
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
@@ -862,6 +860,11 @@ struct CachedItem {
     image_evicted: bool,
 }
 impl CachedItem {
+    fn next_revision() -> u64 {
+        static REVISION: AtomicU64 = AtomicU64::new(1);
+        REVISION.fetch_add(1, Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     fn new(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
         Self::updated(content, theme, None, false, false)
@@ -875,6 +878,7 @@ impl CachedItem {
         expanded: bool,
         growing: bool,
     ) -> Self {
+        let item = previous.as_ref().and_then(|cached| cached.item.clone());
         let (
             image,
             image_source,
@@ -949,6 +953,8 @@ impl CachedItem {
             tool_output,
             patches,
             token: ChangeToken::of(content),
+            item,
+            revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
             blocks: HashMap::new(),
@@ -1042,6 +1048,7 @@ impl CachedItem {
             }
         }
         self.highlight(theme);
+        self.revision = Self::next_revision();
     }
 
     /// Hands the parser what was kept back from it while `content`, which is
@@ -2151,15 +2158,23 @@ impl Runtime {
                         cached.image_item = Some(item.clone());
                     }
                 }
-                if cached.token == token && !image_changed {
+                let unchanged = cached.item.as_ref().is_some_and(|previous| {
+                    Arc::ptr_eq(previous, item) || previous.content == item.content
+                });
+                if unchanged {
+                    cached.item = Some(item.clone());
                     if !growing {
                         cached.settle(&item.content, self.syntax_theme);
                     }
                     continue;
                 }
-                if let Some(body) = cached.token.appended(&item.content) {
+                if let Some(previous) = cached.item.as_ref()
+                    && let ItemContent::Text { text, .. } = &previous.content
+                    && let Some(body) = cached.token.appended(text, &item.content)
+                {
                     cached.extend(body, growing, self.syntax_theme);
                     cached.token = token;
+                    cached.item = Some(item.clone());
                     continue;
                 }
             }
@@ -2175,6 +2190,7 @@ impl Runtime {
                 cached.image_source = Some(item.clone());
                 cached.image_item = Some(item.clone());
             }
+            cached.item = Some(item.clone());
             self.cache.insert(item.id.clone(), cached);
         }
         // Nothing streams into an idle conversation, so no block is waiting
@@ -14397,7 +14413,10 @@ mod tests {
                 continue;
             }
             let content = text(&BODY[..end]);
-            let Some(body) = streamed.token.appended(&content) else {
+            let Some(body) = streamed
+                .token
+                .appended(&BODY[..streamed.token.body], &content)
+            else {
                 panic!("a longer prefix of the same body must read as an append");
             };
             streamed.extend(body, true, THEME);
@@ -14439,7 +14458,10 @@ mod tests {
                 .filter(|end| end % step == 0 || *end == BODY.len())
             {
                 let content = text(&BODY[..end]);
-                let body = streamed.token.appended(&content).expect("an append");
+                let body = streamed
+                    .token
+                    .appended(&BODY[..streamed.token.body], &content)
+                    .expect("an append");
                 streamed.extend(body, true, THEME);
                 streamed.token = ChangeToken::of(&content);
             }
@@ -14686,7 +14708,7 @@ mod tests {
                     }
                     let grown = streamed
                         .token
-                        .appended(&content)
+                        .appended(&body[..streamed.token.body], &content)
                         .expect("a longer prefix of the same body reads as an append");
                     streamed.extend(grown, true, THEME);
                     streamed.token = ChangeToken::of(&content);
@@ -14730,43 +14752,61 @@ mod tests {
         );
     }
 
-    /// The token is what licenses reusing a parse, so it must refuse anything
-    /// that is not bytes added to the end.
+    /// Parser continuation requires the complete previous prefix and matching
+    /// presentation flags, rather than a bounded digest of that prefix.
     #[test]
     fn change_token_refuses_a_rewritten_body() {
         const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
         let cached = CachedItem::new(&text("hello world"), THEME);
         assert_eq!(
-            cached.token.appended(&text("hello world and more")),
+            cached
+                .token
+                .appended("hello world", &text("hello world and more")),
             Some("hello world and more")
         );
         assert!(
             cached
                 .token
-                .appended(&text("HELLO WORLD and more"))
+                .appended("hello world", &text("HELLO WORLD and more"))
                 .is_none()
         );
-        assert!(cached.token.appended(&text("hello world")).is_none());
-        assert!(cached.token.appended(&text("hello")).is_none());
         assert!(
             cached
                 .token
-                .appended(&ItemContent::Text {
-                    text: "hello world and more".to_owned(),
-                    thinking: true,
-                    phase: chat::Phase::Final,
-                })
+                .appended("hello world", &text("hello world"))
+                .is_none()
+        );
+        assert!(
+            cached
+                .token
+                .appended("hello world", &text("hello"))
+                .is_none()
+        );
+        assert!(
+            cached
+                .token
+                .appended(
+                    "hello world",
+                    &ItemContent::Text {
+                        text: "hello world and more".to_owned(),
+                        thinking: true,
+                        phase: chat::Phase::Final,
+                    }
+                )
                 .is_none(),
             "thinking text is collapsed differently and is not the same item"
         );
         assert!(
             cached
                 .token
-                .appended(&ItemContent::Text {
-                    text: "hello world and more".to_owned(),
-                    thinking: false,
-                    phase: chat::Phase::Commentary,
-                })
+                .appended(
+                    "hello world",
+                    &ItemContent::Text {
+                        text: "hello world and more".to_owned(),
+                        thinking: false,
+                        phase: chat::Phase::Commentary,
+                    }
+                )
                 .is_none(),
             "narration and an answer are typeset differently, so a phase change \
              is not an append"
