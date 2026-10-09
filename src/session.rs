@@ -347,6 +347,7 @@ enum ConversionCheckpoint {
     PaneAdoptions {
         snapshot: Arc<WorkspaceState>,
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+        restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
@@ -580,6 +581,15 @@ impl SessionRuntime {
         state: Arc<WorkspaceState>,
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     ) {
+        self.snapshot_terminal_panes(state, adoptions, Vec::new());
+    }
+
+    pub fn snapshot_terminal_panes(
+        &self,
+        state: Arc<WorkspaceState>,
+        adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+        restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
@@ -600,6 +610,7 @@ impl SessionRuntime {
                 .push_back(ConversionCheckpoint::PaneAdoptions {
                     snapshot: state,
                     adoptions,
+                    restorations,
                 });
             changed.notify_one();
         }
@@ -1308,6 +1319,21 @@ trait SessionStore {
             ))
         }
     }
+    fn save_workspace_with_terminal_panes(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[crate::persistence::TerminalPaneAdoption],
+        restorations: &[crate::persistence::TerminalPaneRestoration],
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        if restorations.is_empty() {
+            self.save_workspace_with_terminal_adoptions(state, base, adoptions)
+        } else {
+            Err(StoreError::InvalidState(
+                "This store does not support restored pane ownership".into(),
+            ))
+        }
+    }
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError>;
     fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError>;
     /// Reads the generations storage currently holds for a workspace, so a
@@ -1372,6 +1398,15 @@ impl SessionStore for StateStore {
         adoptions: &[crate::persistence::TerminalPaneAdoption],
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_with_terminal_adoptions(self, state, base, adoptions)
+    }
+    fn save_workspace_with_terminal_panes(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[crate::persistence::TerminalPaneAdoption],
+        restorations: &[crate::persistence::TerminalPaneRestoration],
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace_with_terminal_panes(self, state, base, adoptions, restorations)
     }
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
         Self::save_project(self, project)
@@ -1449,6 +1484,15 @@ impl SessionStore for Arc<StateStore> {
         adoptions: &[crate::persistence::TerminalPaneAdoption],
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_with_terminal_adoptions(self, state, base, adoptions)
+    }
+    fn save_workspace_with_terminal_panes(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        adoptions: &[crate::persistence::TerminalPaneAdoption],
+        restorations: &[crate::persistence::TerminalPaneRestoration],
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace_with_terminal_panes(self, state, base, adoptions, restorations)
     }
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
         StateStore::save_project(self, project)
@@ -1676,12 +1720,17 @@ impl PendingWrites {
             else {
                 return Ok(());
             };
-            let (checkpoint, adoptions) = match checkpoint {
+            let (checkpoint, adoptions, restorations) = match checkpoint {
                 ConversionCheckpoint::PaneAdoptions {
                     snapshot,
                     adoptions,
-                } => (ConversionCheckpoint::Snapshot(snapshot), adoptions),
-                other => (other, Vec::new()),
+                    restorations,
+                } => (
+                    ConversionCheckpoint::Snapshot(snapshot),
+                    adoptions,
+                    restorations,
+                ),
+                other => (other, Vec::new(), Vec::new()),
             };
             match checkpoint {
                 ConversionCheckpoint::PaneAdoptions { .. } => unreachable!(),
@@ -1739,13 +1788,14 @@ impl PendingWrites {
                             }
                         }
                     }
-                    match store.save_workspace_with_terminal_adoptions(
+                    match store.save_workspace_with_terminal_panes(
                         &snapshot,
                         SnapshotBase {
                             workspace: self.workspace_generation,
                             cards: &self.card_generations,
                         },
                         &adoptions,
+                        &restorations,
                     ) {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
@@ -1759,14 +1809,17 @@ impl PendingWrites {
                             if autosave {
                                 self.workspace = Some(snapshot);
                             } else {
-                                self.conversions.push_front(if adoptions.is_empty() {
-                                    ConversionCheckpoint::Snapshot(snapshot)
-                                } else {
-                                    ConversionCheckpoint::PaneAdoptions {
-                                        snapshot,
-                                        adoptions,
-                                    }
-                                });
+                                self.conversions.push_front(
+                                    if adoptions.is_empty() && restorations.is_empty() {
+                                        ConversionCheckpoint::Snapshot(snapshot)
+                                    } else {
+                                        ConversionCheckpoint::PaneAdoptions {
+                                            snapshot,
+                                            adoptions,
+                                            restorations,
+                                        }
+                                    },
+                                );
                             }
                             return Err(error);
                         }
@@ -4484,6 +4537,69 @@ mod tests {
         state.cards[1].title = "canonical shell".into();
         runtime.snapshot(Arc::new(state.clone()));
         runtime.flush(timeout).unwrap();
+        runtime.shutdown();
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+        let restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.focused, Some(canonical_id));
+        assert!(restored.cards.iter().any(|card| card.id == canonical_id
+            && card.title == "canonical shell"
+            && card.existence.is_open()));
+        assert!(
+            !store
+                .load_card(alias, None)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+    }
+
+    #[test]
+    fn writer_resolves_terminal_restoration_after_pending_closure_and_before_later_snapshots() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("canonical-restoration.sqlite3");
+        let boot = BootId::new("boot-canonical-restoration");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        let alias = state.cards[0].id;
+        let CardKind::Terminal(session) = &state.cards[0].kind else {
+            panic!("terminal fixture")
+        };
+        let terminal = session.id;
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+
+        let mut canonical = state.cards[0].clone();
+        canonical.id = CardId::new();
+        let canonical_id = canonical.id;
+        state.cards[0].existence = closed();
+        state.focused = None;
+        // This close may still be coalesced when restoration arrives. The
+        // checkpoint must commit it before resolving the actual recipe owner.
+        runtime.snapshot(Arc::new(state.clone()));
+        state.cards.push(canonical);
+        state.focused = Some(canonical_id);
+        let restoration = crate::persistence::TerminalPaneRestoration {
+            canonical: canonical_id,
+            terminal,
+        };
+        runtime.snapshot_terminal_panes(Arc::new(state.clone()), Vec::new(), vec![restoration]);
+        state.cards[1].title = "canonical shell".into();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        // Repeated model observations are idempotent even when the historical
+        // closed alias still exists in the snapshot.
+        runtime.snapshot_terminal_panes(
+            Arc::new(state.clone()),
+            Vec::new(),
+            vec![restoration, restoration],
+        );
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
         runtime.shutdown();
         let store = StateStore::open(&path, boot).unwrap();
         assert!(!store.recovery_report().dirty_shutdown);

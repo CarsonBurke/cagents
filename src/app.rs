@@ -6872,6 +6872,7 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
+        self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
                 .durable
@@ -6892,10 +6893,11 @@ impl Cagents {
         let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
-            if adoptions.is_empty() {
+            let restorations = std::mem::take(&mut self.shared_views.restorations);
+            if adoptions.is_empty() && restorations.is_empty() {
                 session.snapshot(saved);
             } else {
-                session.snapshot_terminal_adoptions(saved, adoptions);
+                session.snapshot_terminal_panes(saved, adoptions, restorations);
             }
         }
     }
