@@ -549,12 +549,13 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
             {
                 return Err("select 1–256 worktree-relative paths".into());
             }
-            let command = if staging {
-                command.args(["--literal-pathspecs", "add", "--"])
+            if staging {
+                command
+                    .args(["--literal-pathspecs", "add", "--"])
+                    .args(paths)
             } else {
-                command.args(["--literal-pathspecs", "restore", "--staged", "--"])
-            };
-            command.args(paths)
+                unstage_command(command, paths)?
+            }
         }
         GitOperation::Commit { message } => {
             if message.trim().is_empty() || message.len() > 16 * 1024 {
@@ -571,9 +572,255 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
     }
     String::from_utf8(output.stdout).map_err(|_| "Git output is not UTF-8".into())
 }
+/// Existing commits use the original restore operation. An unborn branch
+/// instead removes selected index entries, leaving even edited files intact.
+#[cfg(feature = "host")]
+fn unstage_command(
+    command: crate::process::CommandSpec,
+    paths: Vec<PathBuf>,
+) -> Result<crate::process::CommandSpec, String> {
+    use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let run = |command: CommandSpec| {
+        SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .map_err(|error| error.to_string())
+    };
+    let restore = || {
+        command
+            .clone()
+            .args(["--literal-pathspecs", "restore", "--staged", "--"])
+            .args(paths.clone())
+    };
+    let head = run(command
+        .clone()
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]))?;
+    if head.success {
+        return Ok(restore());
+    }
+    if head.exit_code != Some(1) {
+        return Err("Cannot determine HEAD; refusing to change the index".into());
+    }
+    // A failed revision lookup alone is not proof of an unborn branch: an
+    // existing ref can contain an invalid object ID or be unreadable.
+    let symbolic = run(command.clone().args(["symbolic-ref", "--quiet", "HEAD"]))?;
+    let branch = symbolic.stdout.strip_suffix(b"\n");
+    let Some(branch) = branch.filter(|branch| {
+        symbolic.success && branch.starts_with(b"refs/heads/") && branch.len() > 11
+    }) else {
+        return Err(
+            "HEAD is neither a valid commit nor an unborn branch; the index was left unchanged"
+                .into(),
+        );
+    };
+    let reference = run(command
+        .clone()
+        .args(["show-ref", "--verify", "--quiet", "--"])
+        .arg(OsString::from_vec(branch.to_vec())))?;
+    if reference.success {
+        // Preserve existing-HEAD behavior even when the ref cannot be peeled
+        // to a commit; restore itself must accept or refuse that revision.
+        return Ok(restore());
+    }
+    if reference.exit_code != Some(1) || !reference.stderr.is_empty() {
+        return Err(
+            "The current branch reference is unavailable; the index was left unchanged".into(),
+        );
+    }
+    let indexed = run(command
+        .clone()
+        .args(["--literal-pathspecs", "ls-files", "--cached", "-z", "--"])
+        .args(paths))?;
+    if !indexed.success {
+        return Err(String::from_utf8_lossy(&indexed.stderr).into_owned());
+    }
+    if !indexed.stdout.is_empty() && !indexed.stdout.ends_with(b"\0") {
+        return Err(
+            "Git returned an invalid indexed-path list; the index was left unchanged".into(),
+        );
+    }
+    // NUL-delimited exact indexed names also handle directory selections,
+    // arbitrary filename bytes, option-like names and an empty selection.
+    Ok(command
+        .args([
+            "--literal-pathspecs",
+            "update-index",
+            "--force-remove",
+            "-z",
+            "--stdin",
+        ])
+        .stdin(indexed.stdout))
+}
+
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
+    fn git_output(root: &std::path::Path, arguments: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn remote_unstage_before_first_commit_preserves_edits_and_unselected_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git_output(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir(root.join("selected dir")).unwrap();
+        let selected = [
+            "-option",
+            "selected dir/literal[1].txt",
+            "selected dir/second.txt",
+        ];
+        for name in selected.into_iter().chain(["keep.txt"]) {
+            std::fs::write(root.join(name), "staged version\n").unwrap();
+        }
+        let invoke = |operation| {
+            execute(Operation::Git {
+                root: root.into(),
+                operation,
+            })
+        };
+        invoke(GitOperation::Stage {
+            paths: vec!["-option".into(), "selected dir".into(), "keep.txt".into()],
+        })
+        .unwrap();
+        for name in selected {
+            std::fs::write(root.join(name), "edited after staging\n").unwrap();
+        }
+        invoke(GitOperation::Unstage {
+            paths: vec!["-option".into(), "selected dir".into()],
+        })
+        .unwrap();
+        assert_eq!(git_output(root, &["ls-files", "-z"]), b"keep.txt\0");
+        for name in selected {
+            assert_eq!(
+                std::fs::read(root.join(name)).unwrap(),
+                b"edited after staging\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read(root.join("keep.txt")).unwrap(),
+            b"staged version\n"
+        );
+        // An unmatched selection is a harmless no-op, not an index-wide clear.
+        invoke(GitOperation::Unstage {
+            paths: vec!["absent.txt".into()],
+        })
+        .unwrap();
+        assert_eq!(git_output(root, &["ls-files", "-z"]), b"keep.txt\0");
+    }
+
+    #[test]
+    fn remote_unstage_preserves_existing_head_restore_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git_output(root, &["init", "-q", "-b", "main"]);
+        git_output(root, &["config", "user.name", "Test"]);
+        git_output(root, &["config", "user.email", "test@example.invalid"]);
+        for name in ["selected.txt", "keep.txt"] {
+            std::fs::write(root.join(name), "committed version\n").unwrap();
+        }
+        git_output(root, &["add", "--", "selected.txt", "keep.txt"]);
+        git_output(root, &["commit", "-q", "-m", "initial"]);
+        let head = git_output(root, &["rev-parse", "HEAD"]);
+        for name in ["selected.txt", "keep.txt"] {
+            std::fs::write(root.join(name), "new staged version\n").unwrap();
+        }
+        git_output(root, &["add", "--", "selected.txt", "keep.txt"]);
+        std::fs::write(root.join("selected.txt"), "edited after staging\n").unwrap();
+        execute(Operation::Git {
+            root: root.into(),
+            operation: GitOperation::Unstage {
+                paths: vec!["selected.txt".into()],
+            },
+        })
+        .unwrap();
+        assert_eq!(git_output(root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git_output(root, &["diff", "--cached", "--name-only", "-z"]),
+            b"keep.txt\0"
+        );
+        assert_eq!(
+            git_output(root, &["show", ":selected.txt"]),
+            b"committed version\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("selected.txt")).unwrap(),
+            b"edited after staging\n"
+        );
+    }
+
+    #[test]
+    fn remote_unstage_refuses_damaged_head_without_changing_the_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git_output(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("selected.txt"), "working bytes\n").unwrap();
+        git_output(root, &["add", "--", "selected.txt"]);
+        let tree = git_output(root, &["write-tree"]);
+        let valid_commit = git_output(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit-tree",
+                std::str::from_utf8(&tree).unwrap().trim(),
+                "-m",
+                "fixture",
+            ],
+        );
+        let index = root.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let reference = root.join(".git/refs/heads/main");
+        let invoke = || {
+            execute(Operation::Git {
+                root: root.into(),
+                operation: GitOperation::Unstage {
+                    paths: vec!["selected.txt".into()],
+                },
+            })
+        };
+        for content in [
+            "broken reference\n",
+            "1111111111111111111111111111111111111111\n",
+        ] {
+            std::fs::write(&reference, content).unwrap();
+            assert!(invoke().is_err());
+            assert_eq!(std::fs::read(&index).unwrap(), before);
+        }
+        // An unreadable ref must not become an unborn-branch fallback. Root
+        // bypasses ordinary file permissions, so this assertion is non-root.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::write(&reference, valid_commit).unwrap();
+            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0)).unwrap();
+            let outcome = invoke();
+            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(outcome.is_err());
+            assert_eq!(std::fs::read(&index).unwrap(), before);
+        }
+        std::fs::remove_file(reference).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "damaged HEAD\n").unwrap();
+        assert!(invoke().is_err());
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.join("selected.txt")).unwrap(),
+            b"working bytes\n"
+        );
+    }
+
     #[test]
     fn git_operations_and_worktrees_target_the_daemon_directory() {
         let directory = tempfile::tempdir().unwrap();
