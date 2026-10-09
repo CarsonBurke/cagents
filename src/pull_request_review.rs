@@ -527,6 +527,7 @@ impl State {
         } else {
             return ActionTask::none();
         };
+        let write_order = cache::WriteOrder::capture();
         let snapshot = cache::Snapshot {
             key,
             viewer,
@@ -561,9 +562,11 @@ impl State {
         let generation = self.generation;
         ActionTask::perform(
             async move {
-                let result = tokio::task::spawn_blocking(move || cache.save(&snapshot, order))
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()));
+                let result = tokio::task::spawn_blocking(move || {
+                    write_order.and_then(|write_order| cache.save(&snapshot, &write_order))
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
                 Action::CacheSaved {
                     generation,
                     order,

@@ -520,38 +520,10 @@ enum PreferenceFile {
     Assistance,
     Shortcuts,
     Session,
-    Review,
 }
 
 impl PreferenceFile {
-    const COUNT: usize = 5;
-}
-
-struct ReviewPreferenceStore {
-    store: pull_request_review::cache::JsonStore,
-    lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
-}
-
-impl pull_request_review::cache::Store for ReviewPreferenceStore {
-    fn load(
-        &self,
-        key: &cagents::github::PullRequestKey,
-    ) -> Result<Option<pull_request_review::cache::Snapshot>, String> {
-        self.store.load(key)
-    }
-
-    fn save(
-        &self,
-        snapshot: &pull_request_review::cache::Snapshot,
-        order: u64,
-    ) -> Result<(), String> {
-        let mut lane = self.lane.lock().unwrap_or_else(|error| error.into_inner());
-        // Writes are per-PR deltas. JsonStore rejects stale writes for that
-        // key; a newer write to a different PR must not discard this one.
-        self.store.save(snapshot, order)?;
-        lane[PreferenceFile::Review as usize] = lane[PreferenceFile::Review as usize].max(order);
-        Ok(())
-    }
+    const COUNT: usize = 4;
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -1520,12 +1492,9 @@ impl Editor {
             Arc::new(GitHubService::system("gh")),
             RepositoryService::system("git"),
         )
-        .with_cache(Some(Arc::new(ReviewPreferenceStore {
-            store: pull_request_review::cache::JsonStore::new(
-                self.settings_path.with_file_name("review.json"),
-            ),
-            lane: Arc::clone(&self.preference_lane),
-        })));
+        .with_cache(Some(Arc::new(pull_request_review::cache::JsonStore::new(
+            self.settings_path.with_file_name("review.json"),
+        ))));
         let review_task = review
             .set_source(review_source(&descriptor_root, opened.snapshot.as_ref()))
             .map(move |action| Message::PullRequestReview(id, action))
