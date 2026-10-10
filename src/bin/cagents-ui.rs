@@ -29,7 +29,15 @@ Options:
   -h, --help                Show this help
 ";
 
-fn main() -> std::process::ExitCode {
+pub(crate) fn main() -> std::process::ExitCode {
+    main_with_before_start(|| Ok(()))
+}
+
+/// Development hosts may prepare a replacement after argv and helper modes
+/// settle. Production startup delegates a no-op and keeps the same behavior.
+pub(crate) fn main_with_before_start(
+    before_start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> std::process::ExitCode {
     // SAFETY: first statement of main, before any thread exists.
     unsafe { cagents::account::detach_inherited_selections() };
     // The document render helper answers before anything else exists. Its
@@ -65,6 +73,9 @@ fn main() -> std::process::ExitCode {
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(error) => return report(Err(error)),
     };
+    if let Err(error) = before_start() {
+        return report(Err(error));
+    }
 
     // Diagnostics come before every other statement. The startup sequence
     // below - window lease, session store, activation socket, daemon launch,

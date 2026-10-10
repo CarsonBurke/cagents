@@ -92,6 +92,8 @@ scripts/run-development                 # with the embedded browser
 | Option | Effect |
 | --- | --- |
 | `--browserless` | Build without Servo and open saved browser URLs in the system browser |
+| `--hot` | Experimental browserless Linux body-only UI hot reload; requires the exact recorded cargo-hot installation and bubblewrap |
+| `--hot-integrated` | Explicitly select embedded-browser hot reload instead |
 | `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
 | `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
@@ -130,6 +132,61 @@ How the runner works:
 
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
+
+### Experimental hot reload
+
+The opt-in lane uses the same application modules and startup entry in a separate
+`cagents-ui-hot` binary. This matters because cargo-hot patches its selected
+binary only: the normal UI's views live in the separate `cagents` library. Its
+source watcher covers `src/`, including those actual views, without maintaining
+another module list. Normal and release defaults do not enable `hot-reload`.
+
+Install the pinned external tool explicitly if you choose this lane; the runner
+never installs tools. Bubblewrap and Python3 must already be available on Linux.
+The runner checks Cargo's recorded installation source/version before building
+or stopping the development daemon. Cargo-hot does not provide a version flag.
+
+```sh
+cargo install --locked --git https://github.com/hecrj/cargo-hot.git \
+  --rev 0d57d0664bf2e1c16ba30c34bcfe78cd3eed665f cargo-hot
+scripts/run-development --hot
+# Explicitly opt into the more expensive embedded-browser hot build:
+scripts/run-development --hot-integrated
+```
+
+The helper builds three native Linux products separately using locked
+`dev-runtime` builds, then stages the matched CLI/daemon beside cargo-hot's
+private executable bundle. Cargo-hot always targets the native host triple,
+adds a linker and saved compilation objects, and may need a substantial first
+build even with the ordinary runner's warmed cache. `CARGO_BUILD_JOBS` controls
+its spawned build jobs. Only one hot session can run at a time: the upstream
+client/server uses localhost port1100, and all development sessions share state.
+
+Every helper Cargo invocation runs with `Cargo.lock` mounted read-only in a
+private bubblewrap mount namespace. This also refuses atomic replacement/unlink
+of that file. The ordinary user's filesystem, device, desktop and network access
+are retained; source edits remain writable. The hot tool itself runs with Cargo
+offline because it does not forward `--locked`. A missing/incompatible lock or
+uncached dependency fails instead of rewriting the repository lock. Resolve any
+intentional dependency change through ordinary locked-development maintenance
+and restart; no hash-only lock guard or automatic fallback is used.
+
+Change view/handler **bodies** only while patching. Changes to State/Message
+layout, dependencies, startup, features/profiles, daemon or terminal protocol
+need a cold restart with the normal runner (and `--fresh-daemon` for host/shared
+changes). A watched source change is not proof that it was safely patched.
+`--hot --fresh-daemon` intent is consumed by the hot entry only after cargo-hot
+has successfully linked and launched the actual replacement executable, after
+shared argument parsing and before ordinary UI startup.
+It verifies the matched sibling CLI version, stops the development jobs and
+waits for the private socket to close. Any replacement build failure leaves the
+existing daemon running. Help/invalid arguments/internal helper launches cannot
+consume restart intent. Valid named/device/new-window arguments remain supported.
+
+Qualification for this lane includes an actual view-only edit, unchanged UI PID
+and retained in-memory draft, plus ordinary browserless/integrated builds and
+the real lock mount regression (`python3 tests/hot-development.py`). Source
+implementation alone does not establish native hotpatch acceptance.
 
 ## Build and test resource usage
 
