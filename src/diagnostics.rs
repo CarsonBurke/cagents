@@ -601,7 +601,7 @@ impl ProductReport {
                     || observed.persistence == Persistence::Failed
                 {
                     Some(false)
-                } else if observed.skipped_events != 0 {
+                } else if observed.skipped_events != 0 || !started {
                     None
                 } else if writer_seen {
                     match observed.persistence {
@@ -808,6 +808,39 @@ mod tests {
         assert_eq!(current.persistence, Persistence::Unknown);
         assert_eq!(current.final_flush, None);
     }
+    #[test]
+    fn bounded_recent_history_cannot_claim_clean_after_losing_run_startup_context() {
+        let (_root, path) = fixture();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder.append(Event::Panic { recovered: false }).unwrap();
+        for _ in 0..RECENT_RECORDS {
+            recorder.append(Event::PersistenceRecovered).unwrap();
+        }
+        recorder
+            .append(Event::FinalFlush {
+                complete: true,
+                unsaved: 0,
+                refused: 0,
+                category: None,
+            })
+            .unwrap();
+        recorder.append(Event::Exit { success: true }).unwrap();
+        let report = inspect_at(path).unwrap();
+        let product = &report.products[0];
+        assert!(product.readable);
+        assert_eq!(product.records.len(), RECENT_RECORDS);
+        assert!(
+            !product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Startup))
+        );
+        let last = product.last_observed.as_ref().unwrap();
+        assert_eq!(last.persistence, Persistence::Complete);
+        assert_eq!(last.clean_shutdown, None);
+    }
+
     #[test]
     fn historical_failure_remains_visible_without_changing_a_later_runs_health() {
         let (_root, path) = fixture();

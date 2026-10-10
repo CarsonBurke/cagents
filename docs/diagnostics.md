@@ -49,7 +49,9 @@ JSON reports contain up to 256 redacted recent records per product and a
 and health are **last observed**, not live sibling executable or process checks.
 The human report also shows the latest retained typed failure with its time and
 run, labelled historical because it may have recovered; it does not change the
-last-observed run's health.
+last-observed run's health. The failure line is limited to the recent record
+window. If a run's startup has fallen out of that bounded window, its clean
+shutdown remains unknown even when its final persistence result is retained.
 Missing, unsafe, malformed, or truncated evidence has unknown health. A fresh run
 never inherits a previous run's clean shutdown or successful flush. When no final
 flush was recorded, the command cannot claim whether unsaved writes survived. Abrupt termination, including a daemon
