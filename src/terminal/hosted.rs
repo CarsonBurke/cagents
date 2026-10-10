@@ -1231,7 +1231,9 @@ fn ensure_daemon_ready_at(
         socket,
         timeout,
         &daemon_binary,
-        systemd_user_manager_available(),
+        systemd_user_manager_available()
+            && !crate::instance::has_inherited_daemon_fence()
+                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?,
         |scoped| spawn_daemon(&daemon_binary, application, scoped),
     )
 }
@@ -1349,6 +1351,7 @@ fn spawn_daemon(
     unsafe {
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
+    crate::instance::inherit_daemon_fence(&mut command)?;
     command.spawn()
 }
 

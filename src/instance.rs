@@ -24,6 +24,12 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+mod daemon_admission;
+pub(crate) use daemon_admission::{
+    DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
+    inherit_daemon_fence,
+};
+
 use directories::ProjectDirs;
 use thiserror::Error;
 
@@ -237,7 +243,8 @@ impl WindowLease {
                 &runtime.join(slot_lock_name(&slot)),
                 libc::LOCK_EX | libc::LOCK_NB,
             ) {
-                Ok(lock) => {
+                Ok(mut lock) => {
+                    daemon_admission::publish_capability(&mut lock.0)?;
                     return Ok((
                         Self {
                             _legacy_fence: legacy,

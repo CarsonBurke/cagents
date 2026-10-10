@@ -26,13 +26,21 @@ fn main() -> std::process::ExitCode {
     // Informational flags exit before opening runtime state or taking its
     // daemon lease. Internal precheck owners keep their separate entrypoint.
     command().get_matches();
-    // Both of these come first: the daemon is spawned with stdout and stderr
+    // SAFETY: entry is still single-threaded; helper-only mode returned above.
+    let admission = match unsafe { cagents::host::prepare_daemon_admission() } {
+        Ok(admission) => admission,
+        Err(error) => {
+            eprintln!("cagentsd: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // Both of these precede runtime startup: the daemon is spawned with stdout and stderr
     // on /dev/null, so without a durable sink a panic in the process that owns
     // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.
     cagents::instance::install_panic_hook("cagentsd");
     cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
     tracing::info!(version = cagents::VERSION, "starting cagentsd");
-    match cagents::host::run() {
+    match cagents::host::run(admission) {
         Ok(()) => {
             cagents::diagnostics::record(cagents::diagnostics::Event::Exit { success: true });
             std::process::ExitCode::SUCCESS

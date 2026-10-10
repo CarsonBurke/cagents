@@ -175,7 +175,27 @@ pub fn run_automation_helper() -> Option<Result<(), String>> {
     automations::helper_entry()
 }
 
-pub fn run() -> Result<(), HostError> {
+/// Holds launch exclusion until the daemon listener is ready.
+pub struct DaemonAdmission {
+    _guard: crate::instance::DaemonAdmissionGuard,
+}
+
+/// Authenticate startup authority before diagnostics or runtime threads exist.
+///
+/// # Safety
+/// Call from the single-threaded entry point: this clears inherited authority
+/// markers so later terminal children cannot inherit a consumed descriptor.
+pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
+    let admission = crate::instance::DaemonAdmissionGuard::acquire()?;
+    // SAFETY: the caller guarantees that no other thread accesses environment.
+    unsafe {
+        std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);
+        std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
+    }
+    Ok(DaemonAdmission { _guard: admission })
+}
+
+pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
     let proof = HostSessionProof {
@@ -234,6 +254,7 @@ pub fn run() -> Result<(), HostError> {
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
     let _tray = crate::tray::start(move || {
