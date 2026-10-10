@@ -296,20 +296,41 @@ impl Renderer<'_> {
             }
             Item::Rule => iced::widget::rule::horizontal(2).into(),
             Item::Table { columns, rows } => self.table(settings, columns, rows),
-            Item::Image { alt, .. } => widget::container(selectable_prose::text(
-                alt.spans(settings.style),
-                settings.text_size,
-                iced::Font::default(),
-                self.target,
-                self.find,
-            ))
-            .padding(settings.spacing.0)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_S; 4],
-                true,
-            ))
-            .into(),
+            Item::Image { url, title, alt } => {
+                let mut rows = Vec::new();
+                let alt = alt.spans(settings.style);
+                if !alt.is_empty() {
+                    rows.push(selectable_prose::text(
+                        alt,
+                        settings.text_size,
+                        iced::Font::default(),
+                        self.target,
+                        self.find,
+                    ));
+                }
+                if !title.is_empty() {
+                    rows.push(selectable_prose::text(
+                        vec![Span::new(title.clone())].into(),
+                        design::TEXT_CAPTION.into(),
+                        iced::Font::default(),
+                        self.target,
+                        self.find,
+                    ));
+                }
+                rows.push(
+                    widget::button::link("Open image source")
+                        .on_press(link(self.target, url.clone()))
+                        .into(),
+                );
+                widget::container(widget::column::with_children(rows).spacing(settings.spacing.0))
+                    .padding(settings.spacing.0)
+                    .class(design::surface(
+                        Some(design::sunken),
+                        [design::RADIUS_S; 4],
+                        true,
+                    ))
+                    .into()
+            }
         }
     }
 
@@ -524,6 +545,104 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+        use iced_accessibility::accesskit::Role;
+
+        for (source, uri, alt, title) in [
+            (
+                "![diagram](docs/diagram.png \"Architecture\")",
+                "docs/diagram.png",
+                "diagram",
+                "Architecture",
+            ),
+            (
+                "![](https://example.com/image.png)",
+                "https://example.com/image.png",
+                "",
+                "",
+            ),
+        ] {
+            let target = Target {
+                card: CardId::new(),
+                generation: 17,
+            };
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source.to_owned(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            assert!(matches!(
+                cached.markdown.items(),
+                [markdown::Item::Image { .. }]
+            ));
+            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let mut element = view(&cached, settings, target, None);
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = Rectangle::with_size(Size::new(520.0, 1000.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let nodes: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .collect();
+            for text in [alt, title].into_iter().filter(|text| !text.is_empty()) {
+                assert!(
+                    nodes.iter().any(|node| node.node().value() == Some(text)),
+                    "selectable image text missing: {text}"
+                );
+            }
+            let button = nodes
+                .iter()
+                .find(|node| {
+                    node.node().role() == Role::Button
+                        && node.node().label() == Some("Open image source")
+                })
+                .expect("image source has a named accessible action");
+            let bounds = button.node().bounds().unwrap();
+            let cursor = mouse::Cursor::Available(Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ));
+            let mut messages = Vec::new();
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert!(
+                matches!(messages.as_slice(), [Message::ChatUi(Action::OpenDocument(found, path))]
+                if *found == target && path == uri),
+                "source action must retain its card/generation and exact URI"
+            );
+        }
+    }
 
     const THEMES: [crate::settings::EditorSyntaxTheme; 2] = [
         crate::settings::EditorSyntaxTheme::Auto,
