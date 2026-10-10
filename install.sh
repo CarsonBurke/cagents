@@ -120,10 +120,33 @@ case $(uname -m) in
     x86_64) ;;
     *) fail 'only x86_64 Linux is supported' ;;
 esac
-case $(getconf GNU_LIBC_VERSION 2>/dev/null || :) in
+if ! GLIBC_VERSION=$(getconf GNU_LIBC_VERSION 2>/dev/null); then
+    fail 'the x86_64 glibc release requires a glibc system'
+fi
+case $GLIBC_VERSION in
     glibc\ *) ;;
     *) fail 'the x86_64 glibc release requires a glibc system' ;;
 esac
+if [ "$UNINSTALL" -eq 0 ]; then
+    # GNU_LIBC_VERSION has the form "glibc MAJOR.MINOR". Validate it before
+    # creating directories, downloading files, or installing an update. Removal
+    # keeps the existing platform policy so older installations can be uninstalled.
+    if printf '%s\n' "$GLIBC_VERSION" | LC_ALL=C awk '
+        NR != 1 || $0 !~ /^glibc [0-9]+\.[0-9]+$/ { invalid = 1 }
+        { split($2, version, ".") }
+        END {
+            if (invalid || NR != 1) exit 2
+            exit !(version[1] > 2 || (version[1] == 2 && version[2] >= 35))
+        }
+    '; then
+        :
+    else
+        case $? in
+            1) fail "glibc 2.35 or newer is required (found $GLIBC_VERSION)" ;;
+            *) fail 'could not determine a valid glibc version' ;;
+        esac
+    fi
+fi
 
 : "${HOME:?HOME is not set}"
 case $HOME in
