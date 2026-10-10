@@ -152,7 +152,8 @@ const APPLICATION_NAME: &str = instance::APPLICATION_NAME;
 /// the desktop convention of "<document> — <application>".
 const WINDOW_TITLE_SEPARATOR: &str = " — ";
 
-fn application_window_icon() -> window::Icon {
+/// Embedded artwork for initial window creation, independent of icon themes.
+pub fn application_window_icon() -> window::Icon {
     let rgba = image::load_from_memory_with_format(APPLICATION_ICON_PNG, image::ImageFormat::Png)
         .expect("embedded application icon must be a valid PNG")
         .into_rgba8();
@@ -12628,11 +12629,6 @@ impl Application for Cagents {
         // Unused default chats are never saved. Recreate the active scope's
         // placeholder only after restored runtimes have been initialized.
         tasks.push(app.ensure_default_pane());
-        if let Some(window_id) = app.core.main_window_id() {
-            tasks.push(
-                window::set_icon(window_id, application_window_icon()).map(cosmic::Action::App),
-            );
-        }
         tasks.extend(
             projects
                 .into_iter()
