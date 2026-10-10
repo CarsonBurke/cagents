@@ -6,6 +6,12 @@ use crate::{
     sidebar::ProjectCommand,
 };
 
+#[derive(Debug, Clone, Copy)]
+struct AutomaticAttempt {
+    project: ProjectId,
+    at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
@@ -29,7 +35,7 @@ pub struct State {
     /// Deletions the user has confirmed, by worktree, until each resolves. A
     /// failed one stays so its row can say why and offer to run it again.
     deletions: HashMap<WorktreeId, Deletion>,
-    automatic_attempts: HashMap<WorktreeId, Instant>,
+    automatic_attempts: HashMap<WorktreeId, AutomaticAttempt>,
     editors: Vec<crate::external_editor::Editor>,
 }
 
@@ -274,7 +280,7 @@ impl Cagents {
             .collect::<HashSet<_>>();
         self.project_ui
             .automatic_attempts
-            .retain(|id, _| current_ids.contains(id));
+            .retain(|id, attempt| attempt.project != project_id || current_ids.contains(id));
         let candidate = records.iter().filter_map(|(record, head_repository)| {
             let source = head_repository.as_ref()?;
             let pr = matching_attached_pr(record, source, pull_requests)?;
@@ -304,7 +310,7 @@ impl Cagents {
                     .project_ui
                     .automatic_attempts
                     .get(&record.id)
-                    .is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(30))
+                    .is_some_and(|attempt| attempt.at.elapsed() < Duration::from_secs(30))
             {
                 return None;
             }
@@ -334,14 +340,18 @@ impl Cagents {
         })
         // A refused candidate must not monopolize every later refresh. Prefer
         // unseen candidates, then those whose last attempt is oldest.
-        .min_by_key(|(target, _)| target.worktree.and_then(|id| self.project_ui.automatic_attempts.get(&id).copied()));
+        .min_by_key(|(target, _)| target.worktree.and_then(|id| self.project_ui.automatic_attempts.get(&id).map(|attempt| attempt.at)));
         let Some((target, request)) = candidate else {
             return Task::none();
         };
         let id = target.worktree.unwrap();
-        self.project_ui
-            .automatic_attempts
-            .insert(id, Instant::now());
+        self.project_ui.automatic_attempts.insert(
+            id,
+            AutomaticAttempt {
+                project: project_id,
+                at: Instant::now(),
+            },
+        );
         self.project_ui.deletions.insert(
             id,
             Deletion {

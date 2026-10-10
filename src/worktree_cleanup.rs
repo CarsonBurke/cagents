@@ -163,6 +163,9 @@ impl PreparedRemoval {
         {
             return Err("Window directory protection is not ready".into());
         }
+        // Busy applications skip before the independent-editor process census.
+        // Admission remains fenced while directory leases are then acquired.
+        check_quiescence(&windows)?;
         let _editors =
             crate::instance::verified_running_editors().map_err(|error| error.to_string())?;
         let _directory = acquire(
@@ -171,7 +174,6 @@ impl PreparedRemoval {
             true,
         )
         .map_err(|_| "Worktree is selected or open in an editor".to_owned())?;
-        check_quiescence(&windows)?;
         // Git's own metadata locks prevent checkout, commit, and packed-ref
         // maintenance from changing the confirmed head during removal.
         let mut head = crate::repository::GitFileLock::acquire(&self.admin_dir.join("HEAD"))?;
