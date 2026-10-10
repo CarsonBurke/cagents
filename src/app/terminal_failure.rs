@@ -9,6 +9,19 @@ pub(super) enum Failure {
     Terminal(Box<Details>),
 }
 impl Failure {
+    pub(super) fn enrich_assigned_failure(&mut self, residency: Option<&Residency>) {
+        let Self::Terminal(details) = self else {
+            return;
+        };
+        // The first hydration failure has no typed record until lifecycle
+        // bookkeeping assigns one. Fill only that fallback, preserving a
+        // captured specific failure or the sign-in recovery classification.
+        if details.code == "terminal_unavailable"
+            && let Some(Residency::Failed { typed_error, .. }) = residency
+        {
+            (details.code, details.message) = known_failure(&typed_error.code);
+        }
+    }
     pub(super) fn message(&self) -> &str {
         match self {
             Self::Generic(message) => message,
@@ -697,6 +710,16 @@ mod tests {
         };
         assert_eq!(details.code, "start_failed");
         assert!(!details.copy_text().contains("secret"));
+    }
+    #[test]
+    fn first_hydrating_failure_uses_the_assigned_typed_code() {
+        let (mut app, card, _) = app_and_session();
+        app.fail_runtime(card, "first backend secret".into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.code, "runtime_hydration_failed");
+        assert_eq!(details.message, "The terminal could not be restored.");
+        assert!(!details.copy_text().contains("secret"));
+        assert!(details.exit.is_none());
     }
     #[test]
     fn new_failure_on_same_identity_captures_current_typed_state() {

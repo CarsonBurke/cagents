@@ -7532,7 +7532,7 @@ impl Cagents {
         }
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
-        let failure = self.terminal_failure_payload(card, message.clone());
+        let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
         self.retire_lsp_card(card);
         match self.cards.remove(&card) {
@@ -7557,8 +7557,9 @@ impl Cagents {
             )
             | None => {}
         }
-        self.cards.insert(card, CardRuntime::Failed(failure));
         self.mark_runtime_failed(card, message);
+        failure.enrich_assigned_failure(self.card_state(card).map(|state| &state.residency));
+        self.cards.insert(card, CardRuntime::Failed(failure));
     }
 
     /// Retires a terminal whose process ended, keeping its surface.
