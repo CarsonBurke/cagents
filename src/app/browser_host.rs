@@ -647,7 +647,8 @@ mod tests {
                 id.into(),
                 ActionRequest {
                     action: Action::Click,
-                    target: button.id().clone().into(),
+                    target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+                    target_node: button.id().clone().into(),
                     data: None,
                 },
             ),
