@@ -111,6 +111,9 @@ where
 
         debug::on_hotpatch(move || {
             proxy.send_action(Action::Reload);
+            // Hot patches arrive outside the proxy worker. Wake the event loop
+            // after queuing the reload so an idle window rebuilds its view.
+            let _ = proxy.raw.wake_up();
         });
     }
 
