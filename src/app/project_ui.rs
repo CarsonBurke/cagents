@@ -268,10 +268,18 @@ impl Cagents {
         let Some(repository) = self.review_repositories.get(&project_id).cloned() else {
             return Task::none();
         };
-        let candidate = records.iter().find_map(|(record, head_repository)| {
+        let current_ids = records
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect::<HashSet<_>>();
+        self.project_ui
+            .automatic_attempts
+            .retain(|id, _| current_ids.contains(id));
+        let candidate = records.iter().filter_map(|(record, head_repository)| {
             let source = head_repository.as_ref()?;
             let pr = matching_attached_pr(record, source, pull_requests)?;
             if pr.state.0 != "MERGED"
+                || record.head_oid.as_deref() != Some(pr.head_ref_oid.as_str())
                 || record.lock.locked
                 || self
                     .active_workspace
@@ -323,7 +331,10 @@ impl Cagents {
                     },
                 },
             ))
-        });
+        })
+        // A refused candidate must not monopolize every later refresh. Prefer
+        // unseen candidates, then those whose last attempt is oldest.
+        .min_by_key(|(target, _)| target.worktree.and_then(|id| self.project_ui.automatic_attempts.get(&id).copied()));
         let Some((target, request)) = candidate else {
             return Task::none();
         };
