@@ -45,7 +45,17 @@ impl Click {
         button: Button,
         previous: Option<Click>,
     ) -> Click {
-        let time = Instant::now();
+        Self::new_at(position, button, previous, Instant::now())
+    }
+
+    /// Creates a click at the supplied time, using the same consecutive-click
+    /// policy as [`Self::new`].
+    pub fn new_at(
+        position: Point,
+        button: Button,
+        previous: Option<Click>,
+        time: Instant,
+    ) -> Click {
         let kind = if let Some(previous) = previous {
             if previous.is_consecutive(position, time)
                 && button == previous.button
@@ -86,6 +96,40 @@ impl Click {
             && duration
                 .map(|duration| duration.as_millis() <= 300)
                 .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn consecutive_clicks_include_the_deadline_and_reset_after_it() {
+        let now = Instant::now();
+        let point = Point::new(4.0, 4.0);
+        let first = Click::new_at(point, Button::Left, None, now);
+        let second = Click::new_at(
+            point,
+            Button::Left,
+            Some(first),
+            now + Duration::from_millis(300),
+        );
+        assert_eq!(second.kind(), Kind::Double);
+        let third = Click::new_at(
+            point,
+            Button::Left,
+            Some(second),
+            now + Duration::from_millis(600),
+        );
+        assert_eq!(third.kind(), Kind::Triple);
+        let expired = Click::new_at(
+            point,
+            Button::Left,
+            Some(first),
+            now + Duration::from_millis(301),
+        );
+        assert_eq!(expired.kind(), Kind::Single);
     }
 }
 

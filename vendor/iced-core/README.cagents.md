@@ -13,3 +13,18 @@ cargo test --manifest-path vendor/iced-core/Cargo.toml reconciliation_tests
 ```
 
 Cargo cannot run these dev-dependency tests with `-p iced_core` from the parent workspace because this vendored package is not a workspace member. Its standalone lockfile and build artifacts are local test output.
+
+## Explicit click timestamps
+
+`mouse::Click::new_at` accepts an explicit timestamp so gesture fixtures can
+exercise real event dispatch without depending on test execution speed.
+`Click::new` still uses `Instant::now`; the existing consecutive-click policy
+is unchanged, including the inclusive 300 ms deadline, position tolerance,
+button matching, and single/double/triple progression.
+
+Run the focused standalone timing regression with:
+
+```sh
+cargo test --manifest-path vendor/iced-core/Cargo.toml \
+  mouse::click::tests::consecutive_clicks_include_the_deadline_and_reset_after_it
+```
