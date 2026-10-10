@@ -950,6 +950,15 @@ impl Codex {
             Ok(())
         }
     }
+    /// Whether to hold `item`, parsed from `value`, for the deltas Codex may
+    /// still write into it. Past the bound a running item goes unheld instead
+    /// of failing the session: it loses only its streamed output, which its
+    /// completion then supplies whole.
+    fn tracks(&self, value: &Value, item: &Item) -> bool {
+        streams_updates(value, &item.content)
+            && (self.active_items.len() < MAX_ACTIVE_ITEMS
+                || self.active_items.contains_key(&item.id))
+    }
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
         for turn in array(page, "data")?.iter().rev() {
@@ -995,15 +1004,17 @@ impl Codex {
                     }
                 }
                 for item in parse_item(value, !active, turn_id)? {
-                    if active && self.busy && streams_updates(&item.content) {
-                        if self.active_items.len() >= MAX_ACTIVE_ITEMS
-                            && !self.active_items.contains_key(&item.id)
-                        {
-                            return Err("Too many live Codex tools".into());
+                    if active && self.busy {
+                        if self.tracks(value, &item) {
+                            self.active_items
+                                .entry(item.id.clone())
+                                .or_insert_with(|| item.clone());
+                        } else {
+                            // The page is newer than a completion this
+                            // adapter missed while it was not reading.
+                            self.active_items.remove(&item.id);
+                            self.output_streams.remove(&item.id);
                         }
-                        self.active_items
-                            .entry(item.id.clone())
-                            .or_insert_with(|| item.clone());
                     }
                     items.push(item);
                 }
@@ -2284,12 +2295,7 @@ impl Adapter for Codex {
                 for value in array(turn, "items")? {
                     for item in parse_item(value, method == "turn/completed", string(turn, "id")?)?
                     {
-                        if method == "turn/started" && streams_updates(&item.content) {
-                            if self.active_items.len() >= MAX_ACTIVE_ITEMS
-                                && !self.active_items.contains_key(&item.id)
-                            {
-                                return Err("Too many live Codex tools".into());
-                            }
+                        if method == "turn/started" && self.tracks(value, &item) {
                             self.active_items.insert(item.id.clone(), item.clone());
                         }
                         step.events.push(Event::Item(item));
@@ -2357,12 +2363,7 @@ impl Adapter for Codex {
                     if done {
                         self.active_items.remove(&item.id);
                         self.output_streams.remove(&item.id);
-                    } else if streams_updates(&item.content) {
-                        if self.active_items.len() >= MAX_ACTIVE_ITEMS
-                            && !self.active_items.contains_key(&item.id)
-                        {
-                            return Err("Too many live Codex tools".into());
-                        }
+                    } else if self.tracks(&params["item"], &item) {
                         self.active_items.insert(item.id.clone(), item.clone());
                     }
                     step.events.push(Event::Item(item));
@@ -2764,12 +2765,16 @@ fn item_key(turn: &str, item: &str) -> String {
 /// Running items the app-server can still write into. A live turn's history
 /// also contains settled tools; retaining those exhausts the concurrency
 /// bound when a long conversation is resumed or refreshed.
-fn streams_updates(content: &ItemContent) -> bool {
-    content.status() == Some(ToolStatus::Running)
-        && matches!(
-            content,
-            ItemContent::Tool { .. } | ItemContent::Command { .. } | ItemContent::Changes { .. }
-        )
+///
+/// Only the item types Codex has a delta notification for qualify. The rest
+/// are never written into, and the ones that carry no status of their own,
+/// `sleep` and `subAgentActivity` among them, read as running for as long as
+/// their turn does, so a turn that orchestrates agents holds hundreds.
+fn streams_updates(value: &Value, content: &ItemContent) -> bool {
+    matches!(
+        value["type"].as_str(),
+        Some("commandExecution" | "fileChange" | "mcpToolCall")
+    ) && content.status() == Some(ToolStatus::Running)
 }
 /// Codex leaves `phase` null for models that do not classify their messages,
 /// and an unclassified message has to be treated as the turn's answer or the
@@ -5152,6 +5157,93 @@ mod tests {
         let completed = json!({"id":"running","type":"commandExecution","command":"echo live","cwd":"/repo","status":"completed","aggregatedOutput":"start tail"});
         adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"long","item":completed}})).unwrap();
         assert!(adapter.active_items.is_empty());
+    }
+
+    #[test]
+    fn orchestrating_turn_outlives_the_live_tool_bound() {
+        // `sleep` and `subAgentActivity` state no status, so each reads as
+        // running until its turn ends, whether it arrives in the turn's
+        // history or as it starts.
+        let auxiliary = |index: usize| {
+            if index % 2 == 0 {
+                json!({"id":format!("aux-{index}"),"type":"sleep","durationMs":1000})
+            } else {
+                json!({"id":format!("aux-{index}"),"type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"})
+            }
+        };
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut items: Vec<_> = (0..MAX_ACTIVE_ITEMS * 2).map(auxiliary).collect();
+        items.push(json!({"id":"running","type":"commandExecution","command":"echo live","cwd":"/repo","status":"inProgress","aggregatedOutput":"start"}));
+        let turn = json!({"id":"long","status":"inProgress","items":items});
+        let mut page = Step::default();
+        adapter
+            .page(
+                &json!({"data":[turn.clone()],"nextCursor":null}),
+                &mut page,
+                false,
+            )
+            .unwrap();
+        assert_eq!(adapter.active_items.len(), 1);
+        adapter
+            .receive(
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":turn}}),
+            )
+            .unwrap();
+        for index in 0..MAX_ACTIVE_ITEMS * 2 {
+            adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"long","item":auxiliary(index)}})).unwrap();
+        }
+        assert_eq!(adapter.active_items.len(), 1);
+        let delta = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"long","itemId":"running","delta":" tail"}})).unwrap();
+        assert!(
+            matches!(&delta.events[0], Event::OutputDelta { offset: 5, delta, .. } if delta == " tail")
+        );
+    }
+
+    #[test]
+    fn running_tools_past_the_bound_go_unheld_without_ending_the_session() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let command = |index: usize, status: &str| json!({"id":index.to_string(),"type":"commandExecution","command":"sleep 1","cwd":"/repo","status":status,"aggregatedOutput":""});
+        for index in 0..=MAX_ACTIVE_ITEMS {
+            let started = adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":command(index, "inProgress")}})).unwrap();
+            assert!(matches!(&started.events[0], Event::Item(_)));
+        }
+        assert_eq!(adapter.active_items.len(), MAX_ACTIVE_ITEMS);
+        let unheld = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":MAX_ACTIVE_ITEMS.to_string(),"delta":"lost"}})).unwrap();
+        assert!(unheld.events.is_empty());
+        let completed = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":command(MAX_ACTIVE_ITEMS, "completed")}})).unwrap();
+        assert!(matches!(
+            &completed.events[0],
+            Event::Item(Item {
+                content: ItemContent::Command {
+                    status: ToolStatus::Succeeded,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn active_turn_history_releases_tools_that_completed_unseen() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let command = |status: &str| json!({"id":"cmd","type":"commandExecution","command":"echo hi","cwd":"/repo","status":status,"aggregatedOutput":"hi"});
+        adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":command("inProgress")}})).unwrap();
+        adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"cmd","delta":"\u{1b}["}})).unwrap();
+        assert_eq!(adapter.active_items.len(), 1);
+        assert_eq!(adapter.output_streams.len(), 1);
+        let mut page = Step::default();
+        adapter
+            .page(
+                &json!({"data":[{"id":"turn","status":"inProgress","items":[command("completed")]}],"nextCursor":null}),
+                &mut page,
+                false,
+            )
+            .unwrap();
+        assert!(adapter.active_items.is_empty());
+        assert!(adapter.output_streams.is_empty());
     }
 
     #[test]
