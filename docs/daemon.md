@@ -453,4 +453,6 @@ Settings → Appearance → **Merged worktree cleanup** is disabled by default. 
 
 Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
 
+Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
+
 Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).

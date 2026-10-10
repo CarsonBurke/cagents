@@ -490,6 +490,49 @@ pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
+fn editor_executable(
+    process: &Path,
+    executable: io::Result<PathBuf>,
+) -> io::Result<Option<PathBuf>> {
+    match executable {
+        Ok(executable) => {
+            let name = executable.file_name().and_then(|name| name.to_str());
+            Ok(matches!(
+                name,
+                Some(
+                    "ceditor"
+                        | "ceditor (deleted)"
+                        | "ceditor-development"
+                        | "ceditor-development (deleted)"
+                )
+            )
+            .then_some(executable))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // Shipped ceditor keeps its executable-derived main-thread comm;
+            // unlike cagents-ui, it never marks itself with a different name.
+            // Linux truncates this name to 15 bytes. This fallback identifies
+            // an opaque old editor without treating every hardened desktop
+            // process as editor ownership. Custom-renamed binaries are outside
+            // the same installed-product identity policy as the exe census.
+            let name = match fs::read_to_string(process.join("comm")) {
+                Ok(name) => name,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if matches!(name.trim_end(), "ceditor" | "ceditor-develop") {
+                Err(io::Error::other(
+                    "opaque independent editor ownership cannot be authenticated",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     use std::os::fd::FromRawFd;
     let mut editors = Vec::new();
@@ -511,15 +554,10 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
         if metadata.uid() != current_uid() {
             continue;
         }
-        let executable = match fs::read_link(process.join("exe")) {
-            Ok(executable) => executable,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let name = executable.file_name().and_then(|name| name.to_str());
-        if !matches!(name, Some("ceditor" | "ceditor (deleted)")) {
+        let Some(executable) = editor_executable(&process, fs::read_link(process.join("exe")))?
+        else {
             continue;
-        }
+        };
         let lease_path = editor_ready_path(runtime, pid);
         let lease = OpenOptions::new()
             .read(true)
@@ -1836,6 +1874,55 @@ mod tests {
         assert!(!process_owns_slot(&process, std::process::id(), &expected).unwrap());
         fs::write(process.join("fdinfo/1"), locked_info).unwrap();
         assert!(process_owns_slot(&process, std::process::id(), &expected).unwrap());
+    }
+
+    #[test]
+    fn opaque_editor_identity_preserves_editors_without_blocking_unrelated_hardened_processes() {
+        let process = tempfile::tempdir().unwrap();
+        for (name, editor) in [
+            ("unrelated-daemo", false),
+            ("ceditor", true),
+            ("ceditor-develop", true),
+        ] {
+            fs::write(process.path().join("comm"), format!("{name}\n")).unwrap();
+            let result = editor_executable(
+                process.path(),
+                Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            );
+            assert_eq!(result.is_err(), editor, "{name}");
+            if !editor {
+                assert!(result.unwrap().is_none());
+            }
+        }
+        fs::remove_file(process.path().join("comm")).unwrap();
+        assert!(
+            editor_executable(
+                process.path(),
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            )
+            .is_err()
+        );
+        assert!(
+            editor_executable(
+                process.path(),
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            )
+            .unwrap()
+            .is_none()
+        );
+        for name in [
+            "ceditor",
+            "ceditor (deleted)",
+            "ceditor-development",
+            "ceditor-development (deleted)",
+        ] {
+            assert!(
+                editor_executable(process.path(), Ok(PathBuf::from(name)))
+                    .unwrap()
+                    .is_some(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
