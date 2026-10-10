@@ -449,7 +449,7 @@ Manual sidebar order is stored by the selected device daemon and shared across w
 
 ### Automatic merged worktree cleanup
 
-Settings → Appearance → **Merged worktree cleanup** is disabled by default. When enabled, sidebar PR refreshes propose one clean, inactive GitHub worktree at a time. The daemon confirms that its exact branch and current commit were merged before removing its directory and catalog entry. Branches remain intact. Cleanup never forces Git removal, discards changes, closes sessions, or removes the primary checkout, main branches, locked worktrees, selected scopes, or open editors.
+Settings → General → **Merged worktree cleanup** is disabled by default. When enabled, sidebar PR refreshes propose one clean, inactive GitHub worktree at a time. The daemon confirms that its exact branch and current commit were merged before removing its directory and catalog entry. Branches remain intact. Cleanup never forces Git removal, discards changes, closes sessions, or removes the primary checkout, main branches, locked worktrees, selected scopes, or open editors.
 
 Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
 
