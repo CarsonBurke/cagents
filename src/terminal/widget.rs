@@ -3297,7 +3297,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 );
             }
         });
-        {
+        // Create a later clipped layer: drawing into the restored parent
+        // would place this chrome beneath the terminal's opaque grid layer.
+        renderer.with_layer(widget_clip, |renderer| {
             use cosmic::iced::advanced::text::Renderer as _;
             let review = tree
                 .state
@@ -3375,7 +3377,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     widget_clip,
                 );
             }
-        }
+        });
         if let Some(started) = draw_started {
             // This records CPU draw-command construction, not GPU completion
             // or compositor presentation/scanout.
