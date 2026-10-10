@@ -268,11 +268,7 @@ impl State {
             return true;
         }
         if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event {
-            if let Some(i) = self
-                .consumed_keys
-                .iter()
-                .position(|key| key == physical_key)
-            {
+            if let Some(i) = barrier.keys.iter().position(|key| key == physical_key) {
                 barrier.keys.swap_remove(i);
                 return true;
             }
