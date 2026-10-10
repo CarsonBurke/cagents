@@ -99,7 +99,7 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Host<'_, Mess
         if !iced_accessibility::IdEq::eq(&identity.0, &self.id) {
             identity.0 = self.id.clone();
         }
-        tree.diff_children(std::slice::from_ref(&self.content));
+        tree.diff_children(std::slice::from_mut(&mut self.content));
     }
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
