@@ -220,7 +220,7 @@ impl Cagents {
         for id in self.workspace.order() {
             if let Some(card) = self.card_state(id) {
                 entries.push((
-                    format!("Focus pane: {}", card.title),
+                    format!("Focus pane: {}", self.card_display_title(card)),
                     String::new(),
                     Message::FocusCard(id),
                 ));
