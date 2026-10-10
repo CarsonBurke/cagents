@@ -55,7 +55,7 @@ while queue and visited < 2048:
         text = node.get_text_iface()
         count = text.get_character_count() if text else 0
         # This additional probe cap is independent of the application's cap.
-        value = text.get_text(0, min(count, 16384)) if text else None
+        value = Atspi.Text.get_text(text, 0, min(count, 16384)) if text else None
         record = {"name": node.get_name(), "role": "terminal", "text_interface": bool(text),
                   "character_count": count, "visible_text": value,
                   "focused": node.get_state_set().contains(Atspi.StateType.FOCUSED)}
