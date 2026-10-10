@@ -10545,18 +10545,7 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
     .expect("byte slices and strings serialize")
 }
 
-/// A worktree Git has just removed at the user's request, as it was right
-/// before the removal.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RemovedWorktree {
-    /// The canonical common directory of its repository.
-    pub common_dir: PathBuf,
-    /// Its canonical administrative directory; see [`RepositoryService::git_dir`].
-    pub admin_dir: PathBuf,
-    pub path: PathBuf,
-    /// The branch it had checked out, as a full ref.
-    pub branch: Option<String>,
-}
+pub use crate::worktree_cleanup::RemovedWorktree;
 
 /// Releases the identities held by the applied creations of `removed`.
 ///
@@ -10835,6 +10824,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// The production entrypoint. No caller may create the managed root first.
     /// The retained token and generation belong to the UI; this emits at most
     /// five events, so a per-operation bounded(8) channel cannot drop a stage.
+    #[cfg(feature = "ui")]
     pub fn create_worktree_journaled(
         &self,
         store: &StateStore,
@@ -11606,7 +11596,7 @@ fn finish_worktree_journal(
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 mod worktree_journal_tests {
     use super::*;
     use crate::model::BootId;

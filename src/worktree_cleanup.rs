@@ -15,8 +15,21 @@ pub struct RemovalRequest {
     pub path: PathBuf,
     pub branch: String,
     pub head_oid: String,
-    pub source_repository: crate::github::GitHubRepoKey,
-    pub pull_request: crate::github::PullRequestKey,
+    pub source_repository: crate::github_identity::GitHubRepoKey,
+    pub pull_request: crate::github_identity::PullRequestKey,
+}
+
+/// A worktree Git has just removed at the user's request, as it was right
+/// before the removal.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RemovedWorktree {
+    /// The canonical common directory of its repository.
+    pub common_dir: PathBuf,
+    /// Its canonical Git administrative directory.
+    pub admin_dir: PathBuf,
+    pub path: PathBuf,
+    /// The branch it had checked out, as a full ref.
+    pub branch: Option<String>,
 }
 
 #[cfg(feature = "host")]
@@ -27,6 +40,7 @@ pub(crate) struct PreparedRemoval {
     directory_identity: (u64, u64),
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn exact_merged_head(request: &RemovalRequest, pr: &crate::github::PullRequest) -> bool {
     pr.state.0 == "MERGED"
         && pr.number == request.pull_request.number
@@ -507,28 +521,30 @@ mod tests {
 
     fn request() -> RemovalRequest {
         let source =
-            crate::github::GitHubRepoKey::new("github.com", None, "source", "repository").unwrap();
+            crate::github_identity::GitHubRepoKey::new("github.com", None, "source", "repository")
+                .unwrap();
         RemovalRequest {
             repository: "/fixture/repository".into(),
             path: "/fixture/worktree".into(),
             branch: "feature".into(),
             head_oid: "a".repeat(40),
             source_repository: source.clone(),
-            pull_request: crate::github::PullRequestKey {
+            pull_request: crate::github_identity::PullRequestKey {
                 repository: source,
                 number: 9,
             },
         }
     }
 
+    #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
     fn merged_eligibility_requires_exact_commit_branch_and_source_identity() {
         let request = request();
         let mut pr: crate::github::PullRequest = serde_json::from_value(serde_json::json!({
-            "number": 9, "title": "Fixture", "state": "MERGED", "head_ref_name": "feature",
-            "head_ref_oid": "a".repeat(40), "head_repository": {"name": "repository"},
-            "head_repository_owner": {"login": "source"}, "base_ref_name": "main",
-            "updated_at": "2026-10-09T00:00:00Z", "url": "https://github.com/source/repository/pull/9"
+            "number": 9, "title": "Fixture", "state": "MERGED", "headRefName": "feature",
+            "headRefOid": "a".repeat(40), "headRepository": {"name": "repository"},
+            "headRepositoryOwner": {"login": "source"}, "baseRefName": "main",
+            "updatedAt": "2026-10-09T00:00:00Z", "url": "https://github.com/source/repository/pull/9"
         })).unwrap();
         assert!(exact_merged_head(&request, &pr));
         let original = pr.clone();

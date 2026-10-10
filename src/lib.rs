@@ -53,8 +53,9 @@ pub mod file_manager;
 pub mod fs_safety;
 #[cfg(feature = "ui")]
 pub(crate) mod git_watch;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
+pub mod github_identity;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "ui")]
@@ -76,7 +77,7 @@ pub mod lsp;
 pub mod model;
 pub mod notifications;
 pub mod performance;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod process;
@@ -85,7 +86,7 @@ pub mod project_location;
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
 pub mod reorder;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod repository;
 #[cfg(feature = "ui")]
 pub mod repository_widget;

@@ -518,7 +518,13 @@ fn editor_executable(
             // the same installed-product identity policy as the exe census.
             let name = match fs::read_to_string(process.join("comm")) {
                 Ok(name) => name,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return match process.metadata() {
+                        Err(gone) if gone.kind() == io::ErrorKind::NotFound => Ok(None),
+                        Err(error) => Err(error),
+                        Ok(_) => Err(error),
+                    };
+                }
                 Err(error) => return Err(error),
             };
             if matches!(name.trim_end(), "ceditor" | "ceditor-develop") {

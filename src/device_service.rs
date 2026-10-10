@@ -105,7 +105,7 @@ pub enum Reply {
     },
     Text(String),
     Saved,
-    MergedWorktreeRemoved(Option<crate::repository::RemovedWorktree>),
+    MergedWorktreeRemoved(Option<crate::worktree_cleanup::RemovedWorktree>),
     ProjectNavigation(Navigation),
     /// The replacement is published, but its directory entry could not be
     /// synced. Callers must advance their disk baseline and show this warning.

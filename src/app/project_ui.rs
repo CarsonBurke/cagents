@@ -261,7 +261,7 @@ impl Cagents {
     pub(super) fn cleanup_merged_worktree_task(
         &mut self,
         project_id: ProjectId,
-        records: &[(WorktreeRecord, Option<GitHubRepoKey>)],
+        records: &[(WorktreeRecord, Option<StatusSnapshot>)],
         pull_requests: &[crate::github::PullRequest],
     ) -> Task<Message> {
         if !self.settings.auto_delete_merged_worktrees
@@ -281,8 +281,10 @@ impl Cagents {
         self.project_ui
             .automatic_attempts
             .retain(|id, attempt| attempt.project != project_id || current_ids.contains(id));
-        let candidate = records.iter().filter_map(|(record, head_repository)| {
-            let source = head_repository.as_ref()?;
+        let candidate = records.iter().filter_map(|(record, _)| {
+            let source = self.sidebar_model.project(project_id)?.worktrees.iter()
+                .find(|row| row.id == record.id && row.path == record.path)?
+                .head_repository.as_ref()?;
             let pr = matching_attached_pr(record, source, pull_requests)?;
             if pr.state.0 != "MERGED"
                 || record.head_oid.as_deref() != Some(pr.head_ref_oid.as_str())
