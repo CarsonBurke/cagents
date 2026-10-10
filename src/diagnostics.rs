@@ -976,34 +976,38 @@ mod tests {
             .map(|_| {
                 let path = path.clone();
                 std::thread::spawn(move || {
+                    let mut written = 0;
                     for _ in 0..40 {
                         let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
                         recorder.limit = 1024;
                         for event in [Event::Startup, Event::Panic { recovered: false }] {
-                            // Busy is a deliberately bounded, nonfatal sink failure.
-                            // Retry it here to exercise sustained retention without
-                            // changing production latency or assuming flock fairness.
-                            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                            loop {
-                                match recorder.append(event) {
-                                    Ok(()) => break,
-                                    Err(error)
-                                        if error.kind() == io::ErrorKind::WouldBlock
-                                            && std::time::Instant::now() < deadline =>
-                                    {
-                                        std::thread::yield_now()
-                                    }
-                                    Err(error) => panic!("concurrent append failed: {error}"),
-                                }
+                            // Production may skip a bounded busy attempt. Exercise
+                            // that same contention policy rather than requiring
+                            // flock fairness or retrying until every event lands.
+                            match recorder.append(event) {
+                                Ok(()) => written += 1,
+                                Err(error)
+                                    if error.get_ref().is_some_and(|e| e.is::<LockBusy>()) => {}
+                                Err(error) => panic!("concurrent append failed: {error}"),
                             }
                         }
                     }
+                    written
                 })
             })
             .collect();
-        for thread in threads {
-            thread.join().unwrap();
-        }
+        let written: usize = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .sum();
+        assert!(
+            written >= GENERATIONS * 4,
+            "not enough writes to exercise rotation"
+        );
+        // Once contenders leave, a fresh healthy writer remains usable.
+        let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
+        recorder.limit = 1024;
+        recorder.append(Event::Exit { success: true }).unwrap();
         let files: Vec<_> = std::fs::read_dir(&path)
             .unwrap()
             .map(|e| e.unwrap())
