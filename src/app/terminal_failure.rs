@@ -258,7 +258,20 @@ impl Cagents {
         {
             return Some((**details).clone());
         }
-        let mut details = Details::capture(session, Some(&state.residency));
+        self.capture_terminal_details(card, false)
+    }
+    fn capture_terminal_details(&self, card: CardId, failed: bool) -> Option<Details> {
+        let state = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())?;
+        let CardKind::Terminal(session) = &state.kind else {
+            return None;
+        };
+        let mut details = if failed {
+            Details::capture_failure(session, Some(&state.residency))
+        } else {
+            Details::capture(session, Some(&state.residency))
+        };
         if self.completed_terminal_has_native_owner(card) {
             details.consequence = "Open the existing conversation in the chat view.";
         }
@@ -273,17 +286,11 @@ impl Cagents {
         Some(details)
     }
     pub(super) fn terminal_failure_payload(&self, card: CardId, generic: String) -> Failure {
-        let Some(mut details) = self.terminal_details(card) else {
+        // A new failure captures current state before the generic residency
+        // transition. The view can subsequently reuse that bounded record.
+        let Some(mut details) = self.capture_terminal_details(card, true) else {
             return generic.into();
         };
-        if let Some(state) = self.card_state(card)
-            && let CardKind::Terminal(session) = &state.kind
-        {
-            let failure = Details::capture_failure(session, Some(&state.residency));
-            details.code = failure.code;
-            details.message = failure.message;
-            details.exit = failure.exit;
-        }
         if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if account::login::is_codex_browser(&session.launch)))
             && account::login::callback_failed(&generic)
         {
@@ -692,6 +699,31 @@ mod tests {
         assert!(!details.copy_text().contains("secret"));
     }
     #[test]
+    fn new_failure_on_same_identity_captures_current_typed_state() {
+        let (mut app, card, session) = app_and_session();
+        app.card_state_mut(card).unwrap().residency = Residency::Failed {
+            typed_error: RuntimeError {
+                code: "start_failed".into(),
+                message: "old secret".into(),
+            },
+            retryable: true,
+        };
+        app.fail_runtime(card, "old secret".into());
+        assert_eq!(app.terminal_details(card).unwrap().code, "start_failed");
+        app.card_state_mut(card).unwrap().residency = Residency::Failed {
+            typed_error: RuntimeError {
+                code: "runtime_hydration_failed".into(),
+                message: "new secret".into(),
+            },
+            retryable: true,
+        };
+        app.fail_runtime(card, "new secret".into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.terminal, session.id);
+        assert_eq!(details.code, "runtime_hydration_failed");
+        assert!(!details.copy_text().contains("secret"));
+    }
+    #[test]
     fn failed_relaunch_reports_new_failure_without_previous_identity_exit() {
         let (mut app, card, mut previous) = app_and_session();
         previous.continuity = TerminalContinuity::Exited {
@@ -875,6 +907,7 @@ mod tests {
                 occurred_at_unix_ms: 42,
             },
         );
+        app.card_state_mut(card).unwrap().residency = Residency::Hot;
         app.cards.insert(card, CardRuntime::Completed);
         assert_eq!(
             app.terminal_details(card).unwrap().consequence,
