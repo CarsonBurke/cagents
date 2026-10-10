@@ -129,6 +129,17 @@ ownership refuses recovery instead of selecting an incompatible host. Status,
 preflight and stop commands route to the old CLI without starting a stopped
 daemon. Unsaved windows are neither closed nor rewritten by this recovery.
 
+A window that receives an explicitly incompatible daemon protocol shows a
+persistent explanation with the required and observed versions. **Restart
+daemon** opens the same ownership-verified confirmation used for an unresponsive
+daemon; it never restarts automatically. Confirmation stops only the pinned
+daemon and starts this window's matched sibling executable. Active hosted work
+can stop, as the confirmation explains. Connection loss does not erase the
+mismatch; a compatible reply clears it. An undecodable frame does not establish
+a protocol version. Public staged-install routing remains the preferred recovery
+path; direct daemon startup admission across surviving versions remains tracked
+in [#956](https://github.com/CarsonBurke/cagents/issues/956).
+
 The application shows available updates above the workspace. Dismissing the
 notice moves it into the notices popover; it remains available there. Release
 downloads are checksum verified before the candidate's own CLI reports its

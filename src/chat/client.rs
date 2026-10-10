@@ -261,6 +261,8 @@ fn receive(
         .map_err(|error| frame_read_error(error, stream.read_timeout().ok().flatten()))?
         .ok_or("Daemon disconnected")?;
     if envelope.version != PROTOCOL_VERSION {
+        #[cfg(feature = "ui")]
+        crate::daemon_health::incompatible_stream(stream, envelope.version, health_request);
         return Err("Daemon version mismatch; use matched cagents executables".into());
     }
     if !envelope.proof.is_complete() || proof.is_some_and(|proof| proof != &envelope.proof) {
@@ -838,8 +840,17 @@ impl ClientHandle {
             let envelope: ServerEnvelope = frame
                 .map_err(|error| frame_read_error(error, stream.read_timeout().ok().flatten()))?
                 .ok_or("Daemon disconnected")?;
-            if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
-                return Err("Daemon identity/version changed during native chat attachment".into());
+            if envelope.version != PROTOCOL_VERSION {
+                #[cfg(feature = "ui")]
+                crate::daemon_health::incompatible_stream(
+                    &stream,
+                    envelope.version,
+                    health_request,
+                );
+                return Err("Daemon version mismatch; use matched cagents executables".into());
+            }
+            if envelope.proof != proof {
+                return Err("Daemon identity changed during native chat attachment".into());
             }
             match envelope.message {
                 ServerMessage::ChatActivity {

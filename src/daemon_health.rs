@@ -21,6 +21,10 @@ pub(crate) enum State {
     Unreachable {
         since: SystemTime,
     },
+    Incompatible {
+        since: SystemTime,
+        actual: u16,
+    },
 }
 
 impl State {
@@ -59,14 +63,22 @@ impl Monitor {
     }
     fn observe_request(&self, outcome: Outcome, now: SystemTime, request: Request) {
         let mut observation = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if matches!(outcome, Outcome::Responsive) {
-            observation.replies = observation.replies.wrapping_add(1);
-        } else if request.0 != observation.replies {
+        // A compatible response already in flight before a newly observed
+        // mismatch can belong to the previous daemon. It cannot clear that
+        // mismatch. Preserve ordinary transport recovery's existing behavior.
+        let compatible = matches!(outcome, Outcome::Responsive);
+        if request.0 != observation.replies
+            && (!compatible || matches!(observation.state, State::Incompatible { .. }))
+        {
             return;
+        }
+        if compatible || matches!(outcome, Outcome::Incompatible(_)) {
+            observation.replies = observation.replies.wrapping_add(1);
         }
         let state = &mut observation.state;
         let next = match outcome {
             Outcome::Responsive => State::Responsive,
+            Outcome::TimedOut(_) if matches!(state, State::Incompatible { .. }) => (*state).clone(),
             Outcome::TimedOut(timeout) => match &*state {
                 State::Unresponsive { .. } => (*state).clone(),
                 _ => State::Unresponsive {
@@ -74,6 +86,19 @@ impl Monitor {
                     timeout,
                 },
             },
+            Outcome::Incompatible(actual) => State::Incompatible {
+                since: match &*state {
+                    State::Incompatible {
+                        since,
+                        actual: previous,
+                    } if *previous == actual => *since,
+                    _ => now,
+                },
+                actual,
+            },
+            // A dropped incompatible connection is not recovery. Only a
+            // validated compatible response clears the actionable mismatch.
+            Outcome::Unreachable if matches!(state, State::Incompatible { .. }) => (*state).clone(),
             Outcome::Unreachable => State::Unreachable {
                 since: match &*state {
                     State::Unreachable { since } => *since,
@@ -93,6 +118,7 @@ enum Outcome {
     Responsive,
     TimedOut(Duration),
     Unreachable,
+    Incompatible(u16),
 }
 fn monitor() -> &'static Monitor {
     static MONITOR: OnceLock<Monitor> = OnceLock::new();
@@ -132,6 +158,7 @@ fn timeout(error: &FrameError) -> bool {
 fn control_outcome<T>(result: &Result<T, ControlError>) -> Option<Outcome> {
     match result {
         Ok(_) | Err(ControlError::Remote { .. }) => Some(Outcome::Responsive),
+        Err(ControlError::UnsupportedVersion { actual }) => Some(Outcome::Incompatible(*actual)),
         Err(ControlError::ReplyTimeout { timeout, .. }) => Some(Outcome::TimedOut(*timeout)),
         Err(ControlError::Connect(error))
             if matches!(
@@ -160,6 +187,18 @@ pub(crate) fn connection<T>(path: &Path, result: &Result<T, ControlError>, reque
         && let Some(outcome) = control_outcome(result)
     {
         monitor().observe_request(outcome, SystemTime::now(), request);
+    }
+}
+/// Report only an explicitly decoded version; malformed frames do not prove
+/// what protocol the peer speaks. Socket selection fences remote/other hosts.
+pub(crate) fn incompatible(path: &Path, actual: u16, request: Request) {
+    if selected_socket(path) {
+        monitor().observe_request(Outcome::Incompatible(actual), SystemTime::now(), request);
+    }
+}
+pub(crate) fn incompatible_stream(stream: &UnixStream, actual: u16, request: Request) {
+    if selected_stream(stream) {
+        monitor().observe_request(Outcome::Incompatible(actual), SystemTime::now(), request);
     }
 }
 pub(crate) fn connection_io(path: &Path, result: &io::Result<UnixStream>, request: Request) {
@@ -221,7 +260,8 @@ pub(crate) fn retry_delay() -> Duration {
     }
 }
 /// Suppress only transport diagnostics replaced by the persistent banner.
-/// A provider, filesystem or protocol error remains a feature-level notice.
+/// A provider or filesystem error remains a feature-level notice; a confirmed
+/// protocol mismatch has its own persistent explanation and recovery action.
 pub(crate) fn replaces_notice(message: &str) -> bool {
     replaces_notice_for(&current(), message)
 }
@@ -240,13 +280,17 @@ fn replaces_notice_for(state: &State, message: &str) -> bool {
             .iter()
             .any(|transport| error.starts_with(transport))
         });
-    state.unavailable()
-        && (ipc_failure
-            || message.contains("Timed out waiting for the daemon response")
-            || message.contains("the daemon did not answer within")
-            || message.contains("could not connect to the daemon: Connection refused")
-            || message.contains("the daemon closed the connection before responding")
-            || message.contains("Daemon disconnected"))
+    let protocol_failure = matches!(state, State::Incompatible { .. })
+        && (message.contains("daemon protocol version")
+            || message.contains("Daemon version mismatch"));
+    protocol_failure
+        || state.unavailable()
+            && (ipc_failure
+                || message.contains("Timed out waiting for the daemon response")
+                || message.contains("the daemon did not answer within")
+                || message.contains("could not connect to the daemon: Connection refused")
+                || message.contains("the daemon closed the connection before responding")
+                || message.contains("Daemon disconnected"))
 }
 
 #[cfg(test)]
@@ -281,6 +325,54 @@ mod tests {
             "the daemon protocol version is unsupported"
         ));
     }
+    #[test]
+    fn decoded_mismatch_persists_through_disconnect_and_clears_on_compatible_reply() {
+        let monitor = Monitor::new();
+        let first = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let version = crate::terminal_ipc::PROTOCOL_VERSION + 1;
+        let mismatch: Result<(), _> = Err(ControlError::UnsupportedVersion { actual: version });
+        let previous_daemon_reply = monitor.begin();
+        monitor.observe(control_outcome(&mismatch).unwrap(), first);
+        monitor.observe_request(Outcome::Responsive, first, previous_daemon_reply);
+        let expected = State::Incompatible {
+            since: first,
+            actual: version,
+        };
+        assert_eq!(*monitor.sender.borrow(), expected);
+        let mut updates = monitor.sender.subscribe();
+        for outcome in [
+            Outcome::Incompatible(version),
+            Outcome::Unreachable,
+            Outcome::TimedOut(Duration::from_secs(5)),
+        ] {
+            monitor.observe(outcome, first + Duration::from_secs(30));
+            assert_eq!(*monitor.sender.borrow(), expected);
+            assert!(!updates.has_changed().unwrap());
+        }
+        assert!(replaces_notice_for(
+            &expected,
+            "Notification service unavailable: daemon protocol version 99 is unsupported; expected 66"
+        ));
+        assert!(!replaces_notice_for(
+            &expected,
+            "File save failed: Permission denied"
+        ));
+        assert!(!replaces_notice_for(
+            &expected,
+            "Daemon identity changed during native chat attachment"
+        ));
+        let stale = monitor.begin();
+        monitor.observe(Outcome::Responsive, first + Duration::from_secs(31));
+        monitor.observe_request(
+            Outcome::Incompatible(version),
+            first + Duration::from_secs(32),
+            stale,
+        );
+        assert_eq!(*monitor.sender.borrow(), State::Responsive);
+        assert!(updates.has_changed().unwrap());
+        updates.borrow_and_update();
+    }
+
     #[test]
     fn repeated_timeouts_keep_the_original_since_and_one_transition() {
         let monitor = Monitor::new();

@@ -1697,6 +1697,8 @@ fn serve_connection(
         return ConnectionEnd::Retry;
     }
 
+    #[cfg(feature = "ui")]
+    let health_request = crate::daemon_health::begin();
     let connect_id = 1;
     let connect = ClientEnvelope {
         version: PROTOCOL_VERSION,
@@ -1756,6 +1758,8 @@ fn serve_connection(
             }
         };
         if envelope.version != PROTOCOL_VERSION {
+            #[cfg(feature = "ui")]
+            crate::daemon_health::incompatible(socket, envelope.version, health_request);
             crate::diagnostics::record(crate::diagnostics::Event::ProtocolMismatch);
             tracing::warn!(
                 actual = envelope.version,
@@ -1807,6 +1811,8 @@ fn serve_connection(
                     published.confirm_attachment();
                     did_attach();
                 }
+                #[cfg(feature = "ui")]
+                crate::daemon_health::frame(&stream, None, health_request);
                 break (proof, attached);
             }
             ServerMessage::Error(error) => {
@@ -2002,7 +2008,16 @@ fn serve_connection(
             }
             ClientWork::ServerClosed => return ConnectionEnd::Retry,
         };
-        if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
+        if envelope.version != PROTOCOL_VERSION {
+            #[cfg(feature = "ui")]
+            crate::daemon_health::incompatible(
+                socket,
+                envelope.version,
+                crate::daemon_health::begin(),
+            );
+            return ConnectionEnd::Retry;
+        }
+        if envelope.proof != proof {
             return ConnectionEnd::Retry;
         }
 

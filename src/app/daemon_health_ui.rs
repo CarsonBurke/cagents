@@ -197,6 +197,10 @@ impl Cagents {
                 timestamp(*since),
                 timeout.as_secs_f64(),
             ),
+            daemon_health::State::Incompatible { actual, .. } => format!(
+                "This window requires daemon protocol {}, but the last daemon reply used protocol {actual}. The window and daemon cannot communicate.",
+                crate::terminal_ipc::PROTOCOL_VERSION,
+            ),
             daemon_health::State::Unreachable { since } => format!(
                 "The daemon has been unreachable since {}. Reconnecting…",
                 timestamp(*since),
@@ -232,7 +236,14 @@ impl Cagents {
             return None;
         }
         let mut rows: Vec<Element<'_, Message>> = vec![
-            design::title("Restart the unresponsive daemon?").into(),
+            design::title(
+                if matches!(state.health, daemon_health::State::Incompatible { .. }) {
+                    "Restart the incompatible daemon?"
+                } else {
+                    "Restart the unresponsive daemon?"
+                },
+            )
+            .into(),
             notice_body(
                 "Active native turns and their background subagents will stop. Hosted terminals can close; conversations without durable provider state cannot be resumed. Saved files and drafts remain on disk.",
             ),
@@ -301,6 +312,34 @@ mod tests {
             repeat: false,
         }
     }
+    #[test]
+    fn protocol_mismatch_offers_reviewed_restart_without_stopping_anything() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(
+            app.update(Message::DaemonHealth(daemon_health::State::Incompatible {
+                since: std::time::SystemTime::UNIX_EPOCH,
+                actual: crate::terminal_ipc::PROTOCOL_VERSION + 1,
+            })),
+        );
+        assert!(app.daemon_health_ui.health.unavailable());
+        drop(app.update_daemon_health_ui(Action::Open));
+        assert!(app.daemon_health_ui.confirmation);
+        assert!(!app.daemon_health_ui.restarting);
+        drop(app.update_daemon_health_ui(Action::Confirm));
+        assert!(
+            !app.daemon_health_ui.restarting,
+            "unverified ownership cannot stop a process"
+        );
+        let generation = app.daemon_health_ui.generation;
+        drop(app.update_daemon_health_ui(Action::Prepared {
+            generation,
+            target: Err("ownership changed".into()),
+        }));
+        assert!(app.daemon_health_ui.error.is_some());
+        drop(app.update(Message::DaemonHealth(daemon_health::State::Responsive)));
+        assert!(!app.daemon_health_ui.confirmation);
+    }
+
     #[test]
     fn daemon_health_confirmation_skips_disabled_confirm_and_fences_late_preparation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
