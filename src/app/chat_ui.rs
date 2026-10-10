@@ -10124,7 +10124,7 @@ mod tests {
             }
             let mut element = runtime.find_turn_view_for_test();
             let tree = tree.get_or_insert_with(|| Tree::new(&element));
-            tree.diff(&element);
+            tree.diff(element.as_widget_mut());
             let node = element.as_widget_mut().layout(
                 tree,
                 renderer,

@@ -4328,6 +4328,7 @@ mod tests {
                 crate::settings::EditorSyntaxTheme::Auto,
                 None,
                 runtime.target,
+                None,
             ),
         ]);
         let mut element = selection::transcript(content, runtime.target, None);
