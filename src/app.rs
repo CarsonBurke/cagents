@@ -24636,6 +24636,8 @@ mod tests {
             #[cfg(feature = "integrated-browser")]
             browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
+            terminal_review_card: None,
+            terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
             #[cfg(feature = "integrated-browser")]

@@ -2129,8 +2129,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 )
             ),
             state.selection.map_or_else(
-                || "No terminal selection".into(),
-                |_| "Terminal selection; only visible text is exposed".into()
+                || String::from("No terminal selection"),
+                |_| String::from("Terminal selection; only visible text is exposed")
             ),
             if projection.truncated { "; capped" } else { "" }
         ));

@@ -283,8 +283,8 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     let shared = ReviewInputBarrier::default();
     let mut old_widget = widget(&old, "old-card", shared.clone(), true, false);
     let mut new_widget = widget(&new, "new-card", shared.clone(), false, false);
-    let mut old_tree = Tree::new(&old_widget);
-    let mut new_tree = Tree::new(&new_widget);
+    let mut old_tree = Tree::new(&old_widget as &dyn Widget<Message, Theme, Renderer>);
+    let mut new_tree = Tree::new(&new_widget as &dyn Widget<Message, Theme, Renderer>);
     let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
