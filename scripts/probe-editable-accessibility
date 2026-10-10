@@ -89,7 +89,7 @@ if args.replace_with is not None:
         count = text.get_character_count()
         if count > 4096:
             sys.exit("Fixture field exceeds the text probe budget")
-        if text.get_text(0, count) == expected:
+        if Atspi.Text.get_text(text, 0, count) == expected:
             break
         time.sleep(0.025)
 check()
@@ -97,7 +97,7 @@ text = field.get_text_iface()
 count = text.get_character_count() if text else None
 if count is not None and count > 4096:
     sys.exit("Fixture field exceeds the text probe budget")
-value = text.get_text(0, count) if text else None
+value = Atspi.Text.get_text(text, 0, count) if text else None
 if args.require_private and text:
     sys.exit("Private field unexpectedly exposes a text interface")
 if args.forbidden_text and any(args.forbidden_text in item for item in (value or "", field.get_description() or "")):
