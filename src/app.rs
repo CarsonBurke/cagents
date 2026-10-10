@@ -37,6 +37,7 @@ mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
+mod terminal_failure;
 mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
@@ -2459,6 +2460,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
+        Message::TerminalFailure(action) => action.is_user_action(),
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
@@ -3954,6 +3956,7 @@ pub enum Message {
         committed: bool,
     },
     NewTerminal,
+    TerminalFailure(terminal_failure::Action),
     TerminalStarted {
         card: CardId,
         terminal: TerminalId,
@@ -4446,7 +4449,7 @@ struct BrowserRuntime {
 
 enum CardRuntime {
     Loading,
-    Failed(String),
+    Failed(terminal_failure::Failure),
     Completed,
     Terminal(TerminalSurface),
     Chat(Box<chat_ui::Runtime>),
@@ -4757,6 +4760,7 @@ pub struct Cagents {
     /// interior mutability - the start path holds `&self` - and never for
     /// concurrency: every mutation happens on the update thread.
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
+    terminal_failure: terminal_failure::State,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
     /// Restored agent terminals that are not on screen, attached one at a
@@ -5493,8 +5497,18 @@ impl Cagents {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     ) -> Task<Message> {
+        self.terminal_started_for_operation(card, terminal, result, true)
+    }
+
+    fn terminal_started_for_operation(
+        &mut self,
+        card: CardId,
+        terminal: TerminalId,
+        result: Result<StartedTerminal, String>,
+        current_operation: bool,
+    ) -> Task<Message> {
         tracing::debug!(target: "cagents::pane_open", stage = "started", ?card, ok = result.is_ok());
-        let accept = can_accept_terminal_start(
+        let accept = current_operation && can_accept_terminal_start(
             self.durable.cards.iter().find(|state| state.id == card),
             self.lifecycle.state(card).is_some(),
             matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
@@ -5505,7 +5519,15 @@ impl Cagents {
             if let Ok(started) = result
                 && started.spawned
             {
-                self.begin_terminal_teardown(started.handle);
+                let claimed = self.terminal_runtime_claims(started.session.id);
+                if claimed {
+                    // A stale operation may have started the same hosted PTY
+                    // a newer operation now holds or is attaching. Disconnect
+                    // its client without sending ShutdownTerminal to that PTY.
+                    self.retire_terminal_surface(started.handle, false);
+                } else {
+                    self.begin_terminal_teardown(started.handle);
+                }
             }
             // Nothing will claim this identity, so a held observation
             // is free to decide about it.
@@ -7510,6 +7532,7 @@ impl Cagents {
         }
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
+        let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
         self.retire_lsp_card(card);
         match self.cards.remove(&card) {
@@ -7534,9 +7557,9 @@ impl Cagents {
             )
             | None => {}
         }
-        self.cards
-            .insert(card, CardRuntime::Failed(message.clone()));
         self.mark_runtime_failed(card, message);
+        failure.enrich_assigned_failure(self.card_state(card).map(|state| &state.residency));
+        self.cards.insert(card, CardRuntime::Failed(failure));
     }
 
     /// Retires a terminal whose process ended, keeping its surface.
@@ -7630,6 +7653,7 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::utility(&state.kind));
             return Task::none();
         }
+        let retry_details = self.terminal_details(card);
         let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind
             && session.continuity.live_proof().is_none()
         {
@@ -7665,12 +7689,17 @@ impl Cagents {
             CardKind::Terminal(session) => {
                 self.terminal_recovery_attempts.remove(&session.id);
                 self.cards.insert(card, CardRuntime::Loading);
-                self.start_terminal(
+                let task = self.start_terminal(
                     card,
                     session,
                     state.exposure == Exposure::Visible && surfaces_visible,
                     true,
-                )
+                );
+                if let Some(details) = retry_details {
+                    self.track_terminal_retry(card, details, task)
+                } else {
+                    task
+                }
             }
             #[cfg(feature = "integrated-browser")]
             CardKind::Browser(session) => {
@@ -9141,10 +9170,20 @@ impl Cagents {
                         .align_y(Alignment::Center)
                         .spacing(space::S)
                         .into(),
-                        widget::selectable_text(message)
+                        widget::selectable_text(message.message())
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
+                        if matches!(message, terminal_failure::Failure::Terminal(_)) {
+                            widget::column::with_children(vec![
+                                self.terminal_diagnostic_summary(id),
+                                self.terminal_diagnostic_controls(id),
+                            ])
+                            .spacing(space::M)
+                            .into()
+                        } else {
+                            iced::widget::Space::new().into()
+                        },
                         self.account_recovery_controls(id)
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
@@ -9189,6 +9228,9 @@ impl Cagents {
             )
             .center(Length::Fill)
             .into(),
+            Some(CardRuntime::Loading) if self.terminal_retry_pending(id) => self
+                .terminal_retry_view(id)
+                .expect("retry presentation exists"),
             Some(CardRuntime::Loading) | None => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -12611,6 +12653,7 @@ impl Application for Cagents {
             terminal_wake_rx,
             hosted_terminals_rx,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
+            terminal_failure: terminal_failure::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -12990,6 +13033,7 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
@@ -16204,7 +16248,16 @@ impl Application for Cagents {
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
-        Task::batch([task, binding, chrome, deferred, pull_request, notices])
+        let terminal_probes = self.terminal_transcript_probes();
+        Task::batch([
+            task,
+            binding,
+            chrome,
+            deferred,
+            pull_request,
+            notices,
+            terminal_probes,
+        ])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -21108,7 +21161,7 @@ mod tests {
         assert!(app.chat_start_pending(target));
     }
 
-    fn live_agent_app(program: &str) -> (Cagents, CardId, tempfile::TempDir) {
+    pub(super) fn live_agent_app(program: &str) -> (Cagents, CardId, tempfile::TempDir) {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
 
         let mut app = context_inspector_test_app(false);
@@ -22006,7 +22059,7 @@ mod tests {
         (app, agent.id, session)
     }
 
-    fn unconnected_surface(directory: &Path, terminal: TerminalId) -> TerminalSurface {
+    pub(super) fn unconnected_surface(directory: &Path, terminal: TerminalId) -> TerminalSurface {
         TerminalSurface::from(
             HostedTerminalHandle::connect_at(
                 directory.join("missing.sock"),
@@ -24575,6 +24628,7 @@ mod tests {
             terminal_wake_rx,
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
+            terminal_failure: terminal_failure::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),

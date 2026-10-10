@@ -35,7 +35,10 @@ use libghostty_vt::{
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 
 use crate::{
-    model::{LaunchRecipe, TerminalOutputActivity, TerminalSession, agent_recovery::AgentProcess},
+    model::{
+        LaunchRecipe, TerminalId, TerminalOutputActivity, TerminalSession,
+        agent_recovery::AgentProcess,
+    },
     secure_file::open_private_append_file,
 };
 
@@ -361,6 +364,9 @@ struct PublishedState {
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
+    // The source descriptors pin both identities through terminal retirement;
+    // numeric inode receipts alone cannot distinguish later inode reuse.
+    transcript_location: OnceLock<crate::transcript_location::ValidatedTranscript>,
     /// The newest generation a wake has already announced to the subscriber
     /// side of this protocol.
     ///
@@ -400,6 +406,7 @@ impl PublishedState {
             completed: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
+            transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
             wake,
@@ -680,6 +687,13 @@ impl TerminalHandle {
     /// never rediscovered by a reusable terminal ID.
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
+    }
+    pub(crate) fn transcript_location(&self) -> Option<crate::model::TranscriptLocationReceipt> {
+        self.inner
+            .published
+            .transcript_location
+            .get()
+            .map(|location| location.receipt())
     }
     pub fn spawn(
         session: TerminalSession,
@@ -1609,16 +1623,23 @@ impl Worker {
         // any other output would.
         let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
 
-        let transcript = session
+        let mut transcript = session
             .transcript_path
             .map(|path| {
                 TranscriptWriter::start(
                     path,
+                    session.id,
                     config.transcript_capacity.max(1),
                     config.transcript_max_bytes.max(1),
                 )
             })
             .transpose()?;
+        if let Some(location) = transcript
+            .as_mut()
+            .and_then(|writer| writer.location.take())
+        {
+            let _ = published.transcript_location.set(location);
+        }
         let visibility = if config.initially_visible {
             Visibility::Visible
         } else {
@@ -3323,6 +3344,7 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: Owned
 }
 
 struct TranscriptWriter {
+    location: Option<crate::transcript_location::ValidatedTranscript>,
     sender: Sender<TranscriptMessage>,
     /// Published by the writer once the size cap is reached, so the worker can
     /// stop handing over batches the writer would only drop.
@@ -3331,9 +3353,15 @@ struct TranscriptWriter {
 }
 
 impl TranscriptWriter {
-    fn start(path: PathBuf, capacity: usize, max_bytes: u64) -> Result<Self, String> {
+    fn start(
+        path: PathBuf,
+        terminal: TerminalId,
+        capacity: usize,
+        max_bytes: u64,
+    ) -> Result<Self, String> {
         let file = open_private_append_file(&path)
             .map_err(|error| format!("open transcript {}: {error}", path.display()))?;
+        let location = crate::transcript_location::capture(terminal, &path, &file);
         let written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let capped_flag = Arc::new(AtomicBool::new(false));
@@ -3378,6 +3406,7 @@ impl TranscriptWriter {
             })
             .map_err(|error| format!("start transcript writer: {error}"))?;
         Ok(Self {
+            location,
             sender,
             capped: capped_flag,
             worker,
@@ -5753,7 +5782,7 @@ mod tests {
         fs::write(&path, b"before\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let writer = TranscriptWriter::start(path.clone(), 1, 1 << 20).unwrap();
+        let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 1, 1 << 20).unwrap();
         writer.send(b"after\n".to_vec()).unwrap();
         writer.finish();
 
@@ -5774,7 +5803,7 @@ mod tests {
         let directory = root.path().join("new-transcripts");
         let path = directory.join("terminal.log");
 
-        TranscriptWriter::start(path.clone(), 1, 1 << 20)
+        TranscriptWriter::start(path.clone(), TerminalId::new(), 1, 1 << 20)
             .unwrap()
             .finish();
 
@@ -5793,7 +5822,7 @@ mod tests {
         let root = tempdir().unwrap();
         let path = root.path().join("terminal.log");
 
-        let writer = TranscriptWriter::start(path.clone(), 64, 16).unwrap();
+        let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 64, 16).unwrap();
         writer.send(vec![b'x'; 64]).unwrap();
         writer.send(b"discarded\n".to_vec()).unwrap();
         writer.finish();
@@ -5815,7 +5844,7 @@ mod tests {
         let path = root.path().join("terminal.log");
         fs::write(&path, vec![b'y'; 32]).unwrap();
 
-        let writer = TranscriptWriter::start(path.clone(), 64, 16).unwrap();
+        let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 64, 16).unwrap();
         writer.send(b"new output\n".to_vec()).unwrap();
         writer.finish();
 
@@ -5837,7 +5866,7 @@ mod tests {
         let linked_file = directory.join("linked.log");
         symlink(&victim, &linked_file).unwrap();
 
-        assert!(TranscriptWriter::start(linked_file, 1, 1 << 20).is_err());
+        assert!(TranscriptWriter::start(linked_file, TerminalId::new(), 1, 1 << 20).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
 
         let real_directory = root.path().join("real");
@@ -5845,7 +5874,13 @@ mod tests {
         let linked_directory = root.path().join("linked-directory");
         symlink(&real_directory, &linked_directory).unwrap();
         assert!(
-            TranscriptWriter::start(linked_directory.join("terminal.log"), 1, 1 << 20).is_err()
+            TranscriptWriter::start(
+                linked_directory.join("terminal.log"),
+                TerminalId::new(),
+                1,
+                1 << 20
+            )
+            .is_err()
         );
     }
 

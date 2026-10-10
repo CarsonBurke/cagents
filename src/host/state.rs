@@ -960,7 +960,10 @@ impl HostState {
                 .map(|(sequence, _)| *sequence)
                 .unwrap_or_else(|| record.event_sequence.saturating_add(1)),
             attached,
-            transcript: transcript_metadata(record.session.transcript_path.as_deref()),
+            transcript: transcript_metadata(
+                record.session.transcript_path.as_deref(),
+                record.handle.transcript_location(),
+            ),
             upgrade_sources: record.upgrade_sources.clone(),
             upgrade_relaunches: record.upgrade_relaunches.clone(),
         })
@@ -4009,7 +4012,10 @@ fn record_event_from(
     }
 }
 
-fn transcript_metadata(path: Option<&std::path::Path>) -> Option<TranscriptMetadata> {
+fn transcript_metadata(
+    path: Option<&std::path::Path>,
+    location: Option<crate::model::TranscriptLocationReceipt>,
+) -> Option<TranscriptMetadata> {
     let path = path?;
     let metadata = fs::metadata(path).ok()?;
     let updated_at_unix_ms = metadata
@@ -4026,6 +4032,10 @@ fn transcript_metadata(path: Option<&std::path::Path>) -> Option<TranscriptMetad
         // make without changing that worker's persistence contract.
         durable_offset: 0,
         updated_at_unix_ms,
+        // Original writer identity evidence, not pathname availability. The
+        // UI validates it against freshly opened descriptors when probing and
+        // activating; listing terminals never mints a replacement receipt.
+        location,
     })
 }
 

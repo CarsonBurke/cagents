@@ -111,6 +111,8 @@ pub mod tab_history;
 #[cfg(feature = "ui")]
 pub mod tab_strip;
 pub mod terminal;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod transcript_location;
 #[cfg(feature = "host")]
 pub mod tray;
 #[cfg(feature = "ui")]

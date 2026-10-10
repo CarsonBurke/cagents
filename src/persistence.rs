@@ -1832,6 +1832,7 @@ impl StateStore {
                         byte_len: i64_to_u64(byte_len, "transcript byte length")?,
                         durable_offset: i64_to_u64(durable_offset, "transcript durable offset")?,
                         updated_at_unix_ms: updated_at,
+                        location: None,
                     },
                 ))
             })
@@ -6566,6 +6567,7 @@ mod tests {
             byte_len: 128,
             durable_offset: 96,
             updated_at_unix_ms: 1,
+            location: None,
         };
         store
             .save_transcript_metadata(chat.id, &metadata, 0)
@@ -8286,6 +8288,7 @@ mod tests {
                     byte_len: 123,
                     durable_offset: 100,
                     updated_at_unix_ms: 42,
+                    location: None,
                 },
                 0,
             )

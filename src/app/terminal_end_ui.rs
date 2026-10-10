@@ -397,18 +397,23 @@ impl Cagents {
         ));
 
         widget::container(
-            widget::row::with_children(vec![
-                widget::container(summary)
-                    .width(Length::Fill)
-                    .clip(true)
-                    .into(),
-                widget::row::with_children(actions)
-                    .spacing(space::S)
-                    .align_y(Alignment::Center)
-                    .into(),
+            widget::column::with_children(vec![
+                widget::row::with_children(vec![
+                    widget::container(summary)
+                        .width(Length::Fill)
+                        .clip(true)
+                        .into(),
+                    widget::row::with_children(actions)
+                        .spacing(space::S)
+                        .align_y(Alignment::Center)
+                        .into(),
+                ])
+                .spacing(space::L)
+                .align_y(Alignment::Center)
+                .into(),
+                self.terminal_diagnostic_controls(card),
             ])
-            .spacing(space::L)
-            .align_y(Alignment::Center),
+            .spacing(space::S),
         )
         .padding([space::S, space::L])
         .width(Length::Fill)
