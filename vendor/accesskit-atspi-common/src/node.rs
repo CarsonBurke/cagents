@@ -1733,7 +1733,7 @@ mod editable_text_tests {
                 assert!(actions.is_empty());
             } else {
                 assert!(
-                    matches!(actions.as_slice(), [ActionRequest { action: Action::SetValue, data: Some(ActionData::Value(value)), .. }] if value == "é replacement")
+                    matches!(actions.as_slice(), [ActionRequest { action: Action::SetValue, data: Some(ActionData::Value(value)), .. }] if value.as_ref() == "é replacement")
                 );
             }
         }
