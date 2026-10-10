@@ -13,6 +13,9 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use unicode_segmentation::UnicodeSegmentation;
 
+mod boundary;
+pub(super) use boundary::{Kind, wrap};
+
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 
@@ -161,6 +164,45 @@ impl operation::Focusable for State {
     }
 }
 
+struct Frame {
+    identity: u64,
+    kind: Kind,
+    first_block: usize,
+}
+#[derive(Clone)]
+struct ListMarker {
+    marker: String,
+    indent: usize,
+    content_indent: usize,
+    first: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Cell {
+    table: u64,
+    row: usize,
+    column: usize,
+}
+struct Table {
+    columns: usize,
+    rows: usize,
+    cells: HashMap<(usize, usize), usize>,
+    first_block: usize,
+    last_block: usize,
+    has_text: bool,
+    lists: Vec<ListMarker>,
+}
+struct Ranges {
+    blocks: Vec<Range<usize>>,
+    lo: (usize, usize),
+    hi: (usize, usize),
+}
+impl std::ops::Deref for Ranges {
+    type Target = [Range<usize>];
+    fn deref(&self) -> &Self::Target {
+        &self.blocks
+    }
+}
+
 struct Block {
     identity: u64,
     plain: Arc<str>,
@@ -168,6 +210,8 @@ struct Block {
     visible: Option<Rectangle>,
     hit: usize,
     link: Option<(Target, String)>,
+    lists: Vec<ListMarker>,
+    cell: Option<Cell>,
 }
 
 struct Read {
@@ -176,6 +220,9 @@ struct Read {
     translation: Vector,
     pending: Option<(Vector, Rectangle)>,
     clip: Option<Rectangle>,
+    frames: Vec<Frame>,
+    tables: HashMap<u64, Table>,
+    table_order: Vec<u64>,
 }
 
 impl Read {
@@ -186,7 +233,29 @@ impl Read {
             translation: Vector::ZERO,
             pending: None,
             clip: None,
+            frames: Vec::new(),
+            tables: HashMap::new(),
+            table_order: Vec::new(),
         }
+    }
+
+    fn list_markers(&self) -> Vec<ListMarker> {
+        let mut lists = Vec::new();
+        let mut indent = 0;
+        for frame in &self.frames {
+            if let Kind::ListItem(marker) = &frame.kind {
+                // Checkbox text is content, not the Markdown list marker width.
+                let width = marker.split_whitespace().next().unwrap_or_default().len() + 1;
+                lists.push(ListMarker {
+                    marker: marker.clone(),
+                    indent,
+                    content_indent: indent + width,
+                    first: frame.first_block == self.blocks.len(),
+                });
+                indent += width;
+            }
+        }
+        lists
     }
 
     fn endpoint(&self, inside: bool) -> Option<&Block> {
@@ -207,7 +276,7 @@ impl Read {
             .min_by(|a, b| distance(a.visible.unwrap()).total_cmp(&distance(b.visible.unwrap())))
     }
 
-    fn ranges(&self, anchor: Endpoint, end: Endpoint) -> Option<Vec<Range<usize>>> {
+    fn ranges(&self, anchor: Endpoint, end: Endpoint) -> Option<Ranges> {
         let locate = |point: Endpoint| {
             self.blocks
                 .iter()
@@ -223,8 +292,11 @@ impl Read {
         } else {
             (end, anchor)
         };
-        Some(
-            self.blocks
+        Some(Ranges {
+            lo,
+            hi,
+            blocks: self
+                .blocks
                 .iter()
                 .enumerate()
                 .map(|(index, block)| {
@@ -241,17 +313,205 @@ impl Read {
                     }
                 })
                 .collect(),
-        )
+        })
     }
 
-    fn copy(&self, ranges: &[Range<usize>]) -> String {
-        self.blocks
-            .iter()
-            .zip(ranges)
-            .filter(|(_, range)| !range.is_empty())
-            .map(|(block, range)| &block.plain[range.clone()])
-            .collect::<Vec<_>>()
-            .join("\n\n")
+    // One pass over selected prose, independent of the number of tables.
+    fn table_values(&self, ranges: &Ranges) -> HashMap<u64, HashMap<(usize, usize), String>> {
+        let mut tables: HashMap<u64, HashMap<(usize, usize), String>> = HashMap::new();
+        let mut previous_lists = HashSet::new();
+        for (block, range) in self.blocks.iter().zip(ranges.iter()) {
+            if range.is_empty() {
+                continue;
+            }
+            if let Some(cell) = block.cell {
+                let value = tables
+                    .entry(cell.table)
+                    .or_default()
+                    .entry((cell.row, cell.column))
+                    .or_default();
+                let parents = &self.tables[&cell.table].lists;
+                let lists = &block.lists[parents.len()..];
+                let first = range.start == 0 && lists.iter().any(|list| list.first);
+                if !value.is_empty() {
+                    value.push_str(if first && previous_lists.contains(&cell) {
+                        "\n"
+                    } else {
+                        "\n\n"
+                    });
+                }
+                let indent = parents.last().map_or(0, |list| list.content_indent);
+                value.push_str(&Self::list_text(
+                    &block.plain[range.clone()],
+                    lists,
+                    range.start == 0,
+                    indent,
+                ));
+                if lists.is_empty() {
+                    previous_lists.remove(&cell);
+                } else {
+                    previous_lists.insert(cell);
+                }
+            }
+        }
+        tables
+    }
+
+    fn list_text(text: &str, lists: &[ListMarker], beginning: bool, base_indent: usize) -> String {
+        if !beginning || lists.is_empty() {
+            return text.to_owned();
+        }
+        let mut result = String::new();
+        for list in lists.iter().filter(|list| list.first) {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&" ".repeat(list.indent.saturating_sub(base_indent)));
+            result.push_str(&list.marker);
+            result.push(' ');
+        }
+        let indent = lists
+            .last()
+            .unwrap()
+            .content_indent
+            .saturating_sub(base_indent);
+        if result.is_empty() {
+            result.push_str(&" ".repeat(indent));
+        }
+        for (index, line) in text.split('\n').enumerate() {
+            if index > 0 {
+                result.push('\n');
+                result.push_str(&" ".repeat(indent));
+            }
+            result.push_str(line);
+        }
+        result
+    }
+
+    fn copy(&self, ranges: &Ranges) -> String {
+        let values = self.table_values(ranges);
+        let mut result = String::new();
+        let mut emitted = false;
+        let mut previous_list = false;
+        let mut append = |text: String, lists: &[ListMarker], beginning: bool| {
+            let first_item = beginning && lists.iter().any(|list| list.first);
+            if emitted {
+                result.push_str(if first_item && !lists.is_empty() && previous_list {
+                    "\n"
+                } else {
+                    "\n\n"
+                });
+            }
+            result.push_str(&Self::list_text(&text, lists, beginning, 0));
+            emitted = true;
+            previous_list = !lists.is_empty();
+        };
+        let mut tables = self.table_order.iter().peekable();
+        for (index, (block, range)) in self.blocks.iter().zip(ranges.iter()).enumerate() {
+            while let Some(&&identity) = tables.peek() {
+                let table = &self.tables[&identity];
+                if table.first_block > index {
+                    break;
+                }
+                tables.next();
+                let fully_empty = !table.has_text
+                    && ranges.lo.0 < table.first_block
+                    && table.last_block <= ranges.hi.0;
+                if let Some(values) = values.get(&identity) {
+                    let beginning = ranges.lo.0 < table.first_block
+                        || (ranges.lo.0 == table.first_block && ranges.lo.1 == 0);
+                    append(
+                        self.copy_table(identity, ranges, values),
+                        &table.lists,
+                        beginning,
+                    );
+                } else if fully_empty {
+                    append(
+                        self.copy_table(identity, ranges, &HashMap::new()),
+                        &table.lists,
+                        true,
+                    );
+                }
+            }
+            if !range.is_empty() && block.cell.is_none() {
+                append(
+                    block.plain[range.clone()].to_owned(),
+                    &block.lists,
+                    range.start == 0,
+                );
+            }
+        }
+        result
+    }
+
+    fn copy_table(
+        &self,
+        identity: u64,
+        ranges: &Ranges,
+        values: &HashMap<(usize, usize), String>,
+    ) -> String {
+        let Some(table) = self.tables.get(&identity) else {
+            return String::new();
+        };
+        if table.columns == 0 || table.rows == 0 {
+            return String::new();
+        }
+        let coordinate = |cell: Cell| cell.row * table.columns + cell.column;
+        let lo_cell = self.blocks[ranges.lo.0]
+            .cell
+            .filter(|cell| cell.table == identity);
+        let hi_cell = self.blocks[ranges.hi.0]
+            .cell
+            .filter(|cell| cell.table == identity);
+        let first = lo_cell.map_or(0, coordinate);
+        let last = if let Some(cell) = hi_cell {
+            let end = coordinate(cell);
+            if ranges.hi.1 == 0
+                && table.cells.get(&(cell.row, cell.column)).copied() == Some(ranges.hi.0)
+            {
+                let Some(previous) = end.checked_sub(1) else {
+                    return String::new();
+                };
+                previous
+            } else {
+                end
+            }
+        } else {
+            table.rows * table.columns - 1
+        };
+        if first > last {
+            return String::new();
+        }
+        if first == last {
+            return values
+                .get(&(first / table.columns, first % table.columns))
+                .cloned()
+                .unwrap_or_default();
+        }
+        let mut result = String::new();
+        for coordinate in first..=last {
+            let row = coordinate / table.columns;
+            let column = coordinate % table.columns;
+            if coordinate != first {
+                result.push(if column == 0 { '\n' } else { '\t' });
+            }
+            let value = if table.cells.contains_key(&(row, column)) {
+                values
+                    .get(&(row, column))
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            } else {
+                ""
+            };
+            if value.contains(['\t', '\n', '\r', '"']) {
+                result.push('"');
+                result.push_str(&value.replace('"', "\"\""));
+                result.push('"');
+            } else {
+                result.push_str(value);
+            }
+        }
+        result
     }
 }
 
@@ -287,6 +547,51 @@ impl Operation for Read {
     }
 
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+        if let Some(enter) = state.downcast_ref::<boundary::Enter>() {
+            if let Kind::Table { columns, rows } = &enter.kind {
+                self.table_order.push(enter.identity);
+                let lists = self.list_markers();
+                self.tables.insert(
+                    enter.identity,
+                    Table {
+                        columns: *columns,
+                        rows: *rows,
+                        cells: HashMap::new(),
+                        first_block: self.blocks.len(),
+                        last_block: self.blocks.len(),
+                        has_text: false,
+                        lists,
+                    },
+                );
+            }
+            if let Kind::Cell { row, column } = &enter.kind {
+                if let Some(table) = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|frame| {
+                        matches!(frame.kind, Kind::Table { .. }).then_some(frame.identity)
+                    })
+                    .and_then(|identity| self.tables.get_mut(&identity))
+                {
+                    table.cells.insert((*row, *column), self.blocks.len());
+                }
+            }
+            self.frames.push(Frame {
+                identity: enter.identity,
+                kind: enter.kind.clone(),
+                first_block: self.blocks.len(),
+            });
+            return;
+        }
+        if state.is::<boundary::Exit>() {
+            if let Some(frame) = self.frames.pop() {
+                if let Some(table) = self.tables.get_mut(&frame.identity) {
+                    table.last_block = self.blocks.len();
+                }
+            }
+            return;
+        }
         let Some(prose) = state.downcast_mut::<Prose>() else {
             return;
         };
@@ -300,8 +605,36 @@ impl Operation for Read {
             .clip
             .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
             .map(|point| point - Vector::new(bounds.x, bounds.y));
+        let lists = self.list_markers();
+        let mut table = None;
+        let mut cell = None;
+        for frame in &self.frames {
+            match &frame.kind {
+                Kind::ListItem(_) => {}
+                Kind::Table { .. } => {
+                    table = Some(frame.identity);
+                    cell = None;
+                }
+                Kind::Cell { row, column } => {
+                    cell = table.map(|table| Cell {
+                        table,
+                        row: *row,
+                        column: *column,
+                    })
+                }
+            }
+        }
+        if !prose.plain.is_empty() {
+            for frame in &self.frames {
+                if let Some(table) = self.tables.get_mut(&frame.identity) {
+                    table.has_text = true;
+                }
+            }
+        }
         self.blocks.push(Block {
             identity: prose.identity,
+            lists,
+            cell,
             plain: prose.plain.clone(),
             bounds,
             visible: self
@@ -873,6 +1206,297 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn rendered_markdown(
+        body: &str,
+        change: impl FnOnce(&mut Vec<markdown::Item>),
+    ) -> Element<'static, Message> {
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: body.to_owned(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let mut items = cached.markdown.items().to_vec();
+        change(&mut items);
+        prose::items_for_test(
+            &cached,
+            &items,
+            Target {
+                card: CardId::new(),
+                generation: 3,
+            },
+        )
+    }
+    fn read_rendered(element: &mut Element<'static, Message>, tree: &mut Tree) -> Read {
+        let renderer = crate::app::tests::headless_renderer();
+        let node = element.as_widget_mut().layout(
+            tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(600.0, 2000.0)),
+        );
+        let mut read = Read::new(None);
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), &renderer, &mut read);
+        assert!(
+            read.frames.is_empty(),
+            "structure scope must close after traversal"
+        );
+        read
+    }
+    fn copy_between(read: &Read, first: usize, start: usize, last: usize, end: usize) -> String {
+        let a = Endpoint {
+            identity: read.blocks[first].identity,
+            byte: start,
+        };
+        let b = Endpoint {
+            identity: read.blocks[last].identity,
+            byte: end,
+        };
+        let forward = read.copy(&read.ranges(a, b).unwrap());
+        assert_eq!(read.copy(&read.ranges(b, a).unwrap()), forward);
+        forward
+    }
+    #[test]
+    fn rendered_lists_preserve_markers_tasks_nesting_and_partial_unicode() {
+        let body = "7. α first\n8. β second\n\n- [x] done\n  - nested\n- [ ] pending\n";
+        let mut element = rendered_markdown(body, |_| {});
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            read.blocks
+                .iter()
+                .map(|block| block.plain.as_ref())
+                .collect::<Vec<_>>(),
+            ["α first", "β second", "done", "nested", "pending"]
+        );
+        assert_eq!(
+            copy_between(&read, 0, 0, 4, "pending".len()),
+            "7. α first\n8. β second\n- [x] done\n  - nested\n- [ ] pending"
+        );
+        assert_eq!(
+            copy_between(&read, 0, "α ".len(), 1, "β".len()),
+            "first\n8. β"
+        );
+        assert_eq!(copy_between(&read, 3, 1, 3, 4), "est");
+        let identities = read
+            .blocks
+            .iter()
+            .map(|block| block.identity)
+            .collect::<Vec<_>>();
+        element = rendered_markdown(body.replace("7.", "12.").as_str(), |_| {});
+        tree.diff(&mut element);
+        let changed = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            changed
+                .blocks
+                .iter()
+                .map(|block| block.identity)
+                .collect::<Vec<_>>(),
+            identities
+        );
+        assert_eq!(
+            copy_between(&changed, 0, 0, 1, "β second".len()),
+            "12. α first\n13. β second"
+        );
+    }
+    #[test]
+    fn rendered_tables_copy_linear_intervals_empty_cells_and_delimiters() {
+        let body = "| A | B | C |\n|---|---|---|\n| α | | β |\n| γ | delta | ε |\n";
+        let mut element = rendered_markdown(body, |_| {});
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            read.tables.values().next().unwrap().cells.len(),
+            9,
+            "empty cells still publish coordinates"
+        );
+        assert_eq!(
+            copy_between(&read, 0, 0, read.blocks.len() - 1, "ε".len()),
+            "A\tB\tC\nα\t\tβ\nγ\tdelta\tε"
+        );
+        assert_eq!(
+            copy_between(&read, 1, 0, 3, "α".len()),
+            "B\tC\nα",
+            "a linear drag must not pad unselected outer cells"
+        );
+        assert_eq!(
+            copy_between(&read, 3, 0, 4, 0),
+            "α\t",
+            "empty selected cell before a zero-byte endpoint is retained"
+        );
+        assert_eq!(copy_between(&read, 3, 0, 3, "α".len()), "α");
+        let content = "x\ty\n\"z\"";
+        let mut element = rendered_markdown(body, |items| {
+            let markdown::Item::Table { rows, .. } = &mut items[0] else {
+                panic!("fixture table")
+            };
+            rows[0].cells[1] = vec![markdown::Item::CodeBlock {
+                language: None,
+                code: content.into(),
+                lines: Vec::new(),
+            }];
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            copy_between(&read, 4, 0, 4, content.len()),
+            content,
+            "single-cell text is raw"
+        );
+        assert_eq!(
+            copy_between(&read, 3, 0, 5, "β".len()),
+            "α\t\"x\ty\n\"\"z\"\"\"\tβ"
+        );
+        let mut element = rendered_markdown(body, |items| {
+            let markdown::Item::Table { rows, .. } = &mut items[0] else {
+                panic!("fixture table")
+            };
+            rows[0].cells[1] = [content, "tail"]
+                .into_iter()
+                .map(|code| markdown::Item::CodeBlock {
+                    language: None,
+                    code: code.into(),
+                    lines: Vec::new(),
+                })
+                .collect();
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            copy_between(&read, 4, 0, 5, 0),
+            content,
+            "zero-byte endpoint in a later block must not remove the selected earlier block in its cell"
+        );
+    }
+
+    #[test]
+    fn rendered_empty_tables_and_many_tables_keep_structure() {
+        let body = "before\n\n| | | |\n|---|---|---|\n| | | |\n\nafter";
+        let mut element = rendered_markdown(body, |_| {});
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(read.tables.len(), 1);
+        assert_eq!(
+            read.blocks
+                .iter()
+                .filter(|block| !block.plain.is_empty())
+                .count(),
+            2
+        );
+        let last = read.blocks.len() - 1;
+        assert_eq!(
+            copy_between(&read, 0, 0, last, 5),
+            "before\n\n\t\t\n\t\t\n\nafter"
+        );
+        assert_eq!(copy_between(&read, 0, 0, last, 0), "before\n\n\t\t\n\t\t");
+
+        let body = (0..128)
+            .map(|index| format!("| H{index} | B |\n|---|---|\n| V{index} | W |\n\n"))
+            .collect::<String>();
+        let mut element = rendered_markdown(&body, |_| {});
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        let last = read.blocks.len() - 1;
+        let ranges = read
+            .ranges(
+                Endpoint {
+                    identity: read.blocks[0].identity,
+                    byte: 0,
+                },
+                Endpoint {
+                    identity: read.blocks[last].identity,
+                    byte: 1,
+                },
+            )
+            .unwrap();
+        // The clipboard formatter receives one index shared by all table chunks.
+        let values = read.table_values(&ranges);
+        assert_eq!(values.len(), 128);
+        assert_eq!(values.values().map(HashMap::len).sum::<usize>(), 512);
+        assert_eq!(
+            read.copy(&ranges),
+            (0..128)
+                .map(|index| format!("H{index}\tB\nV{index}\tW"))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+    }
+
+    #[test]
+    fn rendered_ordered_list_continuations_nested_items_and_table_children() {
+        let body = "10. first\n\n    continuation\n\n    - nested\n\n11. next";
+        let mut element = rendered_markdown(body, |_| {});
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            read.blocks
+                .iter()
+                .map(|block| block.plain.as_ref())
+                .collect::<Vec<_>>(),
+            ["first", "continuation", "nested", "next"]
+        );
+        assert_eq!(
+            copy_between(&read, 0, 0, 3, 4),
+            "10. first\n\n    continuation\n    - nested\n11. next"
+        );
+        assert_eq!(copy_between(&read, 1, 2, 1, 7), "ntinu");
+        assert_eq!(copy_between(&read, 1, 0, 1, 12), "    continuation");
+
+        // Markdown's rendered item model supports a table as the first list child.
+        let body = "10. placeholder\n\n| A | B |\n|---|---|\n| α | β |";
+        let mut element = rendered_markdown(body, |items| {
+            let table = items.pop().expect("table");
+            assert!(matches!(table, markdown::Item::Table { .. }));
+            let markdown::Item::List { bullets, .. } = &mut items[0] else {
+                panic!("list")
+            };
+            let markdown::Bullet::Point { items } = &mut bullets[0] else {
+                panic!("point")
+            };
+            *items = vec![table];
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            copy_between(&read, 0, 0, 3, "β".len()),
+            "10. A\tB\n    α\tβ"
+        );
+        assert_eq!(copy_between(&read, 1, 0, 3, "β".len()), "B\nα\tβ");
+        assert_eq!(copy_between(&read, 2, "α".len(), 3, "β".len()), "\tβ");
+    }
+
+    #[test]
+    fn rendered_cell_lists_preserve_inner_structure_without_outer_prefix_duplication() {
+        let body = "10. outside\n\n- α\n- β\n\n| A | B |\n|---|---|\n| left | right |";
+        let mut element = rendered_markdown(body, |items| {
+            let mut table = items.pop().expect("table");
+            let list = items.pop().expect("inner list");
+            assert!(matches!(list, markdown::Item::List { .. }));
+            let markdown::Item::Table { rows, .. } = &mut table else {
+                panic!("table")
+            };
+            rows[0].cells[0] = vec![list];
+            let markdown::Item::List { bullets, .. } = &mut items[0] else {
+                panic!("outer list")
+            };
+            let markdown::Bullet::Point { items } = &mut bullets[0] else {
+                panic!("point")
+            };
+            *items = vec![table];
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let read = read_rendered(&mut element, &mut tree);
+        assert_eq!(
+            copy_between(&read, 0, 0, 4, 5),
+            "10. A\tB\n    \"- α\n    - β\"\tright"
+        );
+        assert_eq!(copy_between(&read, 2, 0, 3, "β".len()), "- α\n- β");
+        assert_eq!(copy_between(&read, 2, "α".len(), 3, "β".len()), "- β");
+    }
+
     #[test]
     fn selection_preserves_accessible_child_state_and_offset() {
         let element = surface(Element::new(crate::ui_controls::accessibility_probe::Probe));
@@ -899,6 +1523,8 @@ mod tests {
             .enumerate()
             .map(|(index, plain)| Block {
                 identity: index as u64 + 1,
+                lists: Vec::new(),
+                cell: None,
                 plain: Arc::from(plain),
                 bounds: Rectangle::default(),
                 visible: Some(Rectangle::default()),
