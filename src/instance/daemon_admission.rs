@@ -400,6 +400,33 @@ mod tests {
 
     #[test]
     fn descriptor_sealing_preserves_only_explicit_forwarded_authority() {
+        const CHILD: &str = "CAGENTS_TEST_DAEMON_FENCE_FORWARDING";
+        if env::var_os(CHILD).is_none() {
+            // Parallel widget/socket fixtures legitimately allocate FD198.
+            // Exercise reserved descriptors in a fresh sealed process rather
+            // than assuming the shared test runner's descriptor table is empty.
+            let mut fixture = process::Command::new(env::current_exe().unwrap());
+            fixture
+                .args([
+                    "--exact",
+                    "instance::daemon_admission::tests::descriptor_sealing_preserves_only_explicit_forwarded_authority",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            // SAFETY: the hook only marks inherited descriptors CLOEXEC; no
+            // authority from another parallel fixture belongs to this child.
+            unsafe {
+                fixture.pre_exec(crate::daemon::seal_inherited_descriptors);
+            }
+            let output = fixture.output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated fence fixture failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("launch");
         let parent = owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).unwrap();
@@ -426,6 +453,29 @@ mod tests {
         assert!(
             owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_err(),
             "child exit and command drop cannot unlock parent authority"
+        );
+        // The production refusal is intentional: forwarding must not replace
+        // an unrelated descriptor merely because it uses the reserved number.
+        use std::os::fd::FromRawFd;
+        let unrelated = File::create(root.path().join("unrelated")).unwrap();
+        // SAFETY: this sealed fixture owns its descriptor table and FD198 is
+        // unused after the forwarded child exited. dup2 creates an owned copy.
+        assert_eq!(
+            unsafe { libc::dup2(unrelated.as_raw_fd(), DAEMON_FENCE_FD) },
+            DAEMON_FENCE_FD,
+        );
+        // SAFETY: successful dup2 transferred ownership of this new descriptor.
+        let reserved = unsafe { File::from_raw_fd(DAEMON_FENCE_FD) };
+        let error = forward_fence(
+            &mut process::Command::new("/bin/true"),
+            parent.try_clone().unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(
+            reserved.metadata().unwrap().ino(),
+            unrelated.metadata().unwrap().ino()
         );
     }
 
