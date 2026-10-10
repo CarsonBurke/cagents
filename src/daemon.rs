@@ -22,7 +22,6 @@ use std::{
 
 #[cfg(feature = "host")]
 use std::{
-    ffi::{c_short, c_ulong, c_void},
     fs::DirBuilder,
     io::{Read, Write},
     os::unix::{
@@ -50,18 +49,6 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
 // Validate the opened descriptor without blocking on an invalid special file.
 const LOCK_OPEN_FLAGS: c_int = O_NOFOLLOW | libc::O_NONBLOCK;
-const LOCK_EX: c_int = 2;
-const LOCK_NB: c_int = 4;
-const LOCK_UN: c_int = 8;
-#[cfg(feature = "host")]
-const SOL_SOCKET: c_int = 1;
-#[cfg(feature = "host")]
-const SO_PEERCRED: c_int = 17;
-#[cfg(feature = "host")]
-const SIGINT: c_int = 2;
-const SIGTERM: c_int = 15;
-#[cfg(feature = "host")]
-const POLLIN: c_short = 0x001;
 #[cfg(feature = "host")]
 const POLL_FOREVER: c_int = -1;
 
@@ -78,43 +65,6 @@ static WAKEUP: LazyLock<io::Result<Wakeup>> = LazyLock::new(Wakeup::create);
 #[cfg(feature = "host")]
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
-unsafe extern "C" {
-    fn flock(fd: c_int, operation: c_int) -> c_int;
-    #[cfg(feature = "host")]
-    fn getsockopt(
-        socket: c_int,
-        level: c_int,
-        option_name: c_int,
-        option_value: *mut c_void,
-        option_len: *mut u32,
-    ) -> c_int;
-    #[cfg(feature = "host")]
-    fn signal(signal: c_int, handler: usize) -> usize;
-    #[cfg(feature = "host")]
-    fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
-    #[cfg(feature = "host")]
-    #[link_name = "write"]
-    fn write_byte(fd: c_int, buffer: *const c_void, count: usize) -> isize;
-}
-
-#[cfg(feature = "host")]
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct UCred {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
-
-#[cfg(feature = "host")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PollFd {
-    fd: c_int,
-    events: c_short,
-    revents: c_short,
-}
-
 #[cfg(feature = "host")]
 /// A socket pair used purely as a wakeup channel: any byte written to `writer`
 /// interrupts a [`wait_for_activity`] blocked on `reader`.
@@ -126,13 +76,17 @@ struct Wakeup {
 #[cfg(feature = "host")]
 impl Wakeup {
     fn create() -> io::Result<Self> {
+        let channel = Self::channel()?;
+        // Only the never-dropped static publishes a signal-handler descriptor.
+        WAKEUP_FD.store(channel.writer.as_raw_fd(), Ordering::Release);
+        Ok(channel)
+    }
+
+    fn channel() -> io::Result<Self> {
         let (reader, writer) = UnixStream::pair()?;
         reader.set_nonblocking(true)?;
         // A full pipe is itself a pending wakeup, so no writer may block on one.
         writer.set_nonblocking(true)?;
-        // Published here rather than by the caller, so the descriptor is visible
-        // to the signal handler as soon as it exists.
-        WAKEUP_FD.store(writer.as_raw_fd(), Ordering::Release);
         Ok(Self { reader, writer })
     }
 
@@ -172,22 +126,26 @@ pub(crate) fn wake() {
 /// There is no timeout: an idle daemon causes no wakeups at all.
 #[cfg(feature = "host")]
 pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
-    let wakeup = wakeup()?;
+    wait_for_activity_with(listener, wakeup()?)
+}
+
+#[cfg(feature = "host")]
+fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Result<()> {
     let mut fds = [
-        PollFd {
+        libc::pollfd {
             fd: listener.as_raw_fd(),
-            events: POLLIN,
+            events: libc::POLLIN,
             revents: 0,
         },
-        PollFd {
+        libc::pollfd {
             fd: wakeup.reader.as_raw_fd(),
-            events: POLLIN,
+            events: libc::POLLIN,
             revents: 0,
         },
     ];
     // SAFETY: fds is a live, fully initialised array of the length passed to
     // poll, and both descriptors are owned for the duration of the call.
-    let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as c_ulong, POLL_FOREVER) };
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_FOREVER) };
     if ready < 0 {
         let error = io::Error::last_os_error();
         // A signal handler ran. The caller re-reads the termination flag, so an
@@ -308,7 +266,7 @@ impl RecoveryLease {
         let started = std::time::Instant::now();
         loop {
             // SAFETY: flock receives a live descriptor and scalar flags.
-            if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(Self { lock });
             }
             let error = io::Error::last_os_error();
@@ -336,7 +294,7 @@ impl Drop for RecoveryLease {
         // until exec closes CLOEXEC descriptors. Explicit unlock prevents that
         // unrelated child from extending the recovery critical section.
         // SAFETY: this guard owns the live locked descriptor.
-        unsafe { flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -366,7 +324,7 @@ impl HostLease {
         validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
         lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         // SAFETY: flock receives a live file descriptor and no pointer data.
-        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(PlatformError::AlreadyRunning {
                 path: paths.socket.clone(),
             });
@@ -402,7 +360,7 @@ impl HostLease {
         };
         validate_lock_file(path, &lock.metadata()?, current_uid())?;
         // SAFETY: flock receives a live, validated descriptor and scalar flags.
-        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = io::Error::last_os_error();
             return if error.kind() == io::ErrorKind::WouldBlock {
                 Ok(true)
@@ -412,7 +370,7 @@ impl HostLease {
         }
         // Explicit release also covers copies inherited by a concurrent fork.
         // SAFETY: this descriptor owns the exclusive lock acquired above.
-        if unsafe { flock(lock.as_raw_fd(), LOCK_UN) } != 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
         Ok(false)
@@ -428,7 +386,7 @@ impl HostLease {
             .open(&paths.lock)?;
         validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
         // SAFETY: the validated descriptor is owned through the guard lifetime.
-        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(PlatformError::AlreadyRunning {
                 path: paths.socket.clone(),
             });
@@ -449,7 +407,7 @@ impl Drop for HostLease {
             Err(_) => {}
         }
         // SAFETY: the file descriptor remains live for the duration of Drop.
-        let _ = unsafe { flock(self.lock.as_raw_fd(), LOCK_UN) };
+        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -552,9 +510,9 @@ pub(crate) fn lease_owner(
         .open(lock_path)?;
     validate_lock_file(lock_path, &lock.metadata()?, current_uid())?;
     // SAFETY: flock receives a live descriptor and no pointers.
-    if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         // SAFETY: this descriptor owns the lock just acquired.
-        let _ = unsafe { flock(lock.as_raw_fd(), LOCK_UN) };
+        let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
         return Err(io::Error::other("daemon ownership is not held").into());
     }
     let error = io::Error::last_os_error();
@@ -596,7 +554,7 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd.as_raw_fd(),
-            SIGTERM,
+            libc::SIGTERM,
             std::ptr::null::<libc::siginfo_t>(),
             0,
         )
@@ -745,10 +703,10 @@ fn daemon_pidfd_from_lock(
     // Check ownership before trusting metadata: a crashed writer can leave a
     // truncated lock file, but an unheld flock proves no daemon can be using it.
     // SAFETY: lock owns a live descriptor and flock takes scalar values.
-    if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         let recovery = recover_stale_socket(&paths.socket);
         // SAFETY: this descriptor owns the lock acquired above.
-        let _ = unsafe { flock(lock.as_raw_fd(), LOCK_UN) };
+        let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
         recovery?;
         return Ok(None);
     }
@@ -773,12 +731,12 @@ fn open_daemon_pidfd_or_recover(
             // its socket after taking the same exclusive lock a live daemon
             // must hold; otherwise preserve the validation failure.
             // SAFETY: lock owns a live descriptor and flock takes scalar values.
-            if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(validation_error.into());
             }
             recover_stale_socket(&paths.socket)?;
             // SAFETY: this descriptor still owns the lock acquired above.
-            let _ = unsafe { flock(lock.as_raw_fd(), LOCK_UN) };
+            let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
             Ok(None)
         }
     }
@@ -921,24 +879,25 @@ pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
 
 #[cfg(feature = "host")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut credentials = UCred::default();
-    let mut length =
-        u32::try_from(std::mem::size_of::<UCred>()).expect("Linux ucred size must fit socklen_t");
+    // SAFETY: zero is valid for every scalar field of the kernel credential buffer.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .expect("Linux ucred size must fit socklen_t");
     // SAFETY: credentials and length are valid writable objects of the sizes
     // passed to getsockopt, and stream owns a live socket descriptor.
     let result = unsafe {
-        getsockopt(
+        libc::getsockopt(
             stream.as_raw_fd(),
-            SOL_SOCKET,
-            SO_PEERCRED,
-            (&mut credentials as *mut UCred).cast(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
             &mut length,
         )
     };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    if usize::try_from(length).ok() != Some(std::mem::size_of::<UCred>()) {
+    if usize::try_from(length).ok() != Some(std::mem::size_of::<libc::ucred>()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "kernel returned an invalid SO_PEERCRED length",
@@ -973,7 +932,7 @@ extern "C" fn request_termination(_signal: c_int) {
     // closes the race where the signal arrives after the accept loop has read
     // the termination flag but before it blocks in poll.
     unsafe {
-        let _ = write_byte(fd, (&raw const byte).cast(), 1);
+        let _ = libc::write(fd, (&raw const byte).cast(), 1);
     }
 }
 
@@ -985,8 +944,14 @@ pub(crate) fn install_signal_handlers() -> io::Result<()> {
     // into lock-free atomics and writes a byte to a descriptor that outlives the
     // process, and both constants are valid POSIX signals.
     unsafe {
-        signal(SIGINT, request_termination as *const () as usize);
-        signal(SIGTERM, request_termination as *const () as usize);
+        libc::signal(
+            libc::SIGINT,
+            request_termination as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            request_termination as *const () as libc::sighandler_t,
+        );
     }
     Ok(())
 }
@@ -1006,6 +971,69 @@ mod tests {
 
     use super::*;
     use crate::model::{HostIncarnation, HostSessionId};
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn socket_peer_identity_uses_the_kernel_effective_uid() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // SAFETY: geteuid has no preconditions. Both sockets are real owned
+        // descriptors, so this exercises the credential buffer and length ABI.
+        let expected = unsafe { libc::geteuid() };
+        assert_eq!(peer_uid(&client).unwrap(), expected);
+        assert_eq!(peer_uid(&server).unwrap(), expected);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn local_wakeup_interrupts_idle_poll_drains_and_accepts_socket_activity() {
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("activity.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // Unlike the global signal channel, this local test channel never
+        // publishes a descriptor to a handler or mutates process signal state.
+        let channel = Arc::new(Wakeup::channel().unwrap());
+        let owned_channel = channel.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = wait_for_activity_with(&listener, &owned_channel);
+            done_tx.send(result).unwrap();
+            listener
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "an idle listener must wait for a real wakeup or socket activity"
+        );
+        channel.wake();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let listener = worker.join().unwrap();
+        let mut descriptor = libc::pollfd {
+            fd: channel.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this live descriptor is owned by channel throughout poll.
+        assert_eq!(
+            unsafe { libc::poll(&mut descriptor, 1, 0) },
+            0,
+            "the delivered wakeup must be drained rather than causing idle spin"
+        );
+        let _client = UnixStream::connect(&path).unwrap();
+        wait_for_activity_with(&listener, &channel).unwrap();
+        let _accepted = listener.accept().unwrap();
+    }
 
     fn proof() -> HostSessionProof {
         HostSessionProof {
