@@ -1725,7 +1725,7 @@ mod tests {
         let theme = crate::settings::EditorSyntaxTheme::default();
         let initial = "first λ line\nselected text\n";
         let mut block = tool_text::ToolText::update(None, initial, tool_text::Language::Plain);
-        let mut element = surface(block.view(theme, None, target));
+        let mut element = surface(block.view(theme, None, target, None));
         let mut tree = Tree::new(&element);
         let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 300.0));
         let node = element
@@ -1751,7 +1751,7 @@ mod tests {
             &format!("{initial}appended output\n"),
             tool_text::Language::Plain,
         );
-        element = surface(block.view(theme, None, target));
+        element = surface(block.view(theme, None, target, None));
         tree.diff(&mut element);
         let node = element
             .as_widget_mut()

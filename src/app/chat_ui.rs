@@ -14,6 +14,7 @@ use std::sync::{
 
 mod clipboard_image;
 mod completion;
+mod find;
 mod fold;
 mod images;
 mod layout;
@@ -788,25 +789,43 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
 
 fn contains_text(content: &ItemContent, query: &str) -> bool {
     match content {
-        ItemContent::Text { text, .. } => text.contains(query),
+        ItemContent::Text { text, .. } => find::contains(text, query),
         ItemContent::Command {
-            command, output, ..
-        } => command.contains(query) || output.contains(query),
-        ItemContent::Changes { changes, .. } => {
-            changes.iter().any(|change| change.diff.contains(query))
+            command,
+            output,
+            label,
+            working_directory,
+            ..
+        } => {
+            find::contains(command, query)
+                || find::contains(output, query)
+                || find::contains(label, query)
+                || find::contains(working_directory, query)
         }
-        ItemContent::Tool { input, output, .. } => input.contains(query) || output.contains(query),
+        ItemContent::Changes { changes, .. } => changes.iter().any(|change| {
+            find::contains(&change.diff, query) || find::contains(&change.path, query) || matches!(&change.kind, chat::ChangeKind::Renamed { from } if find::contains(from, query))
+        }),
+        ItemContent::Tool {
+            name,
+            input,
+            output,
+            ..
+        } => {
+            find::contains(name, query)
+                || find::contains(input, query)
+                || find::contains(output, query)
+        }
         ItemContent::WebSearch {
             query: search,
             results,
         } => {
-            search.contains(query)
-                || results
-                    .iter()
-                    .any(|result| result.title.contains(query) || result.url.contains(query))
+            find::contains(search, query)
+                || results.iter().any(|result| {
+                    find::contains(&result.title, query) || find::contains(&result.url, query) || find::contains(&result.snippet, query)
+                })
         }
         ItemContent::Image { path, description } => {
-            path.contains(query) || description.contains(query)
+            find::contains(path, query) || find::contains(description, query)
         }
         ItemContent::Delivery {
             from,
@@ -815,10 +834,10 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
             body,
             ..
         } => {
-            from.contains(query)
-                || sender.contains(query)
-                || summary.contains(query)
-                || body.contains(query)
+            find::contains(&from, query)
+                || find::contains(&sender, query)
+                || find::contains(&summary, query)
+                || find::contains(&body, query)
         }
     }
 }
@@ -1313,6 +1332,7 @@ pub(super) struct Runtime {
     find: Option<String>,
     find_focused: bool,
     find_matches: Vec<String>,
+    find_disclosure: find::Disclosure,
     find_index: usize,
     copied: Option<(String, Instant)>,
     /// When a cancel that would also stop background subagents was pressed,
@@ -1926,6 +1946,7 @@ impl Runtime {
             find: None,
             find_focused: false,
             find_matches: Vec::new(),
+            find_disclosure: find::Disclosure::default(),
             find_index: 0,
             copied: None,
             interrupt_armed: None,
@@ -1991,6 +2012,7 @@ impl Runtime {
         self.scroll = view::Scroll::default();
         self.asked_after.clear();
         self.asked.clear();
+        self.find_disclosure = find::Disclosure::default();
         self.opened.clear();
         self.expanded.clear();
         self.answers.clear();
@@ -3248,12 +3270,14 @@ impl Cagents {
         };
         let key = runtime.find_matches[runtime.find_index].clone();
         if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
-            runtime.opened.insert(key.clone(), true);
+            runtime.find_disclosure.turn(&key, &mut runtime.opened);
             let query = runtime.find.as_deref().unwrap_or_default();
             for placed in &turn.steps {
                 if let Some(item) = runtime.snapshot.items.get(placed.index)
                     && contains_text(&item.content, query)
-                    && runtime.expanded.insert(item.id.clone())
+                    && runtime
+                        .find_disclosure
+                        .item(&item.id, &mut runtime.expanded)
                 {
                     let previous = runtime.cache.remove(&item.id);
                     runtime.cache.insert(
@@ -3272,9 +3296,11 @@ impl Cagents {
             // its heading is always shown.
             for index in &turn.prompt {
                 if let Some(item) = runtime.snapshot.items.get(*index)
-                    && matches!(&item.content, ItemContent::Delivery { body, .. } if body.contains(query))
+                    && matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query))
                 {
-                    runtime.expanded.insert(item.id.clone());
+                    runtime
+                        .find_disclosure
+                        .item(&item.id, &mut runtime.expanded);
                 }
             }
         }
@@ -6909,6 +6935,9 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime
+                        .find_disclosure
+                        .restore(&mut runtime.expanded, &mut runtime.opened);
                     runtime.find = Some(query);
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
@@ -6918,6 +6947,9 @@ impl Cagents {
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
             Action::CloseFind(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime
+                        .find_disclosure
+                        .restore(&mut runtime.expanded, &mut runtime.opened);
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
@@ -7092,6 +7124,7 @@ impl Cagents {
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_disclosure.manual_item(&id);
                     if !runtime.expanded.remove(&id) {
                         runtime.expanded.insert(id.clone());
                     }
@@ -7127,6 +7160,7 @@ impl Cagents {
                     // Invert the visible default on the first toggle, then
                     // remember explicit choices across paging. Ignore stale keys.
                     if runtime.turns.iter().any(|turn| turn.key == key) {
+                        runtime.find_disclosure.manual_turn(&key);
                         let open = runtime
                             .opened
                             .entry(key)
@@ -10057,6 +10091,154 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).active_scroll(), child);
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
+        fn output_count(
+            runtime: &Runtime,
+            renderer: &cosmic::Renderer,
+            tree: &mut Option<iced::advanced::widget::Tree>,
+        ) -> usize {
+            use iced::advanced::{
+                Layout,
+                widget::{Operation, Tree},
+            };
+            struct Output(usize);
+            impl Operation for Output {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_mut::<selectable_prose::State>()
+                        && prose.plain.as_ref() == "Straße Needle"
+                    {
+                        self.0 += 1;
+                    }
+                }
+            }
+            let mut element = runtime.find_turn_view_for_test();
+            let tree = tree.get_or_insert_with(|| Tree::new(&element));
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &iced::advanced::layout::Limits::new(
+                    iced::Size::ZERO,
+                    iced::Size::new(640.0, 4000.0),
+                ),
+            );
+            let mut output = Output(0);
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), renderer, &mut output);
+            output.0
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut rendered_tree = None;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("find-disclosure"));
+        let target = chat_runtime(&app, card).target;
+        let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = std::iter::once(Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("question"),
+            started_at: None,
+            at: None,
+        }))
+        .chain(["automatic", "manual", "changed"].map(|id| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "Inspect".into(),
+                    input: "{}".into(),
+                    output: "Straße Needle".into(),
+                    status: chat::ToolStatus::Succeeded,
+                },
+                started_at: None,
+                at: None,
+            })
+        }))
+        .collect();
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::Toggle(target, "manual".into())));
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .opened
+            .insert("prompt".into(), false);
+        drop(app.handle_chat_ui(Action::Find(target, "STRASSE".into())));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.find_matches, vec!["prompt"]);
+        assert!(
+            ["automatic", "manual", "changed"]
+                .iter()
+                .all(|id| runtime.expanded.contains(*id))
+        );
+        assert_eq!(runtime.opened.get("prompt"), Some(&true));
+        assert!(
+            runtime.pending.is_none(),
+            "Find must not send provider commands"
+        );
+        assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 3);
+        // Explicitly close and reopen one automatic row: its final open choice
+        // belongs to the user and survives a new query and search closure.
+        drop(app.handle_chat_ui(Action::Toggle(target, "changed".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "changed".into())));
+        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.expanded,
+            HashSet::from(["manual".into(), "changed".into()])
+        );
+        assert_eq!(runtime.opened.get("prompt"), Some(&false));
+        assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 0);
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
+        drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.expanded,
+            HashSet::from(["manual".into(), "changed".into()])
+        );
+        assert_eq!(runtime.opened.get("prompt"), Some(&true));
+        assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 2);
+        assert!(runtime.find.is_none() && runtime.find_matches.is_empty());
+        assert!(runtime.pending.is_none());
+    }
+
+    #[test]
+    fn find_matches_displayed_command_labels_directories_and_changed_paths() {
+        let command = ItemContent::Command {
+            label: "Verify RELEASE".into(),
+            command: "true".into(),
+            working_directory: "/Workspace/Project".into(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: None,
+            output: String::new(),
+        };
+        assert!(contains_text(&command, "release"));
+        assert!(contains_text(&command, "workspace"));
+        let change = ItemContent::Changes {
+            changes: vec![chat::FileChange {
+                path: "src/Über.rs".into(),
+                kind: chat::ChangeKind::Updated,
+                diff: "+line".into(),
+            }],
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert!(contains_text(&change, "ÜBER"));
+        assert!(!contains_text(&change, ""));
     }
 
     #[test]

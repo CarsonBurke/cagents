@@ -2700,6 +2700,12 @@ impl Runtime {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn find_turn_view_for_test(&self) -> Element<'_, Message> {
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
+    }
+
     /// Whether `turn` can be kept between frames: none of its steps is open.
     fn retainable(&self, turn: &turn::Turn) -> bool {
         turn.prompt
@@ -4327,6 +4333,7 @@ mod tests {
                 crate::settings::EditorSyntaxTheme::Auto,
                 None,
                 runtime.target,
+                None,
             ),
         ]);
         let mut element = selection::transcript(content, runtime.target, None);
