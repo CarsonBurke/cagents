@@ -16,6 +16,8 @@ pub(crate) mod dialog_ui;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
 use crate::file_manager::{self, open_system_url};
+#[cfg(feature = "integrated-browser")]
+mod browser_backend;
 mod browser_host;
 mod file_ui;
 mod git_ui;
@@ -4126,7 +4128,18 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
-    BrowserFactoryReady(Result<BrowserFactoryBinding, String>),
+    BrowserFactoryReady {
+        generation: uuid::Uuid,
+        result: Result<BrowserFactoryBinding, crate::capability::BrowserUnavailable>,
+    },
+    #[cfg(feature = "integrated-browser")]
+    BrowserFactoryPoll(uuid::Uuid),
+    #[cfg(feature = "integrated-browser")]
+    BrowserFactoryProbed {
+        generation: uuid::Uuid,
+        operation: uuid::Uuid,
+        result: crate::browser::CapabilityProbe,
+    },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
     ActivateUi {
@@ -4832,6 +4845,8 @@ pub struct Cagents {
     #[cfg(feature = "integrated-browser")]
     browser_factory: Option<Arc<RawWaylandSubsurfaceFactory>>,
     #[cfg(feature = "integrated-browser")]
+    browser_backend: browser_backend::State,
+    #[cfg(feature = "integrated-browser")]
     browser_parent_lifetime: Option<Arc<ParentWindowLifetime>>,
     /// Compositor scale, before the user's interface scale multiplier.
     window_scale_factor: f32,
@@ -5220,46 +5235,6 @@ impl Cagents {
         }
         self.github_availability.insert(project_id, availability);
         self.repository_read_task(path, project_id, generation, open_cards, kind)
-    }
-
-    #[cfg(feature = "integrated-browser")]
-    fn browser_factory_task(&self) -> Task<Message> {
-        if self.browser_factory.is_some() {
-            return Task::none();
-        }
-        let Some(window_id) = self.core.main_window_id() else {
-            return cosmic::task::message(Message::BrowserFactoryReady(Err(
-                "main Wayland window is unavailable".into(),
-            )));
-        };
-        window::run(window_id, move |parent| {
-            let display = parent
-                .display_handle()
-                .map_err(|error| format!("parent display handle: {error}"))?
-                .as_raw();
-            let window = parent
-                .window_handle()
-                .map_err(|error| format!("parent window handle: {error}"))?
-                .as_raw();
-            let parent_lifetime = Arc::new(ParentWindowLifetime::new(window_id));
-            debug_assert_eq!(parent_lifetime.window_id, window_id);
-            let lifetime_guard: Arc<dyn Any + Send + Sync> = parent_lifetime.clone();
-            // SAFETY: this non-inert guard is retained both by Cagents and the
-            // factory. Cagents synchronously joins active/reaping browser
-            // workers and drops the factory before deactivating the guard;
-            // `core` (the actual parent owner) is declared after all of them.
-            let factory = unsafe {
-                RawWaylandSubsurfaceFactory::from_raw_handles(display, window, lifetime_guard)
-            }
-            .map(Arc::new)
-            .map_err(|error| error.to_string())?;
-            Ok(BrowserFactoryBinding {
-                factory,
-                parent_lifetime,
-            })
-        })
-        .map(Message::BrowserFactoryReady)
-        .map(cosmic::Action::App)
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -6913,7 +6888,9 @@ impl Cagents {
             scroll_y: 0.0,
             fidelity: BrowserRestoreFidelity::ExactLive,
         };
-        let mut startup_error = None;
+        let mut startup_error = self
+            .browser_unavailable_reason()
+            .map(|reason| reason.to_string());
         if let Some(factory) = self.browser_factory.clone() {
             match spawn_browser(
                 &session,
@@ -7716,6 +7693,14 @@ impl Cagents {
         {
             return Task::none();
         }
+        #[cfg(feature = "integrated-browser")]
+        if matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Browser(_))
+        ) && self.browser_unavailable_reason().is_some()
+        {
+            return Task::none();
+        }
         if self.completed_terminal_has_native_owner(card) {
             return self.handle_chat_ui(chat_ui::Action::Switch(card));
         }
@@ -8361,6 +8346,10 @@ impl Cagents {
                         });
                     #[cfg(feature = "integrated-browser")]
                     if let Some(session) = deferred_browser {
+                        if let Some(reason) = self.browser_unavailable_reason() {
+                            self.fail_runtime(card, reason.to_string());
+                            continue;
+                        }
                         let Some(factory) = self.browser_factory.clone() else {
                             tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
                             continue;
@@ -9291,12 +9280,14 @@ impl Cagents {
                         .spacing(space::S)
                         .into(),
                         widget::selectable_text(if browser_session.is_some() {
-                            if cfg!(feature = "integrated-browser") {
-                                "The browser could not load. Try again or open it in your system browser."
+                            if let Some(reason) = self.browser_unavailable_reason() {
+                                std::borrow::Cow::Owned(reason.to_string())
+                            } else if cfg!(feature = "integrated-browser") {
+                                std::borrow::Cow::Borrowed("The browser could not load. Try again or open it in your system browser.")
                             } else {
-                                "This build does not include the integrated browser. Open the saved page in your system browser."
+                                std::borrow::Cow::Borrowed("This build does not include the integrated browser. Open the saved page in your system browser.")
                             }
-                        } else { message.message() })
+                        } else { std::borrow::Cow::Borrowed(message.message()) })
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
@@ -9313,7 +9304,11 @@ impl Cagents {
                         self.account_recovery_controls(id)
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
-                            let mut controls = vec![
+                            let mut controls = if browser_session.is_some()
+                                && self.browser_unavailable_reason().is_some()
+                            {
+                                Vec::new()
+                            } else { vec![
                                 crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
@@ -9327,7 +9322,7 @@ impl Cagents {
                                         },
                                     )
                                     .into(),
-                            ];
+                            ] };
                             // A conversation no retry can reach still has one
                             // thing left to do with it, and the reader has to
                             // be the one who asks for it.
@@ -9449,6 +9444,7 @@ impl Cagents {
                 crate::capability::BrowserCapability::current(),
                 self.browser_host_load(id),
                 card_focused,
+                self.browser_unavailable_reason(),
                 surface,
             )
         } else {
@@ -11754,7 +11750,8 @@ impl Cagents {
     /// window is closed or dropped:
     /// 1. request and join every browser still owned by a card;
     /// 2. join every off-UI-path card-close reaper;
-    /// 3. drop the raw-handle factory/Wayland host;
+    /// 3. retire the capability generation and explicitly clear every factory
+    ///    queue, even when a late UI callback retains its factory Arc;
     /// 4. deactivate/drop the parent lifetime guard.
     ///
     /// Idempotent: the exit path runs it before closing the window, and
@@ -11782,7 +11779,10 @@ impl Cagents {
         for teardown in self.browser_teardowns.drain(..) {
             let _ = teardown.join();
         }
-        self.browser_factory.take();
+        self.browser_backend.retire();
+        if let Some(factory) = self.browser_factory.take() {
+            factory.release_parent();
+        }
         if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
             parent_lifetime.deactivate();
         }
@@ -12845,6 +12845,8 @@ impl Application for Cagents {
             terminal_teardowns: Vec::new(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
+            #[cfg(feature = "integrated-browser")]
+            browser_backend: browser_backend::State::default(),
             #[cfg(feature = "integrated-browser")]
             browser_parent_lifetime: None,
             window_scale_factor,
@@ -15160,55 +15162,20 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            // The exit released the parent before closing it. A factory that
-            // captured the window just before must not start browsers on a
-            // surface that is gone, nor mark the cards it would have loaded
-            // failed in the state the exit is about to save.
-            #[cfg(feature = "integrated-browser")]
-            Message::InitializeBrowserFactory if self.exit.is_some() => Task::none(),
-            #[cfg(feature = "integrated-browser")]
-            Message::BrowserFactoryReady(result) if self.exit.is_some() => {
-                if let Ok(BrowserFactoryBinding {
-                    factory,
-                    parent_lifetime,
-                }) = result
-                {
-                    drop(factory);
-                    parent_lifetime.deactivate();
-                }
-                Task::none()
-            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserFactoryReady(_) if self.browser_factory.is_some() => Task::none(),
+            Message::BrowserFactoryReady { generation, result } => {
+                self.browser_factory_ready(generation, result)
+            }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserFactoryReady(result) => match result {
-                Ok(binding) => {
-                    self.browser_parent_lifetime = Some(binding.parent_lifetime);
-                    self.browser_factory = Some(binding.factory);
-                    self.register_deferred_browsers();
-                    self.lifecycle_sweep()
-                }
-                Err(error) => {
-                    let message = format!("GPU-only Servo embedding unavailable: {error}");
-                    let failed = self
-                        .durable
-                        .cards
-                        .iter()
-                        .filter(|card| matches!(&card.kind, CardKind::Browser(_)))
-                        .filter_map(|card| {
-                            matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
-                                .then_some(card.id)
-                        })
-                        .collect::<Vec<_>>();
-                    for card in failed {
-                        self.fail_runtime(card, message.clone());
-                    }
-                    self.status = Some(TransientNotice::error(message));
-                    Task::none()
-                }
-            },
+            Message::BrowserFactoryPoll(generation) => self.browser_factory_poll(generation),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserFactoryProbed {
+                generation,
+                operation,
+                result,
+            } => self.browser_factory_probed(generation, operation, result),
             Message::WindowScaleFactorChanged(scale_factor) => {
                 if scale_factor.is_finite() && scale_factor > 0.0 {
                     self.window_scale_factor = scale_factor;
@@ -24979,6 +24946,8 @@ mod tests {
             terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
+            #[cfg(feature = "integrated-browser")]
+            browser_backend: browser_backend::State::default(),
             #[cfg(feature = "integrated-browser")]
             browser_parent_lifetime: None,
             window_scale_factor: 1.0,

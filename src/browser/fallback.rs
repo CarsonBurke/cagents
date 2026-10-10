@@ -15,14 +15,31 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     backend::{Backend, ObjectId},
     delegate_noop,
-    globals::{GlobalListContents, registry_queue_init},
+    globals::Global,
     protocol::{
-        wl_compositor, wl_region, wl_registry, wl_subcompositor, wl_subsurface, wl_surface,
+        wl_callback, wl_compositor, wl_region, wl_registry, wl_subcompositor, wl_subsurface,
+        wl_surface,
     },
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::{BrowserError, PhysicalViewport, SurfacePlacement};
+use crate::capability::{BrowserUnavailable, MissingWaylandProtocols};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityProbe {
+    Pending,
+    Available,
+    Unavailable(BrowserUnavailable),
+}
+
+enum FactoryHost {
+    Uninitialized,
+    Checking(WaylandPreparation),
+    Ready(Arc<WaylandHost>),
+    Unavailable(BrowserUnavailable),
+    Retired,
+}
 
 /// Owner of a Wayland child `wl_surface`/`wl_subsurface` created in an
 /// externally-rendered mode. The implementation must suppress iced swapchain
@@ -57,6 +74,8 @@ pub trait WaylandSubsurfaceLease: HasDisplayHandle + HasWindowHandle {
 /// isolated browser thread so the resulting native window and Servo GL context
 /// share one owner thread for their complete lifetime.
 pub trait WaylandSubsurfaceFactory: Send + Sync + 'static {
+    /// Engines may register only after this factory has a prepared host.
+    fn availability(&self) -> CapabilityProbe;
     fn create(
         &self,
         viewport: PhysicalViewport,
@@ -67,14 +86,14 @@ pub trait WaylandSubsurfaceFactory: Send + Sync + 'static {
 /// Production factory for embedding Servo into a child of an existing Wayland
 /// `wl_surface` supplied through raw-window-handle 0.6.
 ///
-/// A retained lifetime guard travels with every lease. Protocol objects and
-/// their event queue are created lazily on the browser thread and reused across
-/// hibernation/restoration cycles.
+/// A retained lifetime guard travels with every lease. Protocol globals are prepared in bounded parent UI callbacks before any
+/// browser engine starts. The prepared host is then reused across hibernation
+/// and restoration cycles. Parent teardown explicitly clears its event queue.
 pub struct RawWaylandSubsurfaceFactory {
     display: usize,
     parent_surface: usize,
     lifetime_guard: Arc<dyn Any + Send + Sync>,
-    host: Mutex<Option<Arc<WaylandHost>>>,
+    host: Mutex<FactoryHost>,
 }
 
 impl std::fmt::Debug for RawWaylandSubsurfaceFactory {
@@ -119,8 +138,10 @@ impl RawWaylandSubsurfaceFactory {
     /// # Safety
     ///
     /// The display and surface must belong to the same Wayland client
-    /// connection and remain valid until every factory, lease, and browser
-    /// thread using them has been dropped. `lifetime_guard` must either own the
+    /// connection and remain valid until every lease/browser thread is gone
+    /// and `release_parent` explicitly clears the factory protocol state (or
+    /// the factory is dropped). Retained factory references after release can
+    /// compare identities but cannot recreate or access protocol objects. `lifetime_guard` must either own the
     /// parent directly or be a parent-identified, stateful token paired with an
     /// external owner whose Drop synchronously joins all browser threads before
     /// destroying the parent. An unrelated inert token such as `Arc<()>` does
@@ -131,44 +152,112 @@ impl RawWaylandSubsurfaceFactory {
         lifetime_guard: Arc<dyn Any + Send + Sync>,
     ) -> Result<Self, BrowserError> {
         let RawDisplayHandle::Wayland(display) = display else {
-            return Err(BrowserError::Wayland(format!(
-                "expected a Wayland display handle, received {display:?}"
-            )));
+            return Err(BrowserError::Capability(BrowserUnavailable::NotWayland));
         };
         let RawWindowHandle::Wayland(window) = window else {
-            return Err(BrowserError::Wayland(format!(
-                "expected a Wayland window handle for the parent wl_surface, received {window:?}"
-            )));
+            return Err(BrowserError::Capability(BrowserUnavailable::NotWayland));
         };
 
         Ok(Self {
             display: display.display.as_ptr() as usize,
             parent_surface: window.surface.as_ptr() as usize,
             lifetime_guard,
-            host: Mutex::new(None),
+            host: Mutex::new(FactoryHost::Uninitialized),
         })
     }
 
+    pub fn matches_parent(&self, display: RawDisplayHandle, window: RawWindowHandle) -> bool {
+        matches!((display, window), (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(window))
+            if display.display.as_ptr() as usize == self.display
+                && window.surface.as_ptr() as usize == self.parent_surface)
+    }
+
+    /// Run only in the parent's serialized UI callbacks. This never reads the
+    /// display: Winit owns reading, and this private queue only dispatches
+    /// events it has already received. No worker owns an unfinished probe.
+    pub fn poll_capability(&self) -> CapabilityProbe {
+        let Ok(mut slot) = self.host.lock() else {
+            return CapabilityProbe::Unavailable(BrowserUnavailable::InitializationFailed);
+        };
+        if matches!(*slot, FactoryHost::Uninitialized) {
+            match WaylandPreparation::new(self.display, self.parent_surface) {
+                Ok(preparation) => *slot = FactoryHost::Checking(preparation),
+                Err(reason) => *slot = FactoryHost::Unavailable(reason),
+            }
+        }
+        let ready = match &mut *slot {
+            FactoryHost::Ready(_) => return CapabilityProbe::Available,
+            FactoryHost::Unavailable(reason) => return CapabilityProbe::Unavailable(*reason),
+            FactoryHost::Retired => {
+                return CapabilityProbe::Unavailable(BrowserUnavailable::ParentUnavailable);
+            }
+            FactoryHost::Checking(preparation) => preparation.poll(),
+            FactoryHost::Uninitialized => unreachable!(),
+        };
+        match ready {
+            Ok(false) => CapabilityProbe::Pending,
+            Ok(true) => {
+                let FactoryHost::Checking(preparation) =
+                    std::mem::replace(&mut *slot, FactoryHost::Retired)
+                else {
+                    unreachable!()
+                };
+                match preparation.finish(self.display, self.lifetime_guard.clone()) {
+                    Ok(host) => {
+                        *slot = FactoryHost::Ready(Arc::new(host));
+                        CapabilityProbe::Available
+                    }
+                    Err(reason) => {
+                        *slot = FactoryHost::Unavailable(reason);
+                        CapabilityProbe::Unavailable(reason)
+                    }
+                }
+            }
+            Err(reason) => {
+                *slot = FactoryHost::Unavailable(reason);
+                CapabilityProbe::Unavailable(reason)
+            }
+        }
+    }
+
+    /// Explicitly release every foreign protocol object before the parent
+    /// dies, even when a stale UI closure retains an Arc to this factory.
+    /// Browser leases must have been joined/dropped first.
+    pub fn release_parent(&self) {
+        if let Ok(mut slot) = self.host.lock() {
+            *slot = FactoryHost::Retired;
+        }
+    }
+
     fn host(&self) -> Result<Arc<WaylandHost>, BrowserError> {
-        let mut slot = self
+        let slot = self
             .host
             .lock()
-            .map_err(|_| BrowserError::Wayland("Wayland factory lock was poisoned".into()))?;
-        if let Some(host) = slot.as_ref() {
-            return Ok(host.clone());
+            .map_err(|_| BrowserError::Capability(BrowserUnavailable::InitializationFailed))?;
+        match &*slot {
+            FactoryHost::Ready(host) => Ok(host.clone()),
+            FactoryHost::Unavailable(reason) => Err(BrowserError::Capability(*reason)),
+            _ => Err(BrowserError::Capability(
+                BrowserUnavailable::ParentUnavailable,
+            )),
         }
-
-        let host = Arc::new(WaylandHost::connect(
-            self.display,
-            self.parent_surface,
-            self.lifetime_guard.clone(),
-        )?);
-        *slot = Some(host.clone());
-        Ok(host)
     }
 }
 
 impl WaylandSubsurfaceFactory for RawWaylandSubsurfaceFactory {
+    fn availability(&self) -> CapabilityProbe {
+        let Ok(slot) = self.host.lock() else {
+            return CapabilityProbe::Unavailable(BrowserUnavailable::InitializationFailed);
+        };
+        match &*slot {
+            FactoryHost::Ready(_) => CapabilityProbe::Available,
+            FactoryHost::Unavailable(reason) => CapabilityProbe::Unavailable(*reason),
+            FactoryHost::Retired => {
+                CapabilityProbe::Unavailable(BrowserUnavailable::ParentUnavailable)
+            }
+            _ => CapabilityProbe::Pending,
+        }
+    }
     fn create(
         &self,
         viewport: PhysicalViewport,
@@ -182,17 +271,170 @@ impl WaylandSubsurfaceFactory for RawWaylandSubsurfaceFactory {
     }
 }
 
-struct WaylandDispatch;
-
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandDispatch {
+#[derive(Default)]
+struct WaylandDispatch {
+    globals: Vec<Global>,
+    complete: bool,
+}
+impl Dispatch<wl_registry::WlRegistry, ()> for WaylandDispatch {
     fn event(
-        _state: &mut Self,
-        _proxy: &wl_registry::WlRegistry,
-        _event: wl_registry::Event,
-        _data: &GlobalListContents,
-        _connection: &Connection,
-        _queue: &QueueHandle<Self>,
+        state: &mut Self,
+        _: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
     ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => state.globals.push(Global {
+                name,
+                interface,
+                version,
+            }),
+            wl_registry::Event::GlobalRemove { name } => {
+                state.globals.retain(|global| global.name != name)
+            }
+            _ => {}
+        }
+    }
+}
+impl Dispatch<wl_callback::WlCallback, ()> for WaylandDispatch {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.complete = true;
+        }
+    }
+}
+
+struct BoundGlobals {
+    compositor: wl_compositor::WlCompositor,
+    subcompositor: wl_subcompositor::WlSubcompositor,
+    viewporter: wp_viewporter::WpViewporter,
+}
+struct WaylandPreparation {
+    connection: Connection,
+    queue: EventQueue<WaylandDispatch>,
+    state: WaylandDispatch,
+    registry: wl_registry::WlRegistry,
+    _sync: wl_callback::WlCallback,
+    parent: wl_surface::WlSurface,
+    bound: Option<BoundGlobals>,
+}
+impl WaylandPreparation {
+    fn new(display: usize, parent_surface: usize) -> Result<Self, BrowserUnavailable> {
+        // SAFETY: the caller runs inside a live parent's UI callback; the app
+        // retains and explicitly releases this foreign queue before the owner.
+        let backend = unsafe { Backend::from_foreign_display((display as *mut c_void).cast()) };
+        let connection = Connection::from_backend(backend);
+        let parent_id = unsafe {
+            ObjectId::from_ptr(
+                wl_surface::WlSurface::interface(),
+                (parent_surface as *mut c_void).cast(),
+            )
+        }
+        .map_err(|_| BrowserUnavailable::ParentUnavailable)?;
+        let parent = wl_surface::WlSurface::from_id(&connection, parent_id)
+            .map_err(|_| BrowserUnavailable::ParentUnavailable)?;
+        let queue = connection.new_event_queue();
+        let handle = queue.handle();
+        let registry = connection.display().get_registry(&handle, ());
+        let sync = connection.display().sync(&handle, ());
+        Ok(Self {
+            connection,
+            queue,
+            state: WaylandDispatch::default(),
+            registry,
+            _sync: sync,
+            parent,
+            bound: None,
+        })
+    }
+    fn poll(&mut self) -> Result<bool, BrowserUnavailable> {
+        self.queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|_| BrowserUnavailable::InitializationFailed)?;
+        if self.state.complete && self.bound.is_none() {
+            self.bind_required()?;
+        }
+        match self.connection.flush() {
+            Ok(()) => {}
+            Err(wayland_client::backend::WaylandError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return Err(BrowserUnavailable::InitializationFailed),
+        }
+        Ok(self.state.complete)
+    }
+    fn bind_required(&mut self) -> Result<(), BrowserUnavailable> {
+        let missing = MissingWaylandProtocols::from_advertised(
+            self.state
+                .globals
+                .iter()
+                .map(|global| (global.interface.as_str(), global.version)),
+        );
+        if !missing.is_empty() {
+            return Err(BrowserUnavailable::MissingProtocols(missing));
+        }
+        let handle = self.queue.handle();
+        let bind = |name: &str, maximum: u32| {
+            self.state
+                .globals
+                .iter()
+                .find(|global| global.interface == name && global.version >= 1)
+                .map(|global| (global.name, global.version.min(maximum)))
+                .ok_or(BrowserUnavailable::InitializationFailed)
+        };
+        let (name, version) = bind("wl_compositor", 6)?;
+        let compositor: wl_compositor::WlCompositor =
+            self.registry.bind(name, version, &handle, ());
+        let (name, version) = bind("wl_subcompositor", 1)?;
+        let subcompositor: wl_subcompositor::WlSubcompositor =
+            self.registry.bind(name, version, &handle, ());
+        let (name, version) = bind("wp_viewporter", 1)?;
+        let viewporter: wp_viewporter::WpViewporter =
+            self.registry.bind(name, version, &handle, ());
+        if [compositor.id(), subcompositor.id(), viewporter.id()]
+            .iter()
+            .any(ObjectId::is_null)
+        {
+            return Err(BrowserUnavailable::InitializationFailed);
+        }
+        self.bound = Some(BoundGlobals {
+            compositor,
+            subcompositor,
+            viewporter,
+        });
+        self.state.complete = false;
+        self._sync = self.connection.display().sync(&handle, ());
+        Ok(())
+    }
+    fn finish(
+        self,
+        display: usize,
+        lifetime_guard: Arc<dyn Any + Send + Sync>,
+    ) -> Result<WaylandHost, BrowserUnavailable> {
+        let bound = self.bound.ok_or(BrowserUnavailable::InitializationFailed)?;
+        Ok(WaylandHost {
+            display,
+            connection: self.connection,
+            dispatch: Mutex::new((self.queue, self.state)),
+            compositor: bound.compositor,
+            subcompositor: bound.subcompositor,
+            viewporter: bound.viewporter,
+            parent: self.parent,
+            _registry: self.registry,
+            _lifetime_guard: lifetime_guard,
+        })
     }
 }
 
@@ -212,77 +454,11 @@ struct WaylandHost {
     subcompositor: wl_subcompositor::WlSubcompositor,
     viewporter: wp_viewporter::WpViewporter,
     parent: wl_surface::WlSurface,
+    _registry: wl_registry::WlRegistry,
     _lifetime_guard: Arc<dyn Any + Send + Sync>,
 }
 
 impl WaylandHost {
-    fn connect(
-        display: usize,
-        parent_surface: usize,
-        lifetime_guard: Arc<dyn Any + Send + Sync>,
-    ) -> Result<Self, BrowserError> {
-        let display_ptr = display as *mut c_void;
-        let parent_ptr = parent_surface as *mut c_void;
-
-        // SAFETY: the factory's construction contract guarantees the foreign
-        // display remains valid for this host's full lifetime.
-        let backend = unsafe { Backend::from_foreign_display(display_ptr.cast()) };
-        let connection = Connection::from_backend(backend);
-
-        // SAFETY: that same contract guarantees a live wl_surface on this
-        // foreign display. from_ptr additionally validates its proxy interface.
-        let parent_id =
-            unsafe { ObjectId::from_ptr(wl_surface::WlSurface::interface(), parent_ptr.cast()) }
-                .map_err(|_| {
-                    BrowserError::Wayland(
-                        "the supplied Wayland window handle is not a live wl_surface".into(),
-                    )
-                })?;
-        let parent = wl_surface::WlSurface::from_id(&connection, parent_id).map_err(|_| {
-            BrowserError::Wayland("could not wrap the supplied parent wl_surface".into())
-        })?;
-
-        let (globals, event_queue) = registry_queue_init::<WaylandDispatch>(&connection)
-            .map_err(|error| BrowserError::Wayland(format!("discover Wayland globals: {error}")))?;
-        let queue = event_queue.handle();
-        let compositor = globals
-            .bind::<wl_compositor::WlCompositor, _, _>(&queue, 1..=6, ())
-            .map_err(|error| BrowserError::Wayland(format!("bind wl_compositor: {error}")))?;
-        let subcompositor = globals
-            .bind::<wl_subcompositor::WlSubcompositor, _, _>(&queue, 1..=1, ())
-            .map_err(|error| BrowserError::Wayland(format!("bind wl_subcompositor: {error}")))?;
-        let viewporter = globals
-            .bind::<wp_viewporter::WpViewporter, _, _>(&queue, 1..=1, ())
-            .map_err(|error| {
-                BrowserError::Wayland(format!(
-                    "bind wp_viewporter (required for GPU fractional scaling): {error}"
-                ))
-            })?;
-
-        for (name, id) in [
-            ("wl_compositor", compositor.id()),
-            ("wl_subcompositor", subcompositor.id()),
-            ("wp_viewporter", viewporter.id()),
-        ] {
-            if id.is_null() {
-                return Err(BrowserError::Wayland(format!(
-                    "Wayland server returned an inert {name} proxy"
-                )));
-            }
-        }
-
-        Ok(Self {
-            display,
-            connection,
-            dispatch: Mutex::new((event_queue, WaylandDispatch)),
-            compositor,
-            subcompositor,
-            viewporter,
-            parent,
-            _lifetime_guard: lifetime_guard,
-        })
-    }
-
     fn dispatch_pending(&self) -> Result<(), BrowserError> {
         let mut dispatch = self
             .dispatch
@@ -728,3 +904,7 @@ mod tests {
         assert_eq!(grown.position, None);
     }
 }
+
+#[cfg(all(test, feature = "browser-protocol-fixture"))]
+#[path = "protocol_fixture.rs"]
+mod protocol_fixture;

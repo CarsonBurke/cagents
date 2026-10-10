@@ -41,6 +41,10 @@ Run `./scripts/build-release-linux --help` for the cache location and other
 details. `CARGO_BUILD_JOBS` defaults to 2 inside the builder. Download and build
 temporary files stay in its private disk cache rather than a RAM-backed `/tmp`.
 
+## Native integrated browser capability smoke
+
+Before publishing integrated artifacts, follow [the Wayland capability qualification](browser-wayland.md#qualification) with matched native executables. The browser requires `wl_compositor`, `wl_subcompositor`, and `wp_viewporter` at version 1 or newer. Verify a capable compositor and missing-protocol/timeout states, normal workspace startup, retained descriptors, and the system-browser action. Source registry fixtures do not replace Winit/native validation. Browserless artifacts retain their external-browser behavior.
+
 ## Artifacts
 
 - `cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
