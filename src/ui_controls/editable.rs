@@ -245,7 +245,9 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextInput<'_
         }
     }
     fn id(&self) -> Option<Id> {
-        self.id.clone()
+        // Only the native input owns the runtime's named state. Giving this
+        // decorator the same ID mounts two states under one cache key.
+        None
     }
     fn set_id(&mut self, id: Id) {
         self.inner.set_id(id.clone());
@@ -550,8 +552,16 @@ mod tests {
     #[test]
     fn mounted_field_exposes_unicode_value_and_routes_selection_and_edit_to_callback() {
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut input = TextInput::new("Search settings", "aé👩‍💻z").on_input(|value| value);
+        let id = Id::new("test.editable.search");
+        let mut input = TextInput::new("Search settings", "aé👩‍💻z")
+            .id(id.clone())
+            .on_input(|value| value);
         let mut tree = Tree::new(&input as &dyn Widget<String, Theme, Renderer>);
+        assert!(
+            tree.id.is_none(),
+            "decorator must not duplicate native state ownership"
+        );
+        assert!(IdEq::eq(tree.children[0].id.as_ref().unwrap(), &id));
         let node = input.layout(
             &mut tree,
             &renderer,
@@ -559,6 +569,7 @@ mod tests {
         );
         let layout = Layout::new(&node);
         let accessible = input.a11y_nodes(layout, &tree, mouse::Cursor::Unavailable);
+        assert!(IdEq::eq(accessible.root()[0].id(), &A11yId::from(id)));
         assert_eq!(accessible.root()[0].node().role(), Role::TextInput);
         assert_eq!(accessible.root()[0].node().label(), Some("Search settings"));
         assert_eq!(accessible.root()[0].node().value(), Some("aé👩‍💻z"));

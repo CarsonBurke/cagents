@@ -130,7 +130,8 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         tree.children[0].diff(&mut self.inner as &mut dyn Widget<Message, Theme, Renderer>);
     }
     fn id(&self) -> Option<Id> {
-        self.id.clone()
+        // Keep the native editor as the sole owner of its named runtime state.
+        None
     }
     fn set_id(&mut self, id: Id) {
         self.inner.set_id(id.clone());
@@ -390,6 +391,11 @@ mod tests {
                 .on_action(Message::Edit)
                 .on_cursor(Message::Cursor);
             tree = Tree::new(&editor as &dyn Widget<Message, Theme, Renderer>);
+            assert!(
+                tree.id.is_none(),
+                "decorator must not duplicate native state ownership"
+            );
+            assert!(IdEq::eq(tree.children[0].id.as_ref().unwrap(), &id));
             let node = editor.layout(
                 &mut tree,
                 &renderer,
@@ -397,6 +403,10 @@ mod tests {
             );
             let layout = Layout::new(&node);
             let accessible = editor.a11y_nodes(layout, &tree, mouse::Cursor::Unavailable);
+            assert!(IdEq::eq(
+                accessible.root()[0].id(),
+                &A11yId::from(id.clone())
+            ));
             assert_eq!(accessible.root()[0].node().role(), Role::MultilineTextInput);
             assert_eq!(accessible.children()[0].node().value(), Some("éclair\n"));
             assert_eq!(accessible.children()[1].node().value(), Some("👩‍💻 end"));
