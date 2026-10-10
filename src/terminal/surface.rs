@@ -36,6 +36,11 @@ impl TerminalSurface {
         self.unsized_spawn.load(Ordering::Relaxed)
     }
 
+    /// Semantic surfaces must reset when a card attaches a replacement terminal.
+    pub(crate) fn terminal_id(&self) -> crate::model::TerminalId {
+        self.handle.terminal_id()
+    }
+
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
         self.handle.snapshot()
     }

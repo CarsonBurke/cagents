@@ -2465,6 +2465,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
         | Message::ResizeCardFinished(_)
@@ -2607,6 +2608,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
+            | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused(_)
@@ -4026,6 +4028,11 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    TerminalReviewMode {
+        card: CardId,
+        terminal: crate::model::TerminalId,
+        active: bool,
+    },
     ResizeCard {
         card: CardId,
         width: f32,
@@ -4709,6 +4716,10 @@ pub struct Cagents {
     cards: HashMap<CardId, CardRuntime>,
     terminal_working_directories: HashMap<CardId, PathBuf>,
     terminal_find: HashMap<CardId, terminal_ui::Find>,
+    terminal_review_card: Option<CardId>,
+    terminal_review_revision: u64,
+    terminal_review_identity: Option<crate::model::TerminalId>,
+    terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
@@ -4932,6 +4943,40 @@ pub struct Cagents {
 }
 
 impl Cagents {
+    fn set_terminal_review_owner(&mut self, owner: Option<CardId>) {
+        self.terminal_review_card = owner;
+        self.terminal_review_identity = owner.and_then(|card| match self.cards.get(&card) {
+            Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
+            _ => None,
+        });
+        self.terminal_review_revision = self.terminal_review_revision.wrapping_add(1);
+    }
+
+    fn reconcile_terminal_review_owner(&mut self) {
+        if let Some(owner) = self.terminal_review_card {
+            let current_identity = match self.cards.get(&owner) {
+                Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
+                _ => None,
+            };
+            if self.workspace.focused() != Some(owner)
+                || current_identity.is_none()
+                || current_identity != self.terminal_review_identity
+            {
+                self.set_terminal_review_owner(None);
+            }
+        }
+    }
+
+    fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
+        match self.workspace.focus(id) {
+            Ok(update) => self.apply_viewport(update, true, false),
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                Task::none()
+            }
+        }
+    }
+
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
         let mut settings_warnings = Vec::new();
         let (settings, settings_path, settings_write_blocked, status) =
@@ -7982,6 +8027,9 @@ impl Cagents {
     ) -> Task<Message> {
         let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
+        // Every focus move converges here, including tab cycling and closing a
+        // pane. Also revoke ownership when the terminal runtime is replaced.
+        self.reconcile_terminal_review_owner();
         let focus_changed = self.durable.focused != focused;
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
@@ -8993,9 +9041,28 @@ impl Cagents {
                 message => message,
             }),
             Some(CardRuntime::Terminal(handle)) => {
+                let terminal = handle.terminal_id();
                 let find = self.terminal_find.get(&id).filter(|find| find.open);
                 let terminal = crate::file_drop::target(
                     TerminalWidget::new(handle.clone())
+                        .review_boundary(
+                            self.terminal_review_input.clone(),
+                            self.terminal_review_card.is_some(),
+                            self.terminal_review_card == Some(id),
+                            self.terminal_review_revision,
+                            move |active| Message::TerminalReviewMode {
+                                card: id,
+                                terminal,
+                                active,
+                            },
+                        )
+                        .accessible_name(format!(
+                            "Terminal {}, card {id}",
+                            card.map_or_else(
+                                || "Terminal".to_owned(),
+                                |card| card.title.chars().take(80).collect::<String>()
+                            )
+                        ))
                         .selection_reset(
                             self.terminal_find
                                 .get(&id)
@@ -12634,6 +12701,10 @@ impl Application for Cagents {
             cards: HashMap::new(),
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            terminal_review_card: None,
+            terminal_review_revision: 0,
+            terminal_review_identity: None,
+            terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
             terminal_context: None,
             terminal_paste: None,
             card_chrome: HashMap::new(),
@@ -12917,6 +12988,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
@@ -13025,6 +13097,7 @@ impl Application for Cagents {
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
                 | Message::FocusCard(_)
+                | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
@@ -14380,13 +14453,33 @@ impl Application for Cagents {
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
             }
-            Message::FocusCard(id) => match self.workspace.focus(id) {
-                Ok(update) => self.apply_viewport(update, true, false),
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(error.to_string()));
+            Message::FocusCard(id) => {
+                // Explicit activation also cancels a pending entry on this same
+                // card, even if no view has observed its acknowledgment yet.
+                self.set_terminal_review_owner(None);
+                self.focus_workspace_card(id)
+            }
+            Message::TerminalReviewMode {
+                card,
+                terminal,
+                active,
+            } => {
+                // Queued requests belong to their originating terminal, not a
+                // successor mounted in the same card while the task was pending.
+                if !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == terminal)
+                {
+                    return Task::none();
+                }
+                if active {
+                    self.set_terminal_review_owner(Some(card));
+                    self.focus_workspace_card(card)
+                } else {
+                    if self.terminal_review_card == Some(card) {
+                        self.set_terminal_review_owner(None);
+                    }
                     Task::none()
                 }
-            },
+            }
             Message::ResizeCard { card, width } => {
                 // The settings pane lays itself out against its own width, so
                 // dragging its edge is how the user picks rail or stacked.
@@ -16194,6 +16287,7 @@ impl Application for Cagents {
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
+        self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
         self.sync_worktree_protections();
@@ -21195,6 +21289,116 @@ mod tests {
         (app, id, directory)
     }
 
+    #[test]
+    fn terminal_review_revision_acknowledges_same_card_cancellation_and_focus_switch() {
+        let (mut app, card, _directory) = live_agent_app("owned-review-fixture");
+        let terminal = match app.cards.get(&card).unwrap() {
+            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            _ => unreachable!(),
+        };
+        let initial = app.terminal_review_revision;
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal,
+            active: true,
+        }));
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert_eq!(app.terminal_review_revision, initial + 1);
+        // Entry and same-card activation can be coalesced before any widget view
+        // observes the intermediate true owner. The final false revision differs.
+        drop(app.update(Message::FocusCard(card)));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.terminal_review_card, None);
+        assert_eq!(app.terminal_review_revision, initial + 2);
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal,
+            active: true,
+        }));
+        let acknowledged = app.terminal_review_revision;
+        let other = WorkspaceCard::new(CardId::new(), "Owned other pane", CardWidth::Fraction(0.5))
+            .unwrap();
+        let other_id = other.id;
+        app.workspace.add_card(other, 1, false).unwrap();
+        let update = app.workspace.focus(other_id).unwrap();
+        drop(app.apply_viewport(update, true, false));
+        assert_eq!(app.terminal_review_card, None);
+        assert_eq!(app.terminal_review_revision, acknowledged + 1);
+    }
+
+    #[test]
+    fn terminal_review_owner_is_revoked_when_its_runtime_identity_changes() {
+        let (mut app, card, _directory) = live_agent_app("owned-review-fixture");
+        let terminal = match app.cards.get(&card).unwrap() {
+            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            _ => unreachable!(),
+        };
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal,
+            active: true,
+        }));
+        let revision = app.terminal_review_revision;
+        let identity = app.terminal_review_identity;
+        let (mut replacement, replacement_card, _replacement_directory) =
+            live_agent_app("owned-replacement-fixture");
+        app.cards
+            .insert(card, replacement.cards.remove(&replacement_card).unwrap());
+        app.reconcile_terminal_review_owner();
+        assert!(identity.is_some());
+        assert_eq!(app.terminal_review_card, None);
+        assert_eq!(app.terminal_review_identity, None);
+        assert_eq!(app.terminal_review_revision, revision + 1);
+    }
+
+    #[test]
+    fn queued_review_requests_cannot_claim_or_cancel_a_replacement_terminal() {
+        let (mut app, card, _directory) = live_agent_app("owned-old-fixture");
+        let old_terminal = match app.cards.get(&card).unwrap() {
+            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            _ => unreachable!(),
+        };
+        let (mut replacement, replacement_card, _replacement_directory) =
+            live_agent_app("owned-new-fixture");
+        let replacement_runtime = replacement.cards.remove(&replacement_card).unwrap();
+        let new_terminal = match &replacement_runtime {
+            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            _ => unreachable!(),
+        };
+        app.cards.insert(card, replacement_runtime);
+        let revision = app.terminal_review_revision;
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: old_terminal,
+            active: true,
+        }));
+        assert_eq!(app.terminal_review_card, None);
+        assert_eq!(app.terminal_review_revision, revision);
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: new_terminal,
+            active: true,
+        }));
+        let accepted_revision = app.terminal_review_revision;
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert_eq!(app.terminal_review_identity, Some(new_terminal));
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: old_terminal,
+            active: false,
+        }));
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert_eq!(app.terminal_review_identity, Some(new_terminal));
+        assert_eq!(app.terminal_review_revision, accepted_revision);
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: new_terminal,
+            active: false,
+        }));
+        assert_eq!(app.terminal_review_card, None);
+        assert_eq!(app.terminal_review_revision, accepted_revision + 1);
+    }
+
     fn busy_chat_snapshot() -> crate::chat::Snapshot {
         use crate::chat::{
             Capabilities, Choice, Field, Item, ItemContent, Phase, Request, Role, Snapshot,
@@ -24660,6 +24864,10 @@ mod tests {
             #[cfg(feature = "integrated-browser")]
             browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
+            terminal_review_card: None,
+            terminal_review_revision: 0,
+            terminal_review_identity: None,
+            terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
             #[cfg(feature = "integrated-browser")]

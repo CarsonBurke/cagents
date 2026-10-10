@@ -38,6 +38,8 @@ pub use types::{
     TerminalStartError, TerminalWake,
 };
 #[cfg(feature = "ui")]
+pub(crate) use widget::ReviewInputBarrier;
+#[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
