@@ -3349,7 +3349,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     wrapping: text::Wrapping::None,
                     ellipsize: text::Ellipsize::None,
                 },
-                control.position(),
+                control.center(),
                 color(self.snapshot.foreground),
                 widget_clip,
             );
@@ -3372,7 +3372,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         wrapping: text::Wrapping::None,
                         ellipsize: text::Ellipsize::None,
                     },
-                    feedback.position(),
+                    Point::new(feedback.x, feedback.center_y()),
                     color(self.snapshot.foreground),
                     widget_clip,
                 );
