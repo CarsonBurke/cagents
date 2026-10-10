@@ -27,12 +27,14 @@ pub(super) fn transcript<'a>(
     Element::new(Selection {
         content: content.into(),
         context: Some((target, subagent)),
+        click_clock: iced::time::Instant::now,
     })
 }
 
 struct Selection<'a> {
     content: Element<'a, Message>,
     context: Option<(Target, Option<&'a str>)>,
+    click_clock: fn() -> iced::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -981,7 +983,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                     state.origin = Some(point);
                     state.moved = false;
                     state.next_scroll = None;
-                    let click = mouse::Click::new(point, mouse::Button::Left, state.click);
+                    let click = mouse::Click::new_at(
+                        point,
+                        mouse::Button::Left,
+                        state.click,
+                        (self.click_clock)(),
+                    );
                     state.click = Some(click);
                     if state.modifiers.shift() && state.anchor.is_some() {
                         state.unit = Unit::Character;
@@ -1514,6 +1521,7 @@ mod tests {
         Element::new(Selection {
             content: content.into(),
             context: None,
+            click_clock: iced::time::Instant::now,
         })
     }
     fn read() -> Read {
@@ -1582,12 +1590,23 @@ mod tests {
 
     #[test]
     fn click_units_shift_extension_and_returned_link_drags_use_the_shared_selection() {
+        thread_local! {
+            static CLICK_TIME: std::cell::Cell<iced::time::Instant> =
+                std::cell::Cell::new(iced::time::Instant::now());
+        }
+        fn next_click_time() -> iced::time::Instant {
+            CLICK_TIME.with(|time| {
+                let next = time.get() + std::time::Duration::from_millis(10);
+                time.set(next);
+                next
+            })
+        }
         let renderer = crate::app::tests::headless_renderer();
         let target = Target {
             card: CardId::new(),
             generation: 0,
         };
-        let mut element = surface(super::super::selectable_prose::text(
+        let content = super::super::selectable_prose::text(
             vec![
                 iced::widget::text::Span::new("one two three")
                     .link("https://example.com".to_owned()),
@@ -1597,7 +1616,14 @@ mod tests {
             iced::Font::default(),
             target,
             None,
-        ));
+        );
+        // Renderer/font work may exceed the real double-click deadline under
+        // parallel tests. Keep the actual event path with explicit click times.
+        let mut element = Element::new(Selection {
+            content: content.into(),
+            context: None,
+            click_clock: next_click_time,
+        });
         let mut tree = Tree::new(&element);
         let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
         let mut node = element
