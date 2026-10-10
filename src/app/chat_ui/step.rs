@@ -304,9 +304,9 @@ impl Runtime {
         code_frame(
             match limit {
                 Some(height) if !follows => {
-                    block.view_from_start(self.syntax_theme, height, target)
+                    block.view_from_start(self.syntax_theme, height, target, self.find.as_deref())
                 }
-                limit => block.view(self.syntax_theme, limit, target),
+                limit => block.view(self.syntax_theme, limit, target, self.find.as_deref()),
             },
             Some(caption.to_owned()),
             Some(copy),

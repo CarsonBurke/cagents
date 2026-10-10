@@ -122,23 +122,28 @@ pub(super) fn text(
         .map(|span| span.text.as_ref())
         .collect::<String>()
         .into();
-    let matches = find
-        .filter(|query| !query.is_empty())
-        .map_or_else(Vec::new, |query| {
-            plain
-                .match_indices(query)
-                .map(|(start, found)| start..start + found.len())
-                .collect()
-        });
-    Element::new(Selectable {
+    let highlights = super::find::highlights(&plain, find.unwrap_or_default());
+    let truncated = highlights.truncated;
+    let body = Element::new(Selectable {
         spans,
         plain,
         size,
         font,
         target,
-        matches,
+        matches: highlights.ranges,
         child: widget::text("").into(),
-    })
+    });
+    if truncated {
+        widget::column::with_children(vec![
+            design::caption("Find highlights limited to the first 4096 matches in this block.")
+                .into(),
+            body,
+        ])
+        .width(iced::Length::Fill)
+        .into()
+    } else {
+        body
+    }
 }
 
 pub(super) fn plain(
@@ -180,7 +185,10 @@ impl Selectable {
             let lo = start.clamp(offset, next) - offset;
             let hi = end.clamp(offset, next) - offset;
             let mut boundaries = vec![0, lo, hi, span.text.len()];
-            for found in &self.matches {
+            let first = self.matches.partition_point(|found| found.end <= offset);
+            let last = self.matches.partition_point(|found| found.start < next);
+            let matching = &self.matches[first..last];
+            for found in matching {
                 boundaries.push(found.start.clamp(offset, next) - offset);
                 boundaries.push(found.end.clamp(offset, next) - offset);
             }
@@ -189,10 +197,11 @@ impl Selectable {
             for pair in boundaries.windows(2) {
                 let range = pair[0]..pair[1];
                 let selected = range.start >= lo && range.end <= hi && lo != hi;
-                let found = self
-                    .matches
-                    .iter()
-                    .any(|found| found.contains(&(offset + range.start)));
+                let position = offset + range.start;
+                let candidate = matching.partition_point(|found| found.end <= position);
+                let found = matching
+                    .get(candidate)
+                    .is_some_and(|found| found.contains(&position));
                 if range.is_empty() {
                     continue;
                 }
@@ -616,6 +625,31 @@ mod tests {
                 .any(|span| span.link.as_deref() == Some("src/app.rs:42"))
         );
         assert_eq!(selected[0].font, Some(iced::Font::MONOSPACE));
+    }
+
+    #[test]
+    fn unicode_find_highlights_original_text_across_syntax_spans() {
+        let selectable = Selectable {
+            plain: "Straße CAFÉ".into(),
+            spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
+            matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            child: widget::text("").into(),
+        };
+        assert_eq!(
+            selectable
+                .selected_spans(&State::default())
+                .iter()
+                .filter(|span| span.highlight.is_some())
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "Straße"
+        );
     }
 
     #[test]

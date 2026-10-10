@@ -190,27 +190,26 @@ impl ToolText {
         }
     }
 
-    /// The text, whole or within `limit`, where it follows its last line:
-    /// output is read from its end, and a running step's grows there.
+    /// Bounded output follows its last line; matching uses original text bytes.
     pub(super) fn view(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
         limit: Option<f32>,
         target: Target,
+        find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, limit.map(|height| (height, true)), target)
+        self.surface(theme, limit.map(|height| (height, true)), target, find)
     }
 
-    /// The text within `height`, opened at its first line: a patch, a file
-    /// that was read and a tool's input are read from the top, and opening
-    /// one at its last screen hid the change it was opened for.
+    /// Patches and read results open at their first line.
     pub(super) fn view_from_start(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
         height: f32,
         target: Target,
+        find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, Some((height, false)), target)
+        self.surface(theme, Some((height, false)), target, find)
     }
 
     /// `limit` is the height the text scrolls within and whether it follows
@@ -220,6 +219,7 @@ impl ToolText {
         theme: crate::settings::EditorSyntaxTheme,
         limit: Option<(f32, bool)>,
         target: Target,
+        find: Option<&str>,
     ) -> Element<'static, Message> {
         let mut syntax = self.syntax.borrow_mut();
         if syntax
@@ -242,7 +242,7 @@ impl ToolText {
             design::TEXT_BODY.into(),
             iced::Font::MONOSPACE,
             target,
-            None,
+            find,
         ))
         .padding(design::with_vertical_rail(iced::Padding::from([
             step::GAP_S,
@@ -303,7 +303,7 @@ mod tests {
         let source = "printf 'λ'\nsecond line\n";
         let mut block = ToolText::update(None, source, Language::Shell);
         let read = |block: &ToolText| {
-            let mut element = block.view(theme, None, target);
+            let mut element = block.view(theme, None, target, None);
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -403,8 +403,11 @@ mod tests {
             assert_eq!(scrolled.0.len(), 1);
             scrolled.0[0]
         };
-        assert_eq!(offset(block.view_from_start(theme, 120.0, target)), 0.0);
-        assert!(offset(block.view(theme, Some(120.0), target)) > 0.0);
+        assert_eq!(
+            offset(block.view_from_start(theme, 120.0, target, None)),
+            0.0
+        );
+        assert!(offset(block.view(theme, Some(120.0), target, None)) > 0.0);
     }
 
     #[test]
