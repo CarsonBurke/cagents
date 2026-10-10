@@ -387,8 +387,18 @@ mod tests {
             assert!(description.contains("Embedded webpage accessibility is unavailable"));
             assert!(!host.node().supports_action(Action::Focus));
             assert!(!host.node().supports_action(Action::Click));
-            for forbidden in ["alice", "password", "oauth", "secret", "token", "?", "#"] {
-                assert!(!format!("{accessible:?}").contains(forbidden));
+            for node in accessible.root().iter().chain(accessible.children()) {
+                // AccessKit formats structural NodeIds as #123. Inspect all
+                // semantic properties without mistaking child references for
+                // a leaked URL fragment delimiter.
+                let mut properties = node.node().clone();
+                properties.clear_children();
+                for forbidden in ["alice", "password", "oauth", "secret", "token", "?", "#"] {
+                    assert!(
+                        !format!("{properties:?}").contains(forbidden),
+                        "browser property exposed {forbidden}",
+                    );
+                }
             }
             let child = accessible
                 .children()
