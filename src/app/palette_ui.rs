@@ -626,9 +626,9 @@ mod tests {
         widget::column::with_children(vec![
             app.card_view(app.workspace.focused().unwrap(), true, false),
             app.palette_surface()
-                .unwrap_or_else(|| widget::Space::new(1, 1).into()),
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
             app.pane_rename_surface()
-                .unwrap_or_else(|| widget::Space::new(1, 1).into()),
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
         ])
         .into()
     }
