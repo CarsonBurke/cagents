@@ -2059,7 +2059,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let Some(id) = &self.id else {
             return A11yTree::default();
         };
-        let bounds = layout.bounds();
+        let bounds = layout.bounds() - layout.virtual_offset();
         let geometry = TerminalGeometry::new(
             Self::grid_bounds(bounds),
             self.font_size,

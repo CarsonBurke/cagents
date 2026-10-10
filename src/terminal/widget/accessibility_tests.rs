@@ -298,6 +298,32 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     new.fence();
     let layout = layout::Node::new(Size::new(640.0, 320.0));
+    let accessible =
+        new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
+
+    let shifted = new_widget.a11y_nodes(
+        Layout::new(&layout).with_virtual_offset(cosmic::iced::Vector::new(11.0, 37.0)),
+        &new_tree,
+        mouse::Cursor::Unavailable,
+    );
+    assert!(!accessible.root().is_empty());
+    assert_eq!(accessible.children().len(), shifted.children().len());
+    for (normal, shifted) in accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .zip(shifted.root().iter().chain(shifted.children()))
+    {
+        assert_eq!(normal.id(), shifted.id());
+        if let Some(bounds) = normal.node().bounds() {
+            let moved = shifted.node().bounds().unwrap();
+            assert!((moved.x0 - (bounds.x0 - 11.0)).abs() < 0.0001);
+            assert!((moved.x1 - (bounds.x1 - 11.0)).abs() < 0.0001);
+            assert!((moved.y0 - (bounds.y0 - 37.0)).abs() < 0.0001);
+            assert!((moved.y1 - (bounds.y1 - 37.0)).abs() < 0.0001);
+        }
+    }
+
     let published =
         new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
     let focus_id = published.root()[0].id().clone();
