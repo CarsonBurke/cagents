@@ -52,23 +52,14 @@ else
 fi
 for executable in "${executables[@]}"; do
     [[ -f $binaries/$executable && ! -L $binaries/$executable && -x $binaries/$executable ]] || fail "missing executable: $executable"
-    case $executable in
-        cagents|ceditor)
-            actual=$("$binaries/$executable" --version)
-            [[ $actual == "$executable $version" ]] || fail "wrong shipped version: $actual" ;;
-    esac
-    if [[ $executable != cagentsd ]]; then
-        "$binaries/$executable" --help > /tmp/help
-        [[ -s /tmp/help ]] || fail "empty help: $executable"
-    fi
+    actual=$("$binaries/$executable" --version)
+    [[ $actual == "$executable $version" ]] || fail "wrong shipped version: $actual"
+    "$binaries/$executable" --help > /tmp/help
+    [[ -s /tmp/help ]] || fail "empty help: $executable"
 done
 if [[ $product != ceditor ]]; then
     [[ -x $public_command && $(readlink -f "$public_command") == "$(readlink -f "$binaries/cagents")" ]] || fail 'broken public command entrypoint'
     [[ $("$public_command" --version) == "cagents $version" ]] || fail 'public command version mismatch'
-    # UI help takes the real dynamic-loader/startup path without opening a
-    # window; its bounded private startup record reports the compiled version.
-    grep -F "starting cagents-ui version=\"$version\"" /root/data/cagents/cagents-ui.log >/dev/null \
-        || fail 'UI startup version does not match the package'
     daemon_cli=$public_command
     "$daemon_cli" --json daemon status > /tmp/status
     jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null
