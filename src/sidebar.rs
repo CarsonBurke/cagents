@@ -13591,7 +13591,7 @@ pub(crate) mod tests {
         let members = RowInteraction::members(
             widget::column::with_children(vec![
                 button.into(),
-                crate::ui_controls::editable::TextInput::new("Rename worktree", "nonce")
+                crate::ui_controls::field::TextInput::new("Rename worktree", "nonce")
                     .on_input(|_| SidebarAction::OpenRepositoryPicker)
                     .into(),
             ])
