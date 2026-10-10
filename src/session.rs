@@ -2238,9 +2238,12 @@ fn run_persistence_worker(
     config: PersistenceConfig,
 ) {
     crate::diagnostics::record(crate::diagnostics::Event::PersistenceStarted);
-    let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        persistence_loop(store, writes, queue, last_error, &mut health, config)
-    }));
+    let exit = {
+        let _recovered = crate::instance::recovered_panic_scope();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persistence_loop(store, writes, queue, last_error, &mut health, config)
+        }))
+    };
     if !matches!(exit, Ok(WriterExit::Shutdown(_))) {
         crate::diagnostics::record(crate::diagnostics::Event::WriterUnavailable);
         health.publish(SessionSaveHealth::WriterUnavailable);

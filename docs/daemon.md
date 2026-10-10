@@ -275,10 +275,10 @@ require an explicit local debug capture.
 | A plain login shell | Starts a new shell |
 | Any other command | Waits for **Retry**; it is never replayed automatically |
 
-Each decision is logged at `info` level with the terminal ID, program and
-working directory: the checkpoint in `cagentsd.log` and card recovery in
-`cagents-ui.log`, both in the cagents data directory
-(`~/.local/share/cagents` by default).
+Private production evidence is available through `cagents diagnostics`; it records
+closed lifecycle and failure categories without terminal commands or working
+directories. Detailed checkpoint and card-recovery tracing requires explicit
+local debug capture; see [private diagnostics](diagnostics.md).
 
 ### Failure and rollback
 
@@ -354,9 +354,10 @@ A Codex conversation on any other version does not acquire this claim, and its
 server does not outlive the daemon. When the daemon crashes, is killed, or
 aborts itself, the holder ends the server's process tree: the turn in progress,
 its running commands and its pending approvals are lost, and the conversation
-returns by resuming from disk. The daemon logs a warning to `cagentsd.log`
-naming the thread and the reported version when a conversation starts without
-durable continuity for this reason, once per conversation. Other providers
+returns by resuming from disk. With explicit local debug capture enabled, the
+daemon emits a foreground warning naming the thread and reported version when
+a conversation starts without durable continuity for this reason, once per
+conversation. Other providers
 retain their existing reconnect/resume behavior.
 
 To qualify a version, add it to the allowlist locally and run the

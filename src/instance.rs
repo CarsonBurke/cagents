@@ -290,7 +290,7 @@ thread_local! {
 }
 
 #[must_use = "the scope lasts until this guard is dropped"]
-pub struct RecoveredPanicScope(());
+pub struct RecoveredPanicScope(std::marker::PhantomData<std::rc::Rc<()>>);
 impl Drop for RecoveredPanicScope {
     fn drop(&mut self) {
         let _ = RECOVERED_PANIC_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
@@ -298,7 +298,7 @@ impl Drop for RecoveredPanicScope {
 }
 pub fn recovered_panic_scope() -> RecoveredPanicScope {
     let _ = RECOVERED_PANIC_DEPTH.try_with(|depth| depth.set(depth.get().saturating_add(1)));
-    RecoveredPanicScope(())
+    RecoveredPanicScope(std::marker::PhantomData)
 }
 
 pub fn install_panic_hook(product: &'static str) {

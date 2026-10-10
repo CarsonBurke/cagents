@@ -416,9 +416,9 @@ impl cosmic::Application for StartupError {
                 "This may be temporary. Retry starts cagents again; Close leaves no window open.",
             )
             .into(),
-            cagents::design::body(format!(
-                "The report is in {PRODUCT}-crash.log in the cagents data directory."
-            ))
+            cagents::design::body(
+                "Run `cagents diagnostics` to inspect retained private startup evidence.",
+            )
             .into(),
         ];
         if let Some(failure) = &self.retry_failure {

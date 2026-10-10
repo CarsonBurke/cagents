@@ -1066,6 +1066,16 @@ mod process_tests {
                 "TOKEN=secret prompt --api-key private https://user:password@example.test/?token=value#fragment \x1b[31m"
             );
         }
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("recovered")) {
+            let outcome = {
+                let _recovered = crate::instance::recovered_panic_scope();
+                std::panic::catch_unwind(|| panic!("RECOVERED_SECRET prompt https://private.test"))
+            };
+            assert!(outcome.is_err());
+            record(Event::Ready);
+            record(Event::Exit { success: true });
+            return;
+        }
         let file = PathBuf::from(path)
             .join(crate::instance::STORAGE_NAME)
             .join("diagnostics")
@@ -1180,6 +1190,46 @@ mod process_tests {
             1
         );
         assert!(!String::from_utf8_lossy(&output.stderr).contains(FAILURE_NOTICE));
+    }
+    #[test]
+    fn caught_panic_retains_recovered_evidence_and_allows_a_clean_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diagnostics::process_tests::subprocess_fixture",
+                "--nocapture",
+            ])
+            .env(TEST_STATE, root.path())
+            .env(TEST_MODE, "recovered")
+            .env("XDG_STATE_HOME", root.path())
+            .env("CAGENTS_LOCAL_DEBUG", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("RECOVERED_SECRET"));
+        let report = inspect_at(
+            root.path()
+                .join(crate::instance::STORAGE_NAME)
+                .join("diagnostics"),
+        )
+        .unwrap();
+        let product = &report.products[0];
+        assert_eq!(
+            product.last_observed.as_ref().unwrap().clean_shutdown,
+            Some(true)
+        );
+        assert!(
+            product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Panic { recovered: true }))
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("RECOVERED_SECRET")
+        );
     }
     #[test]
     fn real_panic_hook_retains_only_typed_evidence_after_exit() {
