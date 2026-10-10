@@ -779,7 +779,10 @@ impl Cagents {
                 let Some(card) = self.card_state(id) else {
                     return Task::none();
                 };
-                self.chrome_ui.rename = Some((RenameTarget::Pane(id), card.title.clone()));
+                self.chrome_ui.rename = Some((
+                    RenameTarget::Pane(id),
+                    self.card_display_title(card).to_owned(),
+                ));
                 iced::widget::operation::focus(widget::Id::new("chrome.rename.input"))
                     .chain(iced::widget::operation::select_all(widget::Id::new(
                         "chrome.rename.input",
@@ -828,7 +831,11 @@ impl Cagents {
                 if let Some(card) = self.card_state_mut(id) {
                     card.title = title.clone();
                 }
-                let _ = self.workspace.rename_card(id, title);
+                let presentation = self
+                    .card_state(id)
+                    .map(|card| self.card_display_title(card).to_owned())
+                    .unwrap_or(title);
+                let _ = self.workspace.rename_card(id, presentation);
                 self.persist();
                 self.save_settings_task(false)
             }
@@ -1132,7 +1139,10 @@ impl Cagents {
                 if let Some(health) = &self.save_health {
                     notices.extend(save_health_views(
                         health,
-                        |card| self.card_state(card).map(|card| card.title.as_str()),
+                        |card| {
+                            self.card_state(card)
+                                .map(|card| self.card_display_title(card))
+                        },
                         self.session_recovery_action(),
                     ));
                 }
@@ -1580,7 +1590,7 @@ impl Cagents {
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
         let title = chrome.map_or_else(
-            || card.map_or("Column", |card| card.title.as_str()),
+            || card.map_or("Column", |card| self.card_display_title(card)),
             |chrome| chrome.title.as_str(),
         );
         let focus_id = self.card_header_widget_id(id);

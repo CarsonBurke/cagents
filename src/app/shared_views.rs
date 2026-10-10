@@ -955,7 +955,9 @@ impl Cagents {
             if self.workspace.card(pane.id).is_none() {
                 if let Ok(card) = WorkspaceCard::new(
                     pane.id,
-                    pane.title.clone(),
+                    pane.user_title.as_deref().unwrap_or_else(|| {
+                        browser_host::presentation_title(&pane.kind, &pane.title)
+                    }),
                     CardWidth::Fraction(pane.width_fraction),
                 ) {
                     if let Ok(update) = self.workspace.add_card(
@@ -967,7 +969,15 @@ impl Cagents {
                     }
                 }
             } else {
-                let _ = self.workspace.rename_card(pane.id, pane.title.clone());
+                let _ = self.workspace.rename_card(
+                    pane.id,
+                    pane.user_title
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            browser_host::presentation_title(&pane.kind, &pane.title)
+                        })
+                        .to_owned(),
+                );
                 if self
                     .workspace
                     .card(pane.id)

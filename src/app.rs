@@ -16,6 +16,7 @@ pub(crate) mod dialog_ui;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
 use crate::file_manager::{self, open_system_url};
+mod browser_host;
 mod file_ui;
 mod git_ui;
 mod history_ui;
@@ -2470,6 +2471,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::CyclePaneWidth
         | Message::CloseCard(_)
         | Message::OpenBrowser(_)
+        | Message::OpenBrowserInSystem(_)
         | Message::OpenLink(..)
         | Message::OpenDocumentLink(..)
         | Message::PreviewLocalFile(_)
@@ -4122,6 +4124,12 @@ pub enum Message {
         token: Option<String>,
     },
     OpenBrowser(Url),
+    OpenBrowserInSystem(CardId),
+    BrowserSystemOpened {
+        card: CardId,
+        browser: crate::model::BrowserId,
+        opened: bool,
+    },
     OpenLink(CardId, Url, LinkOpenGesture),
     OpenDocumentLink(CardId, String),
     PreviewLocalFile(CardId),
@@ -5064,12 +5072,19 @@ impl Cagents {
             };
             let index = workspace.cards().len();
             let _ = workspace.add_card(
-                WorkspaceCard::new(card.id, card.title.clone(), width).unwrap_or_else(|_| {
-                    WorkspaceCard {
-                        id: card.id,
-                        accessible_name: "Workspace card".into(),
-                        width: CardWidth::Fraction(0.5),
-                    }
+                WorkspaceCard::new(
+                    card.id,
+                    if matches!(card.kind, CardKind::Browser(_)) {
+                        browser_host::TITLE.to_owned()
+                    } else {
+                        card.title.clone()
+                    },
+                    width,
+                )
+                .unwrap_or_else(|_| WorkspaceCard {
+                    id: card.id,
+                    accessible_name: "Workspace card".into(),
+                    width: CardWidth::Fraction(0.5),
                 }),
                 index,
                 false,
@@ -5913,7 +5928,9 @@ impl Cagents {
         let update = match self.workspace.add_card(
             WorkspaceCard::new(
                 id,
-                card.title.clone(),
+                user_title
+                    .as_deref()
+                    .unwrap_or_else(|| browser_host::presentation_title(&card.kind, &card.title)),
                 CardWidth::Fraction(card.width_fraction),
             )
             .expect("cloned pane has valid width"),
@@ -7324,7 +7341,15 @@ impl Cagents {
         let Some(title) = normalize_card_name(&title) else {
             return false;
         };
-        let _ = self.workspace.rename_card(id, title.clone());
+        let presentation = if self
+            .card_state(id)
+            .is_some_and(|card| matches!(card.kind, CardKind::Browser(_)))
+        {
+            browser_host::TITLE
+        } else {
+            &title
+        };
+        let _ = self.workspace.rename_card(id, presentation.to_owned());
         if self
             .card_state(id)
             .is_some_and(|state| state.title != title)
@@ -7351,9 +7376,18 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+        let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
             let (title, file_caption) = self.repository_chrome(card);
+            if matches!(card.kind, CardKind::Browser(_))
+                && self
+                    .workspace
+                    .card(card.id)
+                    .is_some_and(|pane| pane.accessible_name != title)
+            {
+                presentation_updates.push((card.id, title.to_string()));
+            }
             let caption = match &card.kind {
                 CardKind::Terminal(_)
                     if self.terminal_working_directories.contains_key(&card.id) =>
@@ -7382,6 +7416,9 @@ impl Cagents {
                 );
                 self.card_chrome.insert(card.id, chrome);
             }
+        }
+        for (id, title) in presentation_updates {
+            let _ = self.workspace.rename_card(id, title);
         }
         if self.card_chrome.len() != self.durable.cards.len() {
             self.card_chrome
@@ -7417,6 +7454,9 @@ impl Cagents {
     fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
         if let Some(title) = self.chrome_ui.user_titles.get(&card.id) {
             return title;
+        }
+        if matches!(card.kind, CardKind::Browser(_)) {
+            return browser_host::TITLE;
         }
         if let CardKind::Terminal(session) = &card.kind
             && (self
@@ -8732,14 +8772,17 @@ impl Cagents {
                     browser.lifecycle = lifecycle;
                 }
             }
-            BrowserEvent::Error(error) => {
-                let message = error.to_string();
-                self.status = Some(TransientNotice::error(message));
+            BrowserEvent::Error(_) => {
+                self.status = Some(TransientNotice::error(format!(
+                    "Browser card {id}: a browser operation failed"
+                )));
             }
             BrowserEvent::Crashed { reason, .. } => {
                 self.fail_runtime(id, reason.clone());
                 durable_changed = true;
-                self.status = Some(TransientNotice::error(format!("Browser crashed: {reason}")));
+                self.status = Some(TransientNotice::error(format!(
+                    "Browser card {id}: the browser stopped unexpectedly"
+                )));
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
             BrowserEvent::ClosedByContent => {
@@ -8879,6 +8922,10 @@ impl Cagents {
                         if browser_loading { "Stop" } else { "Reload" },
                     ),
                     address_input.into(),
+                    crate::ui_controls::button::secondary("Open in system browser")
+                        .id(card_control_id(id, "browser.system"))
+                        .on_press(Message::OpenBrowserInSystem(id))
+                        .into(),
                     crate::interaction::tooltip_above(
                         widget::button::icon(Icon::Import)
                             .id(card_control_id(id, "browser.import-logins"))
@@ -8964,7 +9011,8 @@ impl Cagents {
                 widget::row::with_children(vec![
                     address.into(),
                     crate::ui_controls::button::primary("Open in system browser")
-                        .on_press(Message::RetryCard(id))
+                        .id(card_control_id(id, "browser.system"))
+                        .on_press(Message::OpenBrowserInSystem(id))
                         .into(),
                 ])
                 .align_y(Alignment::Center)
@@ -9170,7 +9218,13 @@ impl Cagents {
                         .align_y(Alignment::Center)
                         .spacing(space::S)
                         .into(),
-                        widget::selectable_text(message.message())
+                        widget::selectable_text(if browser_session.is_some() {
+                            if cfg!(feature = "integrated-browser") {
+                                "The browser could not load. Try again or open it in your system browser."
+                            } else {
+                                "This build does not include the integrated browser. Open the saved page in your system browser."
+                            }
+                        } else { message.message() })
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
@@ -9191,7 +9245,15 @@ impl Cagents {
                                 crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
-                                    .on_press(Message::RetryCard(id))
+                                    .on_press(
+                                        if cfg!(not(feature = "integrated-browser"))
+                                            && browser_session.is_some()
+                                        {
+                                            Message::OpenBrowserInSystem(id)
+                                        } else {
+                                            Message::RetryCard(id)
+                                        },
+                                    )
                                     .into(),
                             ];
                             // A conversation no retry can reach still has one
@@ -9308,6 +9370,18 @@ impl Cagents {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
+        let surface = if let Some(session) = browser_session {
+            browser_host::surface(
+                id,
+                &SanitizedLocation::from(&session.current_url),
+                crate::capability::BrowserCapability::current(),
+                self.browser_host_load(id),
+                card_focused,
+                surface,
+            )
+        } else {
+            surface
+        };
         let edge: Element<'a, Message> = if card.is_some() {
             if show_resize_splitter {
                 let limits = self.workspace.card_resize_limits(id);
@@ -9324,7 +9398,11 @@ impl Cagents {
                         |chrome| chrome.resize_id.clone(),
                     ),
                     chrome.map_or_else(
-                        || card.map_or("Resize terminal pane", |state| state.title.as_str()),
+                        || {
+                            card.map_or("Resize terminal pane", |state| {
+                                self.card_display_title(state)
+                            })
+                        },
                         |chrome| chrome.resize_name.as_str(),
                     ),
                     width,
@@ -11952,7 +12030,10 @@ impl Cagents {
             return Task::none();
         };
         let card = durable.cards.remove(from);
-        let (title, width) = (card.title.clone(), card.width_fraction);
+        let (title, width) = (
+            browser_host::presentation_title(&card.kind, &card.title).to_owned(),
+            card.width_fraction,
+        );
         let durable_index = if from < durable_index {
             durable_index - 1
         } else {
@@ -13154,8 +13235,10 @@ impl Application for Cagents {
                 cosmic::task::message(Message::FocusCard(card))
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserError { card: _, message } => {
-                self.status = Some(TransientNotice::error(message));
+            Message::BrowserError { card, message: _ } => {
+                self.status = Some(TransientNotice::error(format!(
+                    "Browser card {card}: a browser operation failed"
+                )));
                 Task::none()
             }
             Message::ExternalUrlOpened(result) => {
@@ -15059,6 +15142,15 @@ impl Application for Cagents {
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::OpenBrowser(url) => self.add_browser(url),
+            Message::OpenBrowserInSystem(card) => self.open_browser_in_system(card),
+            Message::BrowserSystemOpened {
+                card,
+                browser,
+                opened,
+            } => {
+                self.browser_system_opened(card, browser, opened);
+                Task::none()
+            }
             Message::OpenLink(card, url, gesture) => {
                 if url.scheme() == "file" {
                     self.open_document_link(Some(card), url.as_str())
@@ -17212,9 +17304,11 @@ fn browser_command(
     status: &mut Option<TransientNotice>,
 ) -> Task<Message> {
     if let Some(CardRuntime::Browser(browser)) = cards.get(&card)
-        && let Err(error) = command(&browser.handle)
+        && command(&browser.handle).is_err()
     {
-        *status = Some(TransientNotice::error(error.to_string()));
+        *status = Some(TransientNotice::error(format!(
+            "Browser card {card}: a browser operation failed"
+        )));
     }
     Task::none()
 }
