@@ -41,6 +41,258 @@ pub(super) struct State {
 mod tests {
     use super::*;
 
+    /// Retain the actual Settings pane while rename and palette modals change.
+    /// Apply runtime operations to every real control in this same tree.
+    fn rename_fixture_view(app: &Cagents) -> Element<'_, Message> {
+        widget::column::with_children(vec![
+            app.card_view(app.workspace.focused().unwrap(), true, false),
+            app.palette_surface()
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
+            app.pane_rename_surface()
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
+        ])
+        .into()
+    }
+
+    fn rename_fixture_step(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        task: Task<Message>,
+        type_text: bool,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse};
+        use iced::{Event, Rectangle, Size, futures::StreamExt};
+
+        let mut element = rename_fixture_view(app);
+        tree.diff(element.as_widget_mut());
+        let viewport = Rectangle::with_size(Size::new(1000.0, 1600.0));
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut messages = Vec::new();
+        executor.block_on(async {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                // Apply actual immediate runtime effects. Destination changes
+                // also schedule maintenance timers; they are not the focus
+                // contract and need not finish before typing into the widget.
+                while let Ok(Some(action)) =
+                    tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+                {
+                    match action {
+                        iced::runtime::Action::Widget(operation) => {
+                            let mut next = Some(operation);
+                            while let Some(mut operation) = next.take() {
+                                element.as_widget_mut().operate(
+                                    tree,
+                                    Layout::new(&node),
+                                    renderer,
+                                    operation.as_mut(),
+                                );
+                                if let iced::advanced::widget::operation::Outcome::Chain(chained) =
+                                    operation.finish()
+                                {
+                                    next = Some(chained);
+                                }
+                            }
+                        }
+                        iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                            messages.push(message);
+                        }
+                        iced::runtime::Action::Window(_) => {}
+                        _ => panic!("unexpected runtime action in focus fixture"),
+                    }
+                }
+            }
+        });
+        executor.shutdown_background();
+        if type_text {
+            element.as_widget_mut().update(
+                tree,
+                &Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("x".into()),
+                    modified_key: keyboard::Key::Character("x".into()),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: Some("x".into()),
+                    repeat: false,
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        messages
+    }
+
+    fn rename_test_app() -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(card, CardRuntime::Settings);
+        app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+        app
+    }
+
+    #[test]
+    fn rename_dismissal_restores_retained_settings_input_and_preserves_title_policy() {
+        use iced::advanced::widget::Tree;
+
+        for dismissal in 0..3 {
+            let mut app = rename_test_app();
+            let card = app.workspace.focused().unwrap();
+            let original = app.card_state(card).unwrap().title.clone();
+            let renderer = super::super::tests::headless_renderer();
+            let mut tree = Tree::new(rename_fixture_view(&app).as_widget());
+            let focus = iced::widget::operation::focus(crate::settings_widgets::search_id())
+                .map(cosmic::Action::App);
+            let before = rename_fixture_step(&app, &mut tree, &renderer, focus, true);
+            assert!(before.iter().any(|message| matches!(
+                message, Message::SettingsSearchChanged(value) if value == "x"
+            )));
+
+            let open = app.update_chrome(Action::Rename(card));
+            let during = rename_fixture_step(&app, &mut tree, &renderer, open, true);
+            assert!(during.iter().any(|message| matches!(
+                message, Message::ChromeUi(Action::RenameChanged(value)) if value == "x"
+            )));
+            assert!(
+                !during
+                    .iter()
+                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+            );
+            let _ = app.update_chrome(Action::RenameChanged(" New name ".into()));
+            let close = match dismissal {
+                0 => app
+                    .chrome_key_event(&keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    })
+                    .expect("rename handles Escape"),
+                1 => app.update_chrome(Action::RenameCancel),
+                _ => app.update_chrome(Action::RenameSubmit),
+            };
+            assert!(app.pane_rename_surface().is_none());
+            assert_eq!(
+                app.card_state(card).unwrap().title,
+                if dismissal == 2 {
+                    "New name"
+                } else {
+                    &original
+                }
+            );
+            let after = rename_fixture_step(&app, &mut tree, &renderer, close, true);
+            assert!(after.iter().any(|message| matches!(
+                message, Message::SettingsSearchChanged(value) if value == "x"
+            )));
+        }
+    }
+
+    #[test]
+    fn channel_rename_submit_restores_the_current_settings_input() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel};
+        use iced::advanced::widget::Tree;
+
+        let mut app = rename_test_app();
+        let card = app.workspace.focused().unwrap();
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "Old channel".into(),
+                title_source: ChannelTitleSource::Prompt,
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(rename_fixture_view(&app).as_widget());
+        let open = app.update_chrome(Action::RenameChannel(channel));
+        let during = rename_fixture_step(&app, &mut tree, &renderer, open, true);
+        assert!(during.iter().any(|message| matches!(
+            message, Message::ChromeUi(Action::RenameChanged(value)) if value == "x"
+        )));
+        let _ = app.update_chrome(Action::RenameChanged(" New channel ".into()));
+        let submit = app.update_chrome(Action::RenameSubmit);
+        assert!(app.pane_rename_surface().is_none());
+        assert_eq!(app.workspace.focused(), Some(card));
+        let state = app
+            .durable
+            .channels
+            .iter()
+            .find(|state| state.id == channel)
+            .unwrap();
+        assert_eq!(state.title, "New channel");
+        assert_eq!(state.title_source, ChannelTitleSource::Manual);
+        let after = rename_fixture_step(&app, &mut tree, &renderer, submit, true);
+        assert!(after.iter().any(|message| matches!(
+            message, Message::SettingsSearchChanged(value) if value == "x"
+        )));
+    }
+
+    #[test]
+    fn blank_rename_submit_keeps_actual_input_focus() {
+        use iced::advanced::widget::Tree;
+
+        let mut app = rename_test_app();
+        let card = app.workspace.focused().unwrap();
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(rename_fixture_view(&app).as_widget());
+        let open = app.update_chrome(Action::Rename(card));
+        let _ = rename_fixture_step(&app, &mut tree, &renderer, open, false);
+        let _ = app.update_chrome(Action::RenameChanged(" ".into()));
+        let submit = app.update_chrome(Action::RenameSubmit);
+        assert!(app.pane_rename_surface().is_some());
+        let after = rename_fixture_step(&app, &mut tree, &renderer, submit, true);
+        assert!(after.iter().any(|message| matches!(
+            message, Message::ChromeUi(Action::RenameChanged(value)) if value.ends_with('x')
+        )));
+        assert!(
+            !after
+                .iter()
+                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+        );
+    }
+
+    #[test]
+    fn stale_rename_cancel_does_not_steal_focus_from_a_new_palette() {
+        use iced::advanced::widget::Tree;
+
+        let mut app = rename_test_app();
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(rename_fixture_view(&app).as_widget());
+        let open = app.update_palette(palette_ui::Action::Open);
+        let _ = rename_fixture_step(&app, &mut tree, &renderer, open, false);
+        let late_cancel = app.update_chrome(Action::RenameCancel);
+        let after = rename_fixture_step(&app, &mut tree, &renderer, late_cancel, true);
+        assert!(after.iter().any(|message| matches!(
+            message, Message::Palette(palette_ui::Action::Query(value)) if value == "x"
+        )));
+        assert!(
+            !after
+                .iter()
+                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+        );
+    }
+
     #[test]
     fn blank_rename_keeps_the_draft_open_until_it_is_corrected() {
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -612,6 +864,15 @@ fn command<'a>(
 }
 
 impl Cagents {
+    fn dismiss_rename(&mut self) -> Task<Message> {
+        if self.chrome_ui.rename.take().is_none() {
+            return Task::none();
+        }
+        self.workspace.focused().map_or_else(Task::none, |card| {
+            iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
+        })
+    }
+
     /// Keep Tab traversal and global shortcuts inside the open popup.
     pub(super) fn chrome_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if self.chrome_ui.rename.is_some() {
@@ -792,10 +1053,7 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Action::RenameCancel => {
-                self.chrome_ui.rename = None;
-                Task::none()
-            }
+            Action::RenameCancel => self.dismiss_rename(),
             Action::RenameSubmit => {
                 let Some((target, draft)) = self.chrome_ui.rename.as_ref() else {
                     return Task::none();
@@ -804,7 +1062,7 @@ impl Cagents {
                     return Task::none();
                 };
                 let target = *target;
-                self.chrome_ui.rename = None;
+                let restore = self.dismiss_rename();
                 let id = match target {
                     RenameTarget::Pane(id) => id,
                     RenameTarget::Channel(id) => {
@@ -821,7 +1079,7 @@ impl Cagents {
                         );
                         self.refresh_sidebar_channels();
                         self.persist();
-                        return Task::none();
+                        return restore;
                     }
                 };
                 self.chrome_ui.user_titles.insert(id, title.clone());
@@ -830,7 +1088,7 @@ impl Cagents {
                 }
                 let _ = self.workspace.rename_card(id, title);
                 self.persist();
-                self.save_settings_task(false)
+                restore.chain(self.save_settings_task(false))
             }
             Action::CloseOthers(id) | Action::CloseToRight(id) => {
                 let to_right = matches!(action, Action::CloseToRight(_));
