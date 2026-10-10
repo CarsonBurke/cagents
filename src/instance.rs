@@ -1090,7 +1090,7 @@ impl Drop for UiUpdateGuard {
 
 /// Starts another independent process using the same installed UI executable.
 pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>) -> io::Result<()> {
-    let executable = env::current_exe()?.with_file_name("cagents-ui");
+    let executable = crate::companion::Product::Ui.beside_current()?;
     launch_window_at(&executable, new_window, slot, source)
 }
 
@@ -1428,7 +1428,10 @@ pub fn notification_daemon_application(
     if installed || editor_requested {
         // A flag is accepted only with an owned co-installed editor, never a
         // PATH lookup which could silently select another installation.
-        resolve_notification_executable(&executable.with_file_name("ceditor"), std::iter::empty())?;
+        resolve_notification_executable(
+            &crate::companion::Product::Editor.beside(executable)?,
+            std::iter::empty(),
+        )?;
         Ok(crate::notifications::Application::Ceditor)
     } else {
         Ok(crate::notifications::Application::Cagents)
@@ -1448,11 +1451,14 @@ pub fn notification_desktop_id(application: crate::notifications::Application) -
 // The editor's daemon is a private matched companion. The other shell may be
 // installed separately, so resolve only these fixed application names, never a
 // path carried by an alert. Relative PATH entries cannot redirect activation.
-fn notification_executable(name: &str) -> io::Result<PathBuf> {
+fn notification_executable(product: crate::companion::Product) -> io::Result<PathBuf> {
     let current = env::current_exe()?;
-    let sibling = current.with_file_name(name);
+    let sibling = product.beside(&current)?;
     let search = env::var_os("PATH").unwrap_or_default();
-    resolve_notification_executable(&sibling, env::split_paths(&search).map(|p| p.join(name)))
+    resolve_notification_executable(
+        &sibling,
+        env::split_paths(&search).map(|p| p.join(product.file_name())),
+    )
 }
 
 fn resolve_notification_executable(
@@ -1494,7 +1500,8 @@ pub fn launch_notification_destination(
     if destination.application == crate::notifications::Application::Cagents {
         return launch_notification_window(&destination.window, token);
     }
-    let mut command = process::Command::new(notification_executable("ceditor")?);
+    let mut command =
+        process::Command::new(notification_executable(crate::companion::Product::Editor)?);
     command.args(["--notification-window", &destination.window]);
     command.env_remove("XDG_ACTIVATION_TOKEN");
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {
@@ -1505,7 +1512,8 @@ pub fn launch_notification_destination(
 
 pub fn launch_notification_window(slot: &str, token: Option<&str>) -> io::Result<()> {
     validate_window_slot(slot)?;
-    let mut command = process::Command::new(notification_executable("cagents-ui")?);
+    let mut command =
+        process::Command::new(notification_executable(crate::companion::Product::Ui)?);
     command.args(["--window", slot]);
     command.env_remove("XDG_ACTIVATION_TOKEN");
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {

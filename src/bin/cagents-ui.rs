@@ -457,9 +457,9 @@ impl cosmic::Application for StartupError {
 /// opening a second one. Running `cagents-ui` directly again would skip all
 /// three.
 fn relaunch() -> Result<(), String> {
-    let launcher = std::env::current_exe()
-        .map_err(|error| error.to_string())?
-        .with_file_name("cagents");
+    let launcher = cagents::companion::Product::Cli
+        .beside_current()
+        .map_err(|error| error.to_string())?;
     if !launcher.is_file() {
         return Err(format!(
             "the cagents launcher was not found beside this executable at {}",

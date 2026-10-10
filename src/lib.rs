@@ -23,6 +23,7 @@ pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
 pub mod chat;
+pub mod companion;
 pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]

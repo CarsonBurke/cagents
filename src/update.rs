@@ -838,7 +838,7 @@ fn served_version_root(layout: &InstallLayout) -> Result<PathBuf, UpdateError> {
 /// outlives it, and comes from the installed tree so that the windows it
 /// reopens and the daemon they attach to are one matched set.
 pub fn restart_into_installed(installed_ui: &Path) -> Result<(), UpdateError> {
-    let mut command = Command::new(installed_ui.with_file_name("cagents"));
+    let mut command = Command::new(crate::companion::Product::Cli.beside(installed_ui)?);
     command
         .args(["restart-windows", "--instance", crate::instance::NAME])
         .stdin(Stdio::null())

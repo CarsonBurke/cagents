@@ -1219,10 +1219,9 @@ fn ensure_daemon_ready_at(
         .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe =
         std::env::current_exe().map_err(HostedTerminalStartError::CurrentExecutable)?;
-    let Some(binary_directory) = current_exe.parent() else {
-        return Err(HostedTerminalStartError::HostBinaryMissing(current_exe));
-    };
-    let daemon_binary = binary_directory.join(format!("cagentsd{}", std::env::consts::EXE_SUFFIX));
+    let daemon_binary = crate::companion::Product::Daemon
+        .beside(&current_exe)
+        .map_err(|_| HostedTerminalStartError::HostBinaryMissing(current_exe))?;
     if !daemon_binary.is_file() {
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }

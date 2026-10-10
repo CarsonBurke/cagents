@@ -221,7 +221,10 @@ pub(crate) fn run(
         .stderr(Stdio::inherit())
         .process_group(0);
     if let Some(bin) = &owner_bin {
-        command.env(OWNER_CLI_ENV, bin.join("cagents"));
+        command.env(
+            OWNER_CLI_ENV,
+            bin.join(crate::companion::Product::Cli.file_name()),
+        );
     } else {
         command.env_remove(OWNER_CLI_ENV);
     }
@@ -564,7 +567,7 @@ fn window_owner_bin(
 }
 
 fn restore_window_daemon(bin: &Path, launch: &crate::instance::LaunchFence) -> io::Result<()> {
-    let mut command = Command::new(bin.join("cagents"));
+    let mut command = Command::new(bin.join(crate::companion::Product::Cli.file_name()));
     command
         .args(["daemon", "start"])
         .stdin(Stdio::null())

@@ -1970,7 +1970,8 @@ where
         ) {
             Ok(Some(bin)) => {
                 use std::os::unix::process::CommandExt;
-                let mut command = Command::new(bin.join("cagents"));
+                let mut command =
+                    Command::new(bin.join(crate::companion::Product::Cli.file_name()));
                 command.args(&arguments[1..]);
                 crate::install_guard::sanitize_child_environment(&mut command);
                 let error = command.exec();
@@ -2058,7 +2059,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
 /// update is pending. Internal helpers and remote devices do not use this route.
 pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
     crate::install_guard::staged_owner_bin(&std::env::current_exe()?, true)
-        .map(|bin| bin.map(|bin| bin.join("cagents-ui")))
+        .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
@@ -2193,8 +2194,9 @@ fn launch_ui(
     if !new_window && activate().map_err(|error| AppError::new("launch", error))? {
         return Ok(already_running_ui_output());
     }
-    let executable =
-        sibling_executable("cagents-ui").map_err(|error| AppError::new("launch", error))?;
+    let executable = crate::companion::Product::Ui
+        .beside_current()
+        .map_err(|error| AppError::new("launch", error))?;
     let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
     loop {
         let mut command = Command::new(&executable);
@@ -3501,17 +3503,6 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
         Some(path) => current.join(path),
         None => current,
     })
-}
-
-pub(crate) fn sibling_executable(name: &str) -> io::Result<PathBuf> {
-    let current = std::env::current_exe()?;
-    let directory = current.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "the current executable has no parent directory",
-        )
-    })?;
-    Ok(directory.join(name))
 }
 
 fn emit_success(json_output: bool, output: CommandOutput) {

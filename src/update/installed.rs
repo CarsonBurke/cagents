@@ -149,7 +149,10 @@ pub(super) fn perform(
             UpdatePhase::Installing,
             "Starting the installed application",
         )?;
-        let mut command = Command::new(root.join("bin/cagents"));
+        let mut command = Command::new(
+            root.join("bin")
+                .join(crate::companion::Product::Cli.file_name()),
+        );
         command.args(["--json", "daemon", "start"]);
         guard.inherit_for_install(&mut command)?;
         let started = bounded_command(

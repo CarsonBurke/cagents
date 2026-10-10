@@ -73,6 +73,12 @@ cargo build --locked --release --no-default-features --features ui --bin cagents
 together; running one binary from an unrelated directory is not a supported
 layout.
 
+Companion launch paths use fixed product names with the target executable suffix
+and retain the selected executable's directory. A missing companion does not
+select another installation from PATH or the current directory. Notification
+activation retains its separate validated absolute-path lookup. This naming
+rule does not qualify Windows/macOS builds or add app-bundle/libexec layouts.
+
 ## Development runner
 
 Launch the native UI through `scripts/run-development`, not a direct
