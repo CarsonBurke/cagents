@@ -19,7 +19,9 @@ The supported release target is **Linux x86_64 with glibc**, built on Ubuntu
 22.04, running in a **Wayland** session. X11, musl, ARM, and other operating
 systems or package formats are not supported yet. A normal graphical login
 provides an absolute `XDG_RUNTIME_DIR`, which cagents uses for the private
-daemon socket.
+daemon socket. The archive installer rejects glibc versions older than 2.35
+and unknown version results before installing or updating. Existing installations
+can still be removed on older glibc systems.
 
 The `.deb` declares `git (>= 2.36)`, `libc6 (>= 2.35)`, Fontconfig, FreeType,
 GCC/libstdc++, Wayland client, xkbcommon, and zlib runtime dependencies. The
