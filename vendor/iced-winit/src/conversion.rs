@@ -6,7 +6,6 @@ use crate::core::input_method;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::sync::Arc;
 
 use crate::core::keyboard;
 use crate::core::mouse;
@@ -20,7 +19,6 @@ use winit::event::ButtonSource;
 use winit::event::ElementState;
 use winit::event::FingerId;
 use winit::event::Force;
-use winit::icon::IconProvider;
 use winit::keyboard::SmolStr;
 
 /// Returns the activation token provided by the compositor, if any.
@@ -1635,21 +1633,14 @@ pub fn resize_direction(
     }
 }
 
-#[derive(Debug)]
-pub struct RawImage(Vec<u8>, Size<u32>);
-impl IconProvider for RawImage {}
-impl From<RawImage> for winit_core::icon::Icon {
-    fn from(value: RawImage) -> Self {
-        winit_core::icon::Icon(Arc::new(value))
-    }
-}
-
 /// Converts some [`window::Icon`] into its `winit` counterpart.
 ///
 /// Returns `None` if there is an error during the conversion.
 pub fn icon(icon: window::Icon) -> Option<winit_core::icon::Icon> {
     let (pixels, size) = icon.into_raw();
-    Some(winit_core::icon::Icon::from(RawImage(pixels, size)))
+    winit_core::icon::RgbaIcon::new(pixels, size.width, size.height)
+        .ok()
+        .map(winit_core::icon::Icon::from)
 }
 
 /// Converts some [`input_method::Purpose`] into its `winit` counterpart.
@@ -1677,4 +1668,23 @@ pub(crate) fn a11y(
         u128::from(event.target_node.0) as u64
     );
     Event::A11y(id, event)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn window_icon_uses_the_backend_rgba_provider_without_changing_pixels() {
+        // X11 (and other native backends) downcast the provider to RgbaIcon;
+        // a custom provider holding identical pixels is silently ignored.
+        let pixels = vec![19, 37, 83, 0, 211, 127, 43, 159];
+        let input = crate::core::window::icon::from_rgba(pixels.clone(), 2, 1)
+            .expect("valid RGBA icon");
+        let converted = super::icon(input).expect("native icon conversion");
+        let native = converted
+            .cast_ref::<winit_core::icon::RgbaIcon>()
+            .expect("native backend can consume the icon provider");
+        assert_eq!(native.width(), 2);
+        assert_eq!(native.height(), 1);
+        assert_eq!(native.buffer(), pixels.as_slice());
+    }
 }

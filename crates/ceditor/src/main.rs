@@ -107,6 +107,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     iced::daemon(
         move || {
             let mut window_settings = iced::window::Settings {
+                icon: Some(cagents::ui_controls::ceditor_window_icon()),
                 size: iced::Size::new(1280.0, 860.0),
                 min_size: Some(iced::Size::new(720.0, 480.0)),
                 decorations: false,

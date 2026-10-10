@@ -320,6 +320,9 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 transparent: true,
                 resize_border: 8,
                 exit_on_close_request: false,
+                // The startup task runs alongside window creation. Supply the
+                // icon here so no update can be dropped before the window opens.
+                icon: Some(cagents::app::application_window_icon()),
                 ..iced::window::Settings::default()
             };
             window_settings.platform_specific.application_id =
@@ -487,6 +490,9 @@ fn run_startup_error_dialog(message: &str) -> Result<(), Box<dyn std::error::Err
             let (window, open) = iced::window::open(iced::window::Settings {
                 size: iced::Size::new(620.0, 280.0),
                 exit_on_close_request: false,
+                // The startup task runs alongside window creation. Supply the
+                // icon here so no update can be dropped before the window opens.
+                icon: Some(cagents::app::application_window_icon()),
                 ..iced::window::Settings::default()
             });
             let mut core = Core::default();
