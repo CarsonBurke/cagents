@@ -6,10 +6,10 @@ pub use editor::TextEditor;
 use std::{borrow::Cow, cell::Cell, rc::Rc};
 
 use cosmic::iced::advanced::{
-    Layout, Widget, layout, mouse, overlay, renderer,
+    Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
     widget::{Id, Operation, Tree, tree},
 };
-use cosmic::iced::{Clipboard, Event, Length, Padding, Pixels, Rectangle, Shell, Size, Vector};
+use cosmic::iced::{Event, Length, Padding, Pixels, Rectangle, Size, Vector};
 use cosmic::{Element, Renderer, Theme, widget};
 use iced_accessibility::{
     A11yId, A11yNode, A11yTree, IdEq,
