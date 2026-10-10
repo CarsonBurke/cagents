@@ -11,6 +11,7 @@ for directory in /root/data/cagents /root/config/cagents /root/config/ceditor; d
     printf 'saved-user-data\n' > "$directory/smoke-sentinel"
 done
 fail() { printf 'artifact smoke: %s\n' "$*" >&2; exit 1; }
+[[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]] || fail 'runtime timezone database is unavailable'
 daemon_cli=
 cleanup() {
     if [[ -n $daemon_cli ]]; then

@@ -97,3 +97,11 @@ other:
 cat dist/cagents-"${VERSION}"-sizes.txt \
   dist/cagents-browserless-"${VERSION}"-sizes.txt
 ```
+
+Automation schedules use the operating system's IANA timezone database. Both
+Debian variants depend on `tzdata`; portable Linux installations also need that
+package (or the distribution's equivalent zoneinfo database). The build and
+offline runtime images install it explicitly, including UTC and named regional
+zones, so minimal images exercise the same schedule contract as desktops. The
+runtime smoke cache uses provisioning version 2; choose a new cache directory
+when upgrading a previously prepared version-1 image.

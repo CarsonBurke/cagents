@@ -142,7 +142,7 @@ fi
 # This namespace maps the host caller to root, not a subordinate UID range.
 # Ubuntu fakeroot handles package ownership for otherwise unmapped system users.
 # A separate namespace below maps that same caller to their ordinary nonzero UID.
-if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v2 ]]; then
+if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v3 ]]; then
     bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
         --die-with-parent --new-session --clearenv \
         --bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/provision-tmp" /tmp --tmpfs /run \

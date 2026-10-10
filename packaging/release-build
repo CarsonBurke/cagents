@@ -49,7 +49,7 @@ if [[ ${1:-} == --provision ]]; then
         test "$(stat -c %u:%g /tmp/ownership-probe)" = 0:50
     '
     apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
-        ca-certificates build-essential clang cmake curl git libclang-dev \
+        ca-certificates tzdata build-essential clang cmake curl git libclang-dev \
         libdbus-1-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
         libgbm-dev libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
         libxkbcommon-dev ninja-build pkg-config python3 xz-utils \
@@ -57,39 +57,48 @@ if [[ ${1:-} == --provision ]]; then
     audit=$(dpkg --audit)
     [[ -z $audit ]] || { printf '%s\n' "$audit" >&2; fail 'unfinished build dependencies'; }
     [[ -x /usr/bin/clang && -x /usr/bin/clang++ && -d /usr/lib/llvm-14/lib ]]
-    # Install the three official, version-pinned Rust components directly;
-    # no mutable rustup bootstrap or host toolchain is involved.
-    for component in rustc cargo rust-std; do
-        archive="$component-1.93.0-x86_64-unknown-linux-gnu.tar.xz"
+    # Earlier marked roots already contain the checksum-pinned toolchains.
+    # Upgrade runtime/build prerequisites without downloading them again.
+    if [[ ! -f /opt/.cagents-release-provisioned-v2 && ! -f /opt/.cagents-release-provisioned-v3 ]]; then
+        # Install the three official, version-pinned Rust components directly;
+        # no mutable rustup bootstrap or host toolchain is involved.
+        for component in rustc cargo rust-std; do
+            archive="$component-1.93.0-x86_64-unknown-linux-gnu.tar.xz"
+            curl --proto '=https' --tlsv1.2 --fail --location \
+                "https://static.rust-lang.org/dist/$archive" --output "/tmp/$archive"
+            curl --proto '=https' --tlsv1.2 --fail --location \
+                "https://static.rust-lang.org/dist/$archive.sha256" --output "/tmp/$archive.sha256"
+            (cd /tmp && sha256sum --check --strict "$archive.sha256")
+            tar -xJf "/tmp/$archive" -C /tmp --no-same-owner
+            "/tmp/${archive%.tar.xz}/install.sh" --prefix=/opt/rust --disable-ldconfig
+        done
         curl --proto '=https' --tlsv1.2 --fail --location \
-            "https://static.rust-lang.org/dist/$archive" --output "/tmp/$archive"
+            https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
+            --output /tmp/zig.tar.xz
+        printf '%s  %s\n' 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 /tmp/zig.tar.xz \
+            | sha256sum --check --strict
+        mkdir -p /opt/zig
+        tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 --no-same-owner
+        [[ $(/opt/rust/bin/rustc --version) == 'rustc 1.93.0 '* ]]
+        [[ $(/opt/rust/bin/cargo --version) == 'cargo 1.93.0 '* ]]
+        [[ $(/opt/zig/zig version) == 0.15.2 ]]
+        # Jammy's Git 2.34 lacks NUL-delimited worktree discovery (requires 2.36).
         curl --proto '=https' --tlsv1.2 --fail --location \
-            "https://static.rust-lang.org/dist/$archive.sha256" --output "/tmp/$archive.sha256"
-        (cd /tmp && sha256sum --check --strict "$archive.sha256")
-        tar -xJf "/tmp/$archive" -C /tmp --no-same-owner
-        "/tmp/${archive%.tar.xz}/install.sh" --prefix=/opt/rust --disable-ldconfig
-    done
-    curl --proto '=https' --tlsv1.2 --fail --location \
-        https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
-        --output /tmp/zig.tar.xz
-    printf '%s  %s\n' 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 /tmp/zig.tar.xz \
-        | sha256sum --check --strict
-    mkdir -p /opt/zig
-    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 --no-same-owner
+            https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz \
+            --output /tmp/git.tar.xz
+        printf '%s  %s\n' 457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357 /tmp/git.tar.xz \
+            | sha256sum --check --strict
+        tar -xJf /tmp/git.tar.xz -C /tmp --no-same-owner
+        PATH=/opt/rust/bin:$PATH make -C /tmp/git-2.55.0 -j2 \
+            prefix=/opt/git NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+        [[ $(/opt/git/bin/git --version) == 'git version 2.55.0' ]]
+    fi
     [[ $(/opt/rust/bin/rustc --version) == 'rustc 1.93.0 '* ]]
     [[ $(/opt/rust/bin/cargo --version) == 'cargo 1.93.0 '* ]]
     [[ $(/opt/zig/zig version) == 0.15.2 ]]
-    # Jammy's Git 2.34 lacks NUL-delimited worktree discovery (requires 2.36).
-    curl --proto '=https' --tlsv1.2 --fail --location \
-        https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz \
-        --output /tmp/git.tar.xz
-    printf '%s  %s\n' 457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357 /tmp/git.tar.xz \
-        | sha256sum --check --strict
-    tar -xJf /tmp/git.tar.xz -C /tmp --no-same-owner
-    PATH=/opt/rust/bin:$PATH make -C /tmp/git-2.55.0 -j2 \
-        prefix=/opt/git NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
     [[ $(/opt/git/bin/git --version) == 'git version 2.55.0' ]]
-    printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0' > /opt/.cagents-release-provisioned-v2
+    [[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]]
+    printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0' > /opt/.cagents-release-provisioned-v3
     exit 0
 fi
 
