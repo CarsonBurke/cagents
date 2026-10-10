@@ -248,6 +248,24 @@ pub(super) fn view(
     .items(cached.markdown.items(), settings)
 }
 
+#[cfg(test)]
+pub(super) fn items_for_test(
+    cached: &CachedItem,
+    items: &[markdown::Item],
+    target: Target,
+) -> Element<'static, Message> {
+    Renderer {
+        target,
+        cached,
+        dark: true,
+        find: None,
+    }
+    .items(
+        items,
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+    )
+}
+
 struct Renderer<'c> {
     find: Option<&'c str>,
     target: Target,
@@ -358,9 +376,19 @@ impl Renderer<'_> {
                         items,
                     ),
                 };
-                iced::widget::row![marker, self.items(items, nested)]
-                    .spacing(settings.spacing.0)
-                    .into()
+                let mut prefix = start.map_or_else(
+                    || "-".to_owned(),
+                    |start| format!("{}.", index as u64 + start),
+                );
+                if let markdown::Bullet::Task { done, .. } = bullet {
+                    prefix.push_str(if *done { " [x]" } else { " [ ]" });
+                }
+                iced::widget::row![
+                    marker,
+                    selection::wrap(self.items(items, nested), selection::Kind::ListItem(prefix))
+                ]
+                .spacing(settings.spacing.0)
+                .into()
             })
             .collect();
         let list = widget::column::with_children(rows).spacing(settings.spacing.0 * 0.75);
@@ -381,10 +409,25 @@ impl Renderer<'_> {
         let table = table::table(
             columns.iter().enumerate().map(|(index, column)| {
                 table::column(
-                    self.items(&column.header, settings),
-                    move |row: usize| match rows[row].cells.get(index) {
-                        Some(cells) => self.items(cells, settings),
-                        None => iced::widget::text("").into(),
+                    selection::wrap(
+                        self.items(&column.header, settings),
+                        selection::Kind::Cell {
+                            row: 0,
+                            column: index,
+                        },
+                    ),
+                    move |row: usize| {
+                        let content: Element<'static, Message> = match rows[row].cells.get(index) {
+                            Some(cells) => self.items(cells, settings),
+                            None => iced::widget::text("").into(),
+                        };
+                        selection::wrap(
+                            content,
+                            selection::Kind::Cell {
+                                row: row + 1,
+                                column: index,
+                            },
+                        )
                     },
                 )
                 .align_x(alignment(column))
@@ -394,12 +437,18 @@ impl Renderer<'_> {
         .padding_x(settings.spacing.0)
         .padding_y(settings.spacing.0 / 2.0)
         .separator_x(0);
-        iced::widget::scrollable(table)
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            ))
-            .spacing(settings.spacing.0 / 2.0)
-            .into()
+        iced::widget::scrollable(selection::wrap(
+            table,
+            selection::Kind::Table {
+                columns: columns.len(),
+                rows: rows.len() + 1,
+            },
+        ))
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            design::scrollbar(),
+        ))
+        .spacing(settings.spacing.0 / 2.0)
+        .into()
     }
 
     /// A fenced block on the sunken surface commands and outputs use, drawn
