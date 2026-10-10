@@ -1,3 +1,8 @@
+mod accessibility;
+#[cfg(test)]
+mod accessibility_tests;
+pub(crate) use accessibility::ReviewInputBarrier;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -38,6 +43,7 @@ use crate::{
 };
 
 const DEFAULT_PADDING: f32 = 8.0;
+const REVIEW_BAR_HEIGHT: f32 = 24.0;
 
 /// How long the cursor stays lit, and then dark, while it blinks. 530ms is
 /// what xterm and Ghostty both default to.
@@ -979,6 +985,8 @@ impl PtySize {
 
 #[derive(Default)]
 struct WidgetState {
+    a11y: RefCell<accessibility::State>,
+    review_control_pressed: bool,
     history_total: u64,
     completed_read_only: bool,
     shortcut_keys: Vec<keyboard::key::Physical>,
@@ -1491,6 +1499,11 @@ fn terminal_link_at(
 /// worker without ever borrowing or locking Ghostty state.
 pub struct TerminalWidget<Message> {
     id: Option<Id>,
+    accessible_name: String,
+    review_input_barrier: ReviewInputBarrier,
+    suppress_focus_reports: bool,
+    on_review: Option<Box<dyn Fn(bool) -> Message>>,
+    terminal_identity: crate::model::TerminalId,
     read_only: bool,
     handle: TerminalSurface,
     snapshot: Arc<RenderSnapshot>,
@@ -1537,8 +1550,14 @@ impl<Message> TerminalWidget<Message> {
         // and selection handling read the same grid, as they do the grid a
         // hidden terminal kept, until the first live frame replaces it.
         let snapshot = handle.frame();
+        let terminal_identity = handle.terminal_id();
         Self {
             id: None,
+            accessible_name: "Terminal".into(),
+            review_input_barrier: ReviewInputBarrier::default(),
+            suppress_focus_reports: false,
+            on_review: None,
+            terminal_identity,
             read_only: false,
             handle,
             snapshot,
@@ -1604,6 +1623,46 @@ impl<Message> TerminalWidget<Message> {
     }
 
     /// Names the input surface for focus handoffs from tabs and other panes.
+    pub(crate) fn review_boundary(
+        mut self,
+        barrier: ReviewInputBarrier,
+        suppress_focus_reports: bool,
+        on_review: impl Fn(bool) -> Message + 'static,
+    ) -> Self {
+        self.review_input_barrier = barrier;
+        self.suppress_focus_reports = suppress_focus_reports;
+        self.on_review = Some(Box::new(on_review));
+        self
+    }
+    fn publish_review(&self, active: bool, shell: &mut Shell<'_, Message>) {
+        if let Some(callback) = &self.on_review {
+            shell.publish(callback(active));
+        }
+    }
+
+    fn grid_bounds(bounds: Rectangle) -> Rectangle {
+        let height = REVIEW_BAR_HEIGHT.min(bounds.height);
+        Rectangle {
+            y: bounds.y + height,
+            height: bounds.height - height,
+            ..bounds
+        }
+    }
+    fn review_control(bounds: Rectangle) -> Rectangle {
+        Rectangle {
+            x: bounds.x + (bounds.width - 164.0).max(0.0),
+            y: bounds.y,
+            width: bounds.width.min(164.0),
+            height: bounds.height.min(REVIEW_BAR_HEIGHT),
+        }
+    }
+
+    /// A bounded card-owned name; terminal output never enters its label.
+    pub fn accessible_name(mut self, name: String) -> Self {
+        self.accessible_name = name.chars().take(192).collect();
+        self
+    }
+
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
         self
@@ -1787,15 +1846,20 @@ impl<Message> TerminalWidget<Message> {
     }
 
     fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
-        if self.read_only {
-            state.focused = self.model_focused;
-            state.preedit = None;
-            return;
-        }
         if self.model_focused {
             state.focus_requested = false;
         }
-        if state.focused == self.model_focused {
+        if self.read_only {
+            state.preedit = None;
+            return;
+        }
+        if accessibility::focus_report(
+            state.focused,
+            self.model_focused,
+            self.suppress_focus_reports || state.a11y.borrow().review,
+        )
+        .is_none()
+        {
             return;
         }
         match self.handle.focus(self.model_focused) {
@@ -1960,7 +2024,7 @@ impl<Message> TerminalWidget<Message> {
         state: &'state WidgetState,
         geometry: TerminalGeometry,
     ) -> InputMethod<&'state str> {
-        if self.read_only || !self.model_focused {
+        if self.read_only || !self.model_focused || state.a11y.borrow().review {
             return InputMethod::Disabled;
         }
         let Some(caret) = self
@@ -1979,6 +2043,166 @@ impl<Message> TerminalWidget<Message> {
 }
 
 impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message> {
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::{
+            A11yNode, A11yTree,
+            accesskit::{Action, Node, Rect, Role},
+        };
+        if self.snapshot.detached {
+            return A11yTree::default();
+        }
+        let Some(id) = &self.id else {
+            return A11yTree::default();
+        };
+        let bounds = layout.bounds();
+        let geometry = TerminalGeometry::new(
+            Self::grid_bounds(bounds),
+            self.font_size,
+            self.scale_factor,
+            self.font_family,
+            self.line_height,
+            self.padding,
+        );
+        let state = tree.state.downcast_ref::<WidgetState>();
+        let mut a11y = state.a11y.borrow_mut();
+        a11y.barrier = self.review_input_barrier.clone();
+        a11y.bind(id, self.terminal_identity);
+        a11y.refresh(
+            &self.snapshot,
+            accessibility::View {
+                rows: if bounds.height > REVIEW_BAR_HEIGHT {
+                    geometry.rows
+                } else {
+                    0
+                },
+                columns: geometry.columns,
+                offset: self.snapshot.scroll.offset,
+                alternate: self.snapshot.scroll.alternate_screen,
+                focused: self.model_focused,
+            },
+            Instant::now(),
+            true,
+        );
+        a11y.ensure_ids(id);
+        let projection = a11y.projection.as_ref().expect("activated projection");
+        let mut terminal = Node::new(Role::Terminal);
+        terminal.set_label(format!(
+            "{}, {}",
+            self.accessible_name,
+            if self.model_focused {
+                "focused"
+            } else {
+                "not focused"
+            }
+        ));
+        terminal.set_read_only();
+        // Streaming output is available for review, never an unsolicited
+        // live-region announcement on every frame.
+        terminal.set_live(iced_accessibility::accesskit::Live::Off);
+        terminal.add_action(Action::Focus);
+        terminal.add_action(Action::SetTextSelection);
+        terminal.set_bounds(Rect::new(
+            f64::from(bounds.x),
+            f64::from(bounds.y),
+            f64::from(bounds.x + bounds.width),
+            f64::from(bounds.y + bounds.height),
+        ));
+        let cursor = self.snapshot.cursor.filter(|cursor| cursor.visible);
+        terminal.set_description(format!(
+            "{}. {}. {}. Visible grid only{}.",
+            if a11y.review {
+                "Review mode; typing is blocked; Escape returns to terminal input"
+            } else {
+                "Terminal input; activate Review visible terminal to navigate without typing"
+            },
+            cursor.map_or_else(
+                || "Cursor not visible".into(),
+                |c| format!(
+                    "Cursor row {}, column {}",
+                    u32::from(c.row) + 1,
+                    u32::from(c.column) + 1
+                )
+            ),
+            state.selection.map_or_else(
+                || "No terminal selection".into(),
+                |_| "Terminal selection; only visible text is exposed".into()
+            ),
+            if projection.truncated { "; capped" } else { "" }
+        ));
+        let visible_selection = state.selection.and_then(|selection| {
+            let (start, end) = selection.span(self.selection_grid());
+            a11y.grid_selection(
+                (start.row, start.column),
+                (end.row, end.column),
+                self.snapshot.scroll.offset,
+            )
+        });
+        if let Some(selection) = a11y
+            .selection
+            .clone()
+            .filter(|s| a11y.valid_selection(s))
+            .or(visible_selection)
+            .or_else(|| a11y.cursor(&self.snapshot))
+        {
+            terminal.set_text_selection(selection);
+        }
+        let mut children = Vec::with_capacity(projection.rows.len() + 1);
+        for (index, row) in projection.rows.iter().enumerate() {
+            let mut text = Node::new(Role::TextRun);
+            text.set_value(row.text.clone());
+            text.set_character_lengths(row.lengths.clone());
+            text.set_text_direction(iced_accessibility::accesskit::TextDirection::LeftToRight);
+            text.set_character_positions(
+                row.positions
+                    .iter()
+                    .map(|column| column * geometry.metrics.width)
+                    .collect::<Vec<_>>(),
+            );
+            text.set_character_widths(
+                row.widths
+                    .iter()
+                    .map(|width| width * geometry.metrics.width)
+                    .collect::<Vec<_>>(),
+            );
+            let y = geometry.content_bounds.y + index as f32 * geometry.metrics.height;
+            text.set_bounds(Rect::new(
+                f64::from(geometry.content_bounds.x),
+                f64::from(y),
+                f64::from(geometry.content_bounds.x + geometry.content_bounds.width),
+                f64::from(y + geometry.metrics.height),
+            ));
+
+            children.push(A11yTree::leaf(text, a11y.row_ids[index].clone()));
+        }
+        let mut review = Node::new(Role::Button);
+        review.set_label(if a11y.review {
+            "Return to terminal input"
+        } else {
+            "Review visible terminal"
+        });
+        review.add_action(Action::Click);
+        let control = Self::review_control(bounds);
+        review.set_bounds(Rect::new(
+            f64::from(control.x),
+            f64::from(control.y),
+            f64::from(control.x + control.width),
+            f64::from(control.y + control.height),
+        ));
+        children.push(A11yTree::leaf(
+            review,
+            a11y.control_id.as_ref().unwrap().clone(),
+        ));
+        A11yTree::node_with_child_tree(
+            A11yNode::new(terminal, id.clone()),
+            A11yTree::join(children.into_iter()),
+        )
+    }
+
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
     }
@@ -2040,7 +2264,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
     ) {
         let bounds = layout.bounds();
         let geometry = TerminalGeometry::new(
-            bounds,
+            Self::grid_bounds(bounds),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -2048,6 +2272,151 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         let state = tree.state.downcast_mut::<WidgetState>();
+        {
+            let mut a11y = state.a11y.borrow_mut();
+            a11y.barrier = self.review_input_barrier.clone();
+            if let Some(id) = &self.id {
+                a11y.bind(id, self.terminal_identity);
+            }
+            if !self.suppress_focus_reports && self.on_review.is_some() {
+                a11y.review = false;
+                a11y.selection = None;
+            }
+        }
+        let view = accessibility::View {
+            rows: if bounds.height > REVIEW_BAR_HEIGHT {
+                geometry.rows
+            } else {
+                0
+            },
+            columns: geometry.columns,
+            offset: self.snapshot.scroll.offset,
+            alternate: self.snapshot.scroll.alternate_screen,
+            focused: self.model_focused,
+        };
+        if let Some(due) =
+            state
+                .a11y
+                .borrow_mut()
+                .refresh(&self.snapshot, view, Instant::now(), false)
+        {
+            shell.request_redraw_at(due);
+        }
+        if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event {
+            if state.review_control_pressed {
+                state.review_control_pressed = false;
+                shell.capture_event();
+                return;
+            }
+        }
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left))
+        ) && cursor.is_over(Self::review_control(bounds))
+        {
+            let mut a11y = state.a11y.borrow_mut();
+            a11y.refresh(&self.snapshot, view, Instant::now(), true);
+            if let Some(id) = &self.id {
+                a11y.ensure_ids(id);
+            }
+            a11y.review = !a11y.review;
+            a11y.selection = None;
+            if a11y.review {
+                a11y.move_review(0, 0, false);
+            }
+            state.preedit = None;
+            state.review_control_pressed = true;
+            self.publish_review(a11y.review, shell);
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
+        // Chrome never reuses grid hit testing or terminal mouse tracking.
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::WheelScrolled { .. })
+        ) && cursor.is_over(bounds)
+            && !cursor.is_over(Self::grid_bounds(bounds))
+        {
+            shell.capture_event();
+            return;
+        }
+        if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            && cursor.is_over(bounds)
+            && !cursor.is_over(Self::grid_bounds(bounds))
+            && state.pressed_buttons == 0
+            && !state.selecting
+            && state.scrollbar_drag.is_none()
+        {
+            shell.capture_event();
+            return;
+        }
+        // This boundary has no TerminalSurface command calls. Unknown actions
+        // addressed to our terminal are consumed as well, never reinterpreted
+        // as paste, typing, pointer events, or terminal scrolling.
+        if let Event::A11y(id, request) = event {
+            use iced_accessibility::accesskit::{Action, ActionData};
+            let mut a11y = state.a11y.borrow_mut();
+            let ours = self.id.as_ref().is_some_and(|own| own == id);
+            let control = a11y.control_id.as_ref().is_some_and(|own| own == id);
+            let row = a11y.row_ids.iter().any(|own| own == id);
+            if ours || control || row {
+                match request.action {
+                    Action::Focus if ours => {
+                        a11y.review = true;
+                        a11y.move_review(0, 0, false);
+                        state.preedit = None;
+                        state.input_focused = true;
+                        self.publish_review(true, shell);
+                    }
+                    Action::Click if control => {
+                        a11y.review = !a11y.review;
+                        a11y.selection = None;
+                        state.preedit = None;
+                        if a11y.review {
+                            a11y.move_review(0, 0, false);
+                        }
+                        self.publish_review(a11y.review, shell);
+                    }
+                    Action::SetTextSelection if ours => {
+                        if let Some(ActionData::SetTextSelection(selection)) = &request.data {
+                            if a11y.valid_selection(selection) {
+                                a11y.review = true;
+                                a11y.selection = Some(selection.clone());
+                                state.preedit = None;
+                                self.publish_review(true, shell);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+        }
+        if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.modifiers = map_iced_modifiers(*modifiers);
+        }
+        let review_target = match event {
+            Event::Keyboard(_) | Event::InputMethod(_) => {
+                self.model_focused || self.review_input_barrier.owns_keyboard(event)
+            }
+            Event::Mouse(_) => {
+                cursor.is_over(bounds) || self.review_input_barrier.owns_mouse_release(event)
+            }
+            _ => false,
+        };
+        let was_review = state.a11y.borrow().review;
+        let consumed_review_input = review_target && state.a11y.borrow_mut().review_input(event);
+        if consumed_review_input {
+            if was_review && !state.a11y.borrow().review {
+                self.publish_review(false, shell);
+            }
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
         if self.snapshot.scroll.total < state.history_total
             || (self.read_only && !state.completed_read_only)
             || self.selection_reset != state.selection_reset
@@ -2083,8 +2452,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
         // that reaches it focuses the terminal instead of grabbing the thumb.
-        let scrollbar =
-            TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| self.model_focused);
+        let scrollbar = TerminalScrollbar::new(Self::grid_bounds(bounds), self.snapshot.scroll)
+            .filter(|_| self.model_focused);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
         }
@@ -2625,7 +2994,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
 
         let bounds = layout.bounds();
         let geometry = TerminalGeometry::new(
-            bounds,
+            Self::grid_bounds(bounds),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -2893,8 +3262,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
             });
-            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll)
-                .filter(|_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused))
+            if let Some(bar) =
+                TerminalScrollbar::new(Self::grid_bounds(bounds), self.snapshot.scroll).filter(
+                    |_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused),
+                )
             {
                 renderer.fill_quad(
                     renderer::Quad {
@@ -2917,6 +3288,85 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 );
             }
         });
+        {
+            use cosmic::iced::advanced::text::Renderer as _;
+            let review = tree
+                .state
+                .downcast_ref::<WidgetState>()
+                .a11y
+                .borrow()
+                .review;
+            let control = Self::review_control(bounds);
+            let bar = Rectangle {
+                height: bounds.height.min(REVIEW_BAR_HEIGHT),
+                ..bounds
+            };
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: bar,
+                    ..renderer::Quad::default()
+                },
+                color(self.snapshot.background),
+            );
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: control,
+                    border: Border {
+                        width: 1.0,
+                        color: color(self.snapshot.foreground).scale_alpha(0.3),
+                        ..Border::default()
+                    },
+                    ..renderer::Quad::default()
+                },
+                color(self.snapshot.foreground).scale_alpha(0.08),
+            );
+            renderer.fill_text(
+                text::Text {
+                    content: if review {
+                        "Return to input"
+                    } else {
+                        "Review visible text"
+                    }
+                    .to_owned(),
+                    bounds: control.size(),
+                    size: Pixels(12.0),
+                    line_height: text::LineHeight::Relative(1.2),
+                    font: Font::DEFAULT,
+                    align_x: text::Alignment::Center,
+                    align_y: cosmic::iced::alignment::Vertical::Center,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                    ellipsize: text::Ellipsize::None,
+                },
+                control.position(),
+                color(self.snapshot.foreground),
+                widget_clip,
+            );
+            if review {
+                let feedback = Rectangle {
+                    width: (bar.width - control.width - 8.0).max(0.0),
+                    x: bar.x + 4.0,
+                    ..bar
+                };
+                renderer.fill_text(
+                    text::Text {
+                        content: "Review · typing blocked · Esc exits".to_owned(),
+                        bounds: feedback.size(),
+                        size: Pixels(12.0),
+                        line_height: text::LineHeight::Relative(1.2),
+                        font: Font::DEFAULT,
+                        align_x: text::Alignment::Left,
+                        align_y: cosmic::iced::alignment::Vertical::Center,
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::None,
+                        ellipsize: text::Ellipsize::None,
+                    },
+                    feedback.position(),
+                    color(self.snapshot.foreground),
+                    widget_clip,
+                );
+            }
+        }
         if let Some(started) = draw_started {
             // This records CPU draw-command construction, not GPU completion
             // or compositor presentation/scanout.
@@ -2937,14 +3387,17 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        if cursor.is_over(Self::review_control(layout.bounds())) {
+            return mouse::Interaction::Pointer;
+        }
         if self.model_focused
-            && TerminalScrollbar::new(layout.bounds(), self.snapshot.scroll)
+            && TerminalScrollbar::new(Self::grid_bounds(layout.bounds()), self.snapshot.scroll)
                 .is_some_and(|bar| cursor.is_over(bar.track))
         {
             return mouse::Interaction::Pointer;
         }
         let geometry = TerminalGeometry::new(
-            layout.bounds(),
+            Self::grid_bounds(layout.bounds()),
             self.font_size,
             self.scale_factor,
             self.font_family,

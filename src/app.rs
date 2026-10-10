@@ -2462,6 +2462,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
         | Message::ResizeCardFinished(_)
@@ -2604,6 +2605,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
+            | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused(_)
@@ -4010,6 +4012,10 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    TerminalReviewMode {
+        card: CardId,
+        active: bool,
+    },
     ResizeCard {
         card: CardId,
         width: f32,
@@ -4693,6 +4699,8 @@ pub struct Cagents {
     cards: HashMap<CardId, CardRuntime>,
     terminal_working_directories: HashMap<CardId, PathBuf>,
     terminal_find: HashMap<CardId, terminal_ui::Find>,
+    terminal_review_card: Option<CardId>,
+    terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
@@ -4914,6 +4922,16 @@ pub struct Cagents {
 }
 
 impl Cagents {
+    fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
+        match self.workspace.focus(id) {
+            Ok(update) => self.apply_viewport(update, true, false),
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                Task::none()
+            }
+        }
+    }
+
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
         let mut settings_warnings = Vec::new();
         let (settings, settings_path, settings_write_blocked, status) =
@@ -8953,6 +8971,18 @@ impl Cagents {
                 let find = self.terminal_find.get(&id).filter(|find| find.open);
                 let terminal = crate::file_drop::target(
                     TerminalWidget::new(handle.clone())
+                        .review_boundary(
+                            self.terminal_review_input.clone(),
+                            self.terminal_review_card.is_some(),
+                            move |active| Message::TerminalReviewMode { card: id, active },
+                        )
+                        .accessible_name(format!(
+                            "Terminal {}, card {id}",
+                            card.map_or_else(
+                                || "Terminal".to_owned(),
+                                |card| card.title.chars().take(80).collect::<String>()
+                            )
+                        ))
                         .selection_reset(
                             self.terminal_find
                                 .get(&id)
@@ -12578,6 +12608,8 @@ impl Application for Cagents {
             cards: HashMap::new(),
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            terminal_review_card: None,
+            terminal_review_input: crate::terminal::ReviewInputBarrier::default(),
             terminal_context: None,
             terminal_paste: None,
             card_chrome: HashMap::new(),
@@ -12971,6 +13003,7 @@ impl Application for Cagents {
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
                 | Message::FocusCard(_)
+                | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
@@ -14323,13 +14356,24 @@ impl Application for Cagents {
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
             }
-            Message::FocusCard(id) => match self.workspace.focus(id) {
-                Ok(update) => self.apply_viewport(update, true, false),
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(error.to_string()));
+            Message::FocusCard(id) => {
+                self.terminal_review_card = None;
+                self.focus_workspace_card(id)
+            }
+            Message::TerminalReviewMode { card, active } => {
+                if active {
+                    if !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
+                        return Task::none();
+                    }
+                    self.terminal_review_card = Some(card);
+                    self.focus_workspace_card(card)
+                } else {
+                    if self.terminal_review_card == Some(card) {
+                        self.terminal_review_card = None;
+                    }
                     Task::none()
                 }
-            },
+            }
             Message::ResizeCard { card, width } => {
                 // The settings pane lays itself out against its own width, so
                 // dragging its edge is how the user picks rail or stacked.

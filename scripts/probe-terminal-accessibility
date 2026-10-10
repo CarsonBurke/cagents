@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Bounded AT-SPI smoke for one explicitly owned application process.
+
+This never sends keyboard input. Optional actions address only the terminal's
+app-owned review button and its read-only text selection interface.
+"""
+import argparse
+from collections import deque
+import json
+import os
+import select
+import sys
+import gi
+
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--pid", type=int, required=True)
+parser.add_argument("--toggle-review", action="store_true")
+parser.add_argument("--select-first-character", action="store_true")
+args = parser.parse_args()
+try:
+    if os.stat(f"/proc/{args.pid}").st_uid != os.getuid():
+        parser.error("The target process must belong to the current user")
+except FileNotFoundError:
+    parser.error("The target process is not running")
+# Pin the original process. PID reuse must not turn this into an unrelated app
+# action after the owned fixture exits.
+pidfd = os.pidfd_open(args.pid, 0)
+lifetime = select.poll()
+lifetime.register(pidfd, select.POLLIN)
+def require_alive():
+    if lifetime.poll(0):
+        sys.exit("Owned target process exited; refusing accessibility actions")
+Atspi.init()
+Atspi.set_timeout(3000, 3000)
+desktop = Atspi.get_desktop(0)
+app = None
+for index in range(min(desktop.get_child_count(), 512)):
+    candidate = desktop.get_child_at_index(index)
+    if candidate.get_process_id() == args.pid:
+        app = candidate
+        break
+if app is None:
+    sys.exit("Target PID is not registered on this session's AT-SPI bus")
+queue = deque([app])
+terminals = []
+visited = 0
+while queue and visited < 2048:
+    require_alive()
+    node = queue.popleft()
+    visited += 1
+    if node.get_role() == Atspi.Role.TERMINAL:
+        text = node.get_text_iface()
+        count = text.get_character_count() if text else 0
+        # This additional probe cap is independent of the application's cap.
+        value = text.get_text(0, min(count, 16384)) if text else None
+        record = {"name": node.get_name(), "role": "terminal", "text_interface": bool(text),
+                  "character_count": count, "visible_text": value,
+                  "focused": node.get_state_set().contains(Atspi.StateType.FOCUSED)}
+        if text:
+            record["caret"] = text.get_caret_offset()
+            record["selection_count"] = text.get_n_selections()
+            if args.select_first_character and count:
+                require_alive()
+                record["select_first_character"] = bool(text.add_selection(0, 1))
+        if args.toggle_review:
+            buttons = []
+            for i in range(min(node.get_child_count(), 132)):
+                child = node.get_child_at_index(i)
+                if child.get_role() == Atspi.Role.PUSH_BUTTON and child.get_name() in (
+                    "Review visible terminal", "Return to terminal input"
+                ):
+                    buttons.append(child)
+            if len(buttons) != 1:
+                sys.exit("Expected exactly one app-owned terminal review control")
+            action = buttons[0].get_action_iface()
+            if not action or action.get_n_actions() != 1:
+                sys.exit("Review control does not expose one action")
+            require_alive()
+            record["toggle_review"] = bool(action.do_action(0))
+        terminals.append(record)
+        continue
+    child_count = node.get_child_count()
+    if child_count > 512 or len(queue) + visited + child_count > 2048:
+        sys.exit("Probe traversal budget exceeded; no complete result")
+    for index in range(child_count):
+        queue.append(node.get_child_at_index(index))
+if queue:
+    sys.exit("Probe traversal budget exceeded; no complete result")
+if not terminals:
+    sys.exit("No mounted terminal accessibility surface in the target app")
+print(json.dumps({"pid": args.pid, "terminals": terminals}, ensure_ascii=False, indent=2))
