@@ -971,21 +971,15 @@ impl Store {
                 };
                 let (start0, end0) = (start.min(len0), end.min(len0));
                 let (start1, end1) = (start.saturating_sub(len0), end.saturating_sub(len0));
-                let mut item = base.clone();
-                if part > 0 {
-                    // A part index names a position in a body rather than the bytes at
-                    // that position, and the slice moves while an item is live: a
-                    // command's output grows, and a finished tool call is rewritten into
-                    // a command, which drops the input from the body and re-slices what
-                    // is left. Since the reader's disclosure state is keyed by item id,
-                    // an index alone would hand a part the state its reader gave to
-                    // different bytes, so the id also carries the range each field is
-                    // read at and which variant decided that field's meaning. Neither
-                    // moves while a body only grows, so a part the reader expanded
-                    // stays expanded across frames.
-                    item.id =
-                        format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
-                }
+                // A part's identity carries its field ranges and layout so
+                // disclosure state cannot move to different bytes on rewrite.
+                let item_id = if part > 0 {
+                    std::borrow::Cow::Owned(format!(
+                        "{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}"
+                    ))
+                } else {
+                    std::borrow::Cow::Borrowed(base.id.as_str())
+                };
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
                         len2
@@ -1001,14 +995,18 @@ impl Store {
                     .changed
                     .as_ref()
                     .is_some_and(|changed| !changed.contains(&id))
-                    && old.contains_key(item.id.as_str())
+                    && let Some(previous) = old.get(item_id.as_ref())
                 {
-                    reused.insert(item.id.clone());
+                    reused.insert(item_id.into_owned());
                     newest.get_or_insert((ordinal, part));
                     first = Some((ordinal, part));
                     bytes += size;
-                    items.push(std::sync::Arc::new(item));
+                    items.push(std::sync::Arc::clone(previous));
                     continue;
+                }
+                let mut item = base.clone();
+                if part > 0 {
+                    item.id = item_id.into_owned();
                 }
                 let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
                     .map_err(|e| e.to_string())?;
@@ -1162,15 +1160,7 @@ impl Store {
             })
             .collect();
         drop(old);
-        let mut old: std::collections::HashMap<_, _> = std::mem::take(previous)
-            .into_iter()
-            .map(|item| (item.id.clone(), item))
-            .collect();
-        for item in &mut items {
-            if reused.contains(&item.id) {
-                *item = old.remove(&item.id).expect("reused resident item");
-            }
-        }
+        previous.clear();
         self.dirty = false;
         self.changed = Some(Default::default());
         Ok(Window {
@@ -1440,6 +1430,7 @@ mod tests {
             .unwrap();
         let mut previous = store.window().unwrap().items;
         let fixed = previous[0].clone();
+        let live = previous[1].clone();
         store
             .apply(Event::TextDelta {
                 id: "live".into(),
@@ -1449,7 +1440,13 @@ mod tests {
             })
             .unwrap();
         let window = store.window_reusing(&mut previous).unwrap();
+        assert!(
+            previous.is_empty(),
+            "a successful window transfers the resident view"
+        );
         assert!(std::sync::Arc::ptr_eq(&fixed, &window.items[0]));
+        assert!(!std::sync::Arc::ptr_eq(&live, &window.items[1]));
+        assert!(matches!(&live.content, ItemContent::Text { text, .. } if text == "begin"));
         assert_eq!(window.changes.len(), 1);
         assert!(
             matches!(&window.changes[0], crate::chat::presentation::ItemChange::Append { offset: 5, suffix, .. } if suffix == " tail")
@@ -1489,6 +1486,48 @@ mod tests {
         .unwrap();
         assert_eq!(replayed.items, earlier.items);
     }
+    #[test]
+    fn unchanged_paged_window_preserves_every_retained_item() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(history_item("paged", &"λ".repeat(PART_BYTES))))
+            .unwrap();
+        let mut previous = store.window().unwrap().items;
+        let retained = previous.clone();
+        assert!(retained.len() > 1);
+        let window = store.window_reusing(&mut previous).unwrap();
+        assert!(previous.is_empty());
+        assert!(window.changes.is_empty());
+        assert_eq!(retained.len(), window.items.len());
+        for (before, after) in retained.iter().zip(&window.items) {
+            assert!(std::sync::Arc::ptr_eq(before, after));
+        }
+    }
+
+    #[test]
+    fn rejected_window_preserves_residents_after_an_unchanged_item() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["older", "newer"] {
+            store.apply(Event::Item(history_item(id, id))).unwrap();
+        }
+        let mut previous = store.window().unwrap().items;
+        let retained = previous.clone();
+        // Descending iteration first reuses the newer item, then encounters
+        // malformed older metadata. No partial result may consume residents.
+        store
+            .db
+            .execute(
+                "UPDATE items SET metadata=?1 WHERE id='older'",
+                [vec![0xff_u8]],
+            )
+            .unwrap();
+        assert!(store.window_reusing(&mut previous).is_err());
+        assert_eq!(retained.len(), previous.len());
+        for (before, after) in retained.iter().zip(&previous) {
+            assert!(std::sync::Arc::ptr_eq(before, after));
+        }
+    }
+
     fn history_item(id: &str, body: &str) -> Item {
         Item {
             id: id.into(),
