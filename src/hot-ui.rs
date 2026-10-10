@@ -4,8 +4,10 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("The experimental hot-reload runner supports Linux only");
 
+extern crate cagents as app_support;
+use app_support::runtime_state;
 extern crate self as cagents;
-include!("lib.rs");
+include!("modules.rs");
 #[path = "bin/cagents-ui.rs"]
 mod ui_entry;
 

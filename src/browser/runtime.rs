@@ -77,14 +77,8 @@ pub(crate) struct Registration {
 static ENGINE: Mutex<Option<(u64, Sender<Registration>)>> = Mutex::new(None);
 static ENGINE_GENERATIONS: AtomicU64 = AtomicU64::new(1);
 
-thread_local! {
-    /// Lets `BrowserHandle::shutdown` refuse to wait on itself, the way the
-    /// per-card model refused to join its own thread.
-    static IS_ENGINE_THREAD: Cell<bool> = const { Cell::new(false) };
-}
-
 pub(crate) fn on_engine_thread() -> bool {
-    IS_ENGINE_THREAD.with(Cell::get)
+    crate::runtime_state::on_browser_engine_thread()
 }
 
 /// Hands a card to the shared engine thread, starting that thread if no engine
@@ -209,7 +203,7 @@ impl Drop for Engine {
 
 impl Engine {
     fn run(generation: u64, registrations: Receiver<Registration>) {
-        IS_ENGINE_THREAD.with(|flag| flag.set(true));
+        crate::runtime_state::enter_browser_engine_thread();
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         let mut engine = Engine {
             generation,

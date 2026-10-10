@@ -139,7 +139,15 @@ The opt-in lane uses the same application modules and startup entry in a separat
 `cagents-ui-hot` binary. This matters because cargo-hot patches its selected
 binary only: the normal UI's views live in the separate `cagents` library. Its
 source watcher covers `src/`, including those actual views, without maintaining
-another module list. Normal and release defaults do not enable `hot-reload`.
+another module list: both roots include `src/modules.rs`. Normal and release
+defaults do not enable `hot-reload`.
+
+Thread-local storage for panic recovery, the inspector Markdown cache and browser
+engine ownership stays in the ordinary library's `src/runtime_state.rs`. Concrete,
+non-inlined accessors keep executable TLS relocations out of shared hot patches,
+while retaining one storage identity across patches. Application types stay in
+their selected root; the cache crosses only dependency-owned Markdown item types.
+This uses the stable compiler without TLS model flags or bootstrap overrides.
 
 Install the pinned external tool explicitly if you choose this lane; the runner
 never installs tools. Bubblewrap and Python3 must already be available on Linux.
@@ -172,7 +180,8 @@ intentional dependency change through ordinary locked-development maintenance
 and restart; no hash-only lock guard or automatic fallback is used.
 
 Change view/handler **bodies** only while patching. Changes to State/Message
-layout, dependencies, startup, features/profiles, daemon or terminal protocol
+layout, module declarations, runtime-state storage/accessors, dependencies, startup,
+features/profiles, daemon or terminal protocol
 need a cold restart with the normal runner (and `--fresh-daemon` for host/shared
 changes). A watched source change is not proof that it was safely patched.
 `--hot --fresh-daemon` intent is consumed by the hot entry only after cargo-hot
