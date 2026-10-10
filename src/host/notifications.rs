@@ -90,8 +90,15 @@ impl Registration {
 }
 
 #[derive(Default)]
+struct InboxAttention {
+    pending: BTreeSet<crate::agent_execution::Lineage>,
+    events: BTreeMap<Target, Event>,
+}
+
+#[derive(Default)]
 struct Pending {
     events: BTreeMap<Target, Event>,
+    inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
     presence_changed: bool,
@@ -138,6 +145,27 @@ impl Handle {
             if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
                 pending.events.insert(event.target(), event);
             }
+        });
+    }
+
+    pub(in crate::host) fn reconcile_inboxes(
+        &self,
+        pending_lineages: BTreeSet<crate::agent_execution::Lineage>,
+        events: Vec<Event>,
+    ) {
+        let events = events
+            .into_iter()
+            .filter(|event| {
+                matches!(event.target, Target::SessionInbox(_)) && event.validate().is_ok()
+            })
+            .take(MAX_PENDING)
+            .map(|event| (event.target(), event))
+            .collect();
+        self.change(|pending| {
+            pending.inboxes = Some(InboxAttention {
+                pending: pending_lineages,
+                events,
+            })
         });
     }
 
@@ -742,6 +770,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inbox_reconciliation_coalesces_independently_from_lifecycle_attention() {
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let session = TerminalId::new();
+        let lineage = crate::agent_execution::Lineage(session);
+        let inbox = Event {
+            target: Target::SessionInbox(lineage),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: crate::model::MessageId::new().to_string(),
+                kind: crate::notifications::Kind::MessageReceived,
+            },
+        };
+        let lifecycle = Event::session(
+            session,
+            crate::agent::Provider::Claude,
+            "/repo".into(),
+            crate::notifications::Evidence {
+                key: "finished".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        );
+        handle.record(lifecycle.clone());
+        handle.reconcile_inboxes(BTreeSet::from([lineage]), vec![inbox.clone()]);
+        handle.reconcile_inboxes(BTreeSet::from([lineage]), vec![]);
+        let pending = shared.pending.lock().unwrap();
+        assert_eq!(pending.events[&Target::Session(session)], lifecycle);
+        assert_eq!(
+            pending.inboxes.as_ref().unwrap().pending,
+            BTreeSet::from([lineage])
+        );
+        assert!(pending.inboxes.as_ref().unwrap().events.is_empty());
+        drop(pending);
+        // A newer batch wins, including a fully drained authoritative inbox.
+        handle.reconcile_inboxes(BTreeSet::new(), vec![]);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap()
+                .inboxes
+                .as_ref()
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn notification_panic_publishes_failure_preserves_attention_and_releases_requesters() {
         let (wake, _receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
@@ -1146,7 +1226,8 @@ async fn run(
         let Some(core) = shared.upgrade() else {
             break;
         };
-        let pending = std::mem::take(&mut *core.pending.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut pending =
+            std::mem::take(&mut *core.pending.lock().unwrap_or_else(|p| p.into_inner()));
         let current_presence = pending.presence_changed.then(|| {
             core.presence
                 .lock()
@@ -1222,6 +1303,23 @@ async fn run(
             next_attempt = Instant::now();
             retry_delay = RETRY_DELAY;
         }
+        if let Some(inboxes) = pending.inboxes.take() {
+            // A complete durable pending snapshot retires inbox attention only
+            // when mail is gone; offline recipients keep existing attention.
+            match journal.list() {
+                Ok(notices) => {
+                    for notice in notices {
+                        if let Target::SessionInbox(lineage) = notice.event.target
+                            && !inboxes.pending.contains(&lineage)
+                        {
+                            pending.retired.insert(Target::SessionInbox(lineage));
+                        }
+                    }
+                }
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+            pending.events.extend(inboxes.events);
+        }
         for session in pending.retired {
             if stopped(&shared) {
                 return;
@@ -1280,6 +1378,15 @@ async fn run(
         match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
+        }
+        for notice in delivery.values_mut() {
+            if let Some(current) = snapshot
+                .notices
+                .iter()
+                .find(|current| current.id == notice.id)
+            {
+                *notice = current.clone();
+            }
         }
         // Journal eviction also bounds retries across multiple disconnected
         // batches. Never announce an event whose durable identity was evicted.

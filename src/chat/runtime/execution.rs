@@ -170,7 +170,7 @@ impl Tracker {
             Kind::Succeeded => State::Succeeded,
             Kind::Failed => State::Failed,
             Kind::Cancelled => State::Cancelled,
-            Kind::Waiting | Kind::Interrupted | Kind::ReviewRequested => {
+            Kind::Waiting | Kind::Interrupted | Kind::ReviewRequested | Kind::MessageReceived => {
                 return Err("Attention is not a confirmed provider outcome".into());
             }
         };
@@ -273,5 +273,22 @@ mod tests {
         };
         assert_eq!(result.text, "Next answer");
         assert_eq!(result.usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn inbox_attention_cannot_consume_a_settled_provider_result() {
+        let mut tracker = Tracker::default();
+        let run = RunId::new();
+        tracker.start(run, "provider-request".into()).unwrap();
+        tracker.observe(run, &text("message", "Completed answer"));
+        tracker.settle(run, Usage::default()).unwrap();
+
+        assert!(tracker.finish(run, Kind::MessageReceived).is_err());
+        let Update::Finished { state, result } = tracker.finish(run, Kind::Succeeded).unwrap()
+        else {
+            panic!("expected result")
+        };
+        assert_eq!(state, State::Succeeded);
+        assert_eq!(result.text, "Completed answer");
     }
 }

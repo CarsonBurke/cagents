@@ -58,6 +58,33 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     tx.commit().map_err(|error| error.to_string())
 }
 
+/// Eligible arrival heads are notification evidence, not read receipts.
+/// Normal posts advance atomically; held replies are admitted only while
+/// still pending after release. Partial reads never manufacture an arrival.
+pub(super) fn migrate_attention(db: &Connection) -> Result<(), String> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mailbox_attention_heads(
+        lineage TEXT PRIMARY KEY, message TEXT NOT NULL
+    ) STRICT;
+    INSERT OR IGNORE INTO mailbox_attention_heads(lineage,message)
+        SELECT recipient_lineage,id FROM messages WHERE rowid IN (
+            SELECT MAX(m.rowid) FROM messages m LEFT JOIN messages asked ON asked.id=m.reply_to
+            WHERE m.recipient_lineage IS NOT NULL
+              AND (m.reply_to IS NULL
+                   OR (asked.id IS NOT NULL AND (asked.wait_until_ms IS NULL
+                       OR asked.wait_until_ms <= m.created_ms
+                       OR (m.state != 'pending' AND m.settled_ms >= asked.wait_until_ms)))
+                   OR (asked.id IS NULL AND m.state='pending'))
+            GROUP BY m.recipient_lineage
+        );
+    PRAGMA user_version=12;",
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 /// A lineage column; NULL stands for the user.
 struct Recipient(Option<Lineage>);
 
@@ -237,7 +264,84 @@ impl Registry {
             ],
         )
         .map_err(|error| error.to_string())?;
+        if let Some(lineage) = message.to.lineage {
+            tx.execute(
+                "INSERT INTO mailbox_attention_heads(lineage,message)
+                SELECT ?1,?2 WHERE NOT EXISTS(SELECT 1 FROM messages asked
+                    WHERE asked.id=?3 AND asked.wait_until_ms > ?4)
+                ON CONFLICT(lineage) DO UPDATE SET message=excluded.message",
+                params![
+                    lineage.to_string(),
+                    message.id.to_string(),
+                    message.reply_to.map(|id| id.to_string()),
+                    message.created_ms as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Actual unread recipients, including temporarily held replies. This
+    /// controls retirement independently from arrival eligibility.
+    pub(crate) fn pending_message_lineages(
+        &self,
+    ) -> Result<std::collections::BTreeSet<Lineage>, String> {
+        let mut query = self.db.prepare_cached("SELECT DISTINCT recipient_lineage FROM messages WHERE state='pending' AND recipient_lineage IS NOT NULL").map_err(|e| e.to_string())?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .map(|row| {
+                Ok(Lineage(
+                    row.map_err(|e| e.to_string())?
+                        .parse()
+                        .map_err(|e: uuid::Error| e.to_string())?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Admit newly eligible pending arrivals under the caller's existing
+    /// registry lock. A reply read during its hold is never admitted later.
+    /// Newer ordinary arrival heads cover older held replies on release.
+    pub(crate) fn reconcile_message_attention(
+        &mut self,
+        now: u64,
+    ) -> Result<std::collections::BTreeMap<Lineage, MessageId>, String> {
+        self.db
+            .execute(
+                "INSERT INTO mailbox_attention_heads(lineage,message)
+            SELECT recipient_lineage,id FROM messages WHERE rowid IN (
+                SELECT MAX(p.rowid) FROM messages p LEFT JOIN messages asked ON asked.id=p.reply_to
+                WHERE p.recipient_lineage IS NOT NULL AND p.state='pending'
+                  AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
+                GROUP BY p.recipient_lineage
+            )
+            ON CONFLICT(lineage) DO UPDATE SET message=excluded.message
+            WHERE (SELECT rowid FROM messages WHERE id=excluded.message) >
+                COALESCE((SELECT rowid FROM messages WHERE id=mailbox_attention_heads.message),0)",
+                [now as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        let mut query = self.db.prepare_cached("SELECT h.lineage,h.message FROM mailbox_attention_heads h
+            WHERE EXISTS(SELECT 1 FROM messages pending LEFT JOIN messages asked ON asked.id=pending.reply_to
+                WHERE pending.recipient_lineage=h.lineage AND pending.state='pending'
+                  AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1))").map_err(|e| e.to_string())?;
+        query
+            .query_map([now as i64], |row| {
+                let lineage: String = row.get(0)?;
+                let message: String = row.get(1)?;
+                Ok((lineage, message))
+            })
+            .map_err(|e| e.to_string())?
+            .map(|row| {
+                let (lineage, message) = row.map_err(|e| e.to_string())?;
+                Ok((
+                    Lineage(lineage.parse().map_err(|e: uuid::Error| e.to_string())?),
+                    message.parse().map_err(|e: uuid::Error| e.to_string())?,
+                ))
+            })
+            .collect()
     }
 
     /// The message `recipient` received whose ID begins with `handle`.
@@ -428,12 +532,20 @@ impl Registry {
 
     /// Forgets messages sent before `before`, whatever became of them.
     pub(crate) fn prune_messages(&mut self, before: u64) -> Result<usize, String> {
-        self.db
+        let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        let removed = tx
             .execute(
                 "DELETE FROM messages WHERE created_ms < ?1",
                 [before as i64],
             )
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())?;
+        tx.execute_batch(
+            "DELETE FROM mailbox_attention_heads WHERE NOT EXISTS(
+                SELECT 1 FROM messages WHERE id=mailbox_attention_heads.message);",
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(removed)
     }
 
     #[cfg(test)]
@@ -512,6 +624,299 @@ mod tests {
             },
         };
         crate::terminal::ipc::write_frame(&mut Vec::new(), &envelope).unwrap();
+    }
+
+    #[test]
+    fn pruning_an_eligible_head_cannot_promote_a_prematurely_read_held_reply() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let retained = message(Party::user(), party(recipient), 1000);
+        let expired_head = message(Party::user(), party(recipient), 1);
+        registry.post_message(&retained).unwrap();
+        registry.post_message(&expired_head).unwrap();
+        let mut ask = message(party(recipient), party(other), 3);
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(recipient), 4);
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        registry
+            .acknowledge_messages(Some(recipient), None, &Receipt { ids: vec![held.id] }, 50)
+            .unwrap();
+        registry.prune_messages(2).unwrap();
+        for now in [50, 100] {
+            assert_eq!(
+                registry.reconcile_message_attention(now).unwrap()[&recipient],
+                retained.id
+            );
+        }
+    }
+
+    #[test]
+    fn migration_keeps_eligible_head_instead_of_a_prematurely_read_held_reply() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let older = message(Party::user(), party(recipient), 1);
+        registry.post_message(&older).unwrap();
+        let mut ask = message(party(recipient), party(other), 2);
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(recipient), 3);
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        registry
+            .acknowledge_messages(Some(recipient), None, &Receipt { ids: vec![held.id] }, 50)
+            .unwrap();
+        registry
+            .db
+            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .unwrap();
+        migrate_attention(&registry.db).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            older.id
+        );
+        // A legacy store may already have expired the original ask. Missing
+        // eligibility proof cannot promote an already-settled reply.
+        registry
+            .db
+            .execute("DELETE FROM messages WHERE id=?1", [ask.id.to_string()])
+            .unwrap();
+        registry
+            .db
+            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .unwrap();
+        migrate_attention(&registry.db).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            older.id
+        );
+    }
+
+    #[test]
+    fn read_arrival_head_cannot_make_a_remaining_held_reply_alert_eligible() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let mut ask = message(party(recipient), party(other), 1);
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(recipient), 2);
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        let ordinary = message(Party::user(), party(recipient), 3);
+        registry.post_message(&ordinary).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(50).unwrap()[&recipient],
+            ordinary.id
+        );
+        registry
+            .acknowledge_messages(
+                Some(recipient),
+                None,
+                &Receipt {
+                    ids: vec![ordinary.id],
+                },
+                50,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .pending_message_lineages()
+                .unwrap()
+                .contains(&recipient)
+        );
+        assert!(
+            !registry
+                .reconcile_message_attention(50)
+                .unwrap()
+                .contains_key(&recipient)
+        );
+        // Release preserves the durable arrival head rather than inventing
+        // a new identity merely because a subset was read.
+        assert_eq!(
+            registry.reconcile_message_attention(100).unwrap()[&recipient],
+            ordinary.id
+        );
+    }
+
+    #[test]
+    fn expired_mail_retires_attention_and_pruned_heads_remain_valid() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let retained = message(Party::user(), party(recipient), 100);
+        let expired_head = message(Party::user(), party(recipient), 1);
+        registry.post_message(&retained).unwrap();
+        registry.post_message(&expired_head).unwrap();
+        assert_eq!(registry.prune_messages(50).unwrap(), 1);
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            retained.id
+        );
+        assert_eq!(registry.prune_messages(101).unwrap(), 1);
+        assert!(registry.pending_message_lineages().unwrap().is_empty());
+        assert!(
+            registry
+                .reconcile_message_attention(200)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn attention_arrivals_survive_partial_reads_restart_and_clock_reversal() {
+        let (mut registry, directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let first = message(Party::user(), party(recipient), 100);
+        let second = message(Party::user(), party(recipient), 50);
+        registry.post_message(&first).unwrap();
+        registry.post_message(&second).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            second.id
+        );
+        registry
+            .acknowledge_messages(
+                Some(recipient),
+                Some(recipient.0),
+                &Receipt {
+                    ids: vec![second.id],
+                },
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            second.id
+        );
+        assert_eq!(
+            registry
+                .peek_messages(
+                    Some(recipient),
+                    &Inbox {
+                        all: false,
+                        replies_to: None
+                    }
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(300).unwrap()[&recipient],
+            second.id
+        );
+        registry
+            .acknowledge_messages(
+                Some(recipient),
+                None,
+                &Receipt {
+                    ids: vec![first.id],
+                },
+                300,
+            )
+            .unwrap();
+        assert!(registry.pending_message_lineages().unwrap().is_empty());
+        assert!(
+            registry
+                .reconcile_message_attention(300)
+                .unwrap()
+                .is_empty()
+        );
+        let third = message(Party::user(), party(recipient), 10);
+        registry.post_message(&third).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(300).unwrap()[&recipient],
+            third.id
+        );
+    }
+
+    #[test]
+    fn held_reply_keeps_pending_identity_without_hiding_older_available_mail() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let older = message(Party::user(), party(recipient), 1);
+        registry.post_message(&older).unwrap();
+        let mut ask = message(party(recipient), party(other), 2);
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut reply = message(party(other), party(recipient), 3);
+        reply.reply_to = Some(ask.id);
+        registry.post_message(&reply).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(50).unwrap()[&recipient],
+            older.id
+        );
+        registry
+            .acknowledge_messages(
+                Some(recipient),
+                None,
+                &Receipt {
+                    ids: vec![older.id],
+                },
+                50,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .pending_message_lineages()
+                .unwrap()
+                .contains(&recipient)
+        );
+        assert!(
+            !registry
+                .reconcile_message_attention(50)
+                .unwrap()
+                .contains_key(&recipient)
+        );
+        assert_eq!(
+            registry.reconcile_message_attention(100).unwrap()[&recipient],
+            reply.id
+        );
+    }
+
+    #[test]
+    fn attention_migration_uses_arrival_order_and_post_rollback_keeps_head() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let first = message(Party::user(), party(recipient), 100);
+        let last = message(Party::user(), party(recipient), 1);
+        registry.post_message(&first).unwrap();
+        registry.post_message(&last).unwrap();
+        registry
+            .db
+            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .unwrap();
+        migrate_attention(&registry.db).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            last.id
+        );
+        registry.db.execute_batch("CREATE TRIGGER reject_head BEFORE UPDATE ON mailbox_attention_heads BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        let failed = message(Party::user(), party(recipient), 200);
+        assert!(registry.post_message(&failed).is_err());
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&recipient],
+            last.id
+        );
+        assert_eq!(
+            registry
+                .peek_messages(
+                    Some(recipient),
+                    &Inbox {
+                        all: false,
+                        replies_to: None
+                    }
+                )
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

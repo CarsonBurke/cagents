@@ -121,6 +121,25 @@ impl Journal {
                     .get_result::<i64>(connection)
                     .optional()?;
                 let Some(ordinal) = ordinal else {
+                    if matches!(event.target, Target::SessionInbox(_)) {
+                        // Same arrival, potentially a successor terminal. Keep
+                        // notice identity/dismissal/delivery; refresh routing
+                        // metadata without publishing the backlog again.
+                        diesel::update(notices::table.find(&session))
+                            .set(notices::event.eq(&serialized))
+                            .execute(connection)?;
+                        if let Some(source) = event.source_session() {
+                            if let Some(window) = owners::table
+                                .find(source.to_string())
+                                .select(owners::window)
+                                .first::<String>(connection)
+                                .optional()?
+                            {
+                                remember_owner(connection, &session, &window)?;
+                            }
+                        }
+                        return Ok(None);
+                    }
                     return Err(diesel::result::Error::RollbackTransaction);
                 };
                 let owner = event
@@ -324,6 +343,242 @@ mod tests {
             .values(rows)
             .execute(&mut journal.0)
             .unwrap();
+    }
+
+    fn inbox_event(
+        lineage: crate::agent_execution::Lineage,
+        session: TerminalId,
+        message: crate::model::MessageId,
+    ) -> Event {
+        Event {
+            target: Target::SessionInbox(lineage),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: message.to_string(),
+                kind: Kind::MessageReceived,
+            },
+        }
+    }
+
+    #[test]
+    fn a_reply_read_during_its_hold_never_replaces_dismissed_older_attention() {
+        use crate::agent_execution::{
+            Lineage,
+            mailbox::{Message, Party, Receipt, State},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let lineage = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let party = |lineage: Lineage| Party {
+            lineage: Some(lineage),
+            session: Some(lineage.0),
+            title: None,
+        };
+        let message = |from, to, created_ms| Message {
+            id: crate::model::MessageId::new(),
+            from,
+            to,
+            reply_to: None,
+            body: "private message".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms,
+        };
+        let older = message(Party::user(), party(lineage), 1000);
+        registry.post_message(&older).unwrap();
+        let notice = journal
+            .record(
+                inbox_event(
+                    lineage,
+                    lineage.0,
+                    registry.reconcile_message_attention(50).unwrap()[&lineage],
+                ),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        let mut ask = message(party(lineage), party(other), 1);
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(lineage), 3);
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        // The real ask path peeks replies and acknowledges a receipt during
+        // their hold, independently of the older unread inbox message.
+        registry
+            .acknowledge_messages(Some(lineage), None, &Receipt { ids: vec![held.id] }, 50)
+            .unwrap();
+        for now in [50, 100] {
+            let head = registry.reconcile_message_attention(now).unwrap()[&lineage];
+            assert_eq!(head, older.id);
+            assert!(
+                journal
+                    .record(inbox_event(lineage, lineage.0, head), false)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // Expiring the original ask cannot turn its already-read reply into
+        // an arrival either; the eligible head remains durable.
+        registry.prune_messages(2).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&lineage],
+            older.id
+        );
+        let current = journal.list().unwrap().pop().unwrap();
+        assert_eq!(current.id, notice.id);
+        assert!(current.acknowledged && current.delivered);
+    }
+
+    #[test]
+    fn held_reply_release_does_not_reannounce_a_dismissed_later_arrival() {
+        use crate::agent_execution::{
+            Lineage,
+            mailbox::{Message, Party, Receipt, State},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let lineage = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let party = |lineage: Lineage| Party {
+            lineage: Some(lineage),
+            session: Some(lineage.0),
+            title: None,
+        };
+        let message = |from, to| Message {
+            id: crate::model::MessageId::new(),
+            from,
+            to,
+            reply_to: None,
+            body: "private message".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: 1,
+        };
+        let mut ask = message(party(lineage), party(other));
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(lineage));
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        assert!(
+            !registry
+                .reconcile_message_attention(50)
+                .unwrap()
+                .contains_key(&lineage)
+        );
+        let ordinary = message(Party::user(), party(lineage));
+        registry.post_message(&ordinary).unwrap();
+        let notice = journal
+            .record(
+                inbox_event(
+                    lineage,
+                    lineage.0,
+                    registry.reconcile_message_attention(50).unwrap()[&lineage],
+                ),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        // Dismissing the alert does not acknowledge either message.
+        assert!(
+            registry
+                .pending_message_lineages()
+                .unwrap()
+                .contains(&lineage)
+        );
+        registry
+            .acknowledge_messages(
+                Some(lineage),
+                None,
+                &Receipt {
+                    ids: vec![ordinary.id],
+                },
+                50,
+            )
+            .unwrap();
+        assert!(
+            !registry
+                .reconcile_message_attention(50)
+                .unwrap()
+                .contains_key(&lineage)
+        );
+        assert!(
+            journal
+                .record(
+                    inbox_event(
+                        lineage,
+                        lineage.0,
+                        registry.reconcile_message_attention(100).unwrap()[&lineage]
+                    ),
+                    false
+                )
+                .unwrap()
+                .is_none()
+        );
+        let current = journal.list().unwrap().pop().unwrap();
+        assert_eq!(current.id, notice.id);
+        assert!(current.acknowledged && current.delivered);
+    }
+
+    #[test]
+    fn inbox_dismissal_survives_restart_and_successor_but_new_arrival_reactivates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let lineage = crate::agent_execution::Lineage(session);
+        let message = crate::model::MessageId::new();
+        let original = journal
+            .record(inbox_event(lineage, session, message), false)
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(original.id).unwrap();
+        let lifecycle = journal
+            .record(event(session, "finished"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        let successor = TerminalId::new();
+        journal.remember_window([successor], "successor").unwrap();
+        assert!(
+            journal
+                .record(inbox_event(lineage, successor, message), false)
+                .unwrap()
+                .is_none()
+        );
+        let inbox = journal
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|notice| notice.event.target == Target::SessionInbox(lineage))
+            .unwrap();
+        assert_eq!(inbox.id, original.id);
+        assert!(inbox.acknowledged && inbox.delivered);
+        assert_eq!(inbox.event.source_session(), Some(successor));
+        assert_eq!(inbox.window.as_deref(), Some("successor"));
+        let next = journal
+            .record(
+                inbox_event(lineage, successor, crate::model::MessageId::new()),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, original.id);
+        assert!(!next.acknowledged && !next.delivered);
+        journal.retire(Target::SessionInbox(lineage)).unwrap();
+        assert_eq!(journal.list().unwrap()[0].id, lifecycle.id);
     }
 
     #[test]

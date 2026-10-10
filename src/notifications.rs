@@ -21,6 +21,8 @@ pub enum Target {
     Session(TerminalId),
     PullRequest(review::ReviewRequest),
     AgentRun(RunId),
+    /// Pending terminal mailbox attention survives recipient process replacement.
+    SessionInbox(crate::agent_execution::Lineage),
 }
 
 impl Target {
@@ -29,6 +31,7 @@ impl Target {
             Self::Session(id) => id.to_string(),
             Self::PullRequest(request) => request.storage_key(),
             Self::AgentRun(id) => format!("run:{id}"),
+            Self::SessionInbox(lineage) => format!("inbox:{lineage}"),
         }
     }
 }
@@ -63,6 +66,7 @@ pub enum Kind {
     Waiting,
     ReviewRequested,
     Interrupted,
+    MessageReceived,
 }
 
 impl Kind {
@@ -74,6 +78,7 @@ impl Kind {
             Self::Waiting => "Agent needs your attention",
             Self::ReviewRequested => "Your review was requested",
             Self::Interrupted => "Agent outcome unknown",
+            Self::MessageReceived => "Session messages waiting",
         }
     }
 }
@@ -125,6 +130,23 @@ impl Event {
         }
         if let Some(destination) = &self.destination {
             destination.validate()?;
+        }
+        if matches!(self.target, Target::SessionInbox(_)) {
+            if self.evidence.kind != Kind::MessageReceived
+                || self.source_session.is_none()
+                || self.provider.is_some()
+                || self.directory.is_some()
+                || self.destination.is_some()
+                || self
+                    .evidence
+                    .key
+                    .parse::<crate::model::MessageId>()
+                    .is_err()
+            {
+                return Err("Inbox alerts require a live terminal and a durable arrival identity without content metadata".into());
+            }
+        } else if self.evidence.kind == Kind::MessageReceived {
+            return Err("Message alerts require a session inbox target".into());
         }
         if let Target::PullRequest(request) = &self.target {
             request.validate()?;
@@ -322,7 +344,7 @@ impl Preferences {
             && match kind {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
-                Kind::Waiting | Kind::Interrupted => self.waiting,
+                Kind::Waiting | Kind::Interrupted | Kind::MessageReceived => self.waiting,
                 Kind::ReviewRequested => self.review_requests,
             }
     }
@@ -330,6 +352,9 @@ impl Preferences {
 
 /// Only bounded, non-content context may cross into desktop notifications.
 pub fn context(event: &Event) -> String {
+    if matches!(event.target, Target::SessionInbox(_)) {
+        return "Open the terminal and run cagents inbox to read messages.".into();
+    }
     if let Target::PullRequest(request) = &event.target {
         return format!(
             "{}/{} #{}",
@@ -357,6 +382,42 @@ pub fn context(event: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbox_attention_is_distinct_fixed_and_compatible_with_waiting_preferences() {
+        let session = TerminalId::new();
+        let event = Event {
+            target: Target::SessionInbox(crate::agent_execution::Lineage(session)),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: crate::model::MessageId::new().to_string(),
+                kind: Kind::MessageReceived,
+            },
+        };
+        event.validate().unwrap();
+        assert_ne!(
+            event.target.storage_key(),
+            Target::Session(session).storage_key()
+        );
+        assert_eq!(
+            context(&event),
+            "Open the terminal and run cagents inbox to read messages."
+        );
+        assert_eq!(
+            serde_json::from_str::<Event>(&serde_json::to_string(&event).unwrap()).unwrap(),
+            event
+        );
+        let mut unsafe_event = event.clone();
+        unsafe_event.directory = Some("/private/message-content".into());
+        assert!(unsafe_event.validate().is_err());
+        let mut preferences = Preferences::default();
+        preferences.enabled = true;
+        preferences.waiting = false;
+        assert!(!preferences.allows(Kind::MessageReceived, false));
+    }
 
     #[test]
     fn legacy_session_journal_and_typed_wire_have_one_target() {

@@ -151,7 +151,12 @@ pub(in crate::host) fn inbox(
                 .map(|lineage| lineage.unwrap_or(Lineage(session)))
         })
         .transpose()?;
-    registry.read_messages(lineage, session, &query, super::now())
+    let result = registry.read_messages(lineage, session, &query, super::now());
+    drop(registry);
+    if result.is_ok() {
+        wake(host);
+    }
+    result
 }
 
 pub(in crate::host) fn peek(
@@ -196,7 +201,56 @@ pub(in crate::host) fn acknowledge(
                 .map(|lineage| lineage.unwrap_or(Lineage(session)))
         })
         .transpose()?;
-    registry.acknowledge_messages(lineage, session, &receipt, super::now())
+    let result = registry.acknowledge_messages(lineage, session, &receipt, super::now());
+    drop(registry);
+    if result.is_ok() {
+        wake(host);
+    }
+    result
+}
+
+/// Only an unambiguous currently live provider terminal gets a new alert.
+/// Offline lineages retain prior attention, and chats keep the courier path.
+fn terminal_attention(
+    heads: &std::collections::BTreeMap<Lineage, MessageId>,
+    live: &[(
+        TerminalId,
+        crate::agent_execution::directory::Surface,
+        Option<crate::agent::Provider>,
+    )],
+    lineages: &std::collections::BTreeMap<TerminalId, Lineage>,
+) -> Vec<crate::notifications::Event> {
+    use crate::notifications::{Event, Evidence, Kind, Target};
+    // Work scales with currently hosted sessions, not every retained offline
+    // recipient. Any second live member makes a lineage ambiguous.
+    let mut recipients = std::collections::BTreeMap::new();
+    for (id, surface, provider) in live {
+        let candidate = (*surface == crate::agent_execution::directory::Surface::Terminal
+            && provider.is_some())
+        .then_some(*id);
+        recipients
+            .entry(lineages.get(id).copied().unwrap_or(Lineage(*id)))
+            .and_modify(|owner| *owner = None)
+            .or_insert(candidate);
+    }
+    recipients
+        .into_iter()
+        .filter_map(|(lineage, owner)| {
+            let id = owner?;
+            let message = heads.get(&lineage)?;
+            Some(Event {
+                target: Target::SessionInbox(lineage),
+                source_session: Some(id),
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: Evidence {
+                    key: message.to_string(),
+                    kind: Kind::MessageReceived,
+                },
+            })
+        })
+        .collect()
 }
 
 /// The one lineage `handle` names among live agent sessions: by session ID,
@@ -427,12 +481,31 @@ impl Handle {
     /// Gives each lineage with a live, idle conversation its oldest waiting
     /// message. Returns when the next held reply is released.
     fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
-        let (pending, released) = self
-            .0
-            .registry
+        let live = directory::live_sessions(host);
+        let (pending, released, heads, pending_lineages, lineages) = {
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            let (pending, released) = registry.deliverable_messages(super::now())?;
+            let heads = registry.reconcile_message_attention(super::now())?;
+            let pending_lineages = registry.pending_message_lineages()?;
+            let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
+            (pending, released, heads, pending_lineages, lineages)
+        };
+        let notifications = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .deliverable_messages(super::now())?;
+            .notifications
+            .clone();
+        if let Some(notifications) = notifications {
+            let events = terminal_attention(
+                &heads,
+                &live
+                    .iter()
+                    .map(|entry| (entry.id, entry.surface, entry.provider))
+                    .collect::<Vec<_>>(),
+                &lineages,
+            );
+            notifications.reconcile_inboxes(pending_lineages, events);
+        }
         if pending.is_empty() {
             return Ok(released);
         }
@@ -523,6 +596,50 @@ impl Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_attention_requires_a_unique_live_provider_and_tracks_successor() {
+        use crate::{agent::Provider, agent_execution::directory::Surface};
+        let original = TerminalId::new();
+        let successor = TerminalId::new();
+        let lineage = Lineage(original);
+        let heads = std::collections::BTreeMap::from([(lineage, MessageId::new())]);
+        let lineages =
+            std::collections::BTreeMap::from([(successor, lineage), (original, lineage)]);
+        let terminal = (successor, Surface::Terminal, Some(Provider::Claude));
+        let events = terminal_attention(&heads, &[terminal], &lineages);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_session(), Some(successor));
+        assert_eq!(
+            events[0].target,
+            crate::notifications::Target::SessionInbox(lineage)
+        );
+        assert!(events[0].validate().is_ok());
+        assert!(terminal_attention(&heads, &[], &lineages).is_empty());
+        assert!(
+            terminal_attention(
+                &heads,
+                &[(successor, Surface::Chat, Some(Provider::Claude))],
+                &lineages
+            )
+            .is_empty()
+        );
+        assert!(
+            terminal_attention(&heads, &[(successor, Surface::Terminal, None)], &lineages)
+                .is_empty()
+        );
+        assert!(
+            terminal_attention(
+                &heads,
+                &[
+                    terminal,
+                    (original, Surface::Terminal, Some(Provider::Claude))
+                ],
+                &lineages
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn courier_survives_prune_and_delivery_panics_and_stops() {
