@@ -168,9 +168,16 @@ check_archive() {
     local root=$product-$VERSION file parent expected actual mode owner size date time name rest
     local -a files directories executables
     if [[ $product == ceditor ]]; then
-        files=(bin/ceditor "share/applications/$desktop.desktop"
+        files=(bin/ceditor lib/ceditor/current
+            "lib/ceditor/releases/$VERSION/bin/ceditor"
+            "lib/ceditor/releases/$VERSION/bin/cagents"
+            "lib/ceditor/releases/$VERSION/bin/cagentsd"
+            "lib/ceditor/releases/$VERSION/bin/.ceditor-companions"
+            "share/applications/$desktop.desktop"
             "share/icons/hicolor/scalable/apps/$desktop.svg" share/doc/ceditor/LICENSE)
-        executables=(bin/ceditor)
+        executables=("lib/ceditor/releases/$VERSION/bin/ceditor"
+            "lib/ceditor/releases/$VERSION/bin/cagents"
+            "lib/ceditor/releases/$VERSION/bin/cagentsd")
     else
         files=(bin/cagents bin/cagents-ui bin/cagentsd bin/.cagents-ui-lease-v1
             "share/applications/$desktop.desktop" "share/autostart/$desktop.Daemon.desktop"
@@ -203,6 +210,18 @@ check_archive() {
     while read -r mode owner size date time name rest; do
         case $name in
             */) [[ $mode == d* && -z $rest ]] || fail "invalid directory member in $archive" ;;
+            "$root/bin/ceditor")
+                [[ $product == ceditor && $mode == l* && $rest == '-> ../lib/ceditor/current/bin/ceditor' ]] \
+                    || fail "invalid editor public link in $archive"
+                ;;
+            "$root/lib/ceditor/current")
+                [[ $product == ceditor && $mode == l* && $rest == "-> releases/$VERSION" ]] \
+                    || fail "invalid editor release link in $archive"
+                ;;
+            "$root/lib/ceditor/releases/$VERSION/bin/.ceditor-companions")
+                [[ $product == ceditor && $mode == -rw-r--r-- && $size == 22 && -z $rest ]] \
+                    || fail "invalid editor companion marker in $archive"
+                ;;
             "$root/bin/cagents-browserless")
                 [[ $product == cagents-browserless && $mode == l* && $rest == '-> cagents' ]] \
                     || fail "invalid browserless alias in $archive"
@@ -218,6 +237,11 @@ check_archive() {
             fi
         done
     done < "$WORK_DIR/archive-types"
+    if [[ $product == ceditor ]]; then
+        tar -xOzf "$directory/$archive" "$root/lib/ceditor/releases/$VERSION/bin/.ceditor-companions" \
+            | cmp - <(printf 'ceditor companions v1\n') \
+            || fail "wrong editor companion marker in $archive"
+    fi
 }
 
 check_asset_set "$DIST_DIR"

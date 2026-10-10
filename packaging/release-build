@@ -246,7 +246,10 @@ grep -Fqx 'Exec=ceditor %F' "$editor_root/share/applications/$desktop.desktop"
 grep -Fqx "Icon=$desktop" "$editor_root/share/applications/$desktop.desktop"
 grep -Fqx "StartupWMClass=$desktop" "$editor_root/share/applications/$desktop.desktop"
 [[ -x $editor_root/bin/ceditor && -s $editor_root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
-check_glibc "$editor_root/bin/ceditor"
+for binary in ceditor cagents cagentsd; do
+    check_glibc "$editor_root/lib/ceditor/releases/$VERSION/bin/$binary"
+    [[ $("$editor_root/lib/ceditor/releases/$VERSION/bin/$binary" --version) == "$binary $VERSION" ]]
+done
 [[ $("$editor_root/bin/ceditor" --version) == "ceditor $VERSION" ]]
 editor_config="$staging/editor-config"
 settings_path=$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --settings-path)
