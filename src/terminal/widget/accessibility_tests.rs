@@ -182,7 +182,13 @@ fn widget(
     let mut widget = TerminalWidget::new(peer.handle.clone())
         .id(Id::new(name.to_owned()))
         .model_focused(focused)
-        .review_boundary(barrier, suppressed, Message::Review)
+        .review_boundary(
+            barrier,
+            suppressed,
+            suppressed && focused,
+            0,
+            Message::Review,
+        )
         .on_focus(Message::Focus)
         .on_shortcut(|_| Some(Message::Shortcut))
         .on_paste(|_| Message::Paste);
@@ -342,6 +348,10 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     old_widget.suppress_focus_reports = true;
     new_widget.model_focused = true;
     new_widget.suppress_focus_reports = true;
+    old_widget.review_active = false;
+    old_widget.review_revision = 1;
+    new_widget.review_active = true;
+    new_widget.review_revision = 1;
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
     let selection = {
@@ -389,6 +399,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     // Reconstruct the named widget and diff retained state before addressing
     // the actual published control node by its native numeric ID.
     new_widget = widget(&new, "new-card", shared.clone(), true, true);
+    new_widget.review_revision = 1;
     new_tree.diff(&mut new_widget as &mut dyn Widget<Message, Theme, Renderer>);
     let published =
         new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
@@ -410,6 +421,10 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     old_widget.suppress_focus_reports = false;
     new_widget.suppress_focus_reports = false;
+    old_widget.review_active = false;
+    old_widget.review_revision = 2;
+    new_widget.review_active = false;
+    new_widget.review_revision = 2;
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
     assert!(
@@ -452,6 +467,10 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     old_widget.suppress_focus_reports = true;
     new_widget.suppress_focus_reports = true;
+    old_widget.review_active = false;
+    old_widget.review_revision = 3;
+    new_widget.review_active = true;
+    new_widget.review_revision = 3;
     dispatch(
         &mut new_widget,
         &mut new_tree,
@@ -467,6 +486,10 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     new_widget.model_focused = false;
     old_widget.suppress_focus_reports = false;
     new_widget.suppress_focus_reports = false;
+    old_widget.review_active = false;
+    old_widget.review_revision = 4;
+    new_widget.review_active = false;
+    new_widget.review_revision = 4;
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
     old.fence();
@@ -510,4 +533,181 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
             .count(),
         2
     );
+}
+
+fn click_review(
+    widget: &mut TerminalWidget<Message>,
+    tree: &mut Tree,
+    renderer: &Renderer,
+) -> Vec<Message> {
+    let layout = layout::Node::new(Size::new(640.0, 320.0));
+    let published = widget.a11y_nodes(Layout::new(&layout), tree, mouse::Cursor::Unavailable);
+    let control = published
+        .children()
+        .iter()
+        .find(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+        .unwrap()
+        .id()
+        .clone();
+    dispatch(widget, tree, renderer, action(control, Action::Click, None))
+}
+fn reviewing(tree: &Tree) -> bool {
+    tree.state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .review
+}
+#[test]
+fn native_review_entry_survives_old_view_events_until_acknowledged_and_cancelled() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "preack-card",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
+    dispatch(&mut widget, &mut tree, &renderer, redraw());
+    peer.fence();
+    assert_eq!(
+        click_review(&mut widget, &mut tree, &renderer),
+        vec![Message::Review(true)]
+    );
+    dispatch(&mut widget, &mut tree, &renderer, redraw());
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(
+        reviewing(&tree),
+        "old-view redraw and rebuild cannot undo pending entry"
+    );
+    for down in [true, false] {
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            key(
+                keyboard::key::Named::ArrowLeft,
+                keyboard::key::Code::ArrowLeft,
+                down,
+            ),
+        );
+    }
+    assert_no_pty_input(&peer.fence());
+    widget.review_active = true;
+    widget.suppress_focus_reports = true;
+    widget.review_revision = 1;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(reviewing(&tree));
+    assert_eq!(
+        click_review(&mut widget, &mut tree, &renderer),
+        vec![Message::Review(false)]
+    );
+    // A later true acknowledgment must not resurrect a locally requested exit.
+    widget.review_revision = 2;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(!reviewing(&tree));
+    widget.review_active = false;
+    widget.suppress_focus_reports = false;
+    widget.review_revision = 3;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(!reviewing(&tree));
+}
+#[test]
+fn same_card_cancellation_clears_pending_review_without_a_true_view_acknowledgment() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "cancel-card",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    assert_eq!(
+        click_review(&mut widget, &mut tree, &renderer),
+        vec![Message::Review(true)]
+    );
+    // The parent processes entry and explicit same-card FocusCard before rebuilding.
+    // The final view is still focused, false, and globally unsuppressed.
+    widget.review_revision = 2;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(!reviewing(&tree));
+    widget.on_shortcut = None;
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    assert!(
+        peer.fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
+}
+#[test]
+fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
+    let peer = Peer::new();
+    let replacement = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut widget = widget(&peer, "remount-card", barrier.clone(), true, true);
+    widget.review_revision = 5;
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    assert!(reviewing(&tree));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Code::ArrowDown,
+            true,
+        ),
+    );
+    assert_no_pty_input(&peer.fence());
+    {
+        let state = tree.state.downcast_ref::<WidgetState>();
+        state.a11y.borrow_mut().move_review(0, 1, true);
+        assert!(state.a11y.borrow().selection.is_some());
+    }
+    widget = self::widget(&replacement, "remount-card", barrier, true, true);
+    widget.review_revision = 5;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(
+        reviewing(&tree),
+        "active owner blocks input until replacement cancellation arrives"
+    );
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection
+            .is_none()
+    );
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::ArrowLeft,
+            keyboard::key::Code::ArrowLeft,
+            true,
+        ),
+    );
+    assert_no_pty_input(&replacement.fence());
+    widget.review_active = false;
+    widget.suppress_focus_reports = false;
+    widget.review_revision = 6;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(!reviewing(&tree));
 }

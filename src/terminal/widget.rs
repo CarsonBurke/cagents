@@ -987,6 +987,8 @@ impl PtySize {
 struct WidgetState {
     a11y: RefCell<accessibility::State>,
     review_control_pressed: bool,
+    observed_review_revision: Option<u64>,
+    observed_review_identity: Option<crate::model::TerminalId>,
     history_total: u64,
     completed_read_only: bool,
     shortcut_keys: Vec<keyboard::key::Physical>,
@@ -1502,6 +1504,8 @@ pub struct TerminalWidget<Message> {
     accessible_name: String,
     review_input_barrier: ReviewInputBarrier,
     suppress_focus_reports: bool,
+    review_active: bool,
+    review_revision: u64,
     on_review: Option<Box<dyn Fn(bool) -> Message>>,
     terminal_identity: crate::model::TerminalId,
     read_only: bool,
@@ -1556,6 +1560,8 @@ impl<Message> TerminalWidget<Message> {
             accessible_name: "Terminal".into(),
             review_input_barrier: ReviewInputBarrier::default(),
             suppress_focus_reports: false,
+            review_active: false,
+            review_revision: 0,
             on_review: None,
             terminal_identity,
             read_only: false,
@@ -1627,12 +1633,43 @@ impl<Message> TerminalWidget<Message> {
         mut self,
         barrier: ReviewInputBarrier,
         suppress_focus_reports: bool,
+        review_active: bool,
+        review_revision: u64,
         on_review: impl Fn(bool) -> Message + 'static,
     ) -> Self {
         self.review_input_barrier = barrier;
         self.suppress_focus_reports = suppress_focus_reports;
+        self.review_active = review_active;
+        self.review_revision = review_revision;
         self.on_review = Some(Box::new(on_review));
         self
+    }
+    fn reconcile_review(&self, state: &mut WidgetState) {
+        if state.observed_review_identity != Some(self.terminal_identity) {
+            if let Some(id) = &self.id {
+                state.a11y.borrow_mut().bind(id, self.terminal_identity);
+            }
+            state.observed_review_identity = Some(self.terminal_identity);
+            state.observed_review_revision = None;
+        }
+        if state.observed_review_revision != Some(self.review_revision) {
+            let mounted = state.observed_review_revision.is_none();
+            state.observed_review_revision = Some(self.review_revision);
+            // A remounted surface must still block input under its live owner.
+            // Later acknowledgments never resurrect a local exit.
+            if mounted && self.review_active {
+                state.a11y.borrow_mut().review = true;
+            }
+            // A native action takes effect before its parent callback is handled.
+            // Repeated events and old views must not undo that local entry. Only
+            // a newer authoritative cancellation clears it; acknowledgment never
+            // re-enters review after a local exit.
+            if !self.review_active {
+                let mut a11y = state.a11y.borrow_mut();
+                a11y.review = false;
+                a11y.selection = None;
+            }
+        }
     }
     fn publish_review(&self, active: bool, shell: &mut Shell<'_, Message>) {
         if let Some(callback) = &self.on_review {
@@ -2221,7 +2258,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(WidgetState::default())
+        let mut state = WidgetState::default();
+        if self.on_review.is_some() {
+            self.reconcile_review(&mut state);
+        }
+        tree::State::new(state)
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<WidgetState>();
+        if self.on_review.is_some() {
+            self.reconcile_review(state);
+        }
     }
 
     fn id(&self) -> Option<Id> {
@@ -2278,10 +2326,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             if let Some(id) = &self.id {
                 a11y.bind(id, self.terminal_identity);
             }
-            if !self.suppress_focus_reports && self.on_review.is_some() {
-                a11y.review = false;
-                a11y.selection = None;
-            }
+        }
+        if self.on_review.is_some() {
+            self.reconcile_review(state);
         }
         let view = accessibility::View {
             rows: if bounds.height > REVIEW_BAR_HEIGHT {
