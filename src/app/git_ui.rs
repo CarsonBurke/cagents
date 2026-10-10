@@ -773,7 +773,27 @@ mod tests {
             let executable = directory.path().join("gh");
             fs::write(&executable, "#!/bin/sh\n: > \"$HOME/gh-called\"\nexit 19\n").unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-            let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "app::git_ui::tests::local_reads_target_changed_worktrees_and_never_invoke_github", "--nocapture"]).env_clear().env(CHILD, "1").env("HOME", directory.path()).env("PATH", format!("{}:/usr/bin:/bin", directory.path().display())).status().unwrap();
+            // Keep the configured Git toolchain while intercepting every gh
+            // lookup. The distro Git can be older than our required version.
+            let configured_path =
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+            let isolated_path = std::env::join_paths(
+                std::iter::once(directory.path().to_path_buf())
+                    .chain(std::env::split_paths(&configured_path)),
+            )
+            .unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::git_ui::tests::local_reads_target_changed_worktrees_and_never_invoke_github",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", directory.path())
+                .env("PATH", isolated_path)
+                .status()
+                .unwrap();
             assert!(status.success());
             assert!(
                 directory.path().join("local-git-tested").exists(),
