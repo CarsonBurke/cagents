@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Linux-only development orchestration; normal runner never requires this tool."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+HOT_VERSION = "0.1.1"
+HOT_REVISION = "0d57d0664bf2e1c16ba30c34bcfe78cd3eed665f"
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def matches_install(package, record):
+    prefix = f"cargo-hot {HOT_VERSION} (git+https://github.com/hecrj/cargo-hot"
+    if not package.startswith(prefix) or not package.endswith(f"#{HOT_REVISION})"):
+        return False
+    suffix = package[len(prefix):].split("#", 1)[0]
+    if suffix and not suffix.startswith((".git?", "?")):
+        return False
+    return "cargo-hot" in record.get("bins", [])
+
+
+def prerequisites():
+    if sys.platform != "linux":
+        fail("--hot requires Linux")
+    for name in ("bwrap", "cargo", "rustc", "cargo-hot"):
+        if not shutil.which(name):
+            fail(f"--hot requires {name}; no tools are installed automatically")
+    executable = Path(shutil.which("cargo-hot")).resolve()
+    if executable.parent.name != "bin":
+        fail("cargo-hot must be the binary of a recorded Cargo installation")
+    metadata = executable.parent.parent / ".crates2.json"
+    if metadata.stat().st_size > 1024 * 1024:
+        fail("Cargo installation metadata exceeds the inspection budget")
+    installs = json.loads(metadata.read_text())["installs"]
+    if not any(matches_install(package, record) for package, record in installs.items()):
+        fail(f"--hot requires cargo-hot {HOT_VERSION} at {HOT_REVISION}; install that exact revision explicitly")
+    lock = ROOT / "Cargo.lock"
+    if not stat.S_ISREG(lock.lstat().st_mode):
+        fail("Cargo.lock must be a regular file, not a symlink")
+    return str(executable)
+
+
+def sandbox(command, *, offline=False):
+    # Preserve the ordinary user's filesystem/session/device/network authority.
+    # Only the lockfile is immutable. A file mount also refuses atomic rename,
+    # unlink and replacement (EBUSY); source edits remain writable outside/inside.
+    args = [shutil.which("bwrap"), "--die-with-parent", "--bind", "/", "/",
+            "--dev-bind", "/dev", "/dev", "--ro-bind", str(ROOT / "Cargo.lock"),
+            str(ROOT / "Cargo.lock"), "--chdir", str(ROOT)]
+    if offline:
+        args += ["--setenv", "CARGO_NET_OFFLINE", "true"]
+    return args + ["--"] + command
+
+
+def build_product(name, features, target):
+    command = ["cargo", "build", "--locked", "--profile", "dev-runtime",
+               "--target", target, "--no-default-features", "--features", features, "--bin", name,
+               "--message-format", "json-render-diagnostics"]
+    artifact = None
+    with subprocess.Popen(sandbox(command), stdout=subprocess.PIPE, text=True) as child:
+        for line in child.stdout:
+            if len(line) > 2 * 1024 * 1024:
+                child.terminate()
+                fail("Cargo output exceeds the per-message budget")
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                sys.stderr.write(line)
+                continue
+            if value.get("reason") == "compiler-message":
+                sys.stderr.write(value["message"].get("rendered") or "")
+            if (value.get("reason") == "compiler-artifact"
+                    and value.get("target", {}).get("name") == name
+                    and value.get("executable")):
+                artifact = Path(value["executable"])
+        if child.wait() or artifact is None:
+            fail(f"Locked {name} build failed; development daemon was not stopped")
+    return artifact
+
+
+def stage_product(product, destination):
+    # Warm relaunch may have this daemon inode running. Publish a new inode;
+    # never truncate the old executable (ETXTBSY), and durably retain its name.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".hot-product-", delete=False) as output:
+            temporary = Path(output.name)
+            with product.open("rb") as source:
+                shutil.copyfileobj(source, output)
+            output.flush()
+            os.fchmod(output.fileno(), stat.S_IMODE(product.stat().st_mode) & 0o777)
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--browserless", action="store_true")
+    parser.add_argument("--fresh-daemon", action="store_true")
+    parser.add_argument("--log-file")
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    hot = prerequisites()  # Before any build or stop, including direct helper use.
+    if args.check:
+        return 0
+    forwarded = args.args[1:] if args.args[:1] == ["--"] else args.args
+    version = subprocess.check_output(["rustc", "-vV"], text=True)
+    native = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
+    if "linux" not in native:
+        fail("Hot development requires a Linux native Rust toolchain")
+    identity = "development" if args.browserless else "development,full"
+    cli = build_product("cagents", identity, native)
+    daemon = build_product("cagentsd", identity + ",host", native)
+    ui_features = "hot-reload" if args.browserless else "hot-reload,integrated-browser"
+    build_product("cagents-ui-hot", ui_features, native)
+    # Use Cargo's resolved artifact path: respects configured target directory.
+    # cargo-hot always selects host triple but puts its runnable bundle here,
+    # independently of the ordinary artifact's optional triple subdirectory.
+    metadata = subprocess.check_output(sandbox([
+        "cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"
+    ]), text=True)
+    target = Path(json.loads(metadata)["target_directory"])
+    bundle = target / "cargo-hot" / "cagents-ui-hot" / "dev-runtime"
+    bundle.mkdir(parents=True, exist_ok=True)
+    for product in (cli, daemon):
+        stage_product(product, bundle / product.name)
+    # cargo-hot owns its specialized fat binary. Never overwrite it with the
+    # ordinary preflight artifact: a fresh cached fat build would not recopy it.
+    alias = bundle / "cagents-ui"
+    if alias.is_symlink() and os.readlink(alias) == "cagents-ui-hot":
+        pass
+    elif alias.exists() or alias.is_symlink():
+        fail("Hot bundle has an unexpected cagents-ui entry; refusing replacement")
+    else:
+        alias.symlink_to("cagents-ui-hot")
+    command = sandbox([hot, "hot", "--profile", "dev-runtime", "--no-default-features",
+                       "--features", ui_features, "--bin", "cagents-ui-hot", "--", *forwarded], offline=True)
+    if args.fresh_daemon:
+        position = command.index("--chdir")
+        command[position:position] = ["--setenv", "CAGENTS_HOT_FRESH_DAEMON", "1"]
+    else:
+        position = command.index("--chdir")
+        command[position:position] = ["--unsetenv", "CAGENTS_HOT_FRESH_DAEMON"]
+    print("Experimental hot reload: body-only UI edits; type, dependency, startup and daemon changes need a cold restart.", file=sys.stderr)
+    if args.log_file:
+        with open(args.log_file, "w") as output:
+            return subprocess.run(command, stdout=output, stderr=subprocess.STDOUT).returncode
+    os.execvp(command[0], command)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        sys.exit(f"Hot development: {error}")

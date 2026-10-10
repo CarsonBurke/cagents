@@ -15,6 +15,8 @@ publish = false
 [features]
 default = ["full"]
 development = []
+# Experimental Linux-only UI iteration; never selected by production defaults.
+hot-reload = ["development", "ui", "dep:iced_hot", "iced_hot/hot"]
 # Opt-in local redraw-scheduling fixture; ordinary builds use a zero-state recorder.
 latency-harness = ["ui"]
 # Product identity only. Keep this separate from the embedded-browser
@@ -106,6 +108,13 @@ bench = false
 required-features = ["ui"]
 
 [[bin]]
+name = "cagents-ui-hot"
+path = "src/hot-ui.rs"
+test = false
+bench = false
+required-features = ["hot-reload"]
+
+[[bin]]
 name = "cagentsd"
 path = "src/bin/cagentsd.rs"
 test = false
@@ -152,6 +161,8 @@ hayro = { version = "0.7.1", optional = true }
 hmac = { version = "0.12", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
+# Exact same package/source as libcosmic's iced; only its hot feature is added.
+iced_hot = { package = "iced", git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
 # `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
 # default set and the editor is the only consumer.

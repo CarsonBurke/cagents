@@ -1599,21 +1599,11 @@ fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static
 /// when the cached items are rendered.
 fn markdown_body(source: &str) -> Element<'static, InspectorAction> {
     let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_BODY);
-    thread_local! {
-        // One inspector hover is visible at a time; a single entry avoids
-        // retaining every server response for the application's lifetime.
-        static PARSED: std::cell::RefCell<Option<(String, Vec<widget::markdown::Item>)>> = const { std::cell::RefCell::new(None) };
-    }
-    PARSED.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache
-            .as_ref()
-            .is_none_or(|(previous, _)| previous != source)
-        {
-            *cache = Some((source.to_owned(), widget::markdown::parse(source).collect()));
-        }
-        markdown_items(&cache.as_ref().unwrap().1, &settings, 0)
-    })
+    let mut rendered = None;
+    crate::runtime_state::with_inspector_markdown(source, &mut |items| {
+        rendered = Some(markdown_items(items, &settings, 0));
+    });
+    rendered.expect("the markdown cache renders once")
 }
 
 fn markdown_items(

@@ -1,5 +1,4 @@
 use std::{
-    cell::Cell,
     env,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
@@ -289,24 +288,7 @@ pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     Ok(())
 }
 
-// Production evidence is typed and bounded; raw tracing never goes to an
-// automatic file. Explicit local debug capture remains on stderr.
-thread_local! {
-    static RECOVERED_PANIC_DEPTH: Cell<u32> = const { Cell::new(0) };
-    static REPORTING_PANIC: Cell<bool> = const { Cell::new(false) };
-}
-
-#[must_use = "the scope lasts until this guard is dropped"]
-pub struct RecoveredPanicScope(std::marker::PhantomData<std::rc::Rc<()>>);
-impl Drop for RecoveredPanicScope {
-    fn drop(&mut self) {
-        let _ = RECOVERED_PANIC_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
-}
-pub fn recovered_panic_scope() -> RecoveredPanicScope {
-    let _ = RECOVERED_PANIC_DEPTH.try_with(|depth| depth.set(depth.get().saturating_add(1)));
-    RecoveredPanicScope(std::marker::PhantomData)
-}
+pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
 
 pub fn install_panic_hook(product: &'static str) {
     install_panic_hook_with_version(product, crate::VERSION);
@@ -323,23 +305,16 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
     crate::diagnostics::record(crate::diagnostics::Event::Startup);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        if REPORTING_PANIC
-            .try_with(|reporting| reporting.replace(true))
-            .unwrap_or(false)
-        {
+        let Some(recovered) = crate::runtime_state::begin_panic_report() else {
             return;
-        }
-        let recovered = RECOVERED_PANIC_DEPTH
-            .try_with(|depth| depth.get())
-            .unwrap_or(0)
-            > 0;
+        };
         crate::diagnostics::record_panic(recovered);
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {
             previous(panic);
         }
-        let _ = REPORTING_PANIC.try_with(|reporting| reporting.set(false));
+        crate::runtime_state::finish_panic_report();
     }));
 }
 
