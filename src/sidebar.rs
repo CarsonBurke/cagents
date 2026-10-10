@@ -3266,6 +3266,12 @@ impl SidebarState {
                         description.trim_start_matches('\n'),
                     ));
             }
+            SidebarAction::CommitSubjectEditorCursor { cursor, .. } => {
+                self.commit_draft.subject_composer.0.move_to(*cursor);
+            }
+            SidebarAction::CommitEditorCursor { cursor, .. } => {
+                self.commit_draft.composer.0.move_to(*cursor);
+            }
             SidebarAction::CommitSubjectEditorAction { action, .. } => {
                 self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
@@ -3639,6 +3645,14 @@ pub enum SidebarAction {
     CommitMessageChanged {
         key: ActiveWorktreeKey,
         message: String,
+    },
+    CommitSubjectEditorCursor {
+        key: ActiveWorktreeKey,
+        cursor: cosmic::iced::widget::text_editor::Cursor,
+    },
+    CommitEditorCursor {
+        key: ActiveWorktreeKey,
+        cursor: cosmic::iced::widget::text_editor::Cursor,
     },
     CommitSubjectEditorAction {
         key: ActiveWorktreeKey,
@@ -8386,7 +8400,7 @@ fn changes_footer<'a>(
     let submit = commit_action.clone();
     let subject_submit = commit_action.clone();
     let mut subject_input =
-        cosmic::iced::widget::text_editor(&state.commit_draft.subject_composer.0)
+        crate::ui_controls::field::editor("Commit subject", &state.commit_draft.subject_composer.0)
             .placeholder("Commit subject")
             .id(chrome.commit_input_id.clone())
             .font(cosmic::iced::Font::DEFAULT)
@@ -8419,10 +8433,15 @@ fn changes_footer<'a>(
             });
     if !modal_open {
         let key = key.clone();
-        subject_input =
-            subject_input.on_action(move |action| SidebarAction::CommitSubjectEditorAction {
+        let cursor_key = key.clone();
+        subject_input = subject_input
+            .on_action(move |action| SidebarAction::CommitSubjectEditorAction {
                 key: key.clone(),
                 action,
+            })
+            .on_cursor(move |cursor| SidebarAction::CommitSubjectEditorCursor {
+                key: cursor_key.clone(),
+                cursor,
             });
     }
     let mut column = widget::column::with_capacity(5)
@@ -8430,43 +8449,52 @@ fn changes_footer<'a>(
         .push(subject_input);
     let has_subject = !state.commit_draft.subject.trim().is_empty();
 
-    let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_draft.composer.0)
-        .placeholder("Description (optional)")
-        .id(chrome.commit_description_id.clone())
-        .height(Length::Fixed(
-            (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
-                * design::TEXT_BODY
-                * 1.3
-                + 16.0,
-        ))
-        .font(cosmic::iced::Font::DEFAULT)
-        .style(commit_description_style)
-        .size(design::TEXT_BODY)
-        .padding([space::XS, space::S])
-        .key_binding(move |press| {
-            if !matches!(
-                press.status,
-                cosmic::iced::widget::text_editor::Status::Focused { .. }
-            ) {
-                return None;
-            }
-            if press.modifiers.control()
-                && matches!(
-                    press.key,
-                    cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
-                )
-            {
-                can_commit
-                    .then(|| cosmic::iced::widget::text_editor::Binding::Custom(submit.clone()))
-            } else {
-                cosmic::iced::widget::text_editor::Binding::from_key_press(press)
-            }
-        });
+    let mut commit_input =
+        crate::ui_controls::field::editor("Commit description", &state.commit_draft.composer.0)
+            .placeholder("Description (optional)")
+            .id(chrome.commit_description_id.clone())
+            .height(Length::Fixed(
+                (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
+                    * design::TEXT_BODY
+                    * 1.3
+                    + 16.0,
+            ))
+            .font(cosmic::iced::Font::DEFAULT)
+            .style(commit_description_style)
+            .size(design::TEXT_BODY)
+            .padding([space::XS, space::S])
+            .key_binding(move |press| {
+                if !matches!(
+                    press.status,
+                    cosmic::iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    return None;
+                }
+                if press.modifiers.control()
+                    && matches!(
+                        press.key,
+                        cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Enter
+                        )
+                    )
+                {
+                    can_commit
+                        .then(|| cosmic::iced::widget::text_editor::Binding::Custom(submit.clone()))
+                } else {
+                    cosmic::iced::widget::text_editor::Binding::from_key_press(press)
+                }
+            });
     if !modal_open {
-        commit_input = commit_input.on_action(move |action| SidebarAction::CommitEditorAction {
-            key: input_key.clone(),
-            action,
-        });
+        let cursor_key = input_key.clone();
+        commit_input = commit_input
+            .on_action(move |action| SidebarAction::CommitEditorAction {
+                key: input_key.clone(),
+                action,
+            })
+            .on_cursor(move |cursor| SidebarAction::CommitEditorCursor {
+                key: cursor_key.clone(),
+                cursor,
+            });
     }
 
     let commit_label = if state.commit_draft.amend {

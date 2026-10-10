@@ -4,6 +4,7 @@
 //! A field here is one dense row high with the same corner as the buttons
 //! beside it and a hairline edge, so a form reads as one column of controls.
 
+pub use super::editable::{TextEditor, TextInput};
 use std::borrow::Cow;
 
 use cosmic::{
@@ -22,13 +23,13 @@ const INSET_Y: f32 = (design::DENSE_ROW_HEIGHT - LINE_HEIGHT) / 2.0;
 
 /// A single-line text field.
 ///
-/// Returns COSMIC's input so callers keep its whole builder: `on_input`,
-/// `on_submit`, `id`, `width`.
+/// Wraps COSMIC's input with editable accessibility semantics while retaining
+/// its normal input behavior and the shell's field builder methods.
 pub fn text<'a, Message: Clone + 'static>(
     placeholder: impl Into<Cow<'a, str>>,
     value: impl Into<Cow<'a, str>>,
-) -> widget::TextInput<'a, Message> {
-    widget::text_input(placeholder, value)
+) -> TextInput<'a, Message> {
+    TextInput::new(placeholder, value)
         .size(design::TEXT_BODY)
         .line_height(iced::widget::text::LineHeight::Absolute(LINE_HEIGHT.into()))
         .padding([INSET_Y, space::S])
@@ -39,7 +40,7 @@ pub fn text<'a, Message: Clone + 'static>(
 pub fn search<'a, Message: Clone + 'static>(
     placeholder: impl Into<Cow<'a, str>>,
     value: impl Into<Cow<'a, str>>,
-) -> widget::TextInput<'a, Message> {
+) -> TextInput<'a, Message> {
     text(placeholder, value)
         .padding([INSET_Y, space::S, INSET_Y, space::XS])
         .leading_icon(
@@ -181,4 +182,12 @@ mod tests {
             assert_eq!(node.size().height, design::DENSE_ROW_HEIGHT, "{query:?}");
         }
     }
+}
+
+/// A named multiline form field with the native editor's ordinary behavior.
+pub fn editor<'a, Message: Clone + 'static>(
+    name: impl Into<Cow<'a, str>>,
+    content: &'a cosmic::iced::widget::text_editor::Content<cosmic::Renderer>,
+) -> TextEditor<'a, Message> {
+    TextEditor::new(name, content)
 }

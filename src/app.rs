@@ -2545,6 +2545,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::PullRequestHeadChanged(_)
                 | Message::PullRequestTitleChanged(_)
                 | Message::PullRequestBodyChanged(_)
+                | Message::PullRequestBodyCursor(_)
                 | Message::PullRequestDraftChanged(_)
                 | Message::PullRequestRetryConfirmed(_)
                 | Message::SubmitPullRequest
@@ -4208,6 +4209,7 @@ pub enum Message {
     PullRequestHeadChanged(String),
     PullRequestTitleChanged(String),
     PullRequestBodyChanged(iced::widget::text_editor::Action),
+    PullRequestBodyCursor(iced::widget::text_editor::Cursor),
     PullRequestDraftChanged(bool),
     PullRequestRetryConfirmed(bool),
     SubmitPullRequest,
@@ -8812,6 +8814,7 @@ impl Cagents {
             let can_go_forward =
                 active && session.history_index.saturating_add(1) < session.history.len();
             let mut address_input = crate::ui_controls::field::text("URL", address)
+                .private()
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -8955,6 +8958,7 @@ impl Cagents {
                 .map(|chrome| chrome.caption.as_str())
                 .unwrap_or(SanitizedLocation::INVALID);
             let address = crate::ui_controls::field::text("Saved URL", address)
+                .private()
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -13882,6 +13886,8 @@ impl Application for Cagents {
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
                     | SidebarAction::CommitMessageChanged { key, .. }
+                    | SidebarAction::CommitSubjectEditorCursor { key, .. }
+                    | SidebarAction::CommitEditorCursor { key, .. }
                     | SidebarAction::CommitSubjectEditorAction { key, .. }
                     | SidebarAction::CommitEditorAction { key, .. }
                     | SidebarAction::AmendChanged { key, .. } if !self.source_control_is_bound(key))
@@ -14212,6 +14218,8 @@ impl Application for Cagents {
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
+                    | SidebarAction::CommitSubjectEditorCursor { .. }
+                    | SidebarAction::CommitEditorCursor { .. }
                     | SidebarAction::CommitSubjectEditorAction { .. }
                     | SidebarAction::CommitEditorAction { .. }
                     | SidebarAction::AmendChanged { .. }
@@ -15332,6 +15340,12 @@ impl Application for Cagents {
             Message::PullRequestTitleChanged(value) => {
                 if let Some(dialog) = &mut self.pull_request_dialog {
                     dialog.title = value;
+                }
+                Task::none()
+            }
+            Message::PullRequestBodyCursor(cursor) => {
+                if let Some(dialog) = &mut self.pull_request_dialog {
+                    dialog.body.0.move_to(cursor);
                 }
                 Task::none()
             }
@@ -16671,10 +16685,11 @@ impl Application for Cagents {
             .into(),
             widget::column::with_children(vec![
                 design::caption("Description").into(),
-                iced::widget::text_editor(&dialog.body.0)
+                crate::ui_controls::field::editor("Pull request description", &dialog.body.0)
                     .placeholder("Describe the change (Markdown supported)")
                     .height(160)
                     .on_action(Message::PullRequestBodyChanged)
+                    .on_cursor(Message::PullRequestBodyCursor)
                     .into(),
             ])
             .spacing(space::XS)
