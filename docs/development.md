@@ -79,6 +79,27 @@ select another installation from PATH or the current directory. Notification
 activation retains its separate validated absolute-path lookup. This naming
 rule does not qualify Windows/macOS builds or add app-bundle/libexec layouts.
 
+## Linux display backends
+
+The ADE shell and standalone editor explicitly enable both libcosmic's Linux
+X11 and Wayland backends. The active session determines the native parent
+window; an X11-only session does not require a running Wayland compositor.
+For an isolated X11 launch, provide that session's `DISPLAY` and `XAUTHORITY`
+and unset `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` in the child environment.
+Continue to use the development runner so the CLI and daemon match the UI.
+
+Embedded browser surfaces currently require a Wayland parent. Browserless
+builds preserve saved browser descriptors and offer **Open in system browser**.
+Enabling the X11 shell does not add an X11 browser renderer. Integrated X11
+capability handling is tracked in [#9](https://github.com/CarsonBurke/cagents/issues/9).
+
+The root system-backed Wayland protocol dependencies and explicit libcosmic
+and portal Wayland feature forwarding are Linux target dependencies. This
+separation does not make the Linux dependency graph Wayland-free: the Linux UI
+supports both backends, and pinned iced/winit dependencies also select their own
+platform features. It does not qualify Windows or macOS application builds;
+process ownership, IPC and integrated browser portability remain separate work.
+
 ## Development runner
 
 Launch the native UI through `scripts/run-development`, not a direct
