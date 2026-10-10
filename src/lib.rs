@@ -24,7 +24,6 @@ pub mod browser;
 pub mod capability;
 pub mod chat;
 pub mod control;
-pub mod diagnostics;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub(crate) mod daemon_health;
@@ -32,6 +31,7 @@ pub(crate) mod daemon_health;
 pub mod design;
 pub mod device;
 pub mod device_service;
+pub mod diagnostics;
 #[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]

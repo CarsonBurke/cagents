@@ -12,7 +12,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -98,6 +98,9 @@ pub enum Event {
         category: Failure,
     },
     ProtocolMismatch,
+    EventsSkipped {
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +119,31 @@ pub struct Record {
 static SINK: OnceLock<Mutex<Option<Recorder>>> = OnceLock::new();
 static FAILED: AtomicBool = AtomicBool::new(false);
 static FAILURE_PENDING: AtomicBool = AtomicBool::new(false);
+static SKIPPED: AtomicU32 = AtomicU32::new(0);
+static BUSY_REPORTED: AtomicBool = AtomicBool::new(false);
+static BUSY_PENDING: AtomicBool = AtomicBool::new(false);
+pub const GAP_NOTICE: &str = "Some private diagnostics were skipped because the sink was busy.";
+
+fn skipped(count: u32) {
+    let _ = SKIPPED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(count))
+    });
+    if !BUSY_REPORTED.swap(true, Ordering::AcqRel) {
+        BUSY_PENDING.store(true, Ordering::Release);
+        eprintln!("cagents: {GAP_NOTICE}");
+    }
+}
+
+pub fn take_notice() -> Option<&'static str> {
+    if take_failure_notice() {
+        Some(FAILURE_NOTICE)
+    } else if BUSY_PENDING.swap(false, Ordering::AcqRel) {
+        Some(GAP_NOTICE)
+    } else {
+        None
+    }
+}
+
 pub const FAILURE_NOTICE: &str =
     "Private diagnostics are unavailable. Failures from this process may not be retained.";
 
@@ -174,12 +202,7 @@ pub fn record(event: Event) {
         fail_sink();
         return;
     };
-    if let Some(recorder) = sink.as_mut()
-        && recorder.append(event).is_err()
-    {
-        *sink = None;
-        fail_sink();
-    }
+    append_global(&mut sink, event);
 }
 
 /// A panic may interrupt a thread holding the ordinary writer mutex. Never
@@ -191,17 +214,36 @@ pub fn record_panic(recovered: bool) {
     if FAILED.load(Ordering::Acquire) {
         return;
     }
-    let Ok(mut sink) = sink.try_lock() else {
-        fail_sink();
-        return;
-    };
-    if let Some(recorder) = sink.as_mut()
-        && recorder.append(Event::Panic { recovered }).is_err()
-    {
-        *sink = None;
-        fail_sink();
+    match sink.try_lock() {
+        Ok(mut sink) => append_global(&mut sink, Event::Panic { recovered }),
+        Err(std::sync::TryLockError::WouldBlock) => skipped(1),
+        Err(std::sync::TryLockError::Poisoned(_)) => fail_sink(),
     }
 }
+
+fn append_global(sink: &mut Option<Recorder>, event: Event) {
+    let Some(recorder) = sink.as_mut() else {
+        return;
+    };
+    let pending = SKIPPED.swap(0, Ordering::AcqRel);
+    if let Err(error) = recorder.append_with_gap(event, pending) {
+        if error.get_ref().is_some_and(|error| error.is::<LockBusy>()) {
+            skipped(pending.saturating_add(1));
+        } else {
+            *sink = None;
+            fail_sink();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LockBusy;
+impl std::fmt::Display for LockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("diagnostic lock busy")
+    }
+}
+impl std::error::Error for LockBusy {}
 
 fn unsafe_path() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "unsafe diagnostic storage")
@@ -307,10 +349,7 @@ impl Lock {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "diagnostic lock busy",
-        ))
+        Err(io::Error::new(io::ErrorKind::WouldBlock, LockBusy))
     }
 }
 impl Drop for Lock {
@@ -350,7 +389,11 @@ impl Recorder {
             version,
         })
     }
+    #[cfg(test)]
     fn append(&mut self, event: Event) -> io::Result<()> {
+        self.append_with_gap(event, 0)
+    }
+    fn append_with_gap(&mut self, event: Event, skipped: u32) -> io::Result<()> {
         let directory = self.dir.metadata()?;
         if directory.uid() != unsafe { libc::geteuid() } || directory.mode() & 0o777 != 0o700 {
             return Err(unsafe_path());
@@ -363,6 +406,12 @@ impl Recorder {
             )?,
             true,
         )?;
+        if skipped != 0 {
+            self.append_locked(Event::EventsSkipped { count: skipped })?;
+        }
+        self.append_locked(event)
+    }
+    fn append_locked(&mut self, event: Event) -> io::Result<()> {
         let record = Record {
             schema_version: SCHEMA_VERSION,
             product: self.product,
@@ -465,6 +514,7 @@ pub struct Observation {
     pub clean_shutdown: Option<bool>,
     pub persistence: Persistence,
     pub final_flush: Option<Event>,
+    pub skipped_events: u32,
 }
 #[derive(Debug, Serialize)]
 pub struct ProductReport {
@@ -488,6 +538,7 @@ impl ProductReport {
                 clean_shutdown: None,
                 persistence: Persistence::Unknown,
                 final_flush: None,
+                skipped_events: 0,
             };
             let mut started = false;
             let mut writer_seen = false;
@@ -538,12 +589,20 @@ impl ProductReport {
                         observed.final_flush = Some(event);
                     }
                     Event::SettingsFailed { .. } => settings_failed = true,
+                    Event::EventsSkipped { count } => {
+                        observed.skipped_events = observed.skipped_events.saturating_add(count)
+                    }
                     _ => {}
                 }
             }
             if observed.clean_shutdown == Some(true) {
-                observed.clean_shutdown = if settings_failed || unrecovered_failure {
+                observed.clean_shutdown = if settings_failed
+                    || unrecovered_failure
+                    || observed.persistence == Persistence::Failed
+                {
                     Some(false)
+                } else if observed.skipped_events != 0 {
+                    None
                 } else if writer_seen {
                     match observed.persistence {
                         Persistence::Complete => Some(true),
@@ -582,7 +641,7 @@ impl Report {
             "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
         for product in &self.products {
             match &product.last_observed {
-                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.run)),
+                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
                 None => lines.push(format!("{}: health unknown ({})", product.product.name(), if product.readable { "no retained evidence" } else { "evidence unavailable or invalid" })),
             }
         }
@@ -920,8 +979,24 @@ mod tests {
                     for _ in 0..40 {
                         let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
                         recorder.limit = 1024;
-                        recorder.append(Event::Startup).unwrap();
-                        recorder.append(Event::Panic { recovered: false }).unwrap();
+                        for event in [Event::Startup, Event::Panic { recovered: false }] {
+                            // Busy is a deliberately bounded, nonfatal sink failure.
+                            // Retry it here to exercise sustained retention without
+                            // changing production latency or assuming flock fairness.
+                            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                            loop {
+                                match recorder.append(event) {
+                                    Ok(()) => break,
+                                    Err(error)
+                                        if error.kind() == io::ErrorKind::WouldBlock
+                                            && std::time::Instant::now() < deadline =>
+                                    {
+                                        std::thread::yield_now()
+                                    }
+                                    Err(error) => panic!("concurrent append failed: {error}"),
+                                }
+                            }
+                        }
                     }
                 })
             })
@@ -993,6 +1068,34 @@ mod process_tests {
             .join(Product::Ui.filename(0));
         use std::os::unix::fs::PermissionsExt;
         let before = std::fs::read(&file).unwrap();
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("busy")) {
+            let dir = directory(file.parent().unwrap(), false).unwrap();
+            let lock = Lock::acquire(
+                private_file(&dir, &format!("{}.lock", Product::Ui.name()), libc::O_RDWR).unwrap(),
+                true,
+            )
+            .unwrap();
+            record(Event::Ready);
+            record(Event::Ready);
+            assert!(!FAILED.load(Ordering::Acquire));
+            assert_eq!(take_notice(), Some(GAP_NOTICE));
+            assert_eq!(take_notice(), None);
+            assert_eq!(std::fs::read(&file).unwrap(), before);
+            drop(lock);
+            record(Event::Exit { success: true });
+            let report = inspect_at(file.parent().unwrap().to_owned()).unwrap();
+            let last = report.products[0].last_observed.as_ref().unwrap();
+            assert_eq!(last.skipped_events, 2);
+            assert_eq!(last.clean_shutdown, None);
+            assert!(
+                report.products[0]
+                    .records
+                    .iter()
+                    .any(|r| matches!(r.event, Event::Exit { success: true }))
+            );
+            assert!(!FAILED.load(Ordering::Acquire));
+            return;
+        }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("write_failure")) {
             let limit = libc::rlimit {
                 rlim_cur: before.len() as libc::rlim_t,
@@ -1045,6 +1148,34 @@ mod process_tests {
                 !String::from_utf8_lossy(&output.stderr).contains(root.path().to_str().unwrap())
             );
         }
+    }
+    #[test]
+    fn transient_real_flock_contention_recovers_and_records_a_typed_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diagnostics::process_tests::subprocess_fixture",
+                "--nocapture",
+            ])
+            .env(TEST_STATE, root.path())
+            .env(TEST_MODE, "busy")
+            .env("XDG_STATE_HOME", root.path())
+            .env("CAGENTS_LOCAL_DEBUG", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches(GAP_NOTICE)
+                .count(),
+            1
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(FAILURE_NOTICE));
     }
     #[test]
     fn real_panic_hook_retains_only_typed_evidence_after_exit() {

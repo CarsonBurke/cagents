@@ -25,7 +25,11 @@ Each product retains five JSONL files, each at most 2 MiB, plus an empty stable
 lock file. Cooperating windows and crash/restart loops share that product budget.
 An oversized existing file, unsafe replacement, or failed rotation stops the sink;
 it never appends beyond the cap. Failure is non-fatal and emits one fixed notice
-to standard error and, when a UI is available, its notice history. Existing raw
+to standard error and, when a UI is available, its notice history. Lock contention
+waits at most 50 ms, skips the current event, and leaves the recorder available
+for later attempts. The next successful append records a typed skipped-event
+count; one fixed notice reports the gap. A run with a gap cannot claim a clean
+shutdown even when a later exit succeeds. Existing raw
 logs from older versions are preserved; they are not part of this new sink.
 
 Records contain a schema version, product, process/run identity, timestamp,

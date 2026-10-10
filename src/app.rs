@@ -12863,9 +12863,8 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if crate::diagnostics::take_failure_notice() {
-            self.notices
-                .record(TransientNotice::warning(crate::diagnostics::FAILURE_NOTICE));
+        if let Some(notice) = crate::diagnostics::take_notice() {
+            self.notices.record(TransientNotice::warning(notice));
         }
         if crate::device::is_remote() {
             match &message {

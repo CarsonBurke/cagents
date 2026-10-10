@@ -3010,10 +3010,10 @@ impl Application for Editor {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if cagents::diagnostics::take_failure_notice() {
+        if let Some(notice) = cagents::diagnostics::take_notice() {
             self.notice = Some(match self.notice.take() {
-                Some(previous) => format!("{previous}\n{}", cagents::diagnostics::FAILURE_NOTICE),
-                None => cagents::diagnostics::FAILURE_NOTICE.to_owned(),
+                Some(previous) => format!("{previous}\n{notice}"),
+                None => notice.to_owned(),
             });
         }
         self.tab_history.observe(self.active);
