@@ -119,8 +119,32 @@ fn open_in(
     })
 }
 
-pub(crate) fn capture(terminal: TerminalId, path: &Path) -> Option<TranscriptLocationReceipt> {
-    Some(open_in(&root().ok()?, terminal, path).ok()?.receipt)
+#[cfg(any(feature = "host", test))]
+pub(crate) fn capture(
+    terminal: TerminalId,
+    path: &Path,
+    writer: &File,
+) -> Option<ValidatedTranscript> {
+    capture_in(&root().ok()?, terminal, path, writer)
+}
+
+#[cfg(any(feature = "host", test))]
+fn capture_in(
+    root: &Path,
+    terminal: TerminalId,
+    path: &Path,
+    writer: &File,
+) -> Option<ValidatedTranscript> {
+    let validated = open_in(root, terminal, path).ok()?;
+    let original = writer.metadata().ok()?;
+    // The pathname is not the source of truth: a replacement must never
+    // receive a newly minted receipt for a different writer's transcript.
+    if (original.dev(), original.ino())
+        != (validated.receipt.file_device, validated.receipt.file_inode)
+    {
+        return None;
+    }
+    Some(validated)
 }
 
 pub fn open(
@@ -144,6 +168,10 @@ fn open_with_receipt(
 }
 
 impl ValidatedTranscript {
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn receipt(&self) -> TranscriptLocationReceipt {
+        self.receipt
+    }
     #[cfg(feature = "ui")]
     pub async fn reveal(self) -> Result<(), Unavailable> {
         use std::time::Duration;
@@ -280,5 +308,34 @@ mod tests {
             open_with_receipt(&root, terminal, &metadata),
             Err(Unavailable::Changed)
         ));
+    }
+
+    #[test]
+    fn replacing_path_cannot_mint_a_receipt_for_the_original_writer() {
+        let (root, terminal, path) = fixture();
+        let original = File::open(&path).unwrap();
+        let anchor = capture_in(root.path(), terminal, &path, &original).unwrap();
+        fs::rename(&path, root.path().join("previous.log")).unwrap();
+        fs::write(&path, "replacement contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(capture_in(root.path(), terminal, &path, &original).is_none());
+        let metadata = TranscriptMetadata {
+            path,
+            byte_len: 0,
+            durable_offset: 0,
+            updated_at_unix_ms: 0,
+            location: Some(anchor.receipt()),
+        };
+        assert!(matches!(
+            open_with_receipt(root.path(), terminal, &metadata),
+            Err(Unavailable::Changed)
+        ));
+        fs::remove_file(root.path().join("previous.log")).unwrap();
+        drop(original);
+        assert_eq!(anchor._file.metadata().unwrap().nlink(), 0);
+        assert_eq!(
+            anchor._file.metadata().unwrap().ino(),
+            anchor.receipt().file_inode
+        );
     }
 }

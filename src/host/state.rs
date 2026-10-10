@@ -960,7 +960,11 @@ impl HostState {
                 .map(|(sequence, _)| *sequence)
                 .unwrap_or_else(|| record.event_sequence.saturating_add(1)),
             attached,
-            transcript: transcript_metadata(terminal_id, record.session.transcript_path.as_deref()),
+            transcript: transcript_metadata(
+                terminal_id,
+                record.session.transcript_path.as_deref(),
+                record.handle.transcript_location(),
+            ),
             upgrade_sources: record.upgrade_sources.clone(),
             upgrade_relaunches: record.upgrade_relaunches.clone(),
         })
@@ -4012,6 +4016,7 @@ fn record_event_from(
 fn transcript_metadata(
     terminal_id: TerminalId,
     path: Option<&std::path::Path>,
+    location: Option<crate::model::TranscriptLocationReceipt>,
 ) -> Option<TranscriptMetadata> {
     let path = path?;
     let metadata = fs::metadata(path).ok()?;
@@ -4021,7 +4026,7 @@ fn transcript_metadata(
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default();
-    Some(TranscriptMetadata {
+    let mut result = TranscriptMetadata {
         path: path.to_owned(),
         byte_len: metadata.len(),
         // The existing worker flushes on orderly close but does not fsync each
@@ -4029,8 +4034,13 @@ fn transcript_metadata(
         // make without changing that worker's persistence contract.
         durable_offset: 0,
         updated_at_unix_ms,
-        location: crate::transcript_location::capture(terminal_id, path),
-    })
+        location,
+    };
+    if result.location.is_some() && crate::transcript_location::open(terminal_id, &result).is_err()
+    {
+        result.location = None;
+    }
+    Some(result)
 }
 
 fn unix_time_ms() -> i64 {
