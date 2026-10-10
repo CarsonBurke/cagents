@@ -35,7 +35,10 @@ use libghostty_vt::{
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 
 use crate::{
-    model::{LaunchRecipe, TerminalOutputActivity, TerminalSession, agent_recovery::AgentProcess},
+    model::{
+        LaunchRecipe, TerminalId, TerminalOutputActivity, TerminalSession,
+        agent_recovery::AgentProcess,
+    },
     secure_file::open_private_append_file,
 };
 
