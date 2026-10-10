@@ -234,6 +234,7 @@ pub fn run() -> Result<(), HostError> {
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
     let _tray = crate::tray::start(move || {
         let host = tally_host.upgrade()?;

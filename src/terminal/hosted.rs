@@ -1753,6 +1753,7 @@ fn serve_connection(
             }
         };
         if envelope.version != PROTOCOL_VERSION {
+            crate::diagnostics::record(crate::diagnostics::Event::ProtocolMismatch);
             tracing::warn!(
                 actual = envelope.version,
                 expected = PROTOCOL_VERSION,

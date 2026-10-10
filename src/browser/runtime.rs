@@ -1180,7 +1180,7 @@ impl BrowserDelegate {
 fn guarded_dispatch(events: &EventBus, faulted: &Cell<bool>, callback: impl FnOnce()) {
     // Outside the closure, so it survives the unwind: the panic hook runs
     // before unwinding, and without this scope every recovered delegate fault
-    // is filed in the crash log as a process crash, with a backtrace.
+    // is recorded as an unrecovered process panic instead of a caught fault.
     let _recovered = crate::instance::recovered_panic_scope();
     let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(callback)) else {
         return;

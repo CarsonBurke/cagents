@@ -13,10 +13,10 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Mutex, OnceLock,
+        OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 #[cfg(feature = "ui")]
 use std::{
@@ -266,6 +266,9 @@ pub fn ui_launch_handshake_requested() -> bool {
 
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if result.is_ok() {
+        crate::diagnostics::record(crate::diagnostics::Event::Ready);
+    }
     if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
         let message = match result {
@@ -279,310 +282,90 @@ pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     Ok(())
 }
 
-// --- diagnostics ----------------------------------------------------------
-//
-// Every shipped process runs with its standard streams on /dev/null:
-// `control::spawn_ui_process` nulls the UI's stderr, and the daemon is spawned
-// with both stdout and stderr nulled. A subscriber bound to those descriptors
-// throws `RUST_LOG` output away in production, and a panic message goes with
-// it. Diagnostics therefore go to a bounded file under the data directory
-// that the user can find and attach to a report, plus stderr when a terminal
-// is actually attached.
-
-/// Size cap for the rolling diagnostic log. One previous generation is kept as
-/// `<name>.1`, so a product costs at most twice this on disk. Only the lanes
-/// that link `tracing-subscriber` have a log to bound.
-#[cfg(any(feature = "host", feature = "ui"))]
-const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
-/// Crash records are a few kilobytes each. A tighter cap keeps a panic loop
-/// from filling the data directory while still retaining the first failures.
-const MAX_CRASH_LOG_BYTES: u64 = 512 * 1024;
-
-static DIAGNOSTIC_PRODUCT: OnceLock<&'static str> = OnceLock::new();
-/// Opened when the hook is installed: the hook itself runs on a panicking
-/// thread, which is the worst place to create directories or take new locks.
-static CRASH_LOG: OnceLock<Option<Mutex<RotatingFile>>> = OnceLock::new();
-#[cfg(any(feature = "host", feature = "ui"))]
-static TRACE_LOG: OnceLock<Option<Mutex<RotatingFile>>> = OnceLock::new();
-
+// Production evidence is typed and bounded; raw tracing never goes to an
+// automatic file. Explicit local debug capture remains on stderr.
 thread_local! {
-    /// Number of `catch_unwind` recovery scopes active on this thread.
     static RECOVERED_PANIC_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// Latch that stops a panic raised inside the reporting path from
-    /// re-entering the hook and aborting the process with no record at all.
     static REPORTING_PANIC: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Append-only diagnostic file that keeps exactly one previous generation.
-struct RotatingFile {
-    path: PathBuf,
-    file: File,
-    written: u64,
-    limit: u64,
-}
-
-impl RotatingFile {
-    fn open(path: PathBuf, limit: u64) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = open_private_append(&path)?;
-        let written = file.metadata()?.len();
-        Ok(Self {
-            path,
-            file,
-            written,
-            limit,
-        })
-    }
-
-    /// Several processes share one product log (the UI spawns standalone
-    /// dialogs), so a concurrent rotation can rename the file out from under
-    /// another writer. That writer keeps its own descriptor and its records
-    /// land in the retained generation, which is why nothing here locks.
-    fn rotate(&mut self) -> io::Result<()> {
-        let mut previous = self.path.clone().into_os_string();
-        previous.push(".1");
-        fs::rename(&self.path, PathBuf::from(previous))?;
-        self.file = open_private_append(&self.path)?;
-        self.written = 0;
-        Ok(())
-    }
-}
-
-impl Write for RotatingFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        if self.written >= self.limit {
-            // Losing the rotation must not lose the diagnostics; an
-            // over-long file is strictly better than a silent process.
-            let _ = self.rotate();
-        }
-        self.file.write_all(buf)?;
-        self.written += buf.len() as u64;
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
-/// Opens a diagnostic file with the crate's private-file discipline: 0600, no
-/// symlink traversal, and a refusal to append to anything but a regular file
-/// this user owns.
-fn open_private_append(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(PRIVATE_FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != current_uid() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "diagnostic log path is not an owned regular file",
-        ));
-    }
-    file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    Ok(file)
-}
-
-fn open_diagnostic(product: &str, suffix: &str, limit: u64) -> Option<Mutex<RotatingFile>> {
-    let dirs = project_dirs()?;
-    let path = dirs.data_dir().join(format!("{product}{suffix}"));
-    RotatingFile::open(path, limit).map(Mutex::new).ok()
-}
-
-fn crash_log() -> Option<&'static Mutex<RotatingFile>> {
-    let product = *DIAGNOSTIC_PRODUCT.get()?;
-    CRASH_LOG
-        .get_or_init(|| open_diagnostic(product, "-crash.log", MAX_CRASH_LOG_BYTES))
-        .as_ref()
-}
-
-fn append_crash_record(record: &str) {
-    let Some(file) = crash_log() else {
-        return;
-    };
-    let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = file.write_all(record.as_bytes());
-    let _ = file.flush();
-}
-
-fn unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or_default()
-}
-
-/// Marks the current thread as running inside a `catch_unwind` recovery guard.
-/// Rust runs the panic hook *before* unwinding, so without this a deliberately
-/// recovered fault is filed as a process crash: the Servo delegate dispatcher
-/// alone would write one backtrace per callback into the crash log.
 #[must_use = "the scope lasts until this guard is dropped"]
-pub struct RecoveredPanicScope(());
-
+pub struct RecoveredPanicScope(std::marker::PhantomData<std::rc::Rc<()>>);
 impl Drop for RecoveredPanicScope {
     fn drop(&mut self) {
         let _ = RECOVERED_PANIC_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
-
-/// Opens a scope whose panics are recorded as recovered rather than fatal.
-/// Create the guard *outside* the `catch_unwind` closure so it survives the
-/// unwind and is dropped once the caller has handled the failure.
 pub fn recovered_panic_scope() -> RecoveredPanicScope {
     let _ = RECOVERED_PANIC_DEPTH.try_with(|depth| depth.set(depth.get().saturating_add(1)));
-    RecoveredPanicScope(())
+    RecoveredPanicScope(std::marker::PhantomData)
 }
 
-/// Installs a process-wide panic hook that persists a diagnosable record and
-/// then chains to the hook it replaced. Idempotent: later calls do nothing.
 pub fn install_panic_hook(product: &'static str) {
+    install_panic_hook_with_version(product, crate::VERSION);
+}
+
+pub fn install_panic_hook_with_version(product: &'static str, version: &'static str) {
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let _ = DIAGNOSTIC_PRODUCT.set(product);
-    // Open the file now so the hook never creates a directory while unwinding.
-    let _ = crash_log();
+    if let Some(product) = crate::diagnostics::Product::from_name(product) {
+        crate::diagnostics::initialize(product, version);
+    }
+    crate::diagnostics::record(crate::diagnostics::Event::Startup);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        report_panic(product, panic);
-        previous(panic);
+        if REPORTING_PANIC
+            .try_with(|reporting| reporting.replace(true))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let recovered = RECOVERED_PANIC_DEPTH
+            .try_with(|depth| depth.get())
+            .unwrap_or(0)
+            > 0;
+        crate::diagnostics::record_panic(recovered);
+        // Payloads/backtraces can contain secrets. Only a user-requested local
+        // debug capture invokes the raw default hook.
+        if crate::diagnostics::local_debug() {
+            previous(panic);
+        }
+        let _ = REPORTING_PANIC.try_with(|reporting| reporting.set(false));
     }));
 }
 
-fn report_panic(product: &str, panic: &std::panic::PanicHookInfo<'_>) {
-    // Thread-local state is gone during thread teardown; report anyway rather
-    // than lose the record.
-    if REPORTING_PANIC
-        .try_with(|reporting| reporting.replace(true))
-        .unwrap_or(false)
-    {
-        return;
-    }
-    let _reset = ReportingReset;
-    let recovered = RECOVERED_PANIC_DEPTH
-        .try_with(|depth| depth.get())
-        .unwrap_or(0)
-        > 0;
-    let thread = std::thread::current();
-    let message = panic_message(panic.payload());
-    let location = panic.location();
-    let mut record = format!(
-        "--- {product} {} pid={} thread={} at_unix_ms={} ---\n",
-        if recovered {
-            "recovered panic"
-        } else {
-            "panic"
-        },
-        process::id(),
-        thread.name().unwrap_or("<unnamed>"),
-        unix_millis(),
-    );
-    if let Some(location) = location {
-        record.push_str(&format!(
-            "location: {}:{}:{}\n",
-            location.file(),
-            location.line(),
-            location.column()
-        ));
-    }
-    record.push_str(&format!("message: {message}\n"));
-    if !recovered {
-        // A fatal panic is the one report nobody can reproduce on demand, and
-        // `capture` honours RUST_BACKTRACE, so a desktop launch - which never
-        // sets it - left every crash record with nothing but a location. The
-        // process is already dying here, so symbolization costs nothing that
-        // matters. A recovered fault is a routine event on some paths and
-        // still pays nothing.
-        record.push_str(&format!(
-            "backtrace:\n{}\n",
-            std::backtrace::Backtrace::force_capture()
-        ));
-    }
-    append_crash_record(&record);
+pub fn report_startup_failure() {
+    crate::diagnostics::record(crate::diagnostics::Event::StartupFailed);
 }
 
-struct ReportingReset;
-
-impl Drop for ReportingReset {
-    fn drop(&mut self) {
-        let _ = REPORTING_PANIC.try_with(|reporting| reporting.set(false));
-    }
-}
-
-fn panic_message<'a>(payload: &'a (dyn std::any::Any + Send)) -> &'a str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("<non-string panic>")
-}
-
-/// Records a startup failure next to the crash reports. Panics were already
-/// durable; an ordinary `Err` from the startup sequence was not, even though
-/// it is the failure a desktop launch hits most often.
-pub fn report_startup_failure(error: &str) {
-    append_crash_record(&format!(
-        "--- {} startup failure pid={} at_unix_ms={} ---\nmessage: {}\n",
-        DIAGNOSTIC_PRODUCT.get().copied().unwrap_or("cagents"),
-        process::id(),
-        unix_millis(),
-        error.replace('\n', " "),
-    ));
-}
-
-/// Installs the process-wide tracing subscriber. Output goes to a bounded
-/// rolling file under the data directory, and additionally to stderr when a
-/// terminal is attached. `RUST_LOG` wins; `default_filter` is the fallback.
-/// Idempotent: later calls do nothing.
-pub fn install_tracing(product: &'static str, default_filter: &str) {
+pub fn install_tracing(_product: &'static str, default_filter: &str) {
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let _ = DIAGNOSTIC_PRODUCT.set(product);
-    install_global_subscriber(product, default_filter);
+    install_global_subscriber(default_filter);
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
-fn install_global_subscriber(product: &'static str, default_filter: &str) {
-    use std::io::IsTerminal;
+fn install_global_subscriber(default_filter: &str) {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-    let sink = DiagnosticSink {
-        file: TRACE_LOG
-            .get_or_init(|| open_diagnostic(product, ".log", MAX_LOG_BYTES))
-            .as_ref(),
-        stderr: io::stderr().is_terminal(),
-    };
+    let enabled = crate::diagnostics::local_debug();
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
-        // Upstream network/keyring info/debug events contain cookie values and raw
-        // headers. This mandatory filter intersects RUST_LOG; no user-provided
-        // target or span directive can enable those credential-bearing events.
-        .with(tracing_subscriber::filter::filter_fn(|metadata| {
-            !cfg!(feature = "integrated-browser")
-                || !sensitive_browser_diagnostic(metadata.target(), metadata.level())
+        .with(tracing_subscriber::filter::filter_fn(move |metadata| {
+            enabled
+                && (!cfg!(feature = "integrated-browser")
+                    || !sensitive_browser_diagnostic(metadata.target(), metadata.level()))
         }))
-        // The same formatted bytes reach the file and the terminal, so escape
-        // sequences would end up in the artifact the user attaches.
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(sink),
+                .with_writer(io::stderr),
         )
         .try_init();
 }
@@ -600,57 +383,8 @@ fn sensitive_browser_diagnostic(target: &str, level: &tracing::Level) -> bool {
             })
 }
 
-// `tracing-subscriber` is linked only into the UI and daemon builds. The entry
-// point stays callable in every lane so no caller needs feature-dependent code.
 #[cfg(not(any(feature = "host", feature = "ui")))]
-fn install_global_subscriber(_product: &'static str, _default_filter: &str) {}
-
-#[cfg(any(feature = "host", feature = "ui"))]
-struct DiagnosticSink {
-    file: Option<&'static Mutex<RotatingFile>>,
-    stderr: bool,
-}
-
-#[cfg(any(feature = "host", feature = "ui"))]
-struct DiagnosticWriter<'a>(&'a DiagnosticSink);
-
-#[cfg(any(feature = "host", feature = "ui"))]
-impl Write for DiagnosticWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        // The fmt layer hands over one fully formatted event per call, so
-        // taking the lock once here is what keeps events from interleaving.
-        if let Some(file) = self.0.file {
-            let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = file.write_all(buf);
-        }
-        if self.0.stderr {
-            let _ = io::stderr().write_all(buf);
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if let Some(file) = self.0.file {
-            let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = file.flush();
-        }
-        Ok(())
-    }
-}
-
-#[cfg(any(feature = "host", feature = "ui"))]
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticSink {
-    type Writer = DiagnosticWriter<'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        DiagnosticWriter(self)
-    }
-}
+fn install_global_subscriber(_default_filter: &str) {}
 
 pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
     validate_window_slot(slot)?;
@@ -2036,35 +1770,6 @@ mod tests {
             }
         });
         assert_eq!(seen.load(Ordering::Relaxed), 4);
-    }
-
-    #[test]
-    fn diagnostic_logs_stay_bounded_and_private() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("nested").join("product-crash.log");
-        let mut log = RotatingFile::open(path.clone(), 64).unwrap();
-        for index in 0..64 {
-            writeln!(log, "record {index} ------------------------------").unwrap();
-        }
-        log.flush().unwrap();
-
-        let mut retained = path.clone().into_os_string();
-        retained.push(".1");
-        // A panic loop must cost two bounded generations, not one file that
-        // grows until the data directory is full.
-        assert!(fs::metadata(&path).unwrap().len() <= 128);
-        assert!(fs::metadata(PathBuf::from(retained)).unwrap().len() <= 128);
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 2);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            PRIVATE_FILE_MODE
-        );
-
-        let target = directory.path().join("target");
-        File::create(&target).unwrap();
-        let link = directory.path().join("link.log");
-        symlink(&target, &link).unwrap();
-        assert!(RotatingFile::open(link, 64).is_err());
     }
 
     #[test]

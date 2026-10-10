@@ -31,6 +31,7 @@ pub(crate) mod daemon_health;
 pub mod design;
 pub mod device;
 pub mod device_service;
+pub mod diagnostics;
 #[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]

@@ -3,13 +3,16 @@
 //! Catch at service boundaries, after unwinding has released the step's
 //! guards. Retryable services consult their durable registries again; other
 //! services report their unavailability. The panic hook still records
-//! the original failure and backtrace.
+//! a typed recovered-panic event; explicit local debug capture includes detail.
 pub(super) fn attempt<T>(
     service: &str,
     work: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-        .unwrap_or_else(|_| Err(format!("{service} panicked; see cagentsd-crash.log")))
+    let result = {
+        let _recovered = crate::instance::recovered_panic_scope();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+    };
+    result.unwrap_or_else(|_| Err(format!("{service} panicked; inspect `cagents diagnostics`")))
 }
 
 #[cfg(test)]

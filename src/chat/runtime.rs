@@ -371,33 +371,36 @@ impl Handle {
                     started: Instant::now(),
                     write_started: None,
                 };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ready_to_begin
-                        .recv()
-                        .map_err(|_| "Provider startup was cancelled".to_string())?;
-                    if actor.stop.load(Ordering::Acquire) {
-                        let _ = started.send(Err("Provider startup was cancelled".to_string()));
-                        return Ok(());
-                    }
-                    let child = if actor.native_holder.is_some() {
-                        Ok(None)
-                    } else {
-                        spawn_provider(&spec, &actor.stop)
-                    };
-                    let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
-                    actor.child = child?;
-                    match spec.transport {
-                        TransportSpec::JsonLines => actor.run(initial),
-                        TransportSpec::UnixWebSocket {
-                            socket,
-                            device,
-                            inode,
-                        } => actor.run_websocket(initial, &socket, device, inode),
-                        TransportSpec::OwnedUnixWebSocket { socket } => {
-                            actor.run_launched_websocket(initial, &socket)
+                let result = {
+                    let _recovered = crate::instance::recovered_panic_scope();
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ready_to_begin
+                            .recv()
+                            .map_err(|_| "Provider startup was cancelled".to_string())?;
+                        if actor.stop.load(Ordering::Acquire) {
+                            let _ = started.send(Err("Provider startup was cancelled".to_string()));
+                            return Ok(());
                         }
-                    }
-                }))
+                        let child = if actor.native_holder.is_some() {
+                            Ok(None)
+                        } else {
+                            spawn_provider(&spec, &actor.stop)
+                        };
+                        let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
+                        actor.child = child?;
+                        match spec.transport {
+                            TransportSpec::JsonLines => actor.run(initial),
+                            TransportSpec::UnixWebSocket {
+                                socket,
+                                device,
+                                inode,
+                            } => actor.run_websocket(initial, &socket, device, inode),
+                            TransportSpec::OwnedUnixWebSocket { socket } => {
+                                actor.run_launched_websocket(initial, &socket)
+                            }
+                        }
+                    }))
+                }
                 .unwrap_or_else(|_| {
                     Err("Native chat worker panicked; exact provider state is unconfirmed".into())
                 });
