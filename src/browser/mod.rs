@@ -16,7 +16,9 @@ mod runtime;
 mod types;
 mod widget;
 
-pub use fallback::{RawWaylandSubsurfaceFactory, WaylandSubsurfaceFactory, WaylandSubsurfaceLease};
+pub use fallback::{
+    CapabilityProbe, RawWaylandSubsurfaceFactory, WaylandSubsurfaceFactory, WaylandSubsurfaceLease,
+};
 pub use handle::BrowserHandle;
 pub use import::{ImportReport, ImportRequest};
 pub use types::{

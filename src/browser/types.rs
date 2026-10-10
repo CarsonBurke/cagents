@@ -336,6 +336,8 @@ pub enum BrowserEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BrowserError {
+    #[error("{0}")]
+    Capability(crate::capability::BrowserUnavailable),
     #[error("browser command queue is full")]
     CommandQueueFull,
     #[error("browser thread has stopped")]

@@ -1,6 +1,6 @@
 # Browser accessibility
 
-A browser pane exposes an application-owned **Browser host** group around its toolbar and content. The group identifies its card and sanitized location, reports model focus, browser capability, and loading, ready, failed, suspended, or unavailable state. Its identity remains stable across state updates. Toolbar controls retain their own accessibility nodes and keyboard behavior.
+A browser pane exposes an application-owned **Browser host** group around its toolbar and content. The group identifies its card and sanitized location, reports model focus, browser capability, and loading, ready, failed, suspended, or unavailable state. Its identity remains stable across state updates. When the integrated embedding is unavailable, it includes the closed, typed [Wayland capability reason](browser-wayland.md), including exact missing required protocol names. Toolbar controls retain their own accessibility nodes and keyboard behavior.
 
 Embedded webpages currently have no supported DOM accessibility bridge. The host group does not expose webpage text, forms, or a synthetic document tree. Use **Open in system browser** to access the webpage with your browser's accessibility support. This action is available in integrated and browserless builds, reads the current saved URL when activated, and reports its result with the originating card identity. It preserves the application's focused pane. Opening externally leaves the saved browser descriptor intact.
 

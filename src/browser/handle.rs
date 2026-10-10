@@ -390,6 +390,17 @@ impl BrowserHandle {
         visible: bool,
         fallback: Option<Arc<dyn WaylandSubsurfaceFactory>>,
     ) -> Result<Self, BrowserError> {
+        match fallback.as_ref().map(|factory| factory.availability()) {
+            Some(super::CapabilityProbe::Available) => {}
+            Some(super::CapabilityProbe::Unavailable(reason)) => {
+                return Err(BrowserError::Capability(reason));
+            }
+            _ => {
+                return Err(BrowserError::Capability(
+                    crate::capability::BrowserUnavailable::ParentUnavailable,
+                ));
+            }
+        }
         let mailbox = CommandMailbox::new();
         let events = EventBus::new();
         let (teardown, teardown_done) = crossbeam_channel::bounded(0);

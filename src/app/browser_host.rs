@@ -58,12 +58,13 @@ pub(super) fn surface<'a, Message: 'a>(
     capability: BrowserCapability,
     load: LoadState,
     focused: bool,
+    unavailable: Option<crate::capability::BrowserUnavailable>,
     content: Element<'a, Message>,
 ) -> Element<'a, Message> {
     Element::new(Host {
         id: card_control_id(card, "browser.host"),
         description: format!(
-            "Browser card {card}. Location: {}. {}. {}. {}. Embedded webpage accessibility is unavailable. Use Open in system browser to access the webpage in your browser.",
+            "Browser card {card}. Location: {}. {}. {}. {}. {}Embedded webpage accessibility is unavailable. Use Open in system browser to access the webpage in your browser.",
             location.as_str(),
             match capability {
                 BrowserCapability::Integrated => "Integrated browser",
@@ -71,6 +72,9 @@ pub(super) fn surface<'a, Message: 'a>(
             },
             load.label(),
             if focused { "Focused" } else { "Not focused" },
+            unavailable
+                .map(|reason| format!("{reason} "))
+                .unwrap_or_default(),
         ),
         content,
     })
@@ -255,8 +259,24 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Host<'_, Mess
 }
 
 impl Cagents {
+    pub(super) fn browser_unavailable_reason(
+        &self,
+    ) -> Option<crate::capability::BrowserUnavailable> {
+        #[cfg(feature = "integrated-browser")]
+        {
+            self.browser_backend.unavailable()
+        }
+        #[cfg(not(feature = "integrated-browser"))]
+        {
+            None
+        }
+    }
+
     pub(super) fn browser_host_load(&self, card: CardId) -> LoadState {
         if BrowserCapability::current() == BrowserCapability::ExternalOnly {
+            return LoadState::Unavailable;
+        }
+        if self.browser_unavailable_reason().is_some() {
             return LoadState::Unavailable;
         }
         match self.cards.get(&card) {
@@ -380,6 +400,7 @@ mod tests {
                 capability,
                 state,
                 focused,
+                None,
                 Element::new(Probe),
             );
             let tree = retained.get_or_insert_with(|| Tree::new(&element));
@@ -456,6 +477,7 @@ mod tests {
                 BrowserCapability::Integrated,
                 LoadState::Loading,
                 false,
+                None,
                 iced::widget::Space::new().into(),
             )
         };
@@ -515,6 +537,7 @@ mod tests {
                 capability,
                 load,
                 true,
+                None,
                 crate::ui_controls::button::secondary("Open in system browser")
                     .id(id.clone())
                     .on_press(())
@@ -624,6 +647,7 @@ mod tests {
                 BrowserCapability::Integrated,
                 LoadState::Ready,
                 false,
+                None,
                 iced::widget::Space::new().into(),
             );
             let tree = Tree::new(&element);
@@ -648,6 +672,7 @@ mod tests {
             BrowserCapability::Integrated,
             LoadState::Ready,
             true,
+            None,
             crate::ui_controls::button::secondary("Open in system browser")
                 .id(id.clone())
                 .on_press(card)
@@ -773,5 +798,39 @@ mod tests {
         assert!(user_workspace_message_blocked_while_modal(
             &Message::OpenBrowserInSystem(card)
         ));
+    }
+    #[test]
+    fn missing_protocol_is_exact_in_host_semantics_without_registry_payloads() {
+        let missing = crate::capability::MissingWaylandProtocols::from_advertised([
+            ("wl_compositor", 1),
+            ("wl_subcompositor", 1),
+            ("page-secret-token", 99),
+        ]);
+        let card = CardId::new();
+        let location =
+            SanitizedLocation::from(&Url::parse("https://example.test/?secret=private").unwrap());
+        let element: Element<'_, ()> = surface(
+            card,
+            &location,
+            BrowserCapability::Integrated,
+            LoadState::Unavailable,
+            true,
+            Some(crate::capability::BrowserUnavailable::MissingProtocols(
+                missing,
+            )),
+            iced::widget::Space::new().into(),
+        );
+        let tree = Tree::new(&element);
+        let node = layout::Node::new(Size::new(400.0, 200.0));
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let description = accessible.root()[0].node().description().unwrap();
+        assert!(description.contains("Unavailable"));
+        assert!(description.contains("missing required Wayland protocols: wp_viewporter"));
+        assert!(description.contains("Open in system browser"));
+        assert!(!format!("{accessible:?}").contains("secret"));
+        assert!(!format!("{accessible:?}").contains("private"));
     }
 }
