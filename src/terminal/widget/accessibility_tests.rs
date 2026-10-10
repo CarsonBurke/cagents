@@ -674,11 +674,50 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
         ),
     );
     assert_no_pty_input(&peer.fence());
-    {
-        let state = tree.state.downcast_ref::<WidgetState>();
-        state.a11y.borrow_mut().move_review(0, 1, true);
-        assert!(state.a11y.borrow().selection.is_some());
-    }
+    // The projection is intentionally lazy until a native tree is requested.
+    // Mount that tree before addressing its actual emitted text-run node.
+    let layout = layout::Node::new(Size::new(640.0, 320.0));
+    let published = widget.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+    let run = published
+        .children()
+        .iter()
+        .find(|node| node.node().role() == iced_accessibility::accesskit::Role::TextRun)
+        .unwrap()
+        .id()
+        .clone()
+        .into();
+    let selection = iced_accessibility::accesskit::TextSelection {
+        anchor: iced_accessibility::accesskit::TextPosition {
+            node: run,
+            character_index: 0,
+        },
+        focus: iced_accessibility::accesskit::TextPosition {
+            node: run,
+            character_index: 1,
+        },
+    };
+    assert_eq!(
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            action(
+                published.root()[0].id().clone(),
+                Action::SetTextSelection,
+                Some(ActionData::SetTextSelection(selection))
+            )
+        ),
+        vec![Message::Review(true)]
+    );
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection
+            .is_some()
+    );
+    assert_no_pty_input(&peer.fence());
     widget = self::widget(&replacement, "remount-card", barrier, true, true);
     widget.review_revision = 5;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
