@@ -517,7 +517,7 @@ impl Runtime {
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
-        iced::widget::hover(
+        hover::view(
             widget::row::with_children(vec![header.into(), widget::Space::new().width(24).into()])
                 .align_y(Alignment::Center)
                 .spacing(GAP_XS)

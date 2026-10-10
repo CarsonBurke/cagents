@@ -4226,10 +4226,119 @@ mod tests {
                         && node.node().label() == Some(name)),
                     "row action must name its exact target"
                 );
+                // RichText has no separate accessible leaf in this pinned
+                // widget graph; the mounted row's exact name carries its
+                // target, while the preview cache preserves the drawn bytes.
+                let row = nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some(name))
+                    .unwrap()
+                    .id()
+                    .clone();
+                let copy = nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some("Copy this message"))
+                    .unwrap()
+                    .id()
+                    .clone();
+                use iced_accessibility::{
+                    A11yId,
+                    accesskit::{Action as A11yAction, ActionRequest, TreeId},
+                };
+                let event = |id: A11yId, action| {
+                    let A11yId::Widget(widget) = id.clone() else {
+                        panic!("widget identity required")
+                    };
+                    iced::Event::A11y(
+                        widget,
+                        ActionRequest {
+                            action,
+                            target_tree: TreeId::ROOT,
+                            target_node: id.into(),
+                            data: None,
+                        },
+                    )
+                };
+                let mut dispatch = |event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut iced::advanced::Shell::new(&mut messages),
+                        &iced::Rectangle::with_size(iced::Size::new(520.0, 1000.0)),
+                    );
+                    messages
+                };
+                let unknown = A11yId::from(iced::advanced::widget::Id::unique());
+                assert!(dispatch(event(unknown.clone(), A11yAction::Click)).is_empty());
+                assert!(dispatch(event(unknown, A11yAction::Focus)).is_empty());
+                let mut mismatched = event(row.clone(), A11yAction::Click);
+                if let iced::Event::A11y(_, request) = &mut mismatched {
+                    request.target_node = copy.clone().into();
+                }
+                assert!(dispatch(mismatched).is_empty());
+                let mut wrong_tree = event(row.clone(), A11yAction::Click);
+                if let iced::Event::A11y(_, request) = &mut wrong_tree {
+                    request.target_tree = TreeId(uuid::Uuid::new_v4());
+                }
+                assert!(dispatch(wrong_tree).is_empty());
+                let toggled = dispatch(event(row.clone(), A11yAction::Click));
+                assert_eq!(toggled.len(), 1);
                 assert!(
-                    nodes.iter().any(|node| node.node().value() == Some(target)
-                        || node.node().label() == Some(target)),
-                    "rendered preview must keep the actual filename/pattern: {target}"
+                    matches!(&toggled[0], Message::ChatUi(Action::Toggle(actual, id))
+                    if *actual == runtime.target && id == &item.id)
+                );
+                let copied = dispatch(event(copy.clone(), A11yAction::Click));
+                assert_eq!(copied.len(), 1);
+                assert!(
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text))
+                    if *actual == runtime.target && id == &item.id)
+                );
+                assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
+                drop(dispatch);
+                // Keep the actual widget state mounted through diff. AT focus
+                // makes the hover control keyboard-visible without a pointer.
+                tree.diff(element.as_widget_mut());
+                let enter = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Enter,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                let mut dispatch = |event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut iced::advanced::Shell::new(&mut messages),
+                        &iced::Rectangle::with_size(iced::Size::new(520.0, 1000.0)),
+                    );
+                    messages
+                };
+                assert!(dispatch(event(row, A11yAction::Blur)).is_empty());
+                let copied = dispatch(enter.clone());
+                assert_eq!(copied.len(), 1);
+                assert!(
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text))
+                    if *actual == runtime.target && id == &item.id)
+                );
+                assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());
+                assert!(
+                    dispatch(enter).is_empty(),
+                    "cleared hidden Copy focus must not consume Enter"
                 );
             }
         }

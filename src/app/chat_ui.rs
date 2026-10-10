@@ -15,6 +15,7 @@ use std::sync::{
 mod clipboard_image;
 mod completion;
 mod fold;
+mod hover;
 mod images;
 mod layout;
 mod markdown_source;
