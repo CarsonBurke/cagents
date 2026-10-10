@@ -25,6 +25,7 @@ Options:
   --new-window              Open an additional window instead of reusing one
   --window NAME             Open or focus the window saved under NAME
   --from-window NAME        Adopt the session state of the window named NAME
+  -V, --version             Show the compiled version
   -h, --help                Show this help
 ";
 
@@ -193,7 +194,7 @@ struct Options<'a> {
 }
 
 /// `Ok(None)` means the request was answered without opening a window, which
-/// only `--help` does.
+/// informational flags do.
 fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std::error::Error>> {
     let mut arguments = arguments.iter().map(String::as_str);
     let mut options = Options {
@@ -214,6 +215,10 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
             }
             "--help" | "-h" => {
                 print!("{USAGE}");
+                return Ok(None);
+            }
+            "--version" | "-V" => {
+                println!("{PRODUCT} {}", cagents::VERSION);
                 return Ok(None);
             }
             // Naming the accepted arguments matters more here than for most

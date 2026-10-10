@@ -281,7 +281,7 @@ Package: $PACKAGE_NAME
 Version: $VERSION
 Architecture: $DEB_ARCH
 Maintainer: cagents contributors <maintainers@cagents.dev>
-Depends: ca-certificates, curl, git (>= 2.36), libc6 (>= 2.35), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
+Depends: ca-certificates, tzdata, curl, git (>= 2.36), libc6 (>= 2.35), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
 Recommends: gh
 Section: devel
 Priority: optional

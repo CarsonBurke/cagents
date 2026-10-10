@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Executed exclusively inside the offline disposable rootfs by the public runner.
+set -euo pipefail
+artifact=$1
+version=$2
+mkdir -m 700 /run/fixture
+[[ $(dpkg --print-architecture) == amd64 ]] || { printf 'artifact smoke: wrong rootfs architecture\n' >&2; exit 1; }
+mkdir -p /root/data/cagents /root/config/cagents /root/config/ceditor /usr/local/share
+printf 'unrelated-system-file\n' > /usr/local/share/cagents-smoke-sentinel
+for directory in /root/data/cagents /root/config/cagents /root/config/ceditor; do
+    printf 'saved-user-data\n' > "$directory/smoke-sentinel"
+done
+fail() { printf 'artifact smoke: %s\n' "$*" >&2; exit 1; }
+[[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]] || fail 'runtime timezone database is unavailable'
+daemon_cli=
+cleanup() {
+    if [[ -n $daemon_cli ]]; then
+        "$daemon_cli" --json daemon stop-for-rebuild --including-subagents > /tmp/cleanup-status 2>&1 || :
+    fi
+}
+trap cleanup EXIT
+case $artifact in
+    cagents-browserless*) product=cagents-browserless ;;
+    cagents*) product=cagents ;;
+    ceditor*) product=ceditor ;;
+    *) fail 'unexpected artifact' ;;
+esac
+case $artifact in
+    *.deb)
+        [[ $(dpkg-deb -f /artifact Package) == "$product" ]] || fail 'wrong Debian package identity'
+        [[ $(dpkg-deb -f /artifact Version) == "$version" ]] || fail 'wrong Debian package version'
+        dpkg-deb --fsys-tarfile /artifact | tar --numeric-owner -tvf - > /tmp/members
+        awk '$2 != "0/0" { exit 1 }' /tmp/members || fail 'package members must be root-owned'
+        # Real install/configure executes the packaged preinst. Dependencies
+        # must be satisfied in the supplied distribution rootfs.
+        dpkg --install /artifact
+        dpkg-query -L "$product" > /tmp/owned-files
+        binaries=/usr/libexec/$product
+        public_command=/usr/bin/$product ;;
+    *.tar.gz)
+        tar --numeric-owner -tvzf /artifact > /tmp/members
+        awk '$2 != "0/0" { exit 1 }' /tmp/members || fail 'archive members must be root-owned'
+        mkdir /tmp/extracted
+        tar -xzf /artifact -C /tmp/extracted
+        binaries=/tmp/extracted/$product-$version/bin
+        public_command=$binaries/$product ;;
+    *) fail 'unexpected artifact type' ;;
+esac
+if [[ $product == ceditor ]]; then
+    executables=(ceditor)
+else
+    executables=(cagents cagents-ui cagentsd)
+fi
+for executable in "${executables[@]}"; do
+    [[ -f $binaries/$executable && ! -L $binaries/$executable && -x $binaries/$executable ]] || fail "missing executable: $executable"
+    actual=$("$binaries/$executable" --version)
+    [[ $actual == "$executable $version" ]] || fail "wrong shipped version: $actual"
+    "$binaries/$executable" --help > /tmp/help
+    [[ -s /tmp/help ]] || fail "empty help: $executable"
+done
+if [[ $product != ceditor ]]; then
+    [[ -x $public_command && $(readlink -f "$public_command") == "$(readlink -f "$binaries/cagents")" ]] || fail 'broken public command entrypoint'
+    [[ $("$public_command" --version) == "cagents $version" ]] || fail 'public command version mismatch'
+    daemon_cli=$public_command
+    "$daemon_cli" --json daemon status > /tmp/status
+    jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null
+    "$daemon_cli" --json daemon start > /tmp/start
+    jq -e '.ok == true and .command == "daemon.start" and .data.running == true' /tmp/start >/dev/null
+    "$daemon_cli" --json daemon status > /tmp/status
+    jq -e --arg version "$version" '.ok == true and .command == "daemon.status" and .data.running == true and .data.instance == "production" and .data.daemon_version == $version and .data.cli_version == $version and .data.socket == "/run/fixture/cagents/cagentsd.sock"' /tmp/status >/dev/null
+    pid=$(jq -er '.pid | select(type == "number" and . > 1)' /run/fixture/cagents/cagentsd.lock)
+    daemon_executable=$(readlink -f "$binaries/cagentsd")
+    [[ $(readlink "/proc/$pid/exe") == "$daemon_executable" ]] || fail 'daemon did not use the packaged sibling'
+    start=$(awk '{print $22}' "/proc/$pid/stat")
+    same_daemon() {
+        local executable current_start
+        executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+        [[ $executable == "$daemon_executable" ]] || return 1
+        current_start=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null) || return 1
+        [[ $current_start == "$start" ]]
+    }
+    "$daemon_cli" --json terminal list > /tmp/terminals
+    jq -e '.ok == true and .command == "terminal.list" and .data.terminals == []' /tmp/terminals >/dev/null
+    if [[ $artifact == *.deb ]]; then
+        if dpkg --remove "$product" > /tmp/live-remove 2>&1; then fail 'removal allowed a live daemon'; fi
+        same_daemon || fail 'refused removal changed the daemon'
+        "$daemon_cli" --json daemon status > /tmp/status
+        jq -e --arg version "$version" '.ok == true and .data.running == true and .data.daemon_version == $version' /tmp/status >/dev/null
+    fi
+    "$daemon_cli" --json daemon stop-for-rebuild --including-subagents > /tmp/stop
+    jq -e '.ok == true and .command == "daemon.stop_for_rebuild" and .data.stopped == true' /tmp/stop >/dev/null
+    for attempt in {1..100}; do
+        "$daemon_cli" --json daemon status > /tmp/status
+        if jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null; then break; fi
+        sleep 0.05
+    done
+    jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null
+    for attempt in {1..100}; do
+        if ! same_daemon; then break; fi
+        sleep 0.05
+    done
+    if same_daemon; then fail 'daemon process did not exit'; fi
+    daemon_cli=
+fi
+case $artifact in
+    *.deb)
+        dpkg --remove "$product"
+        while IFS= read -r path; do
+            [[ -d $path ]] && continue
+            [[ ! -e $path && ! -L $path ]] || fail "package-owned file remains: $path"
+        done < /tmp/owned-files ;;
+    *) rm -rf -- "/tmp/extracted/$product-$version" ;;
+esac
+[[ $(cat /usr/local/share/cagents-smoke-sentinel) == unrelated-system-file ]] || fail 'unrelated system file changed'
+for directory in /root/data/cagents /root/config/cagents /root/config/ceditor; do
+    [[ $(cat "$directory/smoke-sentinel") == saved-user-data ]] || fail 'saved user data changed'
+done

@@ -151,6 +151,7 @@ pub(super) fn perform(
         )?;
         let mut command = Command::new(root.join("bin/cagents"));
         command.args(["--json", "daemon", "start"]);
+        guard.inherit_for_install(&mut command)?;
         let started = bounded_command(
             &mut command,
             "installed daemon startup",

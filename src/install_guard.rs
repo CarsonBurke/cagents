@@ -114,6 +114,7 @@ impl ResultPipe {
 pub(crate) fn sanitize_child_environment(command: &mut Command) {
     for name in [
         crate::instance::INSTALL_GUARD_ENV,
+        crate::instance::DAEMON_FENCE_ENV,
         RESULT_FD_ENV,
         OWNER_CLI_ENV,
         "CAGENTS_ARCHIVE",
@@ -460,7 +461,7 @@ pub(crate) fn staged_owner_bin(
     }
     // Shared with every UI launch, exclusive against reviewed update/close.
     // Keep it through synchronous daemon recovery and ownership revalidation.
-    let _launch = crate::instance::recovery_launch_fence()?;
+    let launch = crate::instance::LaunchFence::recovery()?;
     let windows = crate::instance::verified_running_windows()?;
     let running = crate::daemon::running_executable().map_err(io::Error::other)?;
     let window_bin = window_owner_bin(&layout.prefix, &windows)?;
@@ -519,7 +520,7 @@ pub(crate) fn staged_owner_bin(
     if !recover {
         return Ok(Some(expected));
     }
-    restore_window_daemon(&expected)?;
+    restore_window_daemon(&expected, &launch)?;
     if crate::daemon::running_executable().map_err(io::Error::other)?
         != Some(expected.join("cagentsd"))
         || windows
@@ -562,7 +563,7 @@ fn window_owner_bin(
     Ok(owner)
 }
 
-fn restore_window_daemon(bin: &Path) -> io::Result<()> {
+fn restore_window_daemon(bin: &Path, launch: &crate::instance::LaunchFence) -> io::Result<()> {
     let mut command = Command::new(bin.join("cagents"));
     command
         .args(["daemon", "start"])
@@ -570,6 +571,7 @@ fn restore_window_daemon(bin: &Path) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     sanitize_child_environment(&mut command);
+    launch.inherit(&mut command)?;
     let mut child = command.spawn()?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

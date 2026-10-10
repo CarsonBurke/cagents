@@ -458,3 +458,20 @@ Directory protection covers both the pathname and a held directory identity. Mov
 Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
 
 Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).
+
+### Direct daemon admission
+
+A direct `cagentsd` start also observes surviving local windows. Before taking
+mutable daemon ownership, it holds the existing update launch fence and checks
+an authenticated protocol capability in each live window lease. The capability
+belongs to the exact kernel lease owner, process lifetime, boot, and executable;
+it does not depend on the installation pathname. Compatible windows can
+reconnect to a matched daemon, including development builds in their separate
+runtime namespace.
+
+An incompatible window, or an older window without this capability, refuses
+startup before socket or daemon state changes. Close that window through the
+reviewed handoff before starting the replacement. Unlocked stale lease records
+do not block startup. Public staged-owner routing and explicit reviewed update
+handoffs keep their existing ownership checks; admission does not stop windows
+or hosted terminals automatically.

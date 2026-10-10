@@ -1117,19 +1117,27 @@ pub(crate) mod tests {
         assert!(count >= 0);
         groups.truncate(count as usize);
         let primary = file.metadata().unwrap().gid();
-        let group = groups
-            .into_iter()
-            .find(|group| *group != primary)
-            .or_else(|| {
-                (unsafe { libc::geteuid() } == 0).then_some(if primary == 0 { 1 } else { 0 })
-            });
-        let Some(group) = group else {
-            eprintln!("shared ownership fixture requires another permitted group");
-            return None;
-        };
-        // SAFETY: the descriptor is live; -1 leaves its owner unchanged.
-        assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), !0, group) }, 0);
-        Some(group)
+        if unsafe { libc::geteuid() } == 0 {
+            groups.push(if primary == 0 { 1 } else { 0 });
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        for group in groups.into_iter().filter(|group| *group != primary) {
+            // Supplementary groups can be inherited but unmapped inside a
+            // rootless user namespace. Membership alone does not establish
+            // that this process can assign that group to an owned fixture.
+            // SAFETY: the descriptor is live; -1 leaves its owner unchanged.
+            if unsafe { libc::fchown(file.as_raw_fd(), !0, group) } == 0 {
+                return Some(group);
+            }
+            let error = io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)),
+                "shared ownership fixture: {error}"
+            );
+        }
+        eprintln!("shared ownership fixture requires another permitted group");
+        None
     }
 
     #[test]

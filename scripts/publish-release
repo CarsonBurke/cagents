@@ -10,6 +10,7 @@ REPOSITORY=CarsonBurke/cagents
 TARGET=x86_64-unknown-linux-gnu
 VERSION=
 VERIFY_ONLY=false
+SMOKE_ROOTFS=
 export LC_ALL=C
 
 fail() {
@@ -19,10 +20,12 @@ fail() {
 
 usage() {
     printf '%s\n' \
-        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--verify-only]' \
+        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--verify-only]' \
         'Validate an existing local bundle and publish it through authenticated gh.' \
         'Defaults: version from Cargo manifests; dist from CAGENTS_DIST_DIR or checkout/dist.' \
         '--verify-only validates local files and the local tag without network access.' \
+        'Both modes install/run/remove artifacts in private offline rootfs copies before publication.' \
+        '--smoke-rootfs overrides the runtime image prepared by the local release builder.' \
         'Publication requires the identical existing tag on github.com/CarsonBurke/cagents.' \
         'Only drafts owned by this local publisher for this exact bundle may be resumed.' \
         'This command never builds, runs Actions, creates tags, or changes published releases.'
@@ -30,10 +33,10 @@ usage() {
 
 while (($#)); do
     case $1 in
-        --version|--dist)
+        --version|--dist|--smoke-rootfs)
             (($# >= 2)) || fail "missing value for $1"
             [[ -n $2 ]] || fail "empty value for $1"
-            case $1 in --version) VERSION=$2 ;; --dist) DIST_DIR=$2 ;; esac
+            case $1 in --version) VERSION=$2 ;; --dist) DIST_DIR=$2 ;; --smoke-rootfs) SMOKE_ROOTFS=$2 ;; esac
             shift 2
             ;;
         --verify-only) VERIFY_ONLY=true; shift ;;
@@ -218,7 +221,7 @@ check_archive() {
 }
 
 check_asset_set "$DIST_DIR"
-WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cagents-publish.XXXXXX")
+WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
 cleanup() { rm -rf -- "$WORK_DIR"; }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -235,6 +238,9 @@ check_metadata "$DIST_DIR"
 check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
 check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
 check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
+smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
+if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
+"$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
 printf 'Validated %s: 13 assets, checksums, archive layouts, and source %s\n' "$TAG" "$SOURCE_COMMIT"
 if "$VERIFY_ONLY"; then
     exit 0
