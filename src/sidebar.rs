@@ -10938,6 +10938,13 @@ mod row_interaction {
                     .0
                     .set(layout.bounds().y + layout.virtual_offset().y);
             }
+            // The outer list translates every descendant together. Strip only
+            // its ancestor offset here; nested scrollables add their own offsets.
+            let child_layout = if matches!(self.kind, Kind::Reorder { project: None, .. }) {
+                layout.with_virtual_offset(cosmic::iced::Vector::ZERO)
+            } else {
+                layout
+            };
             let mut accessible = iced_accessibility::A11yTree::join(
                 self.children
                     .iter()
@@ -10945,7 +10952,7 @@ mod row_interaction {
                     .zip(child_layouts(
                         &self.kind,
                         tree.state.downcast_ref::<State>(),
-                        layout,
+                        child_layout,
                     ))
                     .map(|((child, tree), layout)| {
                         child.as_widget().a11y_nodes(layout, tree, cursor)
@@ -13582,7 +13589,13 @@ pub(crate) mod tests {
             .height(PROJECT_HEADER_HEIGHT)
             .on_press(SidebarAction::OpenRepositoryPicker);
         let members = RowInteraction::members(
-            widget::column::with_children(vec![button.into()]).into(),
+            widget::column::with_children(vec![
+                button.into(),
+                crate::ui_controls::editable::TextInput::new("Rename worktree", "nonce")
+                    .on_input(|_| SidebarAction::OpenRepositoryPicker)
+                    .into(),
+            ])
+            .into(),
             project_id(9),
             vec![row],
             Vec::new(),
@@ -13600,7 +13613,7 @@ pub(crate) mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, Size::new(240.0, 512.0)),
         );
-        let bounds = |offset| {
+        let bounds = |offset, label| {
             let accessible = element.as_widget().a11y_nodes(
                 Layout::new(&node).with_virtual_offset(Vector::new(0.0, offset)),
                 &tree,
@@ -13610,16 +13623,20 @@ pub(crate) mod tests {
                 .root()
                 .iter()
                 .chain(accessible.children())
-                .find(|node| node.node().label() == Some("Drag accessibility worktree"))
+                .find(|node| node.node().label() == Some(label))
                 .unwrap()
                 .node()
                 .bounds()
                 .unwrap()
         };
-        let normal = bounds(0.0);
-        let scrolled = bounds(40.0);
-        assert_eq!(scrolled.y0, normal.y0 - 40.0);
-        assert_eq!(scrolled.y1, normal.y1 - 40.0);
+        for label in ["Drag accessibility worktree", "Rename worktree"] {
+            let normal = bounds(0.0, label);
+            let scrolled = bounds(40.0, label);
+            assert_eq!(scrolled.y0, normal.y0 - 40.0);
+            assert_eq!(scrolled.y1, normal.y1 - 40.0);
+            assert_eq!(scrolled.x0, normal.x0);
+            assert_eq!(scrolled.x1, normal.x1);
+        }
     }
 
     #[test]

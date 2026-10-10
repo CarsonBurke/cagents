@@ -226,7 +226,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         ids.resize_with(self.content.line_count(), Id::unique);
         let mut node = Node::new(Role::MultilineTextInput);
         node.set_label(self.name.as_ref());
-        node.set_bounds(bounds(layout.bounds()));
+        node.set_bounds(bounds(layout.bounds() - layout.virtual_offset()));
         if self.on_action.is_none() {
             node.set_read_only();
             node.set_disabled();
@@ -261,7 +261,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
                 let text = format!("{}{}", line.text, line.ending.as_str());
                 run.set_character_lengths(character_lengths(&text));
                 run.set_value(text);
-                run.set_bounds(bounds(layout.bounds()));
+                run.set_bounds(bounds(layout.bounds() - layout.virtual_offset()));
                 A11yTree::leaf(run, ids[index].clone())
             })
             .collect::<Vec<_>>();
@@ -403,6 +403,27 @@ mod tests {
             );
             let layout = Layout::new(&node);
             let accessible = editor.a11y_nodes(layout, &tree, mouse::Cursor::Unavailable);
+            let shifted = editor.a11y_nodes(
+                layout.with_virtual_offset(cosmic::iced::Vector::new(11.0, 37.0)),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            for (normal, shifted) in accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .zip(shifted.root().iter().chain(shifted.children()))
+            {
+                assert_eq!(normal.id(), shifted.id());
+                if let Some(bounds) = normal.node().bounds() {
+                    let moved = shifted.node().bounds().unwrap();
+                    assert_eq!(moved.x0, bounds.x0 - 11.0);
+                    assert_eq!(moved.x1, bounds.x1 - 11.0);
+                    assert_eq!(moved.y0, bounds.y0 - 37.0);
+                    assert_eq!(moved.y1, bounds.y1 - 37.0);
+                }
+            }
+
             assert!(IdEq::eq(
                 accessible.root()[0].id(),
                 &A11yId::from(id.clone())

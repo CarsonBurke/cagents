@@ -359,7 +359,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextInput<'_
             Role::TextInput
         });
         node.set_label(self.name.as_ref());
-        node.set_bounds(bounds(layout.bounds()));
+        node.set_bounds(bounds(layout.bounds() - layout.virtual_offset()));
         if self.on_input.is_none() {
             node.set_disabled();
             node.set_read_only();
@@ -410,7 +410,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextInput<'_
         let mut run = Node::new(Role::TextRun);
         run.set_value(exposed.clone());
         run.set_character_lengths(character_lengths(&exposed));
-        run.set_bounds(bounds(layout.bounds()));
+        run.set_bounds(bounds(layout.bounds() - layout.virtual_offset()));
         A11yTree::node_with_child_tree(
             A11yNode::new(node, own.id.clone()),
             A11yTree::leaf(run, own.run_id.clone()),
@@ -569,6 +569,27 @@ mod tests {
         );
         let layout = Layout::new(&node);
         let accessible = input.a11y_nodes(layout, &tree, mouse::Cursor::Unavailable);
+        let shifted = input.a11y_nodes(
+            layout.with_virtual_offset(cosmic::iced::Vector::new(11.0, 37.0)),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+        for (normal, shifted) in accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .zip(shifted.root().iter().chain(shifted.children()))
+        {
+            assert_eq!(normal.id(), shifted.id());
+            if let Some(bounds) = normal.node().bounds() {
+                let moved = shifted.node().bounds().unwrap();
+                assert_eq!(moved.x0, bounds.x0 - 11.0);
+                assert_eq!(moved.x1, bounds.x1 - 11.0);
+                assert_eq!(moved.y0, bounds.y0 - 37.0);
+                assert_eq!(moved.y1, bounds.y1 - 37.0);
+            }
+        }
+
         assert!(IdEq::eq(accessible.root()[0].id(), &A11yId::from(id)));
         assert_eq!(accessible.root()[0].node().role(), Role::TextInput);
         assert_eq!(accessible.root()[0].node().label(), Some("Search settings"));
