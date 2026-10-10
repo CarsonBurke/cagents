@@ -7,6 +7,7 @@ use iced_accessibility::accesskit::{
 use iced_runtime::core;
 
 pub struct WinitActivationHandler {
+    pub event_loop: winit::event_loop::EventLoopProxy,
     pub proxy: mpsc::UnboundedSender<Control>,
     pub title: String,
     pub id: core::window::Id,
@@ -17,23 +18,17 @@ impl ActivationHandler for WinitActivationHandler {
     fn request_initial_tree(
         &mut self,
     ) -> Option<iced_accessibility::accesskit::TreeUpdate> {
-        let node_id = self.node_id;
-        let _ = self
-            .proxy
-            .unbounded_send(Control::AccessibilityEnabled(self.id, true));
-        let mut node = Node::new(Role::Window);
-        node.set_label(self.title.clone());
-        let root = NodeId(node_id);
-        Some(TreeUpdate {
-            tree_id: TreeId::ROOT,
-            nodes: vec![(root, node)],
-            tree: Some(Tree::new(root)),
-            focus: root,
-        })
+        send_control(
+            &self.proxy,
+            Control::AccessibilityEnabled(self.id, true),
+            || self.event_loop.wake_up(),
+        );
+        Some(activation_tree(self.node_id, self.title.clone()))
     }
 }
 
 pub struct WinitActionHandler {
+    pub event_loop: winit::event_loop::EventLoopProxy,
     pub id: core::window::Id,
     pub proxy: mpsc::UnboundedSender<Control>,
 }
@@ -43,13 +38,16 @@ impl iced_accessibility::accesskit::ActionHandler for WinitActionHandler {
         &mut self,
         request: iced_accessibility::accesskit::ActionRequest,
     ) {
-        let _ = self
-            .proxy
-            .unbounded_send(Control::Accessibility(self.id, request));
+        send_control(
+            &self.proxy,
+            Control::Accessibility(self.id, request),
+            || self.event_loop.wake_up(),
+        );
     }
 }
 
 pub struct WinitDeactivationHandler {
+    pub event_loop: winit::event_loop::EventLoopProxy,
     pub id: core::window::Id,
     pub proxy: mpsc::UnboundedSender<Control>,
 }
@@ -58,9 +56,37 @@ impl iced_accessibility::accesskit::DeactivationHandler
     for WinitDeactivationHandler
 {
     fn deactivate_accessibility(&mut self) {
-        let _ = self
-            .proxy
-            .unbounded_send(Control::AccessibilityEnabled(self.id, false));
+        send_control(
+            &self.proxy,
+            Control::AccessibilityEnabled(self.id, false),
+            || self.event_loop.wake_up(),
+        );
+    }
+}
+
+// Native accessibility callbacks can run off the event-loop thread. The
+// runner polls this control queue with a noop waker, so enqueueing alone cannot
+// wake an idle window. Wake only after admission, keeping the message available
+// when the event loop resumes; a retired runner needs no further wakeup.
+fn send_control(
+    proxy: &mpsc::UnboundedSender<Control>,
+    control: Control,
+    wake: impl FnOnce(),
+) {
+    if proxy.unbounded_send(control).is_ok() {
+        wake();
+    }
+}
+
+fn activation_tree(node_id: u64, title: String) -> TreeUpdate {
+    let root = NodeId(node_id);
+    let mut node = Node::new(Role::Window);
+    node.set_label(title);
+    TreeUpdate {
+        tree_id: TreeId::ROOT,
+        nodes: vec![(root, node)],
+        tree: Some(Tree::new(root)),
+        focus: root,
     }
 }
 
@@ -172,22 +198,35 @@ mod tests {
     }
 
     #[test]
-    fn activation_keeps_the_adapter_root_and_identifies_its_window() {
+    fn activation_keeps_the_adapter_root_and_title() {
+        let node_id = core::id::window_node_id();
+        let tree = activation_tree(node_id, "Window".into());
+        assert_eq!(tree.focus, NodeId(node_id));
+        assert_eq!(tree.nodes[0].0, NodeId(node_id));
+        assert_eq!(tree.nodes[0].1.label(), Some("Window"));
+    }
+
+    #[test]
+    fn native_control_is_available_when_the_idle_loop_is_woken() {
         let (proxy, mut receiver) = mpsc::unbounded();
         let id = core::window::Id::unique();
-        let node_id = core::id::window_node_id();
-        let mut handler = WinitActivationHandler {
-            proxy,
-            title: "Window".into(),
-            id,
-            node_id,
-        };
-        assert_eq!(
-            handler.request_initial_tree().unwrap().focus,
-            NodeId(node_id)
-        );
-        assert!(
-            matches!(receiver.try_next().unwrap(), Some(Control::AccessibilityEnabled(window, true)) if window == id)
+        send_control(&proxy, Control::AccessibilityEnabled(id, true), || {
+            assert!(matches!(
+                receiver.try_next().unwrap(),
+                Some(Control::AccessibilityEnabled(window, true)) if window == id
+            ));
+        });
+        assert!(receiver.try_next().is_err());
+    }
+
+    #[test]
+    fn retired_native_control_queue_does_not_wake_the_event_loop() {
+        let (proxy, receiver) = mpsc::unbounded();
+        drop(receiver);
+        send_control(
+            &proxy,
+            Control::AccessibilityEnabled(core::window::Id::unique(), false),
+            || panic!("closed runner must not be woken"),
         );
     }
 }
