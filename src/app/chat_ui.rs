@@ -8007,6 +8007,90 @@ pub(super) fn show_chat_snapshot_for_test(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::chat_ui::tests::remote_resume_command_preserves_draft_without_opening_desktop_history",
+                    "--nocapture",
+                ])
+                .env(CHILD, directory.path())
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_STATE_HOME", directory.path().join("state"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated remote resume test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let account_home = directory.join("claude");
+        std::fs::create_dir(&account_home).unwrap();
+        let account = crate::account::Account {
+            provider: Provider::Claude,
+            home: crate::account::AccountHome::Linked {
+                key: uuid::Uuid::new_v4(),
+                path: account_home,
+            },
+        };
+        let session = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            directory.clone(),
+            &account,
+        )
+        .unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.insert_chat_card(session, None, None));
+        let card = app.workspace.focused().unwrap();
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let target = runtime.target;
+        let draft = "/resume private project";
+        runtime.replace_draft(text_editor::Content::with_text(draft));
+        let original_draft = runtime.composer.text();
+
+        let configuration = crate::device::configuration_path().unwrap();
+        std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+        std::fs::write(
+            configuration,
+            br#"{"devices":[{"name":"fixture","host":"fixture.invalid"}]}"#,
+        )
+        .unwrap();
+        // Selection is configuration-only: no SSH or provider is started.
+        crate::device::select(Some("fixture")).unwrap();
+
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        assert!(!app.resume_ui.open);
+        assert_eq!(chat_runtime(&app, card).composer.text(), original_draft);
+        assert!(chat_runtime(&app, card).queued.is_none());
+        assert!(chat_runtime(&app, card).handle().is_none());
+        assert_eq!(
+            app.notices.recent().next().unwrap().notice.message,
+            "Conversation history is not available on remote devices yet"
+        );
+
+        // The picker entry itself also refuses callers that bypass update.
+        app.status = None;
+        drop(app.update_resume(super::super::resume_ui::Action::Open));
+        assert!(!app.resume_ui.open);
+        assert!(app.status.is_some());
+        assert!(app.open_resume_from(card, "private".into()).is_none());
+        assert_eq!(chat_runtime(&app, card).composer.text(), original_draft);
+    }
+
+    #[test]
     fn accepting_next_prompt_suggestion_preserves_newer_user_input_and_requires_exact_observation()
     {
         let mut app = crate::app::tests::context_inspector_test_app(false);

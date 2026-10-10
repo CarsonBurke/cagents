@@ -342,6 +342,16 @@ fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current
 }
 
 impl Cagents {
+    fn resume_history_is_available(&mut self) -> bool {
+        if crate::device::is_remote() {
+            self.status = Some(TransientNotice::warning(
+                "Conversation history is not available on remote devices yet",
+            ));
+            return false;
+        }
+        true
+    }
+
     pub(super) fn resume_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if !self.resume_ui.open {
             return None;
@@ -382,6 +392,11 @@ impl Cagents {
         card: CardId,
         query: String,
     ) -> Option<Task<Message>> {
+        // The composer calls this directly, before the normal message gate.
+        // Refuse before interpreting any host path on the displaying device.
+        if !self.resume_history_is_available() {
+            return None;
+        }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return None;
         };
@@ -416,7 +431,7 @@ impl Cagents {
     /// Opens the picker, or answers `None` while another dialog holds the
     /// window.
     fn open_resume(&mut self, scope: Option<Scope>) -> Option<Task<Message>> {
-        if self.modal_is_open() {
+        if !self.resume_history_is_available() || self.modal_is_open() {
             return None;
         }
         self.chrome_ui.close();
