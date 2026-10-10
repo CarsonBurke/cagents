@@ -1475,8 +1475,7 @@ mod tests {
         };
         store.earlier().unwrap();
         let earlier = store.window_reusing(&mut latest.items).unwrap();
-        let mut replayed = baseline;
-        crate::chat::presentation::Presentation {
+        let replayed = crate::chat::presentation::Presentation {
             children: Vec::new(),
             base_generation: 1,
             metadata: crate::chat::Snapshot {
@@ -1486,7 +1485,7 @@ mod tests {
             order: earlier.items.iter().map(|item| item.id.clone()).collect(),
             changes: earlier.changes,
         }
-        .apply(&mut replayed)
+        .apply(&baseline)
         .unwrap();
         assert_eq!(replayed.items, earlier.items);
     }

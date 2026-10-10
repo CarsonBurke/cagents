@@ -175,17 +175,18 @@ fn apply_items(
 }
 
 impl Presentation {
-    /// A malformed or missed patch never changes the installed snapshot,
+    /// Build a complete next publication from an immutable previous snapshot.
+    /// A malformed or missed patch cannot change the installed snapshot,
     /// including its child transcripts. Unchanged payloads remain shared.
-    pub fn apply(self, snapshot: &mut Snapshot) -> Result<(), &'static str> {
-        if self.base_generation != snapshot.generation
+    pub fn apply(self, previous: &Snapshot) -> Result<Snapshot, &'static str> {
+        if self.base_generation != previous.generation
             || self.metadata.generation <= self.base_generation
             || !self.metadata.items.is_empty()
         {
             return Err("Transcript revision mismatch");
         }
         let mut metadata = self.metadata;
-        metadata.items = apply_items(&snapshot.items, self.order, self.changes)?;
+        metadata.items = apply_items(&previous.items, self.order, self.changes)?;
         let mut children = HashMap::new();
         for child in self.children {
             if children.insert(child.id.clone(), child).is_some() {
@@ -199,18 +200,17 @@ impl Presentation {
             let child = children
                 .remove(&agent.id)
                 .ok_or("Missing child transcript")?;
-            let previous = snapshot
+            let previous_items = previous
                 .subagents
                 .iter()
                 .find(|old| old.id == agent.id)
                 .map_or(&[][..], |old| old.items.as_slice());
-            agent.items = apply_items(previous, child.order, child.changes)?;
+            agent.items = apply_items(previous_items, child.order, child.changes)?;
         }
         if !children.is_empty() {
             return Err("Unknown child transcript");
         }
-        *snapshot = metadata;
-        Ok(())
+        Ok(metadata)
     }
 }
 
@@ -249,9 +249,7 @@ mod tests {
         let delta_bytes = postcard::to_stdvec(&update).unwrap().len();
         assert!(full_bytes > 2 * 1024 * 1024);
         assert!(delta_bytes < 4096);
-        update
-            .apply(std::sync::Arc::make_mut(&mut installed))
-            .unwrap();
+        installed = std::sync::Arc::new(update.apply(&installed).unwrap());
         for (old, new) in retained_ui.items.iter().zip(&installed.items).take(127) {
             assert!(
                 std::sync::Arc::ptr_eq(old, new),
@@ -321,7 +319,7 @@ mod tests {
             }],
         };
         assert!(postcard::to_stdvec(&update).unwrap().len() < 1024);
-        update.apply(&mut snapshot).unwrap();
+        snapshot = update.apply(&snapshot).unwrap();
         assert_eq!(*snapshot.items[0], command);
         assert!(std::sync::Arc::ptr_eq(
             &child,
@@ -362,14 +360,14 @@ mod tests {
             busy: true,
             ..Snapshot::default()
         };
-        Presentation {
+        snapshot = Presentation {
             children: Vec::new(),
             base_generation: 4,
             metadata,
             order: vec!["new".into(), "answer".into()],
             changes: vec![change, ItemChange::Replace(text("new", "hello"))],
         }
-        .apply(&mut snapshot)
+        .apply(&snapshot)
         .unwrap();
         assert_eq!(snapshot.generation, 7);
         assert!(snapshot.busy);
@@ -394,7 +392,7 @@ mod tests {
             (1, 7, vec!["answer".into()]),
             (1, 8, vec!["unknown".into()]),
         ] {
-            let mut snapshot = Snapshot {
+            let snapshot = Snapshot {
                 generation: 1,
                 items: vec![old.clone().into()],
                 ..Snapshot::default()
@@ -417,7 +415,7 @@ mod tests {
                         suffix: "suffix".into()
                     }]
                 }
-                .apply(&mut snapshot)
+                .apply(&snapshot)
                 .is_err()
             );
             assert_eq!(snapshot, before);

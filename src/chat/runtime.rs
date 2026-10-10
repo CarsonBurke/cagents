@@ -4161,8 +4161,7 @@ mod tests {
             panic!("expected incremental update");
         };
         assert!(postcard::to_stdvec(&update).unwrap().len() < 4096);
-        let mut first = baseline.clone();
-        update.clone().apply(&mut first).unwrap();
+        let first = update.clone().apply(&baseline).unwrap();
         assert!(
             Arc::ptr_eq(&fixed, &first.items[0]),
             "unchanged payload is shared across snapshots"

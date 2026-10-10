@@ -1078,12 +1078,16 @@ impl ClientHandle {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                         let sampled_at = update.metadata.sampled_at;
-                        let applied = update.apply(Arc::make_mut(&mut state));
-                        if applied.is_ok() {
-                            SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
-                        }
+                        let applied = match update.apply(&state) {
+                            Ok(next) => {
+                                *state = Arc::new(next);
+                                SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                                true
+                            },
+                            Err(_) => false,
+                        };
                         drop(state);
-                        if applied.is_err() {
+                        if !applied {
                             resync = true;
                             read_again = true;
                         } else if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
@@ -2632,6 +2636,7 @@ mod tests {
             },
         };
         let initial = Snapshot {
+            sampled_at: Some(1000),
             generation: 1,
             items: vec![
                 Arc::new(text("fixed", &"x".repeat(128 * 1024))),
@@ -2642,6 +2647,7 @@ mod tests {
         let update = Presentation {
             base_generation: 1,
             metadata: Snapshot {
+                sampled_at: Some(2000),
                 generation: 2,
                 ..Default::default()
             },
@@ -2659,6 +2665,7 @@ mod tests {
         };
         let (client, mut server) = UnixStream::pair().unwrap();
         let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let (resync_tx, resync_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             server
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -2724,13 +2731,27 @@ mod tests {
             );
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let malformed = Presentation {
-                base_generation: 0,
+                base_generation: 2,
                 metadata: Snapshot {
+                    sampled_at: Some(999_999),
                     generation: 3,
+                    subagents: vec![super::super::Subagent {
+                        id: "missing-child-patch".into(),
+                        kind: "review".into(),
+                        description: String::new(),
+                        status: super::super::ToolStatus::Running,
+                        background: false,
+                        items: vec![],
+                    }],
                     ..Default::default()
                 },
-                order: vec![],
-                changes: vec![],
+                order: vec!["fixed".into(), "live".into()],
+                changes: vec![ItemChange::between(
+                    Some(&text("live", "hello tail")),
+                    &text("live", "hello tail corrupt"),
+                )],
+                // Parent work is valid, then child validation rejects the
+                // entire publication; no partial parent or clock may escape.
                 children: vec![],
             };
             respond(
@@ -2755,6 +2776,8 @@ mod tests {
                 ),
                 "invalid patch must request an unconditional snapshot"
             );
+            resync_tx.send(()).unwrap();
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             respond(
                 &mut codec,
                 &mut server,
@@ -2788,6 +2811,7 @@ mod tests {
             wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         let updated = handle.snapshot();
+        let clock = handle.snapshot_with_clock().1.unwrap();
         assert!(Arc::ptr_eq(&retained.items[0], &updated.items[0]));
         assert!(
             matches!(&retained.items[1].content, ItemContent::Text { text, .. } if text == "hello")
@@ -2795,6 +2819,16 @@ mod tests {
         assert!(
             matches!(&updated.items[1].content, ItemContent::Text { text, .. } if text == "hello tail")
         );
+        advance_tx.send(()).unwrap();
+        resync_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (unchanged, unchanged_clock) = handle.snapshot_with_clock();
+        assert!(
+            Arc::ptr_eq(&updated, &unchanged),
+            "rejected update must preserve installed publication identity"
+        );
+        assert_eq!(unchanged.generation, 2);
+        assert_eq!(unchanged_clock.unwrap().sampled_at, clock.sampled_at);
+        assert_eq!(unchanged_clock.unwrap().received_at, clock.received_at);
         advance_tx.send(()).unwrap();
         while handle.snapshot().generation != 4 {
             wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
