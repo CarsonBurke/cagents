@@ -72,6 +72,16 @@ fn bounded_path(path: &Path) -> String {
 }
 impl Details {
     fn capture(session: &TerminalSession, residency: Option<&Residency>) -> Self {
+        Self::capture_context(session, residency, false)
+    }
+    fn capture_failure(session: &TerminalSession, residency: Option<&Residency>) -> Self {
+        Self::capture_context(session, residency, true)
+    }
+    fn capture_context(
+        session: &TerminalSession,
+        residency: Option<&Residency>,
+        failed: bool,
+    ) -> Self {
         let typed = match &session.continuity {
             TerminalContinuity::Failed { typed_error, .. } => Some(typed_error.code.as_str()),
             _ => match residency {
@@ -81,10 +91,15 @@ impl Details {
         };
         let exit = match &session.continuity {
             TerminalContinuity::Exited { last_exit } => Some(last_exit.clone()),
-            TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit.clone(),
+            // RelaunchAvailable retains the previous process's exit for
+            // continuity. A failed new launch must not attribute it to the
+            // new terminal identity.
+            TerminalContinuity::RelaunchAvailable { last_exit, .. } if !failed => last_exit.clone(),
             _ => None,
         };
-        let (code, message) = if exit.is_some() {
+        let (code, message) = if let Some(typed) = typed {
+            known_failure(typed)
+        } else if exit.is_some() {
             ("process_ended", "The terminal process has ended.")
         } else {
             known_failure(typed.unwrap_or(""))
@@ -261,6 +276,14 @@ impl Cagents {
         let Some(mut details) = self.terminal_details(card) else {
             return generic.into();
         };
+        if let Some(state) = self.card_state(card)
+            && let CardKind::Terminal(session) = &state.kind
+        {
+            let failure = Details::capture_failure(session, Some(&state.residency));
+            details.code = failure.code;
+            details.message = failure.message;
+            details.exit = failure.exit;
+        }
         if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if account::login::is_codex_browser(&session.launch)))
             && account::login::callback_failed(&generic)
         {
@@ -361,7 +384,7 @@ impl Cagents {
             .spacing(space::XS)
             .into()
     }
-    pub(super) fn terminal_diagnostic_controls(&self, card: CardId) -> Element<'_, Message> {
+    pub(super) fn terminal_diagnostic_controls(&self, card: CardId) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
         let available = !remote && probe.is_some_and(|probe| probe.available && !probe.pending);
@@ -667,6 +690,44 @@ mod tests {
         };
         assert_eq!(details.code, "start_failed");
         assert!(!details.copy_text().contains("secret"));
+    }
+    #[test]
+    fn failed_relaunch_reports_new_failure_without_previous_identity_exit() {
+        let (mut app, card, mut previous) = app_and_session();
+        previous.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(17),
+                signal: None,
+                occurred_at_unix_ms: 42,
+            },
+        };
+        let ended = Details::capture(&previous, None);
+        assert_eq!(ended.code, "process_ended");
+        assert!(ended.copy_text().contains("Exit status: 17"));
+        assert!(ended.copy_text().contains("Unix milliseconds): 42"));
+
+        let relaunched = fresh_terminal_relaunch(&previous);
+        assert_ne!(relaunched.id, previous.id);
+        let state = app.card_state_mut(card).unwrap();
+        state.kind = CardKind::Terminal(relaunched.clone());
+        state.residency = Residency::Failed {
+            typed_error: RuntimeError {
+                code: "start_failed".into(),
+                message: "new failure secret".into(),
+            },
+            retryable: true,
+        };
+        app.fail_runtime(card, "backend secret".into());
+        let Some(CardRuntime::Failed(Failure::Terminal(details))) = app.cards.get(&card) else {
+            panic!("terminal failure missing")
+        };
+        assert_eq!(details.terminal, relaunched.id);
+        assert_eq!(details.code, "start_failed");
+        assert!(details.exit.is_none());
+        let copied = details.copy_text();
+        assert!(!copied.contains("Exit status"));
+        assert!(!copied.contains("Ended at"));
+        assert!(!copied.contains("secret"));
     }
     #[test]
     fn known_codex_callback_failure_preserves_recovery_without_raw_backend_text() {
