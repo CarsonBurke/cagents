@@ -2,6 +2,7 @@
 
 - [Building a release](#building-a-release)
 - [Artifacts](#artifacts)
+- [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
 - [Comparing package variants](#comparing-package-variants)
 
@@ -47,6 +48,60 @@ Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
 supported build and package lane today. Windows and macOS need their own native
 ports, validation, packaging, and signing before their targets can be enabled;
 the release tooling does not publish placeholder binaries for them.
+
+## Native platform roadmap
+
+[#7](https://github.com/CarsonBurke/cagents/issues/7) tracks Windows and macOS
+build, packaging and release support. These are proposed ports, not supported
+download targets. Release publication remains local; adding a native validation
+lane does not require moving builds, signing credentials or publication into
+GitHub Actions. PR validation coverage and its execution infrastructure still
+need to be established for each target.
+
+| Target | Current release status | Decision or prerequisite |
+| --- | --- | --- |
+| Linux x86_64 GNU | Supported local build/package lane | Keep matched full, browserless and editor artifacts and native smoke coverage |
+| Windows x64 | No supported native application or package | Qualify runtime and companion discovery before choosing installer layout |
+| Windows ARM64 | Unqualified; inclusion undecided | Choose support policy and qualify dependencies/toolchains before enabling artifacts |
+| macOS Apple Silicon | No supported native application or bundle | Qualify runtime before implementing `.app` layout and installation |
+| macOS Intel | Unqualified; inclusion undecided | Explicitly choose support policy; an Apple Silicon build does not validate Intel |
+
+Each new target progresses through the following gates. Passing an isolated
+crate check is useful evidence, but does not establish application support.
+
+1. **Runtime and build boundaries.** Check and test the CLI, daemon, browserless
+   UI, integrated UI and standalone editor on the native target, keeping the
+   daemon/UI graphs isolated. Establish native IPC, process/session ownership,
+   filesystem/storage, shell/PTY and display behavior. Preserve saved browser
+   descriptors when embedded surfaces are unavailable, and report the actual
+   browser capability. Linux X11 support in [#2](https://github.com/CarsonBurke/cagents/issues/2)
+   is complementary; it is not a Windows or macOS port.
+2. **Provider-free native smoke.** Run a matched executable set in an isolated
+   native session. Open the UI, use settings and a hosted terminal, and exercise
+   reconnect, daemon shutdown and restart without invoking a paid provider.
+   Check both browserless preservation and the target's actual integrated
+   browser capability. Record source identity, toolchain, architecture and
+   binary identities before proposing installable artifacts.
+3. **Installation and lifecycle.** Choose the native layout and explicit
+   discovery of each package's matched companions, including the standalone
+   editor's private set. Fixed target executable suffixes in [#5](https://github.com/CarsonBurke/cagents/issues/5)
+   are only one prerequisite; app-bundle/libexec lookup and native process
+   ownership still require qualification. Verify install, launch, PATH/launcher
+   integration, data permissions, upgrade across daemon versions, and uninstall
+   in a clean native VM. Never select a different installation to compensate
+   for a missing matched companion.
+4. **Metadata, signing and publication.** Define target-specific application
+   identity and version metadata, then qualify Windows signing or macOS signing,
+   notarization and stapling as appropriate. Keep credentials outside source and
+   build artifacts. Publish checksummed artifacts only after the native VM smoke
+   also verifies upgrade and uninstall. Unsupported architectures remain absent
+   from artifact selection; a filename or packaging skeleton is not a port.
+
+For each enabled target, maintain repeatable native validation for pull requests
+and exact-tag release builds. Select the architecture policy, native execution
+infrastructure and signing ownership explicitly before adding a lane. The Linux
+release builder's glibc baseline, artifact names and current updater/install
+contract remain Linux-specific until a qualified target has its own contract.
 
 ## Publishing
 
