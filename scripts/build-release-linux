@@ -115,7 +115,7 @@ assets=("$OUTPUT"/*)
 shopt -u nullglob dotglob
 
 WORK=$(mktemp -d "$CACHE/run.XXXXXX")
-mkdir "$WORK/provision-tmp" "$WORK/build-tmp"
+mkdir "$WORK/provision-tmp" "$WORK/build-tmp" "$WORK/build-var-tmp"
 cleanup() {
     rm -rf -- "$WORK"
 }
@@ -168,7 +168,7 @@ printf 'root:x:0:\nbuilder:x:%s:\n' "$CALLER_GID" > "$WORK/group"
 printf 'Building %s (%s) locally in Ubuntu 22.04; assets: %s\n' "$REF" "$SOURCE_COMMIT" "$OUTPUT"
 bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --new-session --clearenv \
-    --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/build-tmp" /tmp --tmpfs /run \
+    --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/build-tmp" /tmp --bind "$WORK/build-var-tmp" /var/tmp --tmpfs /run \
     --tmpfs /home --dir /home/builder \
     --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
     --ro-bind "$WORK/passwd" /etc/passwd --ro-bind "$WORK/group" /etc/group \
