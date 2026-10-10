@@ -644,6 +644,27 @@ impl Report {
                 Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
                 None => lines.push(format!("{}: health unknown ({})", product.product.name(), if product.readable { "no retained evidence" } else { "evidence unavailable or invalid" })),
             }
+            if let Some(failure) = product.records.iter().rev().find(|record| {
+                matches!(
+                    record.event,
+                    Event::StartupFailed
+                        | Event::Panic { .. }
+                        | Event::Exit { success: false }
+                        | Event::PersistenceFailed { .. }
+                        | Event::WriterUnavailable
+                        | Event::FinalFlush {
+                            complete: false,
+                            ..
+                        }
+                        | Event::SettingsFailed { .. }
+                        | Event::ProtocolMismatch
+                )
+            }) {
+                lines.push(format!(
+                    "{}: latest retained failure at_unix_ms={}, run={}, event={:?} (historical record; may have recovered)",
+                    product.product.name(), failure.at_unix_ms, failure.run, failure.event
+                ));
+            }
         }
         lines.join("\n")
     }
@@ -787,6 +808,42 @@ mod tests {
         assert_eq!(current.persistence, Persistence::Unknown);
         assert_eq!(current.final_flush, None);
     }
+    #[test]
+    fn historical_failure_remains_visible_without_changing_a_later_runs_health() {
+        let (_root, path) = fixture();
+        let mut failed = Recorder::open(&path, Product::Ui).unwrap();
+        failed.append(Event::Startup).unwrap();
+        failed.append(Event::StartupFailed).unwrap();
+        let run = failed.run;
+        drop(failed);
+        let mut later = Recorder::open(&path, Product::Ui).unwrap();
+        later.append(Event::Startup).unwrap();
+        let pending = inspect_at(path.clone()).unwrap();
+        assert_eq!(
+            pending.products[0]
+                .last_observed
+                .as_ref()
+                .unwrap()
+                .clean_shutdown,
+            None
+        );
+        later.append(Event::Exit { success: true }).unwrap();
+        let report = inspect_at(path).unwrap();
+        assert_eq!(
+            report.products[0]
+                .last_observed
+                .as_ref()
+                .unwrap()
+                .clean_shutdown,
+            Some(true)
+        );
+        let human = report.human();
+        assert!(human.contains("event=StartupFailed"));
+        assert!(human.contains(&format!("run={run}")));
+        assert!(human.contains("historical record; may have recovered"));
+        assert!(human.contains("at_unix_ms="));
+    }
+
     #[test]
     fn normal_exit_requires_final_writer_evidence_before_claiming_clean() {
         for (final_event, expected) in [
