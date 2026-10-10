@@ -20,7 +20,9 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
+use cosmic::iced;
 use iced::advanced as core;
+use iced::advanced::widget::Operation as _;
 use iced::advanced::{Widget, widget::operation};
 use iced::{Element, Length, window};
 
