@@ -192,6 +192,9 @@ pub(super) struct History {
     /// Exclusive end of the last row with content or intentional styling.
     /// Kept separately from retained rows: blank screen padding stays scrollable.
     meaningful_end: usize,
+    /// Following output never pulls old scrollback into an intentionally
+    /// cleared active screen. Independent of the user's captured scroll anchor.
+    active_start: u64,
     pub(super) omitted: u64,
 }
 
@@ -262,6 +265,10 @@ impl History {
                 .min(base.scroll.max_offset());
             base.scroll.mouse_tracking = false;
             base.scroll.bracketed_paste = false;
+            let active_start = scroll
+                .total
+                .saturating_sub(scroll.len)
+                .saturating_sub(omitted);
             let meaningful_end = rows
                 .iter()
                 .rposition(|row| {
@@ -279,6 +286,7 @@ impl History {
                 rows: rows.into(),
                 base,
                 meaningful_end,
+                active_start,
                 omitted,
             })
         })();
@@ -316,8 +324,10 @@ impl History {
             // the unused bottom of the frozen screen. Explicit offsets retain
             // their absolute top-row anchor, including intentional blank rows.
             .unwrap_or(
-                self.meaningful_end
-                    .saturating_sub(snapshot.scroll.len as usize) as u64,
+                (self
+                    .meaningful_end
+                    .saturating_sub(snapshot.scroll.len as usize) as u64)
+                    .max(self.active_start),
             )
             .min(snapshot.scroll.max_offset());
         let first = snapshot.scroll.offset as usize;
@@ -354,6 +364,7 @@ impl History {
         let first = self.rows.len().saturating_sub(usize::from(self.base.rows));
         self.rows = self.rows[first..].to_vec().into();
         self.meaningful_end = self.meaningful_end.saturating_sub(first);
+        self.active_start = self.active_start.saturating_sub(first as u64);
         self.base.scroll.total = self.rows.len() as u64;
         self.base.scroll.len = self.base.scroll.total;
         self.base.scroll.offset = 0;
@@ -641,6 +652,29 @@ mod tests {
             "cleared prefix cannot leave a stale content end"
         );
         assert_eq!(history.snapshot_at(None, 1, 11).scroll.offset, 0);
+    }
+
+    #[test]
+    fn completed_tail_does_not_resurrect_scrollback_after_explicit_screen_clear() {
+        let mut text = (0..20)
+            .map(|i| format!("old{i:02}\r\n"))
+            .collect::<String>();
+        text.push_str("\x1b[2J\x1b[H");
+        let history = tall_history(&text);
+        assert!(
+            history.active_start > 0,
+            "fixture must retain older scrollback"
+        );
+        assert!(history.meaningful_end as u64 <= history.active_start);
+        let tail = history.snapshot_at(None, 2, 1);
+        assert_eq!(tail.scroll.offset, history.active_start);
+        assert!(tail.lines.iter().all(|row| line_text(row).is_empty()));
+        let top = history.snapshot_at(Some(0), 2, 2);
+        assert_eq!(
+            line_text(&top.lines[0]),
+            "old00",
+            "older text remains available through explicit scrolling"
+        );
     }
 
     #[test]
