@@ -1246,6 +1246,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "wayland-protocols",
+ "wayland-server",
  "yaml-rust",
 ]
 
