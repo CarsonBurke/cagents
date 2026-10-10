@@ -218,6 +218,19 @@ pub fn ceditor_icon() -> Handle {
     ICON.clone()
 }
 
+/// Native editor window artwork, independent of the installed icon theme.
+pub fn ceditor_window_icon() -> cosmic::iced::window::Icon {
+    let rgba = image::load_from_memory_with_format(
+        include_bytes!("../../packaging/io.github.cagents.ceditor.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("embedded editor icon must be a valid PNG")
+    .into_rgba8();
+    let (width, height) = rgba.dimensions();
+    cosmic::iced::window::icon::from_rgba(rgba.into_raw(), width, height)
+        .expect("embedded editor icon must contain valid RGBA pixels")
+}
+
 /// Provider identity is shared by terminal and native-chat tab presentations.
 pub fn provider_icon(provider: crate::agent::Provider) -> Handle {
     use crate::agent::Provider;
@@ -243,6 +256,24 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn editor_window_icon_preserves_its_distinct_transparent_artwork() {
+        let image = image::load_from_memory_with_format(
+            include_bytes!("../../packaging/io.github.cagents.ceditor.png"),
+            image::ImageFormat::Png,
+        )
+        .unwrap()
+        .into_rgba8();
+        let (pixels, size) = ceditor_window_icon().into_raw();
+        assert_eq!((size.width, size.height), (128, 128));
+        assert_eq!(pixels, image.as_raw().as_slice());
+        for (x, y) in [(0, 0), (127, 0), (0, 127), (127, 127)] {
+            assert_eq!(image.get_pixel(x, y)[3], 0);
+        }
+        assert!(image.pixels().any(|pixel| pixel[3] == 255));
+        assert_ne!(pixels, crate::app::application_window_icon().into_raw().0);
+    }
 
     #[test]
     fn handles_follow_declaration_order() {

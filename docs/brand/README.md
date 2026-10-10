@@ -34,14 +34,18 @@ recognisable.
   icon. `packaging/dev.cagents.Cagents.png` is its 128 px raster, embedded as
   the window and tray icon; regenerate it from the SVG whenever the SVG
   changes.
-- `packaging/io.github.cagents.ceditor.svg` is the ceditor icon, embedded in
-  the UI directly.
+- `packaging/io.github.cagents.ceditor.svg` is the source of truth for the
+  ceditor icon, embedded in the UI directly. Its 128 px raster,
+  `packaging/io.github.cagents.ceditor.png`, is embedded as the native editor
+  window icon; regenerate it whenever the SVG changes.
 
 From the repository root, regenerate the PNG with librsvg's `rsvg-convert`:
 
 ```sh
 rsvg-convert --width 128 --height 128 \
   --output packaging/dev.cagents.Cagents.png packaging/dev.cagents.Cagents.svg
+rsvg-convert --width 128 --height 128 \
+  --output packaging/io.github.cagents.ceditor.png packaging/io.github.cagents.ceditor.svg
 ```
 
 Keep the transparent background; the window and tray loaders expect a 128×128

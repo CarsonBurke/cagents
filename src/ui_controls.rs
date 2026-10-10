@@ -15,7 +15,7 @@ mod tabs;
 
 pub use display::{badge, change_counts, comment_card};
 pub use gauge::{activity_spinner, budget_bar, budget_radial, budget_radial_toned};
-pub use icon::{Icon, ceditor_icon, passive_icon, provider_icon};
+pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
 pub use icon_button::{
     IconButton, control_style, icon_button, segmented_controls, toolbar_actions,
 };
