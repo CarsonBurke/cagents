@@ -819,6 +819,9 @@ fn allocate_untitled_path(directory: &Path) -> Result<PathBuf, String> {
 }
 
 fn create_new_file(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or("File has no parent directory")?;
+    let _protection =
+        cagents::worktree_cleanup::protect(parent).map_err(|error| error.to_string())?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2894,6 +2897,16 @@ impl Application for Editor {
                     });
                 }
             }
+        }
+        let protection_paths = startup_paths
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            cagents::worktree_cleanup::complete_standalone_editor_protection(&protection_paths)
+        {
+            notice = Some(format!("Cannot safely open editor folders yet: {error}"));
+            startup_paths.clear();
         }
         let lsp = LspManager::new(settings.language_servers.clone());
         let line_height_draft = settings.terminal_line_height.to_string();

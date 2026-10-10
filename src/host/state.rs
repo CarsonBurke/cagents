@@ -273,6 +273,7 @@ pub(crate) struct HostState {
     /// independent subscriptions with independent clients - the CLI reads the
     /// model without subscribing at all.
     model_watchers: BTreeSet<ClientId>,
+    client_pids: BTreeMap<ClientId, u32>,
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
@@ -337,6 +338,7 @@ impl HostState {
             execution_gates: BTreeMap::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
+            client_pids: BTreeMap::new(),
             notifications: None,
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
@@ -380,6 +382,10 @@ impl HostState {
         delivery
     }
 
+    pub(super) fn record_client_pid(&mut self, client: ClientId, pid: u32) {
+        self.client_pids.insert(client, pid);
+    }
+
     /// Subscribes `client_id` to terminal-inventory edges. Repeating it is
     /// harmless, so a reconnecting observer never has to track whether its
     /// previous subscription survived.
@@ -396,6 +402,7 @@ impl HostState {
             notifications.presence(client_id, None);
         }
         self.clients.remove(&client_id);
+        self.client_pids.remove(&client_id);
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
@@ -711,6 +718,7 @@ impl HostState {
         if let Some(delivery) = self.clients.remove(&client_id) {
             delivery.close_after_drain();
         }
+        self.client_pids.remove(&client_id);
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
@@ -1361,6 +1369,74 @@ impl HostState {
         let mut replay: Vec<_> = title.chain(cwd).chain(events).collect();
         replay.sort_by_key(|(sequence, _)| *sequence);
         Ok(replay)
+    }
+
+    /// Called with exclusive control admission and window-launch fences held.
+    /// Existing processes can change cwd without asking the daemon, so automatic
+    /// cleanup waits for global process quiescence, not a cached cwd match.
+    pub(super) fn allow_automatic_worktree_cleanup(
+        &mut self,
+        client: ClientId,
+        windows: &[crate::instance::VerifiedWindow],
+    ) -> Result<(), String> {
+        let verified = |id: &ClientId| {
+            self.client_pids
+                .get(id)
+                .is_some_and(|pid| windows.iter().any(|window| window.pid() == *pid))
+        };
+        if !verified(&client) || self.model_watchers.iter().any(|id| !verified(id)) {
+            return Err("A window has not established directory protection".into());
+        }
+        if self.shutting_down
+            || self.upgrade.is_some()
+            || self.inventory_count() != 0
+            || !self.browser_logins_spawning.is_empty()
+            || !self.execution_startups.is_empty()
+            || !self.chat_bindings.is_empty()
+            || !self.chat_handoffs.is_empty()
+            || !self.native_closing.is_empty()
+            || !self.native_adoption_failures.is_empty()
+        {
+            return Err("Hosted process ownership has not settled".into());
+        }
+        let registry = self
+            .model
+            .as_ref()
+            .ok_or("The session registry is unavailable")?;
+        if !registry.cleanup_execution_is_quiescent()?
+            || !registry.active_automation_firings()?.is_empty()
+        {
+            return Err("Accepted or uncertain background work has not settled".into());
+        }
+        if let Some(store) = &self.upgrade_evidence
+            && store.load()?.is_some_and(|checkpoint| {
+                !checkpoint.terminals.is_empty()
+                    || !checkpoint.carried.is_empty()
+                    || !checkpoint.chats.is_empty()
+            })
+        {
+            return Err("Retained upgrade ownership has not settled".into());
+        }
+        // Recovery discovery is intentionally tolerant of unrelated records;
+        // cleanup instead preserves every remaining record it cannot disprove.
+        let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
+        for kind in [
+            crate::daemon::holder_registry::Kind::Terminal,
+            crate::daemon::holder_registry::Kind::Native,
+        ] {
+            let directory = crate::daemon::holder_registry::directory(kind)?;
+            crate::daemon::holder_registry::discover(&directory, &boot, kind)?;
+            for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    return Err("Detached or uncertain holder ownership remains".into());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn inventory_count(&mut self) -> u64 {

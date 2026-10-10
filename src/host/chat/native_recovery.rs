@@ -15,6 +15,10 @@ struct AdoptionFailure {
 }
 
 impl AdoptionFailures {
+    pub(in crate::host) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     const LIMIT: usize = 128;
     const MESSAGE_BYTES: usize = 4096;
 

@@ -827,6 +827,9 @@ pub struct AppSettings {
     /// Absolute, or resolved relative to the repository root.
     #[serde(default = "default_managed_worktree_directory")]
     pub managed_worktree_directory: String,
+    /// Automatic cleanup is opt-in and never discards changes or stops work.
+    #[serde(default)]
+    pub auto_delete_merged_worktrees: bool,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
     #[serde(default)]
@@ -937,6 +940,7 @@ impl Default for AppSettings {
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
             managed_worktree_directory: default_managed_worktree_directory(),
+            auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
@@ -2787,6 +2791,24 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_worktree_cleanup_is_opt_in_for_old_and_new_settings() {
+        let defaults = super::AppSettings::default();
+        assert!(!defaults.auto_delete_merged_worktrees);
+        let mut table = toml::Value::try_from(defaults).unwrap();
+        table
+            .as_table_mut()
+            .unwrap()
+            .remove("auto_delete_merged_worktrees");
+        let legacy: super::AppSettings = table.try_into().unwrap();
+        assert!(!legacy.auto_delete_merged_worktrees);
+        let mut enabled = legacy;
+        enabled.auto_delete_merged_worktrees = true;
+        let saved = toml::to_string(&enabled).unwrap();
+        let restored: super::AppSettings = toml::from_str(&saved).unwrap();
+        assert!(restored.auto_delete_merged_worktrees);
+    }
+
     #[test]
     fn editor_font_inherits_terminal_until_overridden() {
         let mut settings = super::AppSettings::default();

@@ -446,3 +446,15 @@ production application. It does not register an autostart entry. Release builds
 without that feature are production builds.
 
 Manual sidebar order is stored by the selected device daemon and shared across windows. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
+
+### Automatic merged worktree cleanup
+
+Settings → General → **Merged worktree cleanup** is disabled by default. When enabled, sidebar PR refreshes propose one clean, inactive GitHub worktree at a time. The daemon confirms that its exact branch and current commit were merged before removing its directory and catalog entry. Branches remain intact. Cleanup never forces Git removal, discards changes, closes sessions, or removes the primary checkout, main branches, locked worktrees, selected scopes, or open editors.
+
+Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
+
+Directory protection covers both the pathname and a held directory identity. Moving an open checkout with `git worktree move` preserves its protection, and replacing its old pathname does not bypass the original path lease.
+
+Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
+
+Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).

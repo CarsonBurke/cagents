@@ -77,6 +77,16 @@ pub(super) fn migrate_names(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    /// Automatic removal must also wait for durable work not yet represented
+    /// by an actor, including unconfirmed launch ownership after a restart.
+    pub(crate) fn cleanup_execution_is_quiescent(&self) -> Result<bool, String> {
+        self.db.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM agent_launches)
+                AND NOT EXISTS(SELECT 1 FROM agent_runs WHERE state IN ('accepted', 'running', 'waiting'))
+                AND NOT EXISTS(SELECT 1 FROM agents WHERE closed = 0 AND session_id IS NOT NULL)",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
     /// Accepted work can be queued behind the daemon's update write gate before
     /// it owns a hosted actor. Do not lose it from impact merely because there
     /// is no terminal/chat to project yet. Call outside HostState; final update
@@ -1415,6 +1425,50 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    #[test]
+    fn automatic_cleanup_waits_for_accepted_dispatch_and_bound_ownership_retirement() {
+        let (mut registry, _directory, request) = fixture();
+        assert!(registry.cleanup_execution_is_quiescent().unwrap());
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert!(!registry.cleanup_execution_is_quiescent().unwrap());
+        registry.claim_agent_dispatch(&accepted, 2).unwrap();
+        let session = source();
+        registry
+            .reserve_agent_launch(accepted.agent.id, &session)
+            .unwrap();
+        assert!(!registry.cleanup_execution_is_quiescent().unwrap());
+        registry
+            .bind_agent(accepted.agent.id, None, session)
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "confirmed".into(),
+                },
+                3,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                4,
+            )
+            .unwrap();
+        // A completed turn is not proof that its provider process has ended.
+        assert!(!registry.cleanup_execution_is_quiescent().unwrap());
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert!(registry.cleanup_execution_is_quiescent().unwrap());
     }
 
     #[test]

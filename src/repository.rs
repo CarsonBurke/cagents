@@ -4467,6 +4467,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &StageRequest,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         let paths =
             self.matchable_pathspecs(&request.worktree, &request.selection, cancellation)?;
         let command = self.stage_command(&request.worktree, &paths)?;
@@ -4520,6 +4523,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &UnstageRequest,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         let paths = selection_pathspecs(&request.selection);
         if paths.is_empty() {
             return Err(ValidationError::EmptySelection.into());
@@ -4639,6 +4645,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &DiscardRequest,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         if !request.confirmed {
             return Err(ValidationError::ConfirmationRequired.into());
         }
@@ -4768,7 +4777,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         worktree: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<DiscardIndexLock, RepositoryError> {
+    ) -> Result<GitFileLock, RepositoryError> {
         let output = self.run_checked(
             &self.git_read(
                 worktree,
@@ -4777,7 +4786,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let index = parse_path_line(&output.stdout, "index_path")?;
-        DiscardIndexLock::acquire(&index).map_err(|reason| ValidationError::Io(reason).into())
+        GitFileLock::acquire(&index).map_err(|reason| ValidationError::Io(reason).into())
     }
 
     pub fn commit_command(&self, request: &CommitRequest) -> Result<CommandSpec, ValidationError> {
@@ -4874,6 +4883,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         amend: bool,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut command = self.commit_command(request)?;
         if amend {
             command = command.arg("--amend");
@@ -5144,6 +5156,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &PushRequest,
         cancellation: &CancellationToken,
     ) -> Result<PushOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         // Resolved exactly once: the refspec Git is given, the name Git is
         // asked to validate, the ref reconciliation looks up on the remote,
         // and the ref this reports as updated are all this one value.
@@ -6127,7 +6142,7 @@ fn pathspec_arguments<'a>(
 /// that deliberately replace another writer's lock violate that protocol.
 /// Never publish index bytes or remove a foreign/stale lock. A crash leaves
 /// the same stale-lock evidence Git itself leaves, requiring explicit recovery.
-struct DiscardIndexLock {
+pub(crate) struct GitFileLock {
     parent: fs_safety::Root,
     name: OsString,
     file: fs::File,
@@ -6135,8 +6150,13 @@ struct DiscardIndexLock {
     active: bool,
 }
 
-impl DiscardIndexLock {
-    fn acquire(index: &Path) -> Result<Self, String> {
+impl GitFileLock {
+    /// Git removed the containing administrative directory itself.
+    pub(crate) fn retired_with_directory(&mut self) {
+        self.active = false;
+    }
+
+    pub(crate) fn acquire(index: &Path) -> Result<Self, String> {
         if !index.is_absolute() {
             return Err("Git reported a relative index path".into());
         }
@@ -6200,7 +6220,7 @@ impl DiscardIndexLock {
         Ok(())
     }
 
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
         let opened = self.parent.metadata().map_err(|error| error.to_string())?;
         let named = fs::metadata(self.parent.path()).map_err(|error| error.to_string())?;
@@ -6219,7 +6239,7 @@ impl DiscardIndexLock {
     }
 }
 
-impl Drop for DiscardIndexLock {
+impl Drop for GitFileLock {
     fn drop(&mut self) {
         if self.active
             && let Err(reason) = self.release()
@@ -8411,7 +8431,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let index = directory.path().join("index");
             let lock = directory.path().join("index.lock");
-            let mut guard = DiscardIndexLock::acquire(&index).unwrap();
+            let mut guard = GitFileLock::acquire(&index).unwrap();
             if replace {
                 fs::remove_file(&lock).unwrap();
             }
@@ -8430,7 +8450,7 @@ mod tests {
         let directory = root.path().join("metadata");
         let moved = root.path().join("moved");
         fs::create_dir(&directory).unwrap();
-        let mut guard = DiscardIndexLock::acquire(&directory.join("index")).unwrap();
+        let mut guard = GitFileLock::acquire(&directory.join("index")).unwrap();
         fs::rename(&directory, &moved).unwrap();
         fs::create_dir(&directory).unwrap();
         fs::write(directory.join("index.lock"), b"replacement writer").unwrap();
@@ -8447,7 +8467,7 @@ mod tests {
     fn discard_index_guard_releases_owned_lock_during_unwind() {
         let directory = tempfile::tempdir().unwrap();
         let result = std::panic::catch_unwind(|| {
-            let _guard = DiscardIndexLock::acquire(&directory.path().join("index")).unwrap();
+            let _guard = GitFileLock::acquire(&directory.path().join("index")).unwrap();
             panic!("injected discard worker panic");
         });
         assert!(result.is_err());
@@ -10525,18 +10545,7 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
     .expect("byte slices and strings serialize")
 }
 
-/// A worktree Git has just removed at the user's request, as it was right
-/// before the removal.
-#[derive(Debug, Clone)]
-pub struct RemovedWorktree {
-    /// The canonical common directory of its repository.
-    pub common_dir: PathBuf,
-    /// Its canonical administrative directory; see [`RepositoryService::git_dir`].
-    pub admin_dir: PathBuf,
-    pub path: PathBuf,
-    /// The branch it had checked out, as a full ref.
-    pub branch: Option<String>,
-}
+pub use crate::worktree_cleanup::RemovedWorktree;
 
 /// Releases the identities held by the applied creations of `removed`.
 ///
@@ -10815,6 +10824,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// The production entrypoint. No caller may create the managed root first.
     /// The retained token and generation belong to the UI; this emits at most
     /// five events, so a per-operation bounded(8) channel cannot drop a stage.
+    #[cfg(feature = "ui")]
     pub fn create_worktree_journaled(
         &self,
         store: &StateStore,
@@ -11586,7 +11596,7 @@ fn finish_worktree_journal(
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 mod worktree_journal_tests {
     use super::*;
     use crate::model::BootId;

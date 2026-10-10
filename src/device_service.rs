@@ -7,6 +7,10 @@ pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Home,
+    /// Optional cleanup is authorized only by the daemon lifecycle fence.
+    RemoveMergedWorktree {
+        request: crate::worktree_cleanup::RemovalRequest,
+    },
     ProjectNavigation {
         repository: PathBuf,
         kind: crate::model::ProjectKind,
@@ -101,6 +105,7 @@ pub enum Reply {
     },
     Text(String),
     Saved,
+    MergedWorktreeRemoved(Option<crate::worktree_cleanup::RemovedWorktree>),
     ProjectNavigation(Navigation),
     /// The replacement is published, but its directory entry could not be
     /// synced. Callers must advance their disk baseline and show this warning.
@@ -164,6 +169,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::RemoveMergedWorktree { .. } => {
+            Err("Automatic cleanup requires the daemon lifecycle fence".into())
+        }
         Operation::ProjectNavigation { repository, kind } => {
             navigation(repository, kind).map(Reply::ProjectNavigation)
         }

@@ -822,6 +822,7 @@ pub fn save_file(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
+    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     save_file_with_hooks(
         worktree,
         relative_path,
@@ -972,6 +973,7 @@ fn publish_replacement(
 /// An error means publication did not succeed. Once the move succeeds, a
 /// directory-sync failure is logged rather than reported as a failed move.
 pub fn rename_file(worktree: &Path, source: &Path, destination: &Path) -> Result<(), FileIoError> {
+    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     let root = file_operation_root(worktree, source, destination)?;
     let (source_parent, source_name) =
         fs_safety::open_parent_beneath(&root, source).map_err(resolve_error)?;
@@ -1001,6 +1003,7 @@ pub fn rename_file(worktree: &Path, source: &Path, destination: &Path) -> Result
 /// As with `rename_file`, errors precede publication; directory-sync failures
 /// after publication are logged because the new file already exists.
 pub fn copy_file(worktree: &Path, source: &Path, destination: &Path) -> Result<(), FileIoError> {
+    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     copy_file_before_publish(worktree, source, destination, || Ok(()))
 }
 

@@ -1842,6 +1842,7 @@ impl Drop for FindJob {
 
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
+    worktree_protection: Option<crate::worktree_cleanup::Protection>,
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
@@ -2045,11 +2046,25 @@ pub enum RepositoryRuntimeStatus {
 }
 
 impl RepositoryRuntime {
+    fn protect_editor_worktree(&mut self, directory: &Path) -> std::io::Result<()> {
+        if self
+            .worktree_protection
+            .as_ref()
+            .is_some_and(|guard| guard.directory() == directory)
+        {
+            return Ok(());
+        }
+        let next = crate::worktree_cleanup::protect(directory)?;
+        self.worktree_protection = next;
+        Ok(())
+    }
+
     pub fn new(descriptor: RepositoryView) -> Self {
         let identity = descriptor.worktree.display().to_string();
         Self {
             directory_only: descriptor.selected_file.is_some(),
             descriptor,
+            worktree_protection: None,
             standalone: false,
             external_editors: Vec::new(),
             generation: 0,
@@ -2733,6 +2748,16 @@ impl RepositoryRuntime {
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if (self.descriptor.selected_file.is_some()
+            || self
+                .restored_navigation
+                .as_ref()
+                .is_some_and(|navigation| navigation.selected_file.is_some()))
+            && let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone())
+        {
+            self.files = FileListState::Failed(error.to_string());
+            return Task::none();
+        }
         if let Some(navigation) = self.restored_navigation.take() {
             let listing = if self.descriptor.selected_file.is_none() {
                 // The direct file read can precede the initial Git listing.
@@ -2786,6 +2811,10 @@ impl RepositoryRuntime {
         view: RepositoryView,
     ) -> Task<RepositoryAction> {
         if self.descriptor.selected_file.is_none() || self.blocks_navigation() {
+            return Task::none();
+        }
+        if let Err(error) = self.protect_editor_worktree(&view.worktree) {
+            self.files = FileListState::Failed(error.to_string());
             return Task::none();
         }
         self.descriptor = view;
@@ -6068,6 +6097,10 @@ impl RepositoryRuntime {
     }
 
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
+        if let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone()) {
+            self.files = FileListState::Failed(error.to_string());
+            return Task::none();
+        }
         self.pending_fragment = None;
         self.pending_editor_navigation = None;
         self.pending_editor_focus = None;
