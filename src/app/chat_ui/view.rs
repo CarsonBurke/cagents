@@ -4178,6 +4178,184 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        for (operation, target, name) in [
+            (
+                chat::CommandAction::Read,
+                "Read λ notes.md",
+                "Read Read λ notes.md",
+            ),
+            (
+                chat::CommandAction::Search,
+                "Search TODO",
+                "Searched Search TODO",
+            ),
+            (chat::CommandAction::List, "List *.rs", "Listed List *.rs"),
+        ] {
+            let item = chat::Item {
+                id: "exact".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Command {
+                    label: target.into(),
+                    command: target.into(),
+                    working_directory: "/project".into(),
+                    action: operation,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: "result".into(),
+                },
+                started_at: None,
+                at: None,
+            };
+            let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            assert_eq!(runtime.cache[&item.id].preview.text, target);
+            assert_eq!(runtime.turns[0].summary, name);
+            for open in [false, true] {
+                let mut element = runtime.step_header(&item, &runtime.cache[&item.id], open);
+                let renderer = crate::app::tests::headless_renderer();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let nodes: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .collect();
+                assert!(
+                    nodes.iter().any(|node| node.node().role() == Role::Button
+                        && node.node().label() == Some(name)),
+                    "row action must name its exact target"
+                );
+                // RichText has no separate accessible leaf in this pinned
+                // widget graph; the mounted row's exact name carries its
+                // target, while the preview cache preserves the drawn bytes.
+                let row = nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some(name))
+                    .unwrap()
+                    .id()
+                    .clone();
+                let copy = nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some("Copy this message"))
+                    .unwrap()
+                    .id()
+                    .clone();
+                use iced_accessibility::{
+                    A11yId,
+                    accesskit::{Action as A11yAction, ActionRequest, TreeId},
+                };
+                let event = |id: A11yId, action| {
+                    let A11yId::Widget(widget) = id.clone() else {
+                        panic!("widget identity required")
+                    };
+                    iced::Event::A11y(
+                        widget,
+                        ActionRequest {
+                            action,
+                            target_tree: TreeId::ROOT,
+                            target_node: id.into(),
+                            data: None,
+                        },
+                    )
+                };
+                let mut dispatch = |event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut iced::advanced::Shell::new(&mut messages),
+                        &iced::Rectangle::with_size(iced::Size::new(520.0, 1000.0)),
+                    );
+                    messages
+                };
+                let unknown = A11yId::from(iced::advanced::widget::Id::unique());
+                assert!(dispatch(event(unknown.clone(), A11yAction::Click)).is_empty());
+                assert!(dispatch(event(unknown, A11yAction::Focus)).is_empty());
+                let mut mismatched = event(row.clone(), A11yAction::Click);
+                if let iced::Event::A11y(_, request) = &mut mismatched {
+                    request.target_node = copy.clone().into();
+                }
+                assert!(dispatch(mismatched).is_empty());
+                let mut wrong_tree = event(row.clone(), A11yAction::Click);
+                if let iced::Event::A11y(_, request) = &mut wrong_tree {
+                    request.target_tree = TreeId(uuid::Uuid::new_v4());
+                }
+                assert!(dispatch(wrong_tree).is_empty());
+                let toggled = dispatch(event(row.clone(), A11yAction::Click));
+                assert_eq!(toggled.len(), 1);
+                assert!(
+                    matches!(&toggled[0], Message::ChatUi(Action::Toggle(actual, id))
+                    if *actual == runtime.target && id == &item.id)
+                );
+                let copied = dispatch(event(copy.clone(), A11yAction::Click));
+                assert_eq!(copied.len(), 1);
+                assert!(
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text))
+                    if *actual == runtime.target && id == &item.id)
+                );
+                assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
+                drop(dispatch);
+                // Keep the actual widget state mounted through diff. AT focus
+                // makes the hover control keyboard-visible without a pointer.
+                tree.diff(element.as_widget_mut());
+                let enter = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Enter,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                let mut dispatch = |event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut iced::advanced::Shell::new(&mut messages),
+                        &iced::Rectangle::with_size(iced::Size::new(520.0, 1000.0)),
+                    );
+                    messages
+                };
+                assert!(dispatch(event(row, A11yAction::Blur)).is_empty());
+                let copied = dispatch(enter.clone());
+                assert_eq!(copied.len(), 1);
+                assert!(
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text))
+                    if *actual == runtime.target && id == &item.id)
+                );
+                assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());
+                assert!(
+                    dispatch(enter).is_empty(),
+                    "cleared hidden Copy focus must not consume Enter"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transcript_viewport_reaches_pane_edges_with_inset_inside_content() {
         use iced::advanced::{
             Layout, layout,

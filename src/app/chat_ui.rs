@@ -16,6 +16,7 @@ mod clipboard_image;
 mod completion;
 mod find;
 mod fold;
+mod hover;
 mod images;
 mod layout;
 mod markdown_source;
