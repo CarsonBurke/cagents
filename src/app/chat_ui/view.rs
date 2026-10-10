@@ -2736,7 +2736,6 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.hash(&mut hasher);
-        self.copied.hash(&mut hasher);
         self.snapshot.busy.hash(&mut hasher);
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
@@ -2758,6 +2757,12 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            // Only this item's badge changes on copy. Its dismissal timer
+            // does not affect what the turn draws.
+            self.copied
+                .as_ref()
+                .is_some_and(|(id, _)| *id == item.id)
+                .hash(&mut hasher);
             self.cache
                 .get(&item.id)
                 .map(|cached| {
@@ -4596,6 +4601,60 @@ mod tests {
             .iter()
             .map(|turn| runtime.turn_fingerprint(turn, dark))
             .collect()
+    }
+
+    #[test]
+    fn copy_feedback_invalidates_only_the_messages_own_turns() {
+        let items = (0..3)
+            .flat_map(|index| {
+                [
+                    (chat::Role::User, format!("prompt-{index}")),
+                    (chat::Role::Assistant, format!("answer-{index}")),
+                ]
+            })
+            .map(|(role, id)| chat::Item {
+                content: ItemContent::Text {
+                    text: id.clone(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                id,
+                role,
+                started_at: None,
+                at: None,
+            })
+            .collect::<Vec<_>>();
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        assert_eq!(runtime.turns.len(), 3);
+        let changed = |before: &[u64], after: &[u64]| {
+            before
+                .iter()
+                .zip(after)
+                .map(|(before, after)| before != after)
+                .collect::<Vec<_>>()
+        };
+        let original = fingerprints(&runtime, true);
+        let copied_at = Instant::now();
+        runtime.copied = Some(("answer-0".into(), copied_at));
+        let first = fingerprints(&runtime, true);
+        assert_eq!(changed(&original, &first), [true, false, false]);
+
+        // Repeating Copy refreshes its expiry but draws the same checkmark.
+        runtime.copied = Some(("answer-0".into(), copied_at + Duration::from_millis(500)));
+        assert_eq!(first, fingerprints(&runtime, true));
+
+        // Moving feedback removes one checkmark and adds the other.
+        runtime.copied = Some(("answer-1".into(), copied_at));
+        let second = fingerprints(&runtime, true);
+        assert_eq!(changed(&first, &second), [true, true, false]);
+        runtime.copied = None;
+        let cleared = fingerprints(&runtime, true);
+        assert_eq!(changed(&second, &cleared), [false, true, false]);
+        assert_eq!(original, cleared);
+
+        // An item outside this transcript cannot change any visible badge.
+        runtime.copied = Some(("retired-item".into(), copied_at));
+        assert_eq!(original, fingerprints(&runtime, true));
     }
 
     /// Publishes `items` to `runtime` as a provider frame would.
