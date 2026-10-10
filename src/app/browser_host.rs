@@ -227,12 +227,30 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Host<'_, Mess
             f64::from(bounds.x + bounds.width),
             f64::from(bounds.y + bounds.height),
         ));
-        A11yTree::node_with_child_tree(
+        let mut accessible = A11yTree::node_with_child_tree(
             A11yNode::new(node, tree.state.downcast_ref::<HostIdentity>().0.clone()),
-            self.content
-                .as_widget()
-                .a11y_nodes(layout, &tree.children[0], cursor),
-        )
+            self.content.as_widget().a11y_nodes(
+                layout.with_virtual_offset(cosmic::iced::Vector::ZERO),
+                &tree.children[0],
+                cursor,
+            ),
+        );
+        // Native children use content coordinates. Translate the host and its
+        // descendants together; nested scrollables retain their local offsets.
+        let offset = layout.virtual_offset();
+        let translate = |node: &mut A11yNode| {
+            if let Some(bounds) = node.node().bounds() {
+                node.node_mut().set_bounds(Rect::new(
+                    bounds.x0 - f64::from(offset.x),
+                    bounds.y0 - f64::from(offset.y),
+                    bounds.x1 - f64::from(offset.x),
+                    bounds.y1 - f64::from(offset.y),
+                ));
+            }
+        };
+        accessible.root_mut().iter_mut().for_each(translate);
+        accessible.children_mut().iter_mut().for_each(translate);
+        accessible
     }
 }
 
@@ -405,6 +423,9 @@ mod tests {
                 .iter()
                 .find(|n| n.node().label() == Some("Retained child"))
                 .unwrap();
+            let expected = Rect::new(0.0, -37.0, 400.0, 163.0);
+            assert_eq!(host.node().bounds(), Some(expected));
+            assert_eq!(child.node().bounds(), Some(expected));
             if let Some(id) = &child_id {
                 assert!(IdEq::eq(child.id(), id));
             } else {

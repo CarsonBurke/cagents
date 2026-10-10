@@ -3,7 +3,7 @@ use cosmic::iced::advanced::{
     Layout, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
 };
-use cosmic::iced::{Length, Rectangle, Size, Vector};
+use cosmic::iced::{Length, Rectangle, Size};
 pub(crate) struct Probe;
 impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Probe {
     fn tag(&self) -> tree::Tag {
@@ -40,10 +40,16 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Probe {
         tree: &Tree,
         _cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        assert_eq!(layout.virtual_offset(), Vector::new(0.0, 37.0));
+        let bounds = layout.bounds() - layout.virtual_offset();
         let mut node =
             iced_accessibility::accesskit::Node::new(iced_accessibility::accesskit::Role::Button);
         node.set_label("Retained child");
+        node.set_bounds(iced_accessibility::accesskit::Rect::new(
+            f64::from(bounds.x),
+            f64::from(bounds.y),
+            f64::from(bounds.x + bounds.width),
+            f64::from(bounds.y + bounds.height),
+        ));
         iced_accessibility::A11yTree::leaf(
             node,
             tree.state.downcast_ref::<iced_accessibility::Id>().clone(),

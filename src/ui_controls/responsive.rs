@@ -286,5 +286,11 @@ mod tests {
         let second = responsive.a11y_nodes(bounds, &tree, mouse::Cursor::Unavailable);
         assert_eq!(first.root()[0].id(), second.root()[0].id());
         assert_eq!(second.root()[0].node().label(), Some("Retained child"));
+        assert_eq!(
+            second.root()[0].node().bounds(),
+            Some(iced_accessibility::accesskit::Rect::new(
+                0.0, -37.0, 80.0, 3.0
+            ))
+        );
     }
 }
