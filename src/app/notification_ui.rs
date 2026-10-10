@@ -605,7 +605,10 @@ mod tests {
         let lineage = crate::agent_execution::Lineage(fresh.id);
         let operation = uuid::Uuid::new_v4();
         app.notification_ui.inbox_activation = Some((lineage, operation));
-        let cards = app.durable.cards.clone();
+        let mut cards = app.durable.cards.clone();
+        // Focusing the recipient persists its viewport exposure. Every other
+        // saved field, including the launch and live-session proof, survives.
+        cards[0].exposure = Exposure::Visible;
         drop(app.update_notifications(Action::InboxResolved {
             lineage,
             operation,
@@ -613,6 +616,7 @@ mod tests {
         }));
         assert!(app.notification_ui.inbox_activation.is_none());
         assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.focused(), Some(cards[0].id));
         assert!(
             app.notification_ui
                 .pending
