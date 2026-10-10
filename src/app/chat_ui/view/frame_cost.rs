@@ -704,12 +704,6 @@ fn a_refresh_of_a_full_window_with_metadata() {
 }
 
 /// Installs `update` over `installed` as the reader thread does.
-fn install(
-    update: chat::presentation::Presentation,
-    mut installed: Arc<Snapshot>,
-) -> Arc<Snapshot> {
-    update
-        .apply(Arc::make_mut(&mut installed))
-        .expect("a patch that applies");
-    installed
+fn install(update: chat::presentation::Presentation, installed: Arc<Snapshot>) -> Arc<Snapshot> {
+    Arc::new(update.apply(&installed).expect("a patch that applies"))
 }
