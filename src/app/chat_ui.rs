@@ -1050,6 +1050,9 @@ impl CachedItem {
             }
         }
         self.highlight(theme);
+        if !growing {
+            self.settle_blocks();
+        }
         self.revision = Self::next_revision();
     }
 
@@ -1061,6 +1064,7 @@ impl CachedItem {
         {
             self.extend(body, false, theme);
         }
+        self.settle_blocks();
     }
 
     /// A fence larger than this is drawn plain: a syntect pass over it would
@@ -2177,21 +2181,24 @@ impl Runtime {
             self.expanded.retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
-        // Text is appended to the newest item of a running turn and to no
-        // other, so only there is the end of an answer read as unfinished.
+        // Each transcript has its own streaming lifecycle: a child can keep
+        // running after the parent finishes. Only its newest item can grow;
+        // older items release their parser and highlighter continuation.
         let newest = snapshot.items.len().wrapping_sub(1);
         let items = snapshot
             .items
             .iter()
             .enumerate()
             .map(|(index, item)| (item, snapshot.busy && index == newest))
-            .chain(
-                snapshot
-                    .subagents
-                    .iter()
-                    .flat_map(|agent| agent.items.iter())
-                    .map(|item| (item, false)),
-            );
+            .chain(snapshot.subagents.iter().flat_map(|agent| {
+                let newest = agent.items.len().wrapping_sub(1);
+                agent.items.iter().enumerate().map(move |(index, item)| {
+                    (
+                        item,
+                        agent.status == chat::ToolStatus::Running && index == newest,
+                    )
+                })
+            }));
         for (item, growing) in items {
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
@@ -2242,13 +2249,6 @@ impl Runtime {
             }
             cached.item = Some(item.clone());
             self.cache.insert(item.id.clone(), cached);
-        }
-        // Nothing streams into an idle conversation, so no block is waiting
-        // to be continued.
-        if !snapshot.busy {
-            for cached in self.cache.values_mut() {
-                cached.settle_blocks();
-            }
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
@@ -9227,6 +9227,213 @@ mod tests {
             text: body.to_owned(),
             thinking: false,
             phase: chat::Phase::Final,
+        }
+    }
+
+    #[test]
+    fn streaming_children_keep_only_their_newest_fence_live_after_parent_completion() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("streaming-children"));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let item = |id: &str, body: &str| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: text(body),
+                started_at: None,
+                at: None,
+            })
+        };
+        let body = "```rust\nfn first() {}\n";
+        let mut snapshot = Snapshot {
+            generation: 10,
+            ready: true,
+            busy: false,
+            items: vec![item("parent", body)],
+            subagents: vec![
+                chat::Subagent {
+                    id: "running-child".into(),
+                    kind: "task".into(),
+                    description: String::new(),
+                    status: chat::ToolStatus::Running,
+                    background: true,
+                    items: vec![item("child-first", body)],
+                },
+                chat::Subagent {
+                    id: "finished-child".into(),
+                    kind: "task".into(),
+                    description: String::new(),
+                    status: chat::ToolStatus::Succeeded,
+                    background: true,
+                    items: vec![item("finished", body)],
+                },
+            ],
+            ..Snapshot::default()
+        };
+        let publish = |app: &mut Cagents, snapshot: &Snapshot| {
+            handle.publish_snapshot_for_test(snapshot.clone());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.visible.store(true, Ordering::Relaxed);
+            runtime.refresh();
+        };
+        publish(&mut app, &snapshot);
+        let runtime = chat_runtime(&app, card);
+        assert!(
+            runtime.cache["child-first"].open.is_some(),
+            "an idle parent must not retire its running child's fence"
+        );
+        assert!(runtime.cache["parent"].open.is_none());
+        assert!(runtime.cache["finished"].open.is_none());
+        // An unchanged snapshot must also preserve the child's continuation.
+        snapshot.generation += 1;
+        publish(&mut app, &snapshot);
+        assert!(chat_runtime(&app, card).cache["child-first"].open.is_some());
+        let longer = format!("{body}fn second() {{}}\n");
+        snapshot.subagents[0].items[0] = item("child-first", &longer);
+        snapshot.generation += 1;
+        publish(&mut app, &snapshot);
+        let expected = CachedItem::new(&text(&longer), chat_runtime(&app, card).syntax_theme);
+        let cached = &chat_runtime(&app, card).cache["child-first"];
+        assert_eq!(parsed_codes(cached), parsed_codes(&expected));
+        for (key, block) in &expected.blocks {
+            for dark in [false, true] {
+                assert_eq!(
+                    cached.blocks[key].spans(dark).as_ref(),
+                    block.spans(dark).as_ref()
+                );
+            }
+        }
+        // A new child item ends the previous item's continuation, even while
+        // both the child and its parent are running.
+        snapshot.busy = true;
+        snapshot.items.push(item("parent-new", body));
+        snapshot.subagents[0].items.push(item("child-new", body));
+        snapshot.generation += 1;
+        publish(&mut app, &snapshot);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.cache["child-first"].open.is_none());
+        assert!(runtime.cache["child-new"].open.is_some());
+        assert!(runtime.cache["parent"].open.is_none());
+        assert!(runtime.cache["parent-new"].open.is_some());
+        // Each terminal status retires an unchanged item. A resumed child
+        // with the same item ID can subsequently append without losing text.
+        for (index, status) in [
+            chat::ToolStatus::Succeeded,
+            chat::ToolStatus::Stopped,
+            chat::ToolStatus::Failed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("child-ending-{index}");
+            snapshot.subagents[0].status = chat::ToolStatus::Running;
+            snapshot.subagents[0].items.push(item(&id, body));
+            snapshot.generation += 1;
+            publish(&mut app, &snapshot);
+            assert!(chat_runtime(&app, card).cache[&id].open.is_some());
+            snapshot.subagents[0].status = status;
+            snapshot.generation += 1;
+            publish(&mut app, &snapshot);
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.cache[&id].open.is_none());
+            assert!(runtime.cache["parent-new"].open.is_some());
+            snapshot.subagents[0].status = chat::ToolStatus::Running;
+            snapshot.generation += 1;
+            publish(&mut app, &snapshot);
+            *snapshot.subagents[0].items.last_mut().unwrap() = item(&id, &longer);
+            snapshot.generation += 1;
+            publish(&mut app, &snapshot);
+            let cached = &chat_runtime(&app, card).cache[&id];
+            assert!(cached.open.is_some());
+            assert_eq!(parsed_codes(cached), parsed_codes(&expected));
+            for (key, block) in &expected.blocks {
+                for dark in [false, true] {
+                    assert_eq!(
+                        cached.blocks[key].spans(dark).as_ref(),
+                        block.spans(dark).as_ref()
+                    );
+                }
+            }
+        }
+        // A tool can become newest while its preceding answer's fence is
+        // still open. Being in a running child does not keep old text live.
+        snapshot.subagents[0].items.push(Arc::new(chat::Item {
+            id: "child-tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "fixture".into(),
+                input: "{}".into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            started_at: None,
+            at: None,
+        }));
+        snapshot.generation += 1;
+        publish(&mut app, &snapshot);
+        assert!(
+            chat_runtime(&app, card).cache["child-ending-2"]
+                .open
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ending_a_child_item_flushes_its_provisional_markdown_tail() {
+        for another_item in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("child-tail"));
+            let target = chat_runtime(&app, card).target;
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            let child_item = Arc::new(chat::Item {
+                id: "unfinished".into(),
+                role: chat::Role::Assistant,
+                content: text("Use <Type"),
+                started_at: None,
+                at: None,
+            });
+            let mut snapshot = Snapshot {
+                generation: 10,
+                ready: true,
+                subagents: vec![chat::Subagent {
+                    id: "child".into(),
+                    kind: "task".into(),
+                    description: String::new(),
+                    status: chat::ToolStatus::Running,
+                    background: true,
+                    items: vec![child_item.clone()],
+                }],
+                ..Snapshot::default()
+            };
+            let publish = |app: &mut Cagents, snapshot: &Snapshot| {
+                handle.publish_snapshot_for_test(snapshot.clone());
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.visible.store(true, Ordering::Relaxed);
+                runtime.refresh();
+            };
+            publish(&mut app, &snapshot);
+            assert!(
+                chat_runtime(&app, card).cache["unfinished"]
+                    .source
+                    .provisional()
+            );
+            if another_item {
+                let mut next = (*child_item).clone();
+                next.id = "next".into();
+                next.content = text("Next answer");
+                snapshot.subagents[0].items.push(Arc::new(next));
+            } else {
+                snapshot.subagents[0].status = chat::ToolStatus::Succeeded;
+            }
+            snapshot.generation += 1;
+            publish(&mut app, &snapshot);
+            let cached = &chat_runtime(&app, card).cache["unfinished"];
+            assert!(!cached.source.provisional());
+            let expected =
+                CachedItem::new(&child_item.content, chat_runtime(&app, card).syntax_theme);
+            assert_eq!(shown(cached), shown(&expected));
+            assert!(shown(cached).contains("<Type"));
         }
     }
 

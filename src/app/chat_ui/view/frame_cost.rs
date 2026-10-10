@@ -295,11 +295,19 @@ impl Pane {
     /// Publishes the items as a provider frame would, without taking it.
     fn publish(&mut self) {
         self.generation += 1;
-        self.handle.publish_snapshot_for_test(Snapshot {
+        let mut snapshot = Snapshot {
             generation: self.generation,
             items: self.items.iter().cloned().map(Arc::new).collect(),
             ..self.metadata.clone()
-        });
+        };
+        if let Some(child) = snapshot
+            .subagents
+            .iter_mut()
+            .find(|child| child.id == "streaming-child")
+        {
+            child.items = vec![snapshot.items.pop().expect("streamed child item")];
+        }
+        self.handle.publish_snapshot_for_test(snapshot);
     }
 
     /// Opens `id` the way pressing its header does.
@@ -430,6 +438,16 @@ const DELTA: usize = 48;
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_frame_of_a_long_streaming_block() {
+    long_streaming_block(false);
+}
+
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_frame_of_a_long_background_streaming_block() {
+    long_streaming_block(true);
+}
+
+fn long_streaming_block(background: bool) {
     let source: String = CODE
         .iter()
         .cycle()
@@ -448,6 +466,22 @@ fn a_frame_of_a_long_streaming_block() {
         ),
     ));
     let mut pane = Pane::new(items);
+    pane.metadata.busy = !background;
+    if background {
+        pane.metadata.subagents.push(chat::Subagent {
+            id: "streaming-child".into(),
+            kind: "task".into(),
+            description: "The child continues after its parent settled".into(),
+            status: chat::ToolStatus::Running,
+            background: true,
+            items: Vec::new(),
+        });
+        pane.runtime.selected_subagent = Some("streaming-child".into());
+    }
+    println!(
+        "background child: {background}, parent busy: {}",
+        pane.metadata.busy
+    );
     println!(
         "one fenced block streamed {DELTA} bytes a frame, {SAMPLES} frames ending at each length:"
     );
