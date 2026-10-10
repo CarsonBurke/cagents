@@ -742,10 +742,12 @@ impl Cagents {
                             self.lifecycle.remove(pane.id);
                         }
                     }
-                    if let Some(card) = self.card_state_mut(pane.id) {
-                        card.title = pane.title.clone();
-                        card.width_fraction = pane.width_fraction;
-                        card.kind = pane.kind.clone();
+                    let mut kind = pane.kind.clone();
+                    preserve_observed_terminal_exit(&card, &mut kind);
+                    if let Some(current) = self.card_state_mut(pane.id) {
+                        current.title = pane.title.clone();
+                        current.width_fraction = pane.width_fraction;
+                        current.kind = kind;
                     }
                     if !self.cards.contains_key(&pane.id) {
                         tasks.push(self.attach_shared_pane(pane));
@@ -999,6 +1001,32 @@ impl Cagents {
     }
 }
 
+// A layout snapshot can predate a runtime exit. Missing recipe metadata cannot
+// revoke a settled exit for that exact terminal; new identities and live host
+// proofs still adopt normally, as do the incoming launch and other metadata.
+fn preserve_observed_terminal_exit(card: &CardState, incoming: &mut CardKind) {
+    let Some(observed) = ended_terminal(Some(card)) else {
+        return;
+    };
+    let CardKind::Terminal(incoming) = incoming else {
+        return;
+    };
+    if observed.id != incoming.id {
+        return;
+    }
+    match (&observed.continuity, &mut incoming.continuity) {
+        (
+            TerminalContinuity::RelaunchAvailable {
+                last_exit: Some(exit),
+                ..
+            }
+            | TerminalContinuity::Exited { last_exit: exit },
+            TerminalContinuity::RelaunchAvailable { last_exit, .. },
+        ) if last_exit.is_none() => *last_exit = Some(exit.clone()),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,6 +1074,131 @@ mod tests {
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
     }
+    #[test]
+    fn shared_layout_echo_preserves_observed_terminal_exit() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = CardKind::Terminal(fresh_terminal_session(
+            LaunchRecipe::shell(PathBuf::from("/repo")).unwrap(),
+        ));
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        app.workspace_model.views = vec![view.clone()];
+        let owned = HashSet::from([pane.id]);
+        drop(app.project_shared_view(&view, &owned));
+        app.cards.insert(pane.id, CardRuntime::Completed);
+        app.retire_ended_terminal(pane.id, 17, None, false);
+        let observed = ended_terminal(app.card_state(pane.id))
+            .unwrap()
+            .continuity
+            .clone();
+
+        // The registry's pane descriptor can predate the runtime event, even
+        // while its layout revision is newer. It does not revoke that event.
+        drop(app.project_shared_view(&view, &owned));
+        assert_eq!(
+            ended_terminal(app.card_state(pane.id)).unwrap().continuity,
+            observed
+        );
+
+        let CardKind::Terminal(incoming) = &mut view.panes[0].kind else {
+            panic!()
+        };
+        incoming.transcript_path = Some(PathBuf::from("/new/transcript"));
+        incoming.launch.arguments.push("changed".into());
+        let expected_launch = incoming.launch.clone();
+        let TerminalContinuity::RelaunchAvailable { recipe, .. } = &mut incoming.continuity else {
+            panic!()
+        };
+        *recipe = expected_launch.clone();
+        drop(app.project_shared_view(&view, &owned));
+        let saved = ended_terminal(app.card_state(pane.id)).unwrap();
+        assert_eq!(saved.launch, expected_launch);
+        assert_eq!(
+            saved.transcript_path.as_deref(),
+            Some(Path::new("/new/transcript"))
+        );
+        let TerminalContinuity::RelaunchAvailable {
+            last_exit: observed_exit,
+            ..
+        } = observed
+        else {
+            panic!()
+        };
+        assert_eq!(
+            saved.continuity,
+            TerminalContinuity::RelaunchAvailable {
+                recipe: expected_launch,
+                last_exit: observed_exit,
+            }
+        );
+    }
+
+    #[test]
+    fn shared_projection_does_not_turn_hydrating_prior_exit_into_a_settled_end() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = CardKind::Terminal(fresh_terminal_session(
+            LaunchRecipe::shell(PathBuf::from("/repo")).unwrap(),
+        ));
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        app.workspace_model.views = vec![view.clone()];
+        let owned = HashSet::from([pane.id]);
+        drop(app.project_shared_view(&view, &owned));
+        app.retire_ended_terminal(pane.id, 17, None, false);
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.card_state_mut(pane.id).unwrap().residency = Residency::Hydrating { epoch: 1 };
+        assert!(!app.terminal_start_in_flight(pane.id));
+
+        // Projection admits a waiting pane as Cold. Evidence must come from
+        // before that change, while the old exit still belongs to a relaunch.
+        drop(app.project_shared_view(&view, &owned));
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(ended_terminal(app.card_state(pane.id)).is_none());
+    }
+
+    #[test]
+    fn shared_exit_overlay_respects_new_identity_proof_and_explicit_end() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let id = app.durable.cards[0].id;
+        app.retire_ended_terminal(id, 17, None, false);
+        let card = app.card_state(id).unwrap().clone();
+        let CardKind::Terminal(session) = &card.kind else {
+            panic!()
+        };
+        let mut missing = session.clone();
+        missing.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: missing.launch.clone(),
+            last_exit: None,
+        };
+        let mut new_identity = missing.clone();
+        new_identity.id = TerminalId::new();
+        let mut live = missing.clone();
+        live.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("replacement"),
+            boot_id: crate::model::BootId::new("replacement"),
+            host_incarnation: crate::model::HostIncarnation::new("replacement"),
+        };
+        let mut explicit_end = missing.clone();
+        explicit_end.continuity = TerminalContinuity::Exited {
+            last_exit: terminal_exit(23, None),
+        };
+        for session in [new_identity, live, explicit_end] {
+            let mut kind = CardKind::Terminal(session);
+            let expected = kind.clone();
+            preserve_observed_terminal_exit(&card, &mut kind);
+            assert_eq!(kind, expected);
+        }
+        let mut hydrating = card;
+        hydrating.residency = Residency::Hydrating { epoch: 1 };
+        let mut kind = CardKind::Terminal(missing);
+        let expected = kind.clone();
+        preserve_observed_terminal_exit(&hydrating, &mut kind);
+        assert_eq!(
+            kind, expected,
+            "an in-flight relaunch is not a settled exit"
+        );
+    }
+
     #[test]
     fn shared_terminal_reconcile_does_not_block_native_input_on_autosave_contention() {
         fn run(closed_owner: bool) -> Duration {
