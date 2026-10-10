@@ -247,6 +247,7 @@ impl PreparedRemoval {
 pub struct Protection {
     directory: PathBuf,
     _locks: Vec<crate::instance::OwnedLock>,
+    _directories: Vec<std::fs::File>,
 }
 
 impl std::fmt::Debug for Protection {
@@ -272,6 +273,7 @@ fn lock_path(runtime: &Path, directory: &Path) -> io::Result<PathBuf> {
 }
 
 fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
+    use std::os::unix::{fs::MetadataExt, fs::OpenOptionsExt};
     crate::secure_file::reject_symlink_components(directory)?;
     let directory = directory.canonicalize()?;
     // A nested folder or submodule editor also protects containing Git worktrees.
@@ -286,28 +288,55 @@ fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Prot
             }
         }
     }
-    let mut locks = Vec::with_capacity(roots.len());
+    let mut locks = Vec::with_capacity(roots.len() * 2);
+    let mut directories = Vec::with_capacity(roots.len());
     for root in roots {
+        let held_directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&root)?;
+        let identity = held_directory.metadata()?;
         let path = lock_path(runtime, &root)?;
-        let lock = crate::instance::owned_lock(
-            &path,
-            (if exclusive {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_SH
-            }) | libc::LOCK_NB,
-        )?;
-        use std::os::unix::fs::MetadataExt;
-        let held = lock.metadata()?;
-        let named = path.symlink_metadata()?;
-        if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
-            return Err(io::Error::other("worktree protection lock was replaced"));
+        let inode_path = path.with_file_name(format!(
+            "directory-{:x}-{:x}.lock",
+            identity.dev(),
+            identity.ino()
+        ));
+        // The path lease covers replacement at the same pathname. The inode
+        // lease follows an externally moved worktree, while the held directory
+        // descriptor prevents inode reuse until the protection retires.
+        let mut lock_paths = [path, inode_path];
+        lock_paths.sort();
+        for path in lock_paths {
+            let lock = crate::instance::owned_lock(
+                &path,
+                (if exclusive {
+                    libc::LOCK_EX
+                } else {
+                    libc::LOCK_SH
+                }) | libc::LOCK_NB,
+            )?;
+            let held = lock.metadata()?;
+            let named = path.symlink_metadata()?;
+            if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                return Err(io::Error::other("worktree protection lock was replaced"));
+            }
+            locks.push(lock);
         }
-        locks.push(lock);
+        let named_directory = root.symlink_metadata()?;
+        if !named_directory.is_dir()
+            || (named_directory.dev(), named_directory.ino()) != (identity.dev(), identity.ino())
+        {
+            return Err(io::Error::other(
+                "protected directory changed while acquiring its leases",
+            ));
+        }
+        directories.push(held_directory);
     }
     Ok(Protection {
         directory,
         _locks: locks,
+        _directories: directories,
     })
 }
 
@@ -338,7 +367,7 @@ pub fn complete_standalone_editor_protection(paths: &[PathBuf]) -> io::Result<()
 }
 
 fn initial_editor_protections(runtime: &Path, paths: &[PathBuf]) -> io::Result<Vec<Protection>> {
-    let mut guards = Vec::new();
+    let mut directories = std::collections::BTreeSet::new();
     for path in paths {
         let absolute = if path.is_absolute() {
             path.clone()
@@ -352,16 +381,20 @@ fn initial_editor_protections(runtime: &Path, paths: &[PathBuf]) -> io::Result<V
                 .parent()
                 .ok_or_else(|| io::Error::other("editor path has no parent"))?
         };
-        guards.push(acquire(runtime, directory, false)?);
+        crate::secure_file::reject_symlink_components(directory)?;
+        directories.insert(directory.canonicalize()?);
         if let Ok(target) = absolute.canonicalize()
             && target != absolute
             && !target.is_dir()
             && let Some(parent) = target.parent()
         {
-            guards.push(acquire(runtime, parent, false)?);
+            directories.insert(parent.to_owned());
         }
     }
-    Ok(guards)
+    directories
+        .into_iter()
+        .map(|directory| acquire(runtime, &directory, false))
+        .collect()
 }
 
 /// A displaying process protects the next directory before it exposes it.
@@ -450,6 +483,28 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
+    fn fixture_git(root: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["-c", "core.hooksPath=/dev/null", "-C"])
+            .arg(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    }
+
     fn request() -> RemovalRequest {
         let source =
             crate::github::GitHubRepoKey::new("github.com", None, "source", "repository").unwrap();
@@ -498,12 +553,7 @@ mod tests {
         let worktree = directory.path().join("worktree");
         std::fs::create_dir(&repository).unwrap();
         let git = |root: &Path, arguments: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(arguments)
-                .output()
-                .unwrap();
+            let output = fixture_git(root).args(arguments).output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -595,16 +645,12 @@ mod tests {
             crate::repository::GitFileLock::acquire(&common.join("refs/heads/feature")).unwrap();
         let packed = crate::repository::GitFileLock::acquire(&common.join("packed-refs")).unwrap();
         let config = crate::repository::GitFileLock::acquire(&common.join("config")).unwrap();
-        let checkout = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&worktree)
+        let checkout = fixture_git(&worktree)
             .args(["checkout", "--detach"])
             .output()
             .unwrap();
         assert!(!checkout.status.success(), "HEAD lock must fence checkout");
-        let update = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repository)
+        let update = fixture_git(&repository)
             .args(["update-ref", "refs/heads/feature", &request.head_oid])
             .output()
             .unwrap();
@@ -613,9 +659,7 @@ mod tests {
             "branch lock must fence ref writes"
         );
         std::fs::write(worktree.join("late-untracked"), "preserve").unwrap();
-        let removal = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repository)
+        let removal = fixture_git(&repository)
             .args(["worktree", "remove", "--"])
             .arg(&worktree)
             .output()
@@ -666,6 +710,60 @@ mod tests {
         );
         drop(guards);
         acquire(runtime.path(), worktree.path(), true).unwrap();
+    }
+
+    #[test]
+    fn directory_identity_protection_survives_git_worktree_moves_and_path_replacement() {
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let runtime = fixture.path().join("runtime");
+        let repository = fixture.path().join("repository");
+        let original = fixture.path().join("original");
+        let moved = fixture.path().join("moved");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::create_dir(&repository).unwrap();
+        let git = |arguments: &[&std::ffi::OsStr]| {
+            let output = fixture_git(&repository).args(arguments).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init".as_ref(), "-b".as_ref(), "main".as_ref()]);
+        git(&[
+            "-c".as_ref(),
+            "user.name=Fixture".as_ref(),
+            "-c".as_ref(),
+            "user.email=fixture@example.invalid".as_ref(),
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-m".as_ref(),
+            "Fixture".as_ref(),
+        ]);
+        git(&[
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "-b".as_ref(),
+            "feature".as_ref(),
+            original.as_os_str(),
+        ]);
+        let editor = acquire(&runtime, &original, false).unwrap();
+        git(&[
+            "worktree".as_ref(),
+            "move".as_ref(),
+            original.as_os_str(),
+            moved.as_os_str(),
+        ]);
+        // An editor retaining the old descriptor still owns the moved inode.
+        assert!(acquire(&runtime, &moved, true).is_err());
+        std::fs::create_dir(&original).unwrap();
+        // A replacement at the original pathname is covered by its path lease.
+        assert!(acquire(&runtime, &original, true).is_err());
+        drop(editor);
+        let removal = acquire(&runtime, &moved, true).unwrap();
+        assert!(acquire(&runtime, &moved, false).is_err());
+        drop(removal);
+        assert!(acquire(&runtime, &original, true).is_ok());
     }
 
     #[test]
