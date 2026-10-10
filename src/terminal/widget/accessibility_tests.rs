@@ -363,7 +363,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     // Reconstruct the named widget and diff retained state before addressing
     // the actual published control node by its native numeric ID.
     new_widget = widget(&new, "new-card", shared.clone(), true, true);
-    new_tree.diff(&new_widget as &dyn Widget<Message, Theme, Renderer>);
+    new_tree.diff(&mut new_widget as &mut dyn Widget<Message, Theme, Renderer>);
     let published =
         new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
     let control = published
