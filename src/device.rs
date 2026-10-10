@@ -33,15 +33,48 @@ struct Devices {
     #[serde(default)]
     devices: Vec<Device>,
 }
-static REMOTE_ENVIRONMENT: OnceLock<
-    std::collections::BTreeMap<crate::agent::Provider, std::collections::BTreeMap<String, String>>,
-> = OnceLock::new();
-static REMOTE_HOME: OnceLock<PathBuf> = OnceLock::new();
-static REMOTE_SHELL: OnceLock<String> = OnceLock::new();
-static SELECTED: OnceLock<Device> = OnceLock::new();
-static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
-static BRIDGE: Mutex<Option<PathBuf>> = Mutex::new(None);
-static MASTERS: Mutex<Vec<Master>> = Mutex::new(Vec::new());
+/// A selection captures a validated profile rather than consulting mutable
+/// configuration while sessions are live. The current CLI/window still owns
+/// exactly one context; this does not introduce per-pane device selection.
+struct ConnectionContext {
+    device: Device,
+    environment: OnceLock<
+        std::collections::BTreeMap<
+            crate::agent::Provider,
+            std::collections::BTreeMap<String, String>,
+        >,
+    >,
+    home: OnceLock<PathBuf>,
+    shell: OnceLock<String>,
+    bridge: Mutex<Option<Bridge>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+impl ConnectionContext {
+    fn new(device: Device) -> Self {
+        Self {
+            device,
+            environment: OnceLock::new(),
+            home: OnceLock::new(),
+            shell: OnceLock::new(),
+            bridge: Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn close(&self) {
+        // Serialize closure with bridge initialization. Existing consumers may
+        // retain their streams, but no caller can reopen a closed context.
+        let mut bridge = self.bridge.lock().unwrap_or_else(|p| p.into_inner());
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(bridge.take());
+    }
+}
+impl Drop for ConnectionContext {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+static SELECTED: OnceLock<ConnectionContext> = OnceLock::new();
 /// sshd admits `MaxSessions` (10 by default) streams per connection; a refused
 /// one reconnects in full, so each master carries fewer and the next takes over.
 const STREAMS_PER_MASTER: usize = 8;
@@ -53,13 +86,12 @@ const MASTER_PERSIST_SECONDS: u32 = 60;
 /// streams stop waiting on one for `MULTIPLEX_RETRY`.
 const MASTER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const MULTIPLEX_RETRY: Duration = Duration::from_secs(300);
-static MULTIPLEX_PAUSED: Mutex<Option<Instant>> = Mutex::new(None);
 /// `ssh -O exit` answers a healthy master in milliseconds. One that does not
 /// answer would hold process exit for `ConnectTimeout` and then log in afresh.
 const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn selected() -> Option<&'static Device> {
-    SELECTED.get()
+    SELECTED.get().map(|context| &context.device)
 }
 pub fn is_remote() -> bool {
     selected().is_some()
@@ -160,7 +192,7 @@ pub fn select(name: Option<&str>) -> io::Result<()> {
             ))
         })?;
     SELECTED
-        .set(device)
+        .set(ConnectionContext::new(device))
         .map_err(|_| io::Error::other("device is already selected"))
 }
 /// A namespace independent of both the local primary window and other devices.
@@ -196,42 +228,99 @@ pub(crate) fn scoped_window_slot(device: &str, slot: &str) -> String {
 pub struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if let Some(path) = BRIDGE
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-        {
-            let _ = fs::remove_file(&path);
-            if let Some(directory) = path.parent() {
-                let masters = MASTERS
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .len();
-                for control in (0..masters).filter_map(|master| control_path(directory, master)) {
-                    if let Some(device) = selected().filter(|_| Path::new(&control).exists())
-                        && let Ok(mut exit) = ssh(Some(&control))
-                            .args(["-O", "exit", "--", &device.host])
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                    {
-                        let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
-                        while matches!(exit.try_wait(), Ok(None)) {
-                            if Instant::now() >= deadline {
-                                let _ = exit.kill();
-                                let _ = exit.wait();
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                    }
-                    let _ = fs::remove_file(control);
-                }
-                let _ = fs::remove_dir(directory);
-            }
+        if let Some(context) = SELECTED.get() {
+            context.close();
         }
     }
+}
+
+/// A shutdown wakes every descriptor waiter without an idle polling timer.
+struct Cancellation {
+    flag: std::sync::atomic::AtomicBool,
+    reader: UnixStream,
+    writer: UnixStream,
+}
+impl Cancellation {
+    fn new() -> io::Result<Self> {
+        let (reader, writer) = UnixStream::pair()?;
+        Ok(Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            reader,
+            writer,
+        })
+    }
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    }
+}
+/// Workers retain their transport resources, never the context/Bridge owner.
+/// This prevents a cycle from making cancellation depend on process exit.
+struct Transport {
+    device: Device,
+    directory: PathBuf,
+    pool: Arc<Mutex<Vec<Master>>>,
+    paused: Mutex<Option<Instant>>,
+    last_error: Mutex<Option<String>>,
+    cancelled: Cancellation,
+}
+impl Drop for Transport {
+    fn drop(&mut self) {
+        // Only streams of this transport can own these private masters.
+        // One overall deadline bounds cleanup independently of pool size.
+        let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
+        let masters = self.pool.lock().unwrap_or_else(|p| p.into_inner()).len();
+        for control in (0..masters).filter_map(|index| control_path(&self.directory, index)) {
+            if Instant::now() < deadline
+                && Path::new(&control).exists()
+                && let Ok(mut exit) = ssh(Some(&control))
+                    .args(["-O", "exit", "--", &self.device.host])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            {
+                while matches!(exit.try_wait(), Ok(None)) {
+                    if Instant::now() >= deadline {
+                        let _ = exit.kill();
+                        let _ = exit.wait();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let _ = fs::remove_file(control);
+        }
+        let _ = fs::remove_file(self.directory.join("daemon.sock"));
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+struct Bridge {
+    transport: Arc<Transport>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        self.transport.cancelled.cancel();
+        if let Some(worker) = self.worker.take() {
+            join_bounded(worker, MASTER_EXIT_TIMEOUT);
+        }
+    }
+}
+fn join_bounded(worker: thread::JoinHandle<()>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if worker.is_finished() {
+        let _ = worker.join();
+    }
+    // An OS operation that remains stuck cannot block the UI indefinitely.
+    // Its worker still owns cancelled resources until it completes; another
+    // context never reuses that private directory or master pool.
 }
 
 fn quote(value: &str) -> String {
@@ -296,10 +385,13 @@ struct Master {
     starting: Arc<Mutex<()>>,
 }
 /// One stream's place on the least-numbered master with room for it.
-struct Slot(usize);
+struct Slot {
+    index: usize,
+    pool: Arc<Mutex<Vec<Master>>>,
+}
 impl Slot {
-    fn acquire() -> (Self, Arc<Mutex<()>>) {
-        let mut masters = MASTERS.lock().unwrap_or_else(|poison| poison.into_inner());
+    fn acquire(pool: &Arc<Mutex<Vec<Master>>>) -> (Self, Arc<Mutex<()>>) {
+        let mut masters = pool.lock().unwrap_or_else(|poison| poison.into_inner());
         let index = masters
             .iter()
             .position(|master| master.streams < STREAMS_PER_MASTER)
@@ -308,12 +400,18 @@ impl Slot {
                 masters.len() - 1
             });
         masters[index].streams += 1;
-        (Self(index), masters[index].starting.clone())
+        (
+            Self {
+                index,
+                pool: pool.clone(),
+            },
+            masters[index].starting.clone(),
+        )
     }
 }
 impl Drop for Slot {
     fn drop(&mut self) {
-        MASTERS.lock().unwrap_or_else(|poison| poison.into_inner())[self.0].streams -= 1;
+        self.pool.lock().unwrap_or_else(|p| p.into_inner())[self.index].streams -= 1;
     }
 }
 /// Each process owns its private local proxy; reconnecting a client establishes
@@ -321,35 +419,89 @@ impl Drop for Slot {
 /// the control sockets beside the proxy stay on this host in the same private
 /// directory, and grant only the SSH access their owner already has.
 pub fn socket_path() -> io::Result<Option<PathBuf>> {
-    let Some(device) = selected() else {
-        return Ok(None);
-    };
-    let mut bridge = BRIDGE.lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Some(path) = bridge.as_ref() {
-        return Ok(Some(path.clone()));
-    }
-    let runtime = crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY);
-    crate::secure_file::prepare_private_directory(&runtime)?;
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let directory = runtime.join(format!("device-{}", &token[..12]));
-    fs::create_dir(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let path = directory.join("daemon.sock");
-    let listener = UnixListener::bind(&path)?;
-    let device = device.clone();
-    thread::Builder::new().name("cagents-device-bridge".into()).spawn(move || {
-        for incoming in listener.incoming() {
-            let Ok(stream) = incoming else { break; };
-
-            let device = device.clone();
-            let directory = directory.clone();
-            let _ = thread::Builder::new().name("cagents-device-connection".into()).spawn(move || {
-                if let Err(error) = forward(&device, &directory, stream) { tracing::warn!(device = device.name, %error, "remote daemon connection ended; verify SSH access and matching cagents installation"); }
-            });
+    SELECTED
+        .get()
+        .map(ConnectionContext::socket_path)
+        .transpose()
+}
+impl ConnectionContext {
+    fn socket_path(&self) -> io::Result<PathBuf> {
+        let mut bridge = self.bridge.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::other("device connection is closed"));
         }
-    })?;
-    *bridge = Some(path.clone());
-    Ok(Some(path))
+        if let Some(bridge) = bridge.as_ref() {
+            return Ok(bridge.transport.directory.join("daemon.sock"));
+        }
+        let runtime =
+            crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY);
+        crate::secure_file::prepare_private_directory(&runtime)?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let directory = runtime.join(format!("device-{}", &token[..12]));
+        let cancelled = Cancellation::new()?;
+        fs::create_dir(&directory)?;
+        let transport = Arc::new(Transport {
+            device: self.device.clone(),
+            directory,
+            pool: Arc::new(Mutex::new(Vec::new())),
+            paused: Mutex::new(None),
+            last_error: Mutex::new(None),
+            cancelled,
+        });
+        fs::set_permissions(&transport.directory, fs::Permissions::from_mode(0o700))?;
+        let path = transport.directory.join("daemon.sock");
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        let owned = transport.clone();
+        let worker = thread::Builder::new()
+            .name("cagents-device-bridge".into())
+            .spawn(move || run_bridge(listener, owned))?;
+        *bridge = Some(Bridge {
+            transport,
+            worker: Some(worker),
+        });
+        Ok(path)
+    }
+}
+fn run_bridge(listener: UnixListener, transport: Arc<Transport>) {
+    let mut workers = Vec::new();
+    while !transport.cancelled.is_cancelled() {
+        // Reap completed connections during normal operation, not just on close.
+        let mut index = 0;
+        while index < workers.len() {
+            if thread::JoinHandle::is_finished(&workers[index]) {
+                let _ = workers.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let owned = transport.clone();
+                if let Ok(worker) = thread::Builder::new().name("cagents-device-connection".into())
+                    .spawn(move || {
+                        if let Err(error) = forward(&owned, stream)
+                            && !owned.cancelled.is_cancelled()
+                        {
+                            tracing::warn!(device = owned.device.name, %error, "remote daemon connection ended; verify SSH access and matching cagents installation");
+                        }
+                    }) { workers.push(worker); }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if wait_transport_io(&listener, libc::POLLIN, &transport.cancelled, None).is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    transport.cancelled.cancel();
+    drop(listener);
+    let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
+    for worker in workers {
+        join_bounded(worker, deadline.saturating_duration_since(Instant::now()));
+    }
 }
 /// Spawn one stream. When its master is not listening this stream becomes it
 /// (`ControlMaster=auto`, which also reconnects alone past a stale, unresponsive
@@ -358,23 +510,26 @@ pub fn socket_path() -> io::Result<Option<PathBuf>> {
 /// to the control socket and hanging up is how liveness is read without a
 /// process per stream; the master discards such a client.
 fn spawn_stream(
-    device: &Device,
+    transport: &Arc<Transport>,
     control: Option<&str>,
     starting: &Mutex<()>,
     stream: UnixStream,
 ) -> io::Result<Forwarding> {
+    let device = &transport.device;
     let (_starting, waited) = if control.is_some() {
         match starting.try_lock() {
             Ok(guard) => (Some(guard), false),
             Err(TryLockError::Poisoned(poison)) => (Some(poison.into_inner()), false),
-            Err(TryLockError::WouldBlock) => (
-                Some(starting.lock().unwrap_or_else(|poison| poison.into_inner())),
-                true,
-            ),
+            Err(TryLockError::WouldBlock) => {
+                (Some(lock_starting(starting, &transport.cancelled)?), true)
+            }
         }
     } else {
         (None, false)
     };
+    if transport.cancelled.is_cancelled() {
+        return Err(io::Error::other("device connection is closed"));
+    }
     let listening = || control.is_some_and(|control| UnixStream::connect(control).is_ok());
     let cold = control.is_some() && !listening();
     let child = bridge_command(device, control)
@@ -385,11 +540,12 @@ fn spawn_stream(
     // Forward immediately, even while the first stream coordinates startup.
     // SSH can successfully run the bridge without publishing a master socket;
     // waiting here before forwarding would expire the daemon's handshake.
-    let mut forwarding = Forwarding::start(child, stream)?;
+    let mut forwarding = Forwarding::start(child, stream, Some(transport.clone()))?;
     // A stream that waited through a failed start must not make the rest queue
     // behind its own attempt; they fail or connect in parallel as before.
     let deadline = Instant::now() + MASTER_START_TIMEOUT;
-    while cold
+    while !transport.cancelled.is_cancelled()
+        && cold
         && !waited
         && !listening()
         && !forwarding
@@ -406,7 +562,8 @@ fn spawn_stream(
                 device = device.name,
                 "SSH did not share a connection in time; connecting separately for now"
             );
-            *MULTIPLEX_PAUSED
+            *transport
+                .paused
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) =
                 Some(Instant::now() + MULTIPLEX_RETRY);
@@ -423,7 +580,8 @@ fn spawn_stream(
         // Successful remote output proves authentication and remote startup
         // finished. A master would already have published its socket, so this
         // is a functional separate connection rather than a slow master.
-        *MULTIPLEX_PAUSED
+        *transport
+            .paused
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(Instant::now() + MULTIPLEX_RETRY);
     }
@@ -439,21 +597,35 @@ struct Forwarding {
     upstream: Option<thread::JoinHandle<io::Result<u64>>>,
     downstream: Option<thread::JoinHandle<io::Result<u64>>>,
     diagnostics: Option<thread::JoinHandle<String>>,
-    stop_diagnostics: Arc<std::sync::atomic::AtomicBool>,
+    stop_diagnostics: Arc<Cancellation>,
     received_output: Arc<std::sync::atomic::AtomicBool>,
     settled: bool,
+    transport: Option<Arc<Transport>>,
 }
 impl Forwarding {
-    fn start(child: std::process::Child, stream: UnixStream) -> io::Result<Self> {
+    fn start(
+        mut child: std::process::Child,
+        stream: UnixStream,
+        transport: Option<Arc<Transport>>,
+    ) -> io::Result<Self> {
+        let stop = match Cancellation::new() {
+            Ok(stop) => Arc::new(stop),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let mut forwarding = Self {
             child,
             stream,
             upstream: None,
             downstream: None,
             diagnostics: None,
-            stop_diagnostics: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_diagnostics: stop,
             received_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             settled: false,
+            transport,
         };
         let mut input = forwarding
             .child
@@ -470,29 +642,37 @@ impl Forwarding {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("SSH stderr unavailable"))?;
-        use std::os::fd::AsRawFd;
-        // SAFETY: stderr owns this live descriptor, and flags preserves its
-        // existing status flags while making cancellation reads nonblocking.
-        let flags = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        // Pipe and socket copies must observe cancellation even when a peer
+        // stops reading or a detached master retains a pipe descriptor.
+        nonblocking(&input)?;
+        nonblocking(&output)?;
+        nonblocking(&stderr)?;
+        forwarding.stream.set_nonblocking(true)?;
         let mut reader = forwarding.stream.try_clone()?;
         let mut writer = forwarding.stream.try_clone()?;
+        let stop = forwarding.stop_diagnostics.clone();
+        let transport = forwarding.transport.clone();
         forwarding.upstream = Some(
             thread::Builder::new()
                 .name("cagents-device-input".into())
-                .spawn(move || copy_flushed(&mut reader, &mut input))?,
+                .spawn(move || {
+                    copy_transport(&mut reader, &mut input, &stop, transport.as_deref(), None)
+                })?,
         );
         let received_output = forwarding.received_output.clone();
+        let stop = forwarding.stop_diagnostics.clone();
+        let transport = forwarding.transport.clone();
         forwarding.downstream = Some(
             thread::Builder::new()
                 .name("cagents-device-output".into())
                 .spawn(move || {
-                    copy_flushed_notifying(&mut output, &mut writer, Some(&received_output))
+                    copy_transport(
+                        &mut output,
+                        &mut writer,
+                        &stop,
+                        transport.as_deref(),
+                        Some(&received_output),
+                    )
                 })?,
         );
         let stop = forwarding.stop_diagnostics.clone();
@@ -517,20 +697,39 @@ impl Forwarding {
         if result.is_err() {
             let _ = self.child.kill();
         }
-        let status = self.child.wait()?;
+        self.stop_diagnostics.cancel();
+        let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline
+                || self
+                    .transport
+                    .as_ref()
+                    .is_some_and(|transport| transport.cancelled.is_cancelled())
+            {
+                let _ = self.child.kill();
+                break self.child.wait()?;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
         self.settled = true;
-        self.stop_diagnostics
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop_diagnostics.cancel();
         let detail = self
             .diagnostics
             .take()
             .expect("forwarding diagnostics started")
             .join()
             .unwrap_or_default();
-        if !status.success() {
-            *LAST_ERROR
+        if !status.success()
+            && let Some(transport) = &self.transport
+            && !transport.cancelled.is_cancelled()
+        {
+            *transport
+                .last_error
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) =
+                .unwrap_or_else(|p| p.into_inner()) =
                 Some(format!("SSH to {} exited {status}: {detail}", device.host));
         }
         result.map(|_| ())
@@ -538,13 +737,13 @@ impl Forwarding {
 }
 impl Drop for Forwarding {
     fn drop(&mut self) {
+        self.stop_diagnostics.cancel();
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         if !self.settled {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        self.stop_diagnostics
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop_diagnostics.cancel();
         if let Some(worker) = self.upstream.take() {
             let _ = worker.join();
         }
@@ -557,11 +756,118 @@ impl Drop for Forwarding {
     }
 }
 
-fn capture_diagnostics(
-    mut stderr: std::process::ChildStderr,
-    stop: &std::sync::atomic::AtomicBool,
-) -> String {
-    use std::{io::Read, os::fd::AsRawFd, sync::atomic::Ordering};
+fn nonblocking(fd: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    // SAFETY: the caller owns a live descriptor; preserve its existing flags.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+fn wait_transport_io(
+    fd: &impl std::os::fd::AsRawFd,
+    events: libc::c_short,
+    stop: &Cancellation,
+    transport: Option<&Transport>,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut descriptors = vec![
+        libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stop.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    if let Some(transport) = transport {
+        descriptors.push(libc::pollfd {
+            fd: transport.cancelled.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    loop {
+        if stop.is_cancelled()
+            || transport.is_some_and(|transport| transport.cancelled.is_cancelled())
+        {
+            return Ok(());
+        }
+        // SAFETY: every descriptor stays owned for this poll; the cancellation
+        // writer shuts down to wake all waiters, without consuming a token.
+        if unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                -1,
+            )
+        } >= 0
+        {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn copy_transport(
+    reader: &mut (impl io::Read + std::os::fd::AsRawFd),
+    writer: &mut (impl io::Write + std::os::fd::AsRawFd),
+    stop: &Cancellation,
+    transport: Option<&Transport>,
+    received_output: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<u64> {
+    use std::sync::atomic::Ordering;
+    let cancelled = || {
+        stop.is_cancelled() || transport.is_some_and(|transport| transport.cancelled.is_cancelled())
+    };
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0;
+    while !cancelled() {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_transport_io(reader, libc::POLLIN, stop, transport)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut offset = 0;
+        while offset < count && !cancelled() {
+            match writer.write(&buffer[offset..count]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_transport_io(writer, libc::POLLOUT, stop, transport)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        total += offset as u64;
+        if offset < count {
+            break;
+        }
+        writer.flush()?;
+        if let Some(received_output) = received_output {
+            received_output.store(true, Ordering::Release);
+        }
+    }
+    Ok(total)
+}
+
+fn capture_diagnostics(mut stderr: std::process::ChildStderr, stop: &Cancellation) -> String {
+    use std::io::Read;
     let mut captured = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
@@ -573,29 +879,21 @@ fn capture_diagnostics(
                 // Drain an already available diagnostic prefix after child
                 // exit, while bounding cancellation of a continuously busy
                 // descriptor inherited by the persistent master.
-                if stop.load(Ordering::Relaxed) && captured.len() == 4096 {
+                if stop.is_cancelled() && captured.len() == 4096 {
                     break;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                if stop.load(Ordering::Relaxed) {
+                if stop.is_cancelled() {
                     break;
                 }
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop.load(Ordering::Relaxed) {
+                if stop.is_cancelled() {
                     break;
                 }
-                let mut descriptor = libc::pollfd {
-                    fd: stderr.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: this one-element poll array and descriptor remain
-                // valid for the call. The short poll bounds cancellation.
-                let result = unsafe { libc::poll(&mut descriptor, 1, 100) };
-                if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                if wait_transport_io(&stderr, libc::POLLIN, stop, None).is_err() {
                     break;
                 }
             }
@@ -605,14 +903,30 @@ fn capture_diagnostics(
     String::from_utf8_lossy(&captured).trim().to_owned()
 }
 
-fn forward(device: &Device, directory: &Path, stream: UnixStream) -> io::Result<()> {
-    let (slot, starting) = Slot::acquire();
-    let paused = MULTIPLEX_PAUSED
+fn lock_starting<'a>(
+    starting: &'a Mutex<()>,
+    cancelled: &Cancellation,
+) -> io::Result<std::sync::MutexGuard<'a, ()>> {
+    loop {
+        if cancelled.is_cancelled() {
+            return Err(io::Error::other("device connection is closed"));
+        }
+        match starting.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+fn forward(transport: &Arc<Transport>, stream: UnixStream) -> io::Result<()> {
+    let (slot, starting) = Slot::acquire(&transport.pool);
+    let paused = transport
+        .paused
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+        .unwrap_or_else(|p| p.into_inner())
         .is_some_and(|until| Instant::now() < until);
-    let control = control_path(directory, slot.0).filter(|_| !paused);
-    spawn_stream(device, control.as_deref(), &starting, stream)?.finish(device)
+    let control = control_path(&transport.directory, slot.index).filter(|_| !paused);
+    spawn_stream(transport, control.as_deref(), &starting, stream)?.finish(&transport.device)
 }
 /// Runs on the selected host through SSH. stdout contains only framed protocol
 /// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
@@ -685,13 +999,6 @@ fn bridge_runtime_directory(base: &std::path::Path, uid: u32) -> io::Result<Path
 }
 
 fn copy_flushed(reader: &mut impl io::Read, writer: &mut impl io::Write) -> io::Result<u64> {
-    copy_flushed_notifying(reader, writer, None)
-}
-fn copy_flushed_notifying(
-    reader: &mut impl io::Read,
-    writer: &mut impl io::Write,
-    received_output: Option<&std::sync::atomic::AtomicBool>,
-) -> io::Result<u64> {
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0;
     loop {
@@ -706,15 +1013,171 @@ fn copy_flushed_notifying(
         // stdout's LineWriter must deliver binary frames without waiting for
         // a newline or the next request from the peer.
         writer.flush()?;
-        if let Some(received_output) = received_output {
-            received_output.store(true, std::sync::atomic::Ordering::Release);
-        }
         total += count as u64;
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_transport(device: Device, directory: PathBuf) -> Arc<Transport> {
+        Arc::new(Transport {
+            device,
+            directory,
+            pool: Arc::new(Mutex::new(Vec::new())),
+            paused: Mutex::new(None),
+            last_error: Mutex::new(None),
+            cancelled: Cancellation::new().unwrap(),
+        })
+    }
+
+    #[test]
+    fn releasing_an_old_slot_only_changes_its_originating_pool() {
+        let old = Arc::new(Mutex::new(Vec::new()));
+        let new = Arc::new(Mutex::new(Vec::new()));
+        let (old_slot, _) = Slot::acquire(&old);
+        let (new_slot, _) = Slot::acquire(&new);
+        drop(old_slot);
+        assert_eq!(old.lock().unwrap()[0].streams, 0);
+        assert_eq!(new.lock().unwrap()[0].streams, 1);
+        drop(new_slot);
+        assert_eq!(new.lock().unwrap()[0].streams, 0);
+    }
+
+    #[test]
+    fn cancellation_interrupts_startup_coordination_without_unlocking_the_owner() {
+        let lock = Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let cancelled = Arc::new(Cancellation::new().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_lock = lock.clone();
+        let worker_cancelled = cancelled.clone();
+        let worker = thread::spawn(move || {
+            tx.send(lock_starting(&worker_lock, &worker_cancelled).is_err())
+                .unwrap();
+        });
+        cancelled.cancel();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(lock.try_lock().is_err());
+        drop(held);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn bridge_close_releases_listener_without_reopening_a_closed_context() {
+        let context = ConnectionContext::new(Device {
+            name: "fixture".into(),
+            host: "unused-fixture".into(),
+            executable: "cagents".into(),
+        });
+        // No remote connection is made: exercise the real listener/cancellation
+        // ownership with a private local socket and the production accept loop.
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(context.device.clone(), directory.path().to_path_buf());
+        let path = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let owned = transport.clone();
+        let worker = thread::spawn(move || run_bridge(listener, owned));
+        *context.bridge.lock().unwrap() = Some(Bridge {
+            transport,
+            worker: Some(worker),
+        });
+        assert_eq!(context.socket_path().unwrap(), path);
+        let started = Instant::now();
+        context.close();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!path.exists());
+        assert!(context.socket_path().is_err());
+    }
+
+    #[test]
+    fn closing_transport_reaps_only_its_owned_forwarding_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(
+            Device {
+                name: "fixture".into(),
+                host: "unused-fixture".into(),
+                executable: "cagents".into(),
+            },
+            directory.path().to_path_buf(),
+        );
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (_client, server) = UnixStream::pair().unwrap();
+        let forwarding = Forwarding::start(child, server, Some(transport.clone())).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let device = transport.device.clone();
+        let worker = thread::spawn(move || {
+            tx.send(forwarding.finish(&device)).unwrap();
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        transport.cancelled.cancel();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        worker.join().unwrap();
+        // SAFETY: only querying our exact fixture child; no PID discovery/signal.
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(
+            transport.last_error.lock().unwrap().is_none(),
+            "intentional closure is not a device connection error"
+        );
+    }
+
+    #[test]
+    fn cancellation_wakes_a_copy_blocked_on_peer_backpressure() {
+        use std::io::Write;
+        let (mut reader, mut input) = UnixStream::pair().unwrap();
+        let (mut writer, _peer_not_reading) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let padding = [0u8; 65536];
+        loop {
+            match writer.write(&padding) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill owned socket: {error}"),
+            }
+        }
+        input.write_all(b"pending bytes").unwrap();
+        let stop = Arc::new(Cancellation::new().unwrap());
+        let copy_stop = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(copy_transport(
+                &mut reader,
+                &mut writer,
+                &copy_stop,
+                None,
+                None,
+            ))
+            .unwrap();
+        });
+        // The socket remains full; successful completion requires cancellation,
+        // independently of whether the worker has reached poll yet.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        stop.cancel();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), 0);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn device_configuration_rejects_a_fifo_without_a_writer() {
@@ -935,7 +1398,8 @@ mod tests {
                     host: "fixture".into(),
                     executable: "cagents".into(),
                 };
-                done_tx.send(forward(&device, &directory, server)).unwrap();
+                let transport = fixture_transport(device, directory);
+                done_tx.send(forward(&transport, server)).unwrap();
             });
             client.write_all(b"handshake\n").unwrap();
             let mut reader = std::io::BufReader::new(client.try_clone().unwrap());
@@ -972,7 +1436,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let (mut client, server) = UnixStream::pair().unwrap();
-        let forwarding = Forwarding::start(child, server).unwrap();
+        let forwarding = Forwarding::start(child, server, None).unwrap();
         let start = Instant::now();
         drop(forwarding);
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -1004,7 +1468,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let (_client, server) = UnixStream::pair().unwrap();
-        assert!(Forwarding::start(child, server).is_err());
+        assert!(Forwarding::start(child, server, None).is_err());
         // SAFETY: query only the child we created; no signal or blocking wait.
         assert_eq!(
             unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) },
@@ -1061,13 +1525,14 @@ mod tests {
         assert_eq!(control_path(Path::new("/run/user/a b"), 0), None);
         assert_eq!(control_path(Path::new("/run/user/%h"), 0), None);
 
+        let pool = Arc::new(Mutex::new(Vec::new()));
         let mut slots = (0..=STREAMS_PER_MASTER)
-            .map(|_| Slot::acquire().0)
+            .map(|_| Slot::acquire(&pool).0)
             .collect::<Vec<_>>();
-        assert_eq!(slots.pop().unwrap().0, 1);
-        assert!(slots.iter().all(|slot| slot.0 == 0));
+        assert_eq!(slots.pop().unwrap().index, 1);
+        assert!(slots.iter().all(|slot| slot.index == 0));
         slots.pop();
-        assert_eq!(Slot::acquire().0.0, 0);
+        assert_eq!(Slot::acquire(&pool).0.index, 0);
     }
     #[test]
     fn remote_command_quotes_executable_and_rejects_options() {
@@ -1100,10 +1565,13 @@ mod tests {
 }
 
 pub fn home() -> Option<&'static PathBuf> {
-    REMOTE_HOME.get()
+    SELECTED.get().and_then(|context| context.home.get())
 }
 pub fn shell() -> Option<&'static str> {
-    REMOTE_SHELL.get().map(String::as_str)
+    SELECTED
+        .get()
+        .and_then(|context| context.shell.get())
+        .map(String::as_str)
 }
 pub fn prepare() -> io::Result<()> {
     if !is_remote() {
@@ -1115,9 +1583,9 @@ pub fn prepare() -> io::Result<()> {
             shell,
             environment,
         }) => {
-            let _ = REMOTE_HOME.set(path);
-            let _ = REMOTE_ENVIRONMENT.set(environment);
-            let _ = REMOTE_SHELL.set(shell);
+            let _ = SELECTED.get().unwrap().home.set(path);
+            let _ = SELECTED.get().unwrap().environment.set(environment);
+            let _ = SELECTED.get().unwrap().shell.set(shell);
             Ok(())
         }
         Ok(_) => Err(io::Error::other(
@@ -1129,10 +1597,21 @@ pub fn prepare() -> io::Result<()> {
                 selected().unwrap().name,
                 selected().unwrap().host,
                 selected().unwrap().host
-            ) + &LAST_ERROR
+            ) + &SELECTED
+                .get()
+                .unwrap()
+                .bridge
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
+                .unwrap_or_else(|p| p.into_inner())
                 .as_ref()
+                .and_then(|bridge| {
+                    bridge
+                        .transport
+                        .last_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                })
                 .map(|error| format!("; {error}"))
                 .unwrap_or_default(),
         )),
@@ -1145,8 +1624,9 @@ pub(crate) fn environment(
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {
     if persistable {
-        REMOTE_ENVIRONMENT
+        SELECTED
             .get()
+            .and_then(|context| context.environment.get())
             .and_then(|environment| environment.get(&provider))
             .cloned()
             .unwrap_or_default()
