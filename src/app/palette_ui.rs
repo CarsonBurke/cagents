@@ -64,8 +64,13 @@ impl Cagents {
                     .palette_entries()
                     .into_iter()
                     .nth(self.palette.selected);
-                self.palette.query = None;
-                entry.map_or_else(Task::none, |(_, _, message)| self.update(message))
+                match entry {
+                    Some((_, _, message)) => {
+                        self.palette.query = None;
+                        self.update(message)
+                    }
+                    None => self.update_palette(Action::Close),
+                }
             }
         }
     }
@@ -608,6 +613,126 @@ impl ShortcutDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep the real Settings pane mounted while the real palette comes and
+    /// goes. Both controls must receive the same runtime focus operation.
+    fn focus_fixture_view(app: &Cagents) -> Element<'_, Message> {
+        widget::column::with_children(vec![
+            app.card_view(app.workspace.focused().unwrap(), true, false),
+            app.palette_surface()
+                .unwrap_or_else(|| widget::Space::new(1, 1).into()),
+        ])
+        .into()
+    }
+
+    fn focus_fixture_step(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        task: Task<Message>,
+        type_text: bool,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse};
+        use iced::{Event, Rectangle, Size, futures::StreamExt};
+
+        let mut element = focus_fixture_view(app);
+        tree.diff(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(1000.0, 1600.0));
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) =
+                    tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .expect("focus task must complete")
+                {
+                    let iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("unexpected non-widget action in focus task")
+                    };
+                    element.as_widget_mut().operate(
+                        tree,
+                        Layout::new(&node),
+                        renderer,
+                        operation.as_mut(),
+                    );
+                }
+            }
+        });
+        executor.shutdown_background();
+        let mut messages = Vec::new();
+        if type_text {
+            element.as_widget_mut().update(
+                tree,
+                &Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("x".into()),
+                    modified_key: keyboard::Key::Character("x".into()),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: Some("x".into()),
+                    repeat: false,
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        messages
+    }
+
+    #[test]
+    fn empty_palette_enter_restores_retained_settings_input_like_escape() {
+        use iced::advanced::widget::Tree;
+
+        for dismiss in [Action::Submit, Action::Close] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let card = app.workspace.focused().unwrap();
+            app.cards.insert(card, CardRuntime::Settings);
+            app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+            let renderer = super::super::tests::headless_renderer();
+            let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
+            let focus = iced::widget::operation::focus(crate::settings_widgets::search_id())
+                .map(cosmic::Action::App);
+            let initial = focus_fixture_step(&app, &mut tree, &renderer, focus, true);
+            assert!(initial.iter().any(|message| matches!(
+                message, Message::SettingsSearchChanged(value) if value == "x"
+            )));
+
+            let open = app.update_palette(Action::Open);
+            let _ = app.update_palette(Action::Query("zzqxv978unmatched".into()));
+            assert!(app.palette_entries().is_empty());
+            let while_open = focus_fixture_step(&app, &mut tree, &renderer, open, true);
+            assert!(
+                !while_open
+                    .iter()
+                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+            );
+            assert!(
+                while_open
+                    .iter()
+                    .any(|message| matches!(message, Message::Palette(Action::Query(_))))
+            );
+
+            let dismiss = app.update_palette(dismiss);
+            assert!(!app.palette.is_open());
+            let after = focus_fixture_step(&app, &mut tree, &renderer, dismiss, true);
+            assert!(after.iter().any(|message| matches!(
+                message, Message::SettingsSearchChanged(value) if value == "x"
+            )));
+        }
+    }
 
     #[test]
     fn captured_new_tab_shortcut_creates_a_thread_once_and_respects_modals() {
