@@ -97,7 +97,9 @@ pub enum Action {
     Precheck(bool),
     ToggleAdvanced,
     Prompt(text_editor::Action),
+    PromptCursor(text_editor::Cursor),
     Shell(text_editor::Action),
+    ShellCursor(text_editor::Cursor),
     Enable,
     Pause,
     RunNow,
@@ -751,7 +753,9 @@ impl State {
                 | Action::Reuse(..)
                 | Action::Precheck(..)
                 | Action::Prompt(..)
+                | Action::PromptCursor(..)
                 | Action::Shell(..)
+                | Action::ShellCursor(..)
         ) {
             self.error = None;
         }
@@ -1199,6 +1203,16 @@ impl State {
             Action::ToggleAdvanced => {
                 if let Some(draft) = &mut self.draft {
                     draft.advanced = !draft.advanced;
+                }
+            }
+            Action::PromptCursor(cursor) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.prompt.move_to(cursor);
+                }
+            }
+            Action::ShellCursor(cursor) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.shell.move_to(cursor);
                 }
             }
             Action::Prompt(action) => {
@@ -1733,8 +1747,9 @@ impl Draft {
             self.model_picker(models),
             self.effort_picker(models),
             crate::design::caption("Instructions").into(),
-            cosmic::iced::widget::text_editor(&self.prompt)
+            crate::ui_controls::field::editor("Automation instructions", &self.prompt)
                 .on_action(Action::Prompt)
+                .on_cursor(Action::PromptCursor)
                 .height(220)
                 .into(),
         ])
@@ -1831,8 +1846,9 @@ impl Draft {
                         "Runs in the selected directory. A non-zero exit skips the agent.",
                     ))
                     .push(
-                        cosmic::iced::widget::text_editor(&self.shell)
+                        crate::ui_controls::field::editor("Precheck shell command", &self.shell)
                             .on_action(Action::Shell)
+                            .on_cursor(Action::ShellCursor)
                             .height(120),
                     )
                     .push(input(

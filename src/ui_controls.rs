@@ -4,6 +4,7 @@
 pub(crate) mod accessibility_probe;
 pub mod button;
 mod display;
+mod editable;
 pub mod field;
 mod gauge;
 mod icon;

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Probe one named field in an explicitly owned, disposable native app fixture.
+
+No text values are printed. Optional replacement changes only the selected field;
+it does not submit a form, send keystrokes, or start a provider.
+"""
+import argparse
+from collections import deque
+import json
+import os
+import select
+import sys
+import time
+
+import gi
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--pid", type=int, required=True)
+parser.add_argument("--name", required=True)
+parser.add_argument("--focus", action="store_true")
+parser.add_argument("--replace-with")
+parser.add_argument("--expected-value")
+parser.add_argument("--forbidden-text")
+parser.add_argument("--require-private", action="store_true")
+args = parser.parse_args()
+if os.stat(f"/proc/{args.pid}").st_uid != os.getuid():
+    parser.error("Target process must belong to this user")
+pidfd = os.pidfd_open(args.pid, 0)
+poll = select.poll()
+poll.register(pidfd, select.POLLIN)
+deadline = time.monotonic() + 20
+
+def check():
+    if poll.poll(0) or time.monotonic() >= deadline:
+        sys.exit("Owned target exited or probe deadline expired")
+
+Atspi.init()
+Atspi.set_timeout(2000, 2000)
+desktop = Atspi.get_desktop(0)
+app = None
+for index in range(min(desktop.get_child_count(), 512)):
+    check()
+    candidate = desktop.get_child_at_index(index)
+    if candidate.get_process_id() == args.pid:
+        app = candidate
+        break
+if app is None:
+    sys.exit("Owned PID is absent from this session's AT-SPI registry")
+queue = deque([app])
+fields = []
+visited = 0
+while queue:
+    check()
+    node = queue.popleft()
+    visited += 1
+    if node.get_name() == args.name and node.get_role() in (Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT):
+        fields.append(node)
+    count = node.get_child_count()
+    if count > 512 or visited + len(queue) + count > 2048:
+        sys.exit("Owned app tree exceeds the traversal budget")
+    for index in range(count):
+        check()
+        queue.append(node.get_child_at_index(index))
+if len(fields) != 1:
+    sys.exit("Expected one uniquely named editable field in the owned app")
+field = fields[0]
+if args.focus:
+    component = field.get_component_iface()
+    check()
+    if not component or not component.grab_focus():
+        sys.exit("Field refused component focus")
+    while not field.get_state_set().contains(Atspi.StateType.FOCUSED):
+        check()
+        time.sleep(0.025)
+if args.replace_with is not None:
+    editable = field.get_editable_text_iface()
+    check()
+    if not editable or not editable.set_text_contents(args.replace_with):
+        sys.exit("Field refused supported whole-value replacement")
+    # Action dispatch is asynchronous; wait for the field's published tree.
+    expected = args.expected_value if args.expected_value is not None else args.replace_with
+    while True:
+        check()
+        text = field.get_text_iface()
+        if not text:
+            break
+        count = text.get_character_count()
+        if count > 4096:
+            sys.exit("Fixture field exceeds the text probe budget")
+        if Atspi.Text.get_text(text, 0, count) == expected:
+            break
+        time.sleep(0.025)
+check()
+text = field.get_text_iface()
+count = text.get_character_count() if text else None
+if count is not None and count > 4096:
+    sys.exit("Fixture field exceeds the text probe budget")
+value = Atspi.Text.get_text(text, 0, count) if text else None
+if args.require_private and text:
+    sys.exit("Private field unexpectedly exposes a text interface")
+if args.forbidden_text and any(args.forbidden_text in item for item in (value or "", field.get_description() or "")):
+    sys.exit("Forbidden fixture text leaked into accessibility")
+if args.expected_value is not None and value != args.expected_value:
+    sys.exit("Published text differs from the expected fixture value")
+print(json.dumps({"pid": args.pid, "name": args.name,
+    "text_interface": bool(text), "character_count": count,
+    "caret": text.get_caret_offset() if text else None,
+    "selection_count": text.get_n_selections() if text else None,
+    "focused": field.get_state_set().contains(Atspi.StateType.FOCUSED),
+    "editable_text_interface": bool(field.get_editable_text_iface())}, indent=2))

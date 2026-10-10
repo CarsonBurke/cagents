@@ -189,6 +189,8 @@ where
         error: Option<Error>,
         system_theme: Option<oneshot::Sender<theme::Mode>>,
         control_sender: mpsc::UnboundedSender<Control>,
+        #[cfg(feature = "a11y")]
+        accessibility_proxy: winit::event_loop::EventLoopProxy,
 
         #[cfg(feature = "a11y")]
         adapters: std::collections::HashMap<
@@ -219,6 +221,8 @@ where
         sender: event_sender,
         receiver: control_receiver,
         control_sender: control_sender.clone(),
+        #[cfg(feature = "a11y")]
+        accessibility_proxy: proxy.raw.clone(),
         error: None,
         system_theme: Some(system_theme_sender),
 
@@ -680,6 +684,7 @@ where
             let node_id = iced_runtime::core::id::window_node_id();
 
             let activation_handler = WinitActivationHandler {
+                event_loop: self.accessibility_proxy.clone(),
                 proxy: self.control_sender.clone(),
                 id,
                 node_id,
@@ -687,11 +692,13 @@ where
             };
 
             let action_handler = WinitActionHandler {
+                event_loop: self.accessibility_proxy.clone(),
                 id,
                 proxy: self.control_sender.clone(),
             };
 
             let deactivation_handler = WinitDeactivationHandler {
+                event_loop: self.accessibility_proxy.clone(),
                 id,
                 proxy: self.control_sender.clone(),
             };

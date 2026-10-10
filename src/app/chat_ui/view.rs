@@ -1713,7 +1713,7 @@ impl Runtime {
             // the queue, and is not left to fall through to that walk.
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
-            iced::widget::text_editor::TextEditor::new(&self.composer)
+            crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
                 .size(design::TEXT_PROSE)
@@ -1729,6 +1729,7 @@ impl Runtime {
                     composer_editor_style,
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
+                .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
                     if press.modifiers.command()
                         && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
@@ -3804,7 +3805,7 @@ fn field_view<'a>(
     let request_id = request.id.clone();
     let field_id = field.id.clone();
     rows.push(
-        iced::widget::text_input(
+        crate::ui_controls::field::text(
             if field.choices.is_empty() {
                 field.label.as_str()
             } else {
@@ -3816,6 +3817,7 @@ fn field_view<'a>(
             "chat.{}.{}.{}",
             target.card, request.id, field.id
         )))
+        .name(field.label.as_str())
         .secure(field.secret)
         .size(design::TEXT_BODY)
         .on_input_maybe(available.then_some(move |value| {
@@ -3829,11 +3831,12 @@ fn field_view<'a>(
         // Enter sends the answer only where the provider offered nothing
         // to refuse: a key press must never be what grants a permission.
         .on_submit_maybe(submit_answer(request).filter(|_| available).map(|choice| {
-            action(Action::Answer(
+            let answer = action(Action::Answer(
                 target,
                 request.id.clone(),
                 choice.id.clone(),
-            ))
+            ));
+            move |_: String| answer.clone()
         }))
         .into(),
     );

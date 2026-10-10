@@ -1,0 +1,22 @@
+[package]
+name = "accesskit_atspi_common"
+version = "0.15.0"
+authors = ["The AccessKit contributors"]
+license = "MIT OR Apache-2.0"
+description = "AccessKit UI accessibility infrastructure: core AT-SPI translation layer"
+categories = ["gui"]
+keywords = ["gui", "ui", "accessibility"]
+repository = "https://github.com/AccessKit/accesskit"
+readme = "README.md"
+edition = "2021"
+rust-version = "1.77.2"
+
+[features]
+simplified-api = []
+
+[dependencies]
+accesskit = { version = "0.22.0", git = "https://github.com/wash2/accesskit", tag = "cosmic-0.14" }
+accesskit_consumer = { version = "0.32.0", git = "https://github.com/wash2/accesskit", tag = "cosmic-0.14" }
+atspi-common = { version = "0.13", default-features = false }
+serde = "1.0"
+zvariant = { version = "5.4", default-features = false }

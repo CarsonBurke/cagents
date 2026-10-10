@@ -253,6 +253,7 @@ winit-wayland = { path = "vendor/winit-wayland" }
 
 # Preserve pointer positions while Iced dispatches a queued event batch.
 [patch."https://github.com/pop-os/libcosmic.git"]
+libcosmic = { path = "vendor/libcosmic" }
 iced_core = { path = "vendor/iced-core" }
 iced_runtime = { path = "vendor/iced-runtime" }
 iced_winit = { path = "vendor/iced-winit" }
@@ -260,3 +261,8 @@ iced_winit = { path = "vendor/iced-winit" }
 # Backport upstream long-line shaping fix until cosmic-text accepts its release.
 [patch.crates-io]
 harfrust = { path = "vendor/harfrust" }
+
+# Editable fields require the Linux string-editing interface, absent in the pinned adapter.
+[patch."https://github.com/wash2/accesskit"]
+accesskit_unix = { path = "vendor/accesskit-unix" }
+accesskit_atspi_common = { path = "vendor/accesskit-atspi-common" }

@@ -40,7 +40,6 @@ dependencies = [
 [[package]]
 name = "accesskit_atspi_common"
 version = "0.15.0"
-source = "git+https://github.com/wash2/accesskit?tag=cosmic-0.14#f0599eed5f18111228266fe3f28991cc48b5964f"
 dependencies = [
  "accesskit 0.22.0",
  "accesskit_consumer",
@@ -74,7 +73,6 @@ dependencies = [
 [[package]]
 name = "accesskit_unix"
 version = "0.18.0"
-source = "git+https://github.com/wash2/accesskit?tag=cosmic-0.14#f0599eed5f18111228266fe3f28991cc48b5964f"
 dependencies = [
  "accesskit 0.22.0",
  "accesskit_atspi_common",
@@ -5654,7 +5652,6 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libcosmic"
 version = "1.0.0"
-source = "git+https://github.com/pop-os/libcosmic.git?rev=caec74c2559924443f12fc6faf97a5bcefe6271d#caec74c2559924443f12fc6faf97a5bcefe6271d"
 dependencies = [
  "apply",
  "ashpd 0.12.3",

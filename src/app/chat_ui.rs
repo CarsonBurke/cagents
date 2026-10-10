@@ -159,6 +159,7 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    ComposerCursor(Target, text_editor::Cursor),
     Paste(Target),
     PastedImage(Target, Option<clipboard_image::Image>),
     PastedText(Target, Option<String>),
@@ -6452,6 +6453,14 @@ impl Cagents {
                 self.replace_chat_conversation(card, session.clone());
                 self.cards.insert(card, CardRuntime::Loading);
                 return self.start_chat(card, session, chat::Intent::Start, None, false);
+            }
+            Action::ComposerCursor(target, cursor) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer.move_to(cursor);
+                    if runtime.completion.restart(false) {
+                        return view::completion_scroll(target, 0.0);
+                    }
+                }
             }
             Action::Composer(target, action) => {
                 let mut files = None;
