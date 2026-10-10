@@ -1303,9 +1303,9 @@ fn unavailable_console_keeps_failed_idle_provider_bound_and_explicitly_closeable
     // The isolated unit-test executable has no matched CLI sibling. Exercise
     // the actual allocation failure without spawning any user installation.
     assert!(
-        !std::env::current_exe()
+        !crate::companion::Product::Cli
+            .beside_current()
             .unwrap()
-            .with_file_name("cagents")
             .exists()
     );
     let (host, mut request, path) = fixture();

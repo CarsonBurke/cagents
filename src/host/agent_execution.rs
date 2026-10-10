@@ -1027,9 +1027,9 @@ fn create_console(
     session: &chat::Session,
     handle: &chat::runtime::Handle,
 ) -> Result<(), ConsoleError> {
-    let program = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .with_file_name("cagents");
+    let program = crate::companion::Product::Cli
+        .beside_current()
+        .map_err(|e| e.to_string())?;
     if !program.is_file() {
         return Err("The matched cagents CLI for the console is unavailable".into());
     }

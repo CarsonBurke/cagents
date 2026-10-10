@@ -465,7 +465,7 @@ impl Cagents {
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            let executable = crate::control::sibling_executable("cagents").map_err(|error| error.to_string())?;
+                            let executable = crate::companion::Product::Cli.beside_current().map_err(|error| error.to_string())?;
                             let status = std::process::Command::new(executable).args(["--device", &name, "ui", "--new-window"]).args(source.as_ref().map(|source| ["--source", source.as_str()]).into_iter().flatten()).status().map_err(|error| error.to_string())?;
                             if status.success() { Ok(()) } else { Err(format!("Could not connect to {name}. Check its SSH connection and cagents daemon.")) }
                         }).await.unwrap_or_else(|error| Err(error.to_string()))
