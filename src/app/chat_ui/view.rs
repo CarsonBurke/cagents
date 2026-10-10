@@ -3811,11 +3811,12 @@ fn field_view<'a>(
         // Enter sends the answer only where the provider offered nothing
         // to refuse: a key press must never be what grants a permission.
         .on_submit_maybe(submit_answer(request).filter(|_| available).map(|choice| {
-            action(Action::Answer(
+            let answer = action(Action::Answer(
                 target,
                 request.id.clone(),
                 choice.id.clone(),
-            ))
+            ));
+            move |_: String| answer.clone()
         }))
         .into(),
     );

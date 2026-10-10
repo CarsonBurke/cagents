@@ -331,13 +331,13 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
                         (Action::SetValue, Some(ActionData::Value(value))) => {
                             shell.publish(action(text_editor::Action::SelectAll));
                             shell.publish(action(text_editor::Action::Edit(
-                                text_editor::Edit::Paste(std::sync::Arc::new(value.clone())),
+                                text_editor::Edit::Paste(std::sync::Arc::new(value.to_string())),
                             )));
                             shell.invalidate_layout();
                         }
                         (Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
                             shell.publish(action(text_editor::Action::Edit(
-                                text_editor::Edit::Paste(std::sync::Arc::new(value.clone())),
+                                text_editor::Edit::Paste(std::sync::Arc::new(value.to_string())),
                             )));
                             shell.invalidate_layout();
                         }
