@@ -2357,9 +2357,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         if let Event::A11y(id, request) = event {
             use iced_accessibility::accesskit::{Action, ActionData};
             let mut a11y = state.a11y.borrow_mut();
-            let ours = self.id.as_ref().is_some_and(|own| own == id);
-            let control = a11y.control_id.as_ref().is_some_and(|own| own == id);
-            let row = a11y.row_ids.iter().any(|own| own == id);
+            let ours = self
+                .id
+                .as_ref()
+                .is_some_and(|own| iced_accessibility::IdEq::eq(own, id));
+            let control = a11y
+                .control_id
+                .as_ref()
+                .is_some_and(|own| iced_accessibility::IdEq::eq(own, id));
+            let row = a11y
+                .row_ids
+                .iter()
+                .any(|own| iced_accessibility::IdEq::eq(own, id));
             if ours || control || row {
                 match request.action {
                     Action::Focus if ours => {

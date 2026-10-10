@@ -227,13 +227,16 @@ fn dispatch(
     );
     messages
 }
-fn action(id: Id, action: Action, data: Option<ActionData>) -> Event {
+fn action(id: impl Into<A11yId>, action: Action, data: Option<ActionData>) -> Event {
+    // Match the native Winit conversion, which delivers a numeric Unique ID
+    // even when the published widget owns a named Custom ID.
+    let target_node: iced_accessibility::accesskit::NodeId = id.into().into();
     Event::A11y(
-        id.clone(),
+        Id::from(target_node.0),
         ActionRequest {
             action,
             target_tree: TreeId::ROOT,
-            target_node: A11yId::from(id).into(),
+            target_node,
             data,
         },
     )
@@ -295,8 +298,9 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     new.fence();
     let layout = layout::Node::new(Size::new(640.0, 320.0));
-    new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
-    let focus_id = new_widget.id.clone().unwrap();
+    let published =
+        new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
+    let focus_id = published.root()[0].id().clone();
     assert_eq!(
         dispatch(
             &mut new_widget,
@@ -356,14 +360,19 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     }
     assert_no_pty_input(&old.fence());
     assert_no_pty_input(&new.fence());
-    let control = new_tree
-        .state
-        .downcast_ref::<WidgetState>()
-        .a11y
-        .borrow()
-        .control_id
-        .clone()
-        .unwrap();
+    // Reconstruct the named widget and diff retained state before addressing
+    // the actual published control node by its native numeric ID.
+    new_widget = widget(&new, "new-card", shared.clone(), true, true);
+    new_tree.diff(&new_widget as &dyn Widget<Message, Theme, Renderer>);
+    let published =
+        new_widget.a11y_nodes(Layout::new(&layout), &new_tree, mouse::Cursor::Unavailable);
+    let control = published
+        .children()
+        .iter()
+        .find(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+        .unwrap()
+        .id()
+        .clone();
     assert_eq!(
         dispatch(
             &mut new_widget,
