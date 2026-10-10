@@ -564,6 +564,12 @@ impl Cagents {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
+        if let Err(error) = self.worktree_protections.protect_next(&path) {
+            self.status = Some(TransientNotice::warning(format!(
+                "Cannot open this worktree yet: {error}"
+            )));
+            return Task::none();
+        }
         let roots = self
             .known_worktree_roots
             .iter()

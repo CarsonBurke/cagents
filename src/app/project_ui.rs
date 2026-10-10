@@ -29,6 +29,7 @@ pub struct State {
     /// Deletions the user has confirmed, by worktree, until each resolves. A
     /// failed one stays so its row can say why and offer to run it again.
     deletions: HashMap<WorktreeId, Deletion>,
+    automatic_attempts: HashMap<WorktreeId, Instant>,
     editors: Vec<crate::external_editor::Editor>,
 }
 
@@ -190,6 +191,10 @@ pub enum Action {
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target),
+    AutomaticallyDeleted {
+        target: Target,
+        removed: Option<RemovedWorktree>,
+    },
     Deleted {
         target: Target,
         result: Result<(), String>,
@@ -203,6 +208,153 @@ pub enum Action {
 }
 
 impl Cagents {
+    pub(super) fn sync_worktree_protections(&mut self) {
+        let mut paths = Vec::new();
+        if let Some(path) = &self.active_workspace {
+            paths.push(path.clone());
+        }
+        for card in self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+        {
+            // Drafts and parked sessions must not be discarded by an optional
+            // cleanup, even before they acquire a daemon-hosted actor.
+            if matches!(&card.kind, CardKind::Chat(_) | CardKind::Terminal(_))
+                && let Some(scope) = self
+                    .worktree_owners
+                    .get(&card.id)
+                    .or_else(|| self.durable.card_scopes.get(&card.id))
+            {
+                paths.push(scope.clone());
+            }
+            if let CardKind::Repository(view) = &card.kind {
+                if view.selected_file.is_some() {
+                    paths.push(view.worktree.clone());
+                }
+                if let Some(navigation) = self.durable.repository_navigation.get(&card.id)
+                    && navigation.selected_file.is_some()
+                {
+                    paths.push(navigation.worktree.clone());
+                }
+            }
+            if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
+                && runtime.selected_path().is_some()
+            {
+                paths.push(runtime.descriptor.worktree.clone());
+            }
+        }
+        if let Err(error) = self.worktree_protections.sync(paths) {
+            tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
+        }
+    }
+
+    /// Sidebar discovery only proposes a candidate. The daemon fetches its PR
+    /// again and independently authorizes the exact checkout under its fences.
+    pub(super) fn cleanup_merged_worktree_task(
+        &mut self,
+        project_id: ProjectId,
+        records: &[(WorktreeRecord, Option<GitHubRepoKey>)],
+        pull_requests: &[crate::github::PullRequest],
+    ) -> Task<Message> {
+        if !self.settings.auto_delete_merged_worktrees
+            || crate::device::selected().is_some()
+            || self.project_ui.deletion_running()
+            || self.session.is_none()
+        {
+            return Task::none();
+        }
+        let Some(repository) = self.review_repositories.get(&project_id).cloned() else {
+            return Task::none();
+        };
+        let candidate = records.iter().find_map(|(record, head_repository)| {
+            let source = head_repository.as_ref()?;
+            let pr = matching_attached_pr(record, source, pull_requests)?;
+            if pr.state.0 != "MERGED"
+                || record.lock.locked
+                || self
+                    .active_workspace
+                    .as_ref()
+                    .is_some_and(|active| active.starts_with(&record.path))
+                || self
+                    .durable
+                    .cards
+                    .iter()
+                    .any(|card| {
+                        card.existence.is_open()
+                            && card_belongs_to(card, &record.path)
+                            && match &card.kind {
+                                CardKind::Repository(view) => view.selected_file.is_some()
+                                    || self.durable.repository_navigation.get(&card.id)
+                                        .is_some_and(|navigation| navigation.selected_file.is_some())
+                                    || matches!(self.cards.get(&card.id), Some(CardRuntime::Repository(runtime)) if runtime.selected_path().is_some() || runtime.blocks_navigation()),
+                                _ => true,
+                            }
+                    })
+                || self
+                    .project_ui
+                    .automatic_attempts
+                    .get(&record.id)
+                    .is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(30))
+            {
+                return None;
+            }
+            let target = self.project_target(project_id, Some(record.id))?;
+            if self.worktree_deletion_blocker(&target).is_some() {
+                return None;
+            }
+            let branch = record
+                .branch
+                .as_deref()?
+                .strip_prefix("refs/heads/")?
+                .to_owned();
+            Some((
+                target,
+                crate::worktree_cleanup::RemovalRequest {
+                    repository: self.sidebar_model.project(project_id)?.repository.clone(),
+                    path: record.path.clone(),
+                    branch,
+                    head_oid: record.head_oid.clone()?,
+                    source_repository: source.clone(),
+                    pull_request: crate::github::PullRequestKey {
+                        repository: repository.clone(),
+                        number: pr.number,
+                    },
+                },
+            ))
+        });
+        let Some((target, request)) = candidate else {
+            return Task::none();
+        };
+        let id = target.worktree.unwrap();
+        self.project_ui
+            .automatic_attempts
+            .insert(id, Instant::now());
+        self.project_ui.deletions.insert(
+            id,
+            Deletion {
+                target: target.clone(),
+                started_at: Instant::now(),
+                failure: None,
+            },
+        );
+        self.sync_worktree_operation_rows();
+        let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        cosmic::task::future(async move {
+            let removed = tokio::task::spawn_blocking(move || {
+                let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).ok()?;
+                let crate::device_service::Reply::MergedWorktreeRemoved(Some(removed)) = reply else { return None; };
+                if let Some(store) = store
+                    && let Err(errors) = crate::repository::release_deleted_worktree_creations(&store, &removed) {
+                    for error in errors { tracing::warn!(%error, "could not release removed worktree creation receipt"); }
+                }
+                Some(removed)
+            }).await.ok().flatten();
+            Message::ProjectUi(Action::AutomaticallyDeleted { target, removed })
+        })
+    }
+
     pub(super) fn selected_project_removal_blocker(&self, project: ProjectId) -> Option<String> {
         let Some(row) = self.sidebar_model.project(project) else {
             return Some("The project is no longer open.".into());
@@ -1131,6 +1283,22 @@ impl Cagents {
                 }
                 return self.start_worktree_deletion(target);
             }
+            Action::AutomaticallyDeleted { target, removed } => {
+                if removed
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.path == target.path)
+                {
+                    return self.handle_project_action(Action::Deleted {
+                        target,
+                        result: Ok(()),
+                    });
+                }
+                if let Some(id) = target.worktree {
+                    self.project_ui.deletions.remove(&id);
+                }
+                self.sync_worktree_operation_rows();
+                return self.lifecycle_sweep();
+            }
             Action::Deleted { target, result } => match result {
                 Err(failure) => {
                     // A blocker names what to resolve, so it outranks Git's
@@ -1177,7 +1345,7 @@ impl Cagents {
                         self.cards.remove(&id);
                         self.lifecycle.remove(id);
                         if let Some(card) = self.card_state_mut(id) {
-                            card.existence = removed_existence("worktree deleted by user");
+                            card.existence = removed_existence("worktree removed");
                         }
                     }
                     // A card filed under the worktree without running in it -
@@ -1222,7 +1390,7 @@ impl Cagents {
                             generation: 0,
                             path: target.path.clone(),
                             branch: removed.and_then(|worktree| worktree.branch),
-                            existence: removed_existence("worktree deleted by user"),
+                            existence: removed_existence("worktree removed"),
                         }]);
                     }
                     self.forget_worktree_creation(&target.path);

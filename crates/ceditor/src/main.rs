@@ -96,6 +96,7 @@ fn settings_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let settings_path = settings_path()?;
+    cagents::worktree_cleanup::prepare_standalone_editor_protection();
     let flags = app::Flags {
         notification_window: arguments.notification_window,
         paths: arguments.paths,

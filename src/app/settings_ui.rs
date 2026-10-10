@@ -405,6 +405,18 @@ fn settings_category_controls<'a>(
                         )
                     }),
                 ),
+                setting_field(
+                    "Merged worktree cleanup",
+                    "Delete clean, inactive GitHub worktrees after their exact current commit is merged. Cleanup waits until hosted processes have ended, preserves branches, and never discards changes.",
+                    crate::settings_widgets::toggle(
+                        "Delete merged worktrees automatically",
+                        draft.auto_delete_merged_worktrees,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::AutoDeleteMergedWorktrees,
+                            value: enabled.to_string(),
+                        },
+                    ),
+                ),
                 settings_choice(
                     "Default channel pane",
                     "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",

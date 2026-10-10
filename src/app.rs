@@ -2717,6 +2717,7 @@ pub enum SettingsField {
     EditorFontSize,
     TerminalScrollbackLines,
     ManagedWorktreeDirectory,
+    AutoDeleteMergedWorktrees,
     WorktreeSort,
     DefaultWorktreePane,
     DefaultChannelPane,
@@ -2883,6 +2884,7 @@ impl SettingsField {
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
+            Self::AutoDeleteMergedWorktrees => "Delete merged worktrees automatically",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
@@ -2917,6 +2919,7 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
+            | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
             | Self::TerminalPadding
@@ -3115,6 +3118,7 @@ struct SettingsDraft {
     browser_search_url: String,
     terminal_scrollback_lines: String,
     managed_worktree_directory: String,
+    auto_delete_merged_worktrees: bool,
     worktree_sort: String,
     default_worktree_pane: settings::DefaultPane,
     default_channel_pane: settings::DefaultPane,
@@ -3169,6 +3173,7 @@ impl SettingsDraft {
                 .unwrap_or_default(),
             terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
+            auto_delete_merged_worktrees: settings.auto_delete_merged_worktrees,
             worktree_sort: match settings.worktree_sort {
                 settings::WorktreeSort::Newest => "newest",
                 settings::WorktreeSort::Oldest => "oldest",
@@ -3222,6 +3227,9 @@ impl SettingsDraft {
             SettingsField::EditorFontSize => self.editor_font_size = value,
             SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
+            SettingsField::AutoDeleteMergedWorktrees => {
+                self.auto_delete_merged_worktrees = value == "true"
+            }
             SettingsField::WorktreeSort => self.worktree_sort = value,
             SettingsField::DefaultWorktreePane => {
                 if let Some(pane) = settings::DefaultPane::from_key(&value) {
@@ -3494,6 +3502,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_worktree_changes_icons = enabled)
             .map_err(|_| "Choose whether worktree changes icons are shown.".to_owned()),
+        SettingsField::AutoDeleteMergedWorktrees => value
+            .parse::<bool>()
+            .map(|enabled| next.auto_delete_merged_worktrees = enabled)
+            .map_err(|_| "Choose whether merged worktrees are deleted automatically.".to_owned()),
         SettingsField::RelaunchAgentsOnUpgrade => value
             .parse::<bool>()
             .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
@@ -4809,6 +4821,7 @@ pub struct Cagents {
     notices: NoticeLog,
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
+    worktree_protections: crate::worktree_cleanup::WindowProtections,
     channel_ui: channel_ui::State,
     sidebar_selection_ui: sidebar_selection_ui::State,
     chat_ui: chat_ui::State,
@@ -12643,6 +12656,7 @@ impl Application for Cagents {
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
+            worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_drafts(chat_drafts),
@@ -12761,6 +12775,7 @@ impl Application for Cagents {
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
             .set_worktree_sort(app.settings.worktree_sort);
+        app.sync_worktree_protections();
         app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
@@ -13555,6 +13570,8 @@ impl Application for Cagents {
                     self.refresh_ui
                         .git
                         .remember_archived(project_id, generation, &archived);
+                    let merged = recent.into_iter().chain(archived).collect::<Vec<_>>();
+                    return self.cleanup_merged_worktree_task(project_id, &worktrees, &merged);
                 }
                 Task::none()
             }
@@ -16139,6 +16156,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
+        self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
@@ -24611,6 +24629,7 @@ mod tests {
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
+            worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::default(),

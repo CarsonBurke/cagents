@@ -95,8 +95,34 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     serve_with(stream, client_id, host, process_request);
 }
 
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes into the initialized ucred-sized buffer.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    (result == 0
+        && length as usize == std::mem::size_of::<libc::ucred>()
+        && credentials.uid == unsafe { libc::geteuid() }
+        && credentials.pid > 0)
+        .then_some(credentials.pid as u32)
+}
+
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
     let registration = Registration::new(Arc::clone(&host), client_id);
+    if let Some(pid) = peer_pid(&stream) {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_client_pid(client_id, pid);
+    }
     let delivery = Arc::clone(&registration.delivery);
     let Ok(writer_stream) = stream.try_clone() else {
         return;
@@ -323,6 +349,39 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    // The GitHub read must not monopolize the exclusive admission fence. All
+    // authorizing local state is checked again only after that fence is held.
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::RemoveMergedWorktree { request },
+    } = &request
+    {
+        let prepared = {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
+        };
+        let removed = match prepared {
+            Ok(prepared) => {
+                let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+                ensure_control_open(host)?;
+                prepared
+                    .remove(|windows| {
+                        host.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .allow_automatic_worktree_cleanup(client_id, windows)
+                    })
+                    .ok()
+            }
+            Err(_) => None,
+        };
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::MergedWorktreeRemoved(removed),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(

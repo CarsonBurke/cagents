@@ -458,6 +458,129 @@ pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
     .map_err(|error| io::Error::new(error.kind(), format!("an update is in progress: {error}")))
 }
 
+static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
+
+fn editor_ready_path(runtime: &Path, pid: u32) -> PathBuf {
+    let product = if IS_DEVELOPMENT {
+        "ceditor-development"
+    } else {
+        "ceditor"
+    };
+    runtime.join(format!("{product}.worktrees-ready.{pid}"))
+}
+
+pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
+    let _launch = recovery_launch_fence()?;
+    if EDITOR_PROTECTION_READY.get().is_none() {
+        let lock = owned_lock(
+            &editor_ready_path(&runtime_directory()?, process::id()),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )?;
+        EDITOR_PROTECTION_READY
+            .set(lock)
+            .map_err(|_| io::Error::other("editor protection already initialized"))?;
+    }
+    Ok(())
+}
+
+/// An older independent editor has no interpretable directory inventory.
+/// Preserve all candidates while any local editor cannot prove readiness.
+/// Never inspect its buffers, environment, cwd or command arguments.
+pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
+    verified_editors_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
+    use std::os::fd::FromRawFd;
+    let mut editors = Vec::new();
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.uid() != current_uid() {
+            continue;
+        }
+        let executable = match fs::read_link(process.join("exe")) {
+            Ok(executable) => executable,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let name = executable.file_name().and_then(|name| name.to_str());
+        if !matches!(name, Some("ceditor" | "ceditor (deleted)")) {
+            continue;
+        }
+        let lease_path = editor_ready_path(runtime, pid);
+        let lease = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lease_path)
+            .map_err(|_| {
+                io::Error::other(
+                    "close older or unready independent editors before automatic cleanup",
+                )
+            })?;
+        let expected = lease.metadata()?;
+        if !expected.is_file()
+            || expected.uid() != current_uid()
+            || expected.nlink() != 1
+            || !process_owns_slot(&process, pid, &expected)?
+        {
+            return Err(io::Error::other(
+                "independent editor protection cannot be authenticated",
+            ));
+        }
+        // SAFETY: pidfd_open returns a fresh descriptor or -1.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ownership of the successful descriptor is transferred.
+        let pidfd = unsafe { File::from_raw_fd(raw as i32) };
+        let editor = VerifiedWindow {
+            executable,
+            pidfd,
+            pid,
+            lease,
+            lease_path,
+        };
+        if !editor.still_owns_lease()? {
+            return Err(io::Error::other("independent editor ownership changed"));
+        }
+        editors.push(editor);
+    }
+    Ok(editors)
+}
+
+pub(crate) fn window_is_initialized() -> bool {
+    WINDOW_SLOT.get().is_some()
+}
+
+pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
+    owned_lock(
+        &runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))),
+        libc::LOCK_EX | libc::LOCK_NB,
+    )
+}
+
+/// Blocks new windows while automatic cleanup authenticates existing owners.
+pub(crate) fn worktree_mutation_launch_fence() -> io::Result<OwnedLock> {
+    owned_lock(
+        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
+        libc::LOCK_EX | libc::LOCK_NB,
+    )
+}
+
 pub(crate) struct VerifiedWindow {
     pub executable: PathBuf,
     pidfd: File,
@@ -467,6 +590,32 @@ pub(crate) struct VerifiedWindow {
 }
 
 impl VerifiedWindow {
+    pub(crate) fn protects_worktrees(&self) -> io::Result<bool> {
+        let name = self
+            .lease_path
+            .file_name()
+            .ok_or_else(|| io::Error::other("window lease has no name"))?
+            .to_string_lossy();
+        let marker = self
+            .lease_path
+            .with_file_name(format!("{name}.worktrees-ready"));
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.is_file() && metadata.uid() == current_uid() => metadata,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(self.still_owns_lease()?
+            && process_owns_slot(
+                &Path::new("/proc").join(self.pid.to_string()),
+                self.pid,
+                &metadata,
+            )?)
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
     pub fn still_owns_lease(&self) -> io::Result<bool> {
         let expected = self.lease.metadata()?;
         let actual = fs::symlink_metadata(&self.lease_path)?;
@@ -1687,6 +1836,31 @@ mod tests {
         assert!(!process_owns_slot(&process, std::process::id(), &expected).unwrap());
         fs::write(process.join("fdinfo/1"), locked_info).unwrap();
         assert!(process_owns_slot(&process, std::process::id(), &expected).unwrap());
+    }
+
+    #[test]
+    fn automatic_cleanup_preserves_older_and_unregistered_independent_editors() {
+        use std::os::unix::fs::symlink;
+        let runtime = tempfile::tempdir().unwrap();
+        let processes = tempfile::tempdir().unwrap();
+        let editor = processes.path().join("245");
+        fs::create_dir(&editor).unwrap();
+        fs::create_dir(editor.join("fdinfo")).unwrap();
+        symlink("/fixture/ceditor", editor.join("exe")).unwrap();
+        assert!(verified_editors_in(runtime.path(), processes.path()).is_err());
+        // A stale named marker is not evidence of a process-owned kernel lock.
+        fs::write(editor_ready_path(runtime.path(), 245), "").unwrap();
+        assert!(verified_editors_in(runtime.path(), processes.path()).is_err());
+        fs::remove_file(editor.join("exe")).unwrap();
+        symlink("/fixture/unrelated-editor", editor.join("exe")).unwrap();
+        assert!(
+            verified_editors_in(runtime.path(), processes.path())
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_file(editor.join("exe")).unwrap();
+        symlink("/fixture/ceditor (deleted)", editor.join("exe")).unwrap();
+        assert!(verified_editors_in(runtime.path(), processes.path()).is_err());
     }
 
     #[test]
