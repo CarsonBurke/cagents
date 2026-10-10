@@ -960,7 +960,7 @@ impl HostState {
                 .map(|(sequence, _)| *sequence)
                 .unwrap_or_else(|| record.event_sequence.saturating_add(1)),
             attached,
-            transcript: transcript_metadata(record.session.transcript_path.as_deref()),
+            transcript: transcript_metadata(terminal_id, record.session.transcript_path.as_deref()),
             upgrade_sources: record.upgrade_sources.clone(),
             upgrade_relaunches: record.upgrade_relaunches.clone(),
         })
@@ -4009,7 +4009,10 @@ fn record_event_from(
     }
 }
 
-fn transcript_metadata(path: Option<&std::path::Path>) -> Option<TranscriptMetadata> {
+fn transcript_metadata(
+    terminal_id: TerminalId,
+    path: Option<&std::path::Path>,
+) -> Option<TranscriptMetadata> {
     let path = path?;
     let metadata = fs::metadata(path).ok()?;
     let updated_at_unix_ms = metadata
@@ -4026,6 +4029,7 @@ fn transcript_metadata(path: Option<&std::path::Path>) -> Option<TranscriptMetad
         // make without changing that worker's persistence contract.
         durable_offset: 0,
         updated_at_unix_ms,
+        location: crate::transcript_location::capture(terminal_id, path),
     })
 }
 

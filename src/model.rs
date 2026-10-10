@@ -934,6 +934,18 @@ pub struct TranscriptMetadata {
     pub byte_len: u64,
     pub durable_offset: u64,
     pub updated_at_unix_ms: i64,
+    /// Fresh host evidence for the private transcript-location action. Saved
+    /// metadata without this receipt is never authority to reveal a path.
+    #[serde(default)]
+    pub location: Option<TranscriptLocationReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptLocationReceipt {
+    pub root_device: u64,
+    pub root_inode: u64,
+    pub file_device: u64,
+    pub file_inode: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
