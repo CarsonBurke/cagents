@@ -606,17 +606,23 @@ mod tests {
         let operation = uuid::Uuid::new_v4();
         app.notification_ui.inbox_activation = Some((lineage, operation));
         let mut cards = app.durable.cards.clone();
-        // Focusing the recipient persists its viewport exposure. Every other
-        // saved field, including the launch and live-session proof, survives.
-        cards[0].exposure = Exposure::Visible;
         drop(app.update_notifications(Action::InboxResolved {
             lineage,
             operation,
             result: Ok(fresh.clone()),
         }));
         assert!(app.notification_ui.inbox_activation.is_none());
-        assert_eq!(app.durable.cards, cards);
         assert_eq!(app.workspace.focused(), Some(cards[0].id));
+        assert_eq!(app.durable.focused, Some(cards[0].id));
+        // The fixture has not received a native viewport resize. Activation
+        // persists its current projected exposure, including overscan, while
+        // every other saved field and the live-session proof must survive.
+        cards[0].exposure = app
+            .workspace
+            .visibility(cards[0].id)
+            .expect("activated recipient remains in the workspace")
+            .into();
+        assert_eq!(app.durable.cards, cards);
         assert!(
             app.notification_ui
                 .pending
