@@ -189,6 +189,9 @@ impl Row {
 pub(super) struct History {
     rows: Arc<[Row]>,
     base: RenderSnapshot,
+    /// Exclusive end of the last row with content or intentional styling.
+    /// Kept separately from retained rows: blank screen padding stays scrollable.
+    meaningful_end: usize,
     pub(super) omitted: u64,
 }
 
@@ -259,9 +262,23 @@ impl History {
                 .min(base.scroll.max_offset());
             base.scroll.mouse_tracking = false;
             base.scroll.bracketed_paste = false;
+            let meaningful_end = rows
+                .iter()
+                .rposition(|row| {
+                    !row.text.is_empty()
+                        || row.wrapped
+                        || !row.links.is_empty()
+                        || row.styles.iter().any(|style| {
+                            style.foreground != base.foreground
+                                || style.background != base.background
+                                || style.style != CellStyle::default()
+                        })
+                })
+                .map_or(0, |index| index + 1);
             Ok(Self {
                 rows: rows.into(),
                 base,
+                meaningful_end,
                 omitted,
             })
         })();
@@ -295,7 +312,13 @@ impl History {
         snapshot.rows = rows.max(1).min(500);
         snapshot.scroll.len = u64::from(snapshot.rows).min(snapshot.scroll.total);
         snapshot.scroll.offset = offset
-            .unwrap_or(snapshot.scroll.max_offset())
+            // Following output aligns the last meaningful row rather than
+            // the unused bottom of the frozen screen. Explicit offsets retain
+            // their absolute top-row anchor, including intentional blank rows.
+            .unwrap_or(
+                self.meaningful_end
+                    .saturating_sub(snapshot.scroll.len as usize) as u64,
+            )
             .min(snapshot.scroll.max_offset());
         let first = snapshot.scroll.offset as usize;
         let end = (first + snapshot.rows as usize).min(self.rows.len());
@@ -330,6 +353,7 @@ impl History {
     pub(super) fn clear(&mut self) {
         let first = self.rows.len().saturating_sub(usize::from(self.base.rows));
         self.rows = self.rows[first..].to_vec().into();
+        self.meaningful_end = self.meaningful_end.saturating_sub(first);
         self.base.scroll.total = self.rows.len() as u64;
         self.base.scroll.len = self.base.scroll.total;
         self.base.scroll.offset = 0;
@@ -555,6 +579,97 @@ mod tests {
         assert!(history.rows.iter().any(|row| row.styles.len() > 1));
         let hit = source.search("hit", true, || false).unwrap().0[0];
         assert_eq!(hit.start_column, 2);
+    }
+
+    fn tall_history(text: &str) -> History {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 12,
+            rows: 8,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        terminal.vt_write(text.as_bytes());
+        History::capture(
+            &mut terminal,
+            &RenderSnapshot::empty(),
+            super::super::holder::MAX_SCREEN,
+        )
+        .unwrap()
+    }
+
+    fn line_text(row: &RowSnapshot) -> String {
+        row.cells.iter().map(|cell| cell.text.as_str()).collect()
+    }
+
+    #[test]
+    fn completed_tail_resize_keeps_short_output_and_explicit_blank_viewport() {
+        let mut history = tall_history("first\r\nsecond\r\n");
+        assert_eq!(
+            history.rows.len(),
+            8,
+            "frozen screen padding remains retained"
+        );
+        assert_eq!(
+            history.meaningful_end, 2,
+            "Ghostty default padding is empty"
+        );
+        let smaller = history.snapshot_at(None, 2, 9);
+        assert_eq!(smaller.scroll.offset, 0);
+        assert_eq!(smaller.scroll.total, 8);
+        assert_eq!(line_text(&smaller.lines[0]), "first");
+        assert_eq!(line_text(&smaller.lines[1]), "second");
+        let explicit = history.snapshot_at(Some(6), 2, 10);
+        assert_eq!(
+            explicit.scroll.offset, 6,
+            "explicit offsets are absolute top rows"
+        );
+        assert!(explicit.lines.iter().all(|row| line_text(row).is_empty()));
+        history.resize(crate::terminal::TerminalSize {
+            columns: 12,
+            rows: 2,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        });
+        assert_eq!(
+            history.base.scroll.offset, 0,
+            "resize preserves the old top anchor"
+        );
+        history.clear();
+        assert_eq!(history.rows.len(), 2);
+        assert_eq!(
+            history.meaningful_end, 0,
+            "cleared prefix cannot leave a stale content end"
+        );
+        assert_eq!(history.snapshot_at(None, 1, 11).scroll.offset, 0);
+    }
+
+    #[test]
+    fn completed_tail_keeps_full_screen_and_intentionally_styled_blank_rows() {
+        let screen = tall_history("zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven");
+        assert_eq!(screen.meaningful_end, 8);
+        let tail = screen.snapshot_at(None, 2, 1);
+        assert_eq!(tail.scroll.offset, 6);
+        assert_eq!(line_text(&tail.lines[0]), "six");
+        assert_eq!(line_text(&tail.lines[1]), "seven");
+        let top = screen.snapshot_at(Some(0), 2, 2);
+        assert_eq!(line_text(&top.lines[0]), "zero");
+        let styled = tall_history("top\x1b[8;1H\x1b[41m\x1b[2K\x1b[0m");
+        assert_eq!(styled.meaningful_end, 8);
+        let tail = styled.snapshot_at(None, 2, 3);
+        assert_eq!(tail.scroll.offset, 6);
+        assert!(line_text(&tail.lines[1]).is_empty());
+        assert!(
+            tail.lines[1]
+                .cells
+                .iter()
+                .any(|cell| cell.background != tail.background)
+        );
+        let spaces = tall_history("top\x1b[8;1H ");
+        assert_eq!(
+            spaces.meaningful_end, 8,
+            "an explicitly written space remains content"
+        );
+        assert_eq!(line_text(&spaces.snapshot_at(None, 1, 4).lines[0]), " ");
     }
 
     #[test]
