@@ -2742,7 +2742,16 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.hash(&mut hasher);
-        self.snapshot.busy.hash(&mut hasher);
+        // Only reasoning uses the transcript's busy state to decide whether
+        // its disclosure has finished. Other rows derive activity from their
+        // own items and the group's status and duration.
+        if turn
+            .prose
+            .iter()
+            .any(|placed| placed.slot == turn::Slot::Thinking)
+        {
+            self.snapshot.busy.hash(&mut hasher);
+        }
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
@@ -4789,6 +4798,84 @@ mod tests {
     }
 
     #[test]
+    fn busy_changes_invalidate_only_turns_containing_reasoning() {
+        let mut items = frame_cost::transcript(2);
+        items.retain(|item| !matches!(item.content, ItemContent::Text { thinking: true, .. }));
+        for (id, role, thinking) in [
+            ("reasoning-prompt", chat::Role::User, false),
+            ("reasoning", chat::Role::Assistant, true),
+        ] {
+            items.push(chat::Item {
+                id: id.into(),
+                role,
+                content: ItemContent::Text {
+                    text: id.into(),
+                    thinking,
+                    phase: chat::Phase::Final,
+                },
+                started_at: None,
+                at: None,
+            });
+        }
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let reasoning = runtime
+            .turns
+            .iter()
+            .map(|turn| {
+                turn.prose
+                    .iter()
+                    .any(|placed| placed.slot == turn::Slot::Thinking)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning.iter().filter(|&&thinking| thinking).count(), 1);
+        assert!(
+            reasoning.len() >= 3,
+            "historical work and the latest reasoning are grouped"
+        );
+        assert!(runtime.turns.iter().any(|turn| !turn.steps.is_empty()));
+        let idle = fingerprints(&runtime, true);
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        let busy = fingerprints(&runtime, true);
+        assert_eq!(
+            idle.iter()
+                .zip(&busy)
+                .map(|(idle, busy)| idle != busy)
+                .collect::<Vec<_>>(),
+            reasoning,
+        );
+        assert!(!reasoning_finished(
+            &runtime.snapshot.items,
+            true,
+            "reasoning"
+        ));
+        Arc::make_mut(&mut runtime.snapshot).busy = false;
+        assert_eq!(idle, fingerprints(&runtime, true));
+        assert!(reasoning_finished(
+            &runtime.snapshot.items,
+            false,
+            "reasoning"
+        ));
+
+        // Even reasoning already followed by an answer keeps its busy
+        // dependency; this change does not localize cross-item completion.
+        let (mut history, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let idle = fingerprints(&history, true);
+        Arc::make_mut(&mut history.snapshot).busy = true;
+        for (turn, (idle, busy)) in history
+            .turns
+            .iter()
+            .zip(idle.iter().zip(fingerprints(&history, true)))
+        {
+            assert_eq!(
+                *idle != busy,
+                turn.prose
+                    .iter()
+                    .any(|placed| placed.slot == turn::Slot::Thinking)
+            );
+        }
+    }
+
+    #[test]
     fn copy_feedback_invalidates_only_the_messages_own_turns() {
         let items = (0..3)
             .flat_map(|index| {
@@ -5010,6 +5097,11 @@ mod tests {
         }
         items[0].at = Some(3500);
         publish(&mut runtime, &handle, &items, 2);
+        assert_ne!(
+            fingerprint,
+            runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(4000)),
+            "a tool's settled status and duration still invalidate its turn",
+        );
         assert_eq!(
             runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(4000)),
             runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(60000)),
