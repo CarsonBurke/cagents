@@ -133,7 +133,8 @@ use crate::{
 /// Version 65 carries ephemeral provider prompt suggestions in native snapshots.
 /// Version 66 adds daemon-fenced optional merged-worktree cleanup.
 /// Version 67 carries original-writer transcript location identity receipts.
-pub const PROTOCOL_VERSION: u16 = 67;
+/// Version 68 adds lineage-scoped terminal mailbox attention.
+pub const PROTOCOL_VERSION: u16 = 68;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

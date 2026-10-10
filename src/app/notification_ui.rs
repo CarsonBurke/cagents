@@ -14,6 +14,11 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    InboxResolved {
+        lineage: crate::agent_execution::Lineage,
+        operation: uuid::Uuid,
+        result: Result<TerminalSession, ()>,
+    },
     ReviewsReported(Result<(), String>),
     Test,
     Tested(Result<TestOutcome, String>),
@@ -38,6 +43,7 @@ pub(super) struct State {
     acknowledged: BTreeSet<uuid::Uuid>,
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
+    inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
 }
 
 impl Default for State {
@@ -52,6 +58,7 @@ impl Default for State {
             last_focus: None,
             acknowledged: BTreeSet::new(),
             testing: false,
+            inbox_activation: None,
         }
     }
 }
@@ -89,6 +96,47 @@ impl State {
 fn connect() -> Result<ControlClient, String> {
     let socket = crate::terminal_ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     ControlClient::connect(&socket).map_err(|error| error.to_string())
+}
+
+/// Resolve only the current, unambiguous live terminal owner. This is a
+/// directory/descriptor read on an existing daemon, never an inbox read.
+fn resolve_inbox(lineage: crate::agent_execution::Lineage) -> Result<TerminalSession, ()> {
+    use crate::agent_execution::{
+        Authority, Operation, Reply,
+        directory::{Scope, Surface},
+    };
+    let mut client = connect().map_err(|_| ())?;
+    let Reply::Directory(directory) = client
+        .agent(Authority::default(), Operation::Directory(Scope::All))
+        .map_err(|_| ())?
+    else {
+        return Err(());
+    };
+    let mut owners = directory
+        .caller
+        .iter()
+        .chain(&directory.sessions)
+        .filter(|entry| entry.lineage == lineage);
+    let owner = owners.next().ok_or(())?;
+    if owners.next().is_some() || owner.surface != Surface::Terminal || owner.provider.is_none() {
+        return Err(());
+    }
+    let session = client
+        .list()
+        .map_err(|_| ())?
+        .into_iter()
+        .find(|descriptor| descriptor.session.id == owner.id)
+        .ok_or(())?
+        .session;
+    session.continuity.live_proof().ok_or(())?;
+    Ok(session)
+}
+
+fn same_live_terminal(current: &TerminalSession, fresh: &TerminalSession) -> bool {
+    current.id == fresh.id
+        && current.launch == fresh.launch
+        && fresh.continuity.live_proof().is_some()
+        && current.continuity.live_proof() == fresh.continuity.live_proof()
 }
 
 fn observe(
@@ -272,6 +320,10 @@ impl Cagents {
     }
 
     pub(super) fn update_notifications(&mut self, action: Action) -> Task<Message> {
+        if matches!(&action, Action::Activated(target) if !matches!(target, Target::SessionInbox(_)))
+        {
+            self.notification_ui.inbox_activation = None;
+        }
         match action {
             Action::Snapshot(snapshot) => {
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
@@ -328,6 +380,43 @@ impl Cagents {
                     self.notification_ui.acknowledge(id);
                 }
                 self.activate_main_window(None)
+            }
+            Action::Activated(Target::SessionInbox(lineage)) => {
+                let operation = uuid::Uuid::new_v4();
+                self.notification_ui.inbox_activation = Some((lineage, operation));
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || resolve_inbox(lineage))
+                        .await
+                        .unwrap_or(Err(()));
+                    Message::NotificationUi(Action::InboxResolved {
+                        lineage,
+                        operation,
+                        result,
+                    })
+                })
+            }
+            Action::InboxResolved {
+                lineage,
+                operation,
+                result,
+            } => {
+                if self.notification_ui.inbox_activation != Some((lineage, operation)) {
+                    return Task::none();
+                }
+                self.notification_ui.inbox_activation = None;
+                let session = result.ok().filter(|fresh| self.durable.cards.iter().any(|card| {
+                    card.existence.is_open() && matches!(&card.kind, CardKind::Terminal(current) if same_live_terminal(current, fresh))
+                }));
+                let Some(session) = session else {
+                    self.status = Some(TransientNotice::warning(
+                        "The recipient terminal is no longer available here. Messages remain unread.",
+                    ));
+                    return self.activate_main_window(None);
+                };
+                self.status = Some(TransientNotice::warning(
+                    "Messages remain unread. Run cagents inbox in the recipient terminal.",
+                ));
+                self.update_notifications(Action::Activated(Target::Session(session.id)))
             }
             Action::Activated(Target::Session(session)) => {
                 let Some(card) = self
@@ -454,6 +543,115 @@ fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_session(app: &mut Cagents) -> TerminalSession {
+        let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind else {
+            panic!("terminal fixture");
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        session.clone()
+    }
+
+    #[test]
+    fn inbox_activation_ignores_prior_operations_and_changed_runtime_proofs() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let fresh = live_session(&mut app);
+        let lineage = crate::agent_execution::Lineage(fresh.id);
+        let old = uuid::Uuid::new_v4();
+        let current = uuid::Uuid::new_v4();
+        app.notification_ui.inbox_activation = Some((lineage, current));
+        let cards = app.durable.cards.clone();
+        let focus = app.workspace.focused();
+        drop(app.update_notifications(Action::InboxResolved {
+            lineage,
+            operation: old,
+            result: Ok(fresh.clone()),
+        }));
+        assert_eq!(
+            app.notification_ui.inbox_activation,
+            Some((lineage, current))
+        );
+        let mut replaced = fresh;
+        replaced.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("replacement"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        drop(app.update_notifications(Action::InboxResolved {
+            lineage,
+            operation: current,
+            result: Ok(replaced),
+        }));
+        assert!(app.notification_ui.inbox_activation.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.focused(), focus);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Messages remain unread")
+        );
+    }
+
+    #[test]
+    fn inbox_activation_keeps_saved_cards_and_message_acknowledgement_separate() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let fresh = live_session(&mut app);
+        let lineage = crate::agent_execution::Lineage(fresh.id);
+        let operation = uuid::Uuid::new_v4();
+        app.notification_ui.inbox_activation = Some((lineage, operation));
+        let cards = app.durable.cards.clone();
+        drop(app.update_notifications(Action::InboxResolved {
+            lineage,
+            operation,
+            result: Ok(fresh.clone()),
+        }));
+        assert!(app.notification_ui.inbox_activation.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .is_empty()
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("cagents inbox")
+        );
+        // Duplicate completion cannot act again, and a later explicit
+        // lifecycle activation cancels an in-flight inbox activation.
+        drop(app.update_notifications(Action::InboxResolved {
+            lineage,
+            operation,
+            result: Err(()),
+        }));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("cagents inbox")
+        );
+        app.notification_ui.inbox_activation = Some((lineage, uuid::Uuid::new_v4()));
+        drop(app.update_notifications(Action::Activated(Target::Session(fresh.id))));
+        assert!(app.notification_ui.inbox_activation.is_none());
+        let mut changed_launch = fresh.clone();
+        changed_launch.launch.working_directory = "/another".into();
+        assert!(!same_live_terminal(&changed_launch, &fresh));
+        changed_launch = fresh.clone();
+        changed_launch.id = TerminalId::new();
+        assert!(!same_live_terminal(&changed_launch, &fresh));
+    }
 
     #[test]
     fn every_test_notification_answer_is_reported_with_its_own_severity() {
