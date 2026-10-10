@@ -4167,6 +4167,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        for (operation, target, name) in [
+            (
+                chat::CommandAction::Read,
+                "Read λ notes.md",
+                "Read Read λ notes.md",
+            ),
+            (
+                chat::CommandAction::Search,
+                "Search TODO",
+                "Searched Search TODO",
+            ),
+            (chat::CommandAction::List, "List *.rs", "Listed List *.rs"),
+        ] {
+            let item = chat::Item {
+                id: "exact".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Command {
+                    label: target.into(),
+                    command: target.into(),
+                    working_directory: "/project".into(),
+                    action: operation,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: "result".into(),
+                },
+                started_at: None,
+                at: None,
+            };
+            let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            assert_eq!(runtime.cache[&item.id].preview.text, target);
+            assert_eq!(runtime.turns[0].summary, name);
+            for open in [false, true] {
+                let mut element = runtime.step_header(&item, &runtime.cache[&item.id], open);
+                let renderer = crate::app::tests::headless_renderer();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let nodes: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .collect();
+                assert!(
+                    nodes.iter().any(|node| node.node().role() == Role::Button
+                        && node.node().label() == Some(name)),
+                    "row action must name its exact target"
+                );
+                assert!(
+                    nodes.iter().any(|node| node.node().value() == Some(target)
+                        || node.node().label() == Some(target)),
+                    "rendered preview must keep the actual filename/pattern: {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transcript_viewport_reaches_pane_edges_with_inset_inside_content() {
         use iced::advanced::{
             Layout, layout,

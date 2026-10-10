@@ -403,6 +403,10 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
         } => {
             if label.is_empty() {
                 first_line(command)
+            } else if label == command {
+                // Built-in reads/searches carry the exact target in both
+                // fields. A filename or pattern may itself start with a verb.
+                label
             } else {
                 target(*action, label)
             }
@@ -437,8 +441,9 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
 /// Adapters used to write `Read src/app.rs` and `Search TODO`, which the verb
 /// in front of every step turned into "Read Read src/app.rs". They write the
 /// target alone now, and a transcript stored before that still holds the old
-/// form, so the word is taken off here. A file that is itself named `Read …`
-/// loses the word too, which is the cost of telling the two apart by text.
+/// form, so the word is taken off here. Exact command targets are preserved
+/// before this fallback; a distinct summary still lacks metadata to distinguish
+/// a verb from a target name.
 fn target(action: chat::CommandAction, label: &str) -> &str {
     let stored = match action {
         chat::CommandAction::Read => "Read ",
@@ -1095,6 +1100,39 @@ mod tests {
         };
         assert_eq!(step_label(&content), "git add -A \\");
         assert_eq!(step_verb(&content), "Ran");
+    }
+
+    #[test]
+    fn exact_targets_that_start_with_verbs_keep_their_bytes() {
+        for (action, target, expected) in [
+            (
+                CommandAction::Read,
+                "Read λ notes.md",
+                "Read Read λ notes.md",
+            ),
+            (CommandAction::Search, "Search TODO", "Searched Search TODO"),
+            (CommandAction::List, "List *.rs", "Listed List *.rs"),
+        ] {
+            let content = ItemContent::Command {
+                label: target.into(),
+                command: target.into(),
+                working_directory: "/workspace".into(),
+                action,
+                status: ToolStatus::Succeeded,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            };
+            assert_eq!(step_label(&content), target);
+            let item = Item {
+                id: "exact".into(),
+                role: Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            };
+            assert_eq!(group(&[item], &unasked())[0].summary, expected);
+        }
     }
 
     /// A read, a search and a listing say what they did once, whether the
