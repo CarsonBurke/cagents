@@ -12863,6 +12863,10 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if crate::diagnostics::take_failure_notice() {
+            self.notices
+                .record(TransientNotice::warning(crate::diagnostics::FAILURE_NOTICE));
+        }
         if crate::device::is_remote() {
             match &message {
                 Message::GitUi(_)
@@ -17051,6 +17055,9 @@ impl Drop for Cagents {
         self.persist();
         self.fold_settings_drafts();
         if let Err(error) = self.save_settings_now() {
+            crate::diagnostics::record(crate::diagnostics::Event::SettingsFailed {
+                category: crate::diagnostics::Failure::Unknown,
+            });
             tracing::error!(%error, "failed to persist settings");
         }
         if let Some(session) = &mut self.session {

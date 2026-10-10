@@ -67,6 +67,24 @@ pub enum SaveFailureCategory {
     Database,
 }
 
+impl From<SaveFailureCategory> for crate::diagnostics::Failure {
+    fn from(category: SaveFailureCategory) -> Self {
+        match category {
+            SaveFailureCategory::Busy => Self::Busy,
+            SaveFailureCategory::ReadOnly => Self::ReadOnly,
+            SaveFailureCategory::DiskFull => Self::DiskFull,
+            SaveFailureCategory::PermissionDenied => Self::PermissionDenied,
+            SaveFailureCategory::StorageUnavailable => Self::StorageUnavailable,
+            SaveFailureCategory::Corrupt => Self::Corrupt,
+            SaveFailureCategory::Conflict => Self::Conflict,
+            SaveFailureCategory::Serialization => Self::Serialization,
+            SaveFailureCategory::InvalidData => Self::InvalidData,
+            SaveFailureCategory::Io => Self::Io,
+            SaveFailureCategory::Database => Self::Database,
+        }
+    }
+}
+
 /// What to do about writes storage refused by construction. Retrying the same
 /// content cannot help, so the remedy is changing it.
 pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
@@ -2140,6 +2158,7 @@ impl HealthPublisher {
         let at = unix_millis();
         self.last_successful_flush_at_unix_ms = Some(at);
         if self.incident.take().is_some() {
+            crate::diagnostics::record(crate::diagnostics::Event::PersistenceRecovered);
             self.publish(SessionSaveHealth::Recovered {
                 recovered_at_unix_ms: at,
             });
@@ -2206,7 +2225,7 @@ fn unix_millis() -> i64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriterExit {
-    Shutdown,
+    Shutdown(crate::diagnostics::Event),
     Unavailable,
 }
 
@@ -2218,10 +2237,12 @@ fn run_persistence_worker(
     mut health: HealthPublisher,
     config: PersistenceConfig,
 ) {
+    crate::diagnostics::record(crate::diagnostics::Event::PersistenceStarted);
     let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         persistence_loop(store, writes, queue, last_error, &mut health, config)
     }));
-    if !matches!(exit, Ok(WriterExit::Shutdown)) {
+    if !matches!(exit, Ok(WriterExit::Shutdown(_))) {
+        crate::diagnostics::record(crate::diagnostics::Event::WriterUnavailable);
         health.publish(SessionSaveHealth::WriterUnavailable);
     }
 }
@@ -2360,6 +2381,10 @@ fn persistence_loop(
                 // first failure of a cycle and the attempt that gives up are
                 // recorded.
                 if attempts_this_cycle == 1 || retry_exhausted {
+                    crate::diagnostics::record(crate::diagnostics::Event::PersistenceFailed {
+                        category: failure.unwrap_or(SaveFailureCategory::Database).into(),
+                        exhausted: retry_exhausted,
+                    });
                     tracing::warn!(
                         attempts = attempts_this_cycle,
                         exhausted = retry_exhausted,
@@ -2414,6 +2439,9 @@ fn persistence_loop(
                 // budget; the steady-state backoff already paces that wait.
                 thread::sleep(retry_delay.min(remaining));
                 let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut shutdown_rebases);
+                if !errors.is_empty() {
+                    failure = Some(select_failure_category(&errors));
+                }
                 record_flush_errors(&last_error, &errors);
                 health.quarantine(writes.quarantined());
                 if writes.is_settled() {
@@ -2443,14 +2471,41 @@ fn persistence_loop(
             // the next open must recover rather than trust the database. A
             // refused catalog row does not undo that: it is lost either way,
             // and nothing a recovery reconciles depends on it.
-            if writes.is_settled()
-                && writes.quarantine.window_state().is_none()
-                && let Err(error) = store.shutdown()
-                && let Ok(mut message) = last_error.lock()
-            {
-                *message = Some(error.to_string());
+            let mut clean_marker = false;
+            if writes.is_settled() && writes.quarantine.window_state().is_none() {
+                match store.shutdown() {
+                    Ok(()) => clean_marker = true,
+                    Err(error) => {
+                        failure = Some(save_failure_category(&error));
+                        if let Ok(mut message) = last_error.lock() {
+                            *message = Some(error.to_string());
+                        }
+                    }
+                }
             }
-            return WriterExit::Shutdown;
+            let unsaved = usize::from(writes.workspace.is_some())
+                .saturating_add(writes.conversions.len())
+                .saturating_add(writes.projects.len())
+                .saturating_add(writes.worktrees.len())
+                .saturating_add(writes.identity_replacements.len());
+            let complete = clean_marker && unsaved == 0 && refused.is_empty();
+            let final_flush = crate::diagnostics::Event::FinalFlush {
+                complete,
+                unsaved: u32::try_from(unsaved).unwrap_or(u32::MAX),
+                refused: u32::try_from(refused.len()).unwrap_or(u32::MAX),
+                category: if complete {
+                    None
+                } else {
+                    Some(
+                        failure
+                            .or_else(|| refused.first().map(|write| write.category))
+                            .map(Into::into)
+                            .unwrap_or(crate::diagnostics::Failure::Unknown),
+                    )
+                },
+            };
+            crate::diagnostics::record(final_flush);
+            return WriterExit::Shutdown(final_flush);
         }
     }
 }
@@ -2645,6 +2700,7 @@ mod tests {
         shutdowns: Arc<AtomicUsize>,
         /// Counts every write the lane offered, whatever its outcome.
         attempts: Arc<AtomicUsize>,
+        shutdown_failure: bool,
     }
 
     impl FakeStore {
@@ -2655,6 +2711,7 @@ mod tests {
                 rebases: Arc::new(AtomicUsize::new(0)),
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 attempts: Arc::new(AtomicUsize::new(0)),
+                shutdown_failure: false,
             }
         }
 
@@ -2665,6 +2722,7 @@ mod tests {
                 rebases: Arc::new(AtomicUsize::new(0)),
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 attempts: Arc::new(AtomicUsize::new(0)),
+                shutdown_failure: false,
             }
         }
 
@@ -2774,7 +2832,14 @@ mod tests {
 
         fn shutdown(&self) -> Result<(), StoreError> {
             self.shutdowns.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.shutdown_failure {
+                Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "TOKEN=secret clean-marker error",
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -3585,6 +3650,51 @@ mod tests {
     }
 
     #[test]
+    fn final_clean_marker_failure_is_classified_even_with_no_pending_writes() {
+        let mut store = FakeStore::new([]);
+        store.shutdown_failure = true;
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                shutdown: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let last_error = Arc::new(Mutex::new(None));
+        let (health_tx, _health_rx) = async_channel::unbounded();
+        let mut health = HealthPublisher::new(health_tx);
+        let outcome = persistence_loop(
+            store,
+            PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+            queue,
+            Arc::clone(&last_error),
+            &mut health,
+            fast_persistence_config(1),
+        );
+        assert_eq!(
+            outcome,
+            WriterExit::Shutdown(crate::diagnostics::Event::FinalFlush {
+                complete: false,
+                unsaved: 0,
+                refused: 0,
+                category: Some(crate::diagnostics::Failure::PermissionDenied)
+            })
+        );
+        assert!(
+            last_error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains("TOKEN")
+        );
+        let WriterExit::Shutdown(event) = outcome else {
+            panic!("writer failed unexpectedly");
+        };
+        assert!(!serde_json::to_string(&event).unwrap().contains("TOKEN"));
+    }
+
+    #[test]
     fn failed_final_write_does_not_mark_store_clean() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("failed-shutdown.sqlite3");
@@ -3614,7 +3724,7 @@ mod tests {
         let (health_tx, _health_rx) = async_channel::unbounded();
         let mut health = HealthPublisher::new(health_tx);
 
-        persistence_loop(
+        let outcome = persistence_loop(
             store,
             PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
             queue,
@@ -3627,6 +3737,15 @@ mod tests {
                 ..PersistenceConfig::default()
             },
         );
+        assert!(matches!(
+            outcome,
+            WriterExit::Shutdown(crate::diagnostics::Event::FinalFlush {
+                complete: false,
+                unsaved: 1,
+                refused: 0,
+                category: Some(crate::diagnostics::Failure::Busy)
+            })
+        ));
         assert!(last_error.lock().unwrap().is_some());
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
@@ -3674,7 +3793,7 @@ mod tests {
         let (health_tx, _health_rx) = async_channel::unbounded();
         let mut health = HealthPublisher::new(health_tx);
 
-        persistence_loop(
+        let outcome = persistence_loop(
             store,
             PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
             queue,
@@ -3683,6 +3802,15 @@ mod tests {
             PersistenceConfig::default(),
         );
         release.join().unwrap();
+        assert!(matches!(
+            outcome,
+            WriterExit::Shutdown(crate::diagnostics::Event::FinalFlush {
+                complete: true,
+                unsaved: 0,
+                refused: 0,
+                category: None,
+            })
+        ));
         assert!(last_error.lock().unwrap().is_none());
 
         let reopened = StateStore::open(&path, boot).unwrap();

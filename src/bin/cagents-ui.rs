@@ -40,14 +40,6 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = cagents::document_render::hook() {
         return code;
     }
-    // Diagnostics come before every other statement. The startup sequence
-    // below - window lease, session store, activation socket, daemon launch,
-    // checkpoint restore - is exactly the region whose failures used to be
-    // unobservable, because the subscriber was installed after it.
-    cagents::instance::install_panic_hook(PRODUCT);
-    cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
-    tracing::info!(version = cagents::VERSION, "starting cagents-ui");
-
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     // The standalone dialogs write their result to stdout and the tray shows
     // that text verbatim. They inherit the launcher handshake variable from
@@ -58,6 +50,8 @@ fn main() -> std::process::ExitCode {
         .first()
         .is_some_and(|argument| argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR);
     if standalone {
+        cagents::instance::install_panic_hook(PRODUCT);
+        cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
         return report(run_internal(&arguments));
     }
 
@@ -70,6 +64,14 @@ fn main() -> std::process::ExitCode {
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(error) => return report(Err(error)),
     };
+
+    // Diagnostics come before every other statement. The startup sequence
+    // below - window lease, session store, activation socket, daemon launch,
+    // checkpoint restore - is exactly the region whose failures used to be
+    // unobservable, because the subscriber was installed after it.
+    cagents::instance::install_panic_hook(PRODUCT);
+    cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
+    tracing::info!(version = cagents::VERSION, "starting cagents-ui");
 
     let main_thread = std::thread::current().id();
     let previous_hook = std::panic::take_hook();
@@ -103,6 +105,9 @@ fn main() -> std::process::ExitCode {
 /// the message and escapes its newlines; usage text came out as one line of
 /// literal `\n`. Every failure here is a message meant for a person to read.
 fn report(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitCode {
+    cagents::diagnostics::record(cagents::diagnostics::Event::Exit {
+        success: result.is_ok(),
+    });
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -118,7 +123,7 @@ fn report(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitC
 fn report_startup_failure(message: &str) {
     let message = truncated(message);
     tracing::error!(error = message, "cagents-ui startup failed");
-    cagents::instance::report_startup_failure(message);
+    cagents::instance::report_startup_failure();
     // "Already running" is not a failure the user must be shown: the launcher
     // resolves it by activating the window that already exists.
     let already_running =

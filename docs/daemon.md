@@ -258,14 +258,15 @@ including ones not on screen, by observing the foreground agent periodically.
 
 The daemon also stops itself rather than stay wedged. Everything it hosts
 serializes on one internal lock; if a single hold keeps another thread waiting
-for two minutes, the daemon logs the stall to `cagentsd.log` and aborts, leaving
+for two minutes, the daemon aborts immediately, leaving
 a core dump (`coredumpctl info cagentsd`) that names the thread holding it. The
 application then starts a replacement, which recovers as described here. Native
 conversations survive this only with [durable continuity](#native-provider-continuity);
 the others lose their running turn and resume from disk. A
 thread that tries to take that lock twice panics on its own instead, which is
-recorded in `cagentsd-crash.log` and ends that thread's work rather than the
-daemon's.
+recorded as a payload-free typed panic in [private diagnostics](diagnostics.md)
+and ends that thread's work rather than the daemon's. Raw tracing and backtraces
+require an explicit local debug capture.
 
 | Saved record | Recovery |
 |--------------|----------|

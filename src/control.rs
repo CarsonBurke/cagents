@@ -89,6 +89,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Read bounded private diagnostics without starting services.
+    Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
     /// Show this session, its parent and agents, and peers in the same checkout.
@@ -1920,6 +1922,31 @@ where
         }
     };
 
+    // Local evidence must remain readable when a staged owner, backend, or
+    // daemon cannot start. Do not select/prepare a device or follow a route.
+    if matches!(cli.command, TopCommand::Diagnostics) {
+        if cli.device.is_some() {
+            emit_error(
+                cli.json,
+                &AppError::new(
+                    "diagnostics_local_only",
+                    "Diagnostics inspect this device; omit --device",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        return match execute(TopCommand::Diagnostics) {
+            Ok(output) => {
+                emit_success(cli.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let _device_cleanup = crate::device::Cleanup;
     if let Err(error) = crate::device::select(cli.device.as_deref()) {
         emit_error(cli.json, &AppError::new("device", error));
@@ -2015,7 +2042,8 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
     !matches!(
         command,
-        TopCommand::CoordinateInstall { .. }
+        TopCommand::Diagnostics
+            | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
             | TopCommand::UpdateWorker { .. }
@@ -2035,6 +2063,25 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Diagnostics => {
+            let report = crate::diagnostics::inspect().map_err(|_| {
+                AppError::new(
+                    "diagnostics_unavailable",
+                    "Private diagnostics could not be safely read",
+                )
+            })?;
+            let human = report.human();
+            Ok(CommandOutput {
+                command: "diagnostics",
+                data: serde_json::to_value(report).map_err(|_| {
+                    AppError::new(
+                        "diagnostics_unavailable",
+                        "Private diagnostics could not be encoded",
+                    )
+                })?,
+                human,
+            })
+        }
         TopCommand::Linear(command) => linear::execute(command),
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),

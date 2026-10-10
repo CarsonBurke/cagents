@@ -50,12 +50,32 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = cagents::document_render::hook() {
         return code;
     }
-    // Diagnostics come before every other statement: a panic in a render or
+    let arguments = Arguments::parse();
+    if arguments.settings_path {
+        return match settings_path() {
+            Ok(path) => {
+                println!("{}", path.display());
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PRODUCT}: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    // Diagnostics precede ordinary UI startup: a panic in a render or
     // worker thread used to take the window with it and leave nothing behind
     // in ceditor's data directory.
-    cagents::instance::install_panic_hook(PRODUCT);
+    cagents::instance::install_panic_hook_with_version(PRODUCT, env!("CARGO_PKG_VERSION"));
     cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
-    match run() {
+    let result = run(arguments);
+    if result.is_err() {
+        cagents::instance::report_startup_failure();
+    }
+    cagents::diagnostics::record(cagents::diagnostics::Event::Exit {
+        success: result.is_ok(),
+    });
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // Returning the `Result` from `main` instead would render the
@@ -67,16 +87,15 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments = Arguments::parse();
-    let settings_path = directories::ProjectDirs::from("io", "cagents", PRODUCT)
+fn settings_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(directories::ProjectDirs::from("io", "cagents", PRODUCT)
         .ok_or("ceditor configuration directory is unavailable")?
         .config_dir()
-        .join("settings.toml");
-    if arguments.settings_path {
-        println!("{}", settings_path.display());
-        return Ok(());
-    }
+        .join("settings.toml"))
+}
+
+fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
+    let settings_path = settings_path()?;
     let flags = app::Flags {
         notification_window: arguments.notification_window,
         paths: arguments.paths,

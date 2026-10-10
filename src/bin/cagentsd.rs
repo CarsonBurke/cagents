@@ -18,12 +18,17 @@ fn main() -> std::process::ExitCode {
     cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
     tracing::info!(version = cagents::VERSION, "starting cagentsd");
     match cagents::host::run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            cagents::diagnostics::record(cagents::diagnostics::Event::Exit { success: true });
+            std::process::ExitCode::SUCCESS
+        }
         // Returning `Result` from `main` renders this with `Debug`, which
         // wraps the message in its error variant and escapes the quotes
         // around the socket path. Someone running the daemon by hand to find
         // out why it will not start has to read the text.
         Err(error) => {
+            cagents::instance::report_startup_failure();
+            cagents::diagnostics::record(cagents::diagnostics::Event::Exit { success: false });
             eprintln!("cagentsd: {error}");
             std::process::ExitCode::FAILURE
         }

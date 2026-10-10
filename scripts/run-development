@@ -52,6 +52,7 @@ USAGE
 done
 
 if [ "$debug" = true ]; then
+    export CAGENTS_LOCAL_DEBUG=1
     export RUST_BACKTRACE=${RUST_BACKTRACE:-1}
     export RUST_LOG=${RUST_LOG:-cagents=debug,cagentsd=debug,warn}
 fi

@@ -86,7 +86,7 @@ scripts/run-development                 # with the embedded browser
 | Option | Effect |
 | --- | --- |
 | `--browserless` | Build without Servo and open saved browser URLs in the system browser |
-| `--debug` | Enable Rust backtraces and `cagents=debug,cagentsd=debug,warn` tracing; an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
+| `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
 | `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `-- ARGS...` | Pass remaining arguments to the UI |

@@ -51,11 +51,11 @@ coalesced move per frame saves over applying every wheel notch.
 ## Pane open
 
 ```sh
-RUST_LOG=cagents::pane_open=trace scripts/run-development --browserless
+RUST_LOG=cagents::pane_open=trace scripts/run-development --browserless --debug --log-file /var/tmp/cagents-pane-open.log
 ```
 
 The `cagents::pane_open` target timestamps one pane's way onto the screen in
-the UI's diagnostic log, keyed by card: `requested` when the card is created,
+the explicitly captured local debug log, keyed by card: `requested` when the card is created,
 `start_dispatched` when its terminal start is handed to the daemon,
 `recovered` and `attached` on the blocking start, `started` when the UI holds
 the terminal surface, and `visibility` for each change of mounting class.

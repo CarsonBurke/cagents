@@ -3010,6 +3010,12 @@ impl Application for Editor {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if cagents::diagnostics::take_failure_notice() {
+            self.notice = Some(match self.notice.take() {
+                Some(previous) => format!("{previous}\n{}", cagents::diagnostics::FAILURE_NOTICE),
+                None => cagents::diagnostics::FAILURE_NOTICE.to_owned(),
+            });
+        }
         self.tab_history.observe(self.active);
         let previous_tabs = (self.active, self.tabs.len());
         let was_refresh_visible = self.can_refresh_visible();
@@ -3107,6 +3113,7 @@ impl Application for Editor {
             match message {
                 Message::Notification(action) => self.notification_action(action),
                 Message::StartupWindowOpened => {
+                    cagents::diagnostics::record(cagents::diagnostics::Event::Ready);
                     let ready = if self.notifications.observer.is_bound() {
                         Ok(())
                     } else {

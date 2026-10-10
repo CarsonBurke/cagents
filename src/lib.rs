@@ -24,6 +24,7 @@ pub mod browser;
 pub mod capability;
 pub mod chat;
 pub mod control;
+pub mod diagnostics;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub(crate) mod daemon_health;
