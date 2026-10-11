@@ -47,7 +47,15 @@ case $artifact in
     *) fail 'unexpected artifact type' ;;
 esac
 if [[ $product == ceditor ]]; then
-    executables=(ceditor)
+    private=/tmp/extracted/ceditor-$version/lib/ceditor
+    [[ -L $public_command && $(readlink "$public_command") == ../lib/ceditor/current/bin/ceditor ]] || fail 'wrong editor public link'
+    [[ -L $private/current && $(readlink "$private/current") == "releases/$version" ]] || fail 'wrong editor release link'
+    binaries=$private/releases/$version/bin
+    [[ $(readlink -f "$public_command") == "$binaries/ceditor" ]] || fail 'editor link escapes its release'
+    marker=$binaries/.ceditor-companions
+    [[ -f $marker && ! -L $marker && $(stat -c %a "$marker") == 644 && $(stat -c %s "$marker") == 22 ]] || fail 'invalid editor companion marker'
+    cmp -- "$marker" <(printf 'ceditor companions v1\n') || fail 'wrong editor companion marker'
+    executables=(ceditor cagents cagentsd)
 else
     executables=(cagents cagents-ui cagentsd)
 fi
@@ -58,10 +66,14 @@ for executable in "${executables[@]}"; do
     "$binaries/$executable" --help > /tmp/help
     [[ -s /tmp/help ]] || fail "empty help: $executable"
 done
-if [[ $product != ceditor ]]; then
+if [[ $product == ceditor ]]; then
+    daemon_cli=$binaries/cagents
+else
     [[ -x $public_command && $(readlink -f "$public_command") == "$(readlink -f "$binaries/cagents")" ]] || fail 'broken public command entrypoint'
     [[ $("$public_command" --version) == "cagents $version" ]] || fail 'public command version mismatch'
     daemon_cli=$public_command
+fi
+if [[ -n $daemon_cli ]]; then
     "$daemon_cli" --json daemon status > /tmp/status
     jq -e '.ok == true and .command == "daemon.status" and .data.running == false' /tmp/status >/dev/null
     "$daemon_cli" --json daemon start > /tmp/start
