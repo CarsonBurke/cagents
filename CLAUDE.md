@@ -1,11 +1,11 @@
 # Repository workflow
 
-You are a senior app developer tasked with creating a great Agent Development Environment product.
+You are a senior app developer tasked with creating a great Agent Development Environment (ADE) product.
 
 ## Deliver changes through pull requests
 
 - Use Issues, worktrees and PRs to manage your work.
-- Do PRs against `main`; do not commit new work directly to `main`.
+- Do your work in PRs against `main`.
 - Oversee, sub review, and merge PRs as you see reasonable; and sync main.
 
 ## Development and product
@@ -27,7 +27,7 @@ You are a senior app developer tasked with creating a great Agent Development En
   `integrated-browser` select implementation graphs; never reunify `ui` and
   `host` in one Cargo invocation just to shorten a command.
 - Before finishing a feature or dependency change, run every affected isolated boundary. UI-only builds must not resolve Ghostty; host-only builds must not resolve libcosmic, Servo, WebRender, or SpiderMonkey.
-- Do not run independent cold Cargo builds concurrently. They contend for the shared build directory and memory; lower `CARGO_BUILD_JOBS` when the host is already under memory pressure.
+- Do not run independent cold Cargo builds concurrently. They contend for the shared build directory and memory; use lower `CARGO_BUILD_JOBS` when the host is already under memory pressure.
 
 ## Run the application through the development runner
 
@@ -49,7 +49,8 @@ You are a senior app developer tasked with creating a great Agent Development En
 - Run the narrow test target that covers the changed contract.
 - A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `cargo test --locked --no-default-features --all-targets`, then the same with `--features host` and with `--features ui`, to cover the boundaries the change touches.
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
+  - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
 - For browser or feature-boundary changes, verify both browserless and integrated lanes.
 - Use `cargo fmt --check` after Rust edits.
 
-The README's **Run from source** section is the human quick start; dependency prerequisites, the full runner option reference, test lanes, resource guidance, and troubleshooting are in `docs/development.md`. Repository development tooling is shell and Rust; Python is only an upstream native prerequisite of the full Servo build graph.
+The full runner option reference, test lanes, resource guidance, and troubleshooting are in `docs/development.md`.
