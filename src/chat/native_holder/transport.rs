@@ -660,16 +660,7 @@ impl Residence {
 
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
-            // Idle control streams need no periodic wake or per-session thread.
-            let mut poll = libc::pollfd {
-                fd: control.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if unsafe { libc::poll(&mut poll, 1, -1) } < 0 {
-                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
+            if wait_for_control(control.as_raw_fd(), &self.child).is_err() {
                 return self.recovery.is_durable();
             }
             let request = match receive(&control, TIMEOUT) {
@@ -758,6 +749,9 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
+            if wait_for_control(self.listener.socket.as_raw_fd(), &self.child).is_err() {
+                return false;
+            }
             let (control, _) = match self.listener.socket.accept() {
                 Ok(pair) => pair,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -799,6 +793,35 @@ impl Residence {
                     }
                 },
                 _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Keep the dedicated subreaper doing its job even when no daemon is sending
+/// requests. One periodic wake serves both attached streams and orphan listeners.
+fn wait_for_control(
+    fd: RawFd,
+    children: &crate::daemon::owned_children::OwnedChildren,
+) -> io::Result<()> {
+    loop {
+        if let Err(error) = children.reap_exited_descendants() {
+            // A transient inspection failure must not tear down a durable server.
+            eprintln!("Native holder could not reap exited tools: {error}");
+        }
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut poll, 1, 1_000) } {
+            result if result > 0 => return Ok(()),
+            0 => continue,
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         }
     }
@@ -1052,6 +1075,103 @@ extern "C" fn serve_if_requested() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_IDLE_REAPER_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "chat::native_holder::transport::tests::idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider",
+                    "--nocapture",
+                ])
+                .env(STAGE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        // Isolate subreaper state and wait ownership from the test harness's
+        // other tests. The fixture launcher exits without waiting for its tools.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        for orphan in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "sleep 60 & echo $! > \"$1/live\"; sleep 0.2 & echo $! > \"$1/tool\"",
+                    "fixture",
+                ])
+                .arg(directory.path())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !server.exited() {
+                assert!(Instant::now() < deadline, "fixture launcher did not exit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let read_pid = |name| {
+                std::fs::read_to_string(directory.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap()
+            };
+            let live = Process::read(read_pid("live")).unwrap();
+            let tool = read_pid("tool");
+            let tool_identity = Process::read(tool).unwrap();
+
+            if orphan {
+                let path = directory.path().join("control.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let connector = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    UnixStream::connect(path).unwrap()
+                });
+                wait_for_control(listener.as_raw_fd(), &server).unwrap();
+                let _peer = connector.join().unwrap();
+                let _accepted = listener.accept().unwrap();
+            } else {
+                let (reader, mut writer) = UnixStream::pair().unwrap();
+                let sender = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    writer.write_all(b"x").unwrap();
+                });
+                wait_for_control(reader.as_raw_fd(), &server).unwrap();
+                sender.join().unwrap();
+            }
+
+            assert!(server.exited(), "provider leader status was consumed");
+            assert!(live.is_current(), "idle reaping killed a live tool");
+            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        live.pid as u32,
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { status.si_pid() }, 0, "live tool exited");
+            assert_eq!(
+                unsafe { libc::waitpid(tool, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(!tool_identity.is_current());
+            assert!(server.terminate(Duration::from_secs(2)).unwrap());
+            assert!(!live.is_current());
+        }
+    }
 
     #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
