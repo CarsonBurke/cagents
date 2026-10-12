@@ -505,7 +505,7 @@ impl Cagents {
     }
 
     /// `card_worktree` for a card the caller already knows is in no channel.
-    fn unchanneled_card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
+    pub(super) fn unchanneled_card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
         if let Some(scope) = self
             .worktree_owners
             .get(&card.id)

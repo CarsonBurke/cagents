@@ -6,6 +6,14 @@ use crate::workspace_model::{
     views::{self, Change, Pane, Scope, View},
 };
 
+/// One immutable projection for a publication pass. Scope discovery includes
+/// historical directories, but their cards never become open shared panes.
+struct LocalViews {
+    scopes: Vec<Scope>,
+    cards: HashMap<Scope, Vec<CardId>>,
+    panes: HashMap<Scope, Vec<Pane>>,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     baseline: HashMap<Scope, Vec<Pane>>,
@@ -162,17 +170,25 @@ impl Cagents {
                 .find(|channel| channel.id == *id)
                 .map(|channel| channel.cards.clone())
                 .unwrap_or_default(),
-            Scope::Worktree { path, .. } => self
-                .durable
-                .cards
-                .iter()
-                .filter(|card| {
-                    card.existence.is_open()
-                        && !card.kind.is_utility()
-                        && self.card_worktree(card) == Some(path.as_path())
-                })
-                .map(|card| card.id)
-                .collect(),
+            Scope::Worktree { path, .. } => {
+                let channel_cards = self
+                    .durable
+                    .channels
+                    .iter()
+                    .flat_map(|channel| channel.cards.iter().copied())
+                    .collect::<HashSet<_>>();
+                self.durable
+                    .cards
+                    .iter()
+                    .filter(|card| {
+                        card.existence.is_open()
+                            && !card.kind.is_utility()
+                            && !channel_cards.contains(&card.id)
+                            && self.unchanneled_card_worktree(card) == Some(path.as_path())
+                    })
+                    .map(|card| card.id)
+                    .collect()
+            }
         }
     }
 
@@ -207,25 +223,168 @@ impl Cagents {
             .collect()
     }
 
+    fn local_views(&self) -> LocalViews {
+        let cards = self
+            .durable
+            .cards
+            .iter()
+            .map(|card| (card.id, card))
+            .collect::<HashMap<_, _>>();
+        let channel_cards = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        // Preserve the first matching project's authority, just as
+        // worktree_view_scope does, without searching every worktree per path.
+        let mut repositories = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            for path in project
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+                .chain(std::iter::once(project.repository.as_path()))
+                .chain(
+                    project
+                        .repository
+                        .file_name()
+                        .is_some_and(|name| name == ".git")
+                        .then(|| project.repository.parent())
+                        .flatten(),
+                )
+            {
+                repositories.entry(path).or_insert(&project.repository);
+            }
+        }
+        let worktree_cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| !channel_cards.contains(&card.id))
+            .filter_map(|card| {
+                self.unchanneled_card_worktree(card)
+                    .map(|path| (card, path))
+            })
+            .collect::<Vec<_>>();
+        let mut scopes = self
+            .durable
+            .channels
+            .iter()
+            .map(|channel| Scope::Channel(channel.id))
+            .collect::<Vec<_>>();
+        let project_repositories = self
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| &project.repository)
+            .collect::<HashSet<_>>();
+        scopes.extend(
+            self.workspace_model
+                .views
+                .iter()
+                .filter_map(|view| match &view.scope {
+                    Scope::Worktree { repository, .. }
+                        if project_repositories.contains(repository) =>
+                    {
+                        Some(view.scope.clone())
+                    }
+                    _ => None,
+                }),
+        );
+        for path in self
+            .known_worktree_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(self.active_workspace.as_deref())
+            .chain(worktree_cards.iter().map(|(_, path)| *path))
+        {
+            if let Some(repository) = repositories.get(path) {
+                scopes.push(Scope::Worktree {
+                    repository: (*repository).clone(),
+                    path: path.to_owned(),
+                });
+            }
+        }
+        let mut seen = HashSet::new();
+        scopes.retain(|scope| seen.insert(scope.clone()));
+        let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
+        for (card, path) in worktree_cards {
+            if card.existence.is_open() && !card.kind.is_utility() {
+                by_path.entry(path).or_default().push(card.id);
+            }
+        }
+        let mut members = self
+            .durable
+            .channels
+            .iter()
+            .map(|channel| (Scope::Channel(channel.id), channel.cards.clone()))
+            .collect::<HashMap<_, _>>();
+        let pending = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .filter(|pane| pane.pending_terminal_start)
+            .map(|pane| pane.id)
+            .collect::<HashSet<_>>();
+        let mut panes = HashMap::new();
+        for scope in &scopes {
+            if let Scope::Worktree { path, .. } = scope {
+                members.insert(
+                    scope.clone(),
+                    by_path.get(path.as_path()).cloned().unwrap_or_default(),
+                );
+            }
+            let projected = members[scope]
+                .iter()
+                .filter_map(|id| {
+                    if self.shared_views.retained.contains(id)
+                        || self.chat_is_unused_default(*id)
+                        || self.shared_views.defaults.contains_key(id)
+                    {
+                        return None;
+                    }
+                    let mut pane =
+                        Pane::from_card(cards.get(id)?, self.durable.card_scopes.get(id).cloned())?;
+                    pane.user_title = self.chrome_ui.user_titles.get(id).cloned();
+                    pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
+                        && (self.durable.pending_terminal_creations.contains(id)
+                            || pending.contains(id));
+                    if let Scope::Worktree { path, .. } = scope {
+                        pane.scope = Some(path.clone());
+                    }
+                    Some(pane)
+                })
+                .collect();
+            panes.insert(scope.clone(), projected);
+        }
+        LocalViews {
+            scopes,
+            cards: members,
+            panes,
+        }
+    }
+
     pub(super) fn publish_view_changes(&mut self) {
         if self.shared_views.applying
             || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
         {
             return;
         }
-        let scopes = self.local_view_scopes();
-        let desired = scopes
-            .iter()
-            .map(|scope| (scope.clone(), self.local_view_panes(&scope)))
-            .collect::<HashMap<_, _>>();
+        let LocalViews {
+            scopes,
+            cards,
+            mut panes,
+        } = self.local_views();
         let previous_owners = self
             .shared_views
             .baseline
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
-        for (destination, panes) in &desired {
-            for (index, pane) in panes.iter().enumerate() {
+        for (destination, desired) in &panes {
+            for (index, pane) in desired.iter().enumerate() {
                 if let Some(source) = previous_owners
                     .get(&pane.id)
                     .cloned()
@@ -237,7 +396,7 @@ impl Cagents {
                     {
                         continue;
                     }
-                    let before = panes.get(index + 1).map(|pane| pane.id);
+                    let before = desired.get(index + 1).map(|pane| pane.id);
                     let operation = uuid::Uuid::new_v4();
                     let change = Change::Transfer {
                         id: pane.id,
@@ -280,7 +439,7 @@ impl Cagents {
             {
                 continue;
             }
-            let panes = self.local_view_panes(&scope);
+            let panes = panes.remove(&scope).unwrap_or_default();
             if !self.shared_views.initialized.contains(&scope) {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
@@ -350,9 +509,9 @@ impl Cagents {
                 });
             }
             self.shared_views.baseline.insert(scope.clone(), panes);
-            let defaults = self
-                .local_view_cards(&scope)
-                .into_iter()
+            let defaults = cards[&scope]
+                .iter()
+                .copied()
                 .filter(|id| self.shared_views.defaults.contains_key(id))
                 .collect::<Vec<_>>();
             for id in defaults {
@@ -1083,6 +1242,114 @@ mod tests {
             .initialized
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
+    }
+
+    #[test]
+    fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
+        let (mut app, channel, _, pane) = fixture();
+        let repository = PathBuf::from("/repo/.git");
+        let paths = (0..1105)
+            .map(|index| PathBuf::from(format!("/repo/worktree-{index}")))
+            .collect::<Vec<_>>();
+        let worktrees = paths
+            .iter()
+            .map(|path| {
+                crate::sidebar::SidebarWorktree::new(
+                    crate::model::WorktreeId::new(),
+                    path.clone(),
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            worktrees,
+            vec![],
+        ));
+        app.known_worktree_roots.extend(paths.iter().cloned());
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        let terminal = fresh_terminal_session(LaunchRecipe::shell(paths[0].clone()).unwrap());
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.clear();
+        for index in 0..1024 {
+            let id = CardId::new();
+            let existence = if index < 172 {
+                Existence::Open
+            } else {
+                Existence::Closed {
+                    tombstone: crate::model::Tombstone {
+                        operation_id: None,
+                        closed_at_unix_ms: 1,
+                        reason: Some("historical pane".into()),
+                    },
+                }
+            };
+            durable.cards.push(CardState {
+                id,
+                generation: durable.generation,
+                title: format!("pane {index}"),
+                width_fraction: pane.width_fraction,
+                existence,
+                exposure: Exposure::Offscreen,
+                residency: Residency::Cold,
+                kind: if index == 0 {
+                    CardKind::Terminal(terminal.clone())
+                } else {
+                    pane.kind.clone()
+                },
+            });
+            durable.card_scopes.insert(id, paths[index].clone());
+            if index % 7 == 0 {
+                durable.channels[0].cards.push(id);
+            }
+        }
+        let pending_id = durable.cards[0].id;
+        // A channel takes precedence over an explicit worktree scope; the host
+        // pending-start bit is carried even without a local launch intention.
+        let mut pending = pane.clone();
+        pending.id = pending_id;
+        pending.kind = CardKind::Terminal(terminal);
+        pending.pending_terminal_start = true;
+        let mut view = View::empty(channel);
+        view.panes.push(pending);
+        app.workspace_model.views.push(view);
+        let retained = app.durable.cards[1].id;
+        app.shared_views.retained.insert(retained);
+        app.chrome_ui
+            .user_titles
+            .insert(app.durable.cards[2].id, "custom title".into());
+
+        let started = Instant::now();
+        let batched = app.local_views();
+        let batched_elapsed = started.elapsed();
+        let started = Instant::now();
+        let scopes = app.local_view_scopes();
+        let reference = scopes
+            .iter()
+            .map(|scope| (scope.clone(), app.local_view_panes(scope)))
+            .collect::<HashMap<_, _>>();
+        let reference_elapsed = started.elapsed();
+        assert_eq!(batched.scopes, scopes);
+        assert_eq!(batched.panes, reference);
+        assert!(batched.panes[&Scope::Channel(channel)][0].pending_terminal_start);
+        assert!(
+            batched.panes[&Scope::Worktree {
+                repository,
+                path: paths[1023].clone(),
+            }]
+                .is_empty()
+        );
+        eprintln!(
+            "large workspace projection: indexed {batched_elapsed:?}, reference {reference_elapsed:?}"
+        );
     }
     #[test]
     fn shared_layout_echo_preserves_observed_terminal_exit() {
