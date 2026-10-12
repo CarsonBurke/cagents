@@ -171,6 +171,7 @@ impl Cagents {
                 .map(|channel| channel.cards.clone())
                 .unwrap_or_default(),
             Scope::Worktree { path, .. } => {
+                let roots = self.indexed_worktree_roots();
                 let channel_cards = self
                     .durable
                     .channels
@@ -184,7 +185,8 @@ impl Cagents {
                         card.existence.is_open()
                             && !card.kind.is_utility()
                             && !channel_cards.contains(&card.id)
-                            && self.unchanneled_card_worktree(card) == Some(path.as_path())
+                            && self.unchanneled_card_worktree_indexed(card, &roots)
+                                == Some(path.as_path())
                     })
                     .map(|card| card.id)
                     .collect()
@@ -224,6 +226,7 @@ impl Cagents {
     }
 
     fn local_views(&self) -> LocalViews {
+        let roots = self.indexed_worktree_roots();
         let cards = self
             .durable
             .cards
@@ -263,7 +266,7 @@ impl Cagents {
             .iter()
             .filter(|card| !channel_cards.contains(&card.id))
             .filter_map(|card| {
-                self.unchanneled_card_worktree(card)
+                self.unchanneled_card_worktree_indexed(card, &roots)
                     .map(|path| (card, path))
             })
             .collect::<Vec<_>>();
@@ -580,6 +583,22 @@ impl Cagents {
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
         self.prepare_shared_aliases(&views, &owned);
+        // Root discovery is immutable during this projection. Keep only owned
+        // paths across mutable view updates, and refresh the panes each view
+        // changes before visiting the next one.
+        let mut local_worktrees = {
+            let roots = self.indexed_worktree_roots();
+            self.durable
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+                .filter_map(|card| {
+                    self.unchanneled_card_worktree_indexed(card, &roots)
+                        .map(|path| (card.id, path.to_owned()))
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let mut projected_scopes = Vec::new();
         for mut view in views {
             if self.shared_views.blocked.contains(&view.scope) {
                 continue;
@@ -596,10 +615,53 @@ impl Cagents {
                     }
                 }
             }
-            tasks.push(self.project_shared_view(&view, &owned));
-            self.shared_views
-                .baseline
-                .insert(view.scope.clone(), self.local_view_panes(&view.scope));
+            let current = match &view.scope {
+                Scope::Channel(_) => self.local_view_cards(&view.scope),
+                Scope::Worktree { path, .. } => {
+                    let channel_cards = self
+                        .durable
+                        .channels
+                        .iter()
+                        .flat_map(|channel| channel.cards.iter().copied())
+                        .collect::<HashSet<_>>();
+                    self.durable
+                        .cards
+                        .iter()
+                        .filter(|card| {
+                            card.existence.is_open()
+                                && !card.kind.is_utility()
+                                && !channel_cards.contains(&card.id)
+                                && local_worktrees.get(&card.id) == Some(path)
+                        })
+                        .map(|card| card.id)
+                        .collect()
+                }
+            };
+            tasks.push(self.project_shared_view_with_cards(&view, &owned, current));
+            if !view.panes.is_empty() {
+                let roots = self.indexed_worktree_roots();
+                for pane in &view.panes {
+                    if let Some(path) = self
+                        .card_state(pane.id)
+                        .and_then(|card| self.unchanneled_card_worktree_indexed(card, &roots))
+                    {
+                        local_worktrees.insert(pane.id, path.to_owned());
+                    } else {
+                        local_worktrees.remove(&pane.id);
+                    }
+                }
+            }
+            projected_scopes.push(view.scope);
+        }
+        // Capture the completed projection once. A later view may move an
+        // owned pane out of an earlier one, so baselines must describe the
+        // settled workspace rather than an intermediate projection.
+        let mut projected = self.local_views();
+        for scope in projected_scopes {
+            self.shared_views.baseline.insert(
+                scope.clone(),
+                projected.panes.remove(&scope).unwrap_or_default(),
+            );
         }
         self.shared_views.applying = false;
         // Adopt all canonical descriptors before an ordered migration checkpoint.
@@ -742,6 +804,16 @@ impl Cagents {
     }
 
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
+        let current = self.local_view_cards(&view.scope);
+        self.project_shared_view_with_cards(view, owned, current)
+    }
+
+    fn project_shared_view_with_cards(
+        &mut self,
+        view: &View,
+        owned: &HashSet<CardId>,
+        current: Vec<CardId>,
+    ) -> Task<Message> {
         let index = match &view.scope {
             Scope::Channel(id) => {
                 let Some(index) = self
@@ -766,7 +838,18 @@ impl Cagents {
                 None
             }
         };
-        let current = self.local_view_cards(&view.scope);
+        let active = match &view.scope {
+            Scope::Channel(id) => self.durable.active_channel == Some(*id),
+            Scope::Worktree { path, .. } => {
+                self.durable.active_channel.is_none()
+                    && self.active_workspace.as_ref() == Some(path)
+            }
+        };
+        // Historical empty scopes have no descriptors or strip to project.
+        // The active scope still settles its strip, including transferred panes.
+        if !active && current.is_empty() && view.panes.is_empty() {
+            return Task::none();
+        }
         let mut tasks = Vec::new();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
@@ -985,13 +1068,6 @@ impl Cagents {
                 }
             }
         }
-        let active = match &view.scope {
-            Scope::Channel(id) => self.durable.active_channel == Some(*id),
-            Scope::Worktree { path, .. } => {
-                self.durable.active_channel.is_none()
-                    && self.active_workspace.as_ref() == Some(path)
-            }
-        };
         if active {
             tasks.push(self.project_shared_strip(&view.panes, &visible));
         }
@@ -1300,13 +1376,17 @@ mod tests {
                 existence,
                 exposure: Exposure::Offscreen,
                 residency: Residency::Cold,
-                kind: if index == 0 {
-                    CardKind::Terminal(terminal.clone())
+                kind: if index % 3 == 0 {
+                    CardKind::Terminal(fresh_terminal_session(
+                        LaunchRecipe::shell(paths[index].join("src")).unwrap(),
+                    ))
                 } else {
                     pane.kind.clone()
                 },
             });
-            durable.card_scopes.insert(id, paths[index].clone());
+            if index % 3 != 0 {
+                durable.card_scopes.insert(id, paths[index].clone());
+            }
             if index % 7 == 0 {
                 durable.channels[0].cards.push(id);
             }
@@ -1999,6 +2079,13 @@ mod tests {
                 .cards,
             vec![pane.id]
         );
+        for scope in [Scope::Channel(a), Scope::Channel(b)] {
+            assert_eq!(
+                app.shared_views.baseline.get(&scope),
+                Some(&app.local_view_panes(&scope)),
+                "the baseline describes the completed transfer"
+            );
+        }
     }
     #[test]
     fn peer_channel_deletion_retains_local_chat_work_in_worktree() {
