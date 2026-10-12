@@ -248,6 +248,25 @@ pub(super) fn view(
     .items(cached.markdown.items(), settings)
 }
 
+/// Markdown the item carries beside its own body, such as a message an
+/// agent sent, drawn as the body is and with its fences highlighted from the
+/// item's cache.
+pub(super) fn content_view(
+    cached: &CachedItem,
+    content: &markdown::Content,
+    settings: markdown::Settings,
+    target: Target,
+    find: Option<&str>,
+) -> Element<'static, Message> {
+    Renderer {
+        target,
+        cached,
+        dark: cosmic::theme::is_dark(),
+        find,
+    }
+    .items(content.items(), settings)
+}
+
 #[cfg(test)]
 pub(super) fn items_for_test(
     cached: &CachedItem,

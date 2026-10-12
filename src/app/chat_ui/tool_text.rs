@@ -424,9 +424,9 @@ mod tests {
             status: chat::ToolStatus::Succeeded,
         };
         let theme = crate::settings::EditorSyntaxTheme::default();
-        let collapsed = CachedItem::updated(&item, theme, None, false, false);
+        let collapsed = CachedItem::updated(&item, theme, None, false, false, None);
         assert!(collapsed.patches.is_empty());
-        let expanded = CachedItem::updated(&item, theme, Some(collapsed), true, false);
+        let expanded = CachedItem::updated(&item, theme, Some(collapsed), true, false, None);
         assert_eq!(expanded.patches[0].text.as_ref(), diff);
         assert_eq!(
             copy_text(CopyPart::Change(0), &item).as_deref(),
@@ -573,7 +573,7 @@ mod tests {
         let source = format!("{{\"text\":\"{}\"}}", "λ".repeat(700));
         let mut item = tool(&source);
         let theme = crate::settings::EditorSyntaxTheme::Auto;
-        let cached = CachedItem::updated(&item, theme, None, false, false);
+        let cached = CachedItem::updated(&item, theme, None, false, false, None);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
         assert!(cached.preview.text.len() < source.len());
@@ -581,17 +581,17 @@ mod tests {
             copy_text(CopyPart::Input, &item).as_deref(),
             Some(source.as_str())
         );
-        let cached = CachedItem::updated(&item, theme, Some(cached), true, false);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true, false, None);
         let source_cache = cached.tool_input.as_ref().unwrap().text.clone();
         if let ItemContent::Tool { status, .. } = &mut item {
             *status = chat::ToolStatus::Failed;
         }
-        let cached = CachedItem::updated(&item, theme, Some(cached), true, false);
+        let cached = CachedItem::updated(&item, theme, Some(cached), true, false, None);
         assert!(Arc::ptr_eq(
             &source_cache,
             &cached.tool_input.as_ref().unwrap().text
         ));
-        let cached = CachedItem::updated(&item, theme, Some(cached), false, false);
+        let cached = CachedItem::updated(&item, theme, Some(cached), false, false, None);
         assert!(cached.tool_input.is_none());
         assert!(cached.tool_output.is_none());
         assert_eq!(

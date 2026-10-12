@@ -14,6 +14,7 @@ use std::sync::{
 
 mod clipboard_image;
 mod completion;
+mod coordination;
 mod find;
 mod fold;
 mod hover;
@@ -186,6 +187,12 @@ pub enum Action {
     ToggleTurn(Target, String),
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
+    /// Shows the whole of one folded part of a coordination card, addressed
+    /// by the card's item id and the part's name, or folds it again.
+    Unfold(Target, String),
+    /// Brings forward the open session whose id starts with the given one,
+    /// as an agent addressed it in a command.
+    OpenSession(String),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
     OpenDocument(Target, String),
@@ -881,6 +888,8 @@ struct CachedItem {
     image_attempt: u64,
     image_wait: Option<images::Pressure>,
     image_evicted: bool,
+    /// What the step did to work with other agents, where it did.
+    coordination: Option<Box<coordination::Coordinated>>,
 }
 impl CachedItem {
     fn next_revision() -> u64 {
@@ -890,16 +899,18 @@ impl CachedItem {
 
     #[cfg(test)]
     fn new(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
-        Self::updated(content, theme, None, false, false)
+        Self::updated(content, theme, None, false, false, None)
     }
 
-    /// `growing` is whether the item's text may still be appended to.
+    /// `growing` is whether the item's text may still be appended to, and
+    /// `coordination` what the item did to work with other agents.
     fn updated(
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
         previous: Option<Self>,
         expanded: bool,
         growing: bool,
+        coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
         let (
@@ -991,7 +1002,12 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            coordination: coordination.map(|reading| Box::new(coordination::Coordinated::new(reading))),
         };
+        if cached.coordination.is_some() {
+            cached.highlight(theme);
+            cached.settle_blocks();
+        }
         match content {
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
                 if let Some(body) = Self::prose(content) {
@@ -1103,7 +1119,12 @@ impl CachedItem {
         let mut open = self.open.take();
         let mut blocks = HashMap::new();
         let mut last = None;
-        for_each_fence(self.markdown.items(), &mut |language, code| {
+        let coordinated = self
+            .coordination
+            .iter()
+            .flat_map(|coordinated| coordinated.contents())
+            .flat_map(markdown::Content::items);
+        for_each_fence(self.markdown.items().iter().chain(coordinated), &mut |language, code| {
             let key = fence_key(language.unwrap_or_default(), code);
             last = Some(key);
             if blocks.contains_key(&key) {
@@ -1407,6 +1428,8 @@ pub(super) struct Runtime {
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
+    /// Coordination card parts shown in full, as `{item id}#{part}`.
+    unfolded: HashSet<String>,
     answers: view::Answers,
     pending: Option<PendingCommand>,
     next_command: u64,
@@ -1971,6 +1994,7 @@ impl Runtime {
             submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
+            unfolded: HashSet::new(),
             answers: HashMap::new(),
             pending: None,
             next_command: 0,
@@ -2266,6 +2290,7 @@ impl Runtime {
                 previous,
                 self.expanded.contains(&item.id),
                 growing,
+                chat::coordination::recognize(item, self.session.launch.provider),
             );
             if matches!(item.content, ItemContent::Image { .. }) {
                 cached.image_source = Some(item.clone());
@@ -2342,7 +2367,10 @@ impl Runtime {
             }
         }
         self.source_clock = source_clock;
-        self.turns = turn::group(&snapshot.items, &self.asked_after);
+        let cache = &self.cache;
+        self.turns = turn::group(&snapshot.items, &self.asked_after, |item| {
+            cache.get(&item.id)?.coordination.as_deref()
+        });
         reconcile_disclosure(&mut self.opened, &self.turns);
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
@@ -3290,6 +3318,7 @@ impl Cagents {
                             previous,
                             true,
                             false,
+                            chat::coordination::recognize(item, runtime.session.launch.provider),
                         ),
                     );
                 }
@@ -7160,6 +7189,7 @@ impl Cagents {
                                 previous,
                                 runtime.expanded.contains(&id),
                                 false,
+                                chat::coordination::recognize(item, runtime.session.launch.provider),
                             ),
                         );
                     }
@@ -7211,7 +7241,17 @@ impl Cagents {
                                 .flat_map(|agent| agent.items.iter()),
                         )
                         .find(|item| item.id == id)
-                        .and_then(|item| copy_text(part, &item.content)),
+                        .and_then(|item| {
+                            let card = runtime
+                                .cache
+                                .get(&item.id)
+                                .and_then(|cached| cached.coordination.as_deref())
+                                .filter(|coordinated| coordinated.is_card());
+                            match card {
+                                Some(card) if matches!(part, CopyPart::Text) => card.copy_text(),
+                                _ => copy_text(part, &item.content),
+                            }
+                        }),
                 };
                 if let Some(text) = text {
                     let at = Instant::now();
@@ -7224,6 +7264,31 @@ impl Cagents {
                         }),
                     ]);
                 }
+            }
+            Action::Unfold(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && !runtime.unfolded.remove(&key)
+                {
+                    runtime.unfolded.insert(key);
+                }
+            }
+            Action::OpenSession(prefix) => {
+                let mut sessions = self
+                    .durable
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open())
+                    .filter_map(notification_ui::card_session)
+                    .filter(|session| session.to_string().starts_with(&prefix));
+                let (Some(session), None) = (sessions.next(), sessions.next()) else {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "No open session here has the id {prefix}."
+                    )));
+                    return Task::none();
+                };
+                return self.update_notifications(notification_ui::Action::Activated(
+                    crate::notifications::Target::Session(session),
+                ));
             }
             Action::OpenUrl(raw) => match Url::parse(&raw) {
                 Ok(url) if matches!(url.scheme(), "https" | "http" | "file") => {
@@ -10352,6 +10417,7 @@ mod tests {
                     at: None,
                 }],
                 &HashSet::new(),
+                |_| None,
             );
             let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
             assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&!default));

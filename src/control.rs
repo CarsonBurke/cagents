@@ -24,9 +24,11 @@ pub use automations::AutomationCommand;
 mod sessions;
 pub use sessions::SessionsArgs;
 mod messages;
-pub use messages::{AskArgs, InboxArgs, ReplyArgs, SendArgs};
+pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
+#[cfg(feature = "ui")]
+pub(crate) mod invocation;
 
 use crate::{
     agent_execution::Authority,

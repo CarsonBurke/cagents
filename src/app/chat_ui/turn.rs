@@ -15,6 +15,7 @@
 //! back - it says something to the reader, or asks them something - and the
 //! work that follows belongs to the next group.
 
+use super::coordination::Coordinated;
 use crate::chat::{self, Item, ItemContent, Phase, Role, ToolStatus};
 use std::{borrow::Borrow, collections::HashSet};
 
@@ -36,6 +37,9 @@ pub(super) enum Slot {
     Commentary,
     /// The answer, or a user message.
     Prose,
+    /// A message to another agent, or agents started on a prompt: a step,
+    /// drawn as a card among the prose for the words it carries.
+    Card,
 }
 
 /// One transcript item placed within a group.
@@ -152,7 +156,11 @@ impl Turn {
     }
 
     /// Fills in the summary once the group's membership is final.
-    fn describe<T: Borrow<Item>>(&mut self, items: &[T]) {
+    fn describe<'c, T: Borrow<Item>>(
+        &mut self,
+        items: &[T],
+        coordinated: &impl Fn(&Item) -> Option<&'c Coordinated>,
+    ) {
         // A single step names itself, because "1 step" tells the reader
         // nothing they could not see from the row's absence. Several steps are
         // counted, with a failure called out, because that is the one thing a
@@ -161,6 +169,7 @@ impl Turn {
             // A group that did no work draws no strip, so it needs no line.
             [] => return,
             [only] => match items.get(only.index).map(Borrow::borrow) {
+                Some(item) if let Some(coordinated) = coordinated(item) => coordinated.summary(),
                 Some(item) => {
                     let verb = step_verb(&item.content);
                     let label = step_label(&item.content);
@@ -173,7 +182,8 @@ impl Turn {
                 None => "1 step".to_owned(),
             },
             steps => {
-                summarize_steps(steps, items).unwrap_or_else(|| format!("{} steps", steps.len()))
+                summarize_steps(steps, items, coordinated)
+                    .unwrap_or_else(|| format!("{} steps", steps.len()))
             }
         };
         // Still working outranks how the finished steps went, because a
@@ -289,7 +299,14 @@ enum Open {
 /// "attachment" bubble as though the reader had sent it alone. Two messages
 /// the reader genuinely sent back to back land in one group as well, which is
 /// right for the same reason: there is no activity between them to attribute.
-pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>) -> Vec<Turn> {
+///
+/// `coordinated` reads what an item did to work with other agents: a message
+/// or a launch is drawn as a card among the prose rather than as a step.
+pub(super) fn group<'c, T: Borrow<Item>>(
+    items: &[T],
+    asked_after: &HashSet<String>,
+    coordinated: impl Fn(&Item) -> Option<&'c Coordinated>,
+) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
     for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
@@ -313,7 +330,11 @@ pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>)
             continue;
         }
         let speech = speaks(item);
-        let slot = slot_of(item);
+        let slot = if coordinated(item).is_some_and(Coordinated::is_card) {
+            Slot::Card
+        } else {
+            slot_of(item)
+        };
         // Each rendered group is prompt, contiguous tools, then prose. A tool
         // arriving after any visible prose must start another group; otherwise
         // the view would move it ahead of that earlier reasoning or narration.
@@ -329,7 +350,7 @@ pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>)
         turn.spans(item);
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
-            Slot::Thinking | Slot::Commentary | Slot::Prose => {
+            Slot::Thinking | Slot::Commentary | Slot::Prose | Slot::Card => {
                 turn.prose.push(Placed { index, slot })
             }
         }
@@ -342,7 +363,7 @@ pub(super) fn group<T: Borrow<Item>>(items: &[T], asked_after: &HashSet<String>)
         };
     }
     for turn in &mut turns {
-        turn.describe(items);
+        turn.describe(items, &coordinated);
     }
     turns
 }
@@ -490,12 +511,22 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
 /// first because it is what a reader scrolling back is looking for; a kind
 /// that did not happen is left out. `None` when nothing in the group is a
 /// kind this can name, which is when a bare count is the honest summary.
-fn summarize_steps<T: Borrow<Item>>(steps: &[Placed], items: &[T]) -> Option<String> {
+fn summarize_steps<'c, T: Borrow<Item>>(
+    steps: &[Placed],
+    items: &[T],
+    coordinated: &impl Fn(&Item) -> Option<&'c Coordinated>,
+) -> Option<String> {
     let mut edited = std::collections::BTreeSet::new();
     let (mut ran, mut read, mut searched, mut listed, mut web, mut called, mut viewed) =
         (0, 0, 0, 0, 0, 0, 0);
+    let mut coordinating = 0;
     for placed in steps {
-        match &items.get(placed.index)?.borrow().content {
+        let item = items.get(placed.index)?.borrow();
+        if coordinated(item).is_some() {
+            coordinating += 1;
+            continue;
+        }
+        match &item.content {
             ItemContent::Changes { changes, .. } => {
                 edited.extend(changes.iter().map(|change| change.path.as_str()));
             }
@@ -545,6 +576,12 @@ fn summarize_steps<T: Borrow<Item>>(steps: &[Placed], items: &[T]) -> Option<Str
     }
     if viewed > 0 {
         parts.push(format!("viewed {}", counted(viewed, "image", "images")));
+    }
+    if coordinating > 0 {
+        parts.push(match coordinating {
+            1 => "worked with another agent".to_owned(),
+            count => format!("worked with other agents {count} times"),
+        });
     }
     let mut summary = parts.join(", ");
     let first = summary.get(..1)?.to_uppercase();
@@ -617,6 +654,11 @@ mod tests {
         turn.steps.iter().map(|p| p.index).collect()
     }
 
+    /// Nothing here coordinates with other agents.
+    fn plain(_: &Item) -> Option<&'static Coordinated> {
+        None
+    }
+
     /// No question was pending, which is the ordinary case.
     fn unasked() -> HashSet<String> {
         HashSet::new()
@@ -646,7 +688,7 @@ mod tests {
             command("c1", ToolStatus::Succeeded),
             text("a2", Role::Assistant, Phase::Final, false),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[1].prompt, vec![2]);
         assert_eq!(steps(&turns[1]), vec![3]);
@@ -664,7 +706,7 @@ mod tests {
             text("u2", Role::User, Phase::Final, false),
             command("c2", ToolStatus::Running),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns.len(),
             2,
@@ -694,7 +736,7 @@ mod tests {
             text("a2", Role::Assistant, Phase::Final, false),
             text("a3", Role::Assistant, Phase::Final, false),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(turns.len(), 2, "what the agent said in between splits them");
         assert_eq!(steps(&turns[0]), [1]);
         assert_eq!(slots(&turns[0]), [(2, Slot::Prose)]);
@@ -726,7 +768,7 @@ mod tests {
             command("c2", ToolStatus::Succeeded),
         ];
         let asked = HashSet::from(["c1".to_owned()]);
-        let turns = group(&items, &asked);
+        let turns = group(&items, &asked, plain);
         assert_eq!(
             turns.len(),
             2,
@@ -735,7 +777,7 @@ mod tests {
         assert_eq!(steps(&turns[0]), [1]);
         assert_eq!(steps(&turns[1]), [2]);
         assert_eq!(
-            group(&items, &unasked()).len(),
+            group(&items, &unasked(), plain).len(),
             1,
             "with no question pending the same items are one stretch of work"
         );
@@ -758,7 +800,7 @@ mod tests {
             command("c1", ToolStatus::Succeeded),
             text("a1", Role::Assistant, Phase::Final, false),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns.len(),
             1,
@@ -779,7 +821,7 @@ mod tests {
             text("u1", Role::User, Phase::Final, false),
             text("r1", Role::Assistant, Phase::Final, true),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].glyph(),
             None,
@@ -794,7 +836,7 @@ mod tests {
             command("c1", ToolStatus::Failed),
             command("c2", ToolStatus::Running),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].glyph(),
             Some(ToolStatus::Running),
@@ -813,7 +855,7 @@ mod tests {
             command("c1", ToolStatus::Failed),
             command("c2", ToolStatus::Succeeded),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].outcome,
             Some(ToolStatus::Succeeded),
@@ -825,7 +867,7 @@ mod tests {
             command("c1", ToolStatus::Succeeded),
             command("c2", ToolStatus::Failed),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].outcome,
             Some(ToolStatus::Failed),
@@ -841,7 +883,7 @@ mod tests {
             stamped(command("c1", ToolStatus::Succeeded), 1_500),
             stamped(text("a1", Role::Assistant, Phase::Final, false), 3_500),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].working_for(9_000),
             Some(2_500),
@@ -851,7 +893,7 @@ mod tests {
             stamped(text("u1", Role::User, Phase::Final, false), 1_000),
             stamped(command("c1", ToolStatus::Running), 1_200),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns[0].working_for(9_000),
             Some(8_000),
@@ -859,7 +901,7 @@ mod tests {
         );
         let undated = vec![text("u1", Role::User, Phase::Final, false)];
         assert_eq!(
-            group(&undated, &unasked())[0].working_for(9_000),
+            group(&undated, &unasked(), plain)[0].working_for(9_000),
             None,
             "a transcript stored without stamps reports no duration at all"
         );
@@ -870,7 +912,7 @@ mod tests {
             stamped(command("c1", ToolStatus::Succeeded), 2_000),
             stamped(text("a1", Role::Assistant, Phase::Final, false), 2_600),
         ];
-        assert_eq!(group(&mixed, &unasked())[0].working_for(9_000), Some(600));
+        assert_eq!(group(&mixed, &unasked(), plain)[0].working_for(9_000), Some(600));
     }
 
     #[test]
@@ -881,7 +923,7 @@ mod tests {
         let mut reasoning = text("r1", Role::Assistant, Phase::Final, true);
         reasoning.started_at = Some(2_000);
         reasoning.at = Some(3_000);
-        let turns = group(&[tool, reasoning], &unasked());
+        let turns = group(&[tool, reasoning], &unasked(), plain);
         assert_eq!(turns[0].working_for(9_000), Some(4_000));
     }
 
@@ -890,7 +932,7 @@ mod tests {
         let mut tool = command("c1", ToolStatus::Running);
         tool.started_at = Some(1_000);
         tool.at = Some(5_950);
-        let first = group(&[tool.clone()], &unasked());
+        let first = group(&[tool.clone()], &unasked(), plain);
         assert_eq!(first[0].working_for(6_000), Some(5_000));
         assert_eq!(first[0].duration_label(6_000).as_deref(), Some("5s"));
         assert_eq!(
@@ -899,12 +941,12 @@ mod tests {
         );
         assert_eq!(first[0].duration_label(7_000).as_deref(), Some("6s"));
         tool.at = Some(6_050);
-        let updated = group(&[tool.clone()], &unasked());
+        let updated = group(&[tool.clone()], &unasked(), plain);
         assert_eq!(updated[0].working_for(6_100), Some(5_100));
         if let ItemContent::Command { status, .. } = &mut tool.content {
             *status = ToolStatus::Succeeded;
         }
-        let finished = group(&[tool], &unasked());
+        let finished = group(&[tool], &unasked(), plain);
         assert_eq!(finished[0].working_for(90_000), Some(5_050));
         assert_eq!(finished[0].duration_label(90_000).as_deref(), Some("5.0s"));
     }
@@ -914,7 +956,7 @@ mod tests {
         let mut tool = command("c1", ToolStatus::Running);
         tool.started_at = Some(1_000);
         tool.at = Some(1_100);
-        let turns = group(&[tool], &unasked());
+        let turns = group(&[tool], &unasked(), plain);
         assert_eq!(turns[0].duration_label(999).as_deref(), Some("0s"));
         assert_eq!(turns[0].duration_label(1_999).as_deref(), Some("0s"));
         assert_eq!(turns[0].duration_label(60_999).as_deref(), Some("59s"));
@@ -927,7 +969,7 @@ mod tests {
             text("a1", Role::Assistant, Phase::Final, false),
             text("u1", Role::User, Phase::Final, false),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(turns.len(), 2);
         assert!(
             turns[0].prompt.is_empty(),
@@ -952,7 +994,7 @@ mod tests {
             text("s1", Role::System, Phase::Final, false),
             command("c2", ToolStatus::Succeeded),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(
             turns.len(),
             2,
@@ -977,7 +1019,7 @@ mod tests {
             text("r1", Role::Assistant, Phase::Final, true),
             command("c1", ToolStatus::Succeeded),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(turns.len(), 2);
         assert!(steps(&turns[0]).is_empty());
         assert_eq!(steps(&turns[1]), [2]);
@@ -1007,8 +1049,8 @@ mod tests {
             started_at: None,
             at: None,
         };
-        assert_eq!(group(std::slice::from_ref(&empty), &unasked()).len(), 0);
-        assert_eq!(group::<Item>(&[], &unasked()).len(), 0);
+        assert_eq!(group(std::slice::from_ref(&empty), &unasked(), plain).len(), 0);
+        assert_eq!(group::<Item>(&[], &unasked(), plain).len(), 0);
         // A message that has not streamed its first bytes yet is the same
         // shape, and must come back once it has them.
         let items = vec![
@@ -1016,7 +1058,7 @@ mod tests {
             empty,
             text("a1", Role::Assistant, Phase::Final, false),
         ];
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         assert_eq!(turns.len(), 1);
         assert_eq!(
             slots(&turns[0]),
@@ -1052,7 +1094,7 @@ mod tests {
             text("answer", Role::Assistant, Phase::Final, false),
         ];
         let rendered = |items: &[Item]| {
-            group(items, &unasked())
+            group(items, &unasked(), plain)
                 .into_iter()
                 .flat_map(|turn| {
                     turn.prompt
@@ -1080,7 +1122,7 @@ mod tests {
         };
         *text = "Progress before tool3".into();
         assert_eq!(rendered(&items), (0..items.len()).collect::<Vec<_>>());
-        let turns = group(&items, &unasked());
+        let turns = group(&items, &unasked(), plain);
         let tools = turns.iter().find(|turn| steps(turn) == [2, 3]).unwrap();
         assert_eq!(tools.key, "tool1");
         assert!(tools.running);
@@ -1131,7 +1173,7 @@ mod tests {
                 started_at: None,
                 at: None,
             };
-            assert_eq!(group(&[item], &unasked())[0].summary, expected);
+            assert_eq!(group(&[item], &unasked(), plain)[0].summary, expected);
         }
     }
 
@@ -1177,7 +1219,7 @@ mod tests {
                 started_at: None,
                 at: None,
             }];
-            assert_eq!(group(&items, &unasked())[0].summary, row);
+            assert_eq!(group(&items, &unasked(), plain)[0].summary, row);
         }
     }
 

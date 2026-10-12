@@ -302,6 +302,52 @@ enum RelationCommand {
     Remove { id: uuid::Uuid },
 }
 
+#[cfg(feature = "ui")]
+impl LinearCommand {
+    /// What the command does, as the verb a transcript step opens with, and
+    /// what it did it to. Empty where the verb says it all.
+    pub(super) fn describe(&self) -> (&'static str, String) {
+        fn ticket(id: &Option<String>) -> String {
+            id.clone()
+                .unwrap_or_else(|| "this checkout's ticket".to_owned())
+        }
+        let issue = |target: &Target| ticket(&target.id);
+        match &self.command {
+            Operation::Issue { target, .. } => ("Read ticket", ticket(&target.id)),
+            Operation::Comments { target, .. } => ("Read comments on", issue(target)),
+            Operation::Attachments { target, .. } => ("Read links on", issue(target)),
+            Operation::Children { target, .. } => ("Read sub-issues of", issue(target)),
+            Operation::Relations { target, .. } => ("Read relations of", issue(target)),
+            Operation::Search { query, .. } => ("Searched tickets for", query.clone()),
+            Operation::List { .. } => ("Listed tickets", String::new()),
+            Operation::Team { .. } => ("Read Linear teams", String::new()),
+            Operation::Project { .. } => ("Listed Linear projects", String::new()),
+            Operation::Create(save) if save.id.is_some() || save.current => {
+                ("Updated ticket", ticket(&save.id))
+            }
+            Operation::Create(save) => ("Created ticket", save.title.clone().unwrap_or_default()),
+            Operation::Set { target, .. } | Operation::Label { command: LabelCommand::Add { target, .. } | LabelCommand::Remove { target, .. } | LabelCommand::Set { target, .. } } => {
+                ("Updated ticket", issue(target))
+            }
+            Operation::Status {
+                command: StatusCommand::Set { target, state },
+            } => ("Moved ticket", format!("{} to {state}", issue(target))),
+            Operation::Comment {
+                command: CommentCommand::Add { target, .. },
+            } => ("Commented on", issue(target)),
+            Operation::Attach { target, .. } => ("Attached a link to", issue(target)),
+            Operation::Relation {
+                command: RelationCommand::Add { target, related, .. },
+            } => ("Related", format!("{} to {related}", issue(target))),
+            Operation::Relation {
+                command: RelationCommand::Remove { .. },
+            } => ("Removed a ticket relation", String::new()),
+            Operation::Link { id } => ("Linked this checkout to", id.clone()),
+            Operation::Unlink => ("Unlinked this checkout's ticket", String::new()),
+        }
+    }
+}
+
 const ISSUE: &str = "id identifier title description url priority estimate dueDate team { id key name } state { id name type } assignee { id name email } project { id name } parent { id identifier title } labels(first:100) { nodes { id name } pageInfo { hasNextPage endCursor } }";
 const PAGE_INFO: &str = "pageInfo { hasNextPage endCursor }";
 fn error(message: impl Into<String>) -> AppError {
