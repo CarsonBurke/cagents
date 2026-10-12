@@ -125,12 +125,21 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
 /// What a command's `output` says about the step `kind` describes.
 pub(crate) fn outcome(kind: &Kind, output: &str) -> Outcome {
     Outcome {
-        // Every failure prints as `cagents: …`, as an ask's sent line does
-        // when its wait times out.
+        // A failure prints as `cagents: …` just before the command exits.
+        // So do an ask's sent line, when its wait times out, and notices
+        // about the CLI's own diagnostics, which say nothing of the step.
         error: output
             .lines()
+            .rev()
             .filter(|line| messages::read_sent_line(line).is_none())
-            .find_map(|line| line.strip_prefix("cagents: "))
+            .filter_map(|line| line.strip_prefix("cagents: "))
+            .find(|line| {
+                ![
+                    crate::diagnostics::GAP_NOTICE,
+                    crate::diagnostics::FAILURE_NOTICE,
+                ]
+                .contains(line)
+            })
             .map(str::to_owned),
         ..read(kind, output)
     }

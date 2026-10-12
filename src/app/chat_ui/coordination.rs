@@ -157,6 +157,8 @@ impl Coordinated {
                 Act::Inbox { waits: true } => ("Waited for", "a message".into()),
                 Act::Agents => ("Listed", "its agents".into()),
                 Act::Status { agent } => ("Checked on", name(agent)),
+                // Codex names the agents waited on only once the wait ends.
+                Act::Wait { agents } if agents.is_empty() => ("Waited for", "agents".into()),
                 Act::Wait { agents } => ("Waited for", names(agents)),
                 Act::Requests { agent } => ("Read what", format!("{} is asking", name(agent))),
                 Act::Answer {
@@ -284,7 +286,7 @@ fn recipient(
         OutboundKind::Prompt => named(format!("agent {}", message.to)),
         _ if message.to == "parent" => named("the session that started it".into()),
         // A `cagents` recipient is a session ID, or a prefix of one.
-        _ if is_identifier(&message.to) => Recipient {
+        _ if reading.cli && is_identifier(&message.to) => Recipient {
             name: String::new(),
             session: Some(message.to.clone()),
             live: true,
@@ -487,7 +489,6 @@ impl Runtime {
         }
     }
 
-    /// A name the reader can follow to its session.
     /// A recipient's name and session, the session a link to its pane
     /// while it runs.
     fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
@@ -549,7 +550,7 @@ impl Runtime {
         if !message.summary.is_empty() {
             rows.push(design::caption(message.summary.clone()).into());
         }
-        rows.push(self.text_block(
+        rows.extend(self.text_block(
             item,
             cached,
             "body",
@@ -569,6 +570,16 @@ impl Runtime {
             // An ask that timed out was still sent; only the answer is late.
             (ToolStatus::Failed, Some(receipt)) if message.waits => Some((
                 format!("{} · No answer yet; it will arrive as a message", arrival(receipt.arrival)),
+                Tone::Warning,
+            )),
+            // An ask prints its receipt only once its wait ends, so one
+            // stopped while waiting was sent without saying so.
+            (ToolStatus::Stopped, _) if message.waits => Some((
+                "Stopped waiting for an answer".to_owned(),
+                Tone::Warning,
+            )),
+            (ToolStatus::Stopped, None) => Some((
+                "Stopped before it confirmed sending".to_owned(),
                 Tone::Warning,
             )),
             (ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped, _) => {
@@ -662,7 +673,7 @@ impl Runtime {
             if !title.is_empty() {
                 rows.push(design::body(title.join(" · ")).into());
             }
-            rows.push(self.text_block(
+            rows.extend(self.text_block(
                 item,
                 cached,
                 &format!("prompt-{index}"),
@@ -741,6 +752,7 @@ impl Runtime {
     }
 
     /// A message's or a prompt's text, folded to its opening when long.
+    /// `None` for an empty one, as Codex records a call it replays.
     fn text_block(
         &self,
         item: &chat::Item,
@@ -750,15 +762,16 @@ impl Runtime {
         content: Option<&markdown::Content>,
         unfold: &'static str,
         settings: markdown::Settings,
-    ) -> Element<'static, Message> {
-        match (text, content) {
+    ) -> Option<Element<'static, Message>> {
+        Some(match (text, content) {
+            (Text::Inline(text), _) if text.trim().is_empty() => return None,
             (Text::Inline(_), Some(content)) => {
                 self.folded_markdown(item, cached, part, content, unfold, settings)
             }
             (Text::File(path), _) => design::caption(format!("The contents of {path}"))
                 .into(),
             _ => design::caption("Read from standard input, which the transcript does not show").into(),
-        }
+        })
     }
 
     /// Markdown folded to its opening until the reader opens it. `part` keeps

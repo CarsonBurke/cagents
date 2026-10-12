@@ -352,7 +352,7 @@ pub(super) fn group<'c, T: Borrow<Item>>(
             // steps it collapses, so a refused message beside a lookup does
             // not mark the lookup failed. Still waiting on one keeps the
             // group working.
-            Some(card) if slot == Slot::Card => {
+            Some(_) if slot == Slot::Card => {
                 if status == Some(ToolStatus::Running) {
                     turn.running = true;
                 }
@@ -897,6 +897,7 @@ mod tests {
                 kind,
                 outcome: Default::default(),
                 subagents: Vec::new(),
+                cli: true,
             })
         };
         let lookup = reading(Kind::Act(Act::Whoami));

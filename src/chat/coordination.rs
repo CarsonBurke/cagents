@@ -28,6 +28,9 @@ pub struct Coordination {
     /// Subagents, by the ID this conversation's snapshot lists them under,
     /// that the step started or addressed. A view offers only those it finds.
     pub subagents: Vec<String>,
+    /// Whether the step is a `cagents` command, which addresses sessions,
+    /// rather than a provider's own tool, which addresses its agents.
+    pub cli: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,20 +236,26 @@ impl Coordination {
         matches!(self.kind, Kind::Message(_) | Kind::Spawn(_))
     }
 
-    /// Whether the step reached another agent, rather than the application,
-    /// a ticket, or a background shell.
-    /// How the step went, given how its item `reported` it went: a command
-    /// whose exit status a pipeline hid still failed if the CLI said so and
-    /// confirmed nothing.
+    /// How the step went, given how its item `reported` it went: a message
+    /// or a launch whose exit status a pipeline hid still failed if the CLI
+    /// said so and confirmed nothing.
     pub fn status(&self, reported: ToolStatus) -> ToolStatus {
         let outcome = &self.outcome;
-        let confirmed = outcome.receipt.is_some() || outcome.run.is_some();
-        match reported {
-            ToolStatus::Succeeded if outcome.error.is_some() && !confirmed => ToolStatus::Failed,
-            reported => reported,
+        let confirmed = outcome.receipt.is_some()
+            || outcome.run.is_some()
+            || !outcome.messages.is_empty();
+        match (&self.kind, reported) {
+            (Kind::Message(_) | Kind::Spawn(_), ToolStatus::Succeeded)
+                if outcome.error.is_some() && !confirmed =>
+            {
+                ToolStatus::Failed
+            }
+            (_, reported) => reported,
         }
     }
 
+    /// Whether the step reached another agent, rather than the application,
+    /// a ticket, or a background shell.
     pub fn involves_agents(&self) -> bool {
         !matches!(
             self.kind,
@@ -266,10 +275,22 @@ impl Coordination {
 /// command costs one substring search.
 const PROGRAM: &str = "cagents";
 
+/// Whether `line` has `cagents` as a whole word, or the last part of a path,
+/// as a command would. A checkout called `cagents` puts the name in most
+/// paths, which only ever continue past it.
+fn names_program(line: &str) -> bool {
+    line.match_indices(PROGRAM).any(|(at, _)| {
+        line[at + PROGRAM.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next.is_whitespace() || "'\";)|&".contains(next))
+    })
+}
+
 /// A shell line's one `cagents` invocation. A line running several is left as
 /// the command it is: a card for its first would misreport the rest.
 fn cli(line: &str, output: &str) -> Option<Coordination> {
-    if !line.contains(PROGRAM) {
+    if !names_program(line) {
         return None;
     }
     let commands = shell::commands(line)?;
@@ -278,7 +299,8 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
         let Some(argv) = invocation(&simple.argv) else {
             continue;
         };
-        if found.is_some() {
+        // One that may not have run reads as nothing it did.
+        if found.is_some() || simple.guarded {
             return None;
         }
         let stdin = match &simple.stdin {
@@ -299,6 +321,7 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
         outcome: crate::control::invocation::outcome(&kind, output),
         kind,
         subagents: Vec::new(),
+        cli: true,
     })
 }
 
@@ -444,6 +467,7 @@ fn claude(id: &str, name: &str, input: &str, output: &str) -> Option<Coordinatio
         kind,
         outcome,
         subagents,
+        cli: false,
     })
 }
 
@@ -451,7 +475,7 @@ fn claude(id: &str, name: &str, input: &str, output: &str) -> Option<Coordinatio
 /// `None` where the agent handed its report back as a message instead, which
 /// the transcript shows as a delivery of its own.
 fn claude_report(output: &str) -> Option<String> {
-    let report = match output.find("agentId: ") {
+    let report = match output.rfind("agentId: ") {
         Some(0) => "",
         Some(at) if output[..at].ends_with('\n') => &output[..at],
         _ => output,
@@ -501,6 +525,7 @@ fn codex(name: &str, input: &str, output: &str) -> Option<Coordination> {
         kind,
         outcome: Outcome::default(),
         subagents: receivers,
+        cli: false,
     })
 }
 
@@ -544,6 +569,7 @@ fn omp(name: &str, input: &str) -> Option<Coordination> {
         kind: Kind::Spawn(spawn),
         outcome: Outcome::default(),
         subagents,
+        cli: false,
     })
 }
 
@@ -587,6 +613,21 @@ mod tests {
             (receipt.message.as_str(), receipt.arrival),
             ("45d4828a", Arrival::WhenIdle)
         );
+        // An ask confirms itself with its answer, and the CLI's notices
+        // about its own diagnostics are no failure of the step.
+        let notice = format!("cagents: {}", crate::diagnostics::FAILURE_NOTICE);
+        let answered = cli(
+            "cagents ask peer 'ok?' 2>&1",
+            &format!("{notice}\nab12  from session 95fcd1b9\n  yes\n"),
+        )
+        .unwrap();
+        assert_eq!(answered.status(ToolStatus::Succeeded), ToolStatus::Succeeded);
+        let noted = cli("cagents send peer hi 2>&1 | tail -1", &notice).unwrap();
+        assert_eq!(noted.outcome.error, None);
+        // Only a message or a launch is read for a failure its exit status
+        // hid: other commands print what they relay.
+        let relayed = cli("cagents sessions | tail -5", "cagents: earlier failure\n").unwrap();
+        assert_eq!(relayed.status(ToolStatus::Succeeded), ToolStatus::Succeeded);
     }
 
     #[test]
@@ -609,6 +650,14 @@ mod tests {
         assert!(cli("grep cagents src/main.rs", "").is_none());
         assert!(cli("cagents send a hi && cagents send b hi", "").is_none());
         assert!(cli("echo $(cagents whoami)", "").is_none());
+        // It may not run, or run once for each pass of a loop.
+        assert!(cli("true || cagents send x hi", "").is_none());
+        assert!(cli("for s in a b; do\n  cagents send \"$s\" hi\ndone", "").is_none());
+        assert!(cli("cagents send x hi || echo failed", "").is_some());
+        // A checkout named for the program puts it in paths, not commands.
+        assert!(!names_program("cd ~/src/cagents/.worktrees/x && cargo test"));
+        assert!(names_program("~/src/cagents/target/debug/cagents send x hi"));
+        assert!(names_program("echo hi|cagents"));
     }
 
     #[test]
@@ -657,6 +706,7 @@ mod tests {
             (message.to.as_str(), message.summary.as_str()),
             ("reviewer", "docs")
         );
+        assert!(!sent.cli, "a provider's own tool addresses its agents");
         assert!(native(Provider::Claude, "toolu_4", "Bash", "{}", "").is_none());
     }
 

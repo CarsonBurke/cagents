@@ -20,6 +20,9 @@ pub(crate) struct Simple {
     pub(crate) argv: Vec<String>,
     /// What the command reads on standard input, where the line says.
     pub(crate) stdin: Stdin,
+    /// Whether it runs only if the command before it failed, as after `||`,
+    /// so the line does not say that it ran.
+    pub(crate) guarded: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,10 +50,19 @@ enum Token {
 
 /// The simple commands in `line`, in order, unwrapping `sh -c SCRIPT` and its
 /// relatives into the commands of their script. `None` when the line does not
-/// lex: an unterminated quote is a command no shell ran as written.
+/// lex, as an unterminated quote is a command no shell ran as written, or
+/// when it holds a compound command: a loop's or a conditional's body runs
+/// any number of times, which its words alone do not tell.
 pub(crate) fn commands(line: &str) -> Option<Vec<Simple>> {
     commands_at(line, 0)
 }
+
+/// The words that open or continue a compound command where a command name
+/// would be.
+const RESERVED: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "{", "}",
+];
 
 /// How deep `sh -c` wrapping and `$(cat <<EOF …)` are followed. Real lines
 /// nest once or twice.
@@ -97,16 +109,26 @@ fn commands_at(line: &str, depth: usize) -> Option<Vec<Simple>> {
                     _ => {}
                 }
             }
+            // A pipeline may go on past the end of a line.
+            Token::Separator("\n") if current.argv.is_empty() && current.stdin == Stdin::Pipe => {}
             Token::Separator(separator) => {
                 finish(&mut current, &mut simples);
                 assignments = true;
-                if separator == "|" {
-                    current.stdin = Stdin::Pipe;
+                match separator {
+                    "|" => current.stdin = Stdin::Pipe,
+                    "||" => current.guarded = true,
+                    _ => {}
                 }
             }
         }
     }
     finish(&mut current, &mut simples);
+    if simples
+        .iter()
+        .any(|simple| RESERVED.contains(&simple.argv[0].as_str()))
+    {
+        return None;
+    }
     if depth >= MAX_NESTING {
         return Some(simples);
     }
@@ -153,6 +175,7 @@ fn heredoc_output(script: &str, depth: usize) -> Option<String> {
         [Simple {
             argv,
             stdin: Stdin::Text(body),
+            ..
         }] if argv == &["cat"] => Some(body.trim_end_matches('\n').to_owned()),
         _ => None,
     }
@@ -261,20 +284,29 @@ impl Lexer {
             .into_iter()
             .find(|operator| rest.starts_with(operator))?;
         self.at += operator.chars().count();
-        // `2>&1`, `>&-`: a descriptor, not a word to read.
+        while matches!(self.peek(0), Some(' ' | '\t')) {
+            self.at += 1;
+        }
+        // `2>&1`, `>&-`: a descriptor, not a word to read. `>& file`
+        // redirects both streams to a file, which is.
         if operator.ends_with('&') {
+            let ends = |character: Option<char>| {
+                character.is_none_or(|character| " \t\n;|&)".contains(character))
+            };
+            let start = self.at;
             while self
                 .peek(0)
                 .is_some_and(|character| character.is_ascii_digit() || character == '-')
             {
                 self.at += 1;
             }
-            if self.peek(0).is_none_or(|character| " \t\n;|&)".contains(character)) {
+            if self.at > start && ends(self.peek(0)) {
                 return Some(());
             }
-        }
-        while matches!(self.peek(0), Some(' ' | '\t')) {
-            self.at += 1;
+            self.at = start;
+            if ends(self.peek(0)) {
+                return Some(());
+            }
         }
         let target = self.read_word()?;
         // Whether the delimiter was quoted only decides whether the body is
@@ -620,6 +652,34 @@ mod tests {
                 "diff".to_owned(),
                 "<(cagents inbox)".into(),
                 "expected".into()
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_line_says_which_commands_it_runs_and_how_often() {
+        // A loop's or a conditional's body runs any number of times.
+        for line in [
+            "for s in a b; do\n  cagents send \"$s\" hi\ndone",
+            "if ready; then\n  cagents send x hi\nfi",
+            "{ cagents send x hi; }",
+        ] {
+            assert_eq!(commands(line), None, "{line:?}");
+        }
+        let guarded = commands("true || cagents send x hi && echo sent").unwrap();
+        assert_eq!(
+            guarded.iter().map(|simple| simple.guarded).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        let continued = commands("echo hi |\ncagents send x -").unwrap();
+        assert_eq!(continued[1].stdin, Stdin::Pipe);
+        assert_eq!(
+            argv("cagents send x hi >& /dev/null 2>&1 <& 0"),
+            vec![vec![
+                "cagents".to_owned(),
+                "send".into(),
+                "x".into(),
+                "hi".into()
             ]]
         );
     }

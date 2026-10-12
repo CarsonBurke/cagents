@@ -2414,7 +2414,21 @@ impl Runtime {
                                 .map(|placed| placed.index),
                         )
                         .filter_map(|index| self.snapshot.items.get(index))
-                        .any(|item| contains_text(&item.content, query))
+                        .any(|item| {
+                            contains_text(&item.content, query)
+                                // A card shows its words unquoted, as no
+                                // command line or tool input writes them.
+                                || self
+                                    .cache
+                                    .get(&item.id)
+                                    .and_then(|cached| cached.coordination.as_deref())
+                                    .is_some_and(|coordinated| {
+                                        coordinated
+                                            .parts()
+                                            .iter()
+                                            .any(|(_, text)| find::contains(text, query))
+                                    })
+                        })
             })
             .map(|turn| turn.key.clone())
             .collect();
@@ -3302,8 +3316,32 @@ impl Cagents {
         if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
             runtime.find_disclosure.turn(&key, &mut runtime.opened);
             let query = runtime.find.as_deref().unwrap_or_default();
-            for placed in &turn.steps {
-                if let Some(item) = runtime.snapshot.items.get(placed.index)
+            for placed in turn.steps.iter().chain(&turn.prose) {
+                let Some(item) = runtime.snapshot.items.get(placed.index) else {
+                    continue;
+                };
+                // A card's message or prompt, or a message a step read, may
+                // be folded to its opening.
+                let coordinated = runtime
+                    .cache
+                    .get(&item.id)
+                    .and_then(|cached| cached.coordination.as_deref());
+                let mut unfolded = false;
+                for (part, text) in coordinated.map(coordination::Coordinated::parts).unwrap_or_default() {
+                    if find::contains(text, query) {
+                        unfolded = true;
+                        runtime
+                            .find_disclosure
+                            .part(&format!("{}#{part}", item.id), &mut runtime.unfolded);
+                    }
+                }
+                // A collapsed step hides its match, and so does a card whose
+                // match is only in the command or output it was read from.
+                let raw = match coordinated {
+                    Some(coordinated) if coordinated.is_card() => !unfolded,
+                    _ => turn.steps.contains(placed),
+                };
+                if raw
                     && contains_text(&item.content, query)
                     && runtime
                         .find_disclosure
@@ -3321,26 +3359,6 @@ impl Cagents {
                             chat::coordination::recognize(item, runtime.session.launch.provider),
                         ),
                     );
-                }
-            }
-            // So would a card's message or prompt, or a message a step read.
-            for placed in turn.steps.iter().chain(&turn.prose) {
-                let Some(item) = runtime.snapshot.items.get(placed.index) else {
-                    continue;
-                };
-                let Some(coordinated) = runtime
-                    .cache
-                    .get(&item.id)
-                    .and_then(|cached| cached.coordination.as_deref())
-                else {
-                    continue;
-                };
-                for (part, text) in coordinated.parts() {
-                    if find::contains(text, query) {
-                        runtime
-                            .find_disclosure
-                            .part(&format!("{}#{part}", item.id), &mut runtime.unfolded);
-                    }
                 }
             }
             // A delivery folded to its opening would hide a match in its body;
