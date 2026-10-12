@@ -233,8 +233,8 @@ struct Recipient {
 impl Recipient {
     fn plain(&self) -> String {
         match (&self.session, self.name.is_empty()) {
-            (Some(session), true) => format!("session {session}"),
-            (Some(session), false) => format!("{} ({session})", self.name),
+            (Some(session), true) => format!("session {}", short_id(session)),
+            (Some(session), false) => format!("{} ({})", self.name, short_id(session)),
             (None, _) => self.name.clone(),
         }
     }
@@ -343,8 +343,12 @@ fn state_phrase(state: State) -> &'static str {
     }
 }
 
-/// The last thing a command printed, which is where the CLI says what went
-/// wrong.
+/// Why a step failed: what the CLI said, or else the last thing it printed.
+fn failure<'a>(reading: &'a Coordination, output: &'a str) -> &'a str {
+    reading.outcome.error.as_deref().unwrap_or_else(|| last_line(output))
+}
+
+/// The last thing a command printed.
 fn last_line(output: &str) -> &str {
     output
         .lines()
@@ -418,7 +422,8 @@ impl Runtime {
         settings: markdown::Settings,
         raw: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
-        let status = item.content.status().unwrap_or(ToolStatus::Succeeded);
+        let reported = item.content.status().unwrap_or(ToolStatus::Succeeded);
+        let status = coordinated.reading.status(reported);
         let output = match &item.content {
             ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => {
                 output.as_str()
@@ -435,7 +440,7 @@ impl Runtime {
             }
             Kind::Act(_) => {}
         }
-        rows.push(self.card_footer(item, cached, coordinated));
+        rows.push(self.card_footer(item, cached, coordinated, status != reported));
         rows.extend(raw);
         let card = widget::container(
             widget::column::with_children(rows)
@@ -483,36 +488,34 @@ impl Runtime {
     }
 
     /// A name the reader can follow to its session.
+    /// A recipient's name and session, the session a link to its pane
+    /// while it runs.
     fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
         let mut parts: Vec<Element<'static, Message>> = Vec::new();
         if !recipient.name.is_empty() {
             parts.push(design::heading(recipient.name.clone()).into());
         }
-        if let Some(session) = &recipient.session
-            && !recipient.live
-        {
-            parts.push(if recipient.name.is_empty() {
-                design::heading(format!("session {session}")).into()
-            } else {
-                design::caption(session.clone())
-                    .font(iced::Font::MONOSPACE)
-                    .into()
-            });
-        } else if let Some(session) = &recipient.session {
-            let id = design::caption(session.clone()).font(iced::Font::MONOSPACE);
-            parts.push(
-                widget::button::custom(if recipient.name.is_empty() {
-                    Element::from(design::heading(format!("session {session}")))
-                } else {
-                    id.into()
-                })
+        let Some(session) = &recipient.session else {
+            return parts;
+        };
+        let shown = short_id(session);
+        let label: Element<'static, Message> = if recipient.name.is_empty() {
+            design::heading(format!("session {shown}")).into()
+        } else {
+            design::caption(shown.to_owned())
+                .font(iced::Font::MONOSPACE)
+                .into()
+        };
+        parts.push(if recipient.live {
+            widget::button::custom(label)
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([0, step::GAP_XS as u16])
-                .name(format!("Go to session {session}"))
+                .name(format!("Go to session {shown}"))
                 .on_press(action(Action::OpenSession(session.clone())))
-                .into(),
-            );
-        }
+                .into()
+        } else {
+            label
+        });
         parts
     }
 
@@ -569,7 +572,7 @@ impl Runtime {
                 Tone::Warning,
             )),
             (ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped, _) => {
-                let reason = last_line(output);
+                let reason = failure(reading, output);
                 Some((
                     if reason.is_empty() {
                         "Not sent".to_owned()
@@ -675,7 +678,7 @@ impl Runtime {
             ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
             ToolStatus::Running => Some(("Starting…".to_owned(), Tone::Plain)),
             ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => {
-                let reason = last_line(output);
+                let reason = failure(reading, output);
                 Some((
                     match status {
                         ToolStatus::Stopped => "Stopped".to_owned(),
@@ -692,6 +695,36 @@ impl Runtime {
         }
         rows.extend(self.arrived(item, cached, coordinated, "From", settings));
         rows.extend(self.result(item, cached, coordinated, settings));
+    }
+
+    /// How the agents a step left running in the background are doing now,
+    /// for as long as this conversation tracks them.
+    fn background_state(&self, coordinated: &Coordinated) -> Option<&'static str> {
+        let Kind::Spawn(spawn) = &coordinated.reading.kind else {
+            return None;
+        };
+        if spawn.waits {
+            return None;
+        }
+        let states: Vec<ToolStatus> = coordinated
+            .reading
+            .subagents
+            .iter()
+            .filter_map(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
+            .map(|agent| agent.status)
+            .collect();
+        let any = |wanted: ToolStatus| states.contains(&wanted);
+        if states.is_empty() {
+            None
+        } else if any(ToolStatus::Running) {
+            Some("Working in the background")
+        } else if any(ToolStatus::Failed) {
+            Some("Failed")
+        } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
+            Some("Stopped")
+        } else {
+            Some("Finished")
+        }
     }
 
     /// What a run the step waited on answered.
@@ -822,6 +855,7 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
         coordinated: &Coordinated,
+        overruled: bool,
     ) -> Element<'static, Message> {
         let mut controls: Vec<Element<'static, Message>> = Vec::new();
         for id in &coordinated.reading.subagents {
@@ -864,7 +898,17 @@ impl Runtime {
             .on_press(action(Action::Toggle(self.target, item.id.clone())))
             .into(),
         );
-        if let Some(detail) = cached.detail.clone() {
+        // A step the CLI said failed is not "Completed" for its exit status,
+        // and an agent left running in the background is not done because
+        // its launch is.
+        let detail = if overruled {
+            Some("Failed".to_owned())
+        } else {
+            self.background_state(coordinated)
+                .map(str::to_owned)
+                .or_else(|| cached.detail.clone())
+        };
+        if let Some(detail) = detail {
             controls.push(widget::Space::new().width(Length::Fill).into());
             controls.push(design::caption(detail).into());
         }

@@ -346,7 +346,20 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         // `turns` is non-empty: the branch above pushes when it would be, and
         // the states that skip it only occur once a group exists.
         let turn = turns.last_mut().expect("a group is open");
-        turn.observe(item.content.status());
+        let status = item.content.status();
+        match coordinated(item) {
+            // A card shows how it went itself; the strip summarizes only the
+            // steps it collapses, so a refused message beside a lookup does
+            // not mark the lookup failed. Still waiting on one keeps the
+            // group working.
+            Some(card) if slot == Slot::Card => {
+                if status == Some(ToolStatus::Running) {
+                    turn.running = true;
+                }
+            }
+            Some(step) => turn.observe(status.map(|status| step.reading.status(status))),
+            None => turn.observe(status),
+        }
         turn.spans(item);
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
@@ -874,6 +887,54 @@ mod tests {
             "a group that ended on a failure still reports it"
         );
         assert_eq!(turns[0].summary, "Ran 2 commands · failed");
+    }
+
+    #[test]
+    fn a_card_reports_its_own_outcome_and_not_the_strip_beside_it() {
+        use crate::chat::coordination::{Act, Coordination, Kind, Outbound, OutboundKind, Text};
+        let reading = |kind| {
+            Coordinated::new(Coordination {
+                kind,
+                outcome: Default::default(),
+                subagents: Vec::new(),
+            })
+        };
+        let lookup = reading(Kind::Act(Act::Whoami));
+        let message = reading(Kind::Message(Outbound {
+            kind: OutboundKind::Send,
+            to: "db8a852c".into(),
+            body: Text::Inline("hello".into()),
+            summary: String::new(),
+            waits: false,
+        }));
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "whoami" => Some(&lookup),
+            "send" => Some(&message),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("whoami", ToolStatus::Succeeded),
+            command("send", ToolStatus::Failed),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(steps(&turns[0]), [1]);
+        assert_eq!(slots(&turns[0]), [(2, Slot::Card)]);
+        assert_eq!(
+            turns[0].summary, "Looked up this session",
+            "the refused message says so on its card; the lookup went fine"
+        );
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("whoami", ToolStatus::Succeeded),
+            command("send", ToolStatus::Running),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(
+            turns[0].glyph(),
+            Some(ToolStatus::Running),
+            "waiting on a card's answer is still work in progress"
+        );
     }
 
     #[test]

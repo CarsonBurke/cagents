@@ -15,7 +15,7 @@
 
 mod shell;
 
-use super::{Item, ItemContent};
+use super::{Item, ItemContent, ToolStatus};
 use crate::agent::Provider;
 use serde_json::Value;
 
@@ -168,6 +168,9 @@ pub struct Outcome {
     /// what an inbox held.
     pub messages: Vec<Received>,
     pub run: Option<Run>,
+    /// What the CLI said went wrong, which a pipeline such as `| tail -1`
+    /// can print while the step itself reports success.
+    pub error: Option<String>,
 }
 
 /// The CLI's confirmation that a message was accepted for delivery.
@@ -232,6 +235,18 @@ impl Coordination {
 
     /// Whether the step reached another agent, rather than the application,
     /// a ticket, or a background shell.
+    /// How the step went, given how its item `reported` it went: a command
+    /// whose exit status a pipeline hid still failed if the CLI said so and
+    /// confirmed nothing.
+    pub fn status(&self, reported: ToolStatus) -> ToolStatus {
+        let outcome = &self.outcome;
+        let confirmed = outcome.receipt.is_some() || outcome.run.is_some();
+        match reported {
+            ToolStatus::Succeeded if outcome.error.is_some() && !confirmed => ToolStatus::Failed,
+            reported => reported,
+        }
+    }
+
     pub fn involves_agents(&self) -> bool {
         !matches!(
             self.kind,
@@ -366,16 +381,19 @@ fn claude(id: &str, name: &str, input: &str, output: &str) -> Option<Coordinatio
             // The tool call's ID is the subagent's: Claude reports its
             // progress under the call that started it.
             subagents.push(id.to_owned());
-            let waits = input["run_in_background"].as_bool() != Some(true);
+            // Claude Code may background an agent it was not asked to, and
+            // says so in place of a report.
+            let waits = input["run_in_background"].as_bool() != Some(true)
+                && !output.trim_start().starts_with("Async agent launched");
             // A foreground agent's result is its report. A background one's
             // is the harness acknowledging the launch, and its report comes
             // later as a delivery of its own.
-            if waits && !output.trim().is_empty() {
+            if waits && let Some(result) = claude_report(output) {
                 outcome.run = Some(Run {
                     agent: String::new(),
                     state: None,
                     timed_out: false,
-                    result: output.trim().into(),
+                    result,
                 });
             }
             Kind::Spawn(Spawn {
@@ -427,6 +445,20 @@ fn claude(id: &str, name: &str, input: &str, output: &str) -> Option<Coordinatio
         outcome,
         subagents,
     })
+}
+
+/// A foreground agent's report, without the usage Claude Code appends to it.
+/// `None` where the agent handed its report back as a message instead, which
+/// the transcript shows as a delivery of its own.
+fn claude_report(output: &str) -> Option<String> {
+    let report = match output.find("agentId: ") {
+        Some(0) => "",
+        Some(at) if output[..at].ends_with('\n') => &output[..at],
+        _ => output,
+    }
+    .trim();
+    let handed_back = report.starts_with("This agent's report was delivered to you as a message");
+    (!report.is_empty() && !handed_back).then(|| report.to_owned())
 }
 
 /// Codex reports a collaboration call with its prompt as the input and, as
@@ -527,6 +559,18 @@ mod tests {
         )
         .expect("a send");
         assert!(sent.is_card());
+        assert_eq!(sent.status(ToolStatus::Succeeded), ToolStatus::Succeeded);
+        // `| tail -1` hides the exit status of a send the daemon refused.
+        let refused = cli(
+            "cagents send e493822d hi 2>&1 | tail -1",
+            "cagents: InvalidRequest: That is you; a message must go to another session",
+        )
+        .unwrap();
+        assert_eq!(refused.status(ToolStatus::Succeeded), ToolStatus::Failed);
+        assert_eq!(
+            refused.outcome.error.as_deref(),
+            Some("InvalidRequest: That is you; a message must go to another session")
+        );
         let Kind::Message(message) = &sent.kind else {
             panic!("a send is a message");
         };
@@ -581,10 +625,22 @@ mod tests {
             ("Explore", &Text::Inline("Look at #12".into()))
         );
         assert_eq!(started.outcome.run.unwrap().result, "Looks good.");
+        // Claude Code's usage trailer is not the report, and a report
+        // handed back as a message is shown where it arrives.
+        let trailed = "Looks good.\nagentId: a1 (use SendMessage with to: 'a1')\n<usage>total_tokens: 9</usage>";
+        assert_eq!(claude_report(trailed).as_deref(), Some("Looks good."));
+        let handed = "This agent's report was delivered to you as a message from \"a1\".\n\nagentId: a1";
+        assert_eq!(claude_report(handed), None);
 
         let background = r#"{"prompt":"x","run_in_background":true}"#;
         let launched = native(Provider::Claude, "toolu_2", "Agent", background, "Launched").unwrap();
         assert!(launched.outcome.run.is_none());
+        // Claude Code may background an agent it was not asked to; its
+        // acknowledgement is not a report either.
+        let acknowledged = "Async agent launched successfully. (This tool result is internal metadata.)\nagentId: a2 (internal ID)\nThe agent is working in the background.";
+        let unasked = native(Provider::Claude, "toolu_5", "Agent", input, acknowledged).unwrap();
+        assert!(unasked.outcome.run.is_none());
+        assert!(matches!(unasked.kind, Kind::Spawn(Spawn { waits: false, .. })));
 
         let sent = native(
             Provider::Claude,

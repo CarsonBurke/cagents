@@ -2816,7 +2816,8 @@ impl Runtime {
                 })
                 .hash(&mut hasher);
             // A coordinating step names agents by what this conversation
-            // calls them, links their transcripts while it lists them, and
+            // calls them, links their transcripts while it lists them, tells
+            // how those it left in the background are doing, and
             // remembers which of its parts the reader unfolded.
             if self
                 .cache
@@ -2839,7 +2840,7 @@ impl Runtime {
         }
         if coordinating {
             for agent in &self.snapshot.subagents {
-                (&agent.id, &agent.kind, &agent.description).hash(&mut hasher);
+                (&agent.id, &agent.kind, &agent.description, agent.status).hash(&mut hasher);
             }
         }
         hasher.finish()

@@ -124,12 +124,20 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
 
 /// What a command's `output` says about the step `kind` describes.
 pub(crate) fn outcome(kind: &Kind, output: &str) -> Outcome {
+    Outcome {
+        // Every failure prints as `cagents: …`, as an ask's sent line does
+        // when its wait times out.
+        error: output
+            .lines()
+            .filter(|line| messages::read_sent_line(line).is_none())
+            .find_map(|line| line.strip_prefix("cagents: "))
+            .map(str::to_owned),
+        ..read(kind, output)
+    }
+}
+
+fn read(kind: &Kind, output: &str) -> Outcome {
     match kind {
-        Kind::Message(_) => Outcome {
-            receipt: output.lines().find_map(messages::read_sent_line),
-            messages: messages::read_messages(output),
-            run: None,
-        },
         // A prompt or a spawn starts a run, and prints it ahead of any
         // messages that arrived while the command waited on it.
         Kind::Message(Outbound {
@@ -139,7 +147,12 @@ pub(crate) fn outcome(kind: &Kind, output: &str) -> Outcome {
         | Kind::Spawn(_) => Outcome {
             run: agents::read_run(output.trim_start()),
             messages: arrived(output),
-            receipt: None,
+            ..Outcome::default()
+        },
+        Kind::Message(_) => Outcome {
+            receipt: output.lines().find_map(messages::read_sent_line),
+            messages: messages::read_messages(output),
+            ..Outcome::default()
         },
         Kind::Act(Act::Wait { .. }) => Outcome {
             messages: arrived(output),
@@ -295,6 +308,17 @@ mod tests {
         );
         assert_eq!(interrupted.run.unwrap().result, "");
         assert_eq!(interrupted.messages[0].body, "hi");
+    }
+
+    #[test]
+    fn a_prompt_to_an_agent_reads_the_run_it_started() {
+        let prompt = parse("cagents agent send 1a2b3c4d --wait Continue", None).unwrap();
+        let outcome = super::outcome(
+            &prompt,
+            "agent 1a2b3c4d (claude) run 5e6f7a8b Succeeded\n\nDone.",
+        );
+        assert_eq!(outcome.run.unwrap().result, "Done.");
+        assert_eq!(outcome.receipt, None);
     }
 
     #[test]
