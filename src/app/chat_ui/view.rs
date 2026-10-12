@@ -1,4 +1,5 @@
 use super::*;
+use super::coordination::Coordinated;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -38,13 +39,13 @@ const PROMPT_MEASURE: f32 = 560.0;
 /// How much of a long report or message shows until the reader opens it:
 /// its opening paragraph or so, enough to recognize it without reading it. A
 /// short one is read in full where it lands.
-const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
+pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
 const NOTICE_LINES: usize = 3;
 
 /// Reserve an external action row so hovering never shifts the transcript.
 /// Iced's hover widget also keeps controls visible while keyboard-focused.
-fn message_actions<'a>(
+pub(super) fn message_actions<'a>(
     message: Element<'a, Message>,
     actions: Element<'a, Message>,
     alignment: Alignment,
@@ -1058,6 +1059,16 @@ impl Runtime {
                         } else {
                             self.prompt_view(item)
                         }
+                    } else if let Some(coordinated) = cached
+                        .coordination
+                        .as_deref()
+                        .filter(|coordinated| coordinated.is_card())
+                    {
+                        let raw = self
+                            .expanded
+                            .contains(&item.id)
+                            .then(|| self.step_detail(item, cached, markdown_settings));
+                        self.coordination_card(item, cached, coordinated, markdown_settings, raw)
                     } else {
                         match &item.content {
                             ItemContent::Text { .. } => self.prose_view(
@@ -2689,6 +2700,13 @@ impl Runtime {
             return retained::fresh(self.turn_rows(
                 turn,
                 |item, cached| self.step_view(item, cached, settings),
+                |item, cached, coordinated| {
+                    let raw = self
+                        .expanded
+                        .contains(&item.id)
+                        .then(|| self.step_detail(item, cached, settings));
+                    self.coordination_card(item, cached, coordinated, settings, raw)
+                },
                 settings,
             ));
         }
@@ -2696,6 +2714,9 @@ impl Runtime {
             self.turn_rows(
                 turn,
                 |item, cached| self.step_header(item, cached, false),
+                |item, cached, coordinated| {
+                    self.coordination_card(item, cached, coordinated, settings, None)
+                },
                 settings,
             )
         })
@@ -2766,6 +2787,7 @@ impl Runtime {
                 .chain(&turn.prose)
                 .map(|placed| (placed.index, Some(placed.slot))),
         );
+        let mut coordinating = false;
         for (index, slot) in placed {
             let Some(item) = self.snapshot.items.get(index) else {
                 continue;
@@ -2793,15 +2815,44 @@ impl Runtime {
                     )
                 })
                 .hash(&mut hasher);
+            // A coordinating step names agents by what this conversation
+            // calls them, links their transcripts while it lists them, tells
+            // how those it left in the background are doing, and
+            // remembers which of its parts the reader unfolded.
+            if self
+                .cache
+                .get(&item.id)
+                .is_some_and(|cached| cached.coordination.is_some())
+            {
+                coordinating = true;
+                let mut unfolded: Vec<&str> = self
+                    .unfolded
+                    .iter()
+                    .filter(|key| {
+                        key.strip_prefix(item.id.as_str())
+                            .is_some_and(|part| part.starts_with('#'))
+                    })
+                    .map(String::as_str)
+                    .collect();
+                unfolded.sort_unstable();
+                unfolded.hash(&mut hasher);
+            }
+        }
+        if coordinating {
+            for agent in &self.snapshot.subagents {
+                (&agent.id, &agent.kind, &agent.description, agent.status).hash(&mut hasher);
+            }
         }
         hasher.finish()
     }
 
-    /// The rows of one exchange, with `step` drawing each of its steps.
+    /// The rows of one exchange, with `step` drawing each of its steps and
+    /// `card` each of its messages to and launches of other agents.
     fn turn_rows<'s, 'a>(
         &'s self,
         turn: &'s turn::Turn,
         step: impl Fn(&'s chat::Item, &'s CachedItem) -> Element<'a, Message>,
+        card: impl Fn(&'s chat::Item, &'s CachedItem, &'s Coordinated) -> Element<'a, Message>,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let items = &self.snapshot.items;
@@ -2836,6 +2887,11 @@ impl Runtime {
                 continue;
             };
             rows.push(match &item.content {
+                _ if let Some(coordinated) = cached.coordination.as_deref()
+                    && prose.slot == turn::Slot::Card =>
+                {
+                    card(item, cached, coordinated)
+                }
                 ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
                 ItemContent::Image { .. } => self.image_preview(item, cached),
                 // Anything else in the answer slot is a step the grouping did

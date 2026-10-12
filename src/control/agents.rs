@@ -123,12 +123,12 @@ pub struct PromptArgs {
     /// The prompt, which may begin with `-`; a lone `-` reads it from
     /// standard input.
     #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
-    text: Option<String>,
+    pub(super) text: Option<String>,
     /// Read the prompt from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
-    prompt_file: Option<PathBuf>,
+    pub(super) prompt_file: Option<PathBuf>,
     #[arg(long = "prompt", hide = true, conflicts_with_all = ["text", "prompt_file"])]
-    flag: Option<String>,
+    pub(super) flag: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -143,7 +143,7 @@ pub struct RetryArgs {
 pub struct WaitArgs {
     /// Wait for the run to settle or ask for input before returning.
     #[arg(long)]
-    wait: bool,
+    pub(super) wait: bool,
     /// How long `--wait` waits.
     #[arg(long, default_value = "60", value_parser = parse_positive_seconds, requires = "wait")]
     timeout: f64,
@@ -1155,12 +1155,15 @@ fn requests_reply(reply: Reply) -> Result<Vec<crate::chat::Request>, AppError> {
     }
 }
 
+/// The heading of the messages that ended a wait early.
+pub(super) const ARRIVED: &str = "Messages arrived while waiting:";
+
 /// The messages that ended a wait early, and how to go on.
 fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> String {
     if messages.is_empty() {
         return String::new();
     }
-    let mut lines = vec!["\n\nMessages arrived while waiting:".to_owned()];
+    let mut lines = vec![format!("\n\n{ARRIVED}")];
     lines.extend(messages.iter().map(super::messages::message_lines));
     lines.push(
         "Answer one with: cagents reply <id> \"…\"; then wait again with cagents agent wait".into(),
@@ -1197,6 +1200,58 @@ fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> St
         }
     }
     lines
+}
+
+/// The run in output [`submitted`] printed: the acceptance line, or the
+/// [`status_lines`] that replace it when the command waited.
+#[cfg(feature = "ui")]
+pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
+    let head = output.lines().next()?;
+    if let Some(accepted) = head
+        .strip_prefix("Accepted agent ")
+        .or_else(|| head.strip_prefix("Already accepted agent "))
+    {
+        let (agent, _) = accepted.split_once(" run ")?;
+        return Some(crate::chat::coordination::Run {
+            agent: agent.into(),
+            state: None,
+            timed_out: false,
+            result: String::new(),
+        });
+    }
+    let (agent, rest_of_head) = head.strip_prefix("agent ")?.split_once(' ')?;
+    let (_, after_run) = rest_of_head.split_once(" run ")?;
+    let (_, state) = after_run.split_once(' ')?;
+    let (state, timed_out) = match state.strip_suffix(" (wait timed out)") {
+        Some(state) => (state, true),
+        None => (state, false),
+    };
+    use crate::agent_execution::State;
+    let state = [
+        State::Accepted,
+        State::Running,
+        State::Waiting,
+        State::Succeeded,
+        State::Failed,
+        State::Cancelled,
+        State::Interrupted,
+    ]
+    .into_iter()
+    .find(|candidate| format!("{candidate:?}") == state)?;
+    // The result follows the first blank line, up to any messages that
+    // arrived during the wait.
+    let status = output
+        .split_once(ARRIVED)
+        .map_or(output, |(status, _)| status);
+    let result = status
+        .split_once("\n\n")
+        .map_or("", |(_, result)| result);
+    Some(crate::chat::coordination::Run {
+        agent: agent.into(),
+        state: Some(state),
+        timed_out,
+        result: result.trim().into(),
+    })
 }
 
 fn requests_lines(agent: AgentId, requests: &[crate::chat::Request]) -> String {

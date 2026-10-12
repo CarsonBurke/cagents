@@ -329,10 +329,18 @@ impl Pane {
         {
             runtime.opened.insert(turn.key.clone(), true);
         }
+        let coordination = chat::coordination::recognize(item, runtime.session.launch.provider);
         let previous = runtime.cache.remove(id);
         runtime.cache.insert(
             id.to_owned(),
-            CachedItem::updated(&item.content, runtime.syntax_theme, previous, true, false),
+            CachedItem::updated(
+                &item.content,
+                runtime.syntax_theme,
+                previous,
+                true,
+                false,
+                coordination,
+            ),
         );
     }
 
@@ -682,7 +690,10 @@ fn a_refresh_of_a_full_window_with_metadata() {
     let (mut group, mut history) = (Stage::default(), Stage::default());
     for _ in 0..FRAMES {
         let clock = Instant::now();
-        let turns = turn::group(&pane.runtime.snapshot.items, &pane.runtime.asked_after);
+        let cache = &pane.runtime.cache;
+        let turns = turn::group(&pane.runtime.snapshot.items, &pane.runtime.asked_after, |item| {
+            cache.get(&item.id)?.coordination.as_deref()
+        });
         group.0.push(clock.elapsed());
         std::hint::black_box(turns);
         let clock = Instant::now();

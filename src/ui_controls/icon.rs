@@ -61,6 +61,7 @@ enum Source {
 icons! {
     bundled {
         AddedFile => "added-file",
+        Agent => "agent",
         AgentWaiting => "waiting",
         AgentWorking => "working",
         Attention => "attention",

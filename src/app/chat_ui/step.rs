@@ -10,6 +10,7 @@
 //! would act on - that discloses its own detail when asked. Nothing is
 //! rendered per step that the reader has not asked for.
 
+use super::coordination::Coordinated;
 use super::*;
 use crate::chat::{ChangeKind, FileChange, SearchResult, ToolStatus};
 
@@ -456,8 +457,19 @@ impl Runtime {
         open: bool,
     ) -> Element<'static, Message> {
         let target = self.target;
-        let verb = turn::step_verb(&item.content);
-        let label = turn::step_label(&item.content);
+        // A step that worked with another agent says what it did in the
+        // conversation's own names rather than reprinting its command.
+        let coordinated = cached.coordination.as_deref();
+        let (verb, label) = match coordinated {
+            Some(coordinated) => coordinated.line(&|id| self.agent_name(id)),
+            None => (
+                turn::step_verb(&item.content).to_owned(),
+                turn::step_label(&item.content).to_owned(),
+            ),
+        };
+        let glyph = coordinated
+            .and_then(Coordinated::glyph)
+            .unwrap_or_else(|| kind_glyph(&item.content));
         let mut line: Vec<Element<'static, Message>> = vec![
             widget::icon(Icon::handle(if open {
                 Icon::PanDown
@@ -466,12 +478,12 @@ impl Runtime {
             }))
             .size(design::COMPACT_ICON_SIZE)
             .into(),
-            widget::icon(kind_glyph(&item.content).handle())
+            widget::icon(glyph.handle())
                 .size(14)
                 .into(),
         ];
         if !verb.is_empty() {
-            line.push(design::caption(verb).into());
+            line.push(design::caption(verb.clone()).into());
         }
         // The target is a path, a pattern, or a command, so it is set in the
         // same face the reader would see it in a terminal or an editor. That
@@ -484,8 +496,21 @@ impl Runtime {
         // line of its own, so a running build can be followed without the
         // row forgetting what is being built.
         let mut preview: Vec<Element<'static, Message>> = Vec::new();
-        if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(design::body(label.to_owned()).into());
+        if let Some(coordinated) = coordinated {
+            preview.push(design::body(label.clone()).into());
+            let arrived = coordinated.reading.outcome.messages.len();
+            if arrived > 0 {
+                preview.push(
+                    design::caption(if arrived == 1 {
+                        "1 message arrived".to_owned()
+                    } else {
+                        format!("{arrived} messages arrived")
+                    })
+                    .into(),
+                );
+            }
+        } else if matches!(item.content, ItemContent::Tool { .. }) {
+            preview.push(design::body(label.clone()).into());
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
@@ -503,7 +528,7 @@ impl Runtime {
             line.push(design::caption(detail.clone()).into());
         }
         let name = if verb.is_empty() {
-            label.to_owned()
+            label
         } else {
             format!("{verb} {label}")
         };
@@ -535,13 +560,22 @@ impl Runtime {
     /// steps that follow it.
     const OUTPUT_HEIGHT: f32 = 320.0;
 
-    fn step_detail<'a>(
+    pub(super) fn step_detail<'a>(
         &'a self,
         item: &'a chat::Item,
         cached: &'a CachedItem,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        // Messages a coordinating step collected read as messages, ahead of
+        // the command and output they were printed in.
+        if let Some(coordinated) = cached
+            .coordination
+            .as_deref()
+            .filter(|coordinated| !coordinated.is_card())
+        {
+            rows.extend(self.arrived(item, cached, coordinated, "From", settings));
+        }
         match &item.content {
             // A notice's body is a log line or a raw result, drawn verbatim.
             ItemContent::Delivery {

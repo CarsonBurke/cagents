@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "ui")]
+use crate::chat::coordination::{Received, Receipt};
 use crate::agent_execution::{
     Authority, Operation, Reply,
     mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short},
@@ -16,10 +18,10 @@ pub struct MessageArgs {
     /// The message, which may begin with `-`; a lone `-` reads it from
     /// standard input.
     #[arg(value_name = "MESSAGE", allow_hyphen_values = true)]
-    text: Option<String>,
+    pub(super) text: Option<String>,
     /// Read the message from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
-    file: Option<PathBuf>,
+    pub(super) file: Option<PathBuf>,
 }
 
 impl MessageArgs {
@@ -39,15 +41,15 @@ pub struct SendArgs {
     /// The session: its ID, lineage or agent ID, or at least four characters
     /// of one; or `parent`, the session that started this one.
     #[arg(value_name = "SESSION")]
-    to: String,
+    pub(super) to: String,
     #[command(flatten)]
-    message: MessageArgs,
+    pub(super) message: MessageArgs,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct AskArgs {
     #[command(flatten)]
-    send: SendArgs,
+    pub(super) send: SendArgs,
     /// How long to wait for the reply. A later reply arrives as a message.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait)]
     timeout: f64,
@@ -57,12 +59,12 @@ pub struct AskArgs {
 pub struct ReplyArgs {
     /// The message to answer, by its ID or a prefix of it.
     #[arg(value_name = "MESSAGE_ID")]
-    id: String,
+    pub(super) id: String,
     #[command(flatten)]
-    message: MessageArgs,
+    pub(super) message: MessageArgs,
     /// Wait for the answer to this reply, as `ask` does.
     #[arg(long)]
-    wait: bool,
+    pub(super) wait: bool,
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -75,7 +77,7 @@ pub struct InboxArgs {
     all: bool,
     /// Wait for a message if none is new.
     #[arg(long, conflicts_with = "all")]
-    wait: bool,
+    pub(super) wait: bool,
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -210,6 +212,19 @@ fn converse(
     }
 }
 
+/// When a sent message reaches its recipient, as a sent line tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// A live conversation receives it as a prompt once it is idle.
+    WhenIdle,
+    /// A session in a terminal reads it with `cagents inbox`.
+    Inbox,
+    /// No session of it runs; the next to start receives it.
+    NextSession,
+    /// The user, outside every session, reads it with `cagents inbox`.
+    User,
+}
+
 fn sent_line(sent: &Sent) -> String {
     let message = &sent.message;
     let what = if message.reply_to.is_some() {
@@ -217,17 +232,91 @@ fn sent_line(sent: &Sent) -> String {
     } else {
         "Sent"
     };
-    let delivery = match (sent.reach, message.to.lineage) {
-        (_, None) => "the user reads it with `cagents inbox`",
-        (Reach::Conversation, _) => "it arrives as soon as that conversation is idle",
-        (Reach::Inbox, _) => "that session runs in a terminal and reads it with `cagents inbox`",
-        (Reach::Offline, _) => "no session of it runs now; the next one to start receives it",
+    let arrival = match (sent.reach, message.to.lineage) {
+        (_, None) => Arrival::User,
+        (Reach::Conversation, _) => Arrival::WhenIdle,
+        (Reach::Inbox, _) => Arrival::Inbox,
+        (Reach::Offline, _) => Arrival::NextSession,
     };
     format!(
-        "{what} {} to {}; {delivery}",
+        "{what} {} to {}; {}",
         short(message.id),
-        message.to.label()
+        message.to.label(),
+        arrival_phrase(arrival)
     )
+}
+
+/// How a sent line says a message will arrive, which is also how a
+/// transcript reading the line back tells the four apart.
+fn arrival_phrase(arrival: Arrival) -> &'static str {
+    match arrival {
+        Arrival::User => "the user reads it with `cagents inbox`",
+        Arrival::WhenIdle => "it arrives as soon as that conversation is idle",
+        Arrival::Inbox => "that session runs in a terminal and reads it with `cagents inbox`",
+        Arrival::NextSession => "no session of it runs now; the next one to start receives it",
+    }
+}
+
+/// The receipt in a line [`sent_line`] printed.
+#[cfg(feature = "ui")]
+pub(super) fn read_sent_line(line: &str) -> Option<Receipt> {
+    // An ask that timed out reports its sent line as part of the error.
+    let line = line.strip_prefix("cagents: ").unwrap_or(line);
+    let rest = line
+        .strip_prefix("Sent ")
+        .or_else(|| line.strip_prefix("Replied "))?;
+    let (message, rest) = rest.split_once(" to ")?;
+    let (recipient, arrival) = [
+        Arrival::WhenIdle,
+        Arrival::Inbox,
+        Arrival::NextSession,
+        Arrival::User,
+    ]
+    .into_iter()
+    .find_map(|arrival| {
+        let recipient = rest
+            .strip_suffix(arrival_phrase(arrival))?
+            .strip_suffix("; ")?;
+        Some((recipient, arrival))
+    })?;
+    Some(Receipt {
+        message: message.into(),
+        recipient: recipient.into(),
+        arrival,
+    })
+}
+
+/// The messages in output that printed them with [`message_lines`].
+#[cfg(feature = "ui")]
+pub(super) fn read_messages(output: &str) -> Vec<Received> {
+    let mut messages: Vec<Received> = Vec::new();
+    let mut open = false;
+    for line in output.lines() {
+        if open && let Some(body) = line.strip_prefix("  ") {
+            let message = messages.last_mut().expect("an open message");
+            if !message.body.is_empty() {
+                message.body.push('\n');
+            }
+            message.body.push_str(body);
+            continue;
+        }
+        open = false;
+        let Some((id, from)) = line.split_once("  from ") else {
+            continue;
+        };
+        if id.is_empty() || id.contains(char::is_whitespace) {
+            continue;
+        }
+        let from = from.strip_suffix(" (waiting for your reply)").unwrap_or(from);
+        let from = from.rsplit_once(", replying to ").map_or(from, |(from, _)| from);
+        messages.push(Received {
+            id: id.into(),
+            from: from.into(),
+            body: String::new(),
+        });
+        open = true;
+    }
+    messages
 }
 
 /// A message as `inbox`, `ask` and `agent wait` print it.
@@ -487,5 +576,47 @@ mod tests {
             })
             .ends_with("to the user; the user reads it with `cagents inbox`")
         );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_transcript_reads_back_what_the_cli_printed() {
+        let mut message = Message {
+            id: crate::model::MessageId::new(),
+            from: crate::agent_execution::mailbox::Party {
+                lineage: Some(crate::agent_execution::Lineage(TerminalId::new())),
+                session: None,
+                title: Some("Review; then merge".into()),
+            },
+            to: crate::agent_execution::mailbox::Party::user(),
+            reply_to: None,
+            body: "first\n\n  indented\nlast".into(),
+            wait_until_ms: None,
+            state: crate::agent_execution::mailbox::State::Delivered,
+            created_ms: 0,
+        };
+        message.to = message.from.clone();
+        for (reach, arrival) in [
+            (Reach::Conversation, Arrival::WhenIdle),
+            (Reach::Inbox, Arrival::Inbox),
+            (Reach::Offline, Arrival::NextSession),
+        ] {
+            let line = sent_line(&Sent {
+                message: message.clone(),
+                reach,
+            });
+            let receipt = read_sent_line(&line).expect("reads its own line");
+            assert_eq!(receipt.message, short(message.id));
+            assert_eq!(receipt.recipient, message.to.label());
+            assert_eq!(receipt.arrival, arrival);
+        }
+        let mut answer = message.clone();
+        answer.reply_to = Some(crate::model::MessageId::new());
+        let printed = [message_lines(&message), message_lines(&answer)].join("\n\n");
+        let read = read_messages(&format!("{printed}\n\nAnswer one with: cagents reply <id> \"…\""));
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].id, short(message.id));
+        assert_eq!(read[1].from, message.from.label());
+        assert_eq!(read[1].body, "first\n\n  indented\nlast");
     }
 }

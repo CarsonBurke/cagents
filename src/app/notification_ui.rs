@@ -532,7 +532,7 @@ fn test_notice(outcome: Result<TestOutcome, String>) -> TransientNotice {
     }
 }
 
-fn card_session(card: &CardState) -> Option<TerminalId> {
+pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
     match &card.kind {
         CardKind::Terminal(session) => Some(session.id),
         CardKind::Chat(session) => Some(session.id),

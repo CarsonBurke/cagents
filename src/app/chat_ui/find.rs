@@ -159,6 +159,8 @@ pub(super) fn contains(text: &str, query: &str) -> bool {
 #[derive(Default)]
 pub(super) struct Disclosure {
     items: HashSet<String>,
+    /// Coordination card parts unfolded, by their `unfolded` keys.
+    parts: HashSet<String>,
     turns: HashMap<String, Option<bool>>,
 }
 impl Disclosure {
@@ -168,6 +170,11 @@ impl Disclosure {
             true
         } else {
             false
+        }
+    }
+    pub(super) fn part(&mut self, key: &str, unfolded: &mut HashSet<String>) {
+        if unfolded.insert(key.to_owned()) {
+            self.parts.insert(key.to_owned());
         }
     }
     pub(super) fn turn(&mut self, key: &str, opened: &mut HashMap<String, bool>) {
@@ -181,16 +188,23 @@ impl Disclosure {
     pub(super) fn manual_item(&mut self, id: &str) {
         self.items.remove(id);
     }
+    pub(super) fn manual_part(&mut self, key: &str) {
+        self.parts.remove(key);
+    }
     pub(super) fn manual_turn(&mut self, key: &str) {
         self.turns.remove(key);
     }
     pub(super) fn restore(
         &mut self,
         expanded: &mut HashSet<String>,
+        unfolded: &mut HashSet<String>,
         opened: &mut HashMap<String, bool>,
     ) {
         for id in self.items.drain() {
             expanded.remove(&id);
+        }
+        for key in self.parts.drain() {
+            unfolded.remove(&key);
         }
         for (key, previous) in self.turns.drain() {
             if let Some(previous) = previous {
@@ -305,7 +319,12 @@ mod tests {
     fn search_restores_only_its_disclosures_and_preserves_manual_changes() {
         let mut expanded = HashSet::from(["manual".to_owned()]);
         let mut opened = HashMap::from([("closed".to_owned(), false)]);
+        let mut unfolded = HashSet::from(["card#manual".to_owned()]);
         let mut search = Disclosure::default();
+        search.part("card#manual", &mut unfolded);
+        search.part("card#body", &mut unfolded);
+        search.part("card#prompt-0", &mut unfolded);
+        search.manual_part("card#prompt-0");
         assert!(!search.item("manual", &mut expanded));
         assert!(search.item("automatic", &mut expanded));
         assert!(search.item("changed", &mut expanded));
@@ -315,8 +334,12 @@ mod tests {
         search.manual_item("changed");
         // Explicitly choosing to leave this visible is now a manual choice.
         search.manual_turn("changed");
-        search.restore(&mut expanded, &mut opened);
+        search.restore(&mut expanded, &mut unfolded, &mut opened);
         assert_eq!(expanded, HashSet::from(["manual".into(), "changed".into()]));
+        assert_eq!(
+            unfolded,
+            HashSet::from(["card#manual".into(), "card#prompt-0".into()])
+        );
         assert_eq!(
             opened,
             HashMap::from([("closed".into(), false), ("changed".into(), true)])
@@ -324,7 +347,7 @@ mod tests {
         assert!(search.item("automatic", &mut expanded));
         search.manual_item("automatic");
         expanded.remove("automatic");
-        search.restore(&mut expanded, &mut opened);
+        search.restore(&mut expanded, &mut unfolded, &mut opened);
         assert!(!expanded.contains("automatic"));
     }
 }
