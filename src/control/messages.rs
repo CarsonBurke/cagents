@@ -260,6 +260,8 @@ fn arrival_phrase(arrival: Arrival) -> &'static str {
 /// The receipt in a line [`sent_line`] printed.
 #[cfg(feature = "ui")]
 pub(super) fn read_sent_line(line: &str) -> Option<Receipt> {
+    // An ask that timed out reports its sent line as part of the error.
+    let line = line.strip_prefix("cagents: ").unwrap_or(line);
     let rest = line
         .strip_prefix("Sent ")
         .or_else(|| line.strip_prefix("Replied "))?;
@@ -306,7 +308,7 @@ pub(super) fn read_messages(output: &str) -> Vec<Received> {
             continue;
         }
         let from = from.strip_suffix(" (waiting for your reply)").unwrap_or(from);
-        let from = from.split_once(", replying to ").map_or(from, |(from, _)| from);
+        let from = from.rsplit_once(", replying to ").map_or(from, |(from, _)| from);
         messages.push(Received {
             id: id.into(),
             from: from.into(),

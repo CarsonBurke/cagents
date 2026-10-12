@@ -9,7 +9,9 @@
 //!
 //! Expansions are not performed. `$NAME`, `$(…)` and backticks stay in a word
 //! as written, which is the honest rendering of an argument whose value the
-//! transcript never saw.
+//! transcript never saw. The one exception is `"$(cat <<'EOF' … EOF)"`, the
+//! way agents pass a long message as one argument: its value is the heredoc,
+//! which the line does show.
 
 /// One command of a pipeline or list, with its words unquoted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,6 +29,8 @@ pub(crate) enum Stdin {
     Unknown,
     /// A heredoc's or a herestring's text.
     Text(String),
+    /// The file a `<` redirection names.
+    File(String),
     /// The command before it in a pipeline.
     Pipe,
 }
@@ -48,11 +52,12 @@ pub(crate) fn commands(line: &str) -> Option<Vec<Simple>> {
     commands_at(line, 0)
 }
 
-/// How deep `sh -c` wrapping is followed. Real wrappers nest once or twice.
+/// How deep `sh -c` wrapping and `$(cat <<EOF …)` are followed. Real lines
+/// nest once or twice.
 const MAX_NESTING: usize = 4;
 
 fn commands_at(line: &str, depth: usize) -> Option<Vec<Simple>> {
-    let (tokens, mut heredocs) = lex(line)?;
+    let (tokens, mut heredocs) = lex(line, depth)?;
     let mut simples = Vec::new();
     let mut current = Simple::default();
     let mut assignments = true;
@@ -88,7 +93,7 @@ fn commands_at(line: &str, depth: usize) -> Option<Vec<Simple>> {
                         current.stdin = Stdin::Text(body);
                     }
                     "<<<" => current.stdin = Stdin::Text(format!("{target}\n")),
-                    "<" => current.stdin = Stdin::Unknown,
+                    "<" => current.stdin = Stdin::File(target),
                     _ => {}
                 }
             }
@@ -141,6 +146,18 @@ fn script(argv: &[String]) -> Option<&str> {
     None
 }
 
+/// What `script` prints when it is only `cat` reading a heredoc, less the
+/// trailing newlines a command substitution drops.
+fn heredoc_output(script: &str, depth: usize) -> Option<String> {
+    match commands_at(script, depth)?.as_slice() {
+        [Simple {
+            argv,
+            stdin: Stdin::Text(body),
+        }] if argv == &["cat"] => Some(body.trim_end_matches('\n').to_owned()),
+        _ => None,
+    }
+}
+
 fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
@@ -154,8 +171,9 @@ fn is_assignment(word: &str) -> bool {
 
 /// The tokens of `line`, and the bodies of its heredocs in the order their
 /// operators appear.
-fn lex(line: &str) -> Option<(Vec<Token>, Vec<String>)> {
+fn lex(line: &str, depth: usize) -> Option<(Vec<Token>, Vec<String>)> {
     let mut lexer = Lexer {
+        depth,
         chars: line.chars().collect(),
         at: 0,
         tokens: Vec::new(),
@@ -172,6 +190,8 @@ fn lex(line: &str) -> Option<(Vec<Token>, Vec<String>)> {
 }
 
 struct Lexer {
+    /// How deeply the line being lexed is nested in others.
+    depth: usize,
     chars: Vec<char>,
     at: usize,
     tokens: Vec<Token>,
@@ -202,6 +222,8 @@ impl Lexer {
                     }
                 }
                 '|' | '&' | ';' | '(' | ')' => self.separator(),
+                // `<(…)` and `>(…)` are process substitutions: words.
+                '<' | '>' if self.peek(1) == Some('(') => self.word()?,
                 '<' | '>' => self.redirect()?,
                 _ => self.word()?,
             }
@@ -267,7 +289,16 @@ impl Lexer {
 
     /// Reads the bodies of the heredocs opened on the line just ended.
     fn bodies(&mut self) {
-        for (delimiter, strip_tabs) in std::mem::take(&mut self.pending) {
+        let pending = std::mem::take(&mut self.pending);
+        let bodies = self.read_bodies(pending);
+        self.heredocs.extend(bodies);
+    }
+
+    /// Reads the bodies of `pending` heredocs, in order, from the start of a
+    /// line.
+    fn read_bodies(&mut self, pending: Vec<(String, bool)>) -> Vec<String> {
+        let mut bodies = Vec::with_capacity(pending.len());
+        for (delimiter, strip_tabs) in pending {
             let mut body = String::new();
             loop {
                 if self.at >= self.chars.len() {
@@ -290,8 +321,9 @@ impl Lexer {
                 body.push_str(&line);
                 body.push('\n');
             }
-            self.heredocs.push(body);
+            bodies.push(body);
         }
+        bodies
     }
 
     fn word(&mut self) -> Option<()> {
@@ -314,6 +346,7 @@ impl Lexer {
         let mut word = String::new();
         while let Some(character) = self.peek(0) {
             match character {
+                '<' | '>' if self.peek(1) == Some('(') => self.substitution(&mut word)?,
                 ' ' | '\t' | '\n' | '|' | '&' | ';' | '<' | '>' | '(' | ')' => break,
                 '\\' => {
                     match self.peek(1) {
@@ -410,11 +443,15 @@ impl Lexer {
         }
     }
 
-    /// `$(…)`, kept as written: its parentheses and quotes are its own.
+    /// `$(…)`, or `<(…)` and `>(…)`, kept as written: its parentheses,
+    /// quotes and heredocs are its own. Only a `$(…)` that is nothing but
+    /// `cat` reading a heredoc is replaced, by what it would print.
     fn substitution(&mut self, word: &mut String) -> Option<()> {
         let start = self.at;
+        let arithmetic = self.peek(2) == Some('(');
         self.at += 2;
         let mut depth = 1;
+        let mut pending = Vec::new();
         while depth > 0 {
             match self.peek(0)? {
                 '(' => depth += 1,
@@ -432,11 +469,36 @@ impl Lexer {
                     self.double_quoted(&mut ignored)?;
                     continue;
                 }
+                // A heredoc's body is not shell: its quotes and parentheses
+                // are text, and it starts on the next line.
+                '<' if !arithmetic && self.peek(1) == Some('<') && self.peek(2) != Some('<') => {
+                    self.at += 2;
+                    let strip_tabs = self.peek(0) == Some('-');
+                    if strip_tabs {
+                        self.at += 1;
+                    }
+                    while matches!(self.peek(0), Some(' ' | '\t')) {
+                        self.at += 1;
+                    }
+                    pending.push((self.read_word()?, strip_tabs));
+                    continue;
+                }
+                '\n' if !pending.is_empty() => {
+                    self.at += 1;
+                    let pending = std::mem::take(&mut pending);
+                    self.read_bodies(pending);
+                    continue;
+                }
                 _ => {}
             }
             self.at += 1;
         }
-        word.extend(&self.chars[start..self.at]);
+        let written: String = self.chars[start..self.at].iter().collect();
+        let output = written
+            .strip_prefix("$(")
+            .filter(|_| !arithmetic && self.depth < MAX_NESTING)
+            .and_then(|script| heredoc_output(&script[..script.len() - 1], self.depth + 1));
+        word.push_str(output.as_deref().unwrap_or(&written));
         Some(())
     }
 
@@ -526,6 +588,39 @@ mod tests {
         assert_eq!(
             argv("sh -c 'cagents whoami' # comment"),
             vec![vec!["cagents".to_owned(), "whoami".into()]]
+        );
+    }
+
+    #[test]
+    fn a_heredoc_substituted_into_an_argument_is_its_value() {
+        let line = "cagents send peer \"$(cat <<'EOF'\nIt's done (mostly).\nSee \"notes\".\nEOF\n)\" 2>&1";
+        assert_eq!(
+            argv(line),
+            vec![vec![
+                "cagents".to_owned(),
+                "send".into(),
+                "peer".into(),
+                "It's done (mostly).\nSee \"notes\".".into()
+            ]]
+        );
+        // Anything else substituted stays as written.
+        assert_eq!(
+            argv("cagents send peer \"$(cat notes.md)\" $((1 << 2))"),
+            vec![vec![
+                "cagents".to_owned(),
+                "send".into(),
+                "peer".into(),
+                "$(cat notes.md)".into(),
+                "$((1 << 2))".into()
+            ]]
+        );
+        assert_eq!(
+            argv("diff <(cagents inbox) expected"),
+            vec![vec![
+                "diff".to_owned(),
+                "<(cagents inbox)".into(),
+                "expected".into()
+            ]]
         );
     }
 

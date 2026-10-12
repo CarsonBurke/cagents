@@ -14,7 +14,7 @@ use super::*;
 use crate::agent_execution::State;
 use crate::chat::ToolStatus;
 use crate::chat::coordination::{
-    Act, Arrival, Coordination, Kind, Outbound, OutboundKind, Spawn, Text,
+    Act, Arrival, Coordination, Kind, Outbound, OutboundKind, Run, Spawn, Text,
 };
 
 /// A coordinating step as read, with the Markdown its card draws, formed
@@ -80,6 +80,31 @@ impl Coordinated {
         self.reading.is_card()
     }
 
+    /// The text of each part the card folds, by the part's name.
+    pub(super) fn parts(&self) -> Vec<(String, &str)> {
+        let mut parts = Vec::new();
+        match &self.reading.kind {
+            Kind::Message(message) => parts.extend(message.body.inline().map(|body| ("body".to_owned(), body))),
+            Kind::Spawn(spawn) => {
+                parts.push(("brief".to_owned(), spawn.brief.as_str()));
+                parts.extend(spawn.agents.iter().enumerate().filter_map(|(index, agent)| {
+                    Some((format!("prompt-{index}"), agent.prompt.inline()?))
+                }));
+            }
+            Kind::Act(_) => {}
+        }
+        let outcome = &self.reading.outcome;
+        parts.extend(
+            outcome
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| (format!("answer-{index}"), message.body.as_str())),
+        );
+        parts.extend(outcome.run.as_ref().map(|run| ("result".to_owned(), run.result.as_str())));
+        parts
+    }
+
     /// What copying the card takes: the message, or the prompt.
     pub(super) fn copy_text(&self) -> Option<String> {
         match &self.reading.kind {
@@ -96,15 +121,17 @@ impl Coordinated {
         }
     }
 
-    pub(super) fn glyph(&self) -> Icon {
-        match &self.reading.kind {
+    /// The step's glyph, where it is not the one its item's kind has.
+    pub(super) fn glyph(&self) -> Option<Icon> {
+        Some(match &self.reading.kind {
             Kind::Message(_) => Icon::Send,
             Kind::Spawn(_) => Icon::Agent,
             Kind::Act(Act::Inbox { .. }) => Icon::Chat,
             Kind::Act(Act::Linear { .. }) => Icon::Comment,
             Kind::Act(Act::Sessions | Act::Whoami | Act::Agents) => Icon::Users,
+            Kind::Act(Act::Stop { .. } | Act::Output { .. } | Act::Cli(_)) => return None,
             Kind::Act(_) => Icon::Agent,
-        }
+        })
     }
 
     /// The step's verb and what it acted on, `name` naming an agent of this
@@ -174,8 +201,12 @@ fn message_verb(kind: OutboundKind) -> &'static str {
     }
 }
 
-/// The first eight characters of an ID, which is how the CLI prints one.
+/// An ID's first eight characters, which is how the CLI prints one. A name,
+/// such as `reviewer-2`, is kept whole.
 fn short_id(id: &str) -> &str {
+    if !is_identifier(id) {
+        return id;
+    }
     id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
 }
 
@@ -193,8 +224,10 @@ fn started(spawn: &Spawn) -> String {
 /// A message's recipient: a name, and the session ID that tells it apart.
 struct Recipient {
     name: String,
-    /// A session's ID or a prefix of one, which the reader can go to.
+    /// A session's ID or a prefix of one.
     session: Option<String>,
+    /// Whether the session runs now, so the reader can go to it.
+    live: bool,
 }
 
 impl Recipient {
@@ -221,16 +254,21 @@ fn recipient(
             return Recipient {
                 name: title.trim_matches('"').to_owned(),
                 session: Some(session.to_owned()),
+                // An offline recipient is named by its lineage, which no
+                // open pane has.
+                live: receipt.arrival != Arrival::NextSession,
             };
         }
         return Recipient {
             name: receipt.recipient.clone(),
             session: None,
+            live: false,
         };
     }
     let named = |name: String| Recipient {
         name,
         session: None,
+        live: false,
     };
     match message.kind {
         OutboundKind::Report => named("the conversation that started it".into()),
@@ -246,9 +284,10 @@ fn recipient(
         OutboundKind::Prompt => named(format!("agent {}", message.to)),
         _ if message.to == "parent" => named("the session that started it".into()),
         // A `cagents` recipient is a session ID, or a prefix of one.
-        _ if reading.outcome.receipt.is_none() && is_identifier(&message.to) => Recipient {
+        _ if is_identifier(&message.to) => Recipient {
             name: String::new(),
             session: Some(message.to.clone()),
+            live: true,
         },
         _ => named(name(&message.to)),
     }
@@ -268,8 +307,29 @@ fn arrival(arrival: Arrival) -> &'static str {
     }
 }
 
-/// The last thing a command printed, which is where the CLI says what went
-/// wrong.
+/// How a run stands, and which agent runs it, as one status line.
+fn run_line(run: &Run) -> Option<(String, Tone)> {
+    let agent = (!run.agent.is_empty()).then(|| format!("agent {}", run.agent));
+    let tone = match run.state {
+        Some(State::Failed | State::Interrupted) => Tone::Error,
+        Some(State::Cancelled) => Tone::Warning,
+        _ => Tone::Plain,
+    };
+    let state = run.state.map(|state| {
+        let mut state = state_phrase(state).to_owned();
+        if run.timed_out {
+            state.push_str(", still running when the wait ended");
+        }
+        state
+    });
+    match (agent, state) {
+        (Some(agent), Some(state)) => Some((format!("{state} as {agent}"), tone)),
+        (Some(agent), None) => Some((format!("Running on its own as {agent}"), tone)),
+        (None, Some(state)) => Some((state, tone)),
+        (None, None) => None,
+    }
+}
+
 /// How a started agent's run stands, as a reader would say it.
 fn state_phrase(state: State) -> &'static str {
     match state {
@@ -283,6 +343,8 @@ fn state_phrase(state: State) -> &'static str {
     }
 }
 
+/// The last thing a command printed, which is where the CLI says what went
+/// wrong.
 fn last_line(output: &str) -> &str {
     output
         .lines()
@@ -426,7 +488,17 @@ impl Runtime {
         if !recipient.name.is_empty() {
             parts.push(design::heading(recipient.name.clone()).into());
         }
-        if let Some(session) = &recipient.session {
+        if let Some(session) = &recipient.session
+            && !recipient.live
+        {
+            parts.push(if recipient.name.is_empty() {
+                design::heading(format!("session {session}")).into()
+            } else {
+                design::caption(session.clone())
+                    .font(iced::Font::MONOSPACE)
+                    .into()
+            });
+        } else if let Some(session) = &recipient.session {
             let id = design::caption(session.clone()).font(iced::Font::MONOSPACE);
             parts.push(
                 widget::button::custom(if recipient.name.is_empty() {
@@ -507,13 +579,23 @@ impl Runtime {
                     Tone::Error,
                 ))
             }
-            (_, Some(receipt)) if replies.is_empty() => Some((arrival(receipt.arrival).to_owned(), Tone::Plain)),
-            _ => None,
+            (_, Some(receipt)) if replies.is_empty() => {
+                Some((arrival(receipt.arrival).to_owned(), Tone::Plain))
+            }
+            // A prompt to an agent starts a run of it.
+            _ => reading.outcome.run.as_ref().and_then(run_line),
         };
         if let Some((text, tone)) = line {
             rows.push(status_caption(text, tone));
         }
-        rows.extend(self.arrived(item, cached, coordinated, "Answer from", settings));
+        // What an ask or a waiting reply collected answers it; what a
+        // prompt's wait collected merely arrived while it waited.
+        let heading = match message.kind {
+            OutboundKind::Ask | OutboundKind::Reply => "Answer from",
+            _ => "From",
+        };
+        rows.extend(self.arrived(item, cached, coordinated, heading, settings));
+        rows.extend(self.result(item, cached, coordinated, settings));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -603,34 +685,26 @@ impl Runtime {
                     Tone::Error,
                 ))
             }
-            _ => run.and_then(|run| {
-                let agent = (!run.agent.is_empty()).then(|| format!("agent {}", run.agent));
-                let tone = match run.state {
-                    Some(State::Failed | State::Interrupted) => Tone::Error,
-                    Some(State::Cancelled) => Tone::Warning,
-                    _ => Tone::Plain,
-                };
-                let state = run.state.map(|state| {
-                    let mut state = state_phrase(state).to_owned();
-                    if run.timed_out {
-                        state.push_str(", still running when the wait ended");
-                    }
-                    state
-                });
-                match (agent, state) {
-                    (Some(agent), Some(state)) => Some((format!("{state} as {agent}"), tone)),
-                    (Some(agent), None) => Some((format!("Running on its own as {agent}"), tone)),
-                    (None, Some(state)) => Some((state, tone)),
-                    (None, None) => None,
-                }
-            }),
+            _ => run.and_then(run_line),
         };
         if let Some((text, tone)) = line {
             rows.push(status_caption(text, tone));
         }
-        if let Some(result) = coordinated.answers.last().filter(|_| run.is_some_and(|run| !run.result.is_empty())) {
-            rows.push(self.answer_block(item, cached, "result", "Result".to_owned(), result, settings));
-        }
+        rows.extend(self.arrived(item, cached, coordinated, "From", settings));
+        rows.extend(self.result(item, cached, coordinated, settings));
+    }
+
+    /// What a run the step waited on answered.
+    fn result(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        coordinated: &Coordinated,
+        settings: markdown::Settings,
+    ) -> Option<Element<'static, Message>> {
+        let run = coordinated.reading.outcome.run.as_ref()?;
+        let result = coordinated.answers.last().filter(|_| !run.result.is_empty())?;
+        Some(self.answer_block(item, cached, "result", "Result".to_owned(), result, settings))
     }
 
     /// A message's or a prompt's text, folded to its opening when long.

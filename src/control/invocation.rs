@@ -19,15 +19,18 @@ thread_local! {
 
 /// What `argv`, starting at the `cagents` word, does, `stdin` being what the
 /// shell line shows it reading. `None` for a command the CLI would reject.
-pub(crate) fn coordination(argv: &[String], stdin: Option<String>) -> Option<Kind> {
+pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
     let cli = GRAMMAR.with_borrow_mut(|grammar| {
         let matches = grammar.try_get_matches_from_mut(argv).ok()?;
         Cli::from_arg_matches(&matches).ok()
     })?;
+    // As the CLI's `read_text` reads it: standard input only for a lone `-`.
     let text = |inline: Option<String>, file: Option<PathBuf>| match (inline, file) {
-        (Some(inline), _) if inline != "-" => Text::Inline(inline),
+        (Some(inline), _) if inline == "-" => stdin.clone(),
+        (Some(inline), _) => Text::Inline(inline),
+        (None, Some(path)) if path.as_os_str() == "-" => stdin.clone(),
         (None, Some(path)) => Text::File(path.display().to_string()),
-        _ => stdin.clone().map_or(Text::Unseen, Text::Inline),
+        (None, None) => Text::Unseen,
     };
     let message = |kind, to: String, body: messages::MessageArgs, waits| {
         Kind::Message(Outbound {
@@ -127,16 +130,35 @@ pub(crate) fn outcome(kind: &Kind, output: &str) -> Outcome {
             messages: messages::read_messages(output),
             run: None,
         },
-        Kind::Spawn(_) => Outcome {
+        // A prompt or a spawn starts a run, and prints it ahead of any
+        // messages that arrived while the command waited on it.
+        Kind::Message(Outbound {
+            kind: OutboundKind::Prompt,
+            ..
+        })
+        | Kind::Spawn(_) => Outcome {
             run: agents::read_run(output.trim_start()),
+            messages: arrived(output),
+            receipt: None,
+        },
+        Kind::Act(Act::Wait { .. }) => Outcome {
+            messages: arrived(output),
             ..Outcome::default()
         },
-        Kind::Act(Act::Inbox { .. } | Act::Wait { .. }) => Outcome {
+        Kind::Act(Act::Inbox { .. }) => Outcome {
             messages: messages::read_messages(output),
             ..Outcome::default()
         },
         Kind::Act(_) => Outcome::default(),
     }
+}
+
+/// The messages after a wait's run statuses, which a run's own result could
+/// otherwise be mistaken for.
+fn arrived(output: &str) -> Vec<crate::chat::coordination::Received> {
+    output
+        .split_once(agents::ARRIVED)
+        .map_or_else(Vec::new, |(_, arrived)| messages::read_messages(arrived))
 }
 
 /// The leading subcommand words of `argv`, such as `terminal list`.
@@ -161,7 +183,8 @@ mod tests {
 
     fn parse(line: &str, stdin: Option<&str>) -> Option<Kind> {
         let argv: Vec<String> = line.split(' ').map(str::to_owned).collect();
-        super::coordination(&argv, stdin.map(str::to_owned))
+        let stdin = stdin.map_or(Text::Unseen, |stdin| Text::Inline(stdin.into()));
+        super::coordination(&argv, stdin)
     }
 
     #[test]
@@ -240,6 +263,14 @@ mod tests {
             }))
         );
         assert_eq!(parse("cagents send", None), None);
+        // Standard input is read only for `-`, as the CLI reads it.
+        assert_eq!(
+            parse("cagents send peer", Some("hi\n")).map(|kind| match kind {
+                Kind::Message(message) => message.body,
+                _ => Text::Inline(String::new()),
+            }),
+            Some(Text::Unseen)
+        );
         assert_eq!(parse("cagents agent console x", None), None);
         assert_eq!(parse("cagents --help", None), None);
     }
@@ -256,5 +287,23 @@ mod tests {
         let run = waited.run.unwrap();
         assert_eq!(run.state, Some(crate::agent_execution::State::Succeeded));
         assert_eq!(run.result, "All green.");
+        assert_eq!(waited.messages.len(), 1);
+        // A wait that messages ended before the run answered has no result.
+        let interrupted = super::outcome(
+            &spawn,
+            "agent 1a2b3c4d (codex) run 5e6f7a8b Running\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nAnswer one with: cagents reply <id> \"…\"",
+        );
+        assert_eq!(interrupted.run.unwrap().result, "");
+        assert_eq!(interrupted.messages[0].body, "hi");
+    }
+
+    #[test]
+    fn an_ask_that_timed_out_still_reads_as_sent() {
+        let ask = parse("cagents ask peer hi", None).unwrap();
+        let outcome = super::outcome(
+            &ask,
+            "cagents: Sent 45d4828a to session 95fcd1b9; it arrives as soon as that conversation is idle\nNo reply within 30 s.",
+        );
+        assert_eq!(outcome.receipt.unwrap().message, "45d4828a");
     }
 }

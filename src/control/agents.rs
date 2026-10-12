@@ -1155,12 +1155,15 @@ fn requests_reply(reply: Reply) -> Result<Vec<crate::chat::Request>, AppError> {
     }
 }
 
+/// The heading of the messages that ended a wait early.
+pub(super) const ARRIVED: &str = "Messages arrived while waiting:";
+
 /// The messages that ended a wait early, and how to go on.
 fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> String {
     if messages.is_empty() {
         return String::new();
     }
-    let mut lines = vec!["\n\nMessages arrived while waiting:".to_owned()];
+    let mut lines = vec![format!("\n\n{ARRIVED}")];
     lines.extend(messages.iter().map(super::messages::message_lines));
     lines.push(
         "Answer one with: cagents reply <id> \"…\"; then wait again with cagents agent wait".into(),
@@ -1237,12 +1240,12 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
     .find(|candidate| format!("{candidate:?}") == state)?;
     // The result follows the first blank line, up to any messages that
     // arrived during the wait.
-    let result = output
+    let status = output
+        .split_once(ARRIVED)
+        .map_or(output, |(status, _)| status);
+    let result = status
         .split_once("\n\n")
         .map_or("", |(_, result)| result);
-    let result = result
-        .split_once("\n\nMessages arrived while waiting:")
-        .map_or(result, |(result, _)| result);
     Some(crate::chat::coordination::Run {
         agent: agent.into(),
         state: Some(state),

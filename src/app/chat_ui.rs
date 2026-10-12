@@ -3323,6 +3323,26 @@ impl Cagents {
                     );
                 }
             }
+            // So would a card's message or prompt, or a message a step read.
+            for placed in turn.steps.iter().chain(&turn.prose) {
+                let Some(item) = runtime.snapshot.items.get(placed.index) else {
+                    continue;
+                };
+                let Some(coordinated) = runtime
+                    .cache
+                    .get(&item.id)
+                    .and_then(|cached| cached.coordination.as_deref())
+                else {
+                    continue;
+                };
+                for (part, text) in coordinated.parts() {
+                    if find::contains(text, query) {
+                        runtime
+                            .find_disclosure
+                            .part(&format!("{}#{part}", item.id), &mut runtime.unfolded);
+                    }
+                }
+            }
             // A delivery folded to its opening would hide a match in its body;
             // its heading is always shown.
             for index in &turn.prompt {
@@ -6976,7 +6996,11 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime
                         .find_disclosure
-                        .restore(&mut runtime.expanded, &mut runtime.opened);
+                        .restore(
+                            &mut runtime.expanded,
+                            &mut runtime.unfolded,
+                            &mut runtime.opened,
+                        );
                     runtime.find = Some(query);
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
@@ -6988,7 +7012,11 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime
                         .find_disclosure
-                        .restore(&mut runtime.expanded, &mut runtime.opened);
+                        .restore(
+                            &mut runtime.expanded,
+                            &mut runtime.unfolded,
+                            &mut runtime.opened,
+                        );
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
@@ -7248,7 +7276,11 @@ impl Cagents {
                                 .and_then(|cached| cached.coordination.as_deref())
                                 .filter(|coordinated| coordinated.is_card());
                             match card {
-                                Some(card) if matches!(part, CopyPart::Text) => card.copy_text(),
+                                // A message read from a file copies as the
+                                // command that sent it.
+                                Some(card) if matches!(part, CopyPart::Text) => card
+                                    .copy_text()
+                                    .or_else(|| copy_text(part, &item.content)),
                                 _ => copy_text(part, &item.content),
                             }
                         }),
@@ -7266,10 +7298,11 @@ impl Cagents {
                 }
             }
             Action::Unfold(target, key) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && !runtime.unfolded.remove(&key)
-                {
-                    runtime.unfolded.insert(key);
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_disclosure.manual_part(&key);
+                    if !runtime.unfolded.remove(&key) {
+                        runtime.unfolded.insert(key);
+                    }
                 }
             }
             Action::OpenSession(prefix) => {
@@ -7280,11 +7313,20 @@ impl Cagents {
                     .filter(|card| card.existence.is_open())
                     .filter_map(notification_ui::card_session)
                     .filter(|session| session.to_string().starts_with(&prefix));
-                let (Some(session), None) = (sessions.next(), sessions.next()) else {
-                    self.status = Some(TransientNotice::warning(format!(
-                        "No open session here has the id {prefix}."
-                    )));
-                    return Task::none();
+                let session = match (sessions.next(), sessions.next()) {
+                    (Some(session), None) => session,
+                    (None, _) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "Session {prefix} is not open in this window."
+                        )));
+                        return Task::none();
+                    }
+                    (Some(_), Some(_)) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "More than one open session starts with {prefix}."
+                        )));
+                        return Task::none();
+                    }
                 };
                 return self.update_notifications(notification_ui::Action::Activated(
                     crate::notifications::Target::Session(session),

@@ -10,6 +10,7 @@
 //! would act on - that discloses its own detail when asked. Nothing is
 //! rendered per step that the reader has not asked for.
 
+use super::coordination::Coordinated;
 use super::*;
 use crate::chat::{ChangeKind, FileChange, SearchResult, ToolStatus};
 
@@ -466,7 +467,9 @@ impl Runtime {
                 turn::step_label(&item.content).to_owned(),
             ),
         };
-        let glyph = coordinated.map_or_else(|| kind_glyph(&item.content), |c| c.glyph());
+        let glyph = coordinated
+            .and_then(Coordinated::glyph)
+            .unwrap_or_else(|| kind_glyph(&item.content));
         let mut line: Vec<Element<'static, Message>> = vec![
             widget::icon(Icon::handle(if open {
                 Icon::PanDown

@@ -522,7 +522,7 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     let mut coordinating = 0;
     for placed in steps {
         let item = items.get(placed.index)?.borrow();
-        if coordinated(item).is_some() {
+        if coordinated(item).is_some_and(|coordinated| coordinated.reading.involves_agents()) {
             coordinating += 1;
             continue;
         }

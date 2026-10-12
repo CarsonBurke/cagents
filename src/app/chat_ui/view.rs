@@ -2787,6 +2787,7 @@ impl Runtime {
                 .chain(&turn.prose)
                 .map(|placed| (placed.index, Some(placed.slot))),
         );
+        let mut coordinating = false;
         for (index, slot) in placed {
             let Some(item) = self.snapshot.items.get(index) else {
                 continue;
@@ -2814,22 +2815,15 @@ impl Runtime {
                     )
                 })
                 .hash(&mut hasher);
-            // A coordination card names the agents it reached, links their
-            // transcripts while this conversation lists them, and remembers
-            // which of its parts the reader unfolded.
-            if let Some(coordinated) = self
+            // A coordinating step names agents by what this conversation
+            // calls them, links their transcripts while it lists them, and
+            // remembers which of its parts the reader unfolded.
+            if self
                 .cache
                 .get(&item.id)
-                .and_then(|cached| cached.coordination.as_deref())
+                .is_some_and(|cached| cached.coordination.is_some())
             {
-                for id in &coordinated.reading.subagents {
-                    self.snapshot
-                        .subagents
-                        .iter()
-                        .find(|agent| agent.id == *id)
-                        .map(|agent| (&agent.kind, &agent.description))
-                        .hash(&mut hasher);
-                }
+                coordinating = true;
                 let mut unfolded: Vec<&str> = self
                     .unfolded
                     .iter()
@@ -2841,6 +2835,11 @@ impl Runtime {
                     .collect();
                 unfolded.sort_unstable();
                 unfolded.hash(&mut hasher);
+            }
+        }
+        if coordinating {
+            for agent in &self.snapshot.subagents {
+                (&agent.id, &agent.kind, &agent.description).hash(&mut hasher);
             }
         }
         hasher.finish()

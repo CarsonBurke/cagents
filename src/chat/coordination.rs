@@ -229,6 +229,22 @@ impl Coordination {
     pub fn is_card(&self) -> bool {
         matches!(self.kind, Kind::Message(_) | Kind::Spawn(_))
     }
+
+    /// Whether the step reached another agent, rather than the application,
+    /// a ticket, or a background shell.
+    pub fn involves_agents(&self) -> bool {
+        !matches!(
+            self.kind,
+            Kind::Act(
+                Act::Sessions
+                    | Act::Whoami
+                    | Act::Stop { .. }
+                    | Act::Output { .. }
+                    | Act::Linear { .. }
+                    | Act::Cli(_)
+            )
+        )
+    }
 }
 
 /// The program name that marks a line worth lexing at all, so the common
@@ -251,12 +267,14 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
             return None;
         }
         let stdin = match &simple.stdin {
-            shell::Stdin::Text(text) => Some(text.clone()),
+            shell::Stdin::Text(text) => Text::Inline(text.clone()),
+            shell::Stdin::File(path) => Text::File(path.clone()),
             shell::Stdin::Pipe => index
                 .checked_sub(1)
                 .and_then(|before| commands.get(before))
-                .and_then(piped_text),
-            shell::Stdin::Unknown => None,
+                .and_then(piped_text)
+                .map_or(Text::Unseen, Text::Inline),
+            shell::Stdin::Unknown => Text::Unseen,
         };
         found = Some((argv, stdin));
     }
@@ -310,9 +328,11 @@ fn piped_text(before: &shell::Simple) -> Option<String> {
         ("echo", words) if words.first().is_none_or(|word| !word.starts_with('-')) => {
             Some(format!("{}\n", words.join(" ")))
         }
-        ("printf", [format, words @ ..]) if format == "%s\\n" || format == "%s" => {
-            Some(words.join(""))
+        // A format reused for each word: `%s\n` writes a line per word.
+        ("printf", [format, words @ ..]) if format == "%s\\n" => {
+            Some(words.iter().map(|word| format!("{word}\n")).collect())
         }
+        ("printf", [format, words @ ..]) if format == "%s" => Some(words.concat()),
         _ => None,
     }
 }
