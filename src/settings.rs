@@ -877,6 +877,11 @@ pub struct AppSettings {
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
+    /// Preview rows by provider: `window:<provider key>` or `credits`.
+    /// An absent provider retains its automatic headline; an empty list
+    /// deliberately shows only the provider control.
+    #[serde(default)]
+    pub usage_preview_rows: HashMap<String, Vec<String>>,
     /// Dirty-worktree badges in the Projects sidebar; hiding them leaves
     /// source-control data and agent activity indicators intact.
     #[serde(default = "default_show_worktree_changes_icons")]
@@ -961,6 +966,7 @@ impl Default for AppSettings {
             chat_content_fraction: default_native_fraction(),
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
+            usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
@@ -2801,6 +2807,31 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
+        let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
+        previous_schema
+            .as_table_mut()
+            .unwrap()
+            .remove("usage_preview_rows");
+        let legacy: AppSettings = previous_schema.try_into().unwrap();
+        assert!(legacy.usage_preview_rows.is_empty());
+        let mut settings = AppSettings::default();
+        settings.usage_preview_rows.insert(
+            "claude".into(),
+            vec![
+                "window:five_hour".into(),
+                "window:seven_day".into(),
+                "window:seven_day_fable".into(),
+            ],
+        );
+        settings
+            .usage_preview_rows
+            .insert("codex".into(), Vec::new());
+        let decoded: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(decoded.usage_preview_rows, settings.usage_preview_rows);
+    }
+
     #[test]
     fn automatic_worktree_cleanup_is_opt_in_for_old_and_new_settings() {
         let defaults = super::AppSettings::default();
