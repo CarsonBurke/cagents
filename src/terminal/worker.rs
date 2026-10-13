@@ -62,6 +62,10 @@ const TRANSCRIPT_TRUNCATED_MARKER: &[u8] = b"\n[cagents transcript truncated: si
 /// terminal nobody is watching is never observed on the timer at all.
 const FOREGROUND_POLL_MIN: Duration = Duration::from_secs(2);
 const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
+/// Allow a root's HUP handler to finish before forcing its pinned family.
+const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
+/// Total budget for hangup, escalation and an authoritative holder exit report.
+const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// How long shutdown waits for the PTY reader to leave its blocking read
 /// before abandoning the thread. Closing its wake pipe releases the read
 /// immediately in every case we can construct; this only bounds the ones we
@@ -361,6 +365,7 @@ struct PublishedState {
     archive_ready: Condvar,
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     completed: AtomicBool,
+    shutdown_requested: AtomicBool,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
@@ -404,6 +409,7 @@ impl PublishedState {
             archive_ready: Condvar::new(),
             archive_observer: OnceLock::new(),
             completed: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
             transcript_location: OnceLock::new(),
@@ -413,6 +419,13 @@ impl PublishedState {
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
         }
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        // Wake the same select loop as capture credit. A full wake channel
+        // already guarantees a pending event; shutdown cannot wait on input.
+        let _ = self.capture_tx.try_send(());
     }
 
     fn prepare_search(&self, owner: Option<u64>, request: u64) -> Arc<AtomicU64> {
@@ -648,17 +661,7 @@ struct HandleInner {
 
 impl Drop for HandleInner {
     fn drop(&mut self) {
-        let on_worker_thread = self
-            .worker
-            .get_mut()
-            .ok()
-            .and_then(|worker| worker.as_ref())
-            .is_some_and(|worker| worker.thread().id() == thread::current().id());
-        if on_worker_thread {
-            let _ = self.commands.try_send(Command::Shutdown);
-        } else {
-            let _ = self.commands.send(Command::Shutdown);
-        }
+        self.published.request_shutdown();
         if let Ok(worker) = self.worker.get_mut()
             && let Some(worker) = worker.take()
             && worker.thread().id() != thread::current().id()
@@ -860,9 +863,49 @@ impl TerminalHandle {
         self.inner.published.set_agent_activity(None);
     }
 
-    /// True only after final capture, PTY/emulator teardown and reader/reaper cleanup.
-    /// Published before the final `Completed` event.
-    /// Foreground-process exit alone does not imply completion.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_missing_exit_report_for_test(session: TerminalSession) -> Self {
+        let (commands, receiver) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let worker_published = Arc::clone(&published);
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let mut worker = Worker::start(
+                session,
+                TerminalConfig::default(),
+                receiver,
+                events,
+                worker_published,
+            )
+            .unwrap();
+            assert!(
+                !worker.holder.registered(),
+                "failure fixture must not write holder recovery into user state"
+            );
+            worker.disconnected_exit_report();
+            // A timed-out caller sets shutdown; still run cleanup if its
+            // readiness receiver disappeared instead of panicking first.
+            let _ = ready.send(());
+            worker.run();
+        });
+        if let Err(error) = initialized.recv_timeout(Duration::from_secs(5)) {
+            published.request_shutdown();
+            panic!("test terminal initialization did not finish: {error}");
+        }
+        Self {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published,
+                worker: Mutex::new(Some(worker)),
+            }),
+        }
+    }
+
+    /// True after teardown and either a confirmed root exit or committed carry.
+    /// Published before the final `Completed` event when an exit is confirmed.
+    /// A stopped parser or foreground-process exit alone releases no ownership.
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
     }
@@ -1154,16 +1197,26 @@ impl TerminalHandle {
         outcome
     }
 
+    /// Starts shutdown before joining any workers, so a daemon with many
+    /// terminals lets all roots handle their hangups concurrently.
+    pub(crate) fn request_shutdown(&self) {
+        self.inner.published.request_shutdown();
+    }
+
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        let sent = self.send_command(Command::Shutdown);
+        self.request_shutdown();
         if let Ok(mut worker) = self.inner.worker.lock()
             && let Some(worker) = worker.take()
             && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
-        self.release_completed_holder();
-        if self.is_completed() { Ok(()) } else { sent }
+        if self.is_completed() {
+            self.release_completed_holder();
+            Ok(())
+        } else {
+            Err(TerminalSendError::Closed)
+        }
     }
 
     /// The caller first fences the exact source against this retained worker.
@@ -1302,6 +1355,12 @@ impl TerminalHandle {
 
 fn command_channel(capacity: usize) -> (Sender<Command>, Receiver<Command>) {
     crossbeam_channel::bounded(capacity.max(1))
+}
+
+struct WorkerCompletion {
+    event: Option<TerminalEvent>,
+    /// A confirmed root exit or already-committed carry released ownership.
+    ownership_released: bool,
 }
 
 struct Worker {
@@ -1711,6 +1770,13 @@ impl Worker {
         })
     }
 
+    #[cfg(test)]
+    fn disconnected_exit_report(&mut self) {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        drop(sender);
+        self.child_exit_rx = receiver;
+    }
+
     fn run(self) {
         let published = Arc::clone(&self.published);
         let events = self.events.clone();
@@ -1720,13 +1786,15 @@ impl Worker {
         // A panic during teardown skips both publications and retains live
         // inventory rather than certifying unobserved cleanup.
         let completion = self.run_to_completion();
-        published.completed.store(true, Ordering::Release);
-        if let Some(completion) = completion {
+        published
+            .completed
+            .store(completion.ownership_released, Ordering::Release);
+        if let Some(completion) = completion.event {
             let _ = events.send(completion);
         }
     }
 
-    fn run_to_completion(mut self) -> Option<TerminalEvent> {
+    fn run_to_completion(mut self) -> WorkerCompletion {
         // An adopted terminal's title, set by drawing its screen again.
         self.drain_effects();
         if self.visibility == Visibility::Visible {
@@ -1738,6 +1806,10 @@ impl Worker {
         let mut shutting_down = false;
         let mut carried_command = None;
         while !shutting_down && (pty_open || !exited) {
+            if self.published.shutdown_requested.load(Ordering::Acquire) {
+                shutting_down = true;
+                break;
+            }
             self.publish_bell();
             // Output or a busy input queue must not keep resetting discovery's
             // timeout: an agent can start in an existing shell's process group.
@@ -1814,32 +1886,13 @@ impl Worker {
             self.capture_when_ready(false);
         }
         if shutting_down && !exited && !self.carried {
-            match self.child_exit_rx.try_recv() {
-                Ok(result) => self.handle_child_exit(&mut exited, result),
-                Err(TryRecvError::Disconnected) => {
-                    self.handle_child_exit(&mut exited, Err("child reaper closed".into()));
-                }
-                Err(TryRecvError::Empty) if self.checked_shutdown => {
-                    let result = self
-                        .child_exit_rx
-                        .recv()
-                        .unwrap_or_else(|_| Err("child reaper closed".into()));
-                    self.handle_child_exit(&mut exited, result);
-                }
-                Err(TryRecvError::Empty) => match self.child.kill() {
-                    Ok(()) => {
-                        let result = self
-                            .child_exit_rx
-                            .recv()
-                            .unwrap_or_else(|_| Err("child reaper closed".into()));
-                        self.handle_child_exit(&mut exited, result);
-                    }
-                    Err(error) => match self.child_exit_rx.try_recv() {
-                        Ok(result) => self.handle_child_exit(&mut exited, result),
-                        Err(_) => self.error("terminate child", error.to_string()),
-                    },
-                },
-            }
+            let result = shutdown_child_exit(
+                &self.child,
+                self.child_identity.as_ref(),
+                &self.child_exit_rx,
+                self.checked_shutdown,
+            );
+            self.handle_child_exit(&mut exited, result);
         }
         if let Some(transcript) = self.transcript.take() {
             transcript.finish();
@@ -1915,7 +1968,19 @@ impl Worker {
                 let _ = self.published.archived_command(command);
             }
         }
-        if !shutting_down && exited && self.holder.registered() {
+        let ownership_released = completion.is_some() || self.carried;
+        if !ownership_released && self.holder.registered() {
+            // A missing exit report cannot authorize a fresh replacement or
+            // erase the holder's recovery record. Retain that exact owner for
+            // a successor without claiming a successful completed handoff.
+            if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+                .and_then(|screen| self.holder.cache_screen(&screen))
+            {
+                self.error("retain unconfirmed terminal screen", error);
+            }
+            self.holder.leave_for_successor();
+            drop(self.holder);
+        } else if !shutting_down && completion.is_some() && self.holder.registered() {
             self.holder.prove_cleanup();
             if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
                 .and_then(|screen| self.holder.cache_screen(&screen))
@@ -1934,7 +1999,10 @@ impl Worker {
         drop(self.master);
         // Terminal, render state, and every Ghostty encoder drop here, on the
         // same OS thread on which they were constructed and used.
-        completion
+        WorkerCompletion {
+            event: completion,
+            ownership_released,
+        }
     }
 
     fn handle_child_exit(&mut self, exited: &mut bool, result: ChildExit) {
@@ -3030,6 +3098,63 @@ fn wait_for_worker_event(
         },
         (false, false) => WorkerEvent::Command(commands.recv().ok()),
     }
+}
+
+/// Sending HUP successfully does not mean the process exited. Preserve its
+/// graceful handler first, then escalate through pinned identities and bound
+/// how long a stalled holder can keep a daemon waiting for its exit report.
+fn shutdown_child_exit(
+    child: &holder::HeldChild,
+    identity: Option<&RootIdentity>,
+    exits: &Receiver<ChildExit>,
+    checked: bool,
+) -> ChildExit {
+    let deadline = std::time::Instant::now() + CHILD_SHUTDOWN_DEADLINE;
+    match exits.try_recv() {
+        Ok(result) => return result,
+        // A lost report channel does not mean this pinned root stopped.
+        Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
+    }
+    if !checked {
+        if let Err(error) = child.kill() {
+            return exits
+                .try_recv()
+                .unwrap_or_else(|_| Err(format!("hang up child: {error}")));
+        }
+        match exits.recv_timeout(CHILD_HANGUP_GRACE) {
+            Ok(result) => return result,
+            Err(RecvTimeoutError::Disconnected) => {
+                if child
+                    .exited_within(CHILD_HANGUP_GRACE)
+                    .map_err(|error| format!("observe child exit: {error}"))?
+                {
+                    return Err("child reaper closed".into());
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        let stopped = identity
+            .ok_or_else(|| "Child identity unavailable".to_owned())
+            .and_then(|root| FrozenFamily::capture(root, deadline))
+            .and_then(|mut family| family.kill(deadline));
+        if let Err(error) = stopped {
+            // Census failure cannot grant authority over guessed descendants.
+            // This root remains pinned independently by its holder's pidfd.
+            tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+            child
+                .force_kill()
+                .map_err(|error| format!("terminate child: {error}"))?;
+        }
+    }
+    exits
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|error| match error {
+            RecvTimeoutError::Disconnected => "child reaper closed".to_owned(),
+            RecvTimeoutError::Timeout => {
+                "terminal shutdown did not receive a confirmed child exit before its deadline"
+                    .to_owned()
+            }
+        })?
 }
 
 fn child_exit_event(
@@ -5245,6 +5370,158 @@ mod tests {
         // Revealing it makes the next observation prompt again.
         worker.reveal();
         assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN);
+    }
+
+    #[test]
+    fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
+        use std::io::Read as _;
+        struct Cleanup<'a>(&'a holder::HeldChild);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.force_kill();
+            }
+        }
+        for (script, expected_code) in [
+            ("trap '' HUP; printf ready; while :; do sleep 1; done", None),
+            (
+                "trap 'exit 3' HUP; printf ready; while :; do sleep 0.05; done",
+                Some(3),
+            ),
+        ] {
+            let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+            command.args(["-c", script]);
+            let (sender, exits) = crossbeam_channel::bounded(1);
+            let held = holder::spawn(
+                command,
+                portable_pty::PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                sender,
+            )
+            .unwrap();
+            let cleanup = Cleanup(&held.child);
+            let mut reader = std::fs::File::from(held.master.duplicate().unwrap());
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            // This test owns the master and uses it only for readiness input.
+            assert_eq!(
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut ready = [0; 5];
+            let mut received = 0;
+            while received < ready.len() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "held fixture did not print readiness before its deadline"
+                );
+                let mut target = libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // One owned descriptor; retry an interrupted wait against the
+                // same deadline rather than extending the readiness budget.
+                let polled = unsafe {
+                    libc::poll(
+                        &mut target,
+                        1,
+                        remaining.as_millis().min(i32::MAX as u128) as i32,
+                    )
+                };
+                if polled < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                assert!(polled > 0, "held fixture readiness wait failed or expired");
+                match reader.read(&mut ready[received..]) {
+                    Ok(0) => panic!("held fixture closed before readiness"),
+                    Ok(count) => received += count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => panic!("read held fixture readiness: {error}"),
+                }
+            }
+            assert_eq!(&ready, b"ready");
+            let root = RootIdentity::capture(held.child.pid(), None).unwrap();
+            let started = std::time::Instant::now();
+            let status = shutdown_child_exit(&held.child, Some(&root), &exits, false).unwrap();
+            assert!(started.elapsed() < CHILD_SHUTDOWN_DEADLINE);
+            match expected_code {
+                Some(code) => assert_eq!(status.exit_code(), code),
+                None => assert!(status.signal().is_some()),
+            }
+            assert!(!held.child.unreaped());
+            drop(cleanup);
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn shutdown_does_not_fabricate_completion_when_holder_reporting_fails() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let (sender, exits) = crossbeam_channel::bounded(1);
+        let held = holder::spawn(
+            command,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            sender,
+        )
+        .unwrap();
+        let (sender, disconnected) = crossbeam_channel::bounded(1);
+        drop(sender);
+        assert!(
+            matches!(shutdown_child_exit(&held.child, None, &disconnected, true), Err(message) if message == "child reaper closed")
+        );
+        assert!(matches!(
+            child_exit_event(&mut false, Err("child reaper closed".into()), false),
+            Some(TerminalEvent::Error { .. })
+        ));
+        let _ = exits.recv_timeout(CHILD_SHUTDOWN_DEADLINE);
+    }
+
+    #[test]
+    fn shutdown_bypasses_a_saturated_input_queue_and_coalesced_wake() {
+        let (mut worker, events) = capture_worker();
+        let expected = worker.current_size;
+        let (commands, receiver) = command_channel(1);
+        commands
+            .send(Command::Resize(TerminalSize {
+                columns: 100,
+                rows: 40,
+                ..expected
+            }))
+            .unwrap();
+        worker.commands = receiver;
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events,
+                published: Arc::clone(&worker.published),
+                worker: Mutex::new(None),
+            }),
+        };
+        assert!(handle.inner.commands.is_full());
+        let _ = handle.inner.published.capture_tx.try_send(());
+        handle.request_shutdown();
+        worker.run();
+        assert!(handle.is_completed());
+        assert_eq!(handle.snapshot().columns, expected.columns);
+        assert!(handle.shutdown().is_ok());
     }
 
     #[test]
