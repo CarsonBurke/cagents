@@ -349,7 +349,7 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
     )
     .class(design::surface(
         Some(design::sunken),
-        [design::RADIUS_S; 4],
+        [design::RADIUS_M; 4],
         false,
     ))
     .padding([step::GAP_S as u16, step::GAP_M as u16])
