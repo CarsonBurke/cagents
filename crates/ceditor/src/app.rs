@@ -41,6 +41,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
+const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
+
 mod checkout;
 mod notification_ui;
 
@@ -2570,6 +2573,15 @@ impl Editor {
         }
     }
 
+    fn reveal_quick_open_selection(&self, total: usize) -> Task<Message> {
+        cagents::interaction::reveal_list_selection(
+            widget::Id::new("ceditor.quick-open.results"),
+            self.quick_open_selection(total),
+            QUICK_OPEN_ROW_HEIGHT,
+            QUICK_OPEN_ROW_SPACING,
+        )
+    }
+
     fn quick_open_search(&mut self, query: String, generation: u64) -> Task<Message> {
         // Abandon the walk the new keystroke supersedes before starting another.
         self.quick_open_cancel.cancel();
@@ -4020,11 +4032,11 @@ impl Application for Editor {
                     self.settings_search.clear();
                     self.settings_reset_confirm = false;
                     self.settings_category = category;
-                    Task::none()
+                    cagents::settings_widgets::reveal_content_start()
                 }
                 Message::SettingsSearchChanged(query) => {
                     self.settings_search = query;
-                    Task::none()
+                    cagents::settings_widgets::reveal_content_start()
                 }
                 Message::ResetSettings => {
                     if !self.settings_writable {
@@ -4116,6 +4128,7 @@ impl Application for Editor {
                     self.quick_open_query.clear();
                     iced::widget::operation::focus(widget::Id::new("ceditor.quick-open.query"))
                         .map(cosmic::Action::App)
+                        .chain(self.reveal_quick_open_selection(self.quick_open_results().len()))
                 }
                 Message::QuickOpenQueryChanged(query) => {
                     self.quick_open_query = query.clone();
@@ -4123,14 +4136,17 @@ impl Application for Editor {
                     // A new query means a new result list: start at its top.
                     self.quick_open_index = 0;
                     self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
-                    self.quick_open_search(query, self.quick_open_generation)
+                    Task::batch([
+                        self.quick_open_search(query, self.quick_open_generation),
+                        self.reveal_quick_open_selection(self.quick_open_results().len()),
+                    ])
                 }
                 Message::QuickOpenNext => {
                     let total = self.quick_open_results().len();
                     if total > 0 {
                         self.quick_open_index = (self.quick_open_selection(total) + 1) % total;
                     }
-                    Task::none()
+                    self.reveal_quick_open_selection(total)
                 }
                 Message::QuickOpenPrevious => {
                     let total = self.quick_open_results().len();
@@ -4140,7 +4156,7 @@ impl Application for Editor {
                             .checked_sub(1)
                             .unwrap_or(total - 1);
                     }
-                    Task::none()
+                    self.reveal_quick_open_selection(total)
                 }
                 Message::QuickOpenActivate => {
                     let results = self.quick_open_results();
@@ -4165,8 +4181,10 @@ impl Application for Editor {
                             Ok(files) => self.quick_open_files = Some(files),
                             Err(error) => self.notice = Some(error),
                         }
+                        self.reveal_quick_open_selection(self.quick_open_results().len())
+                    } else {
+                        Task::none()
                     }
-                    Task::none()
                 }
                 Message::OpenQuickFile(path) => {
                     let Some(id) = self.active else {
@@ -4922,6 +4940,7 @@ impl Application for Editor {
                     let label = path.to_string_lossy().into_owned();
                     let highlighted = index == selected;
                     widget::button::text(label)
+                        .height(QUICK_OPEN_ROW_HEIGHT)
                         .class(if highlighted {
                             cosmic::theme::Button::Suggested
                         } else {
@@ -4945,7 +4964,7 @@ impl Application for Editor {
                             .into(),
                         widget::scrollable(
                             widget::column::with_children(rows)
-                                .spacing(2)
+                                .spacing(QUICK_OPEN_ROW_SPACING)
                                 // Every result button fills the row, so the
                                 // thumb would sit on top of its background.
                                 .padding(design::with_vertical_rail(iced::Padding::ZERO)),
@@ -4953,6 +4972,7 @@ impl Application for Editor {
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
+                        .id(widget::Id::new("ceditor.quick-open.results"))
                         .height(360)
                         .into(),
                     ])
@@ -5242,6 +5262,7 @@ impl Editor {
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
+            .id(cagents::settings_widgets::content_id())
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
@@ -6150,6 +6171,123 @@ mod tests {
             app.sidebar_open, sidebar_open,
             "the configured digit chord never fired",
         );
+    }
+
+    fn dialog_scroll_step(
+        app: &Editor,
+        tree: &mut iced::advanced::widget::Tree,
+        id: widget::Id,
+        task: Task<Message>,
+    ) -> f32 {
+        use iced::advanced::{Layout, layout, renderer::Headless, widget::Operation};
+        use iced::{Size, futures::StreamExt};
+        struct Probe(widget::Id, Option<f32>);
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+            ) {
+                if id == Some(&self.0) {
+                    self.1 = Some(translation.y);
+                }
+            }
+        }
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let renderer = executor
+            .block_on(<cosmic::Renderer as Headless>::new(
+                iced::Font::DEFAULT,
+                iced::Pixels::from(16),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut view = app.dialog().unwrap();
+        tree.diff(view.as_widget_mut());
+        let node = view.as_widget_mut().layout(
+            tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 800.0)),
+        );
+        executor.block_on(async {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Widget(mut operation) = action {
+                        view.as_widget_mut().operate(
+                            tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                    }
+                }
+            }
+        });
+        let mut probe = Probe(id, None);
+        view.as_widget_mut()
+            .operate(tree, Layout::new(&node), &renderer, &mut probe);
+        probe.1.expect("dialog result scrollable is mounted")
+    }
+
+    #[test]
+    fn quick_open_keyboard_selection_stays_visible_and_queries_reset_scroll() {
+        use iced::advanced::widget::Tree;
+        let mut app = editor();
+        let directory = tempfile::tempdir().unwrap();
+        add(&mut app, directory.path().to_str().unwrap(), None);
+        app.quick_open = true;
+        app.quick_open_files = Some(
+            (0..40)
+                .map(|index| PathBuf::from(format!("file-{index}.rs")))
+                .collect(),
+        );
+        let mut tree = Tree::new(app.dialog().unwrap().as_widget());
+        let id = widget::Id::new("ceditor.quick-open.results");
+        // Up wraps from the first to the last result, far beyond the viewport.
+        let previous = app.update(Message::QuickOpenPrevious);
+        assert!(dialog_scroll_step(&app, &mut tree, id.clone(), previous) > 1000.0);
+        let next = app.update(Message::QuickOpenNext);
+        assert_eq!(dialog_scroll_step(&app, &mut tree, id.clone(), next), 0.0);
+        let previous = app.update(Message::QuickOpenPrevious);
+        assert!(dialog_scroll_step(&app, &mut tree, id.clone(), previous) > 1000.0);
+        // Retain many rows while applying the query handler's task, preventing
+        // shorter-content clamping from disguising a missing reveal operation.
+        let files = app.quick_open_files.clone();
+        let query = app.update(Message::QuickOpenQueryChanged("file".into()));
+        app.quick_open_files = files;
+        assert_eq!(dialog_scroll_step(&app, &mut tree, id, query), 0.0);
+    }
+
+    #[test]
+    fn editor_settings_navigation_reveals_the_content_start() {
+        use iced::advanced::widget::Tree;
+        let mut app = editor();
+        app.settings_open = true;
+        app.settings_category = SettingsCategory::Keyboard;
+        let mut tree = Tree::new(app.dialog().unwrap().as_widget());
+        let id = cagents::settings_widgets::content_id();
+        let scroll = || {
+            iced::widget::operation::scroll_to(
+                id.clone(),
+                iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 },
+            )
+        };
+        assert!(dialog_scroll_step(&app, &mut tree, id.clone(), scroll()) > 0.0);
+        let category = app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard));
+        assert_eq!(
+            dialog_scroll_step(&app, &mut tree, id.clone(), category),
+            0.0
+        );
+        assert!(dialog_scroll_step(&app, &mut tree, id.clone(), scroll()) > 0.0);
+        let query = app.update(Message::SettingsSearchChanged("keyboard".into()));
+        assert_eq!(dialog_scroll_step(&app, &mut tree, id, query), 0.0);
     }
 
     #[test]

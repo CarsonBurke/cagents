@@ -25,6 +25,9 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct MessageBox(pub Box<Message>);
 
+const ROW_HEIGHT: f32 = 40.0;
+const ROW_SPACING: f32 = space::XXS;
+
 impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
         match action {
@@ -41,6 +44,7 @@ impl Cagents {
                 self.palette.selected = 0;
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
+                    .chain(self.reveal_palette_selection())
             }
             Action::Close => {
                 self.palette.recording = None;
@@ -53,7 +57,7 @@ impl Cagents {
             Action::Query(query) => {
                 self.palette.query = Some(query);
                 self.palette.selected = 0;
-                Task::none()
+                self.reveal_palette_selection()
             }
             Action::Run(MessageBox(message)) => self.run_palette_command(*message),
             Action::Submit => {
@@ -187,12 +191,11 @@ impl Cagents {
     }
 
     fn reveal_palette_selection(&self) -> Task<Message> {
-        iced::widget::operation::scroll_to(
+        crate::interaction::reveal_list_selection(
             widget::Id::new("palette.commands"),
-            iced::widget::operation::AbsoluteOffset {
-                x: 0.0,
-                y: (self.palette.selected.saturating_sub(7) * 42) as f32,
-            },
+            self.palette.selected,
+            ROW_HEIGHT,
+            ROW_SPACING,
         )
     }
 
@@ -299,7 +302,7 @@ impl Cagents {
                 };
                 button
                     .width(Length::Fill)
-                    .height(40)
+                    .height(ROW_HEIGHT)
                     .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
                     .into()
             })
@@ -314,7 +317,7 @@ impl Cagents {
                 widget::column::with_children(vec![
                     input.into(),
                     widget::container(
-                        widget::scrollable(rows.spacing(space::XXS))
+                        widget::scrollable(rows.spacing(ROW_SPACING))
                             .id(widget::Id::new("palette.commands"))
                             .height(Length::Shrink),
                     )
@@ -632,6 +635,92 @@ impl ShortcutDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run a real scroll operation against the retained native widget tree.
+    fn scroll_fixture_step(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        palette: bool,
+        task: Task<Message>,
+    ) -> f32 {
+        use iced::advanced::{Layout, layout, widget::Operation};
+        use iced::{Size, futures::StreamExt};
+        struct Probe {
+            id: widget::Id,
+            offset: Option<f32>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(&mut self, id: Option<&widget::Id>, _: iced::Rectangle,
+                _: iced::Rectangle, translation: iced::Vector) {
+                if id == Some(&self.id) {
+                    self.offset = Some(translation.y);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let mut view = if palette {
+            app.palette_surface().unwrap()
+        } else {
+            app.card_view(app.workspace.focused().unwrap(), true, false)
+        };
+        tree.diff(view.as_widget_mut());
+        let node = view.as_widget_mut().layout(tree, &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(800.0, 300.0)));
+        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        executor.block_on(async {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Widget(mut operation) = action {
+                        view.as_widget_mut().operate(tree, Layout::new(&node), &renderer, operation.as_mut());
+                    }
+                }
+            }
+        });
+        let mut probe = Probe {
+            id: if palette { widget::Id::new("palette.commands") } else { crate::settings_widgets::content_id() },
+            offset: None,
+        };
+        view.as_widget_mut().operate(tree, Layout::new(&node), &renderer, &mut probe);
+        probe.offset.expect("the results scrollable is mounted")
+    }
+
+    #[test]
+    fn palette_query_and_reopen_reveal_the_first_selected_result() {
+        use iced::advanced::widget::Tree;
+        let mut app = settings_focus_fixture();
+        let _ = app.update_palette(Action::Open);
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let scroll = || iced::widget::operation::scroll_to(widget::Id::new("palette.commands"),
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 });
+        assert!(scroll_fixture_step(&app, &mut tree, true, scroll()) > 0.0);
+        // A space keeps every result, so clamping a shorter result set cannot
+        // accidentally make this pass without applying the reveal operation.
+        let query = app.update_palette(Action::Query(" ".into()));
+        assert_eq!(scroll_fixture_step(&app, &mut tree, true, query), 0.0);
+        assert!(scroll_fixture_step(&app, &mut tree, true, scroll()) > 0.0);
+        let _ = app.update_palette(Action::Close);
+        let reopen = app.update_palette(Action::Open);
+        assert_eq!(scroll_fixture_step(&app, &mut tree, true, reopen), 0.0);
+    }
+
+    #[test]
+    fn settings_category_and_query_changes_reveal_the_new_content_start() {
+        use iced::advanced::widget::Tree;
+        let mut app = settings_focus_fixture();
+        app.settings_category = SettingsCategory::Keyboard;
+        let mut tree = Tree::new(app.card_view(app.workspace.focused().unwrap(), true, false).as_widget());
+        let scroll = || iced::widget::operation::scroll_to(crate::settings_widgets::content_id(),
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 });
+        assert!(scroll_fixture_step(&app, &mut tree, false, scroll()) > 0.0);
+        let category = app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard));
+        assert_eq!(scroll_fixture_step(&app, &mut tree, false, category), 0.0);
+        assert!(scroll_fixture_step(&app, &mut tree, false, scroll()) > 0.0);
+        let query = app.update(Message::SettingsSearchChanged("keyboard".into()));
+        assert_eq!(scroll_fixture_step(&app, &mut tree, false, query), 0.0);
+    }
 
     /// Keep the real Settings pane mounted while the real palette comes and
     /// goes. Both controls must receive the same runtime focus operation.

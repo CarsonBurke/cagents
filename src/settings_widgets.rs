@@ -200,6 +200,19 @@ pub fn editor_options<'a, Message: Clone + 'static>(
     ]
 }
 
+/// Content identity shared by the ADE settings pane and standalone editor.
+pub fn content_id() -> widget::Id {
+    widget::Id::new("settings.content")
+}
+
+/// Category and query changes reveal the beginning of their new results.
+pub fn reveal_content_start<Message: Send + 'static>() -> iced::Task<Message> {
+    iced::widget::operation::scroll_to(
+        content_id(),
+        iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+    )
+}
+
 pub fn search_id() -> widget::Id {
     widget::Id::new("settings.search")
 }

@@ -15981,11 +15981,11 @@ impl Application for Cagents {
             Message::SelectSettingsCategory(category) => {
                 self.settings_search.clear();
                 self.settings_category = category;
-                Task::none()
+                crate::settings_widgets::reveal_content_start()
             }
             Message::SettingsSearchChanged(query) => {
                 self.settings_search = query;
-                Task::none()
+                crate::settings_widgets::reveal_content_start()
             }
             Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
             Message::SettingsDraftChanged { field, value } => {
