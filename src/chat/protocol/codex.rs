@@ -4478,6 +4478,11 @@ mod tests {
     #[test]
     fn metadata_refresh_preserves_the_model_selected_for_the_next_prompt() {
         let mut adapter = adapter();
+        adapter.models.push(Model {
+            id: "gpt-next".into(),
+            label: "Next model".into(),
+            reasoning: Vec::new(),
+        });
         adapter
             .command(Command::SetModel {
                 model: "gpt-next".into(),
