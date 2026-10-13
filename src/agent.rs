@@ -229,22 +229,36 @@ impl Provider {
     #[cfg(any(feature = "ui", feature = "host"))]
     pub fn authored_content_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         if self == Self::Omp {
-            omp::config_root(launch, Path::new(launch.environment.get("HOME")?))
+            omp::config_root(
+                launch,
+                &launch
+                    .working_directory
+                    .join(launch.environment.get("HOME")?),
+            )
         } else {
             self.session_root(launch)
         }
     }
 
     /// Resolve account/profile roots exclusively from the preserved launch.
+    /// Relative environment paths are interpreted by the child in its own cwd,
+    /// never in the cwd of the UI or daemon reading its history.
     pub fn session_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
-        let home = Path::new(launch.environment.get("HOME")?);
-        (self.adapter().session_root)(launch, home)
+        let home = launch
+            .working_directory
+            .join(launch.environment.get("HOME")?);
+        (self.adapter().session_root)(launch, &home).map(|root| launch.working_directory.join(root))
     }
 
     #[cfg(feature = "host")]
     pub(crate) fn session_state_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         if self == Self::Omp {
-            omp::state_root(launch, Path::new(launch.environment.get("HOME")?))
+            omp::state_root(
+                launch,
+                &launch
+                    .working_directory
+                    .join(launch.environment.get("HOME")?),
+            )
         } else {
             self.session_root(launch)
         }
@@ -408,6 +422,60 @@ mod tests {
             working_directory: "/tmp".into(),
             environment: Default::default(),
         }
+    }
+
+    #[test]
+    fn session_roots_resolve_relative_paths_in_the_provider_launch_directory() {
+        let mut recipe = launch("claude", &[]);
+        recipe.working_directory = "/project/worktree".into();
+        recipe.environment.insert("HOME".into(), "home".into());
+        for (provider, default) in [
+            (Provider::Claude, "home/.claude"),
+            (Provider::Codex, "home/.codex"),
+            (Provider::Omp, "home/.omp/agent"),
+        ] {
+            assert_eq!(
+                provider.session_root(&recipe),
+                Some(recipe.working_directory.join(default))
+            );
+        }
+        for (provider, variable) in [
+            (Provider::Claude, "CLAUDE_CONFIG_DIR"),
+            (Provider::Codex, "CODEX_HOME"),
+            (Provider::Omp, "PI_CODING_AGENT_DIR"),
+        ] {
+            recipe
+                .environment
+                .insert(variable.into(), "selected-account".into());
+            assert_eq!(
+                provider.session_root(&recipe),
+                Some(recipe.working_directory.join("selected-account"))
+            );
+            recipe
+                .environment
+                .insert(variable.into(), "/absolute/account".into());
+            assert_eq!(
+                provider.session_root(&recipe),
+                Some("/absolute/account".into())
+            );
+        }
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn omp_authored_content_resolves_relative_home_in_the_launch_directory() {
+        let mut recipe = launch("omp", &[]);
+        recipe.working_directory = "/project/worktree".into();
+        recipe.environment.insert("HOME".into(), "home".into());
+        assert_eq!(
+            Provider::Omp.authored_content_root(&recipe),
+            Some(recipe.working_directory.join("home/.omp/agent"))
+        );
+        #[cfg(feature = "host")]
+        assert_eq!(
+            Provider::Omp.session_state_root(&recipe),
+            Some(recipe.working_directory.join("home/.omp/agent"))
+        );
     }
 
     #[test]
