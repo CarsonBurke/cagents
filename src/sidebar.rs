@@ -3720,6 +3720,11 @@ pub fn search_focus_id() -> Id {
     stable_id("search")
 }
 
+/// Closing search returns to the control that opens it in both densities.
+pub fn search_toggle_focus_id() -> Id {
+    stable_id("toggle-controls")
+}
+
 /// The focus target of the pane's resize handle.
 pub fn resize_handle_id() -> Id {
     stable_id("resize-handle")
@@ -3998,7 +4003,7 @@ fn header<'a>(
         let search_button = crate::interaction::tooltip(
             button::icon(Icon::Search)
                 .class(sidebar_button_style(selected))
-                .id(stable_id("toggle-controls"))
+                .id(search_toggle_focus_id())
                 .name("Search projects")
                 .selected(selected)
                 .width(ICON_CONTROL_SIZE)
@@ -10458,15 +10463,26 @@ mod row_interaction {
                 _ => {}
             }
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
+            // Handle the search's own Escape before the input captures it
+            // merely to blur. Other focused controls and modal dialogs retain
+            // their own dismissal because this requires enabled search focus.
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
-                && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown), modifiers, ..
-                }) if modifiers.is_empty())
+                && let Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(key), modifiers, ..
+                }) = event
+                && modifiers.is_empty()
             {
-                shell.publish(SidebarAction::FocusFirstSearchResult);
-                shell.capture_event();
-                return;
+                let action = match key {
+                    keyboard::key::Named::ArrowDown => Some(SidebarAction::FocusFirstSearchResult),
+                    keyboard::key::Named::Escape => Some(SidebarAction::ToggleControls),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    shell.publish(action);
+                    shell.capture_event();
+                    return;
+                }
             }
             if let Kind::Selectable {
                 row,
@@ -11236,12 +11252,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn search_down_enters_results_only_when_the_enabled_search_input_has_focus() {
+    fn search_navigation_and_escape_require_enabled_input_focus() {
         use cosmic::iced::{
             Event, Rectangle,
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
+        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
         for (focused, modal) in [(false, false), (true, false), (true, true)] {
             let state = SidebarState::default();
             let renderer = headless_renderer();
@@ -11265,8 +11282,8 @@ pub(crate) mod tests {
             element.as_widget_mut().update(
                 &mut tree,
                 &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
-                    modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    key: keyboard::Key::Named(key),
+                    modified_key: keyboard::Key::Named(key),
                     physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
                     location: keyboard::Location::Standard,
                     modifiers: keyboard::Modifiers::empty(),
@@ -11283,11 +11300,16 @@ pub(crate) mod tests {
             assert_eq!(
                 messages,
                 if focused && !modal {
-                    vec![SidebarAction::FocusFirstSearchResult]
+                    vec![if key == keyboard::key::Named::Escape {
+                        SidebarAction::ToggleControls
+                    } else {
+                        SidebarAction::FocusFirstSearchResult
+                    }]
                 } else {
                     vec![]
                 }
             );
+        }
         }
     }
 

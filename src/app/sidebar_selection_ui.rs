@@ -115,6 +115,23 @@ mod tests {
     }
 
     #[test]
+    fn closing_search_clears_filters_and_restores_toggle_focus_in_both_densities() {
+        for compact in [false, true] {
+            let (mut app, _, _) = fixture();
+            app.chrome_ui.projects_collapsed = compact;
+            app.context_inspector_open = false;
+            drop(app.update(Message::Sidebar(SidebarAction::ToggleControls)));
+            drop(app.update(Message::Sidebar(SidebarAction::SearchChanged("channel".into()))));
+            drop(app.update(Message::Sidebar(SidebarAction::SetFilter(sidebar::SidebarFilter::PullRequests))));
+            let task = app.update(Message::Sidebar(SidebarAction::ToggleControls));
+            assert!(!app.sidebar_state.controls_expanded());
+            assert_eq!(app.sidebar_state.query(), "");
+            assert_eq!(app.sidebar_state.filter(), sidebar::SidebarFilter::All);
+            assert_eq!(super::super::tests::focused(&app, task), Some(sidebar::search_toggle_focus_id()));
+        }
+    }
+
+    #[test]
     fn group_confirmation_names_all_targets_and_preserves_unrelated_active_channel() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);

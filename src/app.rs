@@ -14545,12 +14545,12 @@ impl Application for Cagents {
                         Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page)
                     }
                     SidebarAction::ToggleControls => {
-                        if self.sidebar_state.controls_expanded() {
-                            iced::widget::operation::focus(sidebar::search_focus_id())
-                                .map(cosmic::Action::App)
+                        let target = if self.sidebar_state.controls_expanded() {
+                            sidebar::search_focus_id()
                         } else {
-                            Task::none()
-                        }
+                            sidebar::search_toggle_focus_id()
+                        };
+                        iced::widget::operation::focus(target).map(cosmic::Action::App)
                     }
                     // Renaming and duplicating belong to standalone ceditor;
                     // this model never enables those menu items. The two copy
@@ -15878,8 +15878,7 @@ impl Application for Cagents {
                         return cosmic::task::message(Message::CancelDialog);
                     }
                     if self.sidebar_state.controls_expanded() {
-                        self.sidebar_state.apply(&SidebarAction::ToggleControls);
-                        return Task::none();
+                        return self.update(Message::Sidebar(SidebarAction::ToggleControls));
                     }
                     if self.context_inspector_is_overlay() {
                         return cosmic::task::message(Message::ContextInspector(
