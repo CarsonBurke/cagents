@@ -830,7 +830,7 @@ fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
             target: Target {
                 repository: root.join("project"),
                 directory: root.join("project"),
-                channel: None,
+                placement: None,
             },
             surface: Surface::Chat,
             model: None,
@@ -1582,6 +1582,87 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
 }
 
 #[test]
+fn authenticated_worktree_caller_places_child_in_its_exact_visible_view() {
+    use crate::{
+        agent_execution::{Placement, directory::Scope},
+        model::{CardId, CardKind},
+        workspace_model::views::Pane,
+    };
+    if isolated("authenticated_worktree_caller_places_child_in_its_exact_visible_view").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let parent = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let (authority, scope, channels) = {
+        let owned = registry(&host).unwrap();
+        let mut model = owned.lock().unwrap();
+        let session = model.agent(parent.agent.id).unwrap().session.unwrap();
+        let scope = Placement::Worktree {
+            repository: path.parent().unwrap().join("project"),
+            path: path.parent().unwrap().join("project"),
+        };
+        let crate::agent_execution::HostedSession::Chat(chat) = session.clone() else {
+            panic!("chat caller")
+        };
+        model
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                closed: vec![],
+                panes: vec![Pane {
+                    id: CardId::from_uuid(parent.agent.id.as_uuid()),
+                    title: "Caller".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.0,
+                    kind: CardKind::Chat(chat),
+                    scope: Some(path.parent().unwrap().join("project")),
+                }],
+            })
+            .unwrap();
+        (
+            model.retained_agent_authority(session.id()).unwrap(),
+            scope,
+            model.model().unwrap().channels.len(),
+        )
+    };
+    let Reply::Directory(directory) =
+        process(&host, authority.clone(), Operation::Directory(Scope::All)).unwrap()
+    else {
+        panic!("directory")
+    };
+    let caller = directory.caller.unwrap();
+    assert!(caller.channel.is_none());
+    assert_eq!(caller.view_scope, Some(scope.clone()));
+    let mut child_request = request;
+    child_request.idempotency_key = "visible-child".into();
+    let Destination::New(spec) = &mut child_request.destination else {
+        unreachable!()
+    };
+    spec.target.placement = caller.view_scope;
+    // Requested path spelling is retained for retry; ownership is checked
+    // after the host resolves it to the registered project key.
+    let alias = path.parent().unwrap().join("project-alias");
+    std::os::unix::fs::symlink(&spec.target.repository, &alias).unwrap();
+    spec.target.repository = alias;
+    let child = submit(&host, &authority, child_request).unwrap();
+    assert_eq!(child.agent.placement, scope);
+    assert!(child.agent.channel().is_none());
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    assert_eq!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .model()
+            .unwrap()
+            .channels
+            .len(),
+        channels
+    );
+}
+
+#[test]
 fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     use crate::agent_execution::directory::{Owner, Relation, Scope};
     if isolated("directory_lists_live_sessions_with_relations_and_without_granting_control")
@@ -1644,7 +1725,7 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     assert_eq!((me.id, me.relation), (child_session, Relation::Myself));
     assert_eq!(me.project.as_deref(), Some(key.as_path()));
     assert_eq!(me.project_name.as_deref(), Some("Service fixture"));
-    assert_eq!(me.channel, Some(child.agent.channel));
+    assert_eq!(me.channel, child.agent.channel());
     assert_eq!(me.channel_repository.as_deref(), Some(key.as_path()));
     let delegation = me.delegation.unwrap();
     assert_eq!(
@@ -1717,28 +1798,28 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
         .lock()
         .unwrap()
         .apply(&ModelEdit::SeedView {
-            scope: child.agent.channel.into(),
+            scope: child.agent.placement.clone(),
             panes: vec![pane(crate::model::CardId::new())],
             closed: vec![],
         })
         .unwrap();
     assert_eq!(
         read(&parent_authority, Scope::All).caller.unwrap().channel,
-        Some(child.agent.channel)
+        child.agent.channel()
     );
     registry(&host)
         .unwrap()
         .lock()
         .unwrap()
         .apply(&ModelEdit::SeedView {
-            scope: parent.agent.channel.into(),
+            scope: parent.agent.placement.clone(),
             panes: vec![pane(crate::model::CardId::new())],
             closed: vec![],
         })
         .unwrap();
     assert_eq!(
         read(&parent_authority, Scope::All).caller.unwrap().channel,
-        Some(child.agent.channel)
+        child.agent.channel()
     );
 
     // Seeing a session confers no control over it.

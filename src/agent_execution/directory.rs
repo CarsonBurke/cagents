@@ -87,6 +87,9 @@ pub struct Entry {
     /// Daemon-owned channel membership, when this session belongs to one.
     #[serde(default)]
     pub channel: Option<crate::model::ChannelId>,
+    /// Exact daemon-owned view, absent when membership is missing or ambiguous.
+    #[serde(default)]
+    pub view_scope: Option<super::Placement>,
     /// The channel's owning repository, independent of this session's cwd.
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
@@ -145,6 +148,9 @@ impl Entry {
         }
         if let Some(title) = self.title.as_deref().filter(|title| !title.is_empty()) {
             line.push_str(&format!("  \"{title}\""));
+        }
+        if let Some(super::Placement::Worktree { path, .. }) = &self.view_scope {
+            line.push_str(&format!(" [worktree view: {}]", path.display()));
         }
         line.push_str(relation);
         if self.lineage.0 != self.id {

@@ -247,7 +247,7 @@ fn process_hosted(
             require_scope(&project)?;
             let (definition, identity) = prepare(host, definition)?;
             require_scope(&definition.agent.target.repository)?;
-            let channel_title = definition.agent.target.channel.map(|channel| {
+            let channel_title = definition.agent.target.channel().map(|channel| {
                 let channel = model.channel(channel).ok_or("The selected channel is unavailable")?;
                 require_scope(&channel.repository)?;
                 Ok::<_, String>(channel.title.clone())

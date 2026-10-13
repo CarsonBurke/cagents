@@ -249,7 +249,7 @@ mod tests {
                 target: Target {
                     repository: repository.clone(),
                     directory: repository,
-                    channel: Some(channel),
+                    placement: Some(crate::agent_execution::Placement::Channel(channel)),
                 },
                 surface: Surface::Chat,
                 model: Some("fixture".into()),
@@ -364,7 +364,7 @@ mod tests {
         assert!(saved.enabled);
         assert_eq!(saved.execution_revision, execution_revision);
         assert_eq!(saved.definition, proposal.definition);
-        assert_eq!(saved.channel, proposal.definition.agent.target.channel);
+        assert_eq!(saved.channel, proposal.definition.agent.target.channel());
         let accepted = registry
             .claim_automation(
                 automation,
@@ -381,11 +381,11 @@ mod tests {
             .accepted
             .unwrap();
         assert_eq!(
-            Some(accepted.agent.channel),
-            proposal.definition.agent.target.channel
+            accepted.agent.channel(),
+            proposal.definition.agent.target.channel()
         );
         let model = registry.model().unwrap();
-        let channel = model.channel(accepted.agent.channel).unwrap();
+        let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
         assert_eq!(channel.title, "User standup channel");
         assert_eq!(
             channel.repository,
@@ -477,7 +477,7 @@ mod tests {
                         .definition
                         .agent
                         .target
-                        .channel
+                        .channel()
                         .unwrap()
                         .to_string(),
                     super::super::repository_key(&other).unwrap()

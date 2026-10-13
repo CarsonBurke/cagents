@@ -2246,7 +2246,7 @@ mod tests {
                     target: Target {
                         repository: "/fixture".into(),
                         directory: "/fixture".into(),
-                        channel: None,
+                        placement: None,
                     },
                     surface: Surface::Chat,
                     model: None,

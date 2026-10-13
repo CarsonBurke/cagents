@@ -37,6 +37,22 @@ pub enum Action {
     },
 }
 
+fn placement_description(proposal: &Proposal) -> String {
+    match &proposal.definition.agent.target.placement {
+        Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
+            format!("Worktree {}", path.display())
+        }
+        Some(crate::agent_execution::Placement::Channel(id)) => format!(
+            "Channel {} ({id})",
+            proposal
+                .channel_title
+                .as_deref()
+                .unwrap_or("Selected channel")
+        ),
+        None => "New channel named after this automation".into(),
+    }
+}
+
 impl Cagents {
     fn approval_repository(&self) -> Option<&Path> {
         match self.active_workspace_destination()? {
@@ -395,7 +411,7 @@ impl Cagents {
             .map(|account| account.label)
             .unwrap_or_else(|| "Saved account unavailable".into());
         let description = format!(
-            "{}\nProvider: {}\nAccount: {} ({})\nProject: {}\nDirectory: {}\nChannel: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSurface: {:?}\nSession: {:?}\nSchedule: {} ({})\nExecution revision: {}",
+            "{}\nProvider: {}\nAccount: {} ({})\nProject: {}\nDirectory: {}\nView: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSurface: {:?}\nSession: {:?}\nSchedule: {} ({})\nExecution revision: {}",
             definition.name,
             definition.agent.provider.label(),
             account,
@@ -407,18 +423,7 @@ impl Cagents {
                 .unwrap_or_default(),
             definition.agent.target.repository.display(),
             definition.agent.target.directory.display(),
-            definition
-                .agent
-                .target
-                .channel
-                .map(|id| format!(
-                    "{} ({id})",
-                    proposal
-                        .channel_title
-                        .as_deref()
-                        .unwrap_or("Selected channel")
-                ))
-                .unwrap_or_else(|| "New channel named after this automation".into()),
+            placement_description(proposal),
             definition
                 .agent
                 .model
@@ -510,7 +515,7 @@ mod tests {
                 target: Target {
                     repository: "/fixture".into(),
                     directory: "/fixture".into(),
-                    channel: None,
+                    placement: None,
                 },
                 surface: Surface::Chat,
                 model: Some("offline".into()),
@@ -541,6 +546,32 @@ mod tests {
             created_ms: 1,
             state: ProposalState::Pending,
         }
+    }
+
+    #[test]
+    fn approval_describes_worktree_existing_channel_and_fresh_channel_destinations() {
+        use crate::agent_execution::Placement;
+        let mut proposal = proposal();
+        assert_eq!(
+            placement_description(&proposal),
+            "New channel named after this automation"
+        );
+        let id = crate::model::ChannelId::new();
+        proposal.definition.agent.target.placement = Some(Placement::Channel(id));
+        proposal.channel_title = Some("Review queue".into());
+        assert_eq!(
+            placement_description(&proposal),
+            format!("Channel Review queue ({id})")
+        );
+        proposal.definition.agent.target.placement = Some(Placement::Worktree {
+            repository: "/fixture".into(),
+            path: "/fixture/feature branch".into(),
+        });
+        // A previously saved channel title cannot relabel a worktree destination.
+        assert_eq!(
+            placement_description(&proposal),
+            "Worktree /fixture/feature branch"
+        );
     }
 
     fn key(named: keyboard::key::Named) -> keyboard::Event {

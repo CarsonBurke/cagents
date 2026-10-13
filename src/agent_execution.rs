@@ -105,13 +105,64 @@ pub enum Surface {
     Terminal,
 }
 
+/// Exact daemon-owned pane placement. A worktree strip is not a channel.
+pub use crate::workspace_model::views::Scope as Placement;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CompatiblePlacement {
+    Scoped(Placement),
+    Channel(ChannelId),
+}
+impl CompatiblePlacement {
+    fn placement(self) -> Placement {
+        match self {
+            Self::Scoped(scope) => scope,
+            Self::Channel(id) => Placement::Channel(id),
+        }
+    }
+}
+fn placement_from_legacy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Placement, D::Error> {
+    if deserializer.is_human_readable() {
+        CompatiblePlacement::deserialize(deserializer).map(CompatiblePlacement::placement)
+    } else {
+        Placement::deserialize(deserializer)
+    }
+}
+fn optional_placement_from_legacy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Placement>, D::Error> {
+    if deserializer.is_human_readable() {
+        Option::<CompatiblePlacement>::deserialize(deserializer)
+            .map(|value| value.map(CompatiblePlacement::placement))
+    } else {
+        Option::<Placement>::deserialize(deserializer)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     pub repository: PathBuf,
     pub directory: PathBuf,
-    /// An existing shared channel, or a fresh channel created atomically with
-    /// acceptance. Neither a window's active channel nor its cwd is implicit.
-    pub channel: Option<ChannelId>,
+    /// An exact shared view, or a fresh channel created atomically with
+    /// acceptance. Neither window focus nor cwd grants pane membership.
+    #[serde(
+        default,
+        alias = "channel",
+        deserialize_with = "optional_placement_from_legacy"
+    )]
+    pub placement: Option<Placement>,
+}
+
+impl Target {
+    pub fn channel(&self) -> Option<ChannelId> {
+        match self.placement.as_ref() {
+            Some(Placement::Channel(id)) => Some(*id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +236,14 @@ impl Submit {
         if let Destination::New(spec) = &self.destination {
             if !spec.target.repository.is_absolute() || !spec.target.directory.is_absolute() {
                 return Err("Agent repository and working directory must be absolute".into());
+            }
+            if let Some(Placement::Worktree { repository, path }) = &spec.target.placement
+                && (!repository.is_absolute() || !path.is_absolute())
+            {
+                return Err(
+                    "Agent worktree placement must name an absolute repository and view path"
+                        .into(),
+                );
             }
             for (name, value) in [
                 ("model", spec.model.as_deref()),
@@ -260,12 +319,22 @@ pub struct Agent {
     pub id: AgentId,
     pub origin: Origin,
     pub spec: Spec,
-    pub channel: ChannelId,
+    #[serde(alias = "channel", deserialize_with = "placement_from_legacy")]
+    pub placement: Placement,
     pub session: Option<HostedSession>,
     #[serde(default)]
     pub console: Option<TerminalSession>,
     pub created_ms: u64,
     pub closed: bool,
+}
+
+impl Agent {
+    pub fn channel(&self) -> Option<ChannelId> {
+        match &self.placement {
+            Placement::Channel(id) => Some(*id),
+            Placement::Worktree { .. } => None,
+        }
+    }
 }
 
 /// Private launch policy stored with the accepted agent, not a path-based
@@ -521,13 +590,60 @@ mod tests {
             target: Target {
                 repository: "/repo".into(),
                 directory: "/repo".into(),
-                channel: None,
+                placement: None,
             },
             surface: Surface::Chat,
             model: Some("gpt-test".into()),
             permission_mode: None,
             reasoning_effort: Some("low".into()),
         }
+    }
+
+    #[test]
+    fn typed_agent_placement_reads_legacy_channels_and_roundtrips_worktree_wire() {
+        let channel = ChannelId::new();
+        let mut spec = spec();
+        spec.target.placement = Some(Placement::Channel(channel));
+        let agent = Agent {
+            name: None,
+            id: AgentId::new(),
+            origin: Origin::User,
+            spec,
+            placement: Placement::Channel(channel),
+            session: None,
+            console: None,
+            created_ms: 0,
+            closed: false,
+        };
+        let mut legacy = serde_json::to_value(&agent).unwrap();
+        legacy.as_object_mut().unwrap().remove("placement");
+        legacy["channel"] = serde_json::to_value(channel).unwrap();
+        legacy["spec"]["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placement");
+        legacy["spec"]["target"]["channel"] = serde_json::to_value(channel).unwrap();
+        assert_eq!(serde_json::from_value::<Agent>(legacy).unwrap(), agent);
+        let mut worktree = agent;
+        worktree.placement = Placement::Worktree {
+            repository: "/repo".into(),
+            path: "/repo/tree".into(),
+        };
+        worktree.spec.target.placement = Some(worktree.placement.clone());
+        assert!(worktree.channel().is_none());
+        assert!(worktree.spec.target.channel().is_none());
+        let bytes = postcard::to_allocvec(&worktree).unwrap();
+        assert_eq!(postcard::from_bytes::<Agent>(&bytes).unwrap(), worktree);
+        assert_eq!(
+            serde_json::from_value::<Agent>(serde_json::to_value(&worktree).unwrap()).unwrap(),
+            worktree
+        );
+        let mut target = worktree.spec.target;
+        target.placement = None;
+        let mut legacy = serde_json::to_value(&target).unwrap();
+        legacy.as_object_mut().unwrap().remove("placement");
+        legacy["channel"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<Target>(legacy).unwrap(), target);
     }
 
     #[test]

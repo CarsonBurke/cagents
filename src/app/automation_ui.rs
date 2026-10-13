@@ -39,7 +39,7 @@ impl Cagents {
                     target: crate::agent_execution::Target {
                         repository: project.repository.clone(),
                         directory: directory.to_path_buf(),
-                        channel: None,
+                        placement: None,
                     },
                     defaults: crate::agent::Provider::ALL
                         .into_iter()
@@ -159,24 +159,39 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let Some(channel) = self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.id == agent.channel)
-                else {
-                    self.status = Some(TransientNotice::error(
-                        "The agent's project and channel are not loaded in this window. Open the project, then try again.",
-                    ));
-                    return Task::none();
+                let selected = match &agent.placement {
+                    crate::agent_execution::Placement::Channel(id) => {
+                        let Some(channel) = self
+                            .durable
+                            .channels
+                            .iter()
+                            .find(|channel| channel.id == *id)
+                        else {
+                            self.status = Some(TransientNotice::error(
+                                "The agent's project and channel are not loaded in this window. Open the project, then try again.",
+                            ));
+                            return Task::none();
+                        };
+                        if self.sidebar_model.project(channel.project_id).is_none() {
+                            return Task::none();
+                        }
+                        self.select_channel(*id)
+                    }
+                    crate::agent_execution::Placement::Worktree { path, .. } => {
+                        if self.project_ui.deleting_directory(path)
+                            || self.worktree_view_scope(path).as_ref() != Some(&agent.placement)
+                        {
+                            self.status = Some(TransientNotice::error(
+                                "The agent's worktree view is not loaded in this window. Open its project, then try again.",
+                            ));
+                            return Task::none();
+                        }
+                        self.select_worktree(path.clone(), false)
+                    }
                 };
-                if self.sidebar_model.project(channel.project_id).is_none() {
-                    return Task::none();
-                }
                 let adopted = self
                     .adopt_execution_agent(&agent)
                     .unwrap_or_else(Task::none);
-                let selected = self.select_channel(agent.channel);
                 Task::batch([
                     adopted,
                     selected,

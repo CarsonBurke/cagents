@@ -35,8 +35,9 @@ pub enum AgentCommand {
         /// given, and otherwise the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
-        /// Defaults to the calling session's channel in the same project;
-        /// otherwise creates a fresh channel.
+        /// Override the calling session's exact shared view with this channel.
+        /// The default reuses its same-project worktree or channel view;
+        /// missing or ambiguous membership creates a fresh channel with a warning.
         #[arg(long)]
         channel: Option<ChannelId>,
         #[arg(long)]
@@ -492,16 +493,55 @@ impl ControlClient {
     }
 }
 
-fn spawn_channel(
+fn spawn_placement(
     explicit: Option<ChannelId>,
     caller: Option<&crate::agent_execution::directory::Entry>,
     repository: &std::path::Path,
-) -> Option<ChannelId> {
-    explicit.or_else(|| {
-        caller
-            .filter(|caller| caller.channel_repository.as_deref() == Some(repository))
-            .and_then(|caller| caller.channel)
-    })
+) -> (
+    Option<crate::agent_execution::Placement>,
+    Option<&'static str>,
+) {
+    use crate::agent_execution::Placement;
+    if let Some(channel) = explicit {
+        return (Some(Placement::Channel(channel)), None);
+    }
+    let Some(caller) = caller else {
+        return (None, None);
+    };
+    let Some(scope) = &caller.view_scope else {
+        return (
+            None,
+            Some(
+                "The caller has no unambiguous shared view; the agent was placed in a new channel.",
+            ),
+        );
+    };
+    let owner = match scope {
+        Placement::Channel(_) => caller.channel_repository.as_deref(),
+        Placement::Worktree { repository, .. } => Some(repository.as_path()),
+    };
+    if owner == Some(repository) {
+        (Some(scope.clone()), None)
+    } else {
+        (
+            None,
+            Some(
+                "The caller's shared view belongs to another project; the agent was placed in a new channel for the target project.",
+            ),
+        )
+    }
+}
+
+fn with_placement_warning(mut output: CommandOutput, warning: Option<&str>) -> CommandOutput {
+    if let Some(warning) = warning {
+        // Keep the receipt first and the warning outside the agent's result.
+        output.human = match output.human.split_once('\n') {
+            Some((head, tail)) => format!("{head}\nWarning: {warning}\n{tail}"),
+            None => format!("{}\nWarning: {warning}", output.human),
+        };
+        output.data["warnings"] = json!([warning]);
+    }
+    output
 }
 
 /// What a handle names among the caller's agents.
@@ -844,11 +884,11 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                     }
                 }
             };
-            let channel = channel.or_else(|| {
-                channel_repository
-                    .as_deref()
-                    .and_then(|repository| spawn_channel(None, caller.as_ref(), repository))
-            });
+            let (placement, placement_warning) = spawn_placement(
+                channel,
+                caller.as_ref(),
+                channel_repository.as_deref().unwrap_or(&repository),
+            );
             let provider = provider
                 .or(caller.and_then(|caller| caller.provider))
                 .ok_or_else(|| {
@@ -862,7 +902,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                     target: Target {
                         repository,
                         directory,
-                        channel,
+                        placement,
                     },
                     surface: if surface == "terminal" {
                         Surface::Terminal
@@ -876,7 +916,8 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 prompt,
                 idempotency_key: retry.key(),
             };
-            submitted(&mut session, "agent.spawn", request, wait, show)
+            let output = submitted(&mut session, "agent.spawn", request, wait, show)?;
+            Ok(with_placement_warning(output, placement_warning))
         }
         AgentCommand::Send {
             agent,
@@ -1321,14 +1362,14 @@ mod tests {
             name: None,
             id: AgentId::new(),
             origin: Origin::User,
-            channel: crate::model::ChannelId::new(),
+            placement: crate::agent_execution::Placement::Channel(crate::model::ChannelId::new()),
             spec: Spec {
                 provider: Provider::Claude,
                 account: None,
                 target: Target {
                     repository: "/repo".into(),
                     directory: "/repo".into(),
-                    channel: None,
+                    placement: None,
                 },
                 surface: Surface::Chat,
                 model: None,
@@ -1960,14 +2001,14 @@ mod tests {
                 name: None,
                 id: agent.parse().unwrap(),
                 origin: crate::agent_execution::Origin::User,
-                channel: ChannelId::new(),
+                placement: crate::agent_execution::Placement::Channel(ChannelId::new()),
                 spec: Spec {
                     provider: Provider::Claude,
                     account: None,
                     target: Target {
                         repository: "/repo".into(),
                         directory: "/repo".into(),
-                        channel: None,
+                        placement: None,
                     },
                     surface: Surface::Chat,
                     model: None,
@@ -2015,8 +2056,35 @@ mod tests {
     }
 
     #[test]
-    fn spawn_channel_uses_only_same_project_membership_and_explicit_choice_wins() {
-        use crate::agent_execution::directory::{Entry, Relation, Surface};
+    fn unknown_placement_is_visible_in_human_and_json_without_polluting_run_output() {
+        let output = with_placement_warning(
+            CommandOutput {
+                command: "agent.spawn",
+                data: json!({}),
+                human: "agent 1234 (claude) run 5678 Succeeded\n\nActual result".into(),
+            },
+            Some("No unambiguous shared view"),
+        );
+        assert_eq!(
+            output.data["warnings"],
+            json!(["No unambiguous shared view"])
+        );
+        assert!(
+            output
+                .human
+                .contains("\nWarning: No unambiguous shared view\n")
+        );
+        assert_eq!(output.human.split_once("\n\n").unwrap().1, "Actual result");
+        #[cfg(feature = "ui")]
+        assert_eq!(read_run(&output.human).unwrap().result, "Actual result");
+    }
+
+    #[test]
+    fn spawn_placement_uses_exact_caller_view_and_explicit_channel_overrides() {
+        use crate::agent_execution::{
+            Placement,
+            directory::{Entry, Relation, Surface},
+        };
         let channel = ChannelId::new();
         let explicit = ChannelId::new();
         let mut caller = Entry {
@@ -2025,6 +2093,7 @@ mod tests {
             provider: Some(Provider::Claude),
             title: None,
             channel: Some(channel),
+            view_scope: Some(Placement::Channel(channel)),
             channel_repository: Some("/repo".into()),
             state: crate::agent::ActivityState::Idle,
             directory: Some("/repo".into()),
@@ -2035,40 +2104,56 @@ mod tests {
             relation: Relation::Myself,
             lineage: crate::agent_execution::Lineage(crate::model::TerminalId::new()),
         };
+        let repository = std::path::Path::new("/repo");
         assert_eq!(
-            spawn_channel(None, Some(&caller), std::path::Path::new("/repo")),
-            Some(channel)
+            spawn_placement(None, Some(&caller), repository),
+            (Some(Placement::Channel(channel)), None)
         );
         assert_eq!(
-            spawn_channel(Some(explicit), Some(&caller), std::path::Path::new("/repo")),
-            Some(explicit)
-        );
-        assert_eq!(
-            spawn_channel(None, Some(&caller), std::path::Path::new("/other")),
-            None
-        );
-        assert_eq!(
-            spawn_channel(None, None, std::path::Path::new("/repo")),
-            None
+            spawn_placement(Some(explicit), Some(&caller), repository),
+            (Some(Placement::Channel(explicit)), None)
         );
         caller.project = Some("/other-cwd-project".into());
         assert_eq!(
-            spawn_channel(None, Some(&caller), std::path::Path::new("/repo")),
-            Some(channel),
-            "channel ownership is independent of cwd placement"
+            spawn_placement(None, Some(&caller), repository).0,
+            Some(Placement::Channel(channel)),
+            "view ownership is independent of cwd"
         );
+        let strip = Placement::Worktree {
+            repository: repository.into(),
+            path: "/repo/linked-view".into(),
+        };
         caller.channel = None;
+        caller.channel_repository = None;
+        caller.view_scope = Some(strip.clone());
         assert_eq!(
-            spawn_channel(None, Some(&caller), std::path::Path::new("/repo")),
-            None
+            spawn_placement(None, Some(&caller), repository),
+            (Some(strip), None)
+        );
+        assert_eq!(
+            spawn_placement(Some(explicit), Some(&caller), repository).0,
+            Some(Placement::Channel(explicit))
+        );
+        let (scope, warning) = spawn_placement(None, Some(&caller), std::path::Path::new("/other"));
+        assert!(scope.is_none());
+        assert!(warning.unwrap().contains("another project"));
+        caller.view_scope = None;
+        let (scope, warning) = spawn_placement(None, Some(&caller), repository);
+        assert!(scope.is_none());
+        assert!(warning.unwrap().contains("no unambiguous shared view"));
+        assert_eq!(
+            spawn_placement(None, None, repository),
+            (None, None),
+            "external callers retain fresh-channel behavior"
         );
         let mut legacy = serde_json::to_value(&caller).unwrap();
+        legacy.as_object_mut().unwrap().remove("view_scope");
         legacy.as_object_mut().unwrap().remove("channel");
         legacy.as_object_mut().unwrap().remove("channel_repository");
-        assert_eq!(
-            serde_json::from_value::<Entry>(legacy).unwrap().channel,
-            None
-        );
+        let legacy: Entry = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.view_scope.is_none());
+        assert!(legacy.channel.is_none());
+        assert!(legacy.channel_repository.is_none());
     }
 
     #[test]
