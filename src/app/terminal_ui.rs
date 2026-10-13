@@ -180,6 +180,17 @@ mod tests {
     }
 
     #[test]
+    fn live_find_refresh_is_a_completion_during_modals_and_update_preparation() {
+        let card = CardId::new();
+        let refresh = Message::TerminalFind(Action::Refresh(card, 7));
+        assert!(!user_workspace_message_blocked_while_modal(&refresh));
+        assert!(!user_message_blocked_during_update(&refresh));
+        let query = Message::TerminalFind(Action::Query(card, "needle".into()));
+        assert!(user_workspace_message_blocked_while_modal(&query));
+        assert!(user_message_blocked_during_update(&query));
+    }
+
+    #[test]
     fn paste_confirmation_dismisses_after_its_runtime_has_retired() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
