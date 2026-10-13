@@ -1392,6 +1392,11 @@ impl Codex {
             })
             .collect();
         step.events.push(Event::Request(Request {
+            kind: match &kind {
+                RequestKind::Decision | RequestKind::Permissions => chat::RequestKind::Approval,
+                RequestKind::Questions => chat::RequestKind::Question,
+                RequestKind::Elicitation => chat::RequestKind::Consent,
+            },
             id: id.clone(),
             title: title.into(),
             description,
@@ -6204,6 +6209,41 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn question_and_elicitation_kinds_preserve_their_exact_reply_contracts() {
+        let mut adapter = adapter();
+        let questions = adapter.receive(json!({"id":"question-kind","method":"item/tool/requestUserInput","params":{"threadId":"thread-exact","turnId":"turn","itemId":"question","questions":[{"id":"scope","header":"Scope","question":"Which?","isOther":false,"options":[{"label":"One"}]}]}})).unwrap();
+        assert!(
+            matches!(&questions.events[0], Event::Request(request) if request.kind == chat::RequestKind::Question && request.actions[0].id == "submit")
+        );
+        let submitted = adapter
+            .command(Command::Answer {
+                request_id: rpc_id(&json!("question-kind")).unwrap(),
+                action: "submit".into(),
+                answers: vec![Answer {
+                    field: "scope".into(),
+                    values: vec!["One".into()],
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            submitted.writes[0]["result"],
+            json!({"answers":{"scope":{"answers":["One"]}}})
+        );
+        for (id, action) in [("consent-decline", "decline"), ("consent-cancel", "cancel")] {
+            let consent = adapter.receive(json!({"id":id,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-exact","turnId":"turn","mode":"form","message":"Supply input","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}})).unwrap();
+            assert!(consent.events.iter().any(|event| matches!(event, Event::Request(request) if request.kind == chat::RequestKind::Consent && !request.fields.is_empty())));
+            let response = adapter
+                .command(Command::Answer {
+                    request_id: rpc_id(&json!(id)).unwrap(),
+                    action: action.into(),
+                    answers: vec![],
+                })
+                .unwrap();
+            assert_eq!(response.writes[0]["result"], json!({"action":action}));
+        }
     }
 
     #[test]

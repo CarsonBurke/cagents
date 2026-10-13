@@ -65,7 +65,7 @@ pub(super) fn notice(snapshot: &Snapshot) -> Option<String> {
     let approvals = snapshot
         .requests
         .iter()
-        .filter(|request| request.fields.is_empty())
+        .filter(|request| request.kind == chat::RequestKind::Approval)
         .count();
     if approvals > 0 {
         return Some(if approvals == 1 {
@@ -115,7 +115,7 @@ impl Runtime {
                 .snapshot
                 .requests
                 .iter()
-                .filter(|request| request.fields.is_empty())
+                .filter(|request| request.kind == chat::RequestKind::Approval)
             {
                 controls.extend(
                     view::ordered_answers(request)
@@ -200,7 +200,7 @@ impl Runtime {
         let approvals: Vec<_> = snapshot
             .requests
             .iter()
-            .filter(|request| request.fields.is_empty())
+            .filter(|request| request.kind == chat::RequestKind::Approval)
             .collect();
         for request in approvals {
             content.push(view::request_view(
@@ -518,6 +518,7 @@ mod tests {
         snapshot.busy = true;
         assert_eq!(notice(&snapshot).as_deref(), Some("Bash blocked"));
         snapshot.requests.push(chat::Request {
+            kind: crate::chat::RequestKind::Approval,
             id: "approval".into(),
             title: "Allow Bash?".into(),
             description: String::new(),
@@ -526,5 +527,27 @@ mod tests {
         });
         assert_eq!(notice(&snapshot).as_deref(), Some("Approval needed"));
         assert_eq!(notice(&Snapshot::default()), None);
+        snapshot.permission_denials.clear();
+        for kind in [chat::RequestKind::Question, chat::RequestKind::Consent] {
+            snapshot.requests[0].kind = kind;
+            assert_eq!(
+                notice(&snapshot),
+                None,
+                "fieldless human prompts are not tool approvals"
+            );
+            assert!(!super::super::permissions_available(&snapshot));
+        }
+        snapshot.requests[0].kind = chat::RequestKind::Approval;
+        snapshot.requests[0].fields.push(chat::Field {
+            id: "scope".into(),
+            label: "Scope".into(),
+            description: String::new(),
+            choices: vec![],
+            multiple: false,
+            secret: false,
+            initial: String::new(),
+        });
+        assert_eq!(notice(&snapshot).as_deref(), Some("Approval needed"));
+        assert!(super::super::permissions_available(&snapshot));
     }
 }

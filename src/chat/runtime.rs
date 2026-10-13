@@ -4010,6 +4010,7 @@ mod tests {
             &mut state,
             &mut indices,
             Event::Request(super::super::Request {
+                kind: crate::chat::RequestKind::Approval,
                 id: "approval".into(),
                 title: String::new(),
                 description: String::new(),

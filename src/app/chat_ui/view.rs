@@ -790,27 +790,26 @@ fn stake(choice: &chat::Choice) -> Stake {
     }
 }
 
-/// The answer a bare Enter sends, where the question has one that cannot
-/// grant anything.
-///
-/// A question with something to refuse gets no keyboard shortcut at all: the
-/// keystroke that submits a form must never be the keystroke that approves a
-/// command, and a reader typing an answer into a field should not be one
-/// stray Return away from granting a permission. What is left is the
-/// provider's own affirmative on a question that only asks - a form to
-/// submit, an answer to send - which is exactly where Enter belongs.
+/// An affirmative question control is visually primary even when skipping is
+/// available. Approval and consent decisions remain explicit secondary controls.
+fn primary_answer(request: &chat::Request) -> Option<&chat::Choice> {
+    (request.kind == chat::RequestKind::Question)
+        .then(|| {
+            request
+                .actions
+                .iter()
+                .find(|choice| stake(choice) == Stake::Once)
+        })
+        .flatten()
+}
+
+/// Enter submits a question form, never a permission, consent, or fieldless
+/// yes/no confirmation. The latter has no edited answer to submit deliberately.
 fn submit_answer(request: &chat::Request) -> Option<&chat::Choice> {
-    if request
-        .actions
-        .iter()
-        .any(|choice| stake(choice) == Stake::Refuse)
-    {
+    if request.fields.is_empty() {
         return None;
     }
-    request
-        .actions
-        .iter()
-        .find(|choice| stake(choice) == Stake::Once)
+    primary_answer(request)
 }
 
 /// The models `query` names, in the order the provider offered them.
@@ -4211,8 +4210,8 @@ fn field_view<'a>(
                 value,
             ))
         }))
-        // Enter sends the answer only where the provider offered nothing
-        // to refuse: a key press must never be what grants a permission.
+        // Enter submits an available question form; permissions and consent
+        // require an explicit choice.
         .on_submit_maybe(submit_answer(request).filter(|_| available).map(|choice| {
             let answer = action(Action::Answer(
                 target,
@@ -4262,12 +4261,9 @@ fn cost_estimate_label(estimate: crate::chat::pricing::CostEstimate) -> (String,
 /// The decisions the provider offered, in the order a reader should meet
 /// them.
 ///
-/// Refusing comes first, because it is the answer that cannot cost
-/// anything and so the one the keyboard should reach first. Agreeing to
-/// the one thing comes next. Agreeing for the rest of the session comes
-/// last, because it is the widest thing that can be said here. Only a
-/// question with nothing to refuse draws its affirmative as the primary
-/// control: a consent dialog must not make granting the obvious default.
+/// Questions put submitting answers first, even when skipping is offered.
+/// Approval and consent requests put refusal first and require an explicit
+/// choice; a broader session approval follows the one-time approval.
 fn answers_view<'a>(
     target: Target,
     request: &'a chat::Request,
@@ -4286,7 +4282,7 @@ fn answers_view<'a>(
         .into();
     }
     let answers = ordered_answers(request);
-    let primary = submit_answer(request).map(|choice| &choice.id);
+    let primary = primary_answer(request).map(|choice| &choice.id);
     widget::row::with_children(
         answers
             .into_iter()
@@ -4335,7 +4331,9 @@ fn answers_view<'a>(
 pub(super) fn ordered_answers(request: &chat::Request) -> Vec<&chat::Choice> {
     let mut answers: Vec<_> = request.actions.iter().collect();
     // A stable sort keeps equal-stake answers in the provider's order.
-    answers.sort_by_key(|choice| stake(choice));
+    if request.kind != chat::RequestKind::Question {
+        answers.sort_by_key(|choice| stake(choice));
+    }
     answers
 }
 
@@ -5006,6 +5004,7 @@ mod tests {
         snapshot.busy = true;
         snapshot.subagents.push(child);
         snapshot.requests.push(chat::Request {
+            kind: crate::chat::RequestKind::Approval,
             id: "child-approval".into(),
             title: "Child agent · Command approval".into(),
             description: "printf native-fixture".into(),
@@ -6880,6 +6879,7 @@ mod tests {
     #[test]
     fn the_safe_answer_comes_first_and_enter_never_grants() {
         let permission = chat::Request {
+            kind: crate::chat::RequestKind::Approval,
             id: "r1".into(),
             title: "Command approval".into(),
             description: String::new(),
@@ -6905,16 +6905,72 @@ mod tests {
             "a question with something to refuse must not answer to Enter"
         );
 
-        // A question that only asks has an affirmative and nothing to refuse,
-        // which is exactly where a keyboard answer belongs.
+        // Ordinary question forms can submit on Enter even when cancellation
+        // is available. Their explicit semantic kind prevents granting permission.
         let questions = chat::Request {
-            actions: vec![choice("submit")],
+            kind: chat::RequestKind::Question,
+            fields: vec![chat::Field {
+                id: "answer".into(),
+                label: "Question".into(),
+                description: String::new(),
+                choices: vec![],
+                multiple: false,
+                secret: false,
+                initial: String::new(),
+            }],
+            actions: vec![choice("submit"), choice("cancel")],
             ..permission
         };
         assert_eq!(
             submit_answer(&questions).map(|choice| choice.id.as_str()),
             Some("submit")
         );
+        assert_eq!(
+            primary_answer(&questions).map(|choice| choice.id.as_str()),
+            Some("submit")
+        );
+        assert_eq!(
+            ordered_answers(&questions)
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["submit", "cancel"]
+        );
+        let yes_no = chat::Request {
+            fields: vec![],
+            ..questions.clone()
+        };
+        assert!(
+            submit_answer(&yes_no).is_none(),
+            "fieldless confirmation requires an explicit click"
+        );
+        assert_eq!(
+            primary_answer(&yes_no).map(|choice| choice.id.as_str()),
+            Some("submit")
+        );
+        for kind in [chat::RequestKind::Approval, chat::RequestKind::Consent] {
+            let explicit = chat::Request {
+                kind,
+                ..questions.clone()
+            };
+            assert!(submit_answer(&explicit).is_none());
+            assert!(primary_answer(&explicit).is_none());
+            assert_eq!(ordered_answers(&explicit)[0].id, "cancel");
+        }
+        // Claude's transport retains allow/deny while the product is a question.
+        let claude = chat::Request {
+            actions: vec![choice("allow"), choice("deny")],
+            ..questions
+        };
+        assert_eq!(
+            primary_answer(&claude).map(|choice| choice.id.as_str()),
+            Some("allow")
+        );
+        assert_eq!(
+            submit_answer(&claude).map(|choice| choice.id.as_str()),
+            Some("allow")
+        );
+        assert_eq!(ordered_answers(&claude)[0].id, "allow");
     }
 
     fn model(id: &str, label: &str) -> chat::Model {

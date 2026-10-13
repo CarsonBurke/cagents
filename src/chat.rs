@@ -1674,8 +1674,23 @@ pub struct Field {
     pub secret: bool,
     pub initial: String,
 }
+/// What the provider is asking the reader to do, independent of its RPC envelope.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestKind {
+    /// Authorize a tool action or additional permissions. Never submit on Enter.
+    #[default]
+    Approval,
+    /// Answer an ordinary question, including a yes/no confirmation.
+    Question,
+    /// Provider-managed elicitation or consent. Explicit decisions remain required.
+    Consent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
+    /// Old JSON snapshots remain conservative; postcard peers use a matched version.
+    #[serde(default)]
+    pub kind: RequestKind,
     pub id: String,
     pub title: String,
     pub description: String,
@@ -2041,6 +2056,30 @@ pub enum Event {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
+        let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});
+        let mut request: super::Request = serde_json::from_value(legacy).unwrap();
+        assert_eq!(request.kind, super::RequestKind::Approval);
+        for kind in [
+            super::RequestKind::Approval,
+            super::RequestKind::Question,
+            super::RequestKind::Consent,
+        ] {
+            request.kind = kind;
+            let bytes = postcard::to_stdvec(&request).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<super::Request>(&bytes).unwrap(),
+                request
+            );
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                serde_json::from_value::<super::Request>(json).unwrap(),
+                request
+            );
+        }
+    }
+
     #[test]
     fn older_subagent_snapshots_default_to_unknown_model_and_child_waiting_is_visible() {
         let mut agent: super::Subagent = serde_json::from_value(serde_json::json!({

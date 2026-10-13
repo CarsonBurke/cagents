@@ -685,7 +685,13 @@ impl Claude {
             return Err("This Claude request requires an unsupported local consent dialog; it cannot be generically approved or denied".into());
         }
         let response = match action.as_str() {
-            "deny" => json!({"behavior":"deny", "message":"The user denied this request"}),
+            "deny" => {
+                json!({"behavior":"deny", "message": if string(request, "tool_name") == "AskUserQuestion" {
+                    "The user skipped these questions"
+                } else {
+                    "The user denied this request"
+                }})
+            }
             "allow" | "allow_session" => {
                 let mut input = request["input"].clone();
                 if string(request, "tool_name") == "AskUserQuestion" {
@@ -771,6 +777,7 @@ impl Claude {
         {
             let message = "Claude requested a local-only or unsupported consent dialog. It remains pending; interrupt to cancel this turn.";
             let prompt = Request {
+                kind: chat::RequestKind::Consent,
                 id: id.clone(),
                 title: "Unsupported Claude consent dialog".into(),
                 description: format!("{message}\n{request}"),
@@ -808,31 +815,55 @@ impl Claude {
         if !request["input"].is_object() {
             return Err("Claude permission request has malformed input".into());
         }
-        let fields = if name == "AskUserQuestion" {
+        let question = name == "AskUserQuestion";
+        let fields = if question {
             question_fields(&request["input"])?
         } else {
             vec![]
         };
-        let description = permission_description(
-            name,
-            &request["input"],
-            &[
-                string(request, "description"),
-                &clean_permission_text(string(request, "decision_reason")),
-            ],
-        );
-        let mut actions = vec![choice("allow", "Allow once")];
-        if name != "AskUserQuestion"
-            && let Some(suggestions) = session_permission_suggestions(request)
-        {
+        let description = if question {
+            "Claude is waiting for your answers.".to_owned()
+        } else {
+            permission_description(
+                name,
+                &request["input"],
+                &[
+                    string(request, "description"),
+                    &clean_permission_text(string(request, "decision_reason")),
+                ],
+            )
+        };
+        // Claude answers questions through can_use_tool too, but the reader
+        // is submitting answers, not granting permission to run a tool.
+        let mut actions = vec![choice(
+            "allow",
+            if question {
+                "Submit answers"
+            } else {
+                "Allow once"
+            },
+        )];
+        if !question && let Some(suggestions) = session_permission_suggestions(request) {
             let mut session = choice("allow_session", "Allow for session");
             session.description = format!("Session only: {suggestions}");
             actions.push(session);
         }
-        actions.push(choice("deny", "Deny"));
+        actions.push(choice(
+            "deny",
+            if question { "Skip question" } else { "Deny" },
+        ));
         let event = Request {
+            kind: if question {
+                chat::RequestKind::Question
+            } else {
+                chat::RequestKind::Approval
+            },
             id: id.clone(),
-            title: format!("Claude: {name}"),
+            title: if question {
+                "Claude questions".to_owned()
+            } else {
+                format!("Claude: {name}")
+            },
             description,
             fields,
             actions,
@@ -4759,6 +4790,7 @@ impl Claude {
             }
         };
         step.events.push(Event::Request(Request {
+            kind: chat::RequestKind::Consent,
             id: id.clone(),
             title: format!("Claude MCP: {}", string(request, "mcp_server_name")),
             description: string(request, "message").into(),
@@ -6131,9 +6163,24 @@ mod tests {
     fn questions_use_exact_question_keys_and_string_multiselect() {
         let mut adapter = Claude::default();
         let input = json!({"unknown":"preserved","questions":[{"question":"Which sections?","header":"Sections","multiSelect":true,"options":[{"label":"Introduction","description":"Intro"},{"label":"Conclusion","description":"End"}]}]});
-        adapter
+        let requested = adapter
             .receive(approval("q1", "AskUserQuestion", input.clone()))
             .unwrap();
+        let Event::Request(request) = &requested.events[0] else {
+            panic!("question request");
+        };
+        assert_eq!(request.kind, chat::RequestKind::Question);
+        assert_eq!(request.title, "Claude questions");
+        assert!(!request.description.contains("```"));
+        assert_eq!(request.fields[0].label, "Which sections?");
+        assert_eq!(
+            request
+                .actions
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Submit answers", "Skip question"]
+        );
         assert!(
             adapter
                 .answer(
@@ -6164,6 +6211,42 @@ mod tests {
                 "q1",
                 json!({"behavior":"allow","updatedInput":expected})
             )]
+        );
+    }
+
+    #[test]
+    fn skipping_questions_is_not_a_tool_permission_denial() {
+        let mut adapter = Claude::default();
+        let input = json!({"questions":[{"question":"Which file?","options":[{"label":"First"},{"label":"Second"}]}]});
+        adapter
+            .receive(approval("skip", "AskUserQuestion", input))
+            .unwrap();
+        let skipped = adapter
+            .answer("skip".into(), "deny".into(), vec![])
+            .unwrap();
+        assert_eq!(
+            skipped.writes,
+            vec![reply(
+                "skip",
+                json!({"behavior":"deny","message":"The user skipped these questions"})
+            )]
+        );
+        assert!(
+            skipped
+                .events
+                .iter()
+                .all(|event| !matches!(event, Event::PermissionDenied(_)))
+        );
+        assert!(
+            skipped
+                .events
+                .contains(&Event::RequestResolved { id: "skip".into() })
+        );
+        let approval = adapter
+            .receive(approval("tool", "Bash", json!({"command":"echo tested"})))
+            .unwrap();
+        assert!(
+            matches!(&approval.events[0], Event::Request(request) if request.kind == chat::RequestKind::Approval && request.actions[0].label == "Allow once")
         );
     }
 

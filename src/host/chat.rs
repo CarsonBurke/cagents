@@ -4692,6 +4692,7 @@ done
                 title: None,
             });
             initial.events.push(Event::Request(chat::Request {
+                kind: crate::chat::RequestKind::Approval,
                 id: "pending-approval".into(),
                 title: "Edit".into(),
                 description: "Waiting for approval".into(),
