@@ -169,14 +169,17 @@ impl Turn {
             // A group that did no work draws no strip, so it needs no line.
             [] => return,
             [only] => match items.get(only.index).map(Borrow::borrow) {
-                Some(item) if let Some(coordinated) = coordinated(item) => coordinated.summary(),
                 Some(item) => {
-                    let verb = step_verb(&item.content);
-                    let label = step_label(&item.content);
-                    if verb.is_empty() {
-                        label.to_owned()
+                    if let Some(coordinated) = coordinated(item) {
+                        coordinated.summary()
                     } else {
-                        format!("{verb} {label}")
+                        let verb = step_verb(&item.content);
+                        let label = step_label(&item.content);
+                        if verb.is_empty() {
+                            label.to_owned()
+                        } else {
+                            format!("{verb} {label}")
+                        }
                     }
                 }
                 None => "1 step".to_owned(),
