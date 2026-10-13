@@ -829,11 +829,6 @@ impl EditorDocument {
         disk_hash: blake3::Hash,
         markdown: bool,
     ) -> Self {
-        let markdown_items = if markdown {
-            markdown::parse(&text).collect()
-        } else {
-            Vec::new()
-        };
         Self {
             path,
             source,
@@ -841,7 +836,9 @@ impl EditorDocument {
             saved_text: text,
             disk_hash,
             markdown,
-            markdown_items,
+            // Source editing does not consume the preview AST. Parse only
+            // when preview is first mounted, alongside its text snapshot.
+            markdown_items: Vec::new(),
             markdown_stale: true,
             preview_text: String::new(),
             diagrams: HashMap::new(),
@@ -12485,17 +12482,26 @@ mod tests {
             blake3::hash(b"# Title\n"),
             true,
         );
-        let original_items = document.markdown_items.len();
+        assert!(document.markdown_items.is_empty());
+        assert!(document.preview_text.is_empty());
+        assert!(document.markdown_stale);
         document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
             std::sync::Arc::new("More".into()),
         )));
         assert!(document.dirty);
+        assert!(document.markdown_items.is_empty());
+        document.sync_markdown();
         assert!(!document.markdown_items.is_empty());
-        assert!(document.markdown_items.len() >= original_items);
+        assert_eq!(document.preview_text, document.content.text());
+        assert!(!document.markdown_stale);
         document.discard_edits();
         assert!(!document.dirty);
         assert!(document.active_save.is_none());
         assert_eq!(document.content.text(), "# Title\n");
+        assert!(document.markdown_stale);
+        document.sync_markdown();
+        assert_eq!(document.preview_text, "# Title\n");
+        assert_eq!(document.markdown_items.len(), 1);
     }
 
     #[test]

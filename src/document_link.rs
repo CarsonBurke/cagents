@@ -90,6 +90,30 @@ mod tests {
         }
     }
     #[test]
+    fn heading_fragments_preserve_duplicate_and_explicit_suffix_collisions() {
+        let items: Vec<_> = markdown::parse(
+            "# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n",
+        )
+        .collect();
+        for (fragment, index) in [
+            ("repeated", 0),
+            ("repeated-1", 1),
+            ("repeated-2", 2),
+            ("repeated-1-1", 3),
+            ("repeated-3", 4),
+        ] {
+            assert_eq!(heading_index(&items, fragment), Some(index));
+        }
+        assert_eq!(heading_index(&items, "missing"), None);
+    }
+
+    #[test]
+    fn heading_fragments_reach_late_duplicates_in_generated_documents() {
+        let items: Vec<_> = markdown::parse(&"# Result\n".repeat(4096)).collect();
+        assert_eq!(heading_index(&items, "result-4095"), Some(4095));
+    }
+
+    #[test]
     fn local_links_use_the_document_directory_and_decode_url_paths() {
         let source = Path::new("/repo/docs/top_runs.md");
         for (link, expected, fragment) in [
@@ -132,6 +156,9 @@ use cosmic::widget::markdown;
 
 pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
     let mut used = std::collections::HashSet::new();
+    // Each base slug resumes after its last suffix, instead of retrying every
+    // preceding duplicate when a generated document repeats a heading.
+    let mut suffixes = std::collections::HashMap::<String, usize>::new();
     let style =
         crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_BODY).style;
     for (index, item) in items.iter().enumerate() {
@@ -155,10 +182,15 @@ pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<
                 })
                 .collect();
             let mut unique = slug.clone();
-            let mut suffix = 0;
-            while !used.insert(unique.clone()) {
-                suffix += 1;
-                unique = format!("{slug}-{suffix}");
+            if !used.insert(unique.clone()) {
+                let suffix = suffixes.entry(slug.clone()).or_default();
+                loop {
+                    *suffix += 1;
+                    unique = format!("{slug}-{suffix}");
+                    if used.insert(unique.clone()) {
+                        break;
+                    }
+                }
             }
             if unique == fragment {
                 return Some(index);
