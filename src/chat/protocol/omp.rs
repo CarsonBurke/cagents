@@ -587,6 +587,7 @@ impl Omp {
                     }]
                 };
                 step.events.push(Event::Request(Request {
+                    kind: crate::chat::RequestKind::Question,
                     id,
                     title: text(frame, "title").into(),
                     description: text(frame, "message").into(),
@@ -2540,6 +2541,36 @@ mod tests {
         let request = adapter.request("get_state");
         assert!(adapter.receive(json!({"type":"response","id":request["id"],"command":"get_state","success":true,"data":{"sessionId":"other"}})).is_err());
         assert!(!adapter.ready);
+    }
+
+    #[test]
+    fn extension_questions_include_fieldless_confirmation_without_tool_approval() {
+        let mut adapter = Omp {
+            ready: true,
+            ..Default::default()
+        };
+        for method in ["select", "input", "editor", "confirm"] {
+            let requested = adapter.receive(json!({"type":"extension_ui_request","id":method,"method":method,"title":"Question","message":"Continue?","options":["One","Two"]})).unwrap();
+            assert!(
+                matches!(&requested.events[0], Event::Request(request) if request.kind == crate::chat::RequestKind::Question && request.fields.is_empty() == (method == "confirm"))
+            );
+            let response = adapter
+                .command(Command::Answer {
+                    request_id: method.into(),
+                    action: "submit".into(),
+                    answers: vec![Answer {
+                        field: "value".into(),
+                        values: vec!["One".into()],
+                    }],
+                })
+                .unwrap();
+            let expected = if method == "confirm" {
+                json!({"type":"extension_ui_response","id":method,"confirmed":true})
+            } else {
+                json!({"type":"extension_ui_response","id":method,"value":"One"})
+            };
+            assert_eq!(response.writes, vec![expected]);
+        }
     }
 
     #[test]

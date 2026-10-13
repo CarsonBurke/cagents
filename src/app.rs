@@ -21735,6 +21735,7 @@ mod tests {
                 .into(),
             ],
             requests: vec![Request {
+                kind: crate::chat::RequestKind::Approval,
                 id: "request-1".into(),
                 title: "Allow this command?".into(),
                 description: "ls".into(),

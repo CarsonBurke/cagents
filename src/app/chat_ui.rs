@@ -1598,7 +1598,7 @@ fn permissions_available(snapshot: &Snapshot) -> bool {
         || snapshot
             .requests
             .iter()
-            .any(|request| request.fields.is_empty())
+            .any(|request| request.kind == chat::RequestKind::Approval)
 }
 
 /// The name the composer answers itself, by opening the conversation picker,
@@ -11356,6 +11356,7 @@ mod tests {
         };
         runtime.session.launch.provider = Provider::Claude;
         Arc::make_mut(&mut runtime.snapshot).requests = vec![chat::Request {
+            kind: crate::chat::RequestKind::Approval,
             id: "approval".into(),
             title: "Allow Bash?".into(),
             description: String::new(),
@@ -11424,6 +11425,7 @@ mod tests {
         snapshot.permission_mode = Some("default".into());
         snapshot.capabilities.permission_modes = vec!["default".into(), "plan".into()];
         snapshot.requests = vec![chat::Request {
+            kind: crate::chat::RequestKind::Approval,
             id: "approval".into(),
             title: "Allow Bash?".into(),
             description: String::new(),
