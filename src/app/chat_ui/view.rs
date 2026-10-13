@@ -1,5 +1,5 @@
-use super::*;
 use super::coordination::Coordinated;
+use super::*;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -2886,12 +2886,13 @@ impl Runtime {
             let Some((item, cached)) = placed(prose.index) else {
                 continue;
             };
+            if let Some(coordinated) = cached.coordination.as_deref()
+                && prose.slot == turn::Slot::Card
+            {
+                rows.push(card(item, cached, coordinated));
+                continue;
+            }
             rows.push(match &item.content {
-                _ if let Some(coordinated) = cached.coordination.as_deref()
-                    && prose.slot == turn::Slot::Card =>
-                {
-                    card(item, cached, coordinated)
-                }
                 ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
                 ItemContent::Image { .. } => self.image_preview(item, cached),
                 // Anything else in the answer slot is a step the grouping did
