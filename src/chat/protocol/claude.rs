@@ -982,6 +982,18 @@ impl Claude {
         self.skills.contains(name) || self.authored.contains(name)
     }
     fn message(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        self.message_with_tools(frame, step, &HashMap::new(), false)
+    }
+    fn history_message(&mut self, record: &HistoryRecord, step: &mut Step) -> Result<(), String> {
+        self.message_with_tools(&record.frame, step, &record.tool_calls, true)
+    }
+    fn message_with_tools(
+        &mut self,
+        frame: &Value,
+        step: &mut Step,
+        history_calls: &HistoryCalls,
+        history: bool,
+    ) -> Result<(), String> {
         let carrier = required(frame, "uuid")?;
         if self.retracted.contains(carrier) {
             return Ok(());
@@ -1064,6 +1076,7 @@ impl Claude {
                 }
             }
             for (index, block) in content.iter().enumerate() {
+                let correlated_call = history_calls.get(&index);
                 let index = self
                     .blocks
                     .iter()
@@ -1160,22 +1173,53 @@ impl Claude {
                             }
                             self.tool(item.clone());
                             step.events.push(Event::Item(item));
+                        } else if history {
+                            // Keep the original call position as an overlap
+                            // anchor without changing its confirmed outcome.
+                            if let Some(completed) = self.tools.get(&tool_id) {
+                                step.events.push(Event::Item(completed.clone()));
+                            }
                         }
                     }
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
-                        let mut item = self.tools.get(&tool_id).cloned().unwrap_or(Item {
-                            id: tool_id.clone(),
-                            role: Role::Assistant,
-                            content: ItemContent::Tool {
-                                name: "Tool".into(),
-                                input: String::new(),
-                                output: String::new(),
-                                status: ToolStatus::Running,
-                            },
-                            started_at: None,
-                            at: None,
-                        });
+                        let needs_call=self.tools.get(&tool_id).is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
+                        let recovered = if needs_call {
+                            if let Some(call) = correlated_call {
+                                self.remember_tool_input(&tool_id, &call["input"])?;
+                                let name = required(call, "name")?;
+                                let content = tool_content(name, &call["input"], &self.cwd);
+                                if matches!(&content, ItemContent::Changes { .. }) {
+                                    self.edit_tools.insert(tool_id.clone(), name.into());
+                                }
+                                Some(content)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let mut item = recovered
+                            .map(|content| Item {
+                                id: tool_id.clone(),
+                                role: Role::Assistant,
+                                content,
+                                started_at: None,
+                                at: None,
+                            })
+                            .or_else(|| self.tools.get(&tool_id).cloned())
+                            .unwrap_or(Item {
+                                id: tool_id.clone(),
+                                role: Role::Assistant,
+                                content: ItemContent::Tool {
+                                    name: "Tool".into(),
+                                    input: String::new(),
+                                    output: String::new(),
+                                    status: ToolStatus::Running,
+                                },
+                                started_at: None,
+                                at: None,
+                            });
                         apply_result(
                             &mut item.content,
                             content_text(&block["content"]),
@@ -1524,7 +1568,7 @@ impl Adapter for Claude {
             let frames = history.page()?;
             let mut history_step = Step::default();
             for frame in frames {
-                self.message(&frame, &mut history_step)?;
+                self.history_message(&frame, &mut history_step)?;
             }
             // Replayed Agent tool uses can reinsert completed background jobs.
             // The full history index is authoritative even when a sidecar is
@@ -1790,7 +1834,7 @@ impl Adapter for Claude {
                 // ago; which agents are still running is already known.
                 let running = self.background_agents.clone();
                 for frame in frames? {
-                    self.message(&frame, &mut step)?;
+                    self.history_message(&frame, &mut step)?;
                 }
                 self.background_agents = running;
                 let items = step
@@ -4007,6 +4051,21 @@ struct History {
     agent_ids: HashMap<String, String>,
     agent_status: HashMap<String, ToolStatus>,
     background_agent_tools: HashSet<String>,
+    /// Result carriers' preceding call locations in the selected visible
+    /// chain. Offset metadata only; no input or patch bodies are retained.
+    result_calls: HashMap<u64, Vec<(usize, (u64, u64, usize, usize))>>,
+}
+type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
+#[derive(Debug)]
+struct HistoryRecord {
+    frame: Value,
+    tool_calls: HistoryCalls,
+}
+impl std::ops::Deref for HistoryRecord {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.frame
+    }
 }
 struct HistoryNode {
     parent: Option<String>,
@@ -4014,6 +4073,7 @@ struct HistoryNode {
     message: bool,
     range: (u64, u64, usize),
     order: usize,
+    tool_refs: Vec<(String, usize, bool)>,
 }
 impl History {
     fn open(launch: &Launch, id: &str) -> Result<Self, String> {
@@ -4073,7 +4133,15 @@ impl History {
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
-    fn index(mut file: File, id: &str) -> Result<Self, String> {
+    fn index(file: File, id: &str) -> Result<Self, String> {
+        Self::index_with_tool_budget(file, id, 32 * 1024 * 1024, 200_000)
+    }
+    fn index_with_tool_budget(
+        mut file: File,
+        id: &str,
+        tool_bytes_limit: usize,
+        tool_count_limit: usize,
+    ) -> Result<Self, String> {
         use std::io::BufRead as _;
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if !metadata.is_file() || metadata.len() > 256 * 1024 * 1024 {
@@ -4093,6 +4161,8 @@ impl History {
         let mut stopped_agent_tools = HashSet::<String>::new();
         let mut position = 0;
         let mut line = Vec::new();
+        let mut tool_ref_bytes = 0_usize;
+        let mut tool_ref_count = 0_usize;
         while position < metadata.len() {
             line.clear();
             let count = std::io::Read::by_ref(&mut reader)
@@ -4241,6 +4311,40 @@ impl History {
             );
             let range = (record_offset, count as u64, base);
             let order = record_offset as usize;
+            // Rewritten UUID carriers replace their index entry. Charge the
+            // references actually retained, not all prior serialized carriers.
+            if let Some(previous) = nodes.get(uuid) {
+                tool_ref_count -= previous.tool_refs.len();
+                tool_ref_bytes -= previous
+                    .tool_refs
+                    .iter()
+                    .map(|(id, _, _)| id.len() + 64)
+                    .sum::<usize>();
+            }
+            let mut tool_refs = Vec::new();
+            if visible && let Some(blocks) = value["message"]["content"].as_array() {
+                for (index, block) in blocks.iter().enumerate() {
+                    let result = string(block, "type") == "tool_result";
+                    let tool = if result {
+                        block["tool_use_id"].as_str()
+                    } else if matches!(string(block, "type"), "tool_use" | "server_tool_use") {
+                        block["id"].as_str()
+                    } else {
+                        None
+                    };
+                    if let Some(tool) = tool {
+                        tool_ref_bytes = tool_ref_bytes.saturating_add(tool.len() + 64);
+                        tool_ref_count += 1;
+                        if tool_ref_bytes > tool_bytes_limit || tool_ref_count > tool_count_limit {
+                            return Err(
+                                "Claude transcript exceeds the tool correlation index limit".into(),
+                            );
+                        }
+                        tool_refs.push((tool.to_owned(), index, result));
+                    }
+                }
+            }
+
             nodes.insert(
                 uuid.into(),
                 HistoryNode {
@@ -4249,6 +4353,7 @@ impl History {
                     message,
                     range,
                     order,
+                    tool_refs,
                 },
             );
         }
@@ -4283,6 +4388,7 @@ impl History {
         }
         leaf = leaf.or(fallback);
         let mut chain = Vec::new();
+        let mut chain_tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
         while let Some(id) = leaf {
             if !seen.insert(id) {
@@ -4293,10 +4399,28 @@ impl History {
             };
             if node.visible {
                 chain.push(node.range);
+                chain_tools.push((node.range, &node.tool_refs));
             }
             leaf = node.parent.as_deref();
         }
         chain.reverse();
+        chain_tools.reverse();
+        let mut tool_calls = HashMap::new();
+        let mut result_calls = HashMap::<u64, Vec<(usize, (u64, u64, usize, usize))>>::new();
+        for (range, refs) in chain_tools {
+            for (id, index, result) in refs {
+                if *result {
+                    if let Some(call) = tool_calls.get(id).copied() {
+                        result_calls
+                            .entry(range.0)
+                            .or_default()
+                            .push((*index, call));
+                    }
+                } else {
+                    tool_calls.insert(id.clone(), (range.0, range.1, range.2, *index));
+                }
+            }
+        }
         let offset = chain.len();
         Ok(Self {
             file,
@@ -4308,6 +4432,7 @@ impl History {
             agent_ids,
             agent_status,
             background_agent_tools,
+            result_calls,
         })
     }
     /// Settles each agent the transcript leaves running that the user stopped,
@@ -4455,37 +4580,133 @@ impl History {
         }
         Ok(children)
     }
-    fn page(&mut self) -> Result<Vec<Value>, String> {
+    fn read_record(&mut self, offset: u64, len: u64, base: usize) -> Result<Value, String> {
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = vec![0; len as usize];
+        self.file
+            .read_exact(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let mut frame: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Claude history changed while reading: {e}"))?;
+        frame["_cagents_block_base"] = json!(base);
+        frame
+            .as_object_mut()
+            .ok_or("Claude history message is not an object")?
+            .remove("supersedes");
+        Ok(frame)
+    }
+    fn page(&mut self) -> Result<Vec<HistoryRecord>, String> {
         let mut start = self.offset;
         let mut total = 0;
+        let mut charged = HashSet::new();
         while start > 0 && self.offset - start < 100 {
-            let len = self.chain[start - 1].1;
-            // Large individual records remain loadable; the runtime externalizes
-            // their image/text payloads rather than discarding the conversation.
-            if total + len > HISTORY_PAGE && start != self.offset {
+            let (offset, len, _) = self.chain[start - 1];
+            let mut records = HashMap::new();
+            if !charged.contains(&offset) {
+                records.insert(offset, len);
+            }
+            if let Some(calls) = self.result_calls.get(&offset) {
+                for &(_, (call, len, _, _)) in calls {
+                    if !charged.contains(&call) {
+                        records.entry(call).or_insert(len);
+                    }
+                }
+            }
+            let bytes: u64 = records.values().sum();
+            // A normal oversized call/result pair remains readable, but a
+            // pathological multi-result group cannot hydrate the entire log.
+            if bytes > (MAX_PAYLOAD as u64) * 2 {
+                return Err(
+                    "Claude history tool dependency group exceeds the bounded page limit".into(),
+                );
+            }
+            // Original records and required call dependencies share the page
+            // byte budget. One oversized record/dependency group remains
+            // loadable under the existing individual MAX_PAYLOAD limit.
+            if total + bytes > HISTORY_PAGE && start != self.offset {
                 break;
             }
-            total += len;
+            total += bytes;
+            charged.extend(records.into_keys());
             start -= 1;
         }
         let mut result = Vec::new();
-        for &(offset, len, base) in &self.chain[start..self.offset] {
-            self.file
-                .seek(SeekFrom::Start(offset))
-                .map_err(|e| e.to_string())?;
-            let mut bytes = vec![0; len as usize];
-            self.file
-                .read_exact(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            let mut frame: Value = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("Claude history changed while reading: {e}"))?;
-            frame["_cagents_block_base"] = json!(base);
-            // The index has already removed superseded carriers across all pages.
-            frame
-                .as_object_mut()
-                .ok_or("Claude history message is not an object")?
-                .remove("supersedes");
-            result.push(frame);
+        let mut positions = HashMap::new();
+        for index in start..self.offset {
+            let (offset, len, base) = self.chain[index];
+            positions.insert(offset, result.len());
+            result.push(HistoryRecord {
+                frame: self.read_record(offset, len, base)?,
+                tool_calls: HashMap::new(),
+            });
+        }
+        let mut dependencies = std::collections::BTreeMap::<
+            u64,
+            (u64, usize, std::collections::BTreeSet<usize>),
+        >::new();
+        for &(offset, _, _) in &self.chain[start..self.offset] {
+            if let Some(calls) = self.result_calls.get(&offset) {
+                for &(_, (call, len, base, index)) in calls {
+                    dependencies
+                        .entry(call)
+                        .or_insert_with(|| (len, base, Default::default()))
+                        .2
+                        .insert(index);
+                }
+            }
+        }
+        let mut call_blocks = HashMap::new();
+        for (offset, (len, base, indices)) in dependencies {
+            let mut original = if positions.contains_key(&offset) {
+                None
+            } else {
+                Some(self.read_record(offset, len, base)?)
+            };
+            for index in indices {
+                let block = if let Some(position) = positions.get(&offset) {
+                    result[*position].frame["message"]["content"]
+                        .as_array()
+                        .and_then(|blocks| blocks.get(index))
+                        .cloned()
+                        .ok_or("Claude indexed tool block changed while reading")?
+                } else {
+                    let blocks = original.as_mut().unwrap()["message"]["content"]
+                        .as_array_mut()
+                        .ok_or("Claude indexed tool call changed while reading")?;
+                    std::mem::take(
+                        blocks
+                            .get_mut(index)
+                            .ok_or("Claude indexed tool block changed while reading")?,
+                    )
+                };
+                if !matches!(string(&block, "type"), "tool_use" | "server_tool_use") {
+                    return Err("Claude indexed tool call changed while reading".into());
+                }
+                required(&block, "name")?;
+                call_blocks.insert((offset, index), std::sync::Arc::new(block));
+            }
+        }
+        for &(offset, _, _) in &self.chain[start..self.offset] {
+            if let Some(calls) = self.result_calls.get(&offset) {
+                let record = &mut result[positions[&offset]];
+                for &(result_index, (call, _, _, call_index)) in calls {
+                    let block = record.frame["message"]["content"]
+                        .as_array()
+                        .and_then(|blocks| blocks.get(result_index))
+                        .ok_or("Claude indexed tool result changed while reading")?;
+                    let context = call_blocks[&(call, call_index)].clone();
+                    if string(block, "type") != "tool_result"
+                        || required(block, "tool_use_id")? != required(&context, "id")?
+                    {
+                        return Err(
+                            "Claude indexed tool result identity changed while reading".into()
+                        );
+                    }
+                    record.tool_calls.insert(result_index, context);
+                }
+            }
         }
         self.offset = start;
         Ok(result)
@@ -8933,5 +9154,303 @@ mod tests {
             event,
             Event::Capabilities(capabilities) if capabilities.skill_reach == SkillReach::Leading
         )));
+    }
+
+    fn correlation_history(mut frames: Vec<Value>) -> History {
+        let mut file = tempfile::tempfile().unwrap();
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut parent = Value::Null;
+        for (index, frame) in frames.iter_mut().enumerate() {
+            if frame.get("uuid").is_none() {
+                frame["uuid"] = json!(format!("frame-{index}"));
+            }
+            if frame.get("parentUuid").is_none() {
+                frame["parentUuid"] = parent;
+            }
+            frame["sessionId"] = json!(session);
+            parent = frame["uuid"].clone();
+            writeln!(file, "{frame}").unwrap();
+        }
+        file.rewind().unwrap();
+        History::index(file, session).unwrap()
+    }
+    fn correlation_call(id: &str, path: &str) -> Value {
+        json!({"type":"tool_use","id":id,"name":"Edit","input":{"file_path":path,"old_string":"old","new_string":"requested"}})
+    }
+    fn correlation_result(id: &str, failed: bool) -> Value {
+        json!({"type":"tool_result","tool_use_id":id,"is_error":failed,"content":if failed {"permission denied"}else{"done"}})
+    }
+    fn actual_patch() -> Value {
+        json!({"type":"update","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-old","+actually applied"]}]})
+    }
+    #[test]
+    fn claude_history_correlates_edits_across_every_100_record_page_boundary() {
+        let mut frames = vec![json!({"type":"user","message":{"content":"fixture"}})];
+        for index in 0..147 {
+            let path = if index == 145 {
+                "/project/failed.rs".into()
+            } else if index == 146 {
+                "/project/pending.rs".into()
+            } else {
+                format!(
+                    "/project/file-{:03}.rs",
+                    if index < 141 { index } else { index - 141 }
+                )
+            };
+            frames.push(json!({"type":"assistant","uuid":format!("call-{index}"),"message":{"content":[correlation_call(&format!("edit-{index}"),&path)]}}));
+            if index < 146 {
+                frames.push(json!({"type":"user","uuid":format!("result-{index}"),"message":{"content":[correlation_result(&format!("edit-{index}"),index==145)]},"toolUseResult":actual_patch()}));
+            }
+        }
+        assert_eq!(frames.len(), 294);
+        let mut adapter = Claude {
+            history: Some(correlation_history(frames)),
+            ..Claude::default()
+        };
+        let mut items = HashMap::new();
+        let mut pages = 0;
+        while adapter.history.as_ref().unwrap().offset > 0 {
+            let step = adapter.command(Command::LoadEarlier).unwrap();
+            pages += 1;
+            let Event::History { items: page, .. } = step.events.into_iter().next().unwrap() else {
+                panic!("history")
+            };
+            for item in page {
+                items.entry(item.id.clone()).or_insert(item);
+            }
+        }
+        assert_eq!(pages, 3);
+        let mut successful = HashSet::new();
+        let mut succeeded = 0;
+        for item in items.values() {
+            if let ItemContent::Changes {
+                changes,
+                status: ToolStatus::Succeeded,
+            } = &item.content
+            {
+                succeeded += 1;
+                successful.extend(changes.iter().map(|change| change.path.clone()));
+            }
+        }
+        assert_eq!(succeeded, 145);
+        assert_eq!(successful.len(), 141);
+        for index in [46, 96] {
+            let ItemContent::Changes { changes, status } = &items[&format!("edit-{index}")].content
+            else {
+                panic!("boundary edit must be classified")
+            };
+            assert_eq!(*status, ToolStatus::Succeeded);
+            assert!(changes[0].diff.contains("+actually applied"));
+            assert!(!changes[0].diff.contains("+requested"));
+        }
+        assert!(
+            matches!(&items["edit-145"].content,ItemContent::Tool{name,status:ToolStatus::Failed,output,..} if name=="Edit"&&output=="permission denied")
+        );
+        assert!(matches!(
+            &items["edit-146"].content,
+            ItemContent::Changes {
+                status: ToolStatus::Running,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn claude_history_recovers_more_parallel_results_than_the_tool_cache_can_hold() {
+        let count = MAX_TOOLS + 17;
+        let calls = (0..count)
+            .map(|i| correlation_call(&format!("edit-{i}"), &format!("/project/file-{i}.rs")))
+            .collect::<Vec<_>>();
+        let results = (0..count)
+            .map(|i| correlation_result(&format!("edit-{i}"), i % 17 == 0))
+            .collect::<Vec<_>>();
+        let mut history = correlation_history(vec![
+            json!({"type":"assistant","message":{"content":calls}}),
+            json!({"type":"user","message":{"content":results}}),
+        ]);
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        for record in history.page().unwrap() {
+            adapter.history_message(&record, &mut step).unwrap();
+        }
+        let items = settled(
+            step.events
+                .into_iter()
+                .filter_map(|event| {
+                    if let Event::Item(item) = event {
+                        Some(item)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        );
+        assert_eq!(items.len(), count);
+        for (index, item) in items.iter().enumerate() {
+            if index % 17 == 0 {
+                assert!(
+                    matches!(&item.content,ItemContent::Tool{name,status:ToolStatus::Failed,..} if name=="Edit")
+                );
+            } else {
+                assert!(matches!(
+                    &item.content,
+                    ItemContent::Changes {
+                        status: ToolStatus::Succeeded,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+    #[test]
+    fn claude_history_context_selects_only_the_matching_call_and_preserves_completion_on_older_replay()
+     {
+        let mut frames = vec![
+            json!({"type":"assistant","uuid":"calls","message":{"content":[{"type":"text","text":"private earlier narration"},correlation_call("wanted","/project/wanted.rs"),correlation_call("unrelated","/project/unrelated.rs")]}}),
+        ];
+        for index in 0..600 {
+            frames
+                .push(json!({"type":"assistant","message":{"content":format!("filler-{index}")}}));
+        }
+        frames.push(json!({"type":"user","uuid":"result","message":{"content":[correlation_result("wanted",false)]},"toolUseResult":actual_patch()}));
+        let mut history = correlation_history(frames);
+        let first = history.page().unwrap();
+        let context = &first.last().unwrap().tool_calls;
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[&0]["id"], "wanted");
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        for record in first {
+            adapter.history_message(&record, &mut step).unwrap();
+        }
+        assert!(!step.events.iter().any(|event|matches!(event,Event::Item(item) if item.id=="unrelated"||matches!(&item.content,ItemContent::Text{text,..} if text=="private earlier narration"))));
+        while history.offset > 0 {
+            let mut replay = Step::default();
+            for record in history.page().unwrap() {
+                adapter.history_message(&record, &mut replay).unwrap();
+            }
+            if replay
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="wanted"))
+            {
+                assert!(replay.events.iter().all(|event|!matches!(event,Event::Item(item) if item.id=="wanted"&&item.content.status()==Some(ToolStatus::Running))));
+            }
+        }
+        assert_eq!(
+            adapter.tools["wanted"].content.status(),
+            Some(ToolStatus::Succeeded)
+        );
+    }
+    #[test]
+    fn claude_history_context_excludes_abandoned_retracted_and_future_calls() {
+        let frames = vec![
+            json!({"type":"user","uuid":"root","parentUuid":null,"message":{"content":"root"}}),
+            json!({"type":"assistant","uuid":"abandoned","parentUuid":"root","message":{"content":[correlation_call("reused","/wrong/abandoned.rs")]}}),
+            json!({"type":"user","uuid":"current","parentUuid":"root","message":{"content":"current branch"}}),
+            json!({"type":"user","uuid":"before-call","message":{"content":[correlation_result("reused",false)]}}),
+            json!({"type":"assistant","uuid":"future","message":{"content":[correlation_call("reused","/project/current.rs")]}}),
+            json!({"type":"user","uuid":"after-call","message":{"content":[correlation_result("reused",false)]}}),
+            json!({"type":"assistant","uuid":"retracted","message":{"content":[correlation_call("dropped","/wrong/retracted.rs")]}}),
+            json!({"type":"user","uuid":"last","supersedes":["retracted"],"message":{"content":[correlation_result("dropped",false)]}}),
+        ];
+        let mut history = correlation_history(frames);
+        let page = history.page().unwrap();
+        assert!(
+            page.iter()
+                .all(|record| record["uuid"] != "abandoned" && record["uuid"] != "retracted")
+        );
+        for record in &page {
+            match record["uuid"].as_str().unwrap() {
+                "before-call" | "last" => assert!(record.tool_calls.is_empty()),
+                "after-call" => assert_eq!(
+                    record.tool_calls[&0]["input"]["file_path"],
+                    "/project/current.rs"
+                ),
+                _ => {}
+            }
+        }
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        adapter.message(&json!({"type":"user","uuid":"live","_cagents_history_tool_call":correlation_call("unlogged","/wrong/spoof.rs"),"message":{"content":[correlation_result("unlogged",false)]}}),&mut step).unwrap();
+        assert!(
+            matches!(&adapter.tools["unlogged"].content,ItemContent::Tool{name,status:ToolStatus::Succeeded,..} if name=="Tool")
+        );
+    }
+    #[test]
+    fn claude_history_large_dependency_pairs_stay_bounded_and_errors_keep_the_cursor() {
+        let mut call = correlation_call("large", "/project/large.rs");
+        call["input"]["new_string"] = json!("n".repeat(HISTORY_PAGE as usize + 32));
+        let mut frames =
+            vec![json!({"type":"assistant","uuid":"large-call","message":{"content":[call]}})];
+        for index in 0..101 {
+            frames
+                .push(json!({"type":"assistant","message":{"content":format!("filler-{index}")}}));
+        }
+        frames.push(json!({"type":"user","uuid":"large-result","message":{"content":[correlation_result("large",false)]}}));
+        let mut history = correlation_history(frames);
+        let page = history.page().unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["uuid"], "large-result");
+        assert!(history.offset > 0);
+        assert!(
+            page[0].tool_calls[&0]["input"]["new_string"]
+                .as_str()
+                .unwrap()
+                .len()
+                > HISTORY_PAGE as usize
+        );
+        let prior = history.offset;
+        // Synthetic offset metadata tests the aggregate guard without allocating
+        // multiple30MiB inputs. It fails before attempting any dependency read.
+        let offset = history.chain[prior - 1].0;
+        history.result_calls.insert(
+            offset,
+            vec![
+                (0, (u64::MAX - 1, MAX_PAYLOAD as u64, 0, 0)),
+                (1, (u64::MAX - 2, MAX_PAYLOAD as u64, 0, 0)),
+                (2, (u64::MAX - 3, MAX_PAYLOAD as u64, 0, 0)),
+            ],
+        );
+        assert!(history.page().unwrap_err().contains("bounded page limit"));
+        assert_eq!(history.offset, prior);
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        adapter.tool(Item {
+            id: "confirmed".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Changes {
+                changes: vec![],
+                status: ToolStatus::Succeeded,
+            },
+        });
+        assert!(adapter.command(Command::LoadEarlier).is_err());
+        assert_eq!(adapter.history.as_ref().unwrap().offset, prior);
+        assert_eq!(
+            adapter.tools["confirmed"].content.status(),
+            Some(ToolStatus::Succeeded)
+        );
+    }
+
+    #[test]
+    fn claude_history_correlation_budget_counts_only_retained_rewritten_carriers() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for index in 0..3 {
+            let mut call = correlation_call("edit", "/project/a.rs");
+            call["input"]["new_string"] = json!(format!("new-{index}"));
+            writeln!(file,"{}",json!({"type":"assistant","uuid":"rewritten","parentUuid":null,"sessionId":session,"message":{"content":[call]}})).unwrap();
+        }
+        writeln!(file,"{}",json!({"type":"user","uuid":"result","parentUuid":"rewritten","sessionId":session,"message":{"content":[correlation_result("edit",false)]}})).unwrap();
+        file.rewind().unwrap();
+        // Two retained references fit this small budget. Cumulatively charging
+        // rewritten carriers would reject the same valid durable history.
+        let mut history = History::index_with_tool_budget(file, session, 256, 2).unwrap();
+        let page = history.page().unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
     }
 }
