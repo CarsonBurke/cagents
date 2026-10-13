@@ -478,9 +478,7 @@ impl Runtime {
             }))
             .size(design::COMPACT_ICON_SIZE)
             .into(),
-            widget::icon(glyph.handle())
-                .size(14)
-                .into(),
+            widget::icon(glyph.handle()).size(14).into(),
         ];
         if !verb.is_empty() {
             line.push(design::caption(verb.clone()).into());

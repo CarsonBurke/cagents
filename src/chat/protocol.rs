@@ -12,6 +12,8 @@ mod terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
+    /// Page an exact provider transcript without starting a provider process.
+    History,
     JsonLines,
     /// A supervised provider server that both native and CLI views can join.
     OwnedUnixWebSocket {

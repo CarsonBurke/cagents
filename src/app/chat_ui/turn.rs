@@ -184,10 +184,8 @@ impl Turn {
                 }
                 None => "1 step".to_owned(),
             },
-            steps => {
-                summarize_steps(steps, items, coordinated)
-                    .unwrap_or_else(|| format!("{} steps", steps.len()))
-            }
+            steps => summarize_steps(steps, items, coordinated)
+                .unwrap_or_else(|| format!("{} steps", steps.len())),
         };
         // Still working outranks how the finished steps went, because a
         // reader deciding whether to wait needs that first.
@@ -977,7 +975,10 @@ mod tests {
             stamped(command("c1", ToolStatus::Succeeded), 2_000),
             stamped(text("a1", Role::Assistant, Phase::Final, false), 2_600),
         ];
-        assert_eq!(group(&mixed, &unasked(), plain)[0].working_for(9_000), Some(600));
+        assert_eq!(
+            group(&mixed, &unasked(), plain)[0].working_for(9_000),
+            Some(600)
+        );
     }
 
     #[test]
@@ -1114,7 +1115,10 @@ mod tests {
             started_at: None,
             at: None,
         };
-        assert_eq!(group(std::slice::from_ref(&empty), &unasked(), plain).len(), 0);
+        assert_eq!(
+            group(std::slice::from_ref(&empty), &unasked(), plain).len(),
+            0
+        );
         assert_eq!(group::<Item>(&[], &unasked(), plain).len(), 0);
         // A message that has not streamed its first bytes yet is the same
         // shape, and must come back once it has them.

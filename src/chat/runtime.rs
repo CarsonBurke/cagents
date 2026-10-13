@@ -148,6 +148,7 @@ struct Inner {
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
+    history_only: bool,
 }
 
 enum NativeOwnership {
@@ -232,7 +233,8 @@ impl Handle {
             Some(NativeOwnership::New(_, environment)) => environment.clone(),
             _ => spec.environment.clone(),
         };
-        if !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+        if !matches!(spec.transport, TransportSpec::History)
+            && !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
             && let Some(context) = &spec.execution
         {
             context.verify_directory(&spec.working_directory)?;
@@ -323,6 +325,7 @@ impl Handle {
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
+            history_only: matches!(spec.transport, TransportSpec::History),
         });
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -389,6 +392,7 @@ impl Handle {
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
                         match spec.transport {
+                            TransportSpec::History => actor.run_history(initial),
                             TransportSpec::JsonLines => actor.run(initial),
                             TransportSpec::UnixWebSocket {
                                 socket,
@@ -884,13 +888,14 @@ impl Handle {
             .clone()
     }
     pub fn owns_work(&self) -> bool {
-        !self.is_completed()
-            || self
-                .0
-                .failure
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_some()
+        !self.0.history_only
+            && (!self.is_completed()
+                || self
+                    .0
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some())
     }
     /// What the conversation is doing, read without loading its transcript.
     pub(crate) fn activity(&self) -> crate::agent::ActivityState {
@@ -1092,7 +1097,10 @@ fn preflight_inner(
     retained: bool,
 ) -> Result<Store, String> {
     use std::os::unix::ffi::OsStrExt;
-    if !retained && !spec.working_directory.is_dir() {
+    if !retained
+        && !matches!(spec.transport, TransportSpec::History)
+        && !spec.working_directory.is_dir()
+    {
         return Err("Provider working directory does not exist".into());
     }
     if spec.program.is_empty()
@@ -1214,7 +1222,10 @@ impl super::protocol::LaunchCleanup for Handle {
 }
 
 fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildGuard>, String> {
-    if matches!(spec.transport, TransportSpec::UnixWebSocket { .. }) {
+    if matches!(
+        spec.transport,
+        TransportSpec::History | TransportSpec::UnixWebSocket { .. }
+    ) {
         return Ok(None);
     }
     if let Some(context) = &spec.execution {
@@ -1532,6 +1543,43 @@ impl TurnAttention {
     }
 }
 impl Actor {
+    /// A history reader owns no process, network connection, or execution
+    /// authority. It keeps the ordinary bounded store and paging contract.
+    fn run_history(&mut self, initial: Step) -> Result<(), String> {
+        if !initial.writes.is_empty() {
+            return Err("History initialization attempted a provider write".into());
+        }
+        self.step(initial)?;
+        while !self.stop.load(Ordering::Acquire) {
+            self.drain_commands(false)?;
+            if !self.pending.is_empty() {
+                return Err("History reader attempted a provider write".into());
+            }
+            if self.dirty && self.visible.load(Ordering::Acquire) {
+                self.dirty = false;
+                (self.notify)(Update::Presentation);
+            }
+            if !self.incoming.is_empty() {
+                continue;
+            }
+            let mut fd = libc::pollfd {
+                fd: self.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll receives one initialized entry whose descriptor is
+            // held by this actor for the entire call.
+            if unsafe { libc::poll(&mut fd, 1, -1) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error.to_string());
+                }
+            }
+            let mut buffer = [0; 64];
+            while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+        }
+        Ok(())
+    }
     fn run(&mut self, initial: Step) -> Result<(), String> {
         let mut stdin = self
             .child
@@ -2406,6 +2454,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.busy = false;
             state.waiting = false;
             state.error = None;
+            state.read_only_reason = None;
             state.plan.clear();
             state.permission_mode = None;
             state.permissions = None;
@@ -2740,6 +2789,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.ready = false;
             state.history_loading = false;
         }
+        Event::ReadOnlyHistory { reason } => state.read_only_reason = Some(reason),
         Event::Ready(ready) => {
             if !ready {
                 state.prompt_suggestion = None;
@@ -2867,6 +2917,37 @@ mod tests {
         assert!(state.prompt_suggestion.is_none());
         apply_event(&mut state, &mut indices, suggestion());
         assert!(state.prompt_suggestion.is_none());
+    }
+
+    #[test]
+    fn read_only_history_reason_survives_exit_and_snapshot_serialization() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let reason =
+            "The saved working directory is unavailable. Conversation history is read-only.";
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::ReadOnlyHistory {
+                reason: reason.into(),
+            },
+        );
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        assert_eq!(state.read_only_reason.as_deref(), Some(reason));
+        let mut wire = serde_json::to_value(&state).unwrap();
+        let restored: Snapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored.read_only_reason, state.read_only_reason);
+        wire.as_object_mut().unwrap().remove("read_only_reason");
+        let legacy: Snapshot = serde_json::from_value(wire).unwrap();
+        assert!(legacy.read_only_reason.is_none());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "New conversation".into(),
+            },
+        );
+        assert!(state.read_only_reason.is_none());
     }
 
     #[test]

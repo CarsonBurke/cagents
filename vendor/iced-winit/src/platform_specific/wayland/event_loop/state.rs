@@ -1,7 +1,10 @@
 use crate::{
     Control,
     handlers::{
-        activation::IcedRequestData,
+        activation::{
+            ActivationInput, ActivationInputKind, IcedRequestData,
+            newest_activation_input,
+        },
         ext_background_effect,
         overlap::{OverlapNotificationV1, OverlapNotifyV1},
         shell::corner_radius::CornerRadiusWrapper,
@@ -129,6 +132,7 @@ pub(crate) struct SctkSeat {
     pub(crate) kbd: Option<WlKeyboard>,
     pub(crate) kbd_focus: Option<WlSurface>,
     pub(crate) last_kbd_press: Option<(KeyEvent, u32)>,
+    pub(crate) last_activation_input: Option<ActivationInput>,
     pub(crate) ptr: Option<ThemedPointer>,
     pub(crate) ptr_focus: Option<WlSurface>,
     pub(crate) last_ptr_press: Option<(u32, u32, u32)>, // (time, button, serial)
@@ -1639,29 +1643,15 @@ impl SctkState {
                                         .map(|l| l.surface.wl_surface().clone())
                                 });
                             let seat_and_serial = surface.as_ref().and_then(|surface| {
-                                self.seats.first().and_then(|seat| {
-                                    if seat
-                                        .kbd_focus
-                                        .as_ref()
-                                        .map(|focus| focus == surface)
-                                        .unwrap_or(false)
-                                    {
-                                        seat.last_kbd_press
-                                            .as_ref()
-                                            .map(|(_, serial)| (seat.seat.clone(), *serial))
-                                    } else if seat
-                                        .ptr_focus
-                                        .as_ref()
-                                        .map(|focus| focus == surface)
-                                        .unwrap_or(false)
-                                    {
-                                        seat.last_ptr_press
-                                            .as_ref()
-                                            .map(|(_, _, serial)| (seat.seat.clone(), *serial))
-                                    } else {
-                                        None
-                                    }
-                                })
+                                newest_activation_input(self.seats.iter().filter_map(|seat| {
+                                    let input = seat.last_activation_input.as_ref()?;
+                                    let focus = match input.kind {
+                                        ActivationInputKind::Keyboard => seat.kbd_focus.as_ref(),
+                                        ActivationInputKind::Pointer => seat.ptr_focus.as_ref(),
+                                    };
+                                    (input.surface == *surface && focus == Some(surface))
+                                        .then(|| (input.received_at, (seat.seat.clone(), input.serial)))
+                                }))
                             });
 
                             (seat_and_serial, surface)

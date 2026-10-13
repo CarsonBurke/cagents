@@ -45,6 +45,10 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         .as_deref()
         .map(|id| History::open(launch, id))
         .transpose()?;
+    let history_only = launch.needs_read_only_history();
+    if history_only {
+        spec.transport = super::TransportSpec::History;
+    }
     let session_id = launch
         .session_id
         .clone()
@@ -57,6 +61,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         Box::new(Claude {
             session_id: Some(session_id),
             resumed: launch.session_id.is_some(),
+            history_only,
             cwd: launch.recipe.working_directory.clone(),
             history,
             ..Claude::default()
@@ -331,6 +336,9 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<String, Item>,
+    /// Synthetic task rows shown before their Agent tool is known. Bounded by
+    /// the same cache as task tools, so late correlation can retract one row.
+    visible_task_rows: HashSet<String>,
     /// The tool each call shown as a file change was made with. A change has
     /// no place for the name, and an edit that fails is shown as its call
     /// again; the input says which tool that was only while it is still
@@ -382,6 +390,8 @@ struct Claude {
     aliases: HashMap<String, String>,
     usage: Usage,
     history: Option<History>,
+    /// A saved directory is gone; only its exact persisted history is readable.
+    history_only: bool,
 }
 impl Claude {
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
@@ -454,10 +464,19 @@ impl Claude {
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(id) = self.tool_order.pop_front() {
                 self.tools.remove(&id);
+                self.visible_task_rows.remove(&id);
                 self.edit_tools.remove(&id);
                 self.tool_inputs.remove(&id);
             }
         }
+    }
+    fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
+        self.agent_task_calls
+            .iter()
+            .filter(|(known, _)| known == tool)
+            .map(|(_, task)| format!("claude-task:{task}"))
+            .filter(|id| self.visible_task_rows.remove(id))
+            .collect()
     }
     fn remember_tool_input(&mut self, id: &str, input: &Value) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
@@ -938,6 +957,7 @@ impl Claude {
             .as_str()
             .filter(|id| !id.is_empty());
         let event_start = step.events.len();
+        let mut global_task_removals = Vec::new();
         let role = if string(frame, "type") == "user" {
             Role::User
         } else {
@@ -1082,6 +1102,7 @@ impl Claude {
                                 .is_some_and(|status| status != ToolStatus::Running)
                         }) {
                             if string(block, "name") == "Agent" {
+                                global_task_removals.extend(self.task_rows_for_agent(&tool_id));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -1248,6 +1269,14 @@ impl Claude {
             route_subagent_events(&mut step.events, event_start, parent);
         }
         self.track_carrier(carrier, ids, child);
+        // System task rows belong to the main transcript even if the Agent
+        // tool arrives in a nested transcript. Emit their removals only after
+        // routing that tool's own events to its parent agent.
+        if !global_task_removals.is_empty() {
+            step.events.push(Event::ItemsRemoved {
+                ids: global_task_removals,
+            });
+        }
         Ok(())
     }
     fn agent_call(&mut self, agent: &str, tool: &str) {
@@ -1428,9 +1457,13 @@ impl Adapter for Claude {
         Ok(step)
     }
     fn initialize(&mut self) -> Result<Step, String> {
-        let mut step = self.control(
-            json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[], "promptSuggestions":true}),
-        )?;
+        let mut step = if self.history_only {
+            Step::default()
+        } else {
+            self.control(
+                json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[], "promptSuggestions":true}),
+            )?
+        };
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
             let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
@@ -1505,10 +1538,35 @@ impl Adapter for Claude {
             step.events.extend(children);
             self.history = Some(history);
         }
-        self.status(false, "Initializing Claude stream-json", &mut step);
+        if self.history_only {
+            let reason = format!(
+                "The saved working directory {} is unavailable. Conversation history is read-only.",
+                self.cwd.display()
+            );
+            step.events.push(Event::ReadOnlyHistory {
+                reason: reason.clone(),
+            });
+            step.events.push(Event::Status {
+                busy: false,
+                detail: reason,
+            });
+            step.events.push(Event::Exited { code: None });
+        } else {
+            self.status(false, "Initializing Claude stream-json", &mut step);
+        }
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
+        if self.history_only {
+            match command {
+                Command::LoadEarlier => {}
+                Command::Refresh => return Ok(Step::default()),
+                _ => return Err(
+                    "The saved working directory is unavailable; this conversation is read-only"
+                        .into(),
+                ),
+            }
+        }
         match command {
             Command::Prompt {
                 text,
@@ -1740,6 +1798,7 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
                 self.tool_input_order.clear();
@@ -3674,6 +3733,15 @@ impl Claude {
                         .find(|(_, known)| known == task)
                         .map(|(tool, _)| tool.clone())
                 });
+                // Lifecycle bookkeeping and notification summaries still need
+                // the synthetic tool. Only its duplicate presentation is hidden.
+                let represented = known_tool
+                    .as_deref()
+                    .or_else(|| frame["tool_use_id"].as_str())
+                    .is_some_and(|tool| {
+                        self.tools.get(tool).is_some_and(|item|
+                        matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
+                    });
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.stopped_agents.retain(|known| known != tool);
@@ -3713,7 +3781,16 @@ impl Claude {
                     });
                 }
                 self.tool(item.clone());
-                step.events.push(Event::Item(item.clone()));
+                if represented {
+                    if self.visible_task_rows.remove(&item.id) {
+                        step.events.push(Event::ItemsRemoved {
+                            ids: vec![item.id.clone()],
+                        });
+                    }
+                } else {
+                    self.visible_task_rows.insert(item.id.clone());
+                    step.events.push(Event::Item(item.clone()));
+                }
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
                 {
@@ -3832,11 +3909,23 @@ struct HistoryNode {
 impl History {
     fn open(launch: &Launch, id: &str) -> Result<Self, String> {
         validate_id(id)?;
-        let cwd = launch
-            .recipe
-            .working_directory
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve Claude session directory: {e}"))?;
+        let saved_cwd = &launch.recipe.working_directory;
+        let cwd = match saved_cwd.canonicalize() {
+            Ok(cwd) => cwd,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && saved_cwd.is_absolute()
+                    && saved_cwd.components().all(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    }) =>
+            {
+                saved_cwd.clone()
+            }
+            Err(error) => return Err(format!("Cannot resolve Claude session directory: {error}")),
+        };
         let config = launch
             .recipe
             .environment
@@ -6605,6 +6694,98 @@ mod tests {
     }
 
     #[test]
+    fn correlated_task_lifecycle_updates_the_agent_without_a_duplicate_tool_row() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true,"description":"Inspect parser"}}]}})).unwrap();
+        for frame in [
+            json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"tool-agent","task_type":"local_agent","description":"Inspect parser"}),
+            json!({"type":"system","subtype":"task_progress","task_id":"task-one","tool_use_id":"tool-agent","patch":{"summary":"Checking tokens"}}),
+            json!({"type":"system","subtype":"task_notification","task_id":"task-one","tool_use_id":"tool-agent","status":"completed","summary":"Found the parser defect.","uuid":"done"}),
+        ] {
+            let step = adapter.receive(frame).unwrap();
+            assert!(!step.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            ));
+            if step.events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Subagent {
+                        status: Some(ToolStatus::Succeeded),
+                        ..
+                    }
+                )
+            }) {
+                assert!(step.events.iter().any(|event| matches!(event, Event::Item(Item { content:ItemContent::Delivery { body, .. }, .. }) if body == "Found the parser defect.")));
+            }
+        }
+        assert_eq!(
+            adapter.tools["claude-task:task-one"].content.status(),
+            Some(ToolStatus::Succeeded)
+        );
+        assert!(adapter.visible_task_rows.is_empty());
+    }
+
+    #[test]
+    fn an_agent_arriving_after_its_task_retracts_only_the_correlated_fallback_row() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"tool-agent","task_type":"local_agent","description":"Inspect parser"})).unwrap();
+        assert!(
+            started.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            )
+        );
+        let agent = adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(agent.events.iter().any(
+            |event| matches!(event, Event::ItemsRemoved { ids } if ids == &["claude-task:task-one"])
+        ));
+        assert!(
+            agent
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(item) if item.id == "tool-agent"))
+        );
+        let progress = adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task-one","patch":{"summary":"Checking tokens"}})).unwrap();
+        assert!(
+            !progress.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            )
+        );
+        assert!(adapter.visible_task_rows.is_empty());
+    }
+
+    #[test]
+    fn a_late_nested_agent_retracts_its_task_row_from_the_main_transcript() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"nested-task","tool_use_id":"nested-tool","task_type":"local_agent","description":"Inspect nested"})).unwrap();
+        assert!(started.events.iter().any(
+            |event| matches!(event, Event::Item(item) if item.id == "claude-task:nested-task")
+        ));
+        let agent = adapter.receive(json!({"type":"assistant","uuid":"nested-launch","parent_tool_use_id":"outer-agent","message":{"id":"nested-message","content":[{"type":"tool_use","id":"nested-tool","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(agent.events.iter().any(|event| matches!(event, Event::ItemsRemoved { ids } if ids == &["claude-task:nested-task"])));
+        assert!(!agent.events.iter().any(|event| matches!(event, Event::SubagentItemsRemoved { ids, .. } if ids.contains(&"claude-task:nested-task".into()))));
+        assert!(agent.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id == "outer-agent" && item.id == "nested-tool")));
+        let progress = adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"nested-task","patch":{"summary":"Checking nested"}})).unwrap();
+        assert!(!progress.events.iter().any(
+            |event| matches!(event, Event::Item(item) if item.id == "claude-task:nested-task")
+        ));
+    }
+
+    #[test]
+    fn uncorrelated_agent_command_and_workflow_tasks_keep_their_fallback_rows() {
+        let mut adapter = Claude::default();
+        for kind in ["local_agent", "local_bash", "local_workflow"] {
+            let id = format!("claude-task:{kind}");
+            let step = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":kind,"task_type":kind,"description":"Uncorrelated work"})).unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(item) if item.id == id))
+            );
+        }
+        assert_eq!(adapter.visible_task_rows.len(), 3);
+    }
+
+    #[test]
     fn background_agent_stays_running_until_task_notification() {
         let mut adapter = Claude::default();
         adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
@@ -7718,6 +7899,167 @@ mod tests {
         // `--session-id` names a conversation that does not exist on disk
         // until its first prompt, so nothing could resume it yet.
         assert!(!confirmed(false));
+    }
+
+    #[test]
+    fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("removed-worktree");
+        std::fs::create_dir(&cwd).unwrap();
+        let config = root.path().join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history_dir = config.join("projects").join(project);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = File::create(history_dir.join(format!("{id}.jsonl"))).unwrap();
+        // Cross the provider page boundary and the runtime's visible window.
+        for index in 0..220 {
+            let parent = (index > 0).then(|| format!("record-{}", index - 1));
+            writeln!(file, "{}", json!({"type":"user","uuid":format!("record-{index}"),"parentUuid":parent,"sessionId":id,"message":{"role":"user","content":format!("Saved prompt {index}")}})).unwrap();
+        }
+        drop(file);
+        std::fs::remove_dir(&cwd).unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        let (spec, mut adapter) = create(&launch).unwrap();
+        assert!(matches!(
+            spec.transport,
+            super::super::TransportSpec::History
+        ));
+        let mut initial = adapter.initialize().unwrap();
+        assert!(initial.writes.is_empty());
+        let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = crate::chat::runtime::Handle::start(
+            spec,
+            adapter,
+            initial,
+            store,
+            launch.session_id.clone(),
+            |_| {},
+        )
+        .unwrap();
+        handle.set_visible(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if handle.snapshot(None).unwrap().exited {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(!snapshot.ready);
+        assert!(snapshot.detail.contains("read-only"));
+        assert_eq!(
+            snapshot.read_only_reason.as_deref(),
+            Some(snapshot.detail.as_str())
+        );
+        assert!(!handle.owns_work());
+        assert_eq!(snapshot.items.len(), 100);
+        assert!(snapshot.has_earlier);
+        assert!(
+            handle
+                .command(Command::Prompt {
+                    text: "must never execute".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send
+                })
+                .unwrap_err()
+                .contains("read-only")
+        );
+        assert!(
+            handle
+                .command(Command::Interrupt)
+                .unwrap_err()
+                .contains("read-only")
+        );
+        handle.command(Command::LoadEarlier).unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 20")));
+        assert!(snapshot.has_earlier);
+        handle.command(Command::LoadEarlier).unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")));
+        assert!(!snapshot.has_earlier);
+        handle.close().unwrap();
+
+        let mut traversal = launch.clone();
+        traversal.recipe.working_directory.push("../other-worktree");
+        assert!(
+            create(&traversal).is_err(),
+            "missing directory fallback must preserve an unambiguous absolute path"
+        );
+    }
+
+    #[test]
+    fn composer_fixture_persists_the_provider_history_used_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let id = "00000000-0000-4000-8000-000000000002";
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat-composer-claude.sh");
+        for index in 0..2 {
+            let mut child = std::process::Command::new(&fixture)
+                .arg(format!("--resume={id}"))
+                .current_dir(&cwd)
+                .env("CLAUDE_CONFIG_DIR", &config)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            writeln!(child.stdin.take().unwrap(), "{}", json!({"type":"user","uuid":format!("prompt-{index}"),"message":{"role":"user","content":format!("Prompt {index}")}})).unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        let (_, mut adapter) = create(&launch).unwrap();
+        let step = adapter.initialize().unwrap();
+        let items = step
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::History { items, .. } => Some(items),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().any(
+            |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Prompt 0")
+        ));
+        assert!(items.iter().any(
+            |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Prompt 1")
+        ));
     }
 
     #[test]

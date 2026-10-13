@@ -149,6 +149,12 @@ pub enum HostedTerminalStartError {
     HostReadyTimeout { path: PathBuf, timeout: Duration },
     #[error("could not complete cagents daemon startup: {0}")]
     HostStartup(String),
+    #[error("could not verify the running cagents daemon: {0}")]
+    HostProtocol(#[source] crate::control::ControlError),
+    #[error(
+        "the running daemon uses protocol {actual}; this executable expects {PROTOCOL_VERSION}. Rebuild the matched executables; for a development session, run scripts/run-development --fresh-daemon (this stops its jobs and background subagents)"
+    )]
+    HostIncompatible { actual: u16 },
     #[error("cagents daemon exited before becoming ready at {path}: {status}")]
     HostExited { path: PathBuf, status: ExitStatus },
     #[error("could not connect to the cagents daemon socket at {path}: {source}")]
@@ -1198,8 +1204,10 @@ fn ensure_daemon_ready_at(
 ) -> Result<(), HostedTerminalStartError> {
     match UnixStream::connect(socket) {
         Ok(stream) => {
-            drop(stream);
-            return Ok(());
+            // A listening socket can belong to an older development build.
+            // Verify the wire protocol before opening a window whose actions
+            // would otherwise all fail against that daemon.
+            return verify_daemon_protocol(stream);
         }
         Err(error)
             if !matches!(
@@ -1234,7 +1242,26 @@ fn ensure_daemon_ready_at(
             && !crate::instance::has_inherited_daemon_fence()
                 .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?,
         |scoped| spawn_daemon(&daemon_binary, application, scoped),
-    )
+    )?;
+    // Another launcher can win the daemon lease while we wait for readiness;
+    // it must satisfy the same protocol contract as an existing daemon.
+    let stream =
+        UnixStream::connect(socket).map_err(|source| HostedTerminalStartError::HostSocket {
+            path: socket.to_owned(),
+            source,
+        })?;
+    verify_daemon_protocol(stream)
+}
+
+fn verify_daemon_protocol(stream: UnixStream) -> Result<(), HostedTerminalStartError> {
+    crate::control::ControlClient::from_stream(stream)
+        .map(|_| ())
+        .map_err(|error| match error {
+            crate::control::ControlError::UnsupportedVersion { actual } => {
+                HostedTerminalStartError::HostIncompatible { actual }
+            }
+            error => HostedTerminalStartError::HostProtocol(error),
+        })
 }
 
 fn start_daemon_at(
@@ -2571,11 +2598,43 @@ mod tests {
 
     #[test]
     fn existing_daemon_is_preserved_before_launch_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents).unwrap();
-        listener.accept().unwrap();
+        for version in [PROTOCOL_VERSION, PROTOCOL_VERSION - 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let mut stream = accept_connection(&listener);
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                let proof = proof("existing");
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof,
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let result =
+                ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+            if version == PROTOCOL_VERSION {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(HostedTerminalStartError::HostIncompatible {
+                    actual
+                }) if actual == version)
+                );
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]
