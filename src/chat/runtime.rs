@@ -2529,6 +2529,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             if let Some(waiting) = waiting {
                 agent.waiting = waiting;
             }
+            let has_detail = detail.is_some();
             if let Some(detail) = detail {
                 agent.detail = detail;
             }
@@ -2536,6 +2537,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 agent.status = status;
                 if status != ToolStatus::Running {
                     agent.waiting = false;
+                    if !has_detail {
+                        agent.detail.clear();
+                    }
                 }
             }
         }
@@ -3676,6 +3680,61 @@ mod tests {
             apply_event(&mut state, &mut indices, completion);
             assert!(!state.history_loading);
         }
+    }
+
+    #[test]
+    fn child_metadata_survives_sparse_updates_and_completion_clears_waiting() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "child".into(),
+                kind: "Codex agent".into(),
+                description: "Inspect repository".into(),
+                status: Some(ToolStatus::Running),
+                background: Some(true),
+                model: Some("gpt-child".into()),
+                waiting: Some(true),
+                detail: Some("Waiting for your approval".into()),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "child".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.subagents[0].model.as_deref(), Some("gpt-child"));
+        assert!(state.subagents[0].waiting);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "child".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(ToolStatus::Succeeded),
+                background: None,
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert_eq!(state.subagents[0].model.as_deref(), Some("gpt-child"));
+        assert!(!state.subagents[0].waiting);
+        assert!(state.subagents[0].detail.is_empty());
     }
 
     #[test]
