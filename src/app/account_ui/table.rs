@@ -1085,7 +1085,7 @@ fn menu<'a>(
         .into()
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
-        if !state.registry.is_default(&account.account) {
+        if state.login_conflict(account).is_none() && !state.registry.is_default(&account.account) {
             items.push(
                 crate::ui_controls::popover_item(
                     Icon::Check,
@@ -1113,7 +1113,7 @@ fn menu<'a>(
                     )
                     .into(),
                 );
-            } else {
+            } else if state.login_conflict(account).is_none() {
                 items.push(
                     crate::ui_controls::popover_item(
                         Icon::Folder,
@@ -1124,6 +1124,18 @@ fn menu<'a>(
                     .into(),
                 );
             }
+        }
+        if let Some(accept) = state.reported_login_action(account) {
+            let reported = account
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref())
+                .unwrap_or("reported login");
+            items.push(
+                crate::ui_controls::button::secondary(format!("Use {reported} for this account"))
+                    .on_press(action(accept))
+                    .into(),
+            );
         }
         items.push(
             crate::ui_controls::popover_item(

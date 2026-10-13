@@ -796,6 +796,7 @@ impl Adapter for Omp {
             Command::SetFastMode { .. } => return Err("Fast mode is not advertised by this OMP connection".into()),
             Command::SetPermissionMode{..} => return Err("OMP approval policy is configured at launch; use its settings command to change policy.".into()),
             Command::Compact => step.writes.push(self.request("compact")),
+            Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),

@@ -1587,6 +1587,36 @@ mod credential_guard {
         }
     }
 
+    // Only this complete boolean request expression is permitted. Reading
+    // that field or supplying credential values remains forbidden.
+    fn without_native_refresh_request(file: &std::path::Path, text: String) -> String {
+        if file.ends_with("src/chat/protocol/codex.rs") {
+            let request = ["json!({\"refresh", "Token\":true})"].concat();
+            text.replace(&request, "json!({\"provider-refresh-option\":true})")
+        } else {
+            text
+        }
+    }
+
+    #[test]
+    fn native_refresh_exception_allows_only_the_boolean_request_expression() {
+        let key = ["refresh", "Token"].concat();
+        let adapter = std::path::Path::new("src/chat/protocol/codex.rs");
+        let request = format!("json!({{\"{key}\":true}})");
+        assert!(!without_native_refresh_request(adapter, request.clone()).contains(&key));
+        for source in [
+            format!("result[\"{key}\"].as_str()"),
+            format!("json!({{\"{key}\":\"credential-value\"}})"),
+            format!("json!({{\"{key}\":true_credentials}})"),
+        ] {
+            assert!(without_native_refresh_request(adapter, source).contains(&key));
+        }
+        assert!(
+            without_native_refresh_request(std::path::Path::new("src/account.rs"), request)
+                .contains(&key)
+        );
+    }
+
     #[test]
     fn no_source_reads_provider_credentials_or_calls_provider_services() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1632,6 +1662,7 @@ mod credential_guard {
                 let documentation = ["https://developers.open", "ai.com/codex/cli/"].concat();
                 text = text.replace(&format!("\"{documentation}\""), "\"install-documentation\"");
             }
+            text = without_native_refresh_request(&file, text);
             for needle in &forbidden {
                 if text.contains(needle.as_str()) {
                     violations.push(format!("{} names {needle}", file.display()));

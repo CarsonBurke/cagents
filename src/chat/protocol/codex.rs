@@ -405,6 +405,11 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
+    LoginRecovery {
+        failure: String,
+        expected: Option<crate::account::Identity>,
+        revision: u64,
+    },
     Initialize,
     Attach,
     Models,
@@ -1628,6 +1633,15 @@ impl Adapter for Codex {
                 if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
                 self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
             }
+            Command::ResumeAfterLogin { failure, expected } => {
+                if self.busy || self.pending.values().any(|pending| matches!(pending, Pending::Turn { .. } | Pending::LoginRecovery { .. })) {
+                    return Err("Finish the active turn or login verification before resuming".into());
+                }
+                if !chat::requires_sign_in(crate::agent::Provider::Codex, &failure) {
+                    return Err("This conversation has no recognized sign-in failure".into());
+                }
+                self.call(&mut step, "account/read", json!({"refreshToken":true}), Pending::LoginRecovery {failure, expected, revision: self.lifecycle_revision})?;
+            }
             Command::Refresh => {
                 if self.pending.len() > MAX_PENDING - 2 { return Err("Too many outstanding Codex requests".into()); }
                 // Returning to the cached live end cancels the store's older
@@ -1690,6 +1704,23 @@ impl Adapter for Codex {
                 self.history_loading = false;
             }
             if let Some(error) = frame.get("error") {
+                if let Pending::LoginRecovery {
+                    failure, revision, ..
+                } = &pending
+                {
+                    if *revision == self.lifecycle_revision && !self.busy {
+                        step.events.push(Event::LoginVerificationFailed {
+                            failure: failure.clone(),
+                            detail: format!(
+                                "Sign-in verification failed: {}",
+                                error["message"]
+                                    .as_str()
+                                    .unwrap_or("Codex account/read failed")
+                            ),
+                        });
+                    }
+                    return Ok(step);
+                }
                 if matches!(pending, Pending::History { .. }) {
                     self.finish_history(&mut step)?;
                 }
@@ -1755,6 +1786,22 @@ impl Adapter for Codex {
                     }));
                     self.read_queue(&mut step)?;
                 }
+                // The actor marks a submitted prompt busy before the server
+                // acknowledges it. A rejected start has no turn/completed
+                // notification to release that optimistic state. Only repair
+                // the lifecycle this request observed: a newer genuine turn
+                // must retain its own activity and waiting state.
+                if let Pending::Turn { revision, .. } = &pending
+                    && *revision == self.lifecycle_revision
+                {
+                    self.busy = false;
+                    self.turn = None;
+                    step.events.push(Event::Waiting(false));
+                    step.events.push(Event::Status {
+                        busy: false,
+                        detail: "Turn failed".into(),
+                    });
+                }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 let message = format!(
                     "{}: {}",
@@ -1786,6 +1833,28 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
+                Pending::LoginRecovery {
+                    failure,
+                    expected,
+                    revision,
+                } => {
+                    if revision != self.lifecycle_revision || self.busy {
+                        return Ok(step);
+                    }
+                    let Ok(identity) = crate::account::codex::parse_account(result) else {
+                        step.events.push(Event::LoginVerificationFailed {failure, detail: "Codex sign-in is still unavailable; finish signing in before resuming".into()});
+                        return Ok(step);
+                    };
+                    if identity.email.is_none()
+                        || expected
+                            .as_ref()
+                            .is_some_and(|expected| !expected.same_login(&identity))
+                    {
+                        step.events.push(Event::LoginVerificationFailed {failure, detail: "Codex signed in to a different or unverifiable account; open Accounts to resolve the login identity".into()});
+                        return Ok(step);
+                    }
+                    step.events.push(Event::LoginRecovered { failure });
+                }
                 Pending::Initialize => {
                     if let Some(retained) = &self.retained_identity {
                         if result["codexHome"].as_str() != Some(retained.reported_home.as_str()) {
@@ -3733,6 +3802,81 @@ mod tests {
                 .iter()
                 .any(|frame| frame["method"] == "thread/prediction/request")
         );
+    }
+
+    #[test]
+    fn rejected_turn_start_releases_optimistic_activity_for_sign_in_recovery() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "first attempt".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        let rejected = adapter.receive(json!({"id":request["id"],"error":{"code":-32000,"message":"Your access token could not be refreshed. Please sign in again."}})).unwrap();
+        assert!(
+            rejected
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Waiting(false)))
+        );
+        assert!(rejected.events.iter().any(|event| matches!(event, Event::Status { busy: false, detail } if detail == "Turn failed")));
+        assert!(rejected.events.iter().any(|event| matches!(event, Event::Error { message, fatal: false } if chat::requires_sign_in(crate::agent::Provider::Codex, message))));
+        assert!(!adapter.busy);
+        assert!(adapter.turn.is_none());
+        assert!(
+            adapter
+                .command(Command::Prompt {
+                    text: "explicit new attempt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejected_turn_start_does_not_settle_a_newer_provider_turn() {
+        for completed in [false, true] {
+            let mut adapter = adapter();
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text: "old attempt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let request = submitted
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "turn/start")
+                .unwrap();
+            adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"newer-turn","status":"inProgress","items":[]}}})).unwrap();
+            if completed {
+                adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"newer-turn","status":"completed","items":[]}}})).unwrap();
+            }
+            let revision = adapter.lifecycle_revision;
+            let rejected = adapter.receive(json!({"id":request["id"],"error":{"code":-32000,"message":"Old request failed"}})).unwrap();
+            assert!(!rejected.events.iter().any(|event| matches!(
+                event,
+                Event::Status { .. }
+                    | Event::Waiting(_)
+                    | Event::TurnSettled
+                    | Event::TurnFinished { .. }
+            )));
+            assert_eq!(adapter.lifecycle_revision, revision);
+            assert_eq!(adapter.busy, !completed);
+            assert_eq!(
+                adapter.turn.as_deref(),
+                (!completed).then_some("newer-turn")
+            );
+        }
     }
 
     #[test]
@@ -6172,5 +6316,93 @@ mod tests {
                 .any(|event| matches!(event, Event::Item(_))),
             "the raw payload still reaches the transcript"
         );
+    }
+    #[test]
+    fn resume_login_verifies_same_account_without_replaying_or_resetting_thread() {
+        let mut adapter = adapter();
+        let failure = "Your access token could not be refreshed. Please sign in again.";
+        let expected = crate::account::Identity {
+            email: Some("expected@example.test".into()),
+            organization: None,
+            plan: None,
+        };
+        let request = adapter
+            .command(Command::ResumeAfterLogin {
+                failure: failure.into(),
+                expected: Some(expected.clone()),
+            })
+            .unwrap();
+        assert_eq!(request.writes.len(), 1);
+        assert_eq!(request.writes[0]["method"], "account/read");
+        assert_eq!(request.writes[0]["params"], json!({"refreshToken":true}));
+        assert!(request.events.is_empty());
+        assert!(
+            adapter
+                .command(Command::ResumeAfterLogin {
+                    failure: failure.into(),
+                    expected: None
+                })
+                .is_err()
+        );
+        let result = adapter.receive(json!({"id":request.writes[0]["id"],"result":{"account":{"type":"chatgpt","email":"expected@example.test","planType":"pro"},"requiresOpenaiAuth":true}})).unwrap();
+        assert_eq!(
+            result.events,
+            vec![Event::LoginRecovered {
+                failure: failure.into()
+            }]
+        );
+        assert!(result.writes.is_empty());
+        assert_eq!(adapter.thread.as_deref(), Some("thread-exact"));
+        for response in [
+            json!({"account":null,"requiresOpenaiAuth":true}),
+            json!({"account":{"type":"chatgpt","email":"different@example.test"}}),
+            json!({"account":{"type":"apiKey"},"requiresOpenaiAuth":false}),
+        ] {
+            let request = adapter
+                .command(Command::ResumeAfterLogin {
+                    failure: failure.into(),
+                    expected: Some(expected.clone()),
+                })
+                .unwrap();
+            let result = adapter
+                .receive(json!({"id":request.writes[0]["id"],"result":response}))
+                .unwrap();
+            assert!(
+                matches!(&result.events[..], [Event::LoginVerificationFailed {failure: captured,..}] if captured == failure)
+            );
+            assert!(result.writes.is_empty());
+        }
+        let request = adapter
+            .command(Command::ResumeAfterLogin {
+                failure: failure.into(),
+                expected: None,
+            })
+            .unwrap();
+        let failed = adapter.receive(json!({"id":request.writes[0]["id"],"error":{"code":-32000,"message":"refresh token permanently invalid"}})).unwrap();
+        assert!(
+            matches!(&failed.events[..], [Event::LoginVerificationFailed {failure: captured,detail}] if captured == failure && detail.contains("verification failed"))
+        );
+        let request = adapter
+            .command(Command::ResumeAfterLogin {
+                failure: failure.into(),
+                expected: None,
+            })
+            .unwrap();
+        adapter.lifecycle_revision += 1;
+        let late = adapter.receive(json!({"id":request.writes[0]["id"],"result":{"account":{"type":"chatgpt","email":"expected@example.test"}}})).unwrap();
+        assert!(late.events.is_empty());
+    }
+    #[test]
+    fn stale_login_verification_rpc_failure_emits_no_new_error() {
+        let mut adapter = adapter();
+        let request = adapter
+            .command(Command::ResumeAfterLogin {
+                failure: "Authentication required. Please sign in again.".into(),
+                expected: None,
+            })
+            .unwrap();
+        adapter.lifecycle_revision += 1;
+        let late = adapter.receive(json!({"id":request.writes[0]["id"],"error":{"code":-32000,"message":"old refresh failed"}})).unwrap();
+        assert!(late.events.is_empty());
     }
 }

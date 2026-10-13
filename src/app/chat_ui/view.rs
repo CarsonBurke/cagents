@@ -900,6 +900,7 @@ impl Cagents {
                     Vec::new()
                 };
                 let view = runtime.view(
+                    self.chat_auth_recovery(runtime),
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
@@ -1116,6 +1117,7 @@ impl Runtime {
 
     fn view<'a>(
         &'a self,
+        recovery: Option<auth_recovery::Recovery>,
         transitioning: bool,
         enter_sends: bool,
         shortcuts: &crate::settings::KeyboardShortcuts,
@@ -1293,7 +1295,9 @@ impl Runtime {
                     .into(),
                 );
             }
-            for (_, error) in self.failures.iter().filter(|(anchor, _)| anchor.is_none()) {
+            for (_, error) in self.failures.iter().filter(|(anchor, error)| {
+                anchor.is_none() && !self.active_auth_notice(anchor, error)
+            }) {
                 transcript.push(notice_entry(error, target));
             }
             for turn in &self.turns {
@@ -1306,11 +1310,9 @@ impl Runtime {
                     },
                     self.turn_trailing_footer(turn),
                 );
-                for (_, error) in self
-                    .failures
-                    .iter()
-                    .filter(|(anchor, _)| anchor.as_ref() == Some(&turn.key))
-                {
+                for (_, error) in self.failures.iter().filter(|(anchor, error)| {
+                    anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
+                }) {
                     transcript.push(notice_entry(error, target));
                 }
             }
@@ -1426,6 +1428,7 @@ impl Runtime {
         // composer: it scrolls away with what it was about instead of
         // staying on screen until the next command happens to clear it.
         if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
+            && !chat::requires_sign_in(self.session.launch.provider, error)
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
             transcript.push(notice_entry(error, target));
@@ -1524,7 +1527,7 @@ impl Runtime {
                 "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             ));
         }
-        if self.disconnected || snapshot.exited {
+        if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
             let enabled =
                 !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
@@ -1585,6 +1588,9 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .into(),
             );
+        }
+        if self.auth_error().is_some() {
+            content.push(auth_recovery::view(self, recovery, !transitioning));
         }
         // A question stays on this surface until the reader resolves it: no
         // answer is synthesized from a default, a timeout, or a closing pane.
@@ -4734,6 +4740,7 @@ mod tests {
                 .summary
                 .clone();
             let mut element = runtime.view(
+                None,
                 false,
                 true,
                 &shortcuts,
@@ -4888,6 +4895,7 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).subagents.push(child);
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let mut element = runtime.view(
+            None,
             false,
             true,
             &shortcuts,
@@ -4955,6 +4963,7 @@ mod tests {
         }
         fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
             runtime(app, target).view(
+                None,
                 false,
                 true,
                 &app.settings.keyboard_shortcuts,
@@ -5627,6 +5636,7 @@ mod tests {
         let (runtime, _handle) = frame_cost::live_runtime(&items);
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let mut element = runtime.view(
+            None,
             false,
             true,
             &shortcuts,
@@ -5693,6 +5703,7 @@ mod tests {
                 let (mut runtime, _handle) = frame_cost::live_runtime(&items);
                 Arc::make_mut(&mut runtime.snapshot).title = title.clone();
                 let mut element = runtime.view(
+                    None,
                     false,
                     true,
                     &shortcuts,
@@ -7226,6 +7237,7 @@ mod tests {
             drop(selected);
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             let mut full = runtime.view(
+                None,
                 false,
                 true,
                 &shortcuts,
@@ -7455,6 +7467,7 @@ mod tests {
             );
             for width in [360.0, 670.0] {
                 let mut element = runtime.view(
+                    None,
                     false,
                     true,
                     &app.settings.keyboard_shortcuts,

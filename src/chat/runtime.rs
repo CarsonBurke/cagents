@@ -363,6 +363,7 @@ impl Handle {
                     indices: BTreeMap::new(),
                     retained: 0,
                     history_error: None,
+                    login_recovery: None,
                     dirty: false,
                     activity: ActivityState::Idle,
                     ready: false,
@@ -1525,6 +1526,7 @@ struct Actor {
     /// Only the active error published by the most recent history failure.
     /// Recovery must not erase an unrelated provider/cache error.
     history_error: Option<String>,
+    login_recovery: Option<String>,
     dirty: bool,
     activity: ActivityState,
     /// Whether the provider was taking prompts when activity was last published.
@@ -1990,6 +1992,25 @@ impl Actor {
                     }
                 }
             }
+            let login_recovery = if let Command::ResumeAfterLogin { failure, .. } = &command {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if state.error.as_ref() != Some(failure)
+                    || !super::requires_sign_in(crate::agent::Provider::Codex, failure)
+                    || state.busy
+                    || state.waiting
+                    || !state.requests.is_empty()
+                    || state.exited
+                    || !state.ready
+                {
+                    let _ = reply.send(Err(
+                        "The sign-in failure changed or the conversation is no longer idle".into(),
+                    ));
+                    continue;
+                }
+                Some(failure.clone())
+            } else {
+                None
+            };
             let starts_turn = matches!(&command, Command::Prompt { .. });
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -2027,6 +2048,9 @@ impl Actor {
             };
             match prepared {
                 Ok(step) => {
+                    if login_recovery.is_some() {
+                        self.login_recovery = login_recovery;
+                    }
                     let result = self.step(step);
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
@@ -2282,6 +2306,7 @@ impl Actor {
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_event(&mut state, &mut self.indices, event);
         // Only metadata is resident independently of the disk-backed window.
@@ -2407,6 +2432,34 @@ impl Write for ByteCounter {
 pub(super) fn observed_at() -> Option<u64> {
     crate::chat::now_ms()
 }
+fn recover_login_error(error: &mut Option<String>, pending: &mut Option<String>, event: &Event) {
+    match event {
+        Event::LoginVerificationFailed { failure, detail } => {
+            if pending.as_ref() == Some(failure) && error.as_ref() == Some(failure) {
+                *error = Some(super::sign_in_verification_failure(failure, detail));
+                *pending = None;
+            }
+        }
+        Event::LoginRecovered { failure } => {
+            if pending.as_ref() == Some(failure) && error.as_ref() == Some(failure) {
+                *error = None;
+            }
+            *pending = None;
+        }
+        // Even an identical later error is a new failure and invalidates the
+        // old proof. No unrelated transcript/cache error or turn is cleared.
+        Event::Error { .. }
+        | Event::HistoryError(_)
+        | Event::Reset { .. }
+        | Event::Exited { .. }
+        | Event::TurnStarted
+        | Event::Request(_)
+        | Event::Waiting(true)
+        | Event::Status { busy: true, .. } => *pending = None,
+        _ => {}
+    }
+}
+
 fn recover_history_error(
     error: &mut Option<String>,
     history_error: &mut Option<String>,
@@ -2531,7 +2584,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.
-        Event::AccountUsage(_) => {}
+        Event::AccountUsage(_)
+        | Event::LoginRecovered { .. }
+        | Event::LoginVerificationFailed { .. } => {}
         Event::Capabilities(value) => state.capabilities = value,
         Event::PermissionMode(mode) => state.permission_mode = mode,
         Event::PermissionSettings(settings) => state.permissions = Some(settings),
@@ -5607,5 +5662,119 @@ mod tests {
         };
         assert!(page.error.is_none());
         assert!(page.patches[0].diff.contains("+new"));
+    }
+    #[test]
+    fn login_recovery_clears_only_captured_failure_without_new_error_or_turn() {
+        let failure = "Authentication required. Please sign in again.".to_owned();
+        let proof = Event::LoginRecovered {
+            failure: failure.clone(),
+        };
+        let mut error = Some(failure.clone());
+        let mut pending = Some(failure.clone());
+        recover_login_error(&mut error, &mut pending, &proof);
+        assert_eq!(error, None);
+        assert_eq!(pending, None);
+        let mut error = Some(failure.clone());
+        let mut pending = Some(failure.clone());
+        recover_login_error(
+            &mut error,
+            &mut pending,
+            &Event::LoginVerificationFailed {
+                failure: failure.clone(),
+                detail: "finish signing in".into(),
+            },
+        );
+        assert_eq!(
+            error,
+            Some(format!(
+                "{failure}\nSign-in verification: finish signing in"
+            ))
+        );
+        assert_eq!(pending, None);
+        for invalidation in [
+            Event::Error {
+                message: failure.clone(),
+                fatal: false,
+            },
+            Event::HistoryError("disk read failed".into()),
+            Event::TurnStarted,
+            Event::Waiting(true),
+            Event::Status {
+                busy: true,
+                detail: "new turn".into(),
+            },
+            Event::Reset {
+                reason: "new thread".into(),
+            },
+            Event::Exited { code: None },
+        ] {
+            let mut error = Some(failure.clone());
+            let mut pending = Some(failure.clone());
+            recover_login_error(&mut error, &mut pending, &invalidation);
+            recover_login_error(&mut error, &mut pending, &proof);
+            recover_login_error(
+                &mut error,
+                &mut pending,
+                &Event::LoginVerificationFailed {
+                    failure: failure.clone(),
+                    detail: "late failed refresh".into(),
+                },
+            );
+            assert_eq!(
+                error,
+                Some(failure.clone()),
+                "late proof cannot clear a later lifecycle or identical error"
+            );
+        }
+        let mut error = Some("unrelated provider error".into());
+        let mut pending = Some(failure.clone());
+        recover_login_error(&mut error, &mut pending, &proof);
+        assert_eq!(error, Some("unrelated provider error".into()));
+        let mut error = Some(failure);
+        let mut pending = None;
+        recover_login_error(&mut error, &mut pending, &proof);
+        assert!(error.is_some(), "unsolicited proof grants no recovery");
+    }
+    #[test]
+    fn repeated_failed_verifications_keep_only_bounded_latest_detail_and_history() {
+        let failure = "Authentication required. Please sign in again.";
+        let mut state = Snapshot {
+            error: Some(failure.into()),
+            session_id: Some("retained-thread".into()),
+            ..Default::default()
+        };
+        state
+            .items
+            .push(Arc::new(text("retained", "original history")));
+        let retained = state.items.clone();
+        let mut indices = BTreeMap::new();
+        for attempt in 0..100 {
+            let captured = state.error.clone().unwrap();
+            let mut pending = Some(captured.clone());
+            let event = Event::LoginVerificationFailed {
+                failure: captured,
+                detail: format!("Attempt {attempt}: {}", "é".repeat(2000)),
+            };
+            recover_login_error(&mut state.error, &mut pending, &event);
+            apply_event(&mut state, &mut indices, event);
+            let message = state.error.as_deref().unwrap();
+            let detail = super::super::sign_in_verification_detail(message).unwrap();
+            assert!(detail.starts_with(&format!("Attempt {attempt}:")));
+            assert_eq!(detail.chars().count(), 512);
+            assert_eq!(message.matches("Sign-in verification: ").count(), 1);
+            assert!(message.starts_with(failure));
+            assert_eq!(state.items, retained);
+            assert_eq!(state.session_id.as_deref(), Some("retained-thread"));
+            assert_eq!(pending, None);
+        }
+        let captured = state.error.clone().unwrap();
+        let mut pending = Some(captured.clone());
+        recover_login_error(
+            &mut state.error,
+            &mut pending,
+            &Event::LoginRecovered { failure: captured },
+        );
+        assert_eq!(state.error, None);
+        assert_eq!(state.items, retained);
     }
 }
