@@ -793,6 +793,7 @@ impl Adapter for Omp {
                 let mut request=self.request("set_model"); request["provider"]=provider.into(); request["modelId"]=id.into(); step.writes.push(request);
                 if let Some(level)=reasoning {let mut request=self.request("set_thinking_level"); request["level"]=level.into();step.writes.push(request);}
             }
+            Command::SetFastMode { .. } => return Err("Fast mode is not advertised by this OMP connection".into()),
             Command::SetPermissionMode{..} => return Err("OMP approval policy is configured at launch; use its settings command to change policy.".into()),
             Command::Compact => step.writes.push(self.request("compact")),
             Command::Refresh => return Ok(self.refresh()),

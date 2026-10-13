@@ -139,7 +139,9 @@ use crate::{
 /// JSON snapshots can omit the defaulted field.
 /// Version 70 carries native subagent model, waiting state and status detail
 /// in sparse events and snapshots.
-pub const PROTOCOL_VERSION: u16 = 71;
+/// Version 72 carries native fast-mode capabilities/state, its setting command,
+/// and separately labeled API-equivalent Codex cost estimates.
+pub const PROTOCOL_VERSION: u16 = 72;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2040,6 +2042,58 @@ mod tests {
         let applied = wire.apply(Some(&restored)).unwrap();
         assert_eq!(applied.activity, next.activity);
         assert_eq!(applied.lines, restored.lines);
+    }
+
+    #[test]
+    fn chat_fast_mode_and_estimate_round_trip_with_legacy_json_defaults() {
+        let snapshot = crate::chat::Snapshot {
+            fast_mode: Some(crate::chat::FastMode {
+                state: crate::chat::FastModeState::Cooldown,
+                disabled_reason: None,
+            }),
+            capabilities: crate::chat::Capabilities {
+                fast_mode: true,
+                ..Default::default()
+            },
+            usage: crate::chat::Usage {
+                cost_estimate: Some(crate::chat::pricing::CostEstimate {
+                    microusd: 12345,
+                    partial: true,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(snapshot.clone()),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
+        let request = ClientRequest::ChatCommand {
+            chat_id: TerminalId::new(),
+            command: crate::chat::Command::SetFastMode { enabled: true },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, request);
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("fast_mode");
+        legacy["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fast_mode");
+        legacy["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cost_estimate");
+        let restored: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.fast_mode.is_none());
+        assert!(!restored.capabilities.fast_mode);
+        assert!(restored.usage.cost_estimate.is_none());
     }
 
     #[test]

@@ -43,6 +43,10 @@ persist_record() {
 }
 
 busy=false
+fast=off
+fast_fixture=${CAGENTS_FIXTURE_FAST_MODE:-0}
+model=haiku
+if [ "$fast_fixture" = 1 ]; then model=opus; fi
 while IFS= read -r frame; do
     kind=$(printf '%s' "$frame" | jq -r '.type')
     case $kind in
@@ -52,6 +56,13 @@ while IFS= read -r frame; do
             metadata='{}'
             if [ "$subtype" = initialize ]; then
                 metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
+                if [ "$fast_fixture" = 1 ]; then
+                    metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
+                fi
+            elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
+                requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
+                if [ "$requested" = true ]; then fast=on; else fast=off; fi
+                metadata=$(jq -cn --arg fast "$fast" '{fast_mode_state:$fast}')
             fi
             jq -cn --arg id "$id" --argjson metadata "$metadata" \
                 '{type:"control_response",response:{subtype:"success",request_id:$id,response:$metadata}}'
@@ -79,8 +90,8 @@ while IFS= read -r frame; do
                 printf '%s\n' "$frame"
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
-                jq -cn --arg session "$session" \
-                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:"haiku"}'
+                jq -cn --arg session "$session" --arg model "$model" \
+                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
                 assistant=$(jq -cn --arg turn "$turn" \
                     '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"I’m checking the submission logs and comparing the failed run with the last successful version."}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
