@@ -1821,6 +1821,9 @@ impl Adapter for Claude {
                 return Err("File changes are served by the transcript cache".into());
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
+            Command::ResumeAfterLogin { .. } => {
+                return Err("Live login verification is available for Codex chats".into());
+            }
             Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
             Command::LoadEarlier => {
                 let Some(mut history) = self.history.take() else {

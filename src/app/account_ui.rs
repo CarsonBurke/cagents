@@ -3182,6 +3182,12 @@ impl Cagents {
             .is_some_and(|state| state.owner == owner)
     }
 
+    pub(super) fn expected_account_login(&self, account: &Account) -> Option<Identity> {
+        account
+            .registry_key()
+            .and_then(|key| self.account_ui.registry.find(key))
+            .map(|registered| registered.identity())
+    }
     pub(super) fn account_login_change(&self, account: &Account) -> Option<String> {
         let state = self.account_ui.account(&account.id())?;
         if &state.account != account {

@@ -6595,10 +6595,7 @@ impl Cagents {
             }
             Action::SignIn(target, account) => return self.sign_in_chat(target, account),
             Action::ResumeAfterSignIn(target) => {
-                if !self.chat_auth_resume_enabled(target) {
-                    return Task::none();
-                }
-                return self.handle_chat_ui(Action::Reconnect(target));
+                return self.resume_after_sign_in(target);
             }
             Action::Reconnect(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -16324,7 +16321,7 @@ mod tests {
         assert!(app.chat_ui.attempt(card).is_none());
     }
     #[test]
-    fn auth_recovery_resume_preserves_session_and_draft_and_rejects_resolved_error() {
+    fn auth_recovery_reconnect_preserves_session_and_draft_and_rejects_resolved_error() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, _) = history_fixture(&mut app);
         let runtime = app.chat_runtime_mut(target).unwrap();
@@ -16332,6 +16329,7 @@ mod tests {
         let launch = runtime.session.launch.clone();
         drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
         assert!(app.chat_ui.attempt(card).is_none());
+        app.chat_runtime_mut(target).unwrap().disconnected = true;
         app.chat_runtime_mut(target).unwrap().error = Some("Codex RPC error: Not logged in".into());
         drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
         assert!(app.chat_ui.attempt(card).is_some());
@@ -16479,5 +16477,68 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn auth_recovery_live_resume_dispatches_verification_without_reconnecting_or_replaying() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let failure = "Codex RPC error: Not logged in";
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.error = Some(failure.into());
+        snapshot.busy = false;
+        snapshot.exited = false;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        runtime.replace_draft(text_editor::Content::with_text("unsent recovery draft"));
+        let launch = runtime.session.launch.clone();
+        drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+        assert!(app.chat_ui.attempt(card).is_none());
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.pending.is_some());
+        assert_eq!(runtime.snapshot.error.as_deref(), Some(failure));
+        assert_eq!(runtime.session.launch, launch);
+        assert_eq!(runtime.composer.text(), "unsent recovery draft");
+        assert!(runtime.queued.is_none());
+    }
+    #[test]
+    fn auth_recovery_panel_reads_latest_verification_detail_from_current_snapshot() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let original = "Authentication required. Please sign in again.";
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.error = Some(chat::sign_in_verification_failure(
+            original,
+            "Different login: open Accounts to resolve the identity",
+        ));
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        runtime.error = Some(original.into());
+        assert_eq!(runtime.auth_error(), runtime.snapshot.error.as_deref(), "Resume must capture the authoritative latest failure, not a stale local copy");
+        assert_eq!(
+            runtime.auth_verification_detail(),
+            Some("Different login: open Accounts to resolve the identity")
+        );
+        assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_some());
+        app.chat_runtime_mut(target).unwrap().error = Some(chat::sign_in_verification_failure(original, "older verification detail"));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.error = Some(original.into());
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        assert_eq!(runtime.auth_error(), Some(original));
+        assert_eq!(runtime.auth_verification_detail(), None, "a new plain failure suppresses older local verification detail");
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.error = None;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        runtime.error = None;
+        assert_eq!(runtime.auth_verification_detail(), None);
     }
 }

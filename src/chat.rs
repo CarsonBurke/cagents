@@ -50,6 +50,33 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
                 .any(|phrase| lower.contains(phrase)))
 }
 
+const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
+
+pub(crate) fn sign_in_verification_detail(message: &str) -> Option<&str> {
+    message
+        .split_once(SIGN_IN_VERIFICATION_MARKER)
+        .map(|(_, detail)| detail)
+}
+
+pub(crate) fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
+    let original = failure
+        .split_once(SIGN_IN_VERIFICATION_MARKER)
+        .map_or(failure, |(original, _)| original);
+    let mut chars = detail.chars().map(|character| {
+        if character.is_whitespace() {
+            ' '
+        } else {
+            character
+        }
+    });
+    let mut bounded: String = chars.by_ref().take(512).collect();
+    if chars.next().is_some() {
+        bounded.pop();
+        bounded.push('…');
+    }
+    format!("{original}{SIGN_IN_VERIFICATION_MARKER}{}", bounded.trim())
+}
+
 #[cfg(test)]
 mod authentication_tests {
     use super::*;
@@ -1112,6 +1139,11 @@ pub enum PromptMode {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
+    /// Verify login on the same live actor without replaying any failed prompt.
+    ResumeAfterLogin {
+        failure: String,
+        expected: Option<crate::account::Identity>,
+    },
     Prompt {
         text: String,
         attachments: Vec<Attachment>,
@@ -1826,6 +1858,15 @@ pub enum PlanState {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Event {
+    /// Correlated account/read proof; runtime fences the captured auth failure.
+    LoginRecovered {
+        failure: String,
+    },
+    /// A failed verification is fenced to the same captured auth failure too.
+    LoginVerificationFailed {
+        failure: String,
+        detail: String,
+    },
     /// Providers correlate this to their latest completed turn before emitting
     /// it. The actor adds its monotonic turn generation at publication.
     PromptSuggestion {

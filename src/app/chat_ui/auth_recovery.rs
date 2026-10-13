@@ -9,11 +9,14 @@ pub(super) struct Recovery {
 }
 impl Runtime {
     pub(super) fn auth_error(&self) -> Option<&str> {
-        self.error
+        self.snapshot.error
             .as_deref()
             .into_iter()
-            .chain(self.snapshot.error.as_deref())
+            .chain(self.error.as_deref())
             .find(|error| chat::requires_sign_in(self.session.launch.provider, error))
+    }
+    pub(super) fn auth_verification_detail(&self) -> Option<&str> {
+        self.auth_error().and_then(chat::sign_in_verification_detail)
     }
     pub(super) fn active_auth_notice(&self, anchor: &Option<String>, message: &str) -> bool {
         self.auth_error().is_some()
@@ -84,6 +87,29 @@ impl Cagents {
             && matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
                 if self.auth_account(runtime).is_some_and(|account| self.account_login_change(&account).is_none()))
     }
+    pub(super) fn resume_after_sign_in(&mut self, target: Target) -> Task<Message> {
+        if !self.chat_auth_resume_enabled(target) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
+            return Task::none();
+        };
+        if runtime.disconnected || runtime.snapshot.exited {
+            return self.handle_chat_ui(Action::Reconnect(target));
+        }
+        let Some(failure) = runtime.auth_error().map(str::to_owned) else {
+            return Task::none();
+        };
+        let Some(account) = self.auth_account(runtime) else {
+            return Task::none();
+        };
+        let expected = self.expected_account_login(&account);
+        self.chat_send(
+            target,
+            Command::ResumeAfterLogin { failure, expected },
+            false,
+        )
+    }
     pub(super) fn sign_in_chat(&mut self, target: Target, account: Account) -> Task<Message> {
         if !self.chat_auth_recovery_enabled(target) {
             return Task::none();
@@ -126,13 +152,11 @@ pub(super) fn view<'a>(
                 .on_press_maybe(resume_enabled.then_some(action(Action::ResumeAfterSignIn(target))))
                 .into(),
         );
-        if login_change.is_some() {
-            controls.push(
-                crate::ui_controls::button::secondary("Open accounts")
-                    .on_press(Message::AccountUi(account_ui::Action::OpenPane))
-                    .into(),
-            );
-        }
+        controls.push(
+            crate::ui_controls::button::secondary("Open accounts")
+                .on_press(Message::AccountUi(account_ui::Action::OpenPane))
+                .into(),
+        );
         format!(
             "{} sign-in is no longer valid · {}",
             runtime.session.launch.provider.label(),
@@ -154,6 +178,12 @@ pub(super) fn view<'a>(
             .wrap()
             .into(),
     ];
+    if let Some(detail) = runtime.auth_verification_detail() {
+        rows.insert(
+            1,
+            design::caption(format!("Sign-in verification: {detail}")).into(),
+        );
+    }
     if let Some(detail) = login_change {
         rows.insert(1, design::caption(format!("{detail} Open accounts to explicitly accept that login, or sign in to the expected account before resuming.")).into());
     }
