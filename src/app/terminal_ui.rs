@@ -180,6 +180,29 @@ mod tests {
     }
 
     #[test]
+    fn live_find_refresh_consumes_its_timer_while_the_terminal_is_reconnecting() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let content = SearchContent::of(&output_snapshot(2));
+        let mut find = Find {
+            open: true,
+            query: "needle".into(),
+            searched_content: Some(SearchContent::of(&output_snapshot(1))),
+            ..Find::default()
+        };
+        let pending = find.schedule_refresh(content).unwrap();
+        app.terminal_find.insert(card, find);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.handle_terminal_find(Action::Refresh(card, pending)));
+        let find = app.terminal_find.get_mut(&card).unwrap();
+        assert_eq!(find.refresh_pending, None);
+        assert_eq!(find.searched_content, None);
+        let replacement = find.schedule_refresh(content).unwrap();
+        assert_ne!(replacement, pending);
+        assert!(find.begin_refresh(replacement, content));
+    }
+
+    #[test]
     fn live_find_refresh_is_a_completion_during_modals_and_update_preparation() {
         let card = CardId::new();
         let refresh = Message::TerminalFind(Action::Refresh(card, 7));
@@ -324,6 +347,15 @@ impl Cagents {
             | Action::Refresh(card, _) => *card,
         };
         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+            // Recovery may have parked the card while this timer was asleep.
+            // Consume it even then so the replacement handle can refresh find.
+            if let Action::Refresh(_, generation) = action
+                && let Some(find) = self.terminal_find.get_mut(&card)
+                && find.refresh_pending == Some(generation)
+            {
+                find.refresh_pending = None;
+                find.searched_content = None;
+            }
             return Task::none();
         };
         let opening = matches!(&action, Action::Open(_));
