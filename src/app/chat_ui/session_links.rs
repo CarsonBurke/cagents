@@ -11,9 +11,13 @@ fn unique_destination(
     prefix: &str,
     candidates: Vec<(TerminalId, Destination)>,
 ) -> Result<Destination, String> {
+    // Saved windows can contain multiple views of the same canonical session.
+    // Current-window candidates come first; ambiguity concerns distinct IDs.
+    let mut seen = std::collections::HashSet::new();
     let mut matches = candidates
         .into_iter()
-        .filter(|(session, _)| session.to_string().starts_with(prefix));
+        .filter(|(session, _)| session.to_string().starts_with(prefix))
+        .filter(|(session, _)| seen.insert(*session));
     match (matches.next(), matches.next()) {
         (Some((_, destination)), None) => Ok(destination),
         (None, _) => Err(format!("Session {prefix} is no longer available.")),
@@ -232,6 +236,21 @@ pub(super) fn handoff_session_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_saved_views_of_one_session_are_not_ambiguous() {
+        let session = TerminalId::new();
+        let prefix = &session.to_string()[..8];
+        let destination = unique_destination(
+            prefix,
+            vec![
+                (session, Destination::Local(session)),
+                (session, Destination::Window("peer".into(), session)),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(destination, Destination::Local(id) if id == session));
+    }
 
     #[test]
     fn cross_window_link_requests_a_token_for_its_native_origin_window() {
