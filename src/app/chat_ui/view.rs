@@ -799,8 +799,23 @@ impl Cagents {
     /// panes open could not tell which worktree an agent was about to change.
     /// The directory's own name is used rather than its path, because the path
     /// is long, repetitive between worktrees, and already in the tab tooltip.
-    fn chat_place(&self, directory: &Path) -> Place {
+    fn chat_place(&self, directory: &Path, card: CardId) -> Place {
         Place {
+            channel: self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card))
+                .map(|channel| {
+                    if channel.title.trim().is_empty() {
+                        format!(
+                            "Channel {}",
+                            channel.id.to_string().chars().take(8).collect::<String>()
+                        )
+                    } else {
+                        channel.title.clone()
+                    }
+                }),
             name: directory
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -818,7 +833,7 @@ impl Cagents {
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
-                let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
+                let place = self.chat_place(&runtime.session.launch.recipe.working_directory, card);
                 let accounts = self.chat_accounts(
                     runtime.session.launch.provider,
                     &runtime.session.launch.recipe,
@@ -939,6 +954,7 @@ fn family_label(provider: Provider) -> &'static str {
 
 /// The worktree a conversation runs in.
 struct Place {
+    channel: Option<String>,
     name: String,
     branch: Option<String>,
 }
@@ -955,6 +971,108 @@ impl Runtime {
             text
         }
     }
+    fn native_child_name(agent: &chat::Subagent) -> &str {
+        agent
+            .description
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .or_else(|| (!agent.kind.trim().is_empty()).then_some(agent.kind.trim()))
+            .unwrap_or("Subagent")
+    }
+
+    fn native_child_status(agent: &chat::Subagent) -> &'static str {
+        match agent.status {
+            chat::ToolStatus::Running if agent.waiting => "Waiting for you",
+            chat::ToolStatus::Running => "Working",
+            chat::ToolStatus::Succeeded => "Finished",
+            chat::ToolStatus::Failed => "Failed",
+            chat::ToolStatus::Denied => "Denied",
+            chat::ToolStatus::Stopped => "Stopped",
+        }
+    }
+
+    fn native_child_identity(&self, agent: &chat::Subagent) -> String {
+        let provider = match self.session.launch.provider {
+            Provider::Codex => "Codex",
+            Provider::Claude => "Claude",
+            Provider::Omp => "OMP",
+        };
+        let model = agent
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or("Model not reported");
+        let mut identity = format!(
+            "{provider} native subagent · {} · {} · {}",
+            Self::short_description(Self::native_child_name(agent), 80),
+            Self::short_description(model, 80),
+            Self::native_child_status(agent)
+        );
+        if !agent.detail.trim().is_empty() {
+            identity.push_str(" · ");
+            identity.push_str(&Self::short_description(agent.detail.trim(), 120));
+        }
+        identity
+    }
+
+    /// Completion requires provider evidence; an idle, attached conversation
+    /// without that evidence is ready, while an unattached one is connecting.
+    fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
+        let snapshot = &self.snapshot;
+        if self.queued.is_some() {
+            (Some(Icon::AgentWorking), "Starting")
+        } else if transitioning {
+            (Some(Icon::AgentWorking), "Switching session")
+        } else if self.attachment_chooser_pending {
+            (Some(Icon::AgentWorking), "Choosing attachments")
+        } else if self.pending.is_some() {
+            (Some(Icon::AgentWorking), "Sending")
+        } else if self.disconnected {
+            (Some(Icon::Warning), "Disconnected")
+        } else if snapshot.exited && self.session.owns_codex_listener() {
+            (Some(Icon::Warning), "Unavailable")
+        } else if snapshot.exited {
+            (Some(Icon::Warning), "Exited")
+        } else if snapshot.waiting || !snapshot.requests.is_empty() {
+            (Some(Icon::AgentWaiting), "Waiting for you")
+        } else if !snapshot.busy
+            && snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running)
+        {
+            (Some(Icon::AgentWaiting), "Subagents waiting")
+        } else if snapshot.is_working() {
+            (
+                Some(Icon::AgentWorking),
+                if !snapshot.busy {
+                    "Subagents working"
+                } else if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
+                    activity_label(snapshot)
+                } else {
+                    snapshot.detail.as_str()
+                },
+            )
+        } else if snapshot.finished_at.is_some() {
+            match snapshot.detail.as_str() {
+                "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
+                "Turn failed" => (Some(Icon::Warning), "Failed"),
+                _ if self.error.is_some() || snapshot.error.is_some() => {
+                    (Some(Icon::Warning), "Finished with error")
+                }
+                _ => (Some(Icon::Check), "Finished"),
+            }
+        } else if self.error.is_some() || snapshot.error.is_some() {
+            (Some(Icon::Warning), "Error")
+        } else if snapshot.ready {
+            (None, "Ready")
+        } else {
+            (Some(Icon::AgentWorking), "Connecting")
+        }
+    }
+
     fn view<'a>(
         &'a self,
         transitioning: bool,
@@ -989,28 +1107,13 @@ impl Runtime {
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut anchors = Vec::new();
         let mut transcript = Vec::new();
+        let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
-            let heading = if agent.description.is_empty() {
-                if agent.kind.is_empty() {
-                    "Subagent".to_owned()
-                } else {
-                    agent.kind.clone()
-                }
-            } else {
-                format!(
-                    "{} · {}",
-                    if agent.kind.is_empty() {
-                        "Subagent"
-                    } else {
-                        &agent.kind
-                    },
-                    Self::short_description(&agent.description, 160),
-                )
-            };
+            let heading = self.native_child_identity(agent);
             let heading = design::caption(heading)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill);
-            transcript.push(
+            selected_identity = Some(
                 if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
                 {
                     widget::row::with_children(vec![
@@ -1429,16 +1532,10 @@ impl Runtime {
                 None,
             )];
             for agent in snapshot.subagents.iter().rev() {
-                let label = if agent.description.is_empty() {
-                    if agent.kind.is_empty() {
-                        "Subagent".to_owned()
-                    } else {
-                        agent.kind.clone()
-                    }
-                } else {
-                    agent.description.clone()
-                };
-                let marker = if agent.status == chat::ToolStatus::Running {
+                let label = Self::native_child_name(agent);
+                let marker = if agent.status == chat::ToolStatus::Running && agent.waiting {
+                    crate::ui_controls::passive_icon(Icon::AgentWaiting, design::COMPACT_ICON_SIZE)
+                } else if agent.status == chat::ToolStatus::Running {
                     crate::ui_controls::activity_spinner(
                         f32::from(design::COMPACT_ICON_SIZE),
                         design::accent_color,
@@ -1453,17 +1550,10 @@ impl Runtime {
                         design::COMPACT_ICON_SIZE,
                     )
                 };
-                let status = match agent.status {
-                    chat::ToolStatus::Running => "Running",
-                    chat::ToolStatus::Succeeded => "Completed",
-                    chat::ToolStatus::Failed => "Failed",
-                    chat::ToolStatus::Denied => "Denied",
-                    chat::ToolStatus::Stopped => "Stopped",
-                };
                 tabs.push(crate::ui_controls::view_tab(
                     crate::ui_controls::ViewTab {
-                        label: Self::short_description(&label, 56).into(),
-                        description: format!("{label} · {status}").into(),
+                        label: format!("Native · {}", Self::short_description(label, 48)).into(),
+                        description: self.native_child_identity(agent).into(),
                         count: None,
                         selected: selected.is_some_and(|active| active.id == agent.id),
                         id: None,
@@ -1483,6 +1573,13 @@ impl Runtime {
                 height,
                 height + design::BORDER_WIDTH,
             ));
+        }
+        if let Some(identity) = selected_identity {
+            content.push(
+                widget::container(identity)
+                    .padding([space::XS, space::M])
+                    .into(),
+            );
         }
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
@@ -2009,61 +2106,43 @@ impl Runtime {
         // sessions, that something is being sent, that the agent has stopped
         // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let failed = self.error.is_some() || snapshot.error.is_some();
-        let (glyph, state): (Option<Icon>, &str) = if self.queued.is_some() {
-            (Some(Icon::AgentWorking), "Starting")
-        } else if transitioning {
-            (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending {
-            (Some(Icon::AgentWorking), "Choosing attachments")
-        } else if self.pending.is_some() {
-            (Some(Icon::AgentWorking), "Sending")
-        } else if self.disconnected {
-            (Some(Icon::Warning), "Disconnected")
-        } else if snapshot.exited && self.session.owns_codex_listener() {
-            (Some(Icon::Warning), "Unavailable")
-        } else if snapshot.exited {
-            (Some(Icon::Warning), "Exited")
-        } else if failed {
-            (Some(Icon::Warning), "Error")
-        } else if snapshot.waiting || !snapshot.requests.is_empty() {
-            (Some(Icon::AgentWaiting), "Waiting for you")
-        } else if snapshot.is_working() {
-            (
-                Some(Icon::AgentWorking),
-                if !snapshot.busy {
-                    "Subagents working"
-                } else if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
-                    activity_label(snapshot)
-                } else {
-                    snapshot.detail.as_str()
-                },
-            )
-        } else {
-            (None, "")
-        };
+        let (glyph, state) = self.conversation_status(transitioning);
         if let Some(glyph) = glyph {
-            status.push(
-                if glyph == Icon::AgentWorking || glyph == Icon::AgentWaiting {
-                    crate::ui_controls::activity_spinner(
-                        f32::from(design::ROW_ICON_SIZE),
-                        design::accent_color,
-                    )
-                } else {
-                    crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
-                },
-            );
+            status.push(if glyph == Icon::AgentWorking {
+                crate::ui_controls::activity_spinner(
+                    f32::from(design::ROW_ICON_SIZE),
+                    design::accent_color,
+                )
+            } else {
+                crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
+            });
         }
         if !state.is_empty() {
             status.push(
                 design::caption(state)
-                    .class(if failed && !transitioning && self.pending.is_none() {
-                        cosmic::theme::Text::Custom(design::warning_text)
-                    } else {
-                        cosmic::theme::Text::default()
-                    })
+                    .class(
+                        if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none()
+                        {
+                            cosmic::theme::Text::Custom(design::warning_text)
+                        } else {
+                            cosmic::theme::Text::default()
+                        },
+                    )
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
+            );
+        }
+        if let Some(channel) = &place.channel {
+            status.push(
+                crate::interaction::tooltip(
+                    design::caption(format!(
+                        "Channel · {}",
+                        Self::short_description(channel, 40)
+                    ))
+                    .wrapping(iced::widget::text::Wrapping::None),
+                    format!("Channel: {channel}"),
+                )
+                .into(),
             );
         }
         if !place.name.is_empty() {
@@ -3518,7 +3597,7 @@ impl Runtime {
                     },
                 );
             let finished = reasoning_finished(items, busy, &item.id);
-            let expanded = !finished || self.expanded.contains(&item.id);
+            let expanded = self.expanded.contains(&item.id);
             let elapsed = item.started_at.or(item.at).and_then(|start| {
                 items
                     .iter()
@@ -3528,7 +3607,14 @@ impl Runtime {
                     .map(|end| format_duration(end.saturating_sub(start)))
             });
             let label = elapsed.filter(|_| finished).map_or_else(
-                || "Thought process".to_owned(),
+                || {
+                    if finished {
+                        "Thought process"
+                    } else {
+                        "Thinking…"
+                    }
+                    .to_owned()
+                },
                 |elapsed| format!("Thought for {elapsed}"),
             );
             let mut rows = vec![
@@ -4250,6 +4336,291 @@ mod frame_cost;
 mod tests {
     use super::*;
 
+    fn native_child_fixture() -> chat::Subagent {
+        chat::Subagent {
+            id: "native-child".into(),
+            kind: "Scout".into(),
+            description: "Inspect repository".into(),
+            status: chat::ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        assert_eq!(runtime.conversation_status(false).1, "Ready");
+        Arc::make_mut(&mut runtime.snapshot).ready = false;
+        assert_eq!(runtime.conversation_status(false).1, "Connecting");
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.finished_at = Some(42);
+        assert_eq!(runtime.conversation_status(false).1, "Finished");
+        Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
+        assert_eq!(runtime.conversation_status(false).1, "Interrupted");
+        Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
+        assert_eq!(runtime.conversation_status(false).1, "Failed");
+        Arc::make_mut(&mut runtime.snapshot).detail.clear();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        assert_ne!(
+            runtime.conversation_status(false).1,
+            "Finished",
+            "old completion cannot mask a new turn"
+        );
+        Arc::make_mut(&mut runtime.snapshot).error = Some("Earlier history unavailable".into());
+        assert_eq!(
+            runtime.conversation_status(false).0,
+            Some(Icon::AgentWorking)
+        );
+        Arc::make_mut(&mut runtime.snapshot).waiting = true;
+        assert_eq!(runtime.conversation_status(false).1, "Waiting for you");
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.waiting = false;
+        snapshot.busy = false;
+        assert_eq!(runtime.conversation_status(false).1, "Finished with error");
+        Arc::make_mut(&mut runtime.snapshot).error = None;
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents.push(native_child_fixture());
+        assert_eq!(runtime.conversation_status(false).1, "Subagents working");
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+        assert_eq!(runtime.conversation_status(false).1, "Subagents waiting");
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Succeeded;
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "Finished",
+            "terminal children cannot retain waiting state"
+        );
+        runtime.disconnected = true;
+        assert_eq!(runtime.conversation_status(false).1, "Disconnected");
+    }
+
+    #[test]
+    fn native_child_identity_uses_its_reported_model_and_waiting_state() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        Arc::make_mut(&mut runtime.snapshot).selected_model = Some("parent-model".into());
+        let mut child = native_child_fixture();
+        let unknown = runtime.native_child_identity(&child);
+        assert!(unknown.contains("Claude native subagent"));
+        assert!(unknown.contains("Model not reported"));
+        assert!(!unknown.contains("parent-model"));
+        child.model = Some("child-model".into());
+        child.waiting = true;
+        child.detail = "Waiting for your approval".into();
+        let known = runtime.native_child_identity(&child);
+        assert!(known.contains("child-model"));
+        assert!(known.contains("Waiting for you"));
+        assert!(known.contains("Waiting for your approval"));
+        child.status = chat::ToolStatus::Succeeded;
+        assert_eq!(Runtime::native_child_status(&child), "Finished");
+    }
+
+    #[test]
+    fn selected_native_child_renders_identity_channel_and_distinct_tab() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let mut child = native_child_fixture();
+        child.model = Some("child-model".into());
+        child.waiting = true;
+        child.detail = "Waiting for your approval".into();
+        runtime.selected_subagent = Some(child.id.clone());
+        Arc::make_mut(&mut runtime.snapshot).subagents.push(child);
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            false,
+            true,
+            &shortcuts,
+            600.0,
+            Place {
+                name: "project".into(),
+                branch: None,
+                channel: Some("Review".into()),
+            },
+            true,
+            None,
+            vec![],
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let labels: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Claude native subagent")
+                    && label.contains("child-model")
+                    && label.contains("Waiting for you")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Native · Inspect repository")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Channel · Review")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("Conversation")),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_disclosure_toggles_through_actions_and_retains_streaming_choice() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        fn runtime(app: &Cagents, target: Target) -> &Runtime {
+            match app.cards.get(&target.card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => panic!("the fixture chat remains mounted"),
+            }
+        }
+        let item = chat::Item {
+            id: "live-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Secret reasoning body".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (mut live, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        Arc::make_mut(&mut live.snapshot).busy = true;
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let renderer = crate::app::tests::headless_renderer();
+        let view = |app: &Cagents| {
+            let runtime = runtime(app, target);
+            let item = &runtime.snapshot.items[0];
+            runtime.text_view(
+                item,
+                &runtime.cache[&item.id],
+                turn::Slot::Thinking,
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            )
+        };
+        let mut tree = Tree::new(view(&app).as_widget());
+        for (step_index, expanded) in [false, true, true, false].into_iter().enumerate() {
+            assert_eq!(
+                runtime(&app, target).expanded.contains("live-thought"),
+                expanded,
+                "the actual Toggle action controls the disclosure state"
+            );
+            let mut element = view(&app);
+            tree.diff(element.as_widget_mut());
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 800.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let values: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .flat_map(|node| {
+                    [node.node().value(), node.node().label()]
+                        .into_iter()
+                        .flatten()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(
+                values
+                    .iter()
+                    .any(|value| value.contains("Secret reasoning body")),
+                expanded,
+                "step={step_index} expanded={expanded} markdown_items={} exposed={values:?}",
+                runtime(&app, target).cache["live-thought"]
+                    .markdown
+                    .items()
+                    .len()
+            );
+            if expanded && !values.iter().any(|value| value.contains("streamed detail")) {
+                // Publish a live delta while open, then keep the same widget tree.
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                let mut snapshot = runtime.snapshot.as_ref().clone();
+                let mut item = snapshot.items[0].as_ref().clone();
+                if let ItemContent::Text { text, .. } = &mut item.content {
+                    text.push_str(" streamed detail");
+                }
+                snapshot.items[0] = Arc::new(item);
+                handle.publish_snapshot_for_test(snapshot);
+                runtime.refresh();
+                assert!(runtime.expanded.contains("live-thought"));
+                continue;
+            }
+            if step_index == 3 {
+                break;
+            }
+            let pointer = iced::Point::new(36.0, 16.0);
+            let mut messages = Vec::new();
+            for event in [
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Available(pointer),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            let toggle = messages
+                .into_iter()
+                .find_map(|message| match message {
+                    Message::ChatUi(Action::Toggle(actual, id)) if actual == target => Some(id),
+                    _ => None,
+                })
+                .expect("the native reasoning button emits a disclosure action");
+            drop(app.handle_chat_ui(Action::Toggle(target, toggle)));
+            assert_eq!(
+                runtime(&app, target).expanded.contains("live-thought"),
+                !expanded,
+                "published Toggle must update the mounted runtime"
+            );
+        }
+    }
+
     #[test]
     fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
         use iced::advanced::{Layout, layout, widget::Tree};
@@ -4464,6 +4835,7 @@ mod tests {
             &shortcuts,
             600.0,
             Place {
+                channel: None,
                 name: "Fixture".into(),
                 branch: None,
             },
@@ -4529,6 +4901,7 @@ mod tests {
                     &shortcuts,
                     width,
                     Place {
+                        channel: None,
                         name: "Fixture".into(),
                         branch: None,
                     },

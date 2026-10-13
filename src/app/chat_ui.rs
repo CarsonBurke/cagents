@@ -1002,7 +1002,8 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
-            coordination: coordination.map(|reading| Box::new(coordination::Coordinated::new(reading))),
+            coordination: coordination
+                .map(|reading| Box::new(coordination::Coordinated::new(reading))),
         };
         if cached.coordination.is_some() {
             cached.highlight(theme);
@@ -1124,25 +1125,32 @@ impl CachedItem {
             .iter()
             .flat_map(|coordinated| coordinated.contents())
             .flat_map(markdown::Content::items);
-        for_each_fence(self.markdown.items().iter().chain(coordinated), &mut |language, code| {
-            let key = fence_key(language.unwrap_or_default(), code);
-            last = Some(key);
-            if blocks.contains_key(&key) {
-                return;
-            }
-            let block = previous
-                .remove(&key)
-                .or_else(|| {
-                    let mut block = previous.remove(&open.take()?)?;
-                    block
-                        .extend(language.and_then(prose::fence_language), code)
-                        .then_some(block)
-                })
-                .unwrap_or_else(|| {
-                    prose::CodeBlock::open(language.and_then(prose::fence_language), code, theme)
-                });
-            blocks.insert(key, block);
-        });
+        for_each_fence(
+            self.markdown.items().iter().chain(coordinated),
+            &mut |language, code| {
+                let key = fence_key(language.unwrap_or_default(), code);
+                last = Some(key);
+                if blocks.contains_key(&key) {
+                    return;
+                }
+                let block = previous
+                    .remove(&key)
+                    .or_else(|| {
+                        let mut block = previous.remove(&open.take()?)?;
+                        block
+                            .extend(language.and_then(prose::fence_language), code)
+                            .then_some(block)
+                    })
+                    .unwrap_or_else(|| {
+                        prose::CodeBlock::open(
+                            language.and_then(prose::fence_language),
+                            code,
+                            theme,
+                        )
+                    });
+                blocks.insert(key, block);
+            },
+        );
         for (key, block) in &mut blocks {
             if Some(*key) != last {
                 block.settle();
@@ -3327,7 +3335,10 @@ impl Cagents {
                     .get(&item.id)
                     .and_then(|cached| cached.coordination.as_deref());
                 let mut unfolded = false;
-                for (part, text) in coordinated.map(coordination::Coordinated::parts).unwrap_or_default() {
+                for (part, text) in coordinated
+                    .map(coordination::Coordinated::parts)
+                    .unwrap_or_default()
+                {
                     if find::contains(text, query) {
                         unfolded = true;
                         runtime
@@ -3339,7 +3350,7 @@ impl Cagents {
                 // match is only in the command or output it was read from.
                 let raw = match coordinated {
                     Some(coordinated) if coordinated.is_card() => !unfolded,
-                    _ => turn.steps.contains(placed),
+                    _ => turn.steps.contains(placed) || placed.slot == turn::Slot::Thinking,
                 };
                 if raw
                     && contains_text(&item.content, query)
@@ -7012,13 +7023,11 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime
-                        .find_disclosure
-                        .restore(
-                            &mut runtime.expanded,
-                            &mut runtime.unfolded,
-                            &mut runtime.opened,
-                        );
+                    runtime.find_disclosure.restore(
+                        &mut runtime.expanded,
+                        &mut runtime.unfolded,
+                        &mut runtime.opened,
+                    );
                     runtime.find = Some(query);
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
@@ -7028,13 +7037,11 @@ impl Cagents {
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
             Action::CloseFind(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime
-                        .find_disclosure
-                        .restore(
-                            &mut runtime.expanded,
-                            &mut runtime.unfolded,
-                            &mut runtime.opened,
-                        );
+                    runtime.find_disclosure.restore(
+                        &mut runtime.expanded,
+                        &mut runtime.unfolded,
+                        &mut runtime.opened,
+                    );
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
@@ -7235,7 +7242,10 @@ impl Cagents {
                                 previous,
                                 runtime.expanded.contains(&id),
                                 false,
-                                chat::coordination::recognize(item, runtime.session.launch.provider),
+                                chat::coordination::recognize(
+                                    item,
+                                    runtime.session.launch.provider,
+                                ),
                             ),
                         );
                     }
@@ -7296,9 +7306,9 @@ impl Cagents {
                             match card {
                                 // A message read from a file copies as the
                                 // command that sent it.
-                                Some(card) if matches!(part, CopyPart::Text) => card
-                                    .copy_text()
-                                    .or_else(|| copy_text(part, &item.content)),
+                                Some(card) if matches!(part, CopyPart::Text) => {
+                                    card.copy_text().or_else(|| copy_text(part, &item.content))
+                                }
                                 _ => copy_text(part, &item.content),
                             }
                         }),
@@ -10325,6 +10335,33 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).active_scroll(), child);
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn finding_collapsed_reasoning_reveals_it_and_restores_disclosure() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("find-reasoning"));
+        let target = chat_runtime(&app, card).target;
+        let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.busy = true;
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "reasoning".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Unique reasoning needle".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: None,
+            at: None,
+        })];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        assert!(chat_runtime(&app, card).expanded.contains("reasoning"));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
     }
 
     #[test]

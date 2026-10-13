@@ -356,6 +356,7 @@ impl Pane {
             &self.shortcuts,
             720.0,
             Place {
+                channel: None,
                 name: "project".into(),
                 branch: None,
             },
@@ -694,9 +695,11 @@ fn a_refresh_of_a_full_window_with_metadata() {
     for _ in 0..FRAMES {
         let clock = Instant::now();
         let cache = &pane.runtime.cache;
-        let turns = turn::group(&pane.runtime.snapshot.items, &pane.runtime.asked_after, |item| {
-            cache.get(&item.id)?.coordination.as_deref()
-        });
+        let turns = turn::group(
+            &pane.runtime.snapshot.items,
+            &pane.runtime.asked_after,
+            |item| cache.get(&item.id)?.coordination.as_deref(),
+        );
         group.0.push(clock.elapsed());
         std::hint::black_box(turns);
         let clock = Instant::now();

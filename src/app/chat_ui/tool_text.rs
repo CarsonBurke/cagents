@@ -71,7 +71,7 @@ impl Preview {
                 output,
                 ..
             } if label.is_empty() || label == command => {
-                (command.as_str(), Language::Shell, output.as_str())
+                (turn::first_line(command), Language::Shell, output.as_str())
             }
             ItemContent::Command {
                 action: chat::CommandAction::Run,
@@ -250,6 +250,9 @@ impl ToolText {
         ])))
         .width(Length::Fill)
         .into();
+        // Find reveals the matching source in the outer transcript. A nested
+        // viewport would otherwise keep a deep match hidden at its old offset.
+        let limit = limit.filter(|_| !find.is_some_and(|query| find::contains(&self.text, query)));
         let Some((height, follows)) = limit else {
             return body;
         };
@@ -408,6 +411,43 @@ mod tests {
             0.0
         );
         assert!(offset(block.view(theme, Some(120.0), target, None)) > 0.0);
+    }
+
+    #[test]
+    fn finding_a_deep_source_match_reveals_it_without_an_inner_scroll_barrier() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let source = format!("{}needle at the end", "ordinary line\n".repeat(200));
+        let block = ToolText::update(None, &source, Language::Shell);
+        let height = |query| {
+            let mut element = block.view_from_start(
+                crate::settings::EditorSyntaxTheme::Auto,
+                320.0,
+                target,
+                query,
+            );
+            let mut tree = Tree::new(&element);
+            element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 10000.0)),
+                )
+                .size()
+                .height
+        };
+        assert!(height(None) <= 320.0);
+        assert!(height(Some("absent")) <= 320.0);
+        assert!(height(Some("needle")) > 320.0);
+        assert!(
+            height(None) <= 320.0,
+            "closing Find restores bounded details"
+        );
     }
 
     #[test]
@@ -598,6 +638,36 @@ mod tests {
             copy_text(CopyPart::Input, &item).as_deref(),
             Some(source.as_str())
         );
+    }
+
+    #[test]
+    fn shell_preview_hides_payload_but_copy_preserves_complete_command() {
+        let source = "cat > tests.rs <<'EOF'\nprivate payload\nEOF";
+        let content = ItemContent::Command {
+            label: source.into(),
+            command: source.into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Running,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        };
+        let preview = Preview::update(None, &content, crate::settings::EditorSyntaxTheme::Auto);
+        assert_eq!(preview.text.as_str(), "cat > tests.rs <<'EOF'");
+        assert_eq!(
+            copy_text(CopyPart::Input, &content).as_deref(),
+            Some(source)
+        );
+        let cached = CachedItem::updated(
+            &content,
+            crate::settings::EditorSyntaxTheme::Auto,
+            None,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(cached.tool_input.as_ref().unwrap().text.as_ref(), source);
     }
 
     #[test]
