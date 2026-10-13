@@ -550,7 +550,12 @@ impl Handle {
         // `completed` is published only once teardown finished; `draining` the moment
         // the actor stopped consuming its command channel.
         let exiting = self.is_completed() || self.0.draining.load(Ordering::Acquire);
-        if exiting && matches!(command, Command::LoadEarlier | Command::Refresh) {
+        if exiting
+            && matches!(
+                command,
+                Command::LoadEarlier | Command::LoadLater | Command::Refresh
+            )
+        {
             let cached = page_command(&self.0.store, &command).map_err(Rejection::Refused)?;
             if command == Command::LoadEarlier && !cached {
                 return Err(Rejection::Refused("Earlier cached history is exhausted; the exited provider must be explicitly resumed to load more".into()));
@@ -1918,7 +1923,10 @@ impl Actor {
                     continue;
                 }
             };
-            if matches!(command, Command::LoadEarlier | Command::Refresh) {
+            if matches!(
+                command,
+                Command::LoadEarlier | Command::LoadLater | Command::Refresh
+            ) {
                 match page_command(&self.store, &command) {
                     Ok(cached) => {
                         self.touch();
@@ -2291,6 +2299,7 @@ fn page_command(store: &Mutex<Store>, command: &Command) -> Result<bool, String>
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     match command {
         Command::LoadEarlier => store.earlier(),
+        Command::LoadLater => store.later(),
         Command::Refresh => {
             store.latest();
             Ok(false)

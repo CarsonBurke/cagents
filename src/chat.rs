@@ -1102,6 +1102,8 @@ pub enum Command {
     Branch {
         id: Option<String>,
     },
+    /// Read the next bounded window of already cached transcript history.
+    LoadLater,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

@@ -1262,7 +1262,7 @@ fn snapshot_channel_name(
 enum HistoryNavigation {
     EarlierEdge,
     EarlierExplicit,
-    LatestEdge,
+    NewerEdge,
     Latest,
 }
 
@@ -5433,12 +5433,12 @@ impl Cagents {
         };
         match page {
             HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
-            HistoryNavigation::LatestEdge
+            HistoryNavigation::NewerEdge
                 if runtime.scroll.at_bottom()
                     && !runtime.scroll.at_top()
                     && runtime.snapshot.has_later =>
             {
-                self.handle_chat_action(Action::Latest(target))
+                self.chat_send(target, Command::LoadLater, false)
             }
             HistoryNavigation::EarlierExplicit if runtime.snapshot.has_earlier => {
                 self.chat_send(target, Command::LoadEarlier, false)
@@ -5505,12 +5505,20 @@ impl Cagents {
         {
             return Task::none();
         }
+        if command == Command::LoadLater
+            && (runtime.selected_subagent.is_some()
+                || !runtime.snapshot.has_later
+                || runtime.snapshot.history_loading
+                || runtime.page_request.is_some())
+        {
+            return Task::none();
+        }
         // The ACK confirms dispatch, not arrival of the newest history.
         // Coalesce repeated gestures while that same navigation is in flight.
         if command == Command::Refresh
             && runtime
                 .page_request
-                .is_some_and(|(page, _)| page == view::Page::Newer)
+                .is_some_and(|(page, _)| page == view::Page::Latest)
         {
             return Task::none();
         }
@@ -5518,14 +5526,17 @@ impl Cagents {
         let id = runtime.next_command;
         let page = match &command {
             Command::LoadEarlier => Some(view::Page::Earlier),
-            Command::Refresh => Some(view::Page::Newer),
+            Command::Refresh => Some(view::Page::Latest),
+            Command::LoadLater => Some(view::Page::Newer),
             _ => None,
         };
         if let Some(page) = page {
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
                 view::Page::Earlier => runtime.earlier_asked = Some(runtime.scroll.content()),
-                view::Page::Newer => runtime.later_asked = Some(runtime.scroll.content()),
+                view::Page::Newer | view::Page::Latest => {
+                    runtime.later_asked = Some(runtime.scroll.content())
+                }
             }
         }
         let first_prompt = match &command {
@@ -7179,12 +7190,12 @@ impl Cagents {
                             runtime.answers.retain(|(id, _), _| id != &request);
                         }
                         runtime.refresh();
-                        if pending.page == Some(view::Page::Newer)
+                        if pending.page == Some(view::Page::Latest)
                             && runtime.deferred_page == Some(HistoryNavigation::Latest)
                         {
                             runtime.deferred_page = None;
                         }
-                        if pending.page == Some(view::Page::Newer)
+                        if pending.page == Some(view::Page::Latest)
                             && runtime.selected_subagent.is_none()
                         {
                             let snap = iced::widget::scrollable::snap_to(
@@ -7474,7 +7485,7 @@ impl Cagents {
                             if !runtime
                                 .pending
                                 .as_ref()
-                                .is_some_and(|pending| pending.page == Some(view::Page::Newer))
+                                .is_some_and(|pending| pending.page == Some(view::Page::Latest))
                             {
                                 runtime.deferred_page = Some(HistoryNavigation::Latest);
                             }
@@ -8016,7 +8027,7 @@ impl Cagents {
                     runtime.earlier_asked = None;
                 }
                 if !at_bottom {
-                    if runtime.deferred_page == Some(HistoryNavigation::LatestEdge) {
+                    if runtime.deferred_page == Some(HistoryNavigation::NewerEdge) {
                         runtime.deferred_page = None;
                     }
                     runtime.later_asked = None;
@@ -8053,11 +8064,11 @@ impl Cagents {
                 {
                     if runtime.pending.is_some() {
                         if runtime.deferred_page.is_none() {
-                            runtime.deferred_page = Some(HistoryNavigation::LatestEdge);
+                            runtime.deferred_page = Some(HistoryNavigation::NewerEdge);
                         }
                         return Task::none();
                     }
-                    return self.chat_send(target, Command::Refresh, false);
+                    return self.chat_send(target, Command::LoadLater, false);
                 }
             }
             Action::ModelPicker(target, open) => {
@@ -9732,7 +9743,7 @@ mod tests {
         let _ = app.handle_chat_ui(Action::Latest(target));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
     }
 
@@ -10168,7 +10179,7 @@ mod tests {
         )));
         assert_eq!(
             chat_runtime(&app, card).deferred_page,
-            Some(HistoryNavigation::LatestEdge)
+            Some(HistoryNavigation::NewerEdge)
         );
         drop(app.handle_chat_ui(Action::Scrolled(
             target,
@@ -10179,6 +10190,23 @@ mod tests {
         assert!(chat_runtime(&app, card).deferred_page.is_none());
         settle(&mut app, card, Ok(()));
         assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn history_bottom_requests_cached_next_page_instead_of_refreshing_to_latest() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            true,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Newer)
+        );
     }
 
     #[test]
@@ -10211,7 +10239,7 @@ mod tests {
         settle(&mut app, card, Ok(()));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
     }
 
@@ -10255,7 +10283,7 @@ mod tests {
         settle(&mut app, card, Ok(()));
         assert_eq!(
             chat_runtime(&app, card).page_request.map(|(page, _)| page),
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert!(chat_runtime(&app, card).pending.is_none());
@@ -10313,7 +10341,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
     }
 

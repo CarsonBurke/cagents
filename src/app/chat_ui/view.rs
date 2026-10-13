@@ -581,6 +581,7 @@ pub(super) fn completion_scroll(target: Target, offset: f32) -> Task<Message> {
 pub(super) enum Page {
     Earlier,
     Newer,
+    Latest,
 }
 
 /// Where the transcript's viewport sits in the conversation it is scrolling.
@@ -626,8 +627,7 @@ impl Scroll {
     ///
     /// The newest message a conversation has is not always the newest one
     /// loaded: paging back through history pins the window to an older page,
-    /// and reaching the bottom of that page is how a reader asks to be
-    /// returned to the live end of the conversation.
+    /// and reaching the bottom asks for the next cached page toward its live end.
     pub(super) fn at_bottom(self) -> bool {
         self.travel() <= 0.0 || self.from_top >= self.travel() - self.page_reach()
     }
@@ -1245,7 +1245,6 @@ impl Runtime {
                 transcript.push(notice_entry(error, target));
             }
             for turn in &self.turns {
-                anchors.push((transcript.len(), turn.key.as_str()));
                 transcript.push(self.turn_view(turn, markdown_settings, dark));
                 for (_, error) in self
                     .failures
@@ -1278,7 +1277,7 @@ impl Runtime {
                     target,
                     Page::Newer,
                     self.paging() == Some(Page::Newer),
-                    self.disconnected || self.paging() == Some(Page::Newer),
+                    self.disconnected || self.paging().is_some(),
                 ));
             }
             if let Some(queued) = &self.queued {
@@ -1417,28 +1416,34 @@ impl Runtime {
                 target,
                 self.selected_subagent.as_deref(),
                 anchors,
+                selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
+                snapshot
+                    .items
+                    .iter()
+                    .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
+                    .chain(self.turns.iter().flat_map(|turn| {
+                        let key = turn
+                            .steps
+                            .first()
+                            .and_then(|step| snapshot.items.get(step.index));
+                        turn.steps.iter().filter_map(move |step| {
+                            Some((
+                                scroll::steps_id(&key?.id),
+                                snapshot.items.get(step.index)?.id.as_str(),
+                            ))
+                        })
+                    }))
+                    .collect(),
             ),
             target,
             self.selected_subagent.as_deref(),
         ));
-        if !self.active_scroll().at_bottom() || (selected.is_none() && snapshot.has_later) {
+        if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
-                widget::button::custom(design::caption(
-                    if selected.is_none() && self.unseen_activity {
-                        "↓ New activity"
-                    } else {
-                        "↓ Jump to latest"
-                    },
-                ))
-                .class(crate::ui_controls::control_style(
-                    selected.is_none() && self.unseen_activity,
-                    None,
-                ))
-                .on_press_maybe(
-                    (selected.is_some() || !self.disconnected || !snapshot.has_later)
-                        .then(|| action(Action::Latest(target))),
-                )
-                .into(),
+                widget::button::custom(design::caption("↓ New activity"))
+                    .class(crate::ui_controls::control_style(true, None))
+                    .on_press_maybe((!self.disconnected).then(|| action(Action::Latest(target))))
+                    .into(),
             );
         }
         // A draft starting for its first message says so on the message
@@ -2991,21 +2996,32 @@ impl Runtime {
                 continue;
             };
             if !matches!(item.content, ItemContent::Delivery { .. }) {
-                rows.push(self.prompt_view(item));
+                rows.push(scroll::item(&item.id, self.prompt_view(item)));
             } else if let Some(cached) = self.cache.get(&item.id) {
                 // Drawn once its body is parsed, as an answer is; never in the
                 // user's own bubble.
-                rows.push(self.delivery_view(item, cached, settings));
+                rows.push(scroll::item(
+                    &item.id,
+                    self.delivery_view(item, cached, settings),
+                ));
             }
         }
         if !turn.steps.is_empty() {
-            rows.push(self.step_strip(turn, || {
+            let mut strip = self.step_strip(turn, || {
                 turn.steps
                     .iter()
                     .filter_map(|placed_step| placed(placed_step.index))
-                    .map(|(item, cached)| step(item, cached))
+                    .map(|(item, cached)| scroll::item(&item.id, step(item, cached)))
                     .collect()
-            }));
+            });
+            // One measured strip supplies aliases for folded steps; expanded
+            // rows below it supply their own, more precise item bounds.
+            if let Some(item) = turn.steps.first().and_then(|step| items.get(step.index)) {
+                strip = widget::container(strip)
+                    .id(scroll::steps_id(&item.id))
+                    .into();
+            }
+            rows.push(strip);
         }
         for prose in &turn.prose {
             let Some((item, cached)) = placed(prose.index) else {
@@ -3014,16 +3030,19 @@ impl Runtime {
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
-                rows.push(card(item, cached, coordinated));
+                rows.push(scroll::item(&item.id, card(item, cached, coordinated)));
                 continue;
             }
-            rows.push(match &item.content {
-                ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
-                ItemContent::Image { .. } => self.image_preview(item, cached),
-                // Anything else in the answer slot is a step the grouping did
-                // not recognize, drawn the way a step is.
-                _ => step(item, cached),
-            });
+            rows.push(scroll::item(
+                &item.id,
+                match &item.content {
+                    ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
+                    ItemContent::Image { .. } => self.image_preview(item, cached),
+                    // Anything else in the answer slot is a step the grouping did
+                    // not recognize, drawn the way a step is.
+                    _ => step(item, cached),
+                },
+            ));
         }
         widget::container(
             widget::column::with_children(rows)
@@ -3803,7 +3822,8 @@ fn paging_view(
         .into(),
         design::caption(match page {
             Page::Earlier => "Load earlier history",
-            Page::Newer => "Jump to latest messages",
+            Page::Newer => "Load newer history",
+            Page::Latest => "Loading recent history…",
         })
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .into(),
@@ -3818,7 +3838,8 @@ fn paging_view(
         .on_press_maybe((!blocked).then(|| {
             action(match page {
                 Page::Earlier => Action::Command(target, Command::LoadEarlier),
-                Page::Newer => Action::Latest(target),
+                Page::Newer => Action::Command(target, Command::LoadLater),
+                Page::Latest => Action::Latest(target),
             })
         })),
     )
