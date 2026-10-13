@@ -1730,6 +1730,7 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
+            Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
             Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
             Command::LoadEarlier => {
                 let Some(mut history) = self.history.take() else {

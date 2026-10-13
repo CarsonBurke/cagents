@@ -172,11 +172,13 @@ fn script(argv: &[String]) -> Option<&str> {
 /// trailing newlines a command substitution drops.
 fn heredoc_output(script: &str, depth: usize) -> Option<String> {
     match commands_at(script, depth)?.as_slice() {
-        [Simple {
-            argv,
-            stdin: Stdin::Text(body),
-            ..
-        }] if argv == &["cat"] => Some(body.trim_end_matches('\n').to_owned()),
+        [
+            Simple {
+                argv,
+                stdin: Stdin::Text(body),
+                ..
+            },
+        ] if argv == &["cat"] => Some(body.trim_end_matches('\n').to_owned()),
         _ => None,
     }
 }
@@ -625,7 +627,8 @@ mod tests {
 
     #[test]
     fn a_heredoc_substituted_into_an_argument_is_its_value() {
-        let line = "cagents send peer \"$(cat <<'EOF'\nIt's done (mostly).\nSee \"notes\".\nEOF\n)\" 2>&1";
+        let line =
+            "cagents send peer \"$(cat <<'EOF'\nIt's done (mostly).\nSee \"notes\".\nEOF\n)\" 2>&1";
         assert_eq!(
             argv(line),
             vec![vec![
@@ -668,7 +671,10 @@ mod tests {
         }
         let guarded = commands("true || cagents send x hi && echo sent").unwrap();
         assert_eq!(
-            guarded.iter().map(|simple| simple.guarded).collect::<Vec<_>>(),
+            guarded
+                .iter()
+                .map(|simple| simple.guarded)
+                .collect::<Vec<_>>(),
             [false, true, false]
         );
         let continued = commands("echo hi |\ncagents send x -").unwrap();

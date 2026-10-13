@@ -16,6 +16,8 @@ pub(super) fn transcript<'a>(
     target: Target,
     subagent: Option<&'a str>,
     anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Vec<(Id, &'a str)>,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -35,6 +37,8 @@ pub(super) fn transcript<'a>(
         target: Some(target),
         subagent,
         anchors,
+        follow_end,
+        items,
     })
 }
 
@@ -47,7 +51,39 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         captured: None,
         subagent: None,
         anchors: Vec::new(),
+        follow_end: true,
+        items: Vec::new(),
     })
+}
+
+/// Measure a displayed message independently of its presentation group. A page
+/// can keep an answer while evicting its prompt, changing the group's identity.
+pub(super) fn item<'a>(id: &str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    widget::container(content).id(item_id(id)).into()
+}
+
+pub(super) fn item_id(id: &str) -> Id {
+    Id::new(format!("chat-scroll-item-{id}"))
+}
+pub(super) fn steps_id(id: &str) -> Id {
+    Id::new(format!("chat-scroll-steps-{id}"))
+}
+
+struct ItemBounds<'a> {
+    ids: std::collections::HashMap<Id, Vec<&'a str>>,
+    rows: std::collections::HashMap<&'a str, Rectangle>,
+}
+impl Operation for ItemBounds<'_> {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if let Some(id) = id.and_then(|id| self.ids.get(id)) {
+            for id in id {
+                self.rows.insert(*id, bounds);
+            }
+        }
+    }
 }
 
 struct Anchored<'a> {
@@ -56,6 +92,8 @@ struct Anchored<'a> {
     content: Element<'a, Message>,
     subagent: Option<&'a str>,
     anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Vec<(Id, &'a str)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,10 +124,11 @@ struct Context {
     rows: Vec<Row>,
     top: Option<f32>,
     used: u64,
+    follow_end: bool,
 }
 
 impl Context {
-    fn position(&self, next: Geometry, rows: &[(&str, Rectangle)]) -> f32 {
+    fn position(&self, next: Geometry, rows: &[(&str, Rectangle)], follow_end: bool) -> f32 {
         let Some((previous, top)) = self.geometry.zip(self.top) else {
             return if self.subagent.is_some() {
                 0.0
@@ -100,12 +139,13 @@ impl Context {
         // Fitting live content normally follows its end. But an earlier page
         // can prepend surviving rows to that same short transcript: preserve
         // the exchange the reader was looking at instead of jumping past it.
-        let prepended = previous.travel() == 0.0
-            && self.rows.first().is_some_and(|old| {
-                rows.iter()
-                    .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
-            });
+        let prepended = self.rows.first().is_some_and(|old| {
+            rows.iter()
+                .any(|(id, bounds)| *id == old.id && bounds.y > old.bounds.y + 0.5)
+        });
         if !prepended
+            && self.follow_end
+            && follow_end
             && previous.travel() - top <= 0.5
             && (previous.travel() > 0.0 || self.subagent.is_none())
         {
@@ -198,12 +238,24 @@ impl Anchor {
         self.active.and_then(|index| self.contexts[index].geometry)
     }
 
+    #[cfg(test)]
     fn layout(
         &mut self,
         subagent: Option<&str>,
         rows: &[(&str, Rectangle)],
         next: Geometry,
         current_top: Option<f32>,
+    ) -> Option<f32> {
+        self.layout_following(subagent, rows, next, current_top, true)
+    }
+
+    fn layout_following(
+        &mut self,
+        subagent: Option<&str>,
+        rows: &[(&str, Rectangle)],
+        next: Geometry,
+        current_top: Option<f32>,
+        follow_end: bool,
     ) -> Option<f32> {
         if let Some(index) = self.active
             && let Some(top) = current_top
@@ -257,7 +309,8 @@ impl Anchor {
         // after reflow even when the desired bottom distance is unchanged.
         let freeze_reading = old_bottom.is_some_and(|bottom| bottom > 0.5)
             && context.geometry.is_some_and(|previous| previous != next);
-        let top = context.position(next, rows);
+        let top = context.position(next, rows, follow_end);
+        context.follow_end = follow_end;
         let bottom = next.travel() - top;
         context.used = self.clock;
         context.remember(next, rows, top);
@@ -498,7 +551,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             viewport: node.size(),
             content: node.children()[0].size(),
         };
-        let rows: Vec<_> = self
+        let mut rows: Vec<_> = self
             .anchors
             .iter()
             .filter_map(|(index, id)| {
@@ -508,7 +561,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .map(|child| (*id, child.bounds()))
             })
             .collect();
-        if let Some(offset) = anchor.layout(self.subagent, &rows, next, top.0) {
+        if !self.items.is_empty() {
+            let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
+            for (id, item) in &self.items {
+                ids.entry(id.clone()).or_default().push(item);
+            }
+            let mut measured = ItemBounds {
+                ids,
+                rows: Default::default(),
+            };
+            self.content.as_widget_mut().operate(
+                child,
+                Layout::new(&node),
+                renderer,
+                &mut measured,
+            );
+            // Item bounds take precedence over coarser direct-child anchors.
+            rows.extend(measured.rows);
+            rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+        }
+        if let Some(offset) =
+            anchor.layout_following(self.subagent, &rows, next, top.0, self.follow_end)
+        {
             self.content.as_widget_mut().operate(
                 child,
                 Layout::new(&node),
@@ -818,6 +892,8 @@ mod tests {
                 target,
                 None,
                 anchors,
+                true,
+                Vec::new(),
             )
         };
         let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 400.0));
@@ -1051,6 +1127,8 @@ mod tests {
             target,
             None,
             vec![],
+            true,
+            Vec::new(),
         );
         let mut tree = Tree::new(element.as_widget());
         let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 400.0));
@@ -1343,6 +1421,123 @@ mod tests {
             anchor.layout(None, &[], geometry(2400.0), Some(1800.0)),
             None
         );
+    }
+
+    #[test]
+    fn rebuilt_named_anchors_match_the_active_widget_id_hash_map() {
+        // This uses Iced's selected ID implementation, including its a11y
+        // reexport, rather than an unused feature-gated copy of the type.
+        let first = item_id("persisted-answer");
+        let rebuilt = item_id("persisted-answer");
+        assert_eq!(first, rebuilt);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert(first, 300.0);
+        assert_eq!(anchors.get(&rebuilt), Some(&300.0));
+    }
+
+    #[test]
+    fn regrouped_answer_and_tool_keep_their_measured_reading_position() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let element = |entries: Vec<(&'static str, f32)>, group| {
+            let ids = entries.iter().map(|(id, _)| (item_id(id), *id)).collect();
+            let children: Vec<Element<'static, Message>> = entries
+                .into_iter()
+                .map(|(id, height)| {
+                    item(id, widget::Space::new().width(Length::Fill).height(height))
+                })
+                .collect();
+            transcript(
+                widget::container(widget::column::with_children(children)).id(Id::new(group)),
+                target,
+                None,
+                Vec::new(),
+                false,
+                ids,
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 400.0));
+        for top in [450.0, 850.0] {
+            let mut initial = element(
+                vec![("prompt", 300.0), ("answer", 500.0), ("tool", 600.0)],
+                "old-group",
+            );
+            let mut tree = Tree::new(&initial);
+            let node = initial
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            initial.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(1000.0 - top),
+            );
+            // A second layout captures the native reading position before the
+            // prompt is evicted and the answer becomes the group's first row.
+            initial
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let context = &tree.state.downcast_ref::<Anchor>().contexts[0];
+            assert_eq!(
+                context
+                    .rows
+                    .iter()
+                    .find(|row| row.id == "answer")
+                    .map(|row| row.bounds.y),
+                Some(300.0)
+            );
+            let mut next = element(
+                vec![("answer", 500.0), ("tool", 600.0), ("newer", 1000.0)],
+                "new-group",
+            );
+            tree.diff(next.as_widget_mut());
+            let node = next.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut actual = ReadTop::default();
+            next.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+            let context = &tree.state.downcast_ref::<Anchor>().contexts[0];
+            assert_eq!(
+                actual.0,
+                Some(top - 300.0),
+                "rows={:?}, geometry={:?}, remembered={:?}",
+                context
+                    .rows
+                    .iter()
+                    .map(|row| (&row.id, row.bounds))
+                    .collect::<Vec<_>>(),
+                context.geometry,
+                context.top
+            );
+        }
+    }
+
+    #[test]
+    fn forward_history_preserves_boundary_instead_of_following_new_page_end() {
+        let mut anchor = Anchor::default();
+        let previous = rows(&[("older", 0.0, 800.0), ("boundary", 800.0, 500.0)]);
+        anchor.layout_following(None, &previous, geometry(1300.0), None, false);
+        let next = rows(&[("boundary", 0.0, 500.0), ("newer", 500.0, 1200.0)]);
+        assert_eq!(
+            anchor.layout_following(None, &next, geometry(1700.0), Some(900.0), true),
+            Some(1200.0)
+        );
+        assert_eq!(anchor.contexts[0].top, Some(100.0));
+    }
+
+    #[test]
+    fn backward_history_from_live_bottom_preserves_overlapping_exchange() {
+        let mut anchor = Anchor::default();
+        let previous = rows(&[("boundary", 0.0, 500.0), ("live", 500.0, 700.0)]);
+        anchor.layout_following(None, &previous, geometry(1200.0), None, true);
+        let next = rows(&[("older", 0.0, 700.0), ("boundary", 700.0, 500.0)]);
+        assert_eq!(
+            anchor.layout_following(None, &next, geometry(1200.0), Some(0.0), false),
+            Some(100.0)
+        );
+        assert_eq!(anchor.contexts[0].top, Some(700.0));
     }
 
     #[test]

@@ -822,6 +822,12 @@ pub enum Action {
     /// Opens the popover for an account, or closes it with `None` or by
     /// naming the account whose popover is already open.
     Popover(Option<AccountId>),
+    /// Include a stable usage row in this provider's status-bar preview.
+    PreviewRow {
+        id: AccountId,
+        key: String,
+        included: bool,
+    },
     /// Shows an account and, when Cagents owns the choice, makes it default.
     ShowAccount(AccountId),
     OpenPane,
@@ -1131,6 +1137,81 @@ fn headline_window(snapshot: &UsageSnapshot) -> Option<&UsageWindow> {
     )
 }
 
+fn preview_window_key(window: &UsageWindow) -> String {
+    format!("window:{}", window.key)
+}
+
+fn preview_row_included(
+    snapshot: &UsageSnapshot,
+    selected: Option<&Vec<String>>,
+    key: &str,
+) -> bool {
+    selected.map_or_else(
+        || headline_window(snapshot).is_some_and(|window| preview_window_key(window) == key),
+        |rows| rows.iter().any(|row| row == key),
+    )
+}
+
+fn preview_chips(
+    account: &AccountState,
+    name: &str,
+    now: Millis,
+    selected: Option<&Vec<String>>,
+) -> Vec<Chip> {
+    let Some(selected) = selected else {
+        return vec![chip(account, name, now)];
+    };
+    let Some(snapshot) = &account.snapshot else {
+        return vec![chip(account, name, now)];
+    };
+    if !matches!(
+        snapshot.status,
+        UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+    ) {
+        return vec![chip(account, name, now)];
+    }
+    let windows: Vec<_> = snapshot
+        .windows
+        .iter()
+        .filter(|window| selected.contains(&preview_window_key(window)))
+        .collect();
+    let multiple = windows.len() > 1 || selected.iter().any(|key| key == "credits");
+    let mut chips: Vec<_> = windows
+        .into_iter()
+        .map(|window| {
+            let mut summary = chip_with_window(account, name, now, |snapshot| {
+                snapshot
+                    .windows
+                    .iter()
+                    .find(|candidate| candidate.key == window.key)
+            });
+            summary.text = if multiple {
+                format!("{}: {}% left", window.label, percent_left(window.used))
+            } else {
+                format!("{}: {}", window.label, summary.text)
+            };
+            summary
+        })
+        .collect();
+    if selected.iter().any(|key| key == "credits")
+        && let Some(credits) = &snapshot.credits
+    {
+        let text = format!("Extra: {}", credits.summary());
+        chips.push(Chip {
+            text: text.clone(),
+            gauge: None,
+            tone: if is_stale(snapshot, now) {
+                ChipTone::Stale
+            } else {
+                ChipTone::Current
+            },
+            essential: false,
+            tooltip: format!("{name} · {text}"),
+        });
+    }
+    chips
+}
+
 fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
     chip_with_window(account, name, now, headline_window)
 }
@@ -1151,7 +1232,7 @@ fn chip_with_window(
     account: &AccountState,
     name: &str,
     now: Millis,
-    window_of: fn(&UsageSnapshot) -> Option<&UsageWindow>,
+    window_of: impl Fn(&UsageSnapshot) -> Option<&UsageWindow>,
 ) -> Chip {
     let Some(snapshot) = &account.snapshot else {
         return match &account.failure {
@@ -2229,6 +2310,36 @@ impl Cagents {
                 // Opening the popover is the reader looking at the figures.
                 id.and_then(|id| self.probe_account(&id, Trigger::Focus, now))
                     .unwrap_or_else(Task::none)
+            }
+            Action::PreviewRow { id, key, included } => {
+                let Some(account) = self.account_ui.account(&id) else {
+                    return Task::none();
+                };
+                let Some(snapshot) = account.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                let known = key == "credits" && snapshot.credits.is_some()
+                    || snapshot
+                        .windows
+                        .iter()
+                        .any(|window| preview_window_key(window) == key);
+                if !known {
+                    return Task::none();
+                }
+                let automatic = headline_window(snapshot)
+                    .map(preview_window_key)
+                    .into_iter()
+                    .collect();
+                let rows = self
+                    .settings
+                    .usage_preview_rows
+                    .entry(account.account.provider.executable().to_owned())
+                    .or_insert(automatic);
+                rows.retain(|row| row != &key);
+                if included {
+                    rows.push(key);
+                }
+                self.save_settings_task(false)
             }
             Action::ShowAccount(id) => {
                 let Some(account) = self
@@ -4189,7 +4300,40 @@ impl Cagents {
         } else {
             lead.name().to_owned()
         };
-        let mut summary = chip(lead, &name, now);
+        let selected = self.settings.usage_preview_rows.get(provider.executable());
+        let mut previews = preview_chips(lead, &name, now, selected);
+        let mut summary = previews.first().cloned().unwrap_or_else(|| {
+            let unavailable = selected.is_some_and(|rows| !rows.is_empty());
+            Chip {
+                text: if unavailable {
+                    "Selected limits unavailable".into()
+                } else {
+                    lead.name().to_owned()
+                },
+                gauge: None,
+                tone: if unavailable {
+                    ChipTone::Stale
+                } else {
+                    ChipTone::Current
+                },
+                essential: !unavailable,
+                tooltip: if unavailable {
+                    format!("{name} does not currently report the selected preview rows")
+                } else {
+                    format!("{name} usage · no preview rows selected")
+                },
+            }
+        });
+        if previews.len() > 1 {
+            summary.tooltip = previews
+                .iter()
+                .map(|chip| chip.tooltip.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if previews.is_empty() {
+            previews.push(summary.clone());
+        }
         if others > 0 {
             summary.tooltip.push_str(&format!(
                 "\n{others} more {} account{}",
@@ -4208,17 +4352,22 @@ impl Cagents {
                 .size(CHIP_ICON_SIZE)
                 .into(),
         ];
-        let tone = summary.tone.color();
-        if let Some(used) = summary.gauge {
-            items.push(crate::ui_controls::budget_radial_toned(
-                used,
-                tone.map(design::Tone::Themed),
-            ));
-        }
-        if !compact || summary.essential {
-            let text =
-                design::caption(summary.text).wrapping(cosmic::iced::widget::text::Wrapping::None);
-            items.push(text.class(summary.tone.text_class()).into());
+        for preview in previews {
+            let tone = preview.tone.color();
+            if let Some(used) = preview.gauge {
+                items.push(crate::interaction::tooltip(
+                    crate::ui_controls::budget_radial_toned(used, tone.map(design::Tone::Themed)),
+                    preview.tooltip.clone(),
+                ));
+            }
+            if !compact || preview.essential {
+                items.push(
+                    design::caption(preview.text)
+                        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                        .class(preview.tone.text_class())
+                        .into(),
+                );
+            }
         }
         if others > 0 && !compact {
             items.push(
@@ -4384,12 +4533,18 @@ impl Cagents {
                 }
                 UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
                     let stale = is_stale(snapshot, now);
-                    rows.extend(
-                        snapshot
-                            .windows
-                            .iter()
-                            .map(|window| usage_window_row(window, now, stale)),
-                    );
+                    rows.extend(snapshot.windows.iter().map(|window| {
+                        let key = preview_window_key(window);
+                        let included = preview_row_included(
+                            snapshot,
+                            self.settings
+                                .usage_preview_rows
+                                .get(account.account.provider.executable()),
+                            &key,
+                        );
+                        let toggle = self.preview_row_toggle(account, key, included, &window.label);
+                        usage_window_row(window, now, stale, toggle)
+                    }));
                     if snapshot.windows.is_empty() {
                         rows.push(
                             design::caption("No usage limits are reported for this account.")
@@ -4399,7 +4554,18 @@ impl Cagents {
                     if let Some(credits) = &snapshot.credits {
                         rows.push(
                             widget::row::with_children(vec![
-                                design::caption("Extra usage").width(Length::Fill).into(),
+                                self.preview_row_toggle(
+                                    account,
+                                    "credits".into(),
+                                    preview_row_included(
+                                        snapshot,
+                                        self.settings
+                                            .usage_preview_rows
+                                            .get(account.account.provider.executable()),
+                                        "credits",
+                                    ),
+                                    "Extra usage",
+                                ),
                                 design::caption(credits.summary())
                                     .class(cosmic::theme::Text::Default)
                                     .into(),
@@ -4442,6 +4608,30 @@ impl Cagents {
             .spacing(spacing)
             .width(Length::Fill)
             .into()
+    }
+
+    fn preview_row_toggle<'a>(
+        &self,
+        account: &AccountState,
+        key: String,
+        included: bool,
+        label: &str,
+    ) -> Element<'a, Message> {
+        let id = account.id.clone();
+        crate::interaction::tooltip(
+            crate::ui_controls::field::checkbox(included)
+                .label(label.to_owned())
+                .width(Length::Fill)
+                .on_toggle(move |included| {
+                    Message::AccountUi(Action::PreviewRow {
+                        id: id.clone(),
+                        key: key.clone(),
+                        included,
+                    })
+                }),
+            format!("Show {label} in the status bar"),
+        )
+        .into()
     }
 
     fn account_header<'a>(
@@ -4721,7 +4911,12 @@ fn identity_line(identity: &Identity) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-fn usage_window_row<'a>(window: &'a UsageWindow, now: Millis, stale: bool) -> Element<'a, Message> {
+fn usage_window_row<'a>(
+    window: &'a UsageWindow,
+    now: Millis,
+    stale: bool,
+    toggle: Element<'a, Message>,
+) -> Element<'a, Message> {
     let tone = if stale {
         design::Tone::Themed(design::muted_color)
     } else {
@@ -4729,9 +4924,7 @@ fn usage_window_row<'a>(window: &'a UsageWindow, now: Millis, stale: bool) -> El
     };
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
-            design::body(window.label.as_str())
-                .width(Length::Fill)
-                .into(),
+            toggle,
             design::caption(format!("{}% left", percent_left(window.used)))
                 .class(cosmic::theme::Text::Default)
                 .into(),
@@ -4935,6 +5128,62 @@ mod tests {
         snapshot.windows = windows;
         snapshot.refresh_status(false, false);
         snapshot
+    }
+
+    #[test]
+    fn usage_preview_defaults_follow_the_headline_and_explicit_rows_keep_identity() {
+        let mut weekly = window(0.7, None);
+        weekly.key = "seven_day".into();
+        weekly.label = "Weekly".into();
+        weekly.kind = WindowKind::Weekly;
+        let mut fable = window(0.95, None);
+        fable.key = "seven_day_fable".into();
+        fable.label = "Fable".into();
+        fable.kind = WindowKind::Scoped;
+        let state = state_with(Some(snapshot(vec![window(0.1, None), weekly, fable], NOW)));
+        let usage = state.snapshot.as_ref().unwrap();
+        assert!(preview_row_included(usage, None, "window:seven_day"));
+        assert!(!preview_row_included(usage, None, "window:seven_day_fable"));
+        assert_eq!(
+            preview_chips(&state, "Claude", NOW, None),
+            vec![chip(&state, "Claude", NOW)]
+        );
+        let selected = vec![
+            "window:session".into(),
+            "window:seven_day".into(),
+            "window:seven_day_fable".into(),
+        ];
+        let chips = preview_chips(&state, "Claude", NOW, Some(&selected));
+        assert_eq!(chips.len(), 3);
+        assert!(chips[0].text.starts_with("Session:"));
+        assert!(chips[1].text.starts_with("Weekly:"));
+        assert!(chips[2].text.starts_with("Fable:"));
+        let empty = Vec::new();
+        assert!(preview_chips(&state, "Claude", NOW, Some(&empty)).is_empty());
+        assert!(!preview_row_included(
+            usage,
+            Some(&empty),
+            "window:seven_day"
+        ));
+    }
+
+    #[test]
+    fn usage_preview_selection_does_not_hide_sign_in_or_unavailable_states() {
+        let empty = Vec::new();
+        let state = state_with(Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW)));
+        assert_eq!(
+            preview_chips(&state, "Claude", NOW, Some(&empty))[0].text,
+            "Sign in"
+        );
+        let state = state_with(Some(UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "",
+            NOW,
+        )));
+        assert_eq!(
+            preview_chips(&state, "Claude", NOW, Some(&empty))[0].text,
+            "Unavailable"
+        );
     }
 
     #[test]
@@ -5365,6 +5614,67 @@ mod app_tests {
     use super::*;
     use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;
+
+    #[test]
+    fn usage_preview_toggle_preserves_the_default_row_and_rejects_unknown_rows() {
+        let mut app = context_inspector_test_app(false);
+        let account = app
+            .account_ui
+            .accounts
+            .iter_mut()
+            .find(|state| state.account.provider == Provider::Claude)
+            .unwrap();
+        account.present = true;
+        let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
+        usage.windows = vec![
+            UsageWindow {
+                key: "five_hour".into(),
+                kind: account::WindowKind::Session,
+                label: "5 hour".into(),
+                used: 0.8,
+                resets_at: None,
+                span_secs: None,
+                binding: false,
+            },
+            UsageWindow {
+                key: "weekly".into(),
+                kind: account::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 0.2,
+                resets_at: None,
+                span_secs: None,
+                binding: false,
+            },
+        ];
+        account.snapshot = Some(usage);
+        let id = account.id.clone();
+        for _ in 0..2 {
+            let _ = app.update_account_ui(Action::PreviewRow {
+                id: id.clone(),
+                key: "window:weekly".into(),
+                included: true,
+            });
+        }
+        assert_eq!(
+            app.settings.usage_preview_rows["claude"],
+            ["window:five_hour", "window:weekly"]
+        );
+        let _ = app.update_account_ui(Action::PreviewRow {
+            id: id.clone(),
+            key: "window:missing".into(),
+            included: true,
+        });
+        assert_eq!(app.settings.usage_preview_rows["claude"].len(), 2);
+        for key in ["window:five_hour", "window:weekly"] {
+            let _ = app.update_account_ui(Action::PreviewRow {
+                id: id.clone(),
+                key: key.into(),
+                included: false,
+            });
+        }
+        assert!(app.settings.usage_preview_rows["claude"].is_empty());
+        assert!(!app.settings.usage_preview_rows.contains_key("codex"));
+    }
 
     fn signed_out(app: &mut Cagents) -> AccountId {
         let state = &mut app.account_ui.accounts[0];

@@ -2215,6 +2215,8 @@ mod tests {
                 target,
                 None,
                 Vec::new(),
+                true,
+                Vec::new(),
             ),
             target,
             None,

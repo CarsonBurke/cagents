@@ -1,6 +1,7 @@
 mod accessibility;
 #[cfg(test)]
 mod accessibility_tests;
+mod links;
 pub(crate) use accessibility::ReviewInputBarrier;
 
 use std::{
@@ -986,6 +987,9 @@ impl PtySize {
 #[derive(Default)]
 struct WidgetState {
     a11y: RefCell<accessibility::State>,
+    links: RefCell<links::Cache>,
+    link_hover_cell: Option<(u16, u16)>,
+    link_hover_spans: Vec<(usize, u16, u16)>,
     review_control_pressed: bool,
     observed_review_revision: Option<u64>,
     observed_review_identity: Option<crate::model::TerminalId>,
@@ -1356,142 +1360,27 @@ impl ShapeCache {
 type ErrorMapper<Message> = dyn Fn(TerminalSendError) -> Message + Send + Sync + 'static;
 type LinkMapper<Message> = dyn Fn(url::Url, crate::settings::LinkOpenGesture) -> Message + 'static;
 
-/// Resolve a printed link without confusing byte offsets with terminal columns.
-/// Only web addresses and local file URLs are activatable; arbitrary schemes
-/// from terminal output must not invoke external handlers.
+#[cfg(test)]
 fn printed_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
-    if let Some(link) = row
-        .hyperlinks
-        .iter()
-        .find(|link| link.start <= column && column < link.end)
-    {
-        let url = url::Url::parse(&link.uri).ok()?;
-        return matches!(url.scheme(), "http" | "https" | "file").then_some(url);
-    }
-    let column = usize::from(column);
-    let cell = row.cells.get(column)?;
-    let boundary = |cell: &CellSnapshot| {
-        cell.style.invisible
-            || cell.text.is_empty()
-            || cell
-                .text
-                .as_str()
-                .chars()
-                .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
-    };
-    if boundary(cell) {
-        return None;
-    }
-    let start = row.cells[..column]
-        .iter()
-        .rposition(boundary)
-        .map_or(0, |i| i + 1);
-    let end = row.cells[column..]
-        .iter()
-        .position(boundary)
-        .map_or(row.cells.len(), |i| column + i);
-    let text: String = row.cells[start..end]
-        .iter()
-        .map(|cell| cell.text.as_str())
-        .collect();
-    let text = text
-        .trim_start_matches(['(', '[', '{'])
-        .trim_end_matches(['.', ',', ';', '!', '?']);
-    // A balanced parenthesis is legal in a URL; trim only surrounding prose.
-    let mut text = text;
-    for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
-        while text.ends_with(close) && text.matches(close).count() > text.matches(open).count() {
-            text = &text[..text.len() - 1];
-        }
-    }
-    let url = url::Url::parse(text).ok()?;
-    match url.scheme() {
-        "http" | "https" if url.host_str().is_some() => Some(url),
-        "file" if url.to_file_path().is_ok() => Some(url),
-        _ => None,
-    }
+    terminal_link_at(
+        &RenderSnapshot {
+            lines: vec![Arc::new(row.clone())].into(),
+            ..RenderSnapshot::empty()
+        },
+        0,
+        column,
+        std::path::Path::new("/"),
+    )
 }
 
+#[cfg(test)]
 fn terminal_link_at(
     snapshot: &RenderSnapshot,
     row: usize,
     column: u16,
     cwd: &std::path::Path,
 ) -> Option<url::Url> {
-    let line = snapshot.lines.get(row)?;
-    if !line.hyperlinks.is_empty()
-        && let Some(url) = printed_link_at(line, column)
-    {
-        return Some(url);
-    }
-    let mut first = row;
-    while first > 0 && snapshot.lines[first - 1].wrapped {
-        first -= 1;
-    }
-    let mut last = row;
-    while last + 1 < snapshot.lines.len() && snapshot.lines[last].wrapped {
-        last += 1;
-    }
-    let combined = if first == last {
-        std::borrow::Cow::Borrowed(line.as_ref())
-    } else {
-        let mut combined = RowSnapshot::default();
-        for line in &snapshot.lines[first..=last] {
-            combined.cells.extend_from_slice(&line.cells);
-        }
-        std::borrow::Cow::Owned(combined)
-    };
-    let offset = snapshot.lines[first..row]
-        .iter()
-        .map(|row| row.cells.len())
-        .sum::<usize>()
-        + usize::from(column);
-    let offset = u16::try_from(offset).ok()?;
-    if let Some(url) = printed_link_at(&combined, offset) {
-        return Some(url);
-    }
-    // Compiler locations are word tokens, optionally surrounded by prose.
-    let boundary = |cell: &CellSnapshot| {
-        cell.text
-            .as_str()
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
-    };
-    let index = usize::from(offset);
-    if boundary(combined.cells.get(index)?) {
-        return None;
-    }
-    let start = combined.cells[..index]
-        .iter()
-        .rposition(boundary)
-        .map_or(0, |index| index + 1);
-    let end = combined.cells[index..]
-        .iter()
-        .position(boundary)
-        .map_or(combined.cells.len(), |end| index + end);
-    let text: String = combined.cells[start..end]
-        .iter()
-        .map(|cell| cell.text.as_str())
-        .collect();
-    let text = text.trim_matches(['(', ')', '[', ']', '{', '}', ',', ';']);
-    let (path, final_number) = text.rsplit_once(':')?;
-    let final_number = final_number
-        .parse::<usize>()
-        .ok()
-        .filter(|number| *number > 0)?;
-    let (path, line, column) = match path.rsplit_once(':') {
-        Some((path, line)) if line.parse::<usize>().is_ok() => {
-            (path, line.parse::<usize>().ok()?, final_number)
-        }
-        _ => (path, final_number, 1),
-    };
-    if path.is_empty() || path.contains("://") || line == 0 {
-        return None;
-    }
-    let path = cwd.join(path);
-    let mut url = url::Url::from_file_path(path).ok()?;
-    url.set_fragment(Some(&format!("L{line}:{column}")));
-    Some(url)
+    links::at(snapshot, row, column, cwd).map(|link| link.url)
 }
 
 /// A lock-free iced view over a single immutable terminal snapshot.
@@ -2556,14 +2445,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     && (!self.snapshot.scroll.mouse_tracking || state.modifiers.shift) =>
             {
                 if let Some(callback) = &self.on_context {
-                    let cell =
-                        self.cell_at(geometry, cursor.position().expect("cursor over terminal"));
-                    let link = terminal_link_at(
-                        &self.snapshot,
-                        usize::from(cell.1),
-                        cell.0,
-                        &self.working_directory,
-                    );
+                    let link = state
+                        .links
+                        .borrow_mut()
+                        .at_cursor(&self.snapshot, geometry, cursor, &self.working_directory)
+                        .map(|link| link.url);
                     let pointer = cursor.position().expect("cursor over terminal");
                     shell.publish(callback(
                         Point::new(pointer.x - bounds.x, pointer.y - bounds.y),
@@ -2725,7 +2611,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     if *button == IcedMouseButton::Left
                         && state.modifiers.control
                         && let Some(open) = &self.on_open_link
-                        && let Some(url) = terminal_link_at(
+                        && let Some(link) = state.links.borrow_mut().at(
                             &self.snapshot,
                             usize::from(cell.1),
                             cell.0,
@@ -2733,7 +2619,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         )
                     {
                         shell.publish(open(
-                            url,
+                            link.url,
                             if state.modifiers.shift {
                                 crate::settings::LinkOpenGesture::ControlShiftClick
                             } else {
@@ -2890,6 +2776,23 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // can be observed - tracking enabled, or a drag in progress
                     // - and then only on a cell crossing.
                     let cell = self.cell_at(geometry, position);
+                    if state.link_hover_cell != Some(cell) {
+                        let spans = state
+                            .links
+                            .borrow_mut()
+                            .at(
+                                &self.snapshot,
+                                usize::from(cell.1),
+                                cell.0,
+                                &self.working_directory,
+                            )
+                            .map_or_else(Vec::new, |link| link.spans);
+                        if spans != state.link_hover_spans {
+                            state.link_hover_spans = spans;
+                            shell.request_redraw();
+                        }
+                        state.link_hover_cell = Some(cell);
+                    }
                     if (self.snapshot.scroll.mouse_tracking || state.pressed_buttons != 0)
                         && state.last_motion_cell != Some(cell)
                     {
@@ -2907,6 +2810,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // Leaving and re-entering the grid is a fresh motion even
                     // when the pointer lands back on the same cell.
                     state.last_motion_cell = None;
+                    state.link_hover_cell = None;
+                    if !state.link_hover_spans.is_empty() {
+                        state.link_hover_spans.clear();
+                        shell.request_redraw();
+                    }
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
@@ -3196,49 +3104,27 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 drop(shaped);
 
-                if state.modifiers.control
-                    && let Some(position) = geometry.cursor_position(cursor)
-                {
+                if let Some(position) = geometry.cursor_position(cursor) {
                     let (column, row) = self.cell_at(geometry, position);
-                    if terminal_link_at(
+                    if let Some(link) = state.links.borrow_mut().at(
                         &self.snapshot,
                         usize::from(row),
                         column,
                         &self.working_directory,
-                    )
-                    .is_some()
-                        && let Some(line) = rows.get(usize::from(row))
-                    {
-                        let span = line
-                            .hyperlinks
-                            .iter()
-                            .find(|span| span.start <= column && column < span.end)
-                            .map(|span| (span.start, span.end))
-                            .unwrap_or_else(|| {
-                                let boundary = |cell: &CellSnapshot| {
-                                    cell.text.as_str().chars().any(char::is_whitespace)
-                                };
-                                let start = line.cells[..usize::from(column)]
-                                    .iter()
-                                    .rposition(boundary)
-                                    .map_or(0, |index| index + 1);
-                                let end = line.cells[usize::from(column)..]
-                                    .iter()
-                                    .position(boundary)
-                                    .map_or(line.cells.len(), |index| usize::from(column) + index);
-                                (start as u16, end as u16)
-                            });
-                        if let Some(bounds) =
-                            geometry.run_bounds(span.0, span.1.saturating_sub(span.0), row)
-                        {
-                            draw_decorations(
-                                renderer,
-                                bounds,
-                                default_foreground,
-                                Underline::Single,
-                                false,
-                                false,
-                            );
+                    ) {
+                        for (row, start, end) in link.spans {
+                            if let Some(bounds) =
+                                geometry.run_bounds(start, end.saturating_sub(start), row as u16)
+                            {
+                                draw_decorations(
+                                    renderer,
+                                    bounds,
+                                    default_foreground,
+                                    Underline::Single,
+                                    false,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -3466,13 +3352,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             let cell = self.cell_at(geometry, position);
             if tree.state.downcast_ref::<WidgetState>().modifiers.control
                 && self.on_open_link.is_some()
-                && terminal_link_at(
-                    &self.snapshot,
-                    usize::from(cell.1),
-                    cell.0,
-                    &self.working_directory,
-                )
-                .is_some()
+                && tree
+                    .state
+                    .downcast_ref::<WidgetState>()
+                    .links
+                    .borrow_mut()
+                    .at(
+                        &self.snapshot,
+                        usize::from(cell.1),
+                        cell.0,
+                        &self.working_directory,
+                    )
+                    .is_some()
             {
                 return mouse::Interaction::Pointer;
             }
@@ -5468,6 +5359,246 @@ mod tests {
         assert_eq!(
             printed_link_at(&linked, 9).unwrap().as_str(),
             "https://example.org/path"
+        );
+    }
+
+    #[test]
+    fn terminal_links_open_plain_and_quoted_paths_without_filesystem_probes() {
+        for (text, target) in [
+            ("./missing/report.md", "file:///repo/./missing/report.md"),
+            ("README.md", "file:///repo/README.md"),
+            (".gitignore", "file:///repo/.gitignore"),
+            (".env.local", "file:///repo/.env.local"),
+            ("/tmp/missing.txt", "file:///tmp/missing.txt"),
+            (
+                "\"docs/report one.md\"",
+                "file:///repo/docs/report%20one.md",
+            ),
+            (
+                "`docs/report one.md:12:3`",
+                "file:///repo/docs/report%20one.md#L12:3",
+            ),
+            ("www.example.org/path", "https://www.example.org/path"),
+        ] {
+            let snapshot = RenderSnapshot {
+                lines: vec![row(text)].into(),
+                ..RenderSnapshot::empty()
+            };
+            // URL normalization removes redundant ./ components.
+            let expected = url::Url::parse(target).unwrap();
+            assert_eq!(
+                terminal_link_at(&snapshot, 0, 5, std::path::Path::new("/repo")),
+                Some(expected),
+                "{text}"
+            );
+        }
+        for text in [
+            "ordinary",
+            ".",
+            "..",
+            ".5",
+            "javascript:alert(1)",
+            "mailto:person@example.org",
+            "src/lib.rs:0",
+            "src/lib.rs:0:2",
+        ] {
+            let snapshot = RenderSnapshot {
+                lines: vec![row(text)].into(),
+                ..RenderSnapshot::empty()
+            };
+            assert!(
+                terminal_link_at(&snapshot, 0, 2, std::path::Path::new("/repo")).is_none(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_link_spans_exclude_prose_and_follow_soft_wraps() {
+        let mut first = (*row("(https://example.")).clone();
+        first.wrapped = true;
+        let snapshot = RenderSnapshot {
+            lines: vec![Arc::new(first), row("org/a_(b)). next")].into(),
+            ..RenderSnapshot::empty()
+        };
+        let link = links::at(&snapshot, 1, 3, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(link.url.as_str(), "https://example.org/a_(b)");
+        assert_eq!(link.spans, vec![(0, 1, 17), (1, 0, 9)]);
+        assert!(links::at(&snapshot, 0, 0, std::path::Path::new("/repo")).is_none());
+        assert!(links::at(&snapshot, 1, 9, std::path::Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn terminal_links_validate_explicit_hyperlinks_and_bound_hover_work() {
+        let mut line = (*row("label")).clone();
+        line.hyperlinks
+            .push(crate::terminal::snapshot::HyperlinkSpan {
+                start: 0,
+                end: 5,
+                uri: "file://remote/etc/passwd".into(),
+            });
+        let snapshot = RenderSnapshot {
+            lines: vec![Arc::new(line)].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert!(links::at(&snapshot, 0, 2, std::path::Path::new("/repo")).is_none());
+        let snapshot = RenderSnapshot {
+            lines: vec![row(&format!("https://example.org/{}", "x".repeat(5000)))].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert!(links::at(&snapshot, 0, 2, std::path::Path::new("/repo")).is_none());
+        let mut huge = (*row(&"x".repeat(65535))).clone();
+        huge.wrapped = true;
+        let snapshot = RenderSnapshot {
+            lines: vec![Arc::new(huge), row(" https://example.org")].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert_eq!(
+            links::at(&snapshot, 1, 5, std::path::Path::new("/repo"))
+                .unwrap()
+                .url
+                .as_str(),
+            "https://example.org/"
+        );
+    }
+
+    #[test]
+    fn terminal_link_cache_tracks_snapshot_and_directory_without_retaining_history() {
+        let mut cache = links::Cache::default();
+        let snapshot = Arc::new(RenderSnapshot {
+            lines: vec![row("README.md")].into(),
+            ..RenderSnapshot::empty()
+        });
+        assert_eq!(
+            cache
+                .at(&snapshot, 0, 2, std::path::Path::new("/one"))
+                .unwrap()
+                .url
+                .as_str(),
+            "file:///one/README.md"
+        );
+        assert_eq!(
+            cache
+                .at(&snapshot, 0, 2, std::path::Path::new("/two"))
+                .unwrap()
+                .url
+                .as_str(),
+            "file:///two/README.md"
+        );
+        let weak = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+        let snapshot = Arc::new(RenderSnapshot {
+            lines: vec![row("ordinary")].into(),
+            ..RenderSnapshot::empty()
+        });
+        assert!(
+            cache
+                .at(&snapshot, 0, 2, std::path::Path::new("/two"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_link_hit_testing_handles_wide_character_tails() {
+        let mut line = (*row("docs/界.md")).clone();
+        line.cells.insert(6, CellSnapshot::default());
+        let snapshot = RenderSnapshot {
+            lines: vec![Arc::new(line)].into(),
+            ..RenderSnapshot::empty()
+        };
+        let link = links::at(&snapshot, 0, 6, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(link.url.as_str(), "file:///repo/docs/%E7%95%8C.md");
+        assert_eq!(link.spans, vec![(0, 0, 10)]);
+    }
+
+    #[test]
+    fn terminal_links_resolve_quoted_spaces_across_soft_wraps() {
+        let mut first = (*row("\"docs/report ")).clone();
+        first.wrapped = true;
+        let snapshot = RenderSnapshot {
+            lines: vec![Arc::new(first), row("one.md:12:3\"")].into(),
+            ..RenderSnapshot::empty()
+        };
+        let link = links::at(&snapshot, 1, 2, std::path::Path::new("/repo")).unwrap();
+        assert_eq!(link.url.as_str(), "file:///repo/docs/report%20one.md#L12:3");
+        assert_eq!(link.spans, vec![(0, 1, 13), (1, 0, 11)]);
+        let snapshot = RenderSnapshot {
+            lines: vec![row("\"other\" README.md \"next\"")].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert_eq!(
+            links::at(&snapshot, 0, 10, std::path::Path::new("/repo"))
+                .unwrap()
+                .url
+                .as_str(),
+            "file:///repo/README.md"
+        );
+    }
+
+    #[test]
+    fn terminal_links_keep_locations_after_quoted_file_paths() {
+        let snapshot = RenderSnapshot {
+            lines: vec![row("\"docs/report one.md\":12:3")].into(),
+            ..RenderSnapshot::empty()
+        };
+        for column in [5, 15, 20, 23] {
+            let link = links::at(&snapshot, 0, column, std::path::Path::new("/repo")).unwrap();
+            assert_eq!(link.url.as_str(), "file:///repo/docs/report%20one.md#L12:3");
+            assert_eq!(link.spans, vec![(0, 1, 19), (0, 20, 25)]);
+            assert_eq!(
+                crate::document_link::resolve(std::path::Path::new("/"), link.url.as_str())
+                    .unwrap(),
+                crate::document_link::DocumentLink::Local {
+                    path: std::path::PathBuf::from("/repo/docs/report one.md"),
+                    fragment: Some("L12:3".into()),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_link_context_hit_testing_uses_translated_cursor_in_grid_coordinates() {
+        let snapshot = Arc::new(RenderSnapshot {
+            columns: 40,
+            rows: 8,
+            lines: vec![row("README.md:3:1")].into(),
+            ..RenderSnapshot::empty()
+        });
+        let node = layout::Node::new(Size::new(400.0, 300.0)).move_to(Point::new(744.0, 45.0));
+        let translation = cosmic::iced::Vector::new(690.0, 0.0);
+        let layout = Layout::new(&node).with_virtual_offset(translation);
+        let geometry = TerminalGeometry::new(
+            TerminalWidget::<()>::grid_bounds(layout.bounds()),
+            DEFAULT_FONT_SIZE,
+            1.0,
+            "",
+            LINE_HEIGHT_RATIO,
+            DEFAULT_PADDING,
+        );
+        let cell = geometry.cell_bounds(3, 0).unwrap();
+        // iced's scrollable supplies content coordinates to its children;
+        // virtual_offset records the camera separately for accessibility.
+        let screen = Point::new(cell.center_x() - translation.x, cell.center_y());
+        let translated = mouse::Cursor::Available(screen + translation);
+        let link = links::Cache::default()
+            .at_cursor(
+                &snapshot,
+                geometry,
+                translated,
+                std::path::Path::new("/repo"),
+            )
+            .unwrap();
+        assert_eq!(link.url.as_str(), "file:///repo/README.md#L3:1");
+        assert!(
+            links::Cache::default()
+                .at_cursor(
+                    &snapshot,
+                    geometry,
+                    mouse::Cursor::Available(screen),
+                    std::path::Path::new("/repo")
+                )
+                .is_none()
         );
     }
 

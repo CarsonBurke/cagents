@@ -1568,6 +1568,7 @@ impl Adapter for Codex {
                 // the cache without moving the reader back into that page.
                 self.reread(&mut step)?;
             }
+            Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
             Command::LoadEarlier => {
                 let cursor = self.cursor.clone().ok_or("No earlier Codex history is available")?;
                 self.history(&mut step, Some(cursor))?;

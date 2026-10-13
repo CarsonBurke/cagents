@@ -265,6 +265,7 @@ winit-wayland = { path = "vendor/winit-wayland" }
 [patch."https://github.com/pop-os/libcosmic.git"]
 libcosmic = { path = "vendor/libcosmic" }
 iced_core = { path = "vendor/iced-core" }
+iced_accessibility = { path = "vendor/iced-accessibility" }
 iced_runtime = { path = "vendor/iced-runtime" }
 iced_winit = { path = "vendor/iced-winit" }
 

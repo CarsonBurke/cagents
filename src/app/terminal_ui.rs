@@ -384,14 +384,18 @@ impl Cagents {
         items.push(command("Find…", Action::Open(card)));
         if let Some(link) = &context.link {
             items.push(
-                widget::button::text("Open link")
-                    .width(Length::Fill)
-                    .on_press(Message::OpenLink(
-                        card,
-                        link.clone(),
-                        settings::LinkOpenGesture::ControlClick,
-                    ))
-                    .into(),
+                widget::button::text(if link.scheme() == "file" {
+                    "Open file · Ctrl+click"
+                } else {
+                    "Open link · Ctrl+click"
+                })
+                .width(Length::Fill)
+                .on_press(Message::OpenLink(
+                    card,
+                    link.clone(),
+                    settings::LinkOpenGesture::ControlClick,
+                ))
+                .into(),
             );
             items.push(command(
                 "Copy link",

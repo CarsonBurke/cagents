@@ -52,6 +52,9 @@ pub(crate) struct Store {
     directory: PathBuf,
     end: Option<Cursor>,
     first: Option<Cursor>,
+    newest: Option<Cursor>,
+    forward: Option<Cursor>,
+    paging: bool,
     cached_earlier: bool,
     provider_earlier: bool,
     pending_earlier: Option<Cursor>,
@@ -135,6 +138,9 @@ impl Store {
                 directory: directory.clone(),
                 end: None,
                 first: None,
+                newest: None,
+                forward: None,
+                paging: false,
                 cached_earlier: false,
                 provider_earlier: false,
                 pending_earlier: None,
@@ -480,9 +486,11 @@ impl Store {
                 .transpose()
                 .map(Option::flatten)
         };
-        let (end, first, pending_earlier) = (
+        let (end, first, newest, forward, pending_earlier) = (
             remap(self.end)?,
             remap(self.first)?,
+            remap(self.newest)?,
+            remap(self.forward)?,
             remap(self.pending_earlier)?,
         );
         let latest_boundary = match self.latest_boundary {
@@ -504,6 +512,8 @@ impl Store {
         transaction.commit().map_err(|e| e.to_string())?;
         self.end = end;
         self.first = first;
+        self.newest = newest;
+        self.forward = forward;
         self.pending_earlier = pending_earlier;
         self.latest_boundary = latest_boundary;
         self.dirty = true;
@@ -666,7 +676,9 @@ impl Store {
                         )
                         .map_err(|e| e.to_string())?
                 {
-                    self.end = Some(first);
+                    self.end = Some((first.0, first.1 + 1));
+                    self.forward = None;
+                    self.paging = true;
                 }
                 self.dirty = true;
                 out.push(Event::HistoryRecovered);
@@ -714,6 +726,9 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 self.end = None;
                 self.first = None;
+                self.newest = None;
+                self.forward = None;
+                self.paging = false;
                 self.provider_earlier = false;
                 self.cached_earlier = false;
                 self.pending_earlier = None;
@@ -833,8 +848,10 @@ impl Store {
     pub fn earlier(&mut self) -> Result<bool, String> {
         if self.cached_earlier {
             if let Some(first) = self.first {
-                self.end = Some(first);
+                self.end = Some((first.0, first.1 + 1));
+                self.forward = None;
             }
+            self.paging = true;
             self.dirty = true;
             Ok(true)
         } else if self.provider_earlier {
@@ -844,7 +861,24 @@ impl Store {
             Err("No earlier transcript is available".into())
         }
     }
+    /// Continue from the newest displayed chunk, retaining it as an anchor.
+    /// Only two cursors are retained, regardless of conversation length.
+    pub fn later(&mut self) -> Result<bool, String> {
+        if self.end.is_none() {
+            return Err("No newer cached transcript is available".into());
+        }
+        let newest = self
+            .newest
+            .ok_or("No newer cached transcript is available")?;
+        self.forward = Some(newest);
+        self.paging = true;
+        self.pending_earlier = None;
+        self.dirty = true;
+        Ok(true)
+    }
     pub fn latest(&mut self) {
+        self.paging = false;
+        self.forward = None;
         self.end = None;
         self.pending_earlier = None;
         self.dirty = true;
@@ -922,19 +956,30 @@ impl Store {
             .collect();
         let mut reused = std::collections::HashSet::new();
         let records = {
-            let mut statement = self.db.prepare("SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129").map_err(|e| e.to_string())?;
+            let query = if self.forward.is_some() {
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
+            } else {
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
+            };
+            let mut statement = self.db.prepare(query).map_err(|e| e.to_string())?;
             let rows = statement
-                .query_map([self.end.map_or(i64::MAX, |cursor| cursor.0)], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, i64>(3)? as usize,
-                        row.get::<_, i64>(4)? as usize,
-                        row.get::<_, i64>(5)? as usize,
-                        row.get::<_, Vec<u8>>(6)?,
-                    ))
-                })
+                .query_map(
+                    [self
+                        .forward
+                        .or(self.end)
+                        .map_or(i64::MAX, |cursor| cursor.0)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)? as usize,
+                            row.get::<_, i64>(4)? as usize,
+                            row.get::<_, i64>(5)? as usize,
+                            row.get::<_, Vec<u8>>(6)?,
+                        ))
+                    },
+                )
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
@@ -957,12 +1002,22 @@ impl Store {
             let total = len0 + len1;
             let kind = layout(&base.content);
             let parts = total.max(1).div_ceil(PART_BYTES);
-            let until = if self.end.is_some_and(|cursor| cursor.0 == ordinal) {
-                self.end.unwrap().1.min(parts)
-            } else {
-                parts
-            };
-            for part in (0..until).rev() {
+            let until =
+                if self.forward.is_none() && self.end.is_some_and(|cursor| cursor.0 == ordinal) {
+                    self.end.unwrap().1.min(parts)
+                } else {
+                    parts
+                };
+            let from = self
+                .forward
+                .filter(|cursor| cursor.0 == ordinal)
+                .map_or(0, |cursor| cursor.1.min(parts));
+            for index in 0..until.saturating_sub(from) {
+                let part = if self.forward.is_some() {
+                    from + index
+                } else {
+                    until - index - 1
+                };
                 let start = cut(part * PART_BYTES)?;
                 let end = if (part + 1) * PART_BYTES >= total {
                     total
@@ -998,8 +1053,11 @@ impl Store {
                     && let Some(previous) = old.get(item_id.as_ref())
                 {
                     reused.insert(item_id.into_owned());
-                    newest.get_or_insert((ordinal, part));
-                    first = Some((ordinal, part));
+                    newest = Some(
+                        newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))),
+                    );
+                    first =
+                        Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
                     items.push(std::sync::Arc::clone(previous));
                     continue;
@@ -1114,15 +1172,36 @@ impl Store {
                         "Provider item metadata exceeds native presentation capacity".into(),
                     );
                 }
-                if newest.is_none() {
-                    newest = Some((ordinal, part));
-                }
+                newest =
+                    Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
                 bytes += size;
-                first = Some((ordinal, part));
+                first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                 items.push(std::sync::Arc::new(item));
             }
         }
-        items.reverse();
+        // A nearly window-sized image may leave room only for the overlap.
+        // Retry without that chunk so pagination always advances. No residents
+        // have been consumed yet, and the retry skips this boundary exactly once.
+        if self.paging && items.len() == 1 {
+            if let Some(cursor) = self.forward
+                && newest == self.newest
+                && newest == Some(cursor)
+            {
+                self.forward = Some((cursor.0, cursor.1 + 1));
+                return self.window_reusing(previous);
+            }
+            if self.forward.is_none()
+                && let Some(cursor) = self.first
+                && first == Some(cursor)
+                && self.end == Some((cursor.0, cursor.1 + 1))
+            {
+                self.end = Some(cursor);
+                return self.window_reusing(previous);
+            }
+        }
+        if self.forward.is_none() {
+            items.reverse();
+        }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
                 part > 0
@@ -1138,6 +1217,10 @@ impl Store {
             None => false,
         };
         self.first = first;
+        self.newest = newest;
+        if self.forward.is_some() {
+            self.end = newest.map(|(ordinal, part)| (ordinal, part + 1));
+        }
         let has_later = if self.end.is_none() {
             false
         } else if let Some((ordinal, part)) = newest {
@@ -1149,6 +1232,12 @@ impl Store {
                 })
                 .map_err(|e| e.to_string())?
         };
+        // The next live update may now use the regular trailing window. The
+        // just-published forward page stays intact until data actually changes.
+        if !has_later {
+            self.forward = None;
+            self.end = None;
+        }
         let changes = items
             .iter()
             .filter(|item| !reused.contains(&item.id))
@@ -1162,6 +1251,7 @@ impl Store {
         drop(old);
         previous.clear();
         self.dirty = false;
+        self.paging = false;
         self.changed = Some(Default::default());
         Ok(Window {
             items,
@@ -1552,6 +1642,201 @@ mod tests {
     }
 
     #[test]
+    fn bounded_history_pages_overlap_and_continue_in_both_directions() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for n in 0..400 {
+            store
+                .apply(Event::Item(history_item(&format!("row-{n:03}"), "message")))
+                .unwrap();
+        }
+        let latest = store.window().unwrap();
+        assert_eq!(latest.items.len(), WINDOW_ITEMS);
+        assert!(!latest.has_later);
+        store.earlier().unwrap();
+        let older = store.window().unwrap();
+        assert_eq!(
+            older.items.last().unwrap().id,
+            latest.items.first().unwrap().id
+        );
+        assert!(older.has_later);
+        store.earlier().unwrap();
+        let oldest = store.window().unwrap();
+        assert_eq!(
+            oldest.items.last().unwrap().id,
+            older.items.first().unwrap().id
+        );
+        assert!(oldest.items.len() <= WINDOW_ITEMS);
+        let mut boundary = oldest.items.last().unwrap().id.clone();
+        for _ in 0..4 {
+            store.later().unwrap();
+            let next = store.window().unwrap();
+            assert_eq!(next.items.first().unwrap().id, boundary);
+            assert!(next.items.len() <= WINDOW_ITEMS);
+            boundary = next.items.last().unwrap().id.clone();
+            if !next.has_later {
+                assert_eq!(boundary, "row-399");
+                return;
+            }
+        }
+        panic!("forward paging never reached cached live end");
+    }
+
+    #[test]
+    fn later_at_live_end_refuses_without_replacing_the_displayed_window() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["older", "newer"] {
+            store.apply(Event::Item(history_item(id, id))).unwrap();
+        }
+        let page = store.window().unwrap();
+        assert!(store.later().is_err());
+        assert_eq!(store.window().unwrap().items, page.items);
+    }
+
+    #[test]
+    fn window_sized_attachment_does_not_stall_pagination_overlap() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(history_item("older", &"o".repeat(PART_BYTES))))
+            .unwrap();
+        store
+            .apply(Event::Item(Item {
+                id: "image".into(),
+                role: Role::Assistant,
+                at: None,
+                started_at: None,
+                content: ItemContent::Image {
+                    path: "x".repeat(WINDOW_BYTES - 32 * 1024),
+                    description: "image".into(),
+                },
+            }))
+            .unwrap();
+        store
+            .apply(Event::Item(history_item("newer", &"n".repeat(PART_BYTES))))
+            .unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "newer");
+        store.earlier().unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "image");
+        store.earlier().unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "older");
+        store.later().unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "image");
+        store.later().unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "newer");
+    }
+
+    #[test]
+    fn forward_page_rebuild_and_reverse_preserve_both_cursors() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for n in 0..500 {
+            store
+                .apply(Event::Item(history_item(&format!("row-{n:03}"), "message")))
+                .unwrap();
+        }
+        store.window().unwrap();
+        for _ in 0..3 {
+            store.earlier().unwrap();
+            store.window().unwrap();
+        }
+        store.later().unwrap();
+        let page = store.window().unwrap();
+        let cursors = (store.first, store.newest);
+        let mut residents = page.items.clone();
+        let rebuilt = store.window_reusing(&mut residents).unwrap();
+        assert_eq!(rebuilt.items, page.items);
+        assert_eq!((store.first, store.newest), cursors);
+        store.earlier().unwrap();
+        let previous = store.window().unwrap();
+        assert_eq!(
+            previous.items.last().unwrap().id,
+            page.items.first().unwrap().id
+        );
+        assert!(previous.items.first().unwrap().id < page.items.first().unwrap().id);
+    }
+
+    #[test]
+    fn provider_history_keeps_overlap_and_live_tail_survives_forward_navigation() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let messages = |start, end| {
+            (start..end)
+                .map(|n| history_item(&format!("row-{n:03}"), "message"))
+                .collect()
+        };
+        store
+            .apply(Event::History {
+                items: messages(200, 250),
+                has_earlier: true,
+            })
+            .unwrap();
+        let initial = store.window().unwrap();
+        assert!(!store.earlier().unwrap());
+        store
+            .apply(Event::History {
+                items: messages(0, 200),
+                has_earlier: false,
+            })
+            .unwrap();
+        let older = store.window().unwrap();
+        assert_eq!(
+            older.items.last().unwrap().id,
+            initial.items.first().unwrap().id
+        );
+        store
+            .apply(Event::Item(history_item(
+                "row-250",
+                "live arrived while reading history",
+            )))
+            .unwrap();
+        let held = store.window().unwrap();
+        assert_eq!(held.items, older.items);
+        store.later().unwrap();
+        let recent = store.window().unwrap();
+        assert_eq!(
+            recent.items.first().unwrap().id,
+            older.items.last().unwrap().id
+        );
+        assert_eq!(recent.items.last().unwrap().id, "row-250");
+        assert!(!recent.has_later);
+        assert!(store.forward.is_none());
+        store
+            .apply(Event::Item(history_item("row-251", "live resumes")))
+            .unwrap();
+        assert_eq!(store.window().unwrap().items.last().unwrap().id, "row-251");
+    }
+
+    #[test]
+    fn chunked_output_pages_continue_without_losing_or_duplicating_bytes() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let text = "x".repeat(WINDOW_BYTES * 3);
+        store
+            .apply(Event::Item(history_item("large", &text)))
+            .unwrap();
+        let mut page = store.window().unwrap();
+        while page.has_earlier {
+            store.earlier().unwrap();
+            page = store.window().unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0;
+        loop {
+            for item in &page.items {
+                if seen.insert(item.id.clone()) {
+                    if let ItemContent::Text { text, .. } = &item.content {
+                        bytes += text.len();
+                    }
+                }
+            }
+            if !page.has_later {
+                break;
+            }
+            let boundary = page.items.last().unwrap().id.clone();
+            store.later().unwrap();
+            page = store.window().unwrap();
+            assert_eq!(page.items.first().unwrap().id, boundary);
+        }
+        assert_eq!(bytes, text.len());
+    }
+
+    #[test]
     fn overlapping_history_inserts_prefix_middle_and_suffix_without_replacing_live_output() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         for id in ["A", "C"] {
@@ -1873,23 +2158,35 @@ mod tests {
         let mut pages = Vec::new();
         loop {
             let page = store.window().unwrap();
-            let value = page
+            let bytes: usize = page
                 .items
-                .into_iter()
-                .map(|item| match item.content.clone() {
-                    ItemContent::Text { text, .. } => text,
+                .iter()
+                .map(|item| match &item.content {
+                    ItemContent::Text { text, .. } => text.len(),
                     _ => panic!("unexpected content"),
                 })
-                .collect::<String>();
-            assert!(value.len() <= WINDOW_BYTES);
-            pages.push(value);
+                .sum();
+            assert!(bytes <= WINDOW_BYTES);
+            pages.push(page.items);
             if !page.has_earlier {
                 break;
             }
             assert!(store.earlier().unwrap());
         }
         pages.reverse();
-        assert_eq!(pages.concat(), original);
+        let mut seen = std::collections::HashSet::new();
+        let mut restored = String::new();
+        for item in pages.into_iter().flatten() {
+            if seen.insert(item.id.clone()) {
+                if let ItemContent::Text { text, .. } = &item.content {
+                    restored.push_str(text);
+                }
+            }
+        }
+        assert!(
+            restored == original,
+            "overlapping Unicode pages must reconstruct every original byte once"
+        );
         store.latest();
         assert!(!store.window().unwrap().has_later);
     }

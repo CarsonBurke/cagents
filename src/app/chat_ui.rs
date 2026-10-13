@@ -736,6 +736,67 @@ fn reconcile_disclosure(opened: &mut HashMap<String, bool>, turns: &[turn::Turn]
     }
 }
 
+/// A page can retain a tool while evicting the prompt that named its group.
+/// Match overlapping stable tool IDs before replacing the bounded snapshot.
+fn carry_step_disclosures(
+    opened: &mut HashMap<String, bool>,
+    search: &mut find::Disclosure,
+    previous: &[turn::Turn],
+    previous_items: &[Arc<chat::Item>],
+    next: &[turn::Turn],
+    next_items: &[Arc<chat::Item>],
+) {
+    // Streaming and status updates normally keep every group identity. No
+    // disclosure can move in that case, so avoid scratch maps on the hot path.
+    if previous.len() == next.len()
+        && previous
+            .iter()
+            .zip(next)
+            .all(|(old, new)| old.key == new.key)
+    {
+        return;
+    }
+    let choices: Vec<_> = previous
+        .iter()
+        .map(|turn| search.reader_turn(&turn.key, opened))
+        .collect();
+    let owners: HashMap<_, _> = previous
+        .iter()
+        .enumerate()
+        .flat_map(|(index, turn)| {
+            turn.steps
+                .iter()
+                .filter_map(move |step| Some((previous_items.get(step.index)?.id.as_str(), index)))
+        })
+        .collect();
+    let previous_keys: HashSet<_> = previous.iter().map(|turn| turn.key.as_str()).collect();
+    for turn in next {
+        if previous_keys.contains(turn.key.as_str()) {
+            continue;
+        }
+        // At most one counter per loaded group, never retained transcript data.
+        let mut overlap = vec![0usize; previous.len()];
+        for step in &turn.steps {
+            if let Some(owner) = next_items
+                .get(step.index)
+                .and_then(|item| owners.get(item.id.as_str()))
+                && choices[*owner].is_some()
+            {
+                overlap[*owner] += 1;
+            }
+        }
+        if let Some((owner, count)) = overlap
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, count)| (**count, std::cmp::Reverse(*index)))
+            && *count > 0
+            && let Some(choice) = choices[owner]
+        {
+            search.inherit_turn(&turn.key, choice, opened);
+        }
+    }
+}
+
 fn status_word(status: chat::ToolStatus) -> &'static str {
     match status {
         chat::ToolStatus::Running => "Running",
@@ -1262,7 +1323,7 @@ fn snapshot_channel_name(
 enum HistoryNavigation {
     EarlierEdge,
     EarlierExplicit,
-    LatestEdge,
+    NewerEdge,
     Latest,
 }
 
@@ -2394,9 +2455,18 @@ impl Runtime {
         }
         self.source_clock = source_clock;
         let cache = &self.cache;
-        self.turns = turn::group(&snapshot.items, &self.asked_after, |item| {
+        let turns = turn::group(&snapshot.items, &self.asked_after, |item| {
             cache.get(&item.id)?.coordination.as_deref()
         });
+        carry_step_disclosures(
+            &mut self.opened,
+            &mut self.find_disclosure,
+            &self.turns,
+            &self.snapshot.items,
+            &turns,
+            &snapshot.items,
+        );
+        self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
@@ -5433,12 +5503,12 @@ impl Cagents {
         };
         match page {
             HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
-            HistoryNavigation::LatestEdge
+            HistoryNavigation::NewerEdge
                 if runtime.scroll.at_bottom()
                     && !runtime.scroll.at_top()
                     && runtime.snapshot.has_later =>
             {
-                self.handle_chat_action(Action::Latest(target))
+                self.chat_send(target, Command::LoadLater, false)
             }
             HistoryNavigation::EarlierExplicit if runtime.snapshot.has_earlier => {
                 self.chat_send(target, Command::LoadEarlier, false)
@@ -5505,12 +5575,20 @@ impl Cagents {
         {
             return Task::none();
         }
+        if command == Command::LoadLater
+            && (runtime.selected_subagent.is_some()
+                || !runtime.snapshot.has_later
+                || runtime.snapshot.history_loading
+                || runtime.page_request.is_some())
+        {
+            return Task::none();
+        }
         // The ACK confirms dispatch, not arrival of the newest history.
         // Coalesce repeated gestures while that same navigation is in flight.
         if command == Command::Refresh
             && runtime
                 .page_request
-                .is_some_and(|(page, _)| page == view::Page::Newer)
+                .is_some_and(|(page, _)| page == view::Page::Latest)
         {
             return Task::none();
         }
@@ -5518,14 +5596,17 @@ impl Cagents {
         let id = runtime.next_command;
         let page = match &command {
             Command::LoadEarlier => Some(view::Page::Earlier),
-            Command::Refresh => Some(view::Page::Newer),
+            Command::Refresh => Some(view::Page::Latest),
+            Command::LoadLater => Some(view::Page::Newer),
             _ => None,
         };
         if let Some(page) = page {
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
                 view::Page::Earlier => runtime.earlier_asked = Some(runtime.scroll.content()),
-                view::Page::Newer => runtime.later_asked = Some(runtime.scroll.content()),
+                view::Page::Newer | view::Page::Latest => {
+                    runtime.later_asked = Some(runtime.scroll.content())
+                }
             }
         }
         let first_prompt = match &command {
@@ -7179,12 +7260,12 @@ impl Cagents {
                             runtime.answers.retain(|(id, _), _| id != &request);
                         }
                         runtime.refresh();
-                        if pending.page == Some(view::Page::Newer)
+                        if pending.page == Some(view::Page::Latest)
                             && runtime.deferred_page == Some(HistoryNavigation::Latest)
                         {
                             runtime.deferred_page = None;
                         }
-                        if pending.page == Some(view::Page::Newer)
+                        if pending.page == Some(view::Page::Latest)
                             && runtime.selected_subagent.is_none()
                         {
                             let snap = iced::widget::scrollable::snap_to(
@@ -7474,7 +7555,7 @@ impl Cagents {
                             if !runtime
                                 .pending
                                 .as_ref()
-                                .is_some_and(|pending| pending.page == Some(view::Page::Newer))
+                                .is_some_and(|pending| pending.page == Some(view::Page::Latest))
                             {
                                 runtime.deferred_page = Some(HistoryNavigation::Latest);
                             }
@@ -8016,7 +8097,7 @@ impl Cagents {
                     runtime.earlier_asked = None;
                 }
                 if !at_bottom {
-                    if runtime.deferred_page == Some(HistoryNavigation::LatestEdge) {
+                    if runtime.deferred_page == Some(HistoryNavigation::NewerEdge) {
                         runtime.deferred_page = None;
                     }
                     runtime.later_asked = None;
@@ -8053,11 +8134,11 @@ impl Cagents {
                 {
                     if runtime.pending.is_some() {
                         if runtime.deferred_page.is_none() {
-                            runtime.deferred_page = Some(HistoryNavigation::LatestEdge);
+                            runtime.deferred_page = Some(HistoryNavigation::NewerEdge);
                         }
                         return Task::none();
                     }
-                    return self.chat_send(target, Command::Refresh, false);
+                    return self.chat_send(target, Command::LoadLater, false);
                 }
             }
             Action::ModelPicker(target, open) => {
@@ -9732,7 +9813,7 @@ mod tests {
         let _ = app.handle_chat_ui(Action::Latest(target));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
     }
 
@@ -10168,7 +10249,7 @@ mod tests {
         )));
         assert_eq!(
             chat_runtime(&app, card).deferred_page,
-            Some(HistoryNavigation::LatestEdge)
+            Some(HistoryNavigation::NewerEdge)
         );
         drop(app.handle_chat_ui(Action::Scrolled(
             target,
@@ -10179,6 +10260,23 @@ mod tests {
         assert!(chat_runtime(&app, card).deferred_page.is_none());
         settle(&mut app, card, Ok(()));
         assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn history_bottom_requests_cached_next_page_instead_of_refreshing_to_latest() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            true,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Newer)
+        );
     }
 
     #[test]
@@ -10211,7 +10309,7 @@ mod tests {
         settle(&mut app, card, Ok(()));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
     }
 
@@ -10255,7 +10353,7 @@ mod tests {
         settle(&mut app, card, Ok(()));
         assert_eq!(
             chat_runtime(&app, card).page_request.map(|(page, _)| page),
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert!(chat_runtime(&app, card).pending.is_none());
@@ -10313,7 +10411,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert_eq!(
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
-            Some(view::Page::Newer)
+            Some(view::Page::Latest)
         );
     }
 
@@ -10543,6 +10641,123 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&!default));
             let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
             assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&default));
+        }
+    }
+
+    #[test]
+    fn paged_tool_groups_keep_reader_choices_when_their_prompt_is_evicted() {
+        for default in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("paged-disclosure"));
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target).unwrap().tool_groups_expanded = default;
+            let item = |id: &str, role, content| {
+                Arc::new(chat::Item {
+                    id: id.into(),
+                    role,
+                    content,
+                    at: None,
+                    started_at: None,
+                })
+            };
+            let tool = |id| {
+                item(
+                    id,
+                    chat::Role::Assistant,
+                    ItemContent::Tool {
+                        name: "shell".into(),
+                        input: "run".into(),
+                        output: "saved output".into(),
+                        status: chat::ToolStatus::Succeeded,
+                    },
+                )
+            };
+            let full = vec![
+                item("prompt", chat::Role::User, text("Work")),
+                tool("first-tool"),
+                tool("boundary-tool"),
+            ];
+            let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+            snapshot.generation += 1;
+            snapshot.items = full.clone();
+            show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+            drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
+            drop(app.handle_chat_ui(Action::Toggle(target, "boundary-tool".into())));
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .unfolded
+                .insert("boundary-tool#output".into());
+            snapshot.generation += 1;
+            snapshot.items = vec![full[2].clone()];
+            snapshot.has_later = true;
+            show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.turns[0].key, "boundary-tool");
+            assert_eq!(runtime.opened.get("boundary-tool"), Some(&!default));
+            assert!(runtime.expanded.contains("boundary-tool"));
+            assert!(runtime.unfolded.contains("boundary-tool#output"));
+            // A new explicit choice on the partial group supersedes the stale
+            // remembered choice when its original prompt returns.
+            drop(app.handle_chat_ui(Action::ToggleTurn(target, "boundary-tool".into())));
+            snapshot.generation += 1;
+            snapshot.items = full;
+            snapshot.has_later = false;
+            show_chat_snapshot_for_test(&mut app, card, snapshot);
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.opened.get("prompt"), Some(&default));
+            assert!(runtime.expanded.contains("boundary-tool"));
+        }
+    }
+
+    #[test]
+    fn paging_inherits_reader_choices_without_retaining_temporary_find_disclosure() {
+        for explicit in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("paged-find-disclosure"));
+            let target = chat_runtime(&app, card).target;
+            let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+            snapshot.generation += 1;
+            snapshot.items = vec![
+                Arc::new(chat::Item {
+                    id: "prompt".into(),
+                    role: chat::Role::User,
+                    content: text("Work"),
+                    at: None,
+                    started_at: None,
+                }),
+                Arc::new(chat::Item {
+                    id: "tool".into(),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Tool {
+                        name: "shell".into(),
+                        input: "run".into(),
+                        output: "search needle".into(),
+                        status: chat::ToolStatus::Succeeded,
+                    },
+                    at: None,
+                    started_at: None,
+                }),
+            ];
+            app.chat_runtime_mut(target).unwrap().tool_groups_expanded = false;
+            show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+            if explicit {
+                drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
+                drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
+            }
+            drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+            assert_eq!(chat_runtime(&app, card).opened.get("prompt"), Some(&true));
+            snapshot.generation += 1;
+            snapshot.items.remove(0);
+            show_chat_snapshot_for_test(&mut app, card, snapshot);
+            drop(app.handle_chat_ui(Action::CloseFind(target)));
+            assert_eq!(
+                chat_runtime(&app, card).opened.get("tool"),
+                explicit.then_some(&false)
+            );
+            assert_eq!(
+                chat_runtime(&app, card).opened.get("prompt"),
+                explicit.then_some(&false)
+            );
         }
     }
 

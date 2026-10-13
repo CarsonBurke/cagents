@@ -185,6 +185,27 @@ impl Disclosure {
             opened.insert(key.to_owned(), true);
         }
     }
+    /// Read the reader's choice beneath any temporary search disclosure.
+    pub(super) fn reader_turn(&self, key: &str, opened: &HashMap<String, bool>) -> Option<bool> {
+        self.turns
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| opened.get(key).copied())
+    }
+    /// Regrouping inherits the reader's choice without taking ownership away
+    /// from an active search that temporarily opened the destination group.
+    pub(super) fn inherit_turn(
+        &mut self,
+        key: &str,
+        choice: bool,
+        opened: &mut HashMap<String, bool>,
+    ) {
+        if let Some(previous) = self.turns.get_mut(key) {
+            *previous = Some(choice);
+        } else {
+            opened.insert(key.to_owned(), choice);
+        }
+    }
     pub(super) fn manual_item(&mut self, id: &str) {
         self.items.remove(id);
     }
