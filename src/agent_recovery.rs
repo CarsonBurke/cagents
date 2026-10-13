@@ -1496,16 +1496,33 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn native_handoff_preserves_the_omp_xdg_configuration_directory() {
-        let environment = preserved_native_environment(
-            b"HOME=/source\0XDG_CONFIG_HOME=/selected/config\0XDG_DATA_HOME=/selected/data\0XDG_STATE_HOME=/selected/state\0",
-            Provider::Omp,
-            &BTreeMap::new(),
-        ).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config");
+        let data = directory.path().join("data");
+        let state = directory.path().join("state");
+        for root in [&config, &data, &state] {
+            fs::create_dir_all(root.join("omp")).unwrap();
+        }
+        let source = format!(
+            "HOME=/source\0XDG_CONFIG_HOME={}\0XDG_DATA_HOME={}\0XDG_STATE_HOME={}\0",
+            config.display(),
+            data.display(),
+            state.display()
+        );
+        let environment =
+            preserved_native_environment(source.as_bytes(), Provider::Omp, &BTreeMap::new())
+                .unwrap();
         let mut recipe = launch("omp", &[]);
         recipe.environment = environment;
-        assert_eq!(Provider::Omp.authored_content_root(&recipe), Some("/selected/config/omp".into()));
-        assert_eq!(Provider::Omp.session_root(&recipe), Some("/selected/data/omp".into()));
-        assert_eq!(Provider::Omp.session_state_root(&recipe), Some("/selected/state/omp".into()));
+        assert_eq!(
+            Provider::Omp.authored_content_root(&recipe),
+            Some(config.join("omp"))
+        );
+        assert_eq!(Provider::Omp.session_root(&recipe), Some(data.join("omp")));
+        assert_eq!(
+            Provider::Omp.session_state_root(&recipe),
+            Some(state.join("omp"))
+        );
     }
 
     #[cfg(feature = "host")]

@@ -229,7 +229,12 @@ impl Provider {
     #[cfg(any(feature = "ui", feature = "host"))]
     pub fn authored_content_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         if self == Self::Omp {
-            omp::config_root(launch, &launch.working_directory.join(launch.environment.get("HOME")?))
+            omp::config_root(
+                launch,
+                &launch
+                    .working_directory
+                    .join(launch.environment.get("HOME")?),
+            )
         } else {
             self.session_root(launch)
         }
@@ -239,15 +244,21 @@ impl Provider {
     /// Relative environment paths are interpreted by the child in its own cwd,
     /// never in the cwd of the UI or daemon reading its history.
     pub fn session_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
-        let home = launch.working_directory.join(launch.environment.get("HOME")?);
-        (self.adapter().session_root)(launch, &home)
-            .map(|root| launch.working_directory.join(root))
+        let home = launch
+            .working_directory
+            .join(launch.environment.get("HOME")?);
+        (self.adapter().session_root)(launch, &home).map(|root| launch.working_directory.join(root))
     }
 
     #[cfg(feature = "host")]
     pub(crate) fn session_state_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         if self == Self::Omp {
-            omp::state_root(launch, &launch.working_directory.join(launch.environment.get("HOME")?))
+            omp::state_root(
+                launch,
+                &launch
+                    .working_directory
+                    .join(launch.environment.get("HOME")?),
+            )
         } else {
             self.session_root(launch)
         }
@@ -423,17 +434,30 @@ mod tests {
             (Provider::Codex, "home/.codex"),
             (Provider::Omp, "home/.omp/agent"),
         ] {
-            assert_eq!(provider.session_root(&recipe), Some(recipe.working_directory.join(default)));
+            assert_eq!(
+                provider.session_root(&recipe),
+                Some(recipe.working_directory.join(default))
+            );
         }
         for (provider, variable) in [
             (Provider::Claude, "CLAUDE_CONFIG_DIR"),
             (Provider::Codex, "CODEX_HOME"),
             (Provider::Omp, "PI_CODING_AGENT_DIR"),
         ] {
-            recipe.environment.insert(variable.into(), "selected-account".into());
-            assert_eq!(provider.session_root(&recipe), Some(recipe.working_directory.join("selected-account")));
-            recipe.environment.insert(variable.into(), "/absolute/account".into());
-            assert_eq!(provider.session_root(&recipe), Some("/absolute/account".into()));
+            recipe
+                .environment
+                .insert(variable.into(), "selected-account".into());
+            assert_eq!(
+                provider.session_root(&recipe),
+                Some(recipe.working_directory.join("selected-account"))
+            );
+            recipe
+                .environment
+                .insert(variable.into(), "/absolute/account".into());
+            assert_eq!(
+                provider.session_root(&recipe),
+                Some("/absolute/account".into())
+            );
         }
     }
 
@@ -443,9 +467,15 @@ mod tests {
         let mut recipe = launch("omp", &[]);
         recipe.working_directory = "/project/worktree".into();
         recipe.environment.insert("HOME".into(), "home".into());
-        assert_eq!(Provider::Omp.authored_content_root(&recipe), Some(recipe.working_directory.join("home/.omp/agent")));
+        assert_eq!(
+            Provider::Omp.authored_content_root(&recipe),
+            Some(recipe.working_directory.join("home/.omp/agent"))
+        );
         #[cfg(feature = "host")]
-        assert_eq!(Provider::Omp.session_state_root(&recipe), Some(recipe.working_directory.join("home/.omp/agent")));
+        assert_eq!(
+            Provider::Omp.session_state_root(&recipe),
+            Some(recipe.working_directory.join("home/.omp/agent"))
+        );
     }
 
     #[test]
