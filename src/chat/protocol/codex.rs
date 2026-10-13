@@ -1058,6 +1058,7 @@ impl Codex {
                             && let Some(metadata) = metadata.as_object_mut()
                         {
                             metadata.remove("status");
+                            metadata.remove("model");
                         }
                         self.discover_child(id, &metadata, step)?;
                     }
@@ -2690,7 +2691,9 @@ impl Codex {
             return Err("Codex metadata belongs to a different thread".into());
         }
         self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
-        if let Some(model) = thread["model"].as_str().filter(|model| !model.is_empty()) {
+        if !self.selection_dirty
+            && let Some(model) = thread["model"].as_str().filter(|model| !model.is_empty())
+        {
             self.selected = Some(model.to_owned());
         }
         self.observe_thread_status(&thread["status"]);
@@ -4450,14 +4453,19 @@ mod tests {
         child.is_child = true;
         child.thread = Some("child".into());
         child.subagent_status = Some(ToolStatus::Failed);
+        child.selected = Some("gpt-new".into());
         parent.children.insert("child".into(), Box::new(child));
         let mut step = Step::default();
-        parent.page(&json!({"data":[{"id":"older","status":"completed","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-exact","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"running","agentNickname":"Scout"}}}]}],"nextCursor":null}), &mut step, true).unwrap();
+        parent.page(&json!({"data":[{"id":"older","status":"completed","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-exact","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"running","agentNickname":"Scout","model":"gpt-old"}}}]}],"nextCursor":null}), &mut step, true).unwrap();
         assert_eq!(
             parent.children["child"].subagent_status,
             Some(ToolStatus::Failed)
         );
-        assert!(step.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, status:None, .. } if id == "child" && kind == "Scout")));
+        assert_eq!(
+            parent.children["child"].selected.as_deref(),
+            Some("gpt-new")
+        );
+        assert!(step.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, status:None, model:None, .. } if id == "child" && kind == "Scout")));
         assert!(!step.events.iter().any(|event| matches!(
             event,
             Event::Subagent {
@@ -4465,6 +4473,28 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn metadata_refresh_preserves_the_model_selected_for_the_next_prompt() {
+        let mut adapter = adapter();
+        adapter
+            .command(Command::SetModel {
+                model: "gpt-next".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        adapter.receive(json!({"method":"thread/started","params":{"thread":{"id":"thread-exact","model":"gpt-prior","canAcceptDirectInput":true,"status":{"type":"idle"}}}})).unwrap();
+        assert_eq!(adapter.selected.as_deref(), Some("gpt-next"));
+        let prompt = adapter
+            .command(Command::Prompt {
+                text: "Next prompt".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert_eq!(prompt.writes[0]["method"], "turn/start");
+        assert_eq!(prompt.writes[0]["params"]["model"], "gpt-next");
     }
 
     #[test]
