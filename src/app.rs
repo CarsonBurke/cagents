@@ -2336,6 +2336,17 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     }
 }
 
+/// The first native size is reported as Opened, before any resize. Both
+/// events carry logical dimensions and replace the pre-map estimate.
+fn window_geometry_message(event: &window::Event) -> Option<Message> {
+    match event {
+        window::Event::Opened { size, .. } | window::Event::Resized(size) => {
+            Some(Message::WindowResized(size.width, size.height))
+        }
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -4856,7 +4867,7 @@ pub struct Cagents {
     window_scale_factor: f32,
     /// Starts at an estimate, because the pane density and the strip's viewport
     /// are both derived from it and the surface does not report a width until
-    /// it has been mapped. `Message::WindowResized` replaces it.
+    /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
     core: Core,
@@ -16542,9 +16553,6 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
-                iced::Event::Window(window::Event::Resized(size)) => {
-                    Some(Message::WindowResized(size.width, size.height))
-                }
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
                 }
@@ -16557,6 +16565,7 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, false),
                 )),
+                iced::Event::Window(event) => window_geometry_message(&event),
                 _ => None,
             }),
         ];
@@ -21037,6 +21046,27 @@ mod tests {
             let _ = app.update(Message::CancelDialog);
             assert!(app.pull_request_dialog.is_none());
         }
+    }
+
+    #[test]
+    fn initial_native_window_size_replaces_estimated_inspector_geometry() {
+        for event in [
+            window::Event::Opened {
+                size: iced::Size::new(960.0, 600.0),
+                position: None,
+            },
+            window::Event::Resized(iced::Size::new(960.0, 600.0)),
+        ] {
+            let mut app = context_inspector_test_app(true);
+            assert!(!app.context_inspector_is_overlay());
+            let message = window_geometry_message(&event).expect("native geometry event");
+            let _ = app.update(message);
+            assert_eq!(app.window_width, 960.0);
+            assert_eq!(app.window_height, 600.0);
+            assert!(app.context_inspector_is_overlay());
+            assert!(app.workspace_inputs_blocked());
+        }
+        assert!(window_geometry_message(&window::Event::Focused).is_none());
     }
 
     #[test]
