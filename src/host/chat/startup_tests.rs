@@ -85,7 +85,7 @@ fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
     );
     assert!(
         directory
-            .join(".agents/skills/cagents-agents/SKILL.md")
+            .join(".agents/skills/cagents/SKILL.md")
             .is_file()
     );
     assert!(host.lock().unwrap().chat_spawning.is_empty());
