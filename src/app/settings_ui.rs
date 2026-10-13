@@ -1441,6 +1441,7 @@ fn settings_layout<'a>(
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
         crate::design::scrollbar(),
     ))
+    .id(crate::settings_widgets::content_id())
     .class(cosmic::style::iced::Scrollable::Minimal)
     .width(Length::Fill)
     .height(Length::Fill);
