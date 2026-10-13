@@ -84,12 +84,20 @@ impl Coordinated {
     pub(super) fn parts(&self) -> Vec<(String, &str)> {
         let mut parts = Vec::new();
         match &self.reading.kind {
-            Kind::Message(message) => parts.extend(message.body.inline().map(|body| ("body".to_owned(), body))),
+            Kind::Message(message) => {
+                parts.extend(message.body.inline().map(|body| ("body".to_owned(), body)))
+            }
             Kind::Spawn(spawn) => {
                 parts.push(("brief".to_owned(), spawn.brief.as_str()));
-                parts.extend(spawn.agents.iter().enumerate().filter_map(|(index, agent)| {
-                    Some((format!("prompt-{index}"), agent.prompt.inline()?))
-                }));
+                parts.extend(
+                    spawn
+                        .agents
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, agent)| {
+                            Some((format!("prompt-{index}"), agent.prompt.inline()?))
+                        }),
+                );
             }
             Kind::Act(_) => {}
         }
@@ -101,7 +109,12 @@ impl Coordinated {
                 .enumerate()
                 .map(|(index, message)| (format!("answer-{index}"), message.body.as_str())),
         );
-        parts.extend(outcome.run.as_ref().map(|run| ("result".to_owned(), run.result.as_str())));
+        parts.extend(
+            outcome
+                .run
+                .as_ref()
+                .map(|run| ("result".to_owned(), run.result.as_str())),
+        );
         parts
     }
 
@@ -347,7 +360,11 @@ fn state_phrase(state: State) -> &'static str {
 
 /// Why a step failed: what the CLI said, or else the last thing it printed.
 fn failure<'a>(reading: &'a Coordination, output: &'a str) -> &'a str {
-    reading.outcome.error.as_deref().unwrap_or_else(|| last_line(output))
+    reading
+        .outcome
+        .error
+        .as_deref()
+        .unwrap_or_else(|| last_line(output))
 }
 
 /// The last thing a command printed.
@@ -434,12 +451,26 @@ impl Runtime {
         };
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &coordinated.reading.kind {
-            Kind::Message(message) => {
-                self.message_rows(&mut rows, item, cached, coordinated, message, status, output, settings)
-            }
-            Kind::Spawn(spawn) => {
-                self.spawn_rows(&mut rows, item, cached, coordinated, spawn, status, output, settings)
-            }
+            Kind::Message(message) => self.message_rows(
+                &mut rows,
+                item,
+                cached,
+                coordinated,
+                message,
+                status,
+                output,
+                settings,
+            ),
+            Kind::Spawn(spawn) => self.spawn_rows(
+                &mut rows,
+                item,
+                cached,
+                coordinated,
+                spawn,
+                status,
+                output,
+                settings,
+            ),
             Kind::Act(_) => {}
         }
         rows.push(self.card_footer(item, cached, coordinated, status != reported));
@@ -476,7 +507,9 @@ impl Runtime {
     /// The glyph or spinner a card's heading opens with.
     fn card_indicator(&self, status: ToolStatus, icon: Icon) -> Element<'static, Message> {
         match status {
-            ToolStatus::Running => crate::ui_controls::activity_spinner(14.0, design::warning_color),
+            ToolStatus::Running => {
+                crate::ui_controls::activity_spinner(14.0, design::warning_color)
+            }
             ToolStatus::Failed => widget::icon(Icon::Error.handle())
                 .size(14)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
@@ -569,15 +602,17 @@ impl Runtime {
             (ToolStatus::Running, _) => Some(("Sending…".to_owned(), Tone::Plain)),
             // An ask that timed out was still sent; only the answer is late.
             (ToolStatus::Failed, Some(receipt)) if message.waits => Some((
-                format!("{} · No answer yet; it will arrive as a message", arrival(receipt.arrival)),
+                format!(
+                    "{} · No answer yet; it will arrive as a message",
+                    arrival(receipt.arrival)
+                ),
                 Tone::Warning,
             )),
             // An ask prints its receipt only once its wait ends, so one
             // stopped while waiting was sent without saying so.
-            (ToolStatus::Stopped, _) if message.waits => Some((
-                "Stopped waiting for an answer".to_owned(),
-                Tone::Warning,
-            )),
+            (ToolStatus::Stopped, _) if message.waits => {
+                Some(("Stopped waiting for an answer".to_owned(), Tone::Warning))
+            }
             (ToolStatus::Stopped, None) => Some((
                 "Stopped before it confirmed sending".to_owned(),
                 Tone::Warning,
@@ -657,13 +692,25 @@ impl Runtime {
             );
         }
         if let Some(brief) = &coordinated.brief {
-            rows.push(self.folded_markdown(item, cached, "brief", brief, "Show the shared brief", settings));
+            rows.push(self.folded_markdown(
+                item,
+                cached,
+                "brief",
+                brief,
+                "Show the shared brief",
+                settings,
+            ));
         }
         let several = spawn.agents.len() > 1;
         for (index, (agent, prompt)) in spawn.agents.iter().zip(&coordinated.prompts).enumerate() {
             let mut title: Vec<String> = Vec::new();
             if several {
-                title.extend([&agent.name, &agent.kind].into_iter().filter(|name| !name.is_empty()).cloned());
+                title.extend(
+                    [&agent.name, &agent.kind]
+                        .into_iter()
+                        .filter(|name| !name.is_empty())
+                        .cloned(),
+                );
             } else if !agent.name.is_empty() && !agent.kind.is_empty() {
                 title.push(agent.kind.clone());
             }
@@ -747,8 +794,18 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Option<Element<'static, Message>> {
         let run = coordinated.reading.outcome.run.as_ref()?;
-        let result = coordinated.answers.last().filter(|_| !run.result.is_empty())?;
-        Some(self.answer_block(item, cached, "result", "Result".to_owned(), result, settings))
+        let result = coordinated
+            .answers
+            .last()
+            .filter(|_| !run.result.is_empty())?;
+        Some(self.answer_block(
+            item,
+            cached,
+            "result",
+            "Result".to_owned(),
+            result,
+            settings,
+        ))
     }
 
     /// A message's or a prompt's text, folded to its opening when long.
@@ -768,9 +825,9 @@ impl Runtime {
             (Text::Inline(_), Some(content)) => {
                 self.folded_markdown(item, cached, part, content, unfold, settings)
             }
-            (Text::File(path), _) => design::caption(format!("The contents of {path}"))
+            (Text::File(path), _) => design::caption(format!("The contents of {path}")).into(),
+            _ => design::caption("Read from standard input, which the transcript does not show")
                 .into(),
-            _ => design::caption("Read from standard input, which the transcript does not show").into(),
         })
     }
 
@@ -787,9 +844,10 @@ impl Runtime {
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
         let open = self.unfolded.contains(&key);
-        let toggle = widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
-            .class(crate::ui_controls::control_style(false, None))
-            .on_press(action(Action::Unfold(self.target, key)));
+        let toggle =
+            widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
+                .class(crate::ui_controls::control_style(false, None))
+                .on_press(action(Action::Unfold(self.target, key)));
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),
             toggle,
@@ -843,10 +901,13 @@ impl Runtime {
     ) -> Element<'static, Message> {
         widget::container(
             widget::column::with_children(vec![
-                widget::row::with_children(vec![muted_glyph(Icon::Chat), design::caption(caption).into()])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center)
-                    .into(),
+                widget::row::with_children(vec![
+                    muted_glyph(Icon::Chat),
+                    design::caption(caption).into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
                 self.folded_markdown(item, cached, part, content, "Show all of it", settings),
             ])
             .spacing(step::GAP_XS),
@@ -891,7 +952,10 @@ impl Runtime {
                 )
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                .on_press(action(Action::SelectSubagent(self.target, Some(agent.id.clone()))))
+                .on_press(action(Action::SelectSubagent(
+                    self.target,
+                    Some(agent.id.clone()),
+                )))
                 .into(),
             );
         }
