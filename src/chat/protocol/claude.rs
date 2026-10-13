@@ -336,6 +336,9 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<String, Item>,
+    /// Synthetic task rows shown before their Agent tool is known. Bounded by
+    /// the same cache as task tools, so late correlation can retract one row.
+    visible_task_rows: HashSet<String>,
     /// The tool each call shown as a file change was made with. A change has
     /// no place for the name, and an edit that fails is shown as its call
     /// again; the input says which tool that was only while it is still
@@ -461,11 +464,25 @@ impl Claude {
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(id) = self.tool_order.pop_front() {
                 self.tools.remove(&id);
+                self.visible_task_rows.remove(&id);
                 self.edit_tools.remove(&id);
                 self.tool_inputs.remove(&id);
             }
         }
     }
+    fn hide_task_rows_for_agent(&mut self, tool: &str, step: &mut Step) {
+        let ids: Vec<_> = self
+            .agent_task_calls
+            .iter()
+            .filter(|(known, _)| known == tool)
+            .map(|(_, task)| format!("claude-task:{task}"))
+            .filter(|id| self.visible_task_rows.remove(id))
+            .collect();
+        if !ids.is_empty() {
+            step.events.push(Event::ItemsRemoved { ids });
+        }
+    }
+
     fn remember_tool_input(&mut self, id: &str, input: &Value) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
             return Ok(());
@@ -1089,6 +1106,7 @@ impl Claude {
                                 .is_some_and(|status| status != ToolStatus::Running)
                         }) {
                             if string(block, "name") == "Agent" {
+                                self.hide_task_rows_for_agent(&tool_id, step);
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -1776,6 +1794,7 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
                 self.tool_input_order.clear();
@@ -3710,6 +3729,15 @@ impl Claude {
                         .find(|(_, known)| known == task)
                         .map(|(tool, _)| tool.clone())
                 });
+                // Lifecycle bookkeeping and notification summaries still need
+                // the synthetic tool. Only its duplicate presentation is hidden.
+                let represented = known_tool
+                    .as_deref()
+                    .or_else(|| frame["tool_use_id"].as_str())
+                    .is_some_and(|tool| {
+                        self.tools.get(tool).is_some_and(|item|
+                        matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
+                    });
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.stopped_agents.retain(|known| known != tool);
@@ -3749,7 +3777,16 @@ impl Claude {
                     });
                 }
                 self.tool(item.clone());
-                step.events.push(Event::Item(item.clone()));
+                if represented {
+                    if self.visible_task_rows.remove(&item.id) {
+                        step.events.push(Event::ItemsRemoved {
+                            ids: vec![item.id.clone()],
+                        });
+                    }
+                } else {
+                    self.visible_task_rows.insert(item.id.clone());
+                    step.events.push(Event::Item(item.clone()));
+                }
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
                 {
@@ -6650,6 +6687,81 @@ mod tests {
         );
         let finished = adapter.receive(json!({"type":"user","uuid":"result-carrier","message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Done"}]}})).unwrap();
         assert!(finished.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn correlated_task_lifecycle_updates_the_agent_without_a_duplicate_tool_row() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true,"description":"Inspect parser"}}]}})).unwrap();
+        for frame in [
+            json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"tool-agent","task_type":"local_agent","description":"Inspect parser"}),
+            json!({"type":"system","subtype":"task_progress","task_id":"task-one","tool_use_id":"tool-agent","patch":{"summary":"Checking tokens"}}),
+            json!({"type":"system","subtype":"task_notification","task_id":"task-one","tool_use_id":"tool-agent","status":"completed","summary":"Found the parser defect.","uuid":"done"}),
+        ] {
+            let step = adapter.receive(frame).unwrap();
+            assert!(!step.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            ));
+            if step.events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Subagent {
+                        status: Some(ToolStatus::Succeeded),
+                        ..
+                    }
+                )
+            }) {
+                assert!(step.events.iter().any(|event| matches!(event, Event::Item(Item { content:ItemContent::Delivery { body, .. }, .. }) if body == "Found the parser defect.")));
+            }
+        }
+        assert_eq!(
+            adapter.tools["claude-task:task-one"].content.status(),
+            Some(ToolStatus::Succeeded)
+        );
+        assert!(adapter.visible_task_rows.is_empty());
+    }
+
+    #[test]
+    fn an_agent_arriving_after_its_task_retracts_only_the_correlated_fallback_row() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task-one","tool_use_id":"tool-agent","task_type":"local_agent","description":"Inspect parser"})).unwrap();
+        assert!(
+            started.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            )
+        );
+        let agent = adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(agent.events.iter().any(
+            |event| matches!(event, Event::ItemsRemoved { ids } if ids == &["claude-task:task-one"])
+        ));
+        assert!(
+            agent
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(item) if item.id == "tool-agent"))
+        );
+        let progress = adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task-one","patch":{"summary":"Checking tokens"}})).unwrap();
+        assert!(
+            !progress.events.iter().any(
+                |event| matches!(event, Event::Item(item) if item.id == "claude-task:task-one")
+            )
+        );
+        assert!(adapter.visible_task_rows.is_empty());
+    }
+
+    #[test]
+    fn uncorrelated_agent_command_and_workflow_tasks_keep_their_fallback_rows() {
+        let mut adapter = Claude::default();
+        for kind in ["local_agent", "local_bash", "local_workflow"] {
+            let id = format!("claude-task:{kind}");
+            let step = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":kind,"task_type":kind,"description":"Uncorrelated work"})).unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(item) if item.id == id))
+            );
+        }
+        assert_eq!(adapter.visible_task_rows.len(), 3);
     }
 
     #[test]
