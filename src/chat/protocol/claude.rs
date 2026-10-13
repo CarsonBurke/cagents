@@ -1813,7 +1813,9 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
-        self.fast_mode_metadata(&frame, &mut step);
+        if frame["parent_tool_use_id"].is_null() {
+            self.fast_mode_metadata(&frame, &mut step);
+        }
         if let Some(run) = self.execution
             && matches!(
                 string(&frame, "type"),
@@ -4809,6 +4811,31 @@ mod tests {
         adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":request.writes[0]["request_id"],"response":{}}})).unwrap();
         assert!(!adapter.fast_mode.as_ref().unwrap().enabled());
         assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn fast_mode_metadata_from_child_frames_cannot_change_parent_speed_or_capability() {
+        let mut adapter = Claude {
+            ready: true,
+            fast_mode: Some(chat::FastMode {
+                state: chat::FastModeState::On,
+                disabled_reason: None,
+            }),
+            ..Default::default()
+        };
+        let child = json!({"type":"assistant","parent_tool_use_id":"child-tool","uuid":"child-message","fast_mode_state":"off","fast_mode_disabled_reason":"disabled_by_env","message":{"id":"child-message","role":"assistant","content":[{"type":"text","text":"Child answer"}]}});
+        let step = adapter.receive(child).unwrap();
+        assert_eq!(
+            adapter.fast_mode.as_ref().unwrap().state,
+            chat::FastModeState::On
+        );
+        assert!(adapter.capabilities().fast_mode);
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::FastMode(_) | Event::Capabilities(_)))
+        );
     }
 
     #[test]
