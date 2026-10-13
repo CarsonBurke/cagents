@@ -1,5 +1,6 @@
 //! A conversation's reported edits, independent of the visible transcript page.
 use super::*;
+mod scroll_restore;
 use crate::chat::{FileChangeKey, FileChangeSource, FilePatchCursor};
 
 // Tasks can outlive a Runtime replacement on the same card. A request ID
@@ -10,6 +11,7 @@ static NEXT_REVIEW_REQUEST: AtomicU64 = AtomicU64::new(1);
 pub(super) struct State {
     pub(super) open: bool,
     pub(super) list_scroll: f32,
+    pub(super) list_epoch: u64,
     file_open_request: Option<u64>,
     selected: Option<FileChangeKey>,
     pub(super) resolved_path: Option<String>,
@@ -25,8 +27,14 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn show(&mut self) {
+        self.open = true;
+        self.list_epoch = NEXT_REVIEW_REQUEST.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn close(&mut self) {
         self.open = false;
+        self.list_epoch = NEXT_REVIEW_REQUEST.fetch_add(1, Ordering::Relaxed);
         self.list_scroll = 0.0;
         self.file_open_request = None;
         self.selected = None;
@@ -41,7 +49,29 @@ impl State {
         self.error = None;
     }
 
+    pub(super) fn record_scroll(
+        &mut self,
+        page: u64,
+        first_page: u64,
+        epoch: u64,
+        narrow: bool,
+        offset: f32,
+    ) {
+        let current = self
+            .list
+            .as_ref()
+            .map_or(first_page, |list| list.request_id);
+        if self.open
+            && page == current
+            && epoch == self.list_epoch
+            && (!narrow || self.selected.is_none())
+        {
+            self.list_scroll = offset;
+        }
+    }
+
     pub(super) fn back(&mut self) {
+        self.list_epoch = NEXT_REVIEW_REQUEST.fetch_add(1, Ordering::Relaxed);
         if let Some(previous) = self.patch_request.take() {
             self.waiting.remove(&previous);
         }
@@ -55,6 +85,7 @@ impl State {
     }
 
     pub(super) fn select(&mut self, key: FileChangeKey) {
+        self.list_epoch = NEXT_REVIEW_REQUEST.fetch_add(1, Ordering::Relaxed);
         if let Some(previous) = self.patch_request.take() {
             self.waiting.remove(&previous);
         }
@@ -395,17 +426,26 @@ impl Runtime {
                 .into(),
             );
         }
+        let list_epoch = self.changes.list_epoch;
         let list: Element<'_, Message> =
             widget::scrollable(widget::column::with_children(files).spacing(2))
                 .id(card_control_id(target.card, "chat-changes-files"))
                 .on_scroll(move |viewport| {
                     action(Action::ChangeListScrolled(
                         target,
+                        summary.request_id,
+                        list_epoch,
+                        narrow,
                         viewport.absolute_offset().y,
                     ))
                 })
                 .height(Length::Fill)
                 .into();
+        let list = scroll_restore::on_mount(
+            list,
+            card_control_id(target.card, "chat-changes-files"),
+            self.changes.list_scroll,
+        );
         let body: Element<'_, Message> = if narrow {
             if self.changes.selected.is_some() {
                 self.change_detail(readable)

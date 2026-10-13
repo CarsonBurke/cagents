@@ -237,7 +237,7 @@ pub enum Action {
     ChangeFiles(Target, Option<chat::FileChangeKey>),
     ChangeSelect(Target, chat::FileChangeKey),
     ChangeBack(Target),
-    ChangeListScrolled(Target, f32),
+    ChangeListScrolled(Target, u64, u64, bool, f32),
     ChangePatches(Target, Option<chat::FilePatchCursor>),
     ChangePatch(Target, usize),
     ChangesLoaded(Target, u64, Result<chat::FileChangeReply, String>),
@@ -7228,7 +7228,10 @@ impl Cagents {
             }
             Action::ChangesPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.changes.open = open;
+                    if open {
+                        runtime.branch_picker = false;
+                        runtime.changes.show();
+                    }
                     if !open {
                         runtime.changes.close();
                         return iced::widget::operation::focus(card_control_id(
@@ -7269,19 +7272,18 @@ impl Cagents {
             Action::ChangeBack(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.changes.back();
-                    return iced::widget::scrollable::scroll_to(
-                        card_control_id(target.card, "chat-changes-files"),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: None,
-                            y: Some(runtime.changes.list_scroll),
-                        },
-                    )
-                    .map(cosmic::Action::App);
                 }
+                // The remounted list restores its saved viewport in layout.
             }
-            Action::ChangeListScrolled(target, offset) => {
+            Action::ChangeListScrolled(target, page, epoch, narrow, offset) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.changes.list_scroll = offset;
+                    runtime.changes.record_scroll(
+                        page,
+                        runtime.snapshot.file_changes.request_id,
+                        epoch,
+                        narrow,
+                        offset,
+                    );
                 }
             }
             Action::ChangePatches(target, cursor) => {
@@ -7318,6 +7320,9 @@ impl Cagents {
             Action::BranchPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.branch_picker = open;
+                    if open {
+                        runtime.changes.close();
+                    }
                 }
                 if open {
                     return self.chat_send(target, Command::ListBranches, false);
@@ -16172,5 +16177,18 @@ mod tests {
                 .allowed_while_modal()
         );
         assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
+    }
+    #[test]
+    fn inline_fork_and_file_review_actions_never_leave_both_panels_open() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("review-picker-exclusion"));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().branch_picker = true;
+        drop(app.handle_chat_ui(Action::ChangesPicker(target, true)));
+        assert!(chat_runtime(&app, card).changes.open);
+        assert!(!chat_runtime(&app, card).branch_picker);
+        drop(app.handle_chat_ui(Action::BranchPicker(target, true)));
+        assert!(!chat_runtime(&app, card).changes.open);
+        assert!(chat_runtime(&app, card).branch_picker);
     }
 }
