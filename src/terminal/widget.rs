@@ -2445,17 +2445,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     && (!self.snapshot.scroll.mouse_tracking || state.modifiers.shift) =>
             {
                 if let Some(callback) = &self.on_context {
-                    let cell =
-                        self.cell_at(geometry, cursor.position().expect("cursor over terminal"));
                     let link = state
                         .links
                         .borrow_mut()
-                        .at(
-                            &self.snapshot,
-                            usize::from(cell.1),
-                            cell.0,
-                            &self.working_directory,
-                        )
+                        .at_cursor(&self.snapshot, geometry, cursor, &self.working_directory)
                         .map(|link| link.url);
                     let pointer = cursor.position().expect("cursor over terminal");
                     shell.publish(callback(
@@ -5562,6 +5555,51 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn terminal_link_context_hit_testing_uses_translated_cursor_in_grid_coordinates() {
+        let snapshot = Arc::new(RenderSnapshot {
+            columns: 40,
+            rows: 8,
+            lines: vec![row("README.md:3:1")].into(),
+            ..RenderSnapshot::empty()
+        });
+        let node = layout::Node::new(Size::new(400.0, 300.0)).move_to(Point::new(744.0, 45.0));
+        let translation = cosmic::iced::Vector::new(690.0, 0.0);
+        let layout = Layout::new(&node).with_virtual_offset(translation);
+        let geometry = TerminalGeometry::new(
+            TerminalWidget::<()>::grid_bounds(layout.bounds()),
+            DEFAULT_FONT_SIZE,
+            1.0,
+            "",
+            LINE_HEIGHT_RATIO,
+            DEFAULT_PADDING,
+        );
+        let cell = geometry.cell_bounds(3, 0).unwrap();
+        // iced's scrollable supplies content coordinates to its children;
+        // virtual_offset records the camera separately for accessibility.
+        let screen = Point::new(cell.center_x() - translation.x, cell.center_y());
+        let translated = mouse::Cursor::Available(screen + translation);
+        let link = links::Cache::default()
+            .at_cursor(
+                &snapshot,
+                geometry,
+                translated,
+                std::path::Path::new("/repo"),
+            )
+            .unwrap();
+        assert_eq!(link.url.as_str(), "file:///repo/README.md#L3:1");
+        assert!(
+            links::Cache::default()
+                .at_cursor(
+                    &snapshot,
+                    geometry,
+                    mouse::Cursor::Available(screen),
+                    std::path::Path::new("/repo")
+                )
+                .is_none()
+        );
     }
 
     fn shape_cache_geometry(family: &str) -> TerminalGeometry {

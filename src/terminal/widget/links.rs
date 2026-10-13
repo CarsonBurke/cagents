@@ -23,6 +23,18 @@ struct Cached {
 }
 
 impl Cache {
+    pub fn at_cursor(
+        &mut self,
+        snapshot: &Arc<RenderSnapshot>,
+        geometry: super::TerminalGeometry,
+        cursor: super::mouse::Cursor,
+        cwd: &Path,
+    ) -> Option<Link> {
+        let position = geometry.cursor_position(cursor)?;
+        let (column, row) = geometry.cell_within(position, snapshot.columns, snapshot.rows);
+        self.at(snapshot, usize::from(row), column, cwd)
+    }
+
     pub fn at(
         &mut self,
         snapshot: &Arc<RenderSnapshot>,
