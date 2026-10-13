@@ -2558,6 +2558,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             description,
             status,
             background,
+            model,
+            waiting,
+            detail,
         } => {
             let agent = subagent(state, &id);
             if let Some(background) = background {
@@ -2569,8 +2572,24 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             if !description.is_empty() {
                 agent.description = description;
             }
+            if let Some(model) = model {
+                agent.model = Some(model);
+            }
+            if let Some(waiting) = waiting {
+                agent.waiting = waiting;
+            }
+            let has_detail = detail.is_some();
+            if let Some(detail) = detail {
+                agent.detail = detail;
+            }
             if let Some(status) = status {
                 agent.status = status;
+                if status != ToolStatus::Running {
+                    agent.waiting = false;
+                    if !has_detail {
+                        agent.detail.clear();
+                    }
+                }
             }
         }
         Event::SubagentItem { id, mut item } => {
@@ -2828,6 +2847,9 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
         return &mut state.subagents[index];
     }
     state.subagents.push(Subagent {
+        model: None,
+        waiting: false,
+        detail: String::new(),
         id: id.into(),
         kind: String::new(),
         description: String::new(),
@@ -3148,6 +3170,9 @@ mod tests {
         assert!(!attention.finish(&mut state, Some(20)));
         state.busy = false;
         state.subagents.push(crate::chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
             id: "child".into(),
             kind: "test".into(),
             description: "Background work".into(),
@@ -3259,6 +3284,9 @@ mod tests {
                     Command::Compact if self.started => Ok(Step {
                         events: (8..40)
                             .map(|index| Event::Subagent {
+                                model: None,
+                                waiting: None,
+                                detail: None,
                                 id: format!("late-background-{index}"),
                                 kind: String::new(),
                                 description: String::new(),
@@ -3275,6 +3303,9 @@ mod tests {
                         Ok(Step {
                             events: (0..40)
                                 .map(|index| Event::Subagent {
+                                    model: None,
+                                    waiting: None,
+                                    detail: None,
                                     id: format!("late-background-{index}"),
                                     kind: "Explore".into(),
                                     description: "Started after the caller observed idle".into(),
@@ -3290,6 +3321,9 @@ mod tests {
                         Ok(Step {
                             events: (0..40)
                                 .map(|index| Event::Subagent {
+                                    model: None,
+                                    waiting: None,
+                                    detail: None,
                                     id: format!("late-background-{index}"),
                                     kind: "Explore".into(),
                                     description: String::new(),
@@ -3444,6 +3478,9 @@ mod tests {
             &mut state,
             &mut indices,
             Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
                 id: "agent-tool".into(),
                 kind: "Explore".into(),
                 description: "Inspect".into(),
@@ -3490,6 +3527,9 @@ mod tests {
             &mut state,
             &mut indices,
             Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
                 id: "agent-tool".into(),
                 kind: String::new(),
                 description: String::new(),
@@ -3511,6 +3551,9 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: id.clone(),
                     kind: "Explore".into(),
                     description: "Background".into(),
@@ -3554,6 +3597,9 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: format!("child-{index}"),
                     kind: String::new(),
                     description: String::new(),
@@ -3592,6 +3638,9 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: format!("child-{index}"),
                     kind: String::new(),
                     description: String::new(),
@@ -3712,6 +3761,116 @@ mod tests {
             apply_event(&mut state, &mut indices, completion);
             assert!(!state.history_loading);
         }
+    }
+
+    #[test]
+    fn a_new_provider_turn_recovers_from_a_prior_nonfatal_error() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let mut history_error = None;
+        let mut apply = |state: &mut Snapshot, event: Event| {
+            recover_history_error(&mut state.error, &mut history_error, &event);
+            apply_event(state, &mut indices, event);
+        };
+        apply(
+            &mut state,
+            Event::Error {
+                message: "Prior turn failed".into(),
+                fatal: false,
+            },
+        );
+        assert_eq!(state.error.as_deref(), Some("Prior turn failed"));
+        apply(
+            &mut state,
+            Event::Status {
+                busy: false,
+                detail: String::new(),
+            },
+        );
+        assert!(state.error.is_some());
+        apply(&mut state, Event::TurnStarted);
+        apply(
+            &mut state,
+            Event::Status {
+                busy: true,
+                detail: String::new(),
+            },
+        );
+        assert_eq!(state.error, None);
+        assert_eq!(state.activity(), ActivityState::Working);
+        apply(&mut state, Event::TurnSettled);
+        apply(
+            &mut state,
+            Event::Status {
+                busy: false,
+                detail: String::new(),
+            },
+        );
+        assert_eq!(state.error, None);
+        assert_eq!(state.activity(), ActivityState::Idle);
+        apply(
+            &mut state,
+            Event::HistoryError("History page failed".into()),
+        );
+        apply(&mut state, Event::TurnStarted);
+        assert_eq!(state.error.as_deref(), Some("History page failed"));
+        apply(&mut state, Event::HistoryRecovered);
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn child_metadata_survives_sparse_updates_and_completion_clears_waiting() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "child".into(),
+                kind: "Codex agent".into(),
+                description: "Inspect repository".into(),
+                status: Some(ToolStatus::Running),
+                background: Some(true),
+                model: Some("gpt-child".into()),
+                waiting: Some(true),
+                detail: Some("Waiting for your approval".into()),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "child".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.subagents[0].model.as_deref(), Some("gpt-child"));
+        assert!(state.subagents[0].waiting);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "child".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(ToolStatus::Succeeded),
+                background: None,
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert_eq!(state.subagents[0].model.as_deref(), Some("gpt-child"));
+        assert!(!state.subagents[0].waiting);
+        assert!(state.subagents[0].detail.is_empty());
     }
 
     #[test]
@@ -4128,6 +4287,9 @@ mod tests {
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 self.0 += 1;
                 let child = |status| Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: "late-child".into(),
                     kind: "test".into(),
                     description: "Work".into(),

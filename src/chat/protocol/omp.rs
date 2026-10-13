@@ -330,6 +330,9 @@ impl Omp {
             self.child_finished.push_back(id.into());
         }
         step.events.push(Event::Subagent {
+            model: None,
+            waiting: None,
+            detail: None,
             id: id.into(),
             kind: text(payload, "agent").into(),
             description: payload["task"]
@@ -864,6 +867,7 @@ impl Adapter for Omp {
                             }
                         }
                         step.events.push(Event::Subagent {
+                            model: None, waiting: None, detail: None,
                             id: child_id, kind: String::new(),
                             description: "Earlier child history exceeds the display limit; live activity remains available".into(), status: None, background: None,
                         });
