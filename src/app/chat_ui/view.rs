@@ -1012,7 +1012,7 @@ impl Runtime {
             text
         }
     }
-    fn native_child_name(agent: &chat::Subagent) -> &str {
+    pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
         agent
             .description
             .lines()
@@ -1358,6 +1358,9 @@ impl Runtime {
             .iter()
             .map(|title| -> Element<'_, Message> { design::heading(title.as_str()).into() })
             .collect();
+        if self.changes.open {
+            content.push(self.changes_view(content_width));
+        }
         if self.branch_picker {
             let mut choices: Vec<Element<'_, Message>> = Vec::new();
             let codex = self.session.launch.provider == Provider::Codex;
@@ -2266,6 +2269,16 @@ impl Runtime {
             );
         }
         status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+        if snapshot.file_changes.total_files > 0
+            || snapshot.file_changes.coverage.has_uncached_changes
+            || self.changes.open
+        {
+            status.push(crate::interaction::tooltip(
+                crate::ui_controls::button::quiet(changes::footer_label(&snapshot.file_changes))
+                    .on_press(action(Action::ChangesPicker(target, !self.changes.open))),
+                "Review file edits reported in this conversation",
+            ));
+        }
         if snapshot.capabilities.branch {
             let available = available
                 && snapshot.ready
@@ -7078,5 +7091,128 @@ mod tests {
         assert_eq!(ids("Sonnet 4.5"), vec!["anthropic/claude-sonnet-4-5"]);
         assert_eq!(ids("  ").len(), 2, "an empty query lists every model");
         assert!(ids("haiku").is_empty());
+    }
+    #[test]
+    fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let key = chat::FileChangeKey {
+            source: chat::FileChangeSource::Subagent { id: "child".into() },
+            path: "src/renamed.rs".into(),
+        };
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.file_changes = Arc::new(chat::FileChangesSummary {
+            total_files: 1,
+            coverage: chat::FileChangesCoverage {
+                has_unloaded_history: true,
+                has_imported_history: true,
+                has_incomplete_delegated_history: true,
+                ..chat::FileChangesCoverage::default()
+            },
+            files: vec![chat::FileChangeSummary {
+                key: key.clone(),
+                resolved_path: None,
+                ownership_unverified: true,
+                revision: 1,
+                kind: chat::ChangeKind::Renamed {
+                    from: "src/old.rs".into(),
+                },
+                succeeded: 0,
+                pending: 1,
+                failed: 0,
+                additions: None,
+                deletions: None,
+                imported: 1,
+            }],
+            ..chat::FileChangesSummary::default()
+        });
+        runtime.snapshot = Arc::new(snapshot);
+        runtime.changes.open = true;
+        runtime.changes.select(key);
+        let renderer = crate::app::tests::headless_renderer();
+        for width in [360.0, 960.0] {
+            let mut element = runtime.changes_view(width);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+            );
+            assert!(
+                node.size().width <= width,
+                "review must fit a narrow split pane"
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let labels: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect();
+            for expected in [
+                "Files changed",
+                "Proposed edit",
+                "Subagent: child",
+                "pending",
+                "from src/old.rs",
+                "Close",
+            ] {
+                assert!(
+                    labels.iter().any(|label| label.contains(expected)),
+                    "{width}: missing {expected}: {labels:?}"
+                );
+            }
+            assert!(
+                !labels.iter().any(|label| label == "Open file"),
+                "unresolved child-relative paths must not route to the parent"
+            );
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut full = runtime.view(
+                false,
+                true,
+                &shortcuts,
+                width,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut full_tree = Tree::new(full.as_widget());
+            let full_node = full.as_widget_mut().layout(
+                &mut full_tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+            );
+            let accessible = full.as_widget().a11y_nodes(
+                Layout::new(&full_node),
+                &full_tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            for label in ["Send message", "Reported edits 1"] {
+                let bounds = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| {
+                        node.node()
+                            .label()
+                            .is_some_and(|name| name.starts_with(label))
+                    })
+                    .and_then(|node| node.node().bounds())
+                    .unwrap_or_else(|| panic!("{width}: {label} must remain mounted"));
+                assert!(
+                    bounds.y0 >= 0.0 && bounds.y1 <= 600.0 && bounds.y1 > bounds.y0,
+                    "{width}: {label} must remain visible in a 600px window: {bounds:?}"
+                );
+            }
+        }
     }
 }

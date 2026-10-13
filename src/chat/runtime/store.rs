@@ -1,5 +1,6 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+mod file_changes;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -49,6 +50,14 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    file_revision: u64,
+    child_file_ordinal: i64,
+    child_files_seen: bool,
+    file_index_incomplete: bool,
+    file_keys: usize,
+    applied_files: usize,
+    pub(super) file_cwd: Option<PathBuf>,
+    pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
     end: Option<Cursor>,
     first: Option<Cursor>,
@@ -133,7 +142,17 @@ impl Store {
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
+            db.execute_batch(file_changes::SCHEMA)
+                .map_err(|e| e.to_string())?;
             Ok(Self {
+                file_revision: 0,
+                child_file_ordinal: 0,
+                child_files_seen: false,
+                file_index_incomplete: false,
+                file_keys: 0,
+                applied_files: 0,
+                file_cwd: None,
+                presented_file_changes: None,
                 db,
                 directory: directory.clone(),
                 end: None,
@@ -277,7 +296,8 @@ impl Store {
             },
         };
         let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
-        if metadata.len() > METADATA_LIMIT {
+        let shortened = metadata.len() > METADATA_LIMIT;
+        if shortened {
             // Every identity field a provider controls is trimmed rather than
             // dropping a turn of the conversation.
             shrink(&mut item.content);
@@ -293,6 +313,10 @@ impl Store {
             ));
         }
         if metadata.len() > METADATA_LIMIT {
+            if matches!(&item.content, ItemContent::Changes { .. }) {
+                self.file_index_incomplete = true;
+                self.files_removed(std::slice::from_ref(&item.id))?;
+            }
             return Ok(Some(format!(
                 "Provider item {} exceeds the 64 KiB identity budget and was not cached",
                 brief(&item.id)
@@ -304,6 +328,7 @@ impl Store {
             body0.len() as i64
         };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         if preserve_input {
@@ -319,6 +344,12 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
+            self.file_index_incomplete = true;
+            self.files_removed(std::slice::from_ref(&item.id))?;
+        } else {
+            self.index_file_item(&item, "", ordinal, older, &body0, &index_spans)?;
+        }
         self.changed(&item.id);
         self.dirty = true;
         Ok(warning)
@@ -508,8 +539,16 @@ impl Store {
         };
         transaction.execute_batch("UPDATE items SET ordinal=(SELECT temporary FROM ordinal_remap WHERE old=items.ordinal);
             UPDATE items SET ordinal=(SELECT new FROM ordinal_remap WHERE temporary=items.ordinal);
+            UPDATE file_edits SET ordinal=(SELECT new FROM ordinal_remap WHERE old=file_edits.ordinal) WHERE source='';
             DROP TABLE ordinal_remap;").map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "UPDATE file_totals SET revision=?1 WHERE source=''",
+                [self.file_revision.saturating_add(1)],
+            )
+            .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
+        self.file_revision = self.file_revision.saturating_add(1);
         self.end = end;
         self.first = first;
         self.newest = newest;
@@ -578,6 +617,7 @@ impl Store {
                 _ => {}
             }
         }
+        self.index_child_event(&event)?;
         let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
@@ -711,6 +751,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
                     transaction
@@ -721,6 +762,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
+                self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -1563,6 +1605,7 @@ mod tests {
         store.earlier().unwrap();
         let earlier = store.window_reusing(&mut latest.items).unwrap();
         let replayed = crate::chat::presentation::Presentation {
+            file_changes_unchanged: false,
             children: Vec::new(),
             base_generation: 1,
             metadata: crate::chat::Snapshot {

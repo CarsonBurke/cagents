@@ -1773,6 +1773,9 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
+                return Err("File changes are served by the transcript cache".into());
+            }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
             Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
             Command::LoadEarlier => {

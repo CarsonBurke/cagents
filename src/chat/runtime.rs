@@ -547,6 +547,14 @@ impl Handle {
         run: Option<crate::model::RunId>,
         command: Command,
     ) -> Result<(), Rejection> {
+        if matches!(
+            &command,
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+        ) {
+            return Err(Rejection::Refused(
+                "File cache reads require a requester-specific reply".into(),
+            ));
+        }
         // `completed` is published only once teardown finished; `draining` the moment
         // the actor stopped consuming its command channel.
         let exiting = self.is_completed() || self.0.draining.load(Ordering::Acquire);
@@ -704,11 +712,24 @@ impl Handle {
         self.0.observe_next.store(true, Ordering::Release);
         state.generation
     }
+    pub(crate) fn file_query(
+        &self,
+        command: &Command,
+    ) -> Result<Option<super::FileChangeReply>, String> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .file_query(command)
+    }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         if after.is_some_and(|generation| generation >= state.generation) && !store.dirty {
             return None;
+        }
+        if let Err(error) = store.publish_files(&mut state) {
+            state.error = Some(format!("Cannot read reported edits: {error}"));
         }
         let refresh_publication =
             store.presented_generation != Some(state.generation) || store.dirty;
@@ -726,6 +747,10 @@ impl Handle {
         }
         if refresh_publication {
             store.presented_generation = Some(state.generation);
+            store.presented_file_changes = Some((
+                state.file_changes.revision,
+                state.file_changes.coverage.clone(),
+            ));
             store.presentation = None;
             store.presented_children = state
                 .subagents
@@ -750,6 +775,9 @@ impl Handle {
             return None;
         }
         if store.presented_generation != Some(state.generation) || store.dirty {
+            if let Err(error) = store.publish_files(&mut state) {
+                state.error = Some(format!("Cannot read reported edits: {error}"));
+            }
             let baseline = store.presented_generation;
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
@@ -808,12 +836,27 @@ impl Handle {
                         .iter_mut()
                         .map(|agent| std::mem::take(&mut agent.items))
                         .collect();
+                    let file_changes_unchanged = store.presented_file_changes.as_ref().is_some_and(
+                        |(revision, coverage)| {
+                            *revision == state.file_changes.revision
+                                && coverage == &state.file_changes.coverage
+                        },
+                    );
+                    let retained_files = if file_changes_unchanged {
+                        Some(std::mem::take(&mut state.file_changes))
+                    } else {
+                        None
+                    };
                     let metadata = state.clone();
+                    if let Some(files) = retained_files {
+                        state.file_changes = files;
+                    }
                     state.items = items;
                     for (agent, items) in state.subagents.iter_mut().zip(child_items) {
                         agent.items = items;
                     }
                     crate::chat::presentation::Presentation {
+                        file_changes_unchanged,
                         base_generation,
                         metadata,
                         order: state.items.iter().map(|item| item.id.clone()).collect(),
@@ -822,6 +865,10 @@ impl Handle {
                     }
                 });
             store.presented_generation = Some(state.generation);
+            store.presented_file_changes = Some((
+                state.file_changes.revision,
+                state.file_changes.coverage.clone(),
+            ));
             store.presented_children = state
                 .subagents
                 .iter()
@@ -1160,6 +1207,7 @@ fn preflight_inner(
         return Err("Provider initialization exceeds stdin queue capacity".into());
     }
     let mut store = Store::new()?;
+    store.file_cwd = Some(spec.working_directory.clone());
     store.recognize_messages(spec.messages.clone());
     let mut metadata = Vec::new();
     for event in initial.events.drain(..) {
@@ -2243,8 +2291,12 @@ impl Actor {
             .iter_mut()
             .map(|agent| std::mem::take(&mut agent.items))
             .collect();
+        // Owned edit summaries have their own item/byte budgets; they do not
+        // count toward the provider's request/model identity budget.
+        let file_changes = std::mem::take(&mut state.file_changes);
         let mut counter = ByteCounter(0);
         let _ = serde_json::to_writer(&mut counter, &*state);
+        state.file_changes = file_changes;
         state.items = items;
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
@@ -5480,5 +5532,80 @@ mod tests {
             .unwrap();
         assert_eq!(reply, "scope transport preserved\n");
         provider.terminate().unwrap();
+    }
+
+    #[test]
+    fn file_changes_cache_queries_remain_available_after_provider_exit() {
+        struct CacheFixture;
+        impl Adapter for CacheFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Item(Item {
+                        id: "edit".into(),
+                        role: super::super::Role::Assistant,
+                        started_at: None,
+                        at: None,
+                        content: ItemContent::Changes {
+                            changes: vec![super::super::FileChange {
+                                path: "a.rs".into(),
+                                kind: super::super::ChangeKind::Updated,
+                                diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                            }],
+                            status: ToolStatus::Succeeded,
+                        },
+                    })],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                panic!("cache query reached provider")
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/true".into(),
+            arguments: vec![],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(CacheFixture);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.exited);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let Some(super::super::FileChangeReply::Files(summary)) = handle
+            .file_query(&Command::LoadFileChanges {
+                request_id: 1,
+                after: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected cached list")
+        };
+        assert_eq!(summary.applied_files, 1);
+        let Some(super::super::FileChangeReply::Patches(page)) = handle
+            .file_query(&Command::LoadFileChangePatches {
+                request_id: 2,
+                key: summary.files[0].key.clone(),
+                cursor: None,
+                revision: summary.files[0].revision,
+            })
+            .unwrap()
+        else {
+            panic!("expected cached patch")
+        };
+        assert!(page.error.is_none());
+        assert!(page.patches[0].diff.contains("+new"));
     }
 }

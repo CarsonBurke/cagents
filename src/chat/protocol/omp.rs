@@ -797,6 +797,8 @@ impl Adapter for Omp {
             Command::SetPermissionMode{..} => return Err("OMP approval policy is configured at launch; use its settings command to change policy.".into()),
             Command::Compact => step.writes.push(self.request("compact")),
             Command::Refresh => return Ok(self.refresh()),
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
+                return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
             Command::LoadEarlier => return Err("OMP history is loaded completely during connection.".into()),
             Command::DismissPermissionDenial { tool_use_id } => step.events.push(Event::PermissionDenialDismissed { tool_use_id }),

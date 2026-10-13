@@ -859,6 +859,9 @@ pub struct Snapshot {
     pub branch_points: Vec<BranchPoint>,
     #[serde(default)]
     pub forked: Option<String>,
+    /// Provider-reported edits in the owned cache, independent of transcript paging.
+    #[serde(default)]
+    pub file_changes: std::sync::Arc<FileChangesSummary>,
 }
 
 /// When a provider takes a message it is holding.
@@ -1110,6 +1113,17 @@ pub enum Command {
     },
     /// Read the next bounded window of already cached transcript history.
     LoadLater,
+    /// Read cached provider edit metadata; never asks the provider to do work.
+    LoadFileChanges {
+        request_id: u64,
+        after: Option<FileChangeKey>,
+    },
+    LoadFileChangePatches {
+        request_id: u64,
+        key: FileChangeKey,
+        cursor: Option<FilePatchCursor>,
+        revision: u64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -1244,6 +1258,87 @@ pub struct FileChange {
     pub kind: ChangeKind,
     /// Unified diff for this path alone.
     pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileChangeReply {
+    Files(FileChangesSummary),
+    Patches(FileChangePage),
+}
+
+/// Changes belong to the conversation or to an explicitly named delegate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FileChangeSource {
+    Conversation,
+    Subagent { id: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FileChangeKey {
+    pub source: FileChangeSource,
+    pub path: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeSummary {
+    pub ownership_unverified: bool,
+    /// Absolute opening pathname from a known provider cwd (or absolute
+    /// report). Parent traversal is preserved; this is not filesystem identity.
+    pub resolved_path: Option<String>,
+    pub revision: u64,
+    pub key: FileChangeKey,
+    pub kind: ChangeKind,
+    pub succeeded: u64,
+    pub pending: u64,
+    pub failed: u64,
+    /// Sum of reported successful patch edits, not a net repository diff.
+    /// None when any successful patch lacks recognizable unified hunks.
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+    /// Replayed contributions whose ownership this process did not observe.
+    /// These may be inherited by a fork; they are not this run's edits.
+    pub imported: u64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangesCoverage {
+    pub has_unloaded_history: bool,
+    pub has_imported_history: bool,
+    pub has_incomplete_delegated_history: bool,
+    pub has_uncached_changes: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangesSummary {
+    pub request_id: u64,
+    pub revision: u64,
+    pub files: Vec<FileChangeSummary>,
+    pub total_files: usize,
+    pub applied_files: usize,
+    pub has_more: bool,
+    pub coverage: FileChangesCoverage,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePatchCursor {
+    pub ordinal: i64,
+    pub file_index: usize,
+    pub offset: usize,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangePatch {
+    pub ownership_unverified: bool,
+    pub item_id: String,
+    pub kind: ChangeKind,
+    pub status: ToolStatus,
+    pub imported: bool,
+    pub offset: usize,
+    pub total_bytes: usize,
+    pub diff: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangePage {
+    pub request_id: u64,
+    pub key: FileChangeKey,
+    pub revision: u64,
+    pub patches: Vec<FileChangePatch>,
+    pub next: Option<FilePatchCursor>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

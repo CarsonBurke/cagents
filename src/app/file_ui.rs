@@ -69,6 +69,26 @@ impl Cagents {
         }
     }
 
+    /// Open a provider-reported filesystem path without applying URL semantics.
+    /// In particular, `link/../file` must retain the kernel's symlink traversal.
+    pub(super) fn open_file_path(&mut self, source: CardId, path: PathBuf) -> Task<Message> {
+        if self.workspace.card(source).is_none() || self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+            self.status = Some(TransientNotice::error("The reported file path is invalid."));
+            return Task::none();
+        }
+        if crate::device::is_remote() {
+            self.update_device(super::device_ui::Action::OpenFile {
+                path,
+                fragment: None,
+            })
+        } else {
+            self.open_local_file(Some(source), path, None)
+        }
+    }
+
     fn open_local_file(
         &mut self,
         source: Option<CardId>,
