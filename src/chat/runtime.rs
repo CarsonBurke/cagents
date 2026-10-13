@@ -2527,6 +2527,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 state.reasoning = reasoning;
             }
         }
+        Event::FastMode(value) => state.fast_mode = Some(value),
         Event::Commands(value) => state.commands = value,
         Event::Skills(value) => state.skills = value,
         Event::Item(mut item) => {
@@ -2778,6 +2779,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
             if value.cost_microusd.is_some() {
                 state.usage.cost_microusd = value.cost_microusd;
+            }
+            if value.cost_estimate.is_some() {
+                state.usage.cost_estimate = value.cost_estimate;
             }
         }
         Event::PromptSuggestion {

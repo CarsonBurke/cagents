@@ -381,6 +381,7 @@ struct Claude {
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     reasoning: Option<String>,
+    fast_mode: Option<chat::FastMode>,
     commands: Vec<SlashCommand>,
     /// The commands the session's latest described list names without
     /// Claude Code's mark for its own: the user's, the project's and
@@ -418,6 +419,29 @@ impl Claude {
             events: vec![],
         })
     }
+    fn fast_mode_metadata(&mut self, data: &Value, step: &mut Step) {
+        if let Some(state) = data["fast_mode_state"]
+            .as_str()
+            .and_then(|state| match state {
+                "off" => Some(chat::FastModeState::Off),
+                "on" => Some(chat::FastModeState::On),
+                "cooldown" => Some(chat::FastModeState::Cooldown),
+                _ => None,
+            })
+        {
+            let value = chat::FastMode {
+                state,
+                disabled_reason: data["fast_mode_disabled_reason"]
+                    .as_str()
+                    .map(str::to_owned),
+            };
+            if self.fast_mode.as_ref() != Some(&value) {
+                self.fast_mode = Some(value.clone());
+                step.events.push(Event::FastMode(value));
+                step.events.push(Event::Capabilities(self.capabilities()));
+            }
+        }
+    }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             steer: self.async_input,
@@ -427,6 +451,10 @@ impl Claude {
             compact: self.commands.iter().any(|c| c.name == "compact"),
             model_selection: !self.models.is_empty(),
             reasoning_selection: self.models.iter().any(|m| !m.reasoning.is_empty()),
+            fast_mode: self
+                .fast_mode
+                .as_ref()
+                .is_some_and(chat::FastMode::changeable),
             permission_modes: MODES.iter().map(|s| (*s).into()).collect(),
             skill_reach: SkillReach::Leading,
             stop_subagent: true,
@@ -1659,6 +1687,21 @@ impl Adapter for Claude {
                     json!({"subtype":"set_model", "model":model, "_cagents_reasoning":reasoning}),
                 )
             }
+            Command::SetFastMode { enabled } => {
+                if !self.ready || !self.capabilities().fast_mode {
+                    return Err("Fast mode is unavailable for this Claude session".into());
+                }
+                if self
+                    .controls
+                    .values()
+                    .any(|request| request["settings"].get("fastMode").is_some())
+                {
+                    return Err("Claude fast mode change is already pending".into());
+                }
+                self.control(
+                    json!({"subtype":"apply_flag_settings", "settings":{"fastMode":enabled}}),
+                )
+            }
             Command::SetPermissionMode { mode } => {
                 if !MODES.contains(&mode.as_str()) {
                     return Err("Unsupported Claude permission mode".into());
@@ -1770,6 +1813,7 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        self.fast_mode_metadata(&frame, &mut step);
         if let Some(run) = self.execution
             && matches!(
                 string(&frame, "type"),
@@ -1927,6 +1971,7 @@ impl Adapter for Claude {
                                 });
                             }
                             self.metadata(&response["response"], &mut step);
+                            self.fast_mode_metadata(&response["response"], &mut step);
                             if let Some(mode) =
                                 response["response"]["current_permission_mode"].as_str()
                             {
@@ -1982,6 +2027,21 @@ impl Adapter for Claude {
                             self.permissions = None;
                             let next = self.control(json!({"subtype":"get_settings", "_cagents_permission_update":request["_cagents_permission_update"]}))?;
                             step.writes.extend(next.writes);
+                        }
+                        "apply_flag_settings" if request["settings"].get("fastMode").is_some() => {
+                            // Only the acknowledged session overlay changes this setting.
+                            self.fast_mode = Some(chat::FastMode {
+                                state: if request["settings"]["fastMode"].as_bool() == Some(true) {
+                                    chat::FastModeState::On
+                                } else {
+                                    chat::FastModeState::Off
+                                },
+                                disabled_reason: None,
+                            });
+                            step.events
+                                .push(Event::FastMode(self.fast_mode.clone().unwrap()));
+                            step.events.push(Event::Capabilities(self.capabilities()));
+                            self.fast_mode_metadata(&response["response"], &mut step);
                         }
                         "apply_flag_settings" => {
                             self.reasoning = request["settings"]["effortLevel"]
@@ -4700,6 +4760,96 @@ mod tests {
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
+
+    #[test]
+    fn fast_mode_setting_requires_confirmation_and_preserves_model_and_effort() {
+        let mut adapter = Claude {
+            ready: true,
+            selected: Some("opus".into()),
+            reasoning: Some("high".into()),
+            fast_mode: Some(chat::FastMode::default()),
+            ..Default::default()
+        };
+        let request = adapter
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        assert_eq!(
+            request.writes[0]["request"],
+            json!({"subtype":"apply_flag_settings","settings":{"fastMode":true}})
+        );
+        assert!(request.events.is_empty());
+        assert!(
+            adapter
+                .command(Command::SetFastMode { enabled: true })
+                .is_err()
+        );
+        let refused = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":request.writes[0]["request_id"],"error":"Fast mode unavailable"}})).unwrap();
+        assert!(
+            refused
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(!adapter.fast_mode.as_ref().unwrap().enabled());
+        let request = adapter
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        let accepted = adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":request.writes[0]["request_id"],"response":{}}})).unwrap();
+        assert!(
+            accepted
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::FastMode(value) if value.enabled()))
+        );
+        assert_eq!(adapter.selected.as_deref(), Some("opus"));
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+        let request = adapter
+            .command(Command::SetFastMode { enabled: false })
+            .unwrap();
+        adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":request.writes[0]["request_id"],"response":{}}})).unwrap();
+        assert!(!adapter.fast_mode.as_ref().unwrap().enabled());
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn fast_mode_metadata_preserves_cooldown_and_provider_unavailability() {
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        let mut step = Step::default();
+        adapter.fast_mode_metadata(
+            &json!({"fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required"}),
+            &mut step,
+        );
+        assert!(adapter.capabilities().fast_mode);
+        adapter.fast_mode_metadata(&json!({"fast_mode_state":"cooldown"}), &mut step);
+        assert!(adapter.fast_mode.as_ref().unwrap().enabled());
+        assert_eq!(
+            adapter.fast_mode.as_ref().unwrap().state,
+            chat::FastModeState::Cooldown
+        );
+        adapter.fast_mode_metadata(
+            &json!({"fast_mode_state":"off","fast_mode_disabled_reason":"disabled_by_env"}),
+            &mut step,
+        );
+        assert!(!adapter.capabilities().fast_mode);
+        assert!(
+            adapter
+                .command(Command::SetFastMode { enabled: true })
+                .is_err()
+        );
+        adapter.fast_mode_metadata(&json!({"fast_mode_state":"unknown"}), &mut step);
+        assert_eq!(
+            adapter
+                .fast_mode
+                .as_ref()
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("disabled_by_env")
+        );
+    }
 
     #[test]
     fn prompt_suggestion_follows_only_current_completed_session_without_transcript_items() {

@@ -365,6 +365,12 @@ fn create_inner(
             selected: None,
             reasoning: None,
             selection_dirty: false,
+            service_tier: None,
+            service_tier_revision: 0,
+            fast_models: Default::default(),
+            effective_model: None,
+            pricing: Default::default(),
+            turn_pricing: Default::default(),
             turn: None,
             busy: false,
             lifecycle_revision: 0,
@@ -408,12 +414,19 @@ enum Pending {
     },
     Turn {
         revision: u64,
+        model: Option<String>,
+        tier: Option<String>,
     },
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
     /// wire announces that the figures a reader was looking at have moved.
     Compact,
     Other,
+    FastMode {
+        enabled: bool,
+        revision: u64,
+        model: Option<String>,
+    },
     QueueAdd,
     /// Removing the named entry, whose answer says whether it left the queue
     /// undelivered.
@@ -489,6 +502,12 @@ struct Codex {
     selected: Option<String>,
     reasoning: Option<String>,
     selection_dirty: bool,
+    service_tier: Option<String>,
+    service_tier_revision: u64,
+    fast_models: std::collections::BTreeSet<String>,
+    effective_model: Option<String>,
+    pricing: chat::pricing::CostTracker,
+    turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
     busy: bool,
     lifecycle_revision: u64,
@@ -883,6 +902,13 @@ impl Codex {
                     .is_some_and(|m| m.iter().any(|m| m == "image")),
             compact: self.ready && self.direct_input,
             model_selection: self.direct_input && !self.models.is_empty(),
+            fast_mode: self.ready
+                && self.direct_input
+                && (self.service_tier.as_deref() == Some("fast")
+                    || self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|model| self.fast_models.contains(model))),
             reasoning_selection: self.direct_input
                 && model.is_some_and(|m| !m.reasoning.is_empty()),
             permission_modes: if self.direct_input {
@@ -928,6 +954,26 @@ impl Codex {
             reasoning: self.reasoning.clone(),
         });
         step.events.push(Event::Capabilities(self.capabilities()));
+        self.fast_mode_event(step);
+    }
+    fn fast_mode_event(&self, step: &mut Step) {
+        step.events.push(Event::FastMode(chat::FastMode {
+            state: if self.service_tier.as_deref() == Some("fast") {
+                chat::FastModeState::On
+            } else {
+                chat::FastModeState::Off
+            },
+            disabled_reason: None,
+        }));
+    }
+    fn remember_turn_pricing(&mut self, id: &str, model: Option<String>, tier: Option<String>) {
+        if self.turn_pricing.iter().any(|(turn, _, _)| turn == id) {
+            return;
+        }
+        if self.turn_pricing.len() >= 32 {
+            self.turn_pricing.pop_front();
+        }
+        self.turn_pricing.push_back((id.into(), model, tier));
     }
     fn history(&mut self, step: &mut Step, cursor: Option<String>) -> Result<(), String> {
         if !self.materialized {
@@ -1488,7 +1534,7 @@ impl Adapter for Codex {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
-                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision })?;
+                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, model: self.selected.clone(), tier: self.service_tier.clone() })?;
                         self.suggestion_turn = None;
                         self.prediction_turn = None;
                         step.events.push(Event::PromptSuggestionCleared);
@@ -1536,10 +1582,31 @@ impl Adapter for Codex {
             Command::SetModel { model, reasoning } => {
                 if !self.direct_input { return Err("This Codex thread does not accept direct input".into()); }
                 let selected = self.models.iter().find(|m| m.id == model).ok_or("Choose a model from the Codex model catalog")?;
+                if (self.service_tier.as_deref() == Some("fast") || self.pending.values().any(|pending| matches!(pending, Pending::FastMode { enabled:true, .. }))) && !self.fast_models.contains(&model) { return Err("Turn off fast mode before selecting a Codex model that does not support it".into()); }
                 if reasoning.as_ref().is_some_and(|r| !selected.reasoning.contains(r)) { return Err("The model does not advertise this reasoning effort".into()); }
                 self.selected = Some(model); self.reasoning = reasoning; self.selection_dirty = true;
                 self.model_events(&mut step);
                 step.events.push(Event::Status { busy: self.busy, detail: "Model/reasoning selection will apply to your next new turn, not the running turn".into() });
+            }
+            Command::SetFastMode { enabled } => {
+                if !self.capabilities().fast_mode {
+                    return Err("The selected Codex model does not advertise fast mode".into());
+                }
+                if self.pending.values().any(|pending| matches!(pending, Pending::FastMode { .. })) {
+                    return Err("Codex fast mode change is already pending".into());
+                }
+                let mut params = json!({"threadId":self.thread,"serviceTier":if enabled {Some("fast")} else {None}});
+                // Model selection is normally staged until the next prompt.
+                // Apply that same choice with its tier so the server never
+                // validates fast against the previous model instead.
+                if self.selection_dirty {
+                    params["model"] = json!(self.selected);
+                    params["effort"] = json!(self.reasoning);
+                }
+                self.call(&mut step, "thread/settings/update", params, Pending::FastMode {
+                    enabled, revision: self.service_tier_revision,
+                    model: self.selection_dirty.then(|| self.selected.clone()).flatten(),
+                })?;
             }
             Command::SetPermissionMode { mode } => {
                 if !self.direct_input || self.busy {
@@ -1782,6 +1849,9 @@ impl Adapter for Codex {
                     self.attached = true;
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
                     self.selected = result["model"].as_str().map(str::to_owned);
+                    self.effective_model = self.selected.clone();
+                    self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
+                    self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.busy = thread["status"]["type"] == "active";
                     step.events.push(Event::PermissionMode(
@@ -1819,6 +1889,21 @@ impl Adapter for Codex {
                             "Unsupported Codex frame: missing string model".to_owned()
                         })?;
                         let id = model.id.clone();
+                        let tiers = value["serviceTiers"].as_array();
+                        let fast = if let Some(tiers) = tiers {
+                            tiers.iter().any(|tier| tier["id"].as_str() == Some("fast"))
+                        } else {
+                            value["additionalSpeedTiers"]
+                                .as_array()
+                                .is_some_and(|tiers| {
+                                    tiers.iter().any(|tier| tier.as_str() == Some("fast"))
+                                })
+                        };
+                        if fast {
+                            self.fast_models.insert(id.clone());
+                        } else {
+                            self.fast_models.remove(&id);
+                        }
                         if let Some(existing) = self.listing.iter_mut().find(|m| m.id == id) {
                             *existing = model;
                         } else {
@@ -1849,6 +1934,8 @@ impl Adapter for Codex {
                         )?;
                     } else {
                         self.models = std::mem::take(&mut self.listing);
+                        self.fast_models
+                            .retain(|id| self.models.iter().any(|model| &model.id == id));
                         self.model_events(&mut step);
                     }
                 }
@@ -1997,9 +2084,31 @@ impl Adapter for Codex {
                     self.page(result, &mut step, earlier)?;
                     self.finish_history(&mut step)?;
                 }
-                Pending::Turn { revision } => {
+                Pending::FastMode {
+                    enabled,
+                    revision,
+                    model,
+                } => {
+                    // A settings notification can confirm or supersede this
+                    // request before its acknowledgement arrives.
+                    if revision == self.service_tier_revision {
+                        self.service_tier = enabled.then(|| "fast".into());
+                        if model.is_some() {
+                            self.effective_model = model;
+                        }
+                        self.service_tier_revision = self.service_tier_revision.saturating_add(1);
+                        self.fast_mode_event(&mut step);
+                        step.events.push(Event::Capabilities(self.capabilities()));
+                    }
+                }
+                Pending::Turn {
+                    revision,
+                    model,
+                    tier,
+                } => {
                     self.materialized = true;
                     let id = string(&result["turn"], "id")?;
+                    self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
                     if revision == self.lifecycle_revision {
@@ -2300,6 +2409,16 @@ impl Adapter for Codex {
                 title: params["threadName"].as_str().map(str::to_owned),
             }),
             "thread/settings/updated" => {
+                let settings = &params["threadSettings"];
+                if settings.get("model").is_some() {
+                    self.effective_model = settings["model"].as_str().map(str::to_owned);
+                }
+                if settings.get("serviceTier").is_some() {
+                    self.service_tier = settings["serviceTier"].as_str().map(str::to_owned);
+                    self.service_tier_revision = self.service_tier_revision.saturating_add(1);
+                    self.fast_mode_event(&mut step);
+                    step.events.push(Event::Capabilities(self.capabilities()));
+                }
                 let mode = permission_mode(
                     &params["threadSettings"]["approvalPolicy"],
                     &params["threadSettings"]["sandboxPolicy"],
@@ -2344,6 +2463,19 @@ impl Adapter for Codex {
                 }
                 let turn_id = string(turn, "id")?;
                 if method == "turn/started" {
+                    let (model, tier) = self
+                        .pending
+                        .values()
+                        .find_map(|pending| match pending {
+                            Pending::Turn { model, tier, .. } => {
+                                Some((model.clone(), tier.clone()))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            (self.effective_model.clone(), self.service_tier.clone())
+                        });
+                    self.remember_turn_pricing(turn_id, model, tier);
                     self.prediction_turn = Some(turn_id.into());
                 }
                 let prediction_turn =
@@ -2549,7 +2681,25 @@ impl Adapter for Codex {
             }
             "thread/tokenUsage/updated" => {
                 let usage = &params["tokenUsage"];
+                let tokens = |value: &Value| chat::pricing::Tokens {
+                    input: value["inputTokens"].as_u64().unwrap_or(0),
+                    cached_input: value["cachedInputTokens"].as_u64().unwrap_or(0),
+                    cache_write_input: value["cacheWriteInputTokens"].as_u64().unwrap_or(0),
+                    output: value["outputTokens"].as_u64().unwrap_or(0),
+                };
+                let observed = self
+                    .turn_pricing
+                    .iter()
+                    .rev()
+                    .find(|(turn, _, _)| Some(turn.as_str()) == params["turnId"].as_str());
+                let cost_estimate = self.pricing.update(
+                    observed.and_then(|(_, model, _)| model.as_deref()),
+                    observed.and_then(|(_, _, tier)| tier.as_deref()),
+                    tokens(&usage["total"]),
+                    tokens(&usage["last"]),
+                );
                 step.events.push(Event::Usage(Usage {
+                    cost_estimate,
                     input_tokens: usage["total"]["inputTokens"].as_u64().unwrap_or(0),
                     output_tokens: usage["total"]["outputTokens"].as_u64().unwrap_or(0),
                     context_tokens: usage["last"]["totalTokens"].as_u64().unwrap_or(0),
@@ -3753,6 +3903,194 @@ mod tests {
         assert_eq!(stale.writes[0]["method"], "thread/queue/list");
     }
 
+    #[test]
+    fn fast_mode_acknowledgements_preserve_model_and_effort_and_reject_false_state() {
+        let mut adapter = adapter();
+        adapter.fast_models.insert("model".into());
+        adapter.reasoning = Some("future-effort".into());
+        let request = adapter
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        assert_eq!(request.writes[0]["method"], "thread/settings/update");
+        assert_eq!(
+            request.writes[0]["params"],
+            json!({"threadId":"thread-exact","serviceTier":"fast"})
+        );
+        assert!(request.events.is_empty());
+        assert!(
+            adapter
+                .command(Command::SetFastMode { enabled: true })
+                .is_err()
+        );
+        let refused = adapter.receive(json!({"id":request.writes[0]["id"],"error":{"code":-1,"message":"fast unavailable"}})).unwrap();
+        assert!(
+            refused
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(adapter.service_tier.is_none());
+        let request = adapter
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        let accepted = adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(
+            accepted
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::FastMode(value) if value.enabled()))
+        );
+        assert_eq!(adapter.selected.as_deref(), Some("model"));
+        assert_eq!(adapter.reasoning.as_deref(), Some("future-effort"));
+        let request = adapter
+            .command(Command::SetFastMode { enabled: false })
+            .unwrap();
+        assert!(request.writes[0]["params"]["serviceTier"].is_null());
+        adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(adapter.service_tier.is_none());
+    }
+
+    #[test]
+    fn fast_mode_applies_staged_model_and_effort_with_the_tier() {
+        let mut adapter = adapter();
+        adapter.effective_model = Some("previous-model".into());
+        adapter.fast_models.insert("model".into());
+        adapter
+            .command(Command::SetModel {
+                model: "model".into(),
+                reasoning: Some("future-effort".into()),
+            })
+            .unwrap();
+        let request = adapter
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        assert_eq!(
+            request.writes[0]["params"],
+            json!({"threadId":"thread-exact","serviceTier":"fast","model":"model","effort":"future-effort"})
+        );
+        adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert_eq!(adapter.effective_model.as_deref(), Some("model"));
+        assert_eq!(adapter.reasoning.as_deref(), Some("future-effort"));
+    }
+
+    #[test]
+    fn fast_mode_settings_notifications_win_over_delayed_acknowledgements() {
+        let mut adapter = adapter();
+        adapter.fast_models.insert("model".into());
+        let request = adapter
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        adapter.receive(json!({"method":"thread/settings/updated","params":{"threadId":"thread-exact","threadSettings":{"model":"model","effort":null,"serviceTier":null}}})).unwrap();
+        let reply = adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(adapter.service_tier.is_none());
+        assert!(
+            !reply
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::FastMode(value) if value.enabled()))
+        );
+    }
+
+    #[test]
+    fn fast_mode_is_advertised_only_by_selected_model_service_tiers() {
+        let mut adapter = adapter();
+        assert!(
+            adapter
+                .command(Command::SetFastMode { enabled: true })
+                .is_err()
+        );
+        for field in [
+            json!({"serviceTiers":[{"id":"fast","name":"Fast","description":"Faster generation"}]}),
+            json!({"additionalSpeedTiers":["fast"]}),
+        ] {
+            let mut value =
+                json!({"model":"model","displayName":"Model","supportedReasoningEfforts":[]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let mut step = Step::default();
+            adapter
+                .call(&mut step, "model/list", json!({}), Pending::Models)
+                .unwrap();
+            adapter
+                .receive(
+                    json!({"id":step.writes[0]["id"],"result":{"data":[value],"nextCursor":null}}),
+                )
+                .unwrap();
+            assert!(adapter.capabilities().fast_mode);
+        }
+        adapter.direct_input = false;
+        assert!(!adapter.capabilities().fast_mode);
+        assert!(
+            adapter
+                .command(Command::SetFastMode { enabled: true })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_cost_estimate_keeps_active_turn_tariff_through_model_and_fast_changes() {
+        let mut adapter = adapter();
+        adapter.selected = Some("gpt-6.1-sol".into());
+        adapter.effective_model = adapter.selected.clone();
+        let started = |id| json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":id,"items":[],"status":"inProgress"}}});
+        let usage = |id, input, output, last_input, last_output| json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-exact","turnId":id,"tokenUsage":{"total":{"inputTokens":input,"cachedInputTokens":0,"outputTokens":output},"last":{"inputTokens":last_input,"cachedInputTokens":0,"outputTokens":last_output}}}});
+        let estimate = |step: Step| {
+            step.events
+                .into_iter()
+                .find_map(|event| match event {
+                    Event::Usage(usage) => usage.cost_estimate.map(|estimate| estimate.microusd),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        adapter.receive(started("first")).unwrap();
+        assert_eq!(
+            estimate(
+                adapter
+                    .receive(usage("first", 1000, 100, 1000, 100))
+                    .unwrap()
+            ),
+            3000
+        );
+        adapter.selected = Some("unpriced-staged-selection".into());
+        adapter.service_tier = Some("fast".into());
+        assert_eq!(
+            estimate(
+                adapter
+                    .receive(usage("first", 2000, 200, 2000, 200))
+                    .unwrap()
+            ),
+            6000
+        );
+        adapter.receive(started("second")).unwrap();
+        assert_eq!(
+            estimate(
+                adapter
+                    .receive(usage("second", 3000, 300, 1000, 100))
+                    .unwrap()
+            ),
+            12000
+        );
+        assert_eq!(
+            estimate(
+                adapter
+                    .receive(usage("first", 2000, 200, 2000, 200))
+                    .unwrap()
+            ),
+            12000
+        );
+    }
+
     fn adapter() -> Codex {
         Codex {
             server_identity: None,
@@ -3777,6 +4115,12 @@ mod tests {
             selected: Some("model".into()),
             reasoning: None,
             selection_dirty: false,
+            service_tier: None,
+            service_tier_revision: 0,
+            fast_models: Default::default(),
+            effective_model: None,
+            pricing: Default::default(),
+            turn_pricing: Default::default(),
             turn: None,
             busy: false,
             lifecycle_revision: 0,

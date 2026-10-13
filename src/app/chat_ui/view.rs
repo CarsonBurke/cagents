@@ -1301,11 +1301,12 @@ impl Runtime {
         if self.branch_picker {
             let mut choices: Vec<Element<'_, Message>> = Vec::new();
             let codex = self.session.launch.provider == Provider::Codex;
+            choices.push(design::heading("Fork chat").into());
             choices.push(
                 design::caption(if codex {
-                    "Fork into a new pane after a completed turn"
+                    "Start a new chat after a completed turn, or copy the whole conversation."
                 } else {
-                    "Branch before a prompt; its text returns as a draft"
+                    "Start a new chat before a prompt, then edit or resend its draft."
                 })
                 .into(),
             );
@@ -1313,9 +1314,11 @@ impl Runtime {
                 choices.push(
                     crate::ui_controls::button::quiet("Fork entire conversation")
                         .on_press_maybe(
-                            (!snapshot.busy && self.pending.is_none()).then(|| {
-                                action(Action::Command(target, Command::Branch { id: None }))
-                            }),
+                            (available
+                                && snapshot.ready
+                                && !snapshot.busy
+                                && snapshot.read_only_reason.is_none())
+                            .then(|| action(Action::Command(target, Command::Branch { id: None }))),
                         )
                         .into(),
                 );
@@ -1323,14 +1326,20 @@ impl Runtime {
             for point in &snapshot.branch_points {
                 choices.push(
                     crate::ui_controls::button::quiet(&point.label)
-                        .on_press_maybe((!snapshot.busy && self.pending.is_none()).then(|| {
-                            action(Action::Command(
-                                target,
-                                Command::Branch {
-                                    id: Some(point.id.clone()),
-                                },
-                            ))
-                        }))
+                        .on_press_maybe(
+                            (available
+                                && snapshot.ready
+                                && !snapshot.busy
+                                && snapshot.read_only_reason.is_none())
+                            .then(|| {
+                                action(Action::Command(
+                                    target,
+                                    Command::Branch {
+                                        id: Some(point.id.clone()),
+                                    },
+                                ))
+                            }),
+                        )
                         .into(),
                 );
             }
@@ -1960,14 +1969,6 @@ impl Runtime {
                 .into()
         };
         let mut actions = Vec::new();
-        if snapshot.capabilities.branch {
-            actions.push(icon(
-                Icon::Branch,
-                "Branch conversation history",
-                available && !snapshot.busy,
-                Action::BranchPicker(target, !self.branch_picker),
-            ));
-        }
         if !snapshot.capabilities.interrupt_modes.is_empty() {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
             let next = if mode == "wait" { "immediate" } else { "wait" };
@@ -2206,6 +2207,48 @@ impl Runtime {
             );
         }
         status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+        if snapshot.capabilities.branch {
+            let available = available
+                && snapshot.ready
+                && !snapshot.busy
+                && snapshot.read_only_reason.is_none();
+            status.push(crate::interaction::tooltip(
+                crate::ui_controls::button::quiet("Fork chat").on_press_maybe(
+                    available.then(|| action(Action::BranchPicker(target, !self.branch_picker))),
+                ),
+                "Start a new conversation from this chat's history",
+            ));
+        }
+        if let Some(mode) = &snapshot.fast_mode {
+            let available = available
+                && snapshot.ready
+                && snapshot.capabilities.fast_mode
+                && snapshot.read_only_reason.is_none()
+                && mode.changeable();
+            let label = match mode.state {
+                crate::chat::FastModeState::Off => "Fast: off",
+                crate::chat::FastModeState::On => "Fast: on",
+                crate::chat::FastModeState::Cooldown => "Fast: cooldown",
+            };
+            let tooltip = if !snapshot.ready {
+                "Connect to this chat to change fast mode.".into()
+            } else if !snapshot.capabilities.fast_mode && mode.disabled_reason.is_none() {
+                "The provider does not advertise fast mode for this chat's selected model.".into()
+            } else {
+                fast_mode_tooltip(mode)
+            };
+            status.push(crate::interaction::tooltip(
+                crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
+                    action(Action::Command(
+                        target,
+                        Command::SetFastMode {
+                            enabled: !mode.enabled(),
+                        },
+                    ))
+                })),
+                tooltip,
+            ));
+        }
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
@@ -2250,6 +2293,9 @@ impl Runtime {
             // Two decimals, because the figure is money a reader is spending
             // and four decimals of a dollar is a number nobody reads.
             spend.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
+        } else if let Some(estimate) = usage.cost_estimate {
+            let (label, tooltip) = cost_estimate_label(estimate);
+            spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
         let mut footer = status;
         if let Some(notice) = permissions::notice(snapshot) {
@@ -4063,6 +4109,36 @@ fn field_view<'a>(
         .into()
 }
 
+fn fast_mode_tooltip(mode: &crate::chat::FastMode) -> String {
+    match mode.disabled_reason.as_deref() {
+        Some("preference" | "sdk_opt_in_required") => "Enable faster responses for subsequent turns. This can use more allowance or cost more.".into(),
+        Some("model" | "unsupported_model") => "Fast mode is unavailable for the selected model.".into(),
+        Some("organization" | "org_disabled") => "Fast mode is disabled by the organization.".into(),
+        Some("subscription" | "subscription_required") => "Fast mode is unavailable on this account's plan.".into(),
+        Some(reason) if reason.contains(' ') => reason.to_owned(),
+        Some(_) => "The provider has disabled fast mode for this chat.".into(),
+        None if mode.state == crate::chat::FastModeState::Cooldown => "Fast mode is temporarily cooling down. The provider will resume it when available; click to turn it off.".into(),
+        None => "Use the provider's faster mode for subsequent turns. It can use more allowance or cost more.".into(),
+    }
+}
+
+fn cost_estimate_label(estimate: crate::chat::pricing::CostEstimate) -> (String, String) {
+    let amount = if estimate.microusd > 0 && estimate.microusd < 10_000 {
+        "<$0.01".to_owned()
+    } else {
+        format!("${:.2}", estimate.microusd as f64 / 1_000_000.0)
+    };
+    let label = format!(
+        "{amount} est.{}",
+        if estimate.partial { " · observed" } else { "" }
+    );
+    let mut tooltip = "API-equivalent text token estimate using the model, cached input, and service tier reported for observed requests. Rates checked 2026-10-12. ChatGPT plan usage is not billed per token; tool fees and regional premiums are excluded.".to_owned();
+    if estimate.partial {
+        tooltip.push_str(" Some usage could not be fully priced or reconciled, including unobserved earlier requests. This is a partial estimate, not a complete conversation total.");
+    }
+    (label, tooltip)
+}
+
 /// The decisions the provider offered, in the order a reader should meet
 /// them.
 ///
@@ -4418,6 +4494,39 @@ mod tests {
             background: true,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_cost_estimates_are_labeled_and_partial_coverage_is_explicit() {
+        let (label, tooltip) = cost_estimate_label(crate::chat::pricing::CostEstimate {
+            microusd: 25_000,
+            partial: false,
+        });
+        assert_eq!(label, "$0.03 est.");
+        assert!(tooltip.contains("ChatGPT plan usage is not billed per token"));
+        let (label, tooltip) = cost_estimate_label(crate::chat::pricing::CostEstimate {
+            microusd: 1_000,
+            partial: true,
+        });
+        assert_eq!(label, "<$0.01 est. · observed");
+        assert!(tooltip.contains("partial estimate"));
+    }
+
+    #[test]
+    fn fast_mode_explains_preference_and_cooldown_without_protocol_terms() {
+        let preference = crate::chat::FastMode {
+            state: crate::chat::FastModeState::Off,
+            disabled_reason: Some("sdk_opt_in_required".into()),
+        };
+        assert!(preference.changeable());
+        assert!(fast_mode_tooltip(&preference).starts_with("Enable faster responses"));
+        assert!(!fast_mode_tooltip(&preference).contains("sdk"));
+        let cooldown = crate::chat::FastMode {
+            state: crate::chat::FastModeState::Cooldown,
+            disabled_reason: None,
+        };
+        assert!(cooldown.enabled());
+        assert!(fast_mode_tooltip(&cooldown).contains("temporarily cooling down"));
     }
 
     #[test]

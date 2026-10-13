@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
+pub mod pricing;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -800,6 +801,8 @@ pub struct Snapshot {
     pub selected_model: Option<String>,
     pub reasoning: Option<String>,
     #[serde(default)]
+    pub fast_mode: Option<FastMode>,
+    #[serde(default)]
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub permissions: Option<PermissionSettings>,
@@ -1070,6 +1073,9 @@ pub enum Command {
     SetModel {
         model: String,
         reasoning: Option<String>,
+    },
+    SetFastMode {
+        enabled: bool,
     },
     SetPermissionMode {
         mode: String,
@@ -1570,6 +1576,8 @@ pub struct Capabilities {
     pub compact: bool,
     pub model_selection: bool,
     pub reasoning_selection: bool,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub permission_modes: Vec<String>,
     pub skill_reach: SkillReach,
     #[serde(default)]
@@ -1588,6 +1596,33 @@ pub struct Capabilities {
     #[serde(default)]
     pub interrupt_stops_background: bool,
 }
+/// Provider-confirmed speed setting, independent of model reasoning effort.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastMode {
+    pub state: FastModeState,
+    pub disabled_reason: Option<String>,
+}
+impl FastMode {
+    pub fn enabled(&self) -> bool {
+        matches!(self.state, FastModeState::On | FastModeState::Cooldown)
+    }
+    pub fn changeable(&self) -> bool {
+        self.enabled()
+            || self
+                .disabled_reason
+                .as_deref()
+                .is_none_or(|reason| matches!(reason, "preference" | "sdk_opt_in_required"))
+    }
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeState {
+    #[default]
+    Off,
+    On,
+    Cooldown,
+}
+
 /// Which of the skills a message names the provider loads with it.
 ///
 /// Every provider reads a skill named in a message, but not every one reads
@@ -1614,6 +1649,9 @@ pub struct Usage {
     pub context_tokens: u64,
     pub context_limit: u64,
     pub cost_microusd: Option<u64>,
+    /// API-equivalent estimate when the provider does not report a cost.
+    #[serde(default)]
+    pub cost_estimate: Option<pricing::CostEstimate>,
 }
 
 /// One step of a plan a provider published, with the state it is in.
@@ -1668,6 +1706,7 @@ pub enum Event {
         selected: Option<String>,
         reasoning: Option<String>,
     },
+    FastMode(FastMode),
     Commands(Vec<SlashCommand>),
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
