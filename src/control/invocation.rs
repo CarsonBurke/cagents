@@ -223,8 +223,9 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
                 result: run.result.text,
             })
         });
-    let receipt = serde_json::from_value::<crate::agent_execution::mailbox::Sent>(data.clone())
-        .ok()
+    let receipt = matches!(expected, "send" | "ask" | "reply")
+        .then(|| serde_json::from_value::<crate::agent_execution::mailbox::Sent>(data.clone()).ok())
+        .flatten()
         .map(|sent| {
             use crate::agent_execution::mailbox::Reach;
             use crate::chat::coordination::{Arrival, Receipt};
