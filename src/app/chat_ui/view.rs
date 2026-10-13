@@ -4489,7 +4489,27 @@ mod tests {
 
     #[test]
     fn live_reasoning_disclosure_toggles_through_actions_and_retains_streaming_choice() {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct ReadText(Vec<(String, iced::Rectangle)>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push((prose.plain.to_string(), bounds));
+                }
+            }
+        }
         fn runtime(app: &Cagents, target: Target) -> &Runtime {
             match app.cards.get(&target.card) {
                 Some(CardRuntime::Chat(runtime)) => runtime,
@@ -4542,28 +4562,30 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, viewport.size()),
             );
-            let accessible = element.as_widget().a11y_nodes(
+            let mut rendered = ReadText::default();
+            element.as_widget_mut().operate(
+                &mut tree,
                 Layout::new(&node),
-                &tree,
-                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut rendered,
             );
-            let values: Vec<_> = accessible
-                .root()
-                .iter()
-                .chain(accessible.children())
-                .flat_map(|node| {
-                    [node.node().value(), node.node().label()]
-                        .into_iter()
-                        .flatten()
-                        .map(str::to_owned)
+            let values: Vec<_> = rendered
+                .0
+                .into_iter()
+                .filter(|(_, bounds)| {
+                    bounds.width > 0.0
+                        && bounds.height > 0.0
+                        && bounds.y < viewport.height
+                        && bounds.y + bounds.height > 0.0
                 })
+                .map(|(text, _)| text)
                 .collect();
             assert_eq!(
                 values
                     .iter()
                     .any(|value| value.contains("Secret reasoning body")),
                 expanded,
-                "step={step_index} expanded={expanded} markdown_items={} exposed={values:?}",
+                "step={step_index} expanded={expanded} markdown_items={} rendered={values:?}",
                 runtime(&app, target).cache["live-thought"]
                     .markdown
                     .items()
