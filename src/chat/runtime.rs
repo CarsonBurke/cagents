@@ -2399,9 +2399,6 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
         }
         Event::TurnStarted => {
-            // A provider-confirmed new turn supersedes the previous operation's
-            // nonfatal failure. Status refreshes alone do not prove recovery.
-            state.error = None;
             state.prompt_suggestion = None;
             state.turn_generation = state.turn_generation.wrapping_add(1);
             state.finished_at = None;
@@ -3770,28 +3767,30 @@ mod tests {
     fn a_new_provider_turn_recovers_from_a_prior_nonfatal_error() {
         let mut state = Snapshot::default();
         let mut indices = BTreeMap::new();
-        apply_event(
+        let mut history_error = None;
+        let mut apply = |state: &mut Snapshot, event: Event| {
+            recover_history_error(&mut state.error, &mut history_error, &event);
+            apply_event(state, &mut indices, event);
+        };
+        apply(
             &mut state,
-            &mut indices,
             Event::Error {
                 message: "Prior turn failed".into(),
                 fatal: false,
             },
         );
         assert_eq!(state.error.as_deref(), Some("Prior turn failed"));
-        apply_event(
+        apply(
             &mut state,
-            &mut indices,
             Event::Status {
                 busy: false,
                 detail: String::new(),
             },
         );
         assert!(state.error.is_some());
-        apply_event(&mut state, &mut indices, Event::TurnStarted);
-        apply_event(
+        apply(&mut state, Event::TurnStarted);
+        apply(
             &mut state,
-            &mut indices,
             Event::Status {
                 busy: true,
                 detail: String::new(),
@@ -3799,10 +3798,9 @@ mod tests {
         );
         assert_eq!(state.error, None);
         assert_eq!(state.activity(), ActivityState::Working);
-        apply_event(&mut state, &mut indices, Event::TurnSettled);
-        apply_event(
+        apply(&mut state, Event::TurnSettled);
+        apply(
             &mut state,
-            &mut indices,
             Event::Status {
                 busy: false,
                 detail: String::new(),
@@ -3810,6 +3808,14 @@ mod tests {
         );
         assert_eq!(state.error, None);
         assert_eq!(state.activity(), ActivityState::Idle);
+        apply(
+            &mut state,
+            Event::HistoryError("History page failed".into()),
+        );
+        apply(&mut state, Event::TurnStarted);
+        assert_eq!(state.error.as_deref(), Some("History page failed"));
+        apply(&mut state, Event::HistoryRecovered);
+        assert_eq!(state.error, None);
     }
 
     #[test]
