@@ -2119,17 +2119,20 @@ impl Runtime {
         }
         if !state.is_empty() {
             status.push(
-                design::caption(state)
-                    .class(
-                        if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none()
-                        {
-                            cosmic::theme::Text::Custom(design::warning_text)
-                        } else {
-                            cosmic::theme::Text::default()
-                        },
-                    )
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
+                design::caption(if selected.is_some() {
+                    format!("Main: {state}")
+                } else {
+                    state.to_owned()
+                })
+                .class(
+                    if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
+                        cosmic::theme::Text::Custom(design::warning_text)
+                    } else {
+                        cosmic::theme::Text::default()
+                    },
+                )
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
             );
         }
         if let Some(channel) = &place.channel {
@@ -2923,7 +2926,15 @@ impl Runtime {
         }
         if coordinating {
             for agent in &self.snapshot.subagents {
-                (&agent.id, &agent.kind, &agent.description, agent.status).hash(&mut hasher);
+                (
+                    &agent.id,
+                    &agent.kind,
+                    &agent.description,
+                    agent.status,
+                    &agent.model,
+                    agent.waiting,
+                )
+                    .hash(&mut hasher);
             }
         }
         hasher.finish()
@@ -4485,6 +4496,149 @@ mod tests {
             labels.iter().any(|label| label.contains("Conversation")),
             "{labels:?}"
         );
+    }
+
+    #[test]
+    fn native_child_tabs_select_both_transcripts_through_real_runtime_rebuild_with_approval() {
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        fn runtime(app: &Cagents, target: Target) -> &Runtime {
+            match app.cards.get(&target.card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => panic!("the fixture chat remains mounted"),
+            }
+        }
+        fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+            runtime(app, target).view(
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                620.0,
+                Place {
+                    name: "native-fixture".into(),
+                    branch: None,
+                    channel: Some("Review".into()),
+                },
+                true,
+                None,
+                Vec::new(),
+            )
+        }
+        let thought = chat::Item {
+            id: "live-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Inspecting compact tools and native agent tabs.".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (mut live, _handle) = frame_cost::live_runtime(&[thought]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        live.session.launch.provider = Provider::Codex;
+        live.expanded.insert("live-thought".into());
+        let mut child = native_child_fixture();
+        child.waiting = true;
+        child.model = Some("gpt-fixture-mini".into());
+        child.detail = "Waiting for your approval".into();
+        let child_name = live.native_child_identity(&child);
+        let snapshot = Arc::make_mut(&mut live.snapshot);
+        snapshot.busy = true;
+        snapshot.subagents.push(child);
+        snapshot.requests.push(chat::Request {
+            id: "child-approval".into(),
+            title: "Child agent · Command approval".into(),
+            description: "printf native-fixture".into(),
+            fields: Vec::new(),
+            actions: vec![
+                chat::Choice {
+                    id: "decline".into(),
+                    label: "Deny".into(),
+                    description: String::new(),
+                },
+                chat::Choice {
+                    id: "accept".into(),
+                    label: "Allow once".into(),
+                    description: String::new(),
+                },
+            ],
+        });
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let mut renderer = crate::app::tests::headless_renderer();
+        let size = iced::Size::new(620.0, 720.0);
+        let mut cache = Cache::new();
+        for (name, selected) in [
+            (child_name.as_str(), Some("native-child")),
+            ("Main conversation", None),
+        ] {
+            let mut ui = UserInterface::build(view(&app, target), size, cache, &mut renderer);
+            let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let bounds = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(name)
+                })
+                .and_then(|node| node.node().bounds())
+                .expect("the transcript tab is mounted");
+            let pointer = iced::Point::new(
+                (bounds.x0 + bounds.x1) as f32 / 2.0,
+                (bounds.y0 + bounds.y1) as f32 / 2.0,
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                ],
+                iced::mouse::Cursor::Available(pointer),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::ChatUi(Action::SelectSubagent(..))))
+            );
+            cache = ui.into_cache();
+            // This is the actual UserInterface cache extraction/rebuild path
+            // used after the press requests a native redraw.
+            let mut ui = UserInterface::build(view(&app, target), size, cache, &mut renderer);
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(pointer),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            cache = ui.into_cache();
+            let selection = messages
+                .into_iter()
+                .find_map(|message| match message {
+                    Message::ChatUi(action @ Action::SelectSubagent(..)) => Some(action),
+                    _ => None,
+                })
+                .expect(
+                    "native transcript tab publishes selection through the full chat hierarchy",
+                );
+            drop(app.handle_chat_ui(selection));
+            assert_eq!(runtime(&app, target).selected_subagent.as_deref(), selected);
+        }
     }
 
     #[test]

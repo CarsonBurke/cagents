@@ -379,7 +379,7 @@ fn last_line(output: &str) -> &str {
 
 /// Describe only metadata reported for this launch; native children do not
 /// inherit the parent model merely because they share a provider.
-fn spawn_identity(reading: &Coordination, spawn: &Spawn) -> String {
+fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<&str>) -> String {
     let mut parts = vec![
         if reading.cli {
             "cagents agent"
@@ -391,11 +391,16 @@ fn spawn_identity(reading: &Coordination, spawn: &Spawn) -> String {
     if !spawn.provider.is_empty() {
         parts.push(spawn.provider.clone());
     }
-    parts.push(if spawn.model.is_empty() {
-        "Model not reported".to_owned()
-    } else {
-        spawn.model.clone()
-    });
+    parts.push(
+        observed_model
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or(if spawn.model.is_empty() {
+                "Model not reported"
+            } else {
+                &spawn.model
+            })
+            .to_owned(),
+    );
     if !spawn.effort.is_empty() {
         parts.push(spawn.effort.clone());
     }
@@ -696,7 +701,20 @@ impl Runtime {
             design::caption("Started").into(),
             design::heading(started(spawn)).into(),
         ];
-        heading.push(design::caption(spawn_identity(reading, spawn)).into());
+        let observed_model = if !reading.cli {
+            match reading.subagents.as_slice() {
+                [id] => self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == id)
+                    .and_then(|agent| agent.model.as_deref()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        heading.push(design::caption(spawn_identity(reading, spawn, observed_model)).into());
         rows.push(
             widget::row::with_children(heading)
                 .spacing(step::GAP_XS)
@@ -1049,12 +1067,16 @@ mod identity_tests {
             cli: false,
         };
         assert_eq!(
-            spawn_identity(&reading, &spawn),
+            spawn_identity(&reading, &spawn, None),
             "Native subagent · Model not reported"
+        );
+        assert_eq!(
+            spawn_identity(&reading, &spawn, Some("gpt-child-reported")),
+            "Native subagent · gpt-child-reported"
         );
         reading.cli = true;
         assert_eq!(
-            spawn_identity(&reading, &spawn),
+            spawn_identity(&reading, &spawn, None),
             "cagents agent · Model not reported · Channel not reported"
         );
         spawn.provider = "codex".into();
@@ -1063,7 +1085,7 @@ mod identity_tests {
         let channel = crate::model::ChannelId::new();
         spawn.channel = Some(channel);
         assert_eq!(
-            spawn_identity(&reading, &spawn),
+            spawn_identity(&reading, &spawn, None),
             format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
         );
     }
