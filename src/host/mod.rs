@@ -396,8 +396,16 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
+    for handle in &handles {
+        handle.request_shutdown();
+    }
     for handle in handles {
-        let _ = handle.shutdown();
+        if let Err(error) = handle.shutdown() {
+            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
+            runtime_error = Some(io::Error::other(format!(
+                "terminal shutdown left unconfirmed ownership: {error}"
+            )));
+        }
     }
     for client in clients {
         let _ = client.join();

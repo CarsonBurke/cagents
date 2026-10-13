@@ -824,6 +824,19 @@ impl HeldChild {
             result => result,
         }
     }
+
+    pub(super) fn exited_within(&self, grace: Duration) -> io::Result<bool> {
+        exits_within(&self.pidfd, grace)
+    }
+
+    /// Escalates only this pinned root after a graceful hangup was ignored.
+    /// The pidfd cannot acquire authority over a reused numeric process ID.
+    pub(super) fn force_kill(&self) -> io::Result<()> {
+        match signal(&self.pidfd, libc::SIGKILL) {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            result => result,
+        }
+    }
 }
 
 fn peer_credentials(socket: &UnixStream) -> io::Result<libc::ucred> {

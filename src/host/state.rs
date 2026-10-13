@@ -4077,6 +4077,51 @@ mod tests {
     }
 
     #[test]
+    fn failed_shutdown_keeps_terminal_owned_and_forbids_fresh_replacement() {
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "trap '' HUP; while :; do sleep 1; done".into()],
+            working_directory: PathBuf::from("/"),
+            environment: Default::default(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle = TerminalHandle::spawn_with_missing_exit_report_for_test(session.clone());
+        let mut host = test_host();
+        host.finish_spawn(0, session, handle.clone(), true).unwrap();
+        assert!(handle.shutdown().is_err());
+        assert!(
+            !handle.is_completed(),
+            "joining a stopped parser is not root-exit confirmation"
+        );
+        assert_eq!(host.inventory_count(), 1);
+        assert!(!host.terminals[&id].completion_observed);
+        assert!(matches!(
+            host.descriptor(0, id).unwrap().session.continuity,
+            TerminalContinuity::Live { .. }
+        ));
+        assert!(
+            !handle
+                .events()
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Completed { .. }))
+        );
+    }
+
+    #[test]
     fn pending_terminal_completion_is_idempotent_and_fenced_by_its_pane() {
         use crate::workspace_model::views::{Change, Pane, Scope};
         let directory = tempfile::tempdir().unwrap();
