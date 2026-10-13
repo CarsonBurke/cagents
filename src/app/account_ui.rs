@@ -4536,14 +4536,37 @@ impl Cagents {
                     sections.push(design::horizontal_rule());
                     sections.push(self.account_switcher(provider, &shown.id, now));
                 }
-                widget::container(widget::column::with_children(sections).spacing(space::S))
-                    .width(POPOVER_WIDTH)
-                    .padding(space::XS)
-                    .into()
+                self.account_popover_body(provider, sections)
             }),
             widget::popover::Position::Top,
             Message::AccountUi(Action::Popover(None)),
         ))
+    }
+
+    fn account_popover_body<'a>(
+        &self,
+        provider: Provider,
+        sections: Vec<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        // Reserve the status bar and a small separation from the window edge.
+        // The complete surface scrolls, so warnings and every account remain
+        // reachable even when their labels span several lines.
+        let height = (self.window_height - CHIP_HEIGHT - 2.0 * space::XS).max(0.0);
+        widget::container(
+            widget::scrollable(widget::column::with_children(sections).spacing(space::S))
+                .id(widget::Id::new(format!(
+                    "account-popover-{}",
+                    provider.executable()
+                )))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink),
+        )
+        .max_height(height)
+        .width(POPOVER_WIDTH)
+        .padding(space::XS)
+        .into()
     }
 
     /// The popover's list of every account of a provider, each with what it
@@ -8037,6 +8060,107 @@ mod app_tests {
         assert!(
             app.read_omp(Trigger::Manual, now_ms()).is_none(),
             "a read under way is not started again"
+        );
+    }
+    #[test]
+    fn account_popover_scroll_reaches_last_account_inside_short_window() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct Metrics {
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            y: f32,
+        }
+        impl Operation for Metrics {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                content: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::scrollable::Scrollable,
+            ) {
+                self.bounds = bounds;
+                self.content = content;
+                self.y = translation.y;
+            }
+        }
+        let mut app = context_inspector_test_app(false);
+        app.window_height = 600.0;
+        let shown = app.account_ui.add_managed_fixture(Provider::Codex, 9910);
+        for key in [9911, 9912] {
+            app.account_ui.add_managed_fixture(Provider::Codex, key);
+        }
+        app.account_ui.account_mut(&shown).unwrap().identity = Some(Identity {
+            email: Some("other-reported-login@example.test".into()),
+            organization: None,
+            plan: None,
+        });
+        let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", NOW);
+        usage.windows = [("session", 0.35), ("weekly", 0.55)]
+            .into_iter()
+            .map(|(key, used)| UsageWindow {
+                key: key.into(),
+                kind: account::WindowKind::Session,
+                label: key.into(),
+                used,
+                resets_at: Some(i64::try_from(NOW + 86_400_000).unwrap()),
+                span_secs: Some(5 * 3_600),
+                binding: false,
+            })
+            .collect();
+        app.account_ui.account_mut(&shown).unwrap().snapshot = Some(usage);
+        let account = app.account_ui.account(&shown).unwrap();
+        let mut element = app.account_popover_body(
+            Provider::Codex,
+            vec![
+                app.account_details(account, NOW, Placement::Popover),
+                design::horizontal_rule(),
+                app.account_switcher(Provider::Codex, &shown, NOW),
+            ],
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1440.0, 600.0)),
+        );
+        assert!(node.size().height <= 600.0 - CHIP_HEIGHT);
+        let mut measured = Metrics {
+            bounds: iced::Rectangle::default(),
+            content: iced::Rectangle::default(),
+            y: 0.0,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut measured);
+        assert!(
+            measured.content.height > measured.bounds.height,
+            "fixture exercises overflow"
+        );
+        let mut bottom = iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+            widget::Id::new("account-popover-codex"),
+            iced::widget::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(f32::MAX),
+            },
+        );
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bottom);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut measured);
+        assert!(measured.y > 0.0);
+        assert!(
+            (measured.content.height - measured.y - measured.bounds.height).abs() < 1.0,
+            "the final account reaches the visible viewport bottom"
         );
     }
 }

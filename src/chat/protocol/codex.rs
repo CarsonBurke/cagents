@@ -1755,6 +1755,22 @@ impl Adapter for Codex {
                     }));
                     self.read_queue(&mut step)?;
                 }
+                // The actor marks a submitted prompt busy before the server
+                // acknowledges it. A rejected start has no turn/completed
+                // notification to release that optimistic state. Only repair
+                // the lifecycle this request observed: a newer genuine turn
+                // must retain its own activity and waiting state.
+                if let Pending::Turn { revision, .. } = &pending
+                    && *revision == self.lifecycle_revision
+                {
+                    self.busy = false;
+                    self.turn = None;
+                    step.events.push(Event::Waiting(false));
+                    step.events.push(Event::Status {
+                        busy: false,
+                        detail: "Turn failed".into(),
+                    });
+                }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 let message = format!(
                     "{}: {}",
@@ -3733,6 +3749,81 @@ mod tests {
                 .iter()
                 .any(|frame| frame["method"] == "thread/prediction/request")
         );
+    }
+
+    #[test]
+    fn rejected_turn_start_releases_optimistic_activity_for_sign_in_recovery() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "first attempt".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        let rejected = adapter.receive(json!({"id":request["id"],"error":{"code":-32000,"message":"Your access token could not be refreshed. Please sign in again."}})).unwrap();
+        assert!(
+            rejected
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Waiting(false)))
+        );
+        assert!(rejected.events.iter().any(|event| matches!(event, Event::Status { busy: false, detail } if detail == "Turn failed")));
+        assert!(rejected.events.iter().any(|event| matches!(event, Event::Error { message, fatal: false } if chat::requires_sign_in(crate::agent::Provider::Codex, message))));
+        assert!(!adapter.busy);
+        assert!(adapter.turn.is_none());
+        assert!(
+            adapter
+                .command(Command::Prompt {
+                    text: "explicit new attempt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejected_turn_start_does_not_settle_a_newer_provider_turn() {
+        for completed in [false, true] {
+            let mut adapter = adapter();
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text: "old attempt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let request = submitted
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "turn/start")
+                .unwrap();
+            adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"newer-turn","status":"inProgress","items":[]}}})).unwrap();
+            if completed {
+                adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"newer-turn","status":"completed","items":[]}}})).unwrap();
+            }
+            let revision = adapter.lifecycle_revision;
+            let rejected = adapter.receive(json!({"id":request["id"],"error":{"code":-32000,"message":"Old request failed"}})).unwrap();
+            assert!(!rejected.events.iter().any(|event| matches!(
+                event,
+                Event::Status { .. }
+                    | Event::Waiting(_)
+                    | Event::TurnSettled
+                    | Event::TurnFinished { .. }
+            )));
+            assert_eq!(adapter.lifecycle_revision, revision);
+            assert_eq!(adapter.busy, !completed);
+            assert_eq!(
+                adapter.turn.as_deref(),
+                (!completed).then_some("newer-turn")
+            );
+        }
     }
 
     #[test]
