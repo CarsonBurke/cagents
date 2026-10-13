@@ -333,7 +333,7 @@ fn run_line(run: &Run) -> Option<(String, Tone)> {
     let state = run.state.map(|state| {
         let mut state = state_phrase(state).to_owned();
         if run.timed_out {
-            state.push_str(", still running when the wait ended");
+            state.push_str(", wait timed out");
         }
         state
     });
