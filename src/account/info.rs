@@ -11,6 +11,35 @@ pub struct Query {
     pub refresh: bool,
 }
 
+/// Fixed-field wire projection. The persisted UsageSnapshot omits unknown JSON
+/// fields, which cannot be omitted from postcard's positional representation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageReading {
+    pub windows: Vec<UsageWindow>,
+    pub credits: Option<Credits>,
+    pub status: super::UsageStatus,
+    pub ordinary_usage_allowed: Option<bool>,
+    pub observed_at: u64,
+    pub source: super::UsageSource,
+    pub plan: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl From<UsageSnapshot> for UsageReading {
+    fn from(snapshot: UsageSnapshot) -> Self {
+        Self {
+            windows: snapshot.windows,
+            credits: snapshot.credits,
+            status: snapshot.status,
+            ordinary_usage_allowed: snapshot.ordinary_usage_allowed,
+            observed_at: snapshot.observed_at,
+            source: snapshot.source,
+            plan: snapshot.plan,
+            detail: snapshot.detail,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
     pub sampled_at: u64,
@@ -80,7 +109,7 @@ pub struct AccountInfo {
     pub selected_by_caller: bool,
     pub default_for_new_chats: bool,
     pub archived: bool,
-    pub usage: Option<UsageSnapshot>,
+    pub usage: Option<UsageReading>,
     pub remaining: Vec<RemainingWindow>,
     pub credits: Option<Credits>,
     /// Derived only from a provider-reported used fraction, never token costs.
@@ -126,7 +155,7 @@ impl AccountInfo {
             .map(|used| (1.0 - used).clamp(0.0, 1.0));
         self.credits_remaining = usage.credits.as_ref().and_then(remaining_credit);
         self.credits = usage.credits.clone();
-        self.usage = Some(usage);
+        self.usage = Some(usage.into());
     }
 }
 
@@ -270,5 +299,120 @@ mod tests {
         credits.unlimited = true;
         credits.limit = Some(money(1000, 2, "USD"));
         assert_eq!(remaining_credit(&credits), None);
+    }
+    #[test]
+    fn full_account_reply_roundtrips_binary_with_unknown_and_reported_permission() {
+        fn row() -> AccountInfo {
+            AccountInfo {
+                id: "codex/system".parse().unwrap(),
+                provider: Provider::Codex,
+                label: Some("Fixture plan".into()),
+                registered_identity: Some(Identity {
+                    email: Some("fixture@example.test".into()),
+                    organization: None,
+                    plan: Some("pro".into()),
+                }),
+                observed_identity: None,
+                identity_conflict: false,
+                selected_by_caller: true,
+                default_for_new_chats: true,
+                archived: false,
+                usage: None,
+                remaining: vec![],
+                credits: None,
+                credits_remaining_fraction: None,
+                credits_remaining: None,
+                age_ms: None,
+                stale: true,
+                detail: None,
+            }
+        }
+        for allowed in [None, Some(false), Some(true)] {
+            let observed = 1_800_000_123_456;
+            let mut account = row();
+            let mut usage = UsageSnapshot::state(
+                super::super::UsageStatus::Warning,
+                "Fixture quota",
+                observed,
+            );
+            usage.ordinary_usage_allowed = allowed;
+            usage.source = super::super::UsageSource::Cache;
+            usage.plan = Some("pro".into());
+            usage.windows.push(UsageWindow {
+                key: "weekly".into(),
+                kind: super::super::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 0.8,
+                resets_at: Some(1_800_010_000),
+                span_secs: Some(604800),
+                binding: true,
+            });
+            usage.credits = Some(Credits {
+                enabled: true,
+                unlimited: false,
+                used: None,
+                limit: None,
+                balance: Some("Provider balance".into()),
+                used_fraction: None,
+            });
+            account.set_usage(usage, observed + 1000);
+            let mut unknown = row();
+            unknown.id = "claude/system".parse().unwrap();
+            unknown.provider = Provider::Claude;
+            unknown.registered_identity = None;
+            unknown.selected_by_caller = false;
+            let report = Report {
+                sampled_at: observed + 1000,
+                caller: Some(Caller::new(
+                    TerminalId::new(),
+                    Some(Provider::Codex),
+                    Some(account.id.clone()),
+                    None,
+                    Some(crate::chat::Usage {
+                        context_tokens: 45_000,
+                        context_limit: 1_050_000,
+                        cost_estimate: Some(crate::chat::pricing::CostEstimate {
+                            microusd: 12345,
+                            partial: true,
+                        }),
+                        ..Default::default()
+                    }),
+                )),
+                accounts: vec![account, unknown],
+                diagnostics: vec!["OMP has no recorded account usage".into()],
+            };
+            let reply = crate::agent_execution::Reply::AccountInfo(report.clone());
+            let bytes = postcard::to_allocvec(&reply).unwrap();
+            let (decoded, remaining) =
+                postcard::take_from_bytes::<crate::agent_execution::Reply>(&bytes).unwrap();
+            assert!(remaining.is_empty());
+            assert_eq!(decoded, reply);
+            let response = crate::terminal_ipc::ServerResponse::Agent(reply);
+            let bytes = postcard::to_allocvec(&response).unwrap();
+            let (decoded, remaining) =
+                postcard::take_from_bytes::<crate::terminal_ipc::ServerResponse>(&bytes).unwrap();
+            assert!(remaining.is_empty());
+            assert_eq!(decoded, response);
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(
+                json["accounts"][0]["usage"]["ordinary_usage_allowed"],
+                serde_json::to_value(allowed).unwrap()
+            );
+            assert!(json["accounts"][1]["usage"].is_null());
+            assert_eq!(serde_json::from_value::<Report>(json).unwrap(), report);
+        }
+        // Cache JSON still omits the optional field. Only the CLI wire DTO has
+        // fixed fields; this change does not rewrite persisted usage semantics.
+        let persisted = UsageSnapshot::state(
+            super::super::UsageStatus::Unavailable,
+            "",
+            1_800_000_123_456,
+        );
+        assert!(
+            serde_json::to_value(persisted)
+                .unwrap()
+                .get("ordinary_usage_allowed")
+                .is_none()
+        );
     }
 }
