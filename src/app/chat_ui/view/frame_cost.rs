@@ -764,7 +764,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
                 input: serde_json::json!({"prompt":"Inspect parser", "run_in_background":true})
                     .to_string(),
                 output: String::new(),
-                status: chat::ToolStatus::Succeeded,
+                status: chat::ToolStatus::Running,
             },
         ),
         item(
@@ -830,9 +830,11 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         "{initial:?}"
     );
     assert!(
-        initial
-            .iter()
-            .any(|label| label.contains("Working in the background")),
+        initial.iter().any(|label| label == "Working"),
+        "{initial:?}"
+    );
+    assert!(
+        !initial.iter().any(|label| label == "Starting…"),
         "{initial:?}"
     );
     let unrelated = runtime.turn_fingerprint(&runtime.turns[1], dark);
@@ -860,10 +862,21 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         "{waiting:?}"
     );
     assert!(
-        !waiting
-            .iter()
-            .any(|label| label.contains("Working in the background")),
+        !waiting.iter().any(|label| label == "Working"),
         "{waiting:?}"
+    );
+    assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Stopped;
+    let stopped = labels(&runtime, &mut tree);
+    assert!(
+        stopped.iter().any(|label| label == "Stopped"),
+        "{stopped:?}"
+    );
+    assert!(
+        !stopped
+            .iter()
+            .any(|label| label == "Starting…" || label == "Working" || label == "Waiting for you"),
+        "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
 }

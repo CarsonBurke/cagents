@@ -39,6 +39,19 @@ pub(super) fn prune_pasted_images() {
     clipboard_image::prune_cache();
 }
 
+/// Names lead the chat hierarchy; prose and operational metadata keep their
+/// existing scale. Keep this local so workbench labels remain unchanged.
+fn chat_title<'a>(
+    text: impl Into<Cow<'a, str>> + 'a,
+) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    design::body(text)
+        .size(design::TEXT_PROSE)
+        .font(iced::Font {
+            weight: iced::font::Weight::Semibold,
+            ..cosmic::font::default()
+        })
+}
+
 fn action(action: Action) -> Message {
     Message::ChatUi(action)
 }

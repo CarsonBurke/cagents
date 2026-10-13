@@ -58,9 +58,9 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
         ToolStatus::Running => (
             crate::ui_controls::activity_spinner(
                 f32::from(design::COMPACT_ICON_SIZE),
-                design::warning_color,
+                design::accent_color,
             ),
-            Some(design::Tone::Themed(design::warning_color)),
+            Some(design::Tone::Themed(design::accent_color)),
         ),
         ToolStatus::Succeeded => glyph(Icon::Check, None),
         ToolStatus::Failed => glyph(
@@ -355,7 +355,11 @@ impl Runtime {
             }
             None => None,
         };
-        line.push(design::caption(turn.summary.clone()).into());
+        line.push(
+            design::heading(turn.summary.clone())
+                .width(Length::Fill)
+                .into(),
+        );
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
         let elapsed = self
