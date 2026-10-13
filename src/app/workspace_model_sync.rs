@@ -728,8 +728,9 @@ impl Cagents {
         agent: &crate::agent_execution::Agent,
     ) -> Option<Task<Message>> {
         if agent.closed
-            || self.channel_ui.is_deleting(agent.channel)
-            || self.channel_ui.was_deleted(agent.channel)
+            || agent.channel().is_some_and(|channel| {
+                self.channel_ui.is_deleting(channel) || self.channel_ui.was_deleted(channel)
+            })
         {
             return None;
         }
@@ -740,11 +741,31 @@ impl Cagents {
         } else {
             agent.session.as_ref()?
         };
-        let channel_index = self
-            .durable
-            .channels
-            .iter()
-            .position(|channel| channel.id == agent.channel)?;
+        let channel_index = match &agent.placement {
+            crate::agent_execution::Placement::Channel(id) => Some(
+                self.durable
+                    .channels
+                    .iter()
+                    .position(|channel| channel.id == *id)?,
+            ),
+            crate::agent_execution::Placement::Worktree { path, .. } => {
+                if self.project_ui.deleting_directory(path)
+                    || self.worktree_view_scope(path).as_ref() != Some(&agent.placement)
+                {
+                    return None;
+                }
+                None
+            }
+        };
+        let active = match &agent.placement {
+            crate::agent_execution::Placement::Channel(id) => {
+                self.durable.active_channel == Some(*id)
+            }
+            crate::agent_execution::Placement::Worktree { path, .. } => {
+                self.durable.active_channel.is_none()
+                    && self.active_workspace.as_ref() == Some(path)
+            }
+        };
         let card_id = CardId::from_uuid(agent.id.as_uuid());
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
@@ -773,12 +794,22 @@ impl Cagents {
         };
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(card.clone());
-        durable
-            .card_scopes
-            .insert(card_id, agent.spec.target.directory.clone());
-        let channel = &mut durable.channels[channel_index];
-        channel.cards.push(card_id);
-        channel.focused.get_or_insert(card_id);
+        let scope_path = match &agent.placement {
+            crate::agent_execution::Placement::Worktree { path, .. } => path.clone(),
+            crate::agent_execution::Placement::Channel(_) => agent.spec.target.directory.clone(),
+        };
+        durable.card_scopes.insert(card_id, scope_path.clone());
+        if let Some(index) = channel_index {
+            let channel = &mut durable.channels[index];
+            channel.cards.push(card_id);
+            channel.focused.get_or_insert(card_id);
+        } else {
+            durable
+                .worktree_focus
+                .entry(scope_path.clone())
+                .or_insert(card_id);
+            self.worktree_owners.insert(card_id, scope_path);
+        }
         self.cards.insert(card_id, CardRuntime::Loading);
         self.lifecycle.register(
             card_id,
@@ -796,7 +827,7 @@ impl Cagents {
             }
             crate::agent_execution::HostedSession::Terminal(_) => Task::none(),
         };
-        if self.durable.active_channel != Some(agent.channel) {
+        if !active {
             return Some(attach);
         }
         let item = WorkspaceCard::new(
@@ -1240,6 +1271,83 @@ mod tests {
     }
 
     #[test]
+    fn worktree_execution_adopts_into_exact_strip_without_a_channel_or_focus_change() {
+        use crate::agent_execution::{Agent, Origin, Placement, Spec, Surface, Target};
+        let (mut app, _, repository) = app_with_project();
+        let path = PathBuf::from("/repo");
+        app.active_workspace = Some(path.clone());
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        let focus = app.workspace.focused();
+        let console = TerminalSession {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: LaunchRecipe {
+                program: "claude".into(),
+                arguments: vec![],
+                working_directory: "/repo/nested".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("placement-test"),
+                boot_id: crate::model::BootId::new("placement-test"),
+                host_incarnation: crate::model::HostIncarnation::new("placement-test"),
+            },
+        };
+        let placement = Placement::Worktree {
+            repository: repository.clone(),
+            path: path.clone(),
+        };
+        let agent = Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository,
+                    directory: "/repo/nested".into(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: None,
+            console: Some(console),
+            created_ms: 0,
+            closed: false,
+        };
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        let channels = app.durable.channels.clone();
+        let deletion = app.project_ui.begin_deleting(path.clone());
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        drop(app.update(Message::ProjectUi(
+            crate::app::project_ui::Action::Deleted {
+                target: deletion,
+                result: Err("fixture deletion refused".into()),
+            },
+        )));
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(app.durable.channels, channels);
+        assert_eq!(app.workspace.focused(), focus);
+        assert!(app.workspace.cards().iter().any(|pane| pane.id == card));
+        assert_eq!(app.durable.card_scopes.get(&card), Some(&path));
+        assert_eq!(app.worktree_owners.get(&card), Some(&path));
+        assert!(
+            app.adopt_execution_agent(&agent).is_none(),
+            "replayed model does not mount twice"
+        );
+    }
+
+    #[test]
     fn headless_execution_adopts_exact_target_without_stealing_focus_or_resurrecting_tombstones() {
         use crate::agent::Provider;
         use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
@@ -1285,14 +1393,14 @@ mod tests {
                 target: Target {
                     repository,
                     directory: PathBuf::from("/repo/worktree"),
-                    channel: Some(target),
+                    placement: Some(crate::agent_execution::Placement::Channel(target)),
                 },
                 surface: Surface::Chat,
                 model: None,
                 permission_mode: None,
                 reasoning_effort: None,
             },
-            channel: target,
+            placement: crate::agent_execution::Placement::Channel(target),
             session: Some(HostedSession::Chat(session.clone())),
             console: None,
             created_ms: 0,

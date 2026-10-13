@@ -60,7 +60,7 @@ pub(super) fn read(
                         run: Some(run.id),
                         run_state: Some(run.state),
                     },
-                    agent.channel,
+                    agent.placement.clone(),
                 ),
             );
         }
@@ -111,13 +111,17 @@ pub(super) fn read(
         }
     };
 
-    let channels = session_channels(&model);
+    let scopes = session_scopes(&model);
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
-        let (delegation, delegated_channel) = delegations.get(&live.id).cloned().unzip();
-        let channel = channels.get(&live.id).copied().unwrap_or(delegated_channel);
+        let (delegation, delegated_scope) = delegations.get(&live.id).cloned().unzip();
+        let view_scope = scopes.get(&live.id).cloned().unwrap_or(delegated_scope);
+        let channel = match &view_scope {
+            Some(crate::agent_execution::Placement::Channel(id)) => Some(*id),
+            _ => None,
+        };
         let relation = if Some(live.id) == caller {
             Relation::Myself
         } else if Some(lineage(live.id)) == parent {
@@ -138,6 +142,7 @@ pub(super) fn read(
             id: live.id,
             surface: live.surface,
             channel,
+            view_scope,
             channel_repository: channel
                 .and_then(|id| model.channel(id))
                 .map(|channel| channel.repository.clone()),
@@ -258,33 +263,31 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
     live
 }
 
-/// Multiple channel placements have no unambiguous default. Worktree strips
-/// do not contribute a channel; cwd and window focus grant no membership.
-fn session_channels(
+/// Only exact live pane membership supplies a view. Multiple distinct views
+/// are ambiguous; neither cwd nor window focus chooses one of them.
+fn session_scopes(
     model: &crate::workspace_model::WorkspaceModel,
-) -> BTreeMap<TerminalId, Option<crate::model::ChannelId>> {
-    let mut channels = BTreeMap::new();
+) -> BTreeMap<TerminalId, Option<crate::agent_execution::Placement>> {
+    let mut scopes: BTreeMap<TerminalId, Option<crate::agent_execution::Placement>> =
+        BTreeMap::new();
     for view in &model.views {
-        let crate::workspace_model::views::Scope::Channel(channel) = view.scope else {
-            continue;
-        };
         for pane in &view.panes {
             let id = match &pane.kind {
                 crate::model::CardKind::Chat(session) => session.id,
                 crate::model::CardKind::Terminal(session) => session.id,
                 _ => continue,
             };
-            channels
+            scopes
                 .entry(id)
                 .and_modify(|known| {
-                    if *known != Some(channel) {
+                    if known.as_ref() != Some(&view.scope) {
                         *known = None;
                     }
                 })
-                .or_insert(Some(channel));
+                .or_insert_with(|| Some(view.scope.clone()));
         }
     }
-    channels
+    scopes
 }
 
 #[cfg(test)]
@@ -292,7 +295,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_membership_ignores_worktree_strips_and_ambiguous_channels() {
+    fn terminal_membership_reports_worktree_views_and_refuses_ambiguous_placement() {
         use crate::{
             model::{
                 CardId, CardKind, ChannelId, LaunchRecipe, TerminalContinuity, TerminalSession,
@@ -338,23 +341,25 @@ mod tests {
         });
         strip.panes.push(pane.clone());
         model.views.push(strip);
-        assert!(!session_channels(&model).contains_key(&id));
+        let worktree = model.views[0].scope.clone();
+        assert_eq!(session_scopes(&model)[&id], Some(worktree));
+        model.views.clear();
         let channel = ChannelId::new();
         let mut first = View::empty(Scope::Channel(channel));
         first.panes.push(pane.clone());
         model.views.push(first.clone());
-        assert_eq!(session_channels(&model)[&id], Some(channel));
+        assert_eq!(session_scopes(&model)[&id], Some(channel.into()));
         model.views.push(first);
         assert_eq!(
-            session_channels(&model)[&id],
-            Some(channel),
+            session_scopes(&model)[&id],
+            Some(channel.into()),
             "duplicate same-channel metadata is unambiguous"
         );
         let mut other = View::empty(Scope::Channel(ChannelId::new()));
         other.panes.push(pane);
         model.views.push(other);
         assert_eq!(
-            session_channels(&model)[&id],
+            session_scopes(&model)[&id],
             None,
             "conflicting legacy descriptors choose no channel"
         );

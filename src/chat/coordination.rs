@@ -102,6 +102,7 @@ pub struct Spawn {
     /// Explicit membership or the channel returned by the CLI. Unknown for
     /// provider-native agents and commands whose output did not expose it.
     pub channel: Option<crate::model::ChannelId>,
+    pub placement: Option<crate::agent_execution::Placement>,
     /// Whether the step holds the turn until the agents finish.
     pub waits: bool,
 }
@@ -211,6 +212,7 @@ pub struct Run {
     pub model: String,
     pub effort: String,
     pub channel: Option<crate::model::ChannelId>,
+    pub placement: Option<crate::agent_execution::Placement>,
     /// Where the command waited on it, how the run stood when it stopped.
     pub state: Option<crate::agent_execution::State>,
     pub timed_out: bool,

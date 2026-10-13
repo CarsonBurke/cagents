@@ -86,6 +86,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                     .map(|directory| directory.display().to_string())
                     .unwrap_or_default(),
                 channel,
+                placement: channel.map(crate::agent_execution::Placement::Channel),
                 waits: wait.wait,
             }),
             AgentCommand::Send {
@@ -167,7 +168,10 @@ pub(crate) fn enrich(kind: &mut Kind, outcome: &Outcome) {
     if !run.effort.is_empty() {
         spawn.effort.clone_from(&run.effort);
     }
-    if run.channel.is_some() {
+    if let Some(placement) = &run.placement {
+        spawn.placement = Some(placement.clone());
+        spawn.channel = run.channel;
+    } else if run.channel.is_some() {
         spawn.channel = run.channel;
     }
 }
@@ -212,12 +216,15 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
             if run.agent != agent.id {
                 return None;
             }
+            let channel = agent.channel();
+            let placement = Some(agent.placement.clone());
             Some(crate::chat::coordination::Run {
                 agent: crate::agent_execution::mailbox::short(agent.id),
                 provider: agent.spec.provider.executable().to_owned(),
                 model: agent.spec.model.unwrap_or_default(),
                 effort: agent.spec.reasoning_effort.unwrap_or_default(),
-                channel: Some(agent.channel),
+                channel,
+                placement,
                 state: Some(run.state),
                 timed_out: data["timed_out"].as_bool().unwrap_or(false),
                 result: run.result.text,
@@ -447,14 +454,14 @@ mod tests {
                 target: Target {
                     repository: "/repo".into(),
                     directory: "/repo".into(),
-                    channel: None,
+                    placement: None,
                 },
                 surface: Surface::Chat,
                 model: model.map(str::to_owned),
                 permission_mode: None,
                 reasoning_effort: Some("low".into()),
             },
-            channel: crate::model::ChannelId::new(),
+            placement: crate::agent_execution::Placement::Channel(crate::model::ChannelId::new()),
             session: None,
             console: None,
             created_ms: 0,
@@ -510,6 +517,26 @@ mod tests {
         let human = parse("cagents agent spawn Review", None).unwrap();
         let result = super::outcome(&human, "Accepted agent 1a2b3c4d run 5e6f7a8b");
         assert!(result.run.unwrap().channel.is_none());
+    }
+
+    #[test]
+    fn accepted_worktree_scope_is_reported_without_an_invented_channel() {
+        let mut parsed = parse("cagents --json agent spawn Review", None).unwrap();
+        let mut reply = json_run("agent.spawn", None);
+        let scope = crate::agent_execution::Placement::Worktree {
+            repository: "/repo".into(),
+            path: "/repo/worktree".into(),
+        };
+        reply["data"]["agent"]["placement"] = serde_json::to_value(&scope).unwrap();
+        let outcome = super::outcome(&parsed, &reply.to_string());
+        assert_eq!(outcome.run.as_ref().unwrap().placement, Some(scope.clone()));
+        assert!(outcome.run.as_ref().unwrap().channel.is_none());
+        super::enrich(&mut parsed, &outcome);
+        let Kind::Spawn(spawn) = parsed else {
+            unreachable!()
+        };
+        assert_eq!(spawn.placement, Some(scope));
+        assert!(spawn.channel.is_none());
     }
 
     #[test]

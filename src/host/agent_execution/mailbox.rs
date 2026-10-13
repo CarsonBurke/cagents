@@ -63,7 +63,10 @@ pub(in crate::host) fn send(
                             .as_ref()
                             .is_some_and(|session| session.id() == id)
                     })?;
-                    Some(model.channel(agent.channel)?.title.clone())
+                    agent
+                        .channel()
+                        .and_then(|channel| model.channel(channel))
+                        .map(|channel| channel.title.clone())
                 })
                 .filter(|title| !title.is_empty())
         };

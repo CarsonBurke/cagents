@@ -871,7 +871,7 @@ impl Registry {
                 automation.reuse_agent = None;
             }
             if new_target {
-                automation.channel = automation.definition.agent.target.channel;
+                automation.channel = automation.definition.agent.target.channel();
             }
         }
         write_revision(&tx, &automation)?;
@@ -1009,7 +1009,7 @@ pub(super) fn create_automation_in(
 ) -> Result<Automation, String> {
     definition.validate()?;
     require_project(tx, &definition)?;
-    let channel = definition.agent.target.channel;
+    let channel = definition.agent.target.channel();
     let automation = Automation {
         id: Uuid::new_v4(),
         revision: 1,
@@ -1112,7 +1112,10 @@ pub(super) fn require_project(tx: &Transaction<'_>, definition: &Definition) -> 
     if !exists {
         return Err("The automation's project is no longer open".into());
     }
-    if let Some(channel) = definition.agent.target.channel {
+    if let Some(placement) = &definition.agent.target.placement {
+        super::execution::require_placement(tx, placement, &definition.agent.target.repository)?;
+    }
+    if let Some(channel) = definition.agent.target.channel() {
         let owned: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM channels WHERE id=?1 AND repository=?2)",
@@ -1383,7 +1386,9 @@ fn accept_firing(
         Destination::Existing(agent)
     } else {
         let mut spec = definition.agent.clone();
-        spec.target.channel = automation.channel;
+        if let Some(channel) = automation.channel {
+            spec.target.placement = Some(crate::agent_execution::Placement::Channel(channel));
+        }
         Destination::New(spec)
     };
     let request = Submit {
@@ -1405,14 +1410,16 @@ fn accept_firing(
     );
     match accepted {
         Ok(accepted) => {
-            if automation.channel.is_none() {
+            if automation.channel.is_none()
+                && let Some(channel) = accepted.agent.channel()
+            {
                 // Naming is a user choice, independent of the execution prompt.
                 // Only initialize the owned channel: subsequent firings and
                 // automation renames preserve any separately chosen title.
                 tx.execute(
                     "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1",
                     params![
-                        accepted.agent.channel.to_string(),
+                        channel.to_string(),
                         automation.definition.name,
                         crate::model::ChannelTitleSource::Manual as i64,
                     ],
@@ -1424,7 +1431,7 @@ fn accept_firing(
             firing.agent = Some(accepted.agent.id);
             firing.run = Some(accepted.run.id);
             firing.state = FiringState::Accepted;
-            automation.channel = Some(accepted.agent.channel);
+            automation.channel = accepted.agent.channel();
             if definition.session_mode == SessionMode::Reuse {
                 automation.reuse_agent = Some(accepted.agent.id);
             }
@@ -1560,7 +1567,7 @@ mod tests {
                 target: Target {
                     repository: repository.clone(),
                     directory: repository,
-                    channel: None,
+                    placement: None,
                 },
                 surface: Surface::Chat,
                 model: None,
@@ -1575,6 +1582,31 @@ mod tests {
             precheck: None,
         };
         (registry, directory, definition)
+    }
+
+    #[test]
+    fn legacy_automation_target_keeps_its_definition_after_reopen() {
+        let (mut registry, directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let mut legacy = serde_json::to_value(&created).unwrap();
+        let target = &mut legacy["definition"]["agent"]["target"];
+        target.as_object_mut().unwrap().remove("placement");
+        target["channel"] = serde_json::Value::Null;
+        registry
+            .db
+            .execute(
+                "UPDATE automations SET record=?2 WHERE id=?1",
+                params![created.id.to_string(), legacy.to_string()],
+            )
+            .unwrap();
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let restored = registry.automation(created.id).unwrap();
+        assert_eq!(restored.definition, definition);
+        assert_eq!(restored.channel, created.channel);
+        assert_eq!(registry.automations(None, 100).unwrap().len(), 1);
     }
 
     #[test]
@@ -1772,7 +1804,7 @@ mod tests {
         assert_eq!(claimed.firing.run, Some(accepted.run.id));
         assert_eq!(
             registry.automation(automation.id).unwrap().channel,
-            Some(accepted.agent.channel)
+            Some(accepted.agent.channel().unwrap())
         );
         drop(registry);
 
@@ -2667,6 +2699,58 @@ mod tests {
     }
 
     #[test]
+    fn fresh_automation_preserves_worktree_placement_without_owning_a_channel() {
+        use crate::agent_execution::Placement;
+        let (mut registry, directory, mut definition) = fixture();
+        let scope = Placement::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![],
+                closed: vec![],
+            })
+            .unwrap();
+        definition.agent.target.placement = Some(scope.clone());
+        definition.session_mode = SessionMode::Fresh;
+        let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+        assert_eq!(agent.placement, scope);
+        assert!(registry.model().unwrap().channels.is_empty());
+        assert!(
+            registry
+                .automation(automation.id)
+                .unwrap()
+                .channel
+                .is_none()
+        );
+        let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+        registry
+            .finish_automation_release(firing.id, &closed, 230)
+            .unwrap();
+        let current = registry.automation(automation.id).unwrap();
+        assert!(current.active_firing.is_none());
+        let next = registry
+            .claim_automation(
+                current.id,
+                current.revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap()
+            .accepted
+            .unwrap();
+        assert_eq!(next.agent.placement, scope);
+        assert!(registry.model().unwrap().channels.is_empty());
+    }
+
+    #[test]
     fn first_channel_uses_current_name_after_a_rename_during_precheck() {
         let (mut registry, _directory, mut definition) = fixture();
         definition.precheck = Some(crate::automations::Precheck {
@@ -2710,7 +2794,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let model = registry.model().unwrap();
-        let channel = model.channel(accepted.agent.channel).unwrap();
+        let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
         assert_eq!(channel.title, "Current standup name");
         assert_eq!(
             channel.title_source,
@@ -2729,7 +2813,7 @@ mod tests {
                 let channel = registry
                     .model()
                     .unwrap()
-                    .channel(agent.channel)
+                    .channel(agent.channel().unwrap())
                     .unwrap()
                     .clone();
                 assert_eq!(channel.title, "Review daily");
@@ -2745,7 +2829,7 @@ mod tests {
                 if let Some(title) = custom_title {
                     registry
                         .apply(&ModelEdit::RetitleChannel {
-                            id: agent.channel,
+                            id: agent.channel().unwrap(),
                             title: title.into(),
                         })
                         .unwrap();
@@ -2766,14 +2850,14 @@ mod tests {
                     registry
                         .model()
                         .unwrap()
-                        .channel(agent.channel)
+                        .channel(agent.channel().unwrap())
                         .unwrap()
                         .title,
                     expected_title
                 );
                 registry
                     .apply(&ModelEdit::SuggestChannelTitle {
-                        id: agent.channel,
+                        id: agent.channel().unwrap(),
                         title: "Provider-generated task title".into(),
                         source: ChannelTitleSource::Provider,
                     })
@@ -2811,11 +2895,11 @@ mod tests {
                     .unwrap()
                     .accepted
                     .unwrap();
-                assert_eq!(next.agent.channel, agent.channel);
+                assert_eq!(next.agent.placement, agent.placement);
                 assert_eq!(next.agent.id == agent.id, mode == SessionMode::Reuse);
                 let model = registry.model().unwrap();
                 assert_eq!(model.channels.len(), 1);
-                let channel = model.channel(agent.channel).unwrap();
+                let channel = model.channel(agent.channel().unwrap()).unwrap();
                 assert_eq!(channel.title, expected_title);
                 assert_eq!(channel.title_source, ChannelTitleSource::Manual);
             }

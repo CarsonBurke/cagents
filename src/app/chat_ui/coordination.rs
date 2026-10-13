@@ -405,10 +405,18 @@ fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<
         parts.push(spawn.effort.clone());
     }
     if reading.cli {
-        parts.push(spawn.channel.as_ref().map_or_else(
-            || "Channel not reported".to_owned(),
-            |channel| format!("Channel {}", channel),
-        ));
+        parts.push(match &spawn.placement {
+            Some(crate::agent_execution::Placement::Channel(channel)) => {
+                format!("Channel {channel}")
+            }
+            Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
+                format!("Worktree view {}", path.display())
+            }
+            None => spawn.channel.as_ref().map_or_else(
+                || "View not reported".to_owned(),
+                |channel| format!("Channel {channel}"),
+            ),
+        });
     }
     parts.join(" · ")
 }
@@ -1148,7 +1156,7 @@ mod identity_tests {
         reading.cli = true;
         assert_eq!(
             spawn_identity(&reading, &spawn, None),
-            "cagents agent · Model not reported · Channel not reported"
+            "cagents agent · Model not reported · View not reported"
         );
         spawn.provider = "codex".into();
         spawn.model = "gpt-reported".into();
@@ -1158,6 +1166,14 @@ mod identity_tests {
         assert_eq!(
             spawn_identity(&reading, &spawn, None),
             format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
+        );
+        spawn.placement = Some(crate::agent_execution::Placement::Worktree {
+            repository: "/repo".into(),
+            path: "/repo/tree".into(),
+        });
+        assert_eq!(
+            spawn_identity(&reading, &spawn, None),
+            "cagents agent · codex · gpt-reported · low · Worktree view /repo/tree"
         );
     }
 }

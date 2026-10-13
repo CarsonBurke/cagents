@@ -320,7 +320,7 @@ mod tests {
                 target: Target {
                     repository: repository.clone(),
                     directory: repository,
-                    channel: None,
+                    placement: None,
                 },
                 surface: Surface::Chat,
                 model: None,

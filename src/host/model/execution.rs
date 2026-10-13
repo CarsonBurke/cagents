@@ -4,8 +4,8 @@ use super::{Registry, repository_key, take_ordinal};
 use crate::{
     agent_execution::{
         Accepted, Agent, Authority, Destination, HostedSession, Lineage, MAX_CHILDREN,
-        MAX_PARENT_DEPTH, MAX_PARENT_RUNNING, MAX_RUNNING, Origin, ResultSummary, Run, State,
-        Submit, Update,
+        MAX_PARENT_DEPTH, MAX_PARENT_RUNNING, MAX_RUNNING, Origin, Placement, ResultSummary, Run,
+        State, Submit, Update,
     },
     model::{AgentId, ChannelId, RunId},
 };
@@ -385,7 +385,7 @@ impl Registry {
         if agent.closed || agent.session.is_some() {
             return Err("Agent already has a hosted session".into());
         }
-        require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         tx.execute(
             "INSERT INTO agent_launches(agent, session_id, source) VALUES (?1, ?2, ?3)",
             params![id.to_string(), source.id().to_string(), encode(source)?],
@@ -756,7 +756,7 @@ impl Registry {
                     return Err("The agent has unfinished or unverified work; inspect and close it before starting another run".into());
                 }
                 // A removed channel must never be resurrected by a follow-up.
-                require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
+                require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
                 agent
             }
             Destination::New(spec) => {
@@ -793,10 +793,10 @@ impl Registry {
                 if !exists {
                     return Err("The target project is not open".into());
                 }
-                let channel = match spec.target.channel {
-                    Some(channel) => {
-                        require_channel(&tx, channel, &spec.target.repository)?;
-                        channel
+                let placement = match &spec.target.placement {
+                    Some(placement) => {
+                        require_placement(&tx, placement, &spec.target.repository)?;
+                        placement.clone()
                     }
                     None => {
                         let channel = ChannelId::new();
@@ -805,7 +805,7 @@ impl Registry {
                             "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
                             params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],
                         ).map_err(|error| error.to_string())?;
-                        channel
+                        Placement::Channel(channel)
                     }
                 };
                 let agent = Agent {
@@ -813,7 +813,7 @@ impl Registry {
                     id: AgentId::new(),
                     origin: origin.clone(),
                     spec: spec.clone(),
-                    channel,
+                    placement,
                     session: None,
                     console: None,
                     created_ms: now_ms,
@@ -915,7 +915,7 @@ impl Registry {
         if agent.closed || run != accepted.run || agent != accepted.agent {
             return Err("The accepted execution changed before provider dispatch".into());
         }
-        require_channel(&self.db, agent.channel, &agent.spec.target.repository)
+        require_placement(&self.db, &agent.placement, &agent.spec.target.repository)
     }
 
     pub(crate) fn agent_request(&self, run: RunId) -> Result<Submit, String> {
@@ -987,7 +987,7 @@ impl Registry {
         {
             return Err("The provider does not match the committed launch intent".into());
         }
-        require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         agent.session = Some(session);
         tx.execute(
             "DELETE FROM agent_launches WHERE agent = ?1",
@@ -1033,7 +1033,7 @@ impl Registry {
         {
             return Err("The provider session changed before its console was attached".into());
         }
-        require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         agent.console = Some(console);
         tx.execute(
             "UPDATE agents SET record = ?2 WHERE id = ?1",
@@ -1362,6 +1362,35 @@ fn read_agent(db: &Connection, id: AgentId) -> Result<Agent, String> {
         )
         .map_err(|error| error.to_string())?;
     decode(&record)
+}
+
+pub(super) fn require_placement(
+    db: &Connection,
+    placement: &Placement,
+    repository: &std::path::Path,
+) -> Result<(), String> {
+    match placement {
+        Placement::Channel(channel) => require_channel(db, *channel, repository),
+        Placement::Worktree {
+            repository: owner,
+            path,
+        } => {
+            if owner != repository || !path.is_absolute() {
+                return Err(
+                    "The worktree view belongs to another project or has an invalid path".into(),
+                );
+            }
+            let scope = encode(placement)?;
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM shared_views JOIN shared_view_scopes USING(scope) WHERE scope=?1 AND repository=?2)",
+                params![scope, repository_key(repository)?], |row| row.get(0),
+            ).map_err(|error|error.to_string())?;
+            if !exists {
+                return Err("The target worktree view is no longer open".into());
+            }
+            Ok(())
+        }
+    }
 }
 
 fn require_channel(
@@ -1725,7 +1754,7 @@ mod tests {
                 target: Target {
                     repository: repository.clone(),
                     directory: repository,
-                    channel: None,
+                    placement: None,
                 },
                 surface: Surface::Chat,
                 model: None,
@@ -1736,6 +1765,93 @@ mod tests {
             idempotency_key: "first-request".into(),
         };
         (registry, directory, request)
+    }
+
+    #[test]
+    fn worktree_placement_requires_the_exact_open_view_without_creating_a_channel() {
+        let (mut registry, directory, mut request) = fixture();
+        let scope = Placement::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![],
+                closed: vec![],
+            })
+            .unwrap();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.target.placement = Some(scope.clone());
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert_eq!(accepted.agent.placement, scope);
+        assert!(accepted.agent.channel().is_none());
+        assert!(registry.model().unwrap().channels.is_empty());
+        require_placement(&registry.db, &scope, directory.path()).unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        assert!(require_placement(&registry.db, &scope, foreign.path()).is_err());
+        let missing = Placement::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().join("missing-view"),
+        };
+        assert!(require_placement(&registry.db, &missing, directory.path()).is_err());
+        registry
+            .db
+            .execute(
+                "DELETE FROM shared_views WHERE scope=?1",
+                [encode(&scope).unwrap()],
+            )
+            .unwrap();
+        assert!(
+            require_placement(&registry.db, &scope, directory.path()).is_err(),
+            "a removed view is never resurrected by a follow-up"
+        );
+        let mut retry = request.clone();
+        retry.idempotency_key = "missing-view".into();
+        assert!(registry.submit_agent(&Origin::User, &retry, 2).is_err());
+        assert_eq!(registry.model().unwrap().agents.len(), 1);
+        assert!(registry.model().unwrap().channels.is_empty());
+    }
+
+    #[test]
+    fn durable_legacy_channel_records_preserve_retry_identity_after_reopen() {
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let mut old_agent = serde_json::to_value(&accepted.agent).unwrap();
+        old_agent.as_object_mut().unwrap().remove("placement");
+        old_agent["channel"] = serde_json::to_value(accepted.agent.channel().unwrap()).unwrap();
+        old_agent["spec"]["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placement");
+        old_agent["spec"]["target"]["channel"] = serde_json::Value::Null;
+        let mut old_request = serde_json::to_value(&request).unwrap();
+        let target = &mut old_request["destination"]["New"]["target"];
+        target.as_object_mut().unwrap().remove("placement");
+        target["channel"] = serde_json::Value::Null;
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![accepted.agent.id.to_string(), old_agent.to_string()],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE agent_runs SET request=?2 WHERE id=?1",
+                params![accepted.run.id.to_string(), old_request.to_string()],
+            )
+            .unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let retried = registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.agent, accepted.agent);
+        assert_eq!(retried.run.id, accepted.run.id);
+        assert_eq!(registry.model().unwrap().channels.len(), 1);
     }
 
     #[test]
@@ -1984,7 +2100,7 @@ mod tests {
         let Destination::New(spec) = &mut request.destination else {
             unreachable!()
         };
-        spec.target.channel = Some(ChannelId::new());
+        spec.target.placement = Some(Placement::Channel(ChannelId::new()));
         assert!(
             registry
                 .submit_agent(
