@@ -2499,7 +2499,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
-        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..)),
+        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
@@ -8682,7 +8682,7 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             return self.start_terminal(card, session, visible, false);
         }
-        clipboard_task
+        Task::batch([clipboard_task, self.refresh_live_terminal_find(card)])
     }
 
     #[cfg(feature = "integrated-browser")]
