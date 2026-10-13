@@ -243,6 +243,7 @@ pub struct KeyboardShortcuts {
     pub clone_pane: Vec<String>,
     pub close_focused_column: Vec<String>,
     pub search_projects: Vec<String>,
+    pub find_in_pane: Vec<String>,
     pub previous_column: Vec<String>,
     pub next_column: Vec<String>,
     pub cycle_pane_width: Vec<String>,
@@ -285,9 +286,8 @@ impl Default for KeyboardShortcuts {
             new_channel: vec!["Ctrl+Shift+G".to_owned()],
             clone_pane: vec!["Ctrl+Shift+D".to_owned()],
             close_focused_column: vec!["Ctrl+W".to_owned()],
-            // A focused terminal receives this chord as forward-char; every
-            // other pane takes it as its search (see `ShortcutScope`).
-            search_projects: vec!["Ctrl+F".to_owned()],
+            search_projects: vec!["Ctrl+Shift+F".to_owned()],
+            find_in_pane: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Ctrl+PageUp".to_owned()],
             next_column: vec!["Ctrl+PageDown".to_owned()],
             cycle_pane_width: vec!["Alt+R".to_owned()],
@@ -329,13 +329,14 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 37] {
+    pub fn actions(&self) -> [&Vec<String>; 38] {
         [
             &self.new_terminal,
             &self.new_channel,
             &self.clone_pane,
             &self.close_focused_column,
             &self.search_projects,
+            &self.find_in_pane,
             &self.previous_column,
             &self.next_column,
             &self.cycle_pane_width,
@@ -388,7 +389,8 @@ impl KeyboardShortcuts {
                     error: SettingsError::InvalidShortcut(error),
                 })
             };
-            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=33) {
+            if chords.is_empty() && !INTRODUCED_SHORTCUT_ACTIONS.contains(&SHORTCUT_ACTIONS[index])
+            {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return fault("every keyboard shortcut needs at least one chord", None);
@@ -412,12 +414,13 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 37] = [
+const SHORTCUT_ACTIONS: [&str; 38] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
     "close_focused_column",
     "search_projects",
+    "find_in_pane",
     "previous_column",
     "next_column",
     "cycle_pane_width",
@@ -1124,7 +1127,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 4;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1147,6 +1150,7 @@ struct RetiredShortcutDefault {
 /// receives it instead.
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
+/// Revision 5 separates project search from find in the focused pane.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1197,6 +1201,11 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "cycle_pane_width",
         retired_in: 4,
         chords: &["Ctrl+Shift+R"],
+    },
+    RetiredShortcutDefault {
+        action: "search_projects",
+        retired_in: 5,
+        chords: &["Ctrl+F"],
     },
 ];
 
@@ -1351,7 +1360,8 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 32] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+    "find_in_pane",
     "toggle_projects",
     "rename_pane",
     "command_palette",
@@ -3375,6 +3385,52 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
+    fn separating_project_search_migrates_defaults_and_preserves_custom_chords() {
+        for (search, occupied, expected_search, expected_find) in [
+            (
+                vec!["Ctrl+F"],
+                "Alt+S",
+                vec!["Ctrl+Shift+F"],
+                vec!["Ctrl+F"],
+            ),
+            (vec!["Alt+F"], "Ctrl+F", vec!["Alt+F"], vec![]),
+            (
+                vec!["Ctrl+F", "Alt+S"],
+                "Alt+T",
+                vec!["Ctrl+F", "Alt+S"],
+                vec![],
+            ),
+            (vec!["Ctrl+F"], "Ctrl+Shift+F", vec!["Ctrl+F"], vec![]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 4.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("find_in_pane");
+            shortcuts.insert("search_projects".into(), search.into());
+            shortcuts.insert("new_terminal".into(), vec![occupied].into());
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.keyboard_shortcuts.search_projects, expected_search);
+            assert_eq!(loaded.keyboard_shortcuts.find_in_pane, expected_find);
+            assert_eq!(loaded.keyboard_shortcuts.new_terminal, [occupied]);
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+        }
+    }
+
+    #[test]
+    fn pane_find_can_be_explicitly_unbound_and_stays_unbound_on_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut settings = AppSettings::default();
+        settings.keyboard_shortcuts.find_in_pane.clear();
+        save(&path, &settings).unwrap();
+        assert_eq!(load(&path).unwrap(), settings);
+    }
+
+    #[test]
     fn introducing_pane_cycling_preserves_an_existing_binding_of_its_default() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -3400,6 +3456,7 @@ next_column = ["Alt+W", "Alt+Right"]
         let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
         document.remove("shortcut_defaults_revision");
         let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+        shortcuts.remove("find_in_pane");
         for action in SHORTCUT_ACTIONS {
             if let Some(chords) = retired_default(action, FIRST_SHORTCUT_DEFAULTS_REVISION) {
                 shortcuts.insert(action.into(), chords.to_vec().into());
@@ -3633,7 +3690,7 @@ new_thread = "Alt+Shift+G"
         let shortcuts = load(&path).unwrap().keyboard_shortcuts;
         assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
         assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
-        assert_eq!(shortcuts.search_projects, ["Ctrl+F"]);
+        assert_eq!(shortcuts.search_projects, ["Ctrl+Shift+F"]);
         // A single string predates chord lists, when Alt+Q alone was the
         // default; a list holding it alone was a choice, since lists shipped
         // with the arrow chord beside it.
@@ -4518,10 +4575,10 @@ new_thread = "Alt+Shift+G"
         newer_build_document(&path, |document| {
             let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
             shortcuts.remove("search_projects");
-            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+Shift+F"].into());
         });
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.keyboard_shortcuts.search_projects, ["Ctrl+F"]);
+        assert_eq!(loaded.keyboard_shortcuts.search_projects, ["Ctrl+Shift+F"]);
         for _ in 0..2 {
             let current = load(&path).unwrap();
             let desired = AppSettings {
@@ -4532,7 +4589,7 @@ new_thread = "Alt+Shift+G"
             let file = saved(&path);
             assert_eq!(
                 file["keyboard_shortcuts"]["new_terminal"],
-                vec!["Ctrl+F"].into()
+                vec!["Ctrl+Shift+F"].into()
             );
             assert!(file["keyboard_shortcuts"].get("search_projects").is_none());
         }
@@ -4568,12 +4625,12 @@ new_thread = "Alt+Shift+G"
         newer_build_document(&path, |document| {
             let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
             shortcuts.remove("search_projects");
-            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+Shift+F"].into());
             shortcuts.insert("future_action".into(), vec!["Ctrl+Shift+T"].into());
         });
         let loaded = load(&path).unwrap();
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.search_projects = vec!["Ctrl+F".into(), "Alt+S".into()];
+        desired.keyboard_shortcuts.search_projects = vec!["Ctrl+Shift+F".into(), "Alt+S".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         let file = saved(&path);
         let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]

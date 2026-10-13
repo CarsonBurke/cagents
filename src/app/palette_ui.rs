@@ -362,7 +362,8 @@ impl Cagents {
             Command::ClonePane => self.clone_focused_pane(),
             Command::CloseFocusedCard => close_focused_message(&self.workspace)
                 .map_or_else(Task::none, |message| self.update(message)),
-            Command::FocusProjectSearch => {
+            Command::FocusProjectSearch => self.update(Message::FocusProjectSearch),
+            Command::FindInPane => {
                 if self.settings_card_focused() {
                     return iced::widget::operation::focus(crate::settings_widgets::search_id())
                         .map(cosmic::Action::App);
@@ -371,7 +372,17 @@ impl Cagents {
                     Some(card) => {
                         self.update(Message::Repository(RepositoryAction::OpenFind { card }))
                     }
-                    None => self.update(Message::FocusProjectSearch),
+                    None => {
+                        if let Some(task) = self.open_chat_find() {
+                            return task;
+                        }
+                        if let Some(card) = self.workspace.focused()
+                            && matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
+                        {
+                            return self.handle_terminal_find(terminal_ui::Action::Open(card));
+                        }
+                        Task::none()
+                    }
                 }
             }
             Command::FocusAdjacent(direction) => self.update(Message::FocusAdjacent(direction)),
@@ -503,6 +514,7 @@ impl SettingsField {
             Self::ShortcutClonePane => Some(Command::ClonePane),
             Self::ShortcutCloseFocusedColumn => Some(Command::CloseFocusedCard),
             Self::ShortcutSearchProjects => Some(Command::FocusProjectSearch),
+            Self::ShortcutFindInPane => Some(Command::FindInPane),
             Self::ShortcutPreviousColumn => Some(Command::FocusAdjacent(
                 crate::workspace::FocusDirection::Left,
             )),
@@ -558,6 +570,7 @@ impl ShortcutDraft {
                 self.close_focused_column.as_str(),
             ),
             (Command::FocusProjectSearch, self.search_projects.as_str()),
+            (Command::FindInPane, self.find_in_pane.as_str()),
             (
                 Command::FocusAdjacent(crate::workspace::FocusDirection::Left),
                 self.previous_column.as_str(),

@@ -1970,10 +1970,21 @@ impl Cagents {
         if focused || self.chrome_ui.hovered_tab == Some(id) {
             children.push(command(
                 Icon::Close,
-                chrome.map_or_else(
-                    || Cow::Owned(card_close_name(labels.type_label, title)),
-                    |chrome| Cow::Borrowed(chrome.close_name.as_str()),
-                ),
+                {
+                    let label = chrome.map_or_else(
+                        || Cow::Owned(card_close_name(labels.type_label, title)),
+                        |chrome| Cow::Borrowed(chrome.close_name.as_str()),
+                    );
+                    if focused {
+                        Cow::Owned(workspace_widget::shortcut_tooltip_named(
+                            workspace_widget::GlobalShortcut::CloseFocusedCard,
+                            &self.settings.keyboard_shortcuts,
+                            &label,
+                        ))
+                    } else {
+                        label
+                    }
+                },
                 chrome.map_or_else(
                     || card_control_id(id, "close"),
                     |chrome| chrome.close_id.clone(),

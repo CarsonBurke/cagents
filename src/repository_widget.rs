@@ -7916,12 +7916,12 @@ fn find_strip<'a>(
     for (icon, label, action) in [
         (
             Icon::ChevronUp,
-            "Previous match",
+            "Previous match — Shift+Enter in search",
             RepositoryAction::FindPrevious { card },
         ),
         (
             Icon::ChevronDown,
-            "Next match",
+            "Next match — Enter in search",
             RepositoryAction::FindNext { card },
         ),
     ] {
@@ -7932,7 +7932,7 @@ fn find_strip<'a>(
         );
     }
     row.push(
-        icon_button(Icon::Close, "Close find")
+        icon_button(Icon::Close, "Close find — Escape")
             .on_press(RepositoryAction::CloseFind { card })
             .into(),
     );

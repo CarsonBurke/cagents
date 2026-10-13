@@ -1066,9 +1066,16 @@ fn settings_category_controls<'a>(
                 ),
                 shortcut_input(
                     "Search projects",
-                    "Moves keyboard focus to project search, or finds in a focused editor. A focused terminal receives this chord instead.",
+                    "Moves keyboard focus to project search from any pane.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Find in pane",
+                    "Finds in the focused conversation, terminal, editor, or settings pane.",
+                    &draft.keyboard_shortcuts.find_in_pane,
+                    SettingsField::ShortcutFindInPane,
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(

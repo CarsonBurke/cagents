@@ -73,6 +73,7 @@ pub enum GlobalShortcut {
     ClonePane,
     CloseFocusedCard,
     FocusProjectSearch,
+    FindInPane,
     FocusAdjacent(FocusDirection),
     CyclePaneWidth,
     /// Moves between the top-level workspaces: every project's worktrees and
@@ -306,7 +307,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::FocusProjectSearch,
         label: "Search projects",
         repeatable: false,
-        scope: ShortcutScope::OutsideTerminal,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FindInPane,
+        label: "Find in pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
@@ -412,6 +419,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ClonePane => &shortcuts.clone_pane,
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
+        GlobalShortcut::FindInPane => &shortcuts.find_in_pane,
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
         GlobalShortcut::FocusAdjacent(FocusDirection::Right) => &shortcuts.next_column,
         GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,
@@ -433,15 +441,18 @@ pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) ->
 }
 
 pub fn shortcut_tooltip(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
-    let descriptor = shortcut_descriptor(action);
+    shortcut_tooltip_named(action, shortcuts, shortcut_descriptor(action).label)
+}
+
+pub fn shortcut_tooltip_named(
+    action: GlobalShortcut,
+    shortcuts: &KeyboardShortcuts,
+    label: &str,
+) -> String {
     if shortcut_keys(action, shortcuts).is_empty() {
-        return format!("{} — unbound", descriptor.label);
+        return format!("{label} — unbound");
     }
-    format!(
-        "{} — {}",
-        descriptor.label,
-        shortcut_chords(action, shortcuts)
-    )
+    format!("{label} — {}", shortcut_chords(action, shortcuts))
 }
 
 #[derive(Debug, Default)]
@@ -3062,7 +3073,7 @@ mod tests {
                 &shortcuts,
                 FocusedPane::Other,
             ),
-            Some(GlobalShortcut::FocusProjectSearch)
+            Some(GlobalShortcut::FindInPane)
         );
         assert_eq!(
             global_shortcut(
@@ -3201,7 +3212,6 @@ mod tests {
         let ctrl = keyboard::Modifiers::CTRL;
         let alt = keyboard::Modifiers::ALT;
         for (key, physical, modifiers) in [
-            character("f", Code::KeyF, ctrl),
             character("r", Code::KeyR, ctrl),
             character("e", Code::KeyE, ctrl),
             character("g", Code::KeyG, ctrl),
@@ -3247,35 +3257,35 @@ mod tests {
         }
     }
 
-    /// The search chord belongs to whatever has focus: a focused terminal
-    /// receives it as input, and any other pane takes it as its search. Chords
-    /// of workspace scope act over a terminal as everywhere else.
+    /// Project search and pane find are distinct commands from every pane.
     #[test]
-    fn a_shell_key_bound_outside_terminals_reaches_a_focused_terminal() {
+    fn project_search_and_pane_find_have_distinct_workspace_chords() {
         use keyboard::key::Code;
 
         let shortcuts = KeyboardShortcuts::default();
-        let search = key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false);
-        let reserved = |focused| {
-            is_global_shortcut_chord(
-                &keyboard::Key::Character("f".into()),
-                keyboard::key::Physical::Code(Code::KeyF),
-                keyboard::Modifiers::CTRL,
-                &shortcuts,
-                focused,
-            )
-        };
-        assert!(!reserved(FocusedPane::Terminal));
-        assert_eq!(
-            global_shortcut(&search, &shortcuts, FocusedPane::Terminal),
-            None
-        );
-        for focused in [FocusedPane::Other, FocusedPane::Review] {
-            assert!(reserved(focused));
-            assert_eq!(
-                global_shortcut(&search, &shortcuts, focused),
-                Some(GlobalShortcut::FocusProjectSearch)
-            );
+        for focused in [
+            FocusedPane::Terminal,
+            FocusedPane::Other,
+            FocusedPane::Review,
+            FocusedPane::Chat,
+        ] {
+            for (modifiers, action) in [
+                (keyboard::Modifiers::CTRL, GlobalShortcut::FindInPane),
+                (
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    GlobalShortcut::FocusProjectSearch,
+                ),
+            ] {
+                let event = key_press("f", Code::KeyF, modifiers, false);
+                assert_eq!(global_shortcut(&event, &shortcuts, focused), Some(action));
+                assert!(is_global_shortcut_chord(
+                    &keyboard::Key::Character("f".into()),
+                    keyboard::key::Physical::Code(Code::KeyF),
+                    modifiers,
+                    &shortcuts,
+                    focused,
+                ));
+            }
         }
 
         // A custom close chord releases the default to the terminal.
@@ -4410,6 +4420,25 @@ mod tests {
                 FocusedPane::Chat
             ),
             None
+        );
+    }
+
+    #[test]
+    fn shortcut_tooltips_follow_customized_and_unbound_bindings() {
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.search_projects = vec!["Alt+S".into(), "Ctrl+Shift+F".into()];
+        assert_eq!(
+            shortcut_tooltip(GlobalShortcut::FocusProjectSearch, &shortcuts),
+            "Search projects — Alt+S, Ctrl+Shift+F"
+        );
+        shortcuts.close_focused_column.clear();
+        assert_eq!(
+            shortcut_tooltip_named(
+                GlobalShortcut::CloseFocusedCard,
+                &shortcuts,
+                "Close terminal"
+            ),
+            "Close terminal — unbound"
         );
     }
 

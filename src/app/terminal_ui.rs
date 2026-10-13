@@ -339,13 +339,16 @@ impl Cagents {
                 })
                 .on_press(message(Action::Case(card)))
                 .into(),
-                crate::ui_controls::button::quiet("↑")
-                    .on_press(message(Action::Next(card, true)))
-                    .into(),
-                crate::ui_controls::button::quiet("↓")
+                crate::ui_controls::icon_button(
+                    Icon::ChevronUp,
+                    "Previous match — Shift+Enter in search",
+                )
+                .on_press(message(Action::Next(card, true)))
+                .into(),
+                crate::ui_controls::icon_button(Icon::ChevronDown, "Next match — Enter in search")
                     .on_press(message(Action::Next(card, false)))
                     .into(),
-                crate::ui_controls::button::quiet("×")
+                crate::ui_controls::icon_button(Icon::Close, "Close find — Escape")
                     .on_press(message(Action::Close(card)))
                     .into(),
             ])
