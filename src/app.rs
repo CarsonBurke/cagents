@@ -4584,13 +4584,7 @@ struct CardChrome {
 }
 
 impl CardChrome {
-    fn new(
-        id: CardId,
-        type_label: &'static str,
-        title: &str,
-        caption: &str,
-        shortcuts: &KeyboardShortcuts,
-    ) -> Self {
+    fn new(id: CardId, type_label: &'static str, title: &str, caption: &str) -> Self {
         Self {
             tooltip: if caption.is_empty() {
                 title.to_owned()
@@ -4615,14 +4609,7 @@ impl CardChrome {
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
             resize_name: format!("Resize {type_label} pane {title}"),
-            close_name: format!(
-                "{}, {}",
-                card_close_name(type_label, title),
-                workspace_widget::shortcut_chords(
-                    workspace_widget::GlobalShortcut::CloseFocusedCard,
-                    shortcuts,
-                ),
-            ),
+            close_name: card_close_name(type_label, title),
         }
     }
 
@@ -7445,13 +7432,7 @@ impl Cagents {
                 .get(&card.id)
                 .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
             {
-                let chrome = CardChrome::new(
-                    card.id,
-                    type_label,
-                    &title,
-                    &caption,
-                    &self.settings.keyboard_shortcuts,
-                );
+                let chrome = CardChrome::new(card.id, type_label, &title, &caption);
                 self.card_chrome.insert(card.id, chrome);
             }
         }
@@ -18464,13 +18445,7 @@ mod tests {
         let caption = card_kind_caption(&kind);
         assert_eq!(caption, "https://example.test/private%20path");
 
-        let chrome = CardChrome::new(
-            CardId::new(),
-            "Browser",
-            "Example",
-            &caption,
-            &KeyboardShortcuts::default(),
-        );
+        let chrome = CardChrome::new(CardId::new(), "Browser", "Example", &caption);
         assert_eq!(chrome.caption, caption);
         assert_eq!(chrome.resize_name, "Resize Browser pane Example");
         assert_eq!(
