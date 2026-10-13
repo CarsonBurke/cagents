@@ -290,6 +290,12 @@ struct Submission {
     deferred_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ReportTask {
+    Agent,
+    Workflow,
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -351,9 +357,9 @@ struct Claude {
     tool_order: VecDeque<String>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
-    /// Tasks Claude started as agents, oldest first, so their notification is
-    /// shown as the agent's report rather than as a command's notice.
-    agent_tasks: VecDeque<String>,
+    /// Report-producing tasks, oldest first. Preserve their explicit native
+    /// kind through progress frames, which omit it, until final notification.
+    report_tasks: VecDeque<(String, ReportTask)>,
     /// Agents whose report was handed back as a peer message, newest last,
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
@@ -1821,7 +1827,7 @@ impl Adapter for Claude {
                 self.permissions = None;
                 self.tool_order.clear();
                 self.tasks.clear();
-                self.agent_tasks.clear();
+                self.report_tasks.clear();
                 self.agent_task_calls.clear();
                 self.stopped_agents.clear();
                 self.handed_back.clear();
@@ -2998,11 +3004,11 @@ fn task_notification(inner: &str) -> ItemContent {
 /// reads as. The frame carries an agent's result, or a command's account of
 /// itself, as its `summary`; the agent's name is the description its task
 /// started with.
-fn live_notification(frame: &Value, description: &str, agent: bool) -> ItemContent {
+fn live_notification(frame: &Value, description: &str, kind: Option<ReportTask>) -> ItemContent {
     let summary = string(frame, "summary").trim();
     let status = string(frame, "status");
     let task = string(frame, "task_id").to_owned();
-    if !agent {
+    let Some(task_kind) = kind else {
         return ItemContent::Delivery {
             kind: DeliveryKind::Notice,
             from: String::new(),
@@ -3014,11 +3020,15 @@ fn live_notification(frame: &Value, description: &str, agent: bool) -> ItemConte
             },
             body: String::new(),
         };
-    }
+    };
+    let origin = match task_kind {
+        ReportTask::Agent => "Native subagent",
+        ReportTask::Workflow => "Native workflow",
+    };
     let subject = if description.is_empty() {
-        "Native subagent".to_owned()
+        origin.to_owned()
     } else {
-        format!("Native subagent \"{description}\"")
+        format!("{origin} \"{description}\"")
     };
     let outcome = match status {
         "failed" => "failed",
@@ -3820,11 +3830,15 @@ impl Claude {
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
                 {
-                    if !self.agent_tasks.iter().any(|known| known == task) {
-                        self.agent_tasks.push_back(task.into());
-                    }
-                    if self.agent_tasks.len() > MAX_TOOLS {
-                        self.agent_tasks.pop_front();
+                    let kind = if string(frame, "task_type") == "local_workflow" {
+                        ReportTask::Workflow
+                    } else {
+                        ReportTask::Agent
+                    };
+                    self.report_tasks.retain(|(known, _)| known != task);
+                    self.report_tasks.push_back((task.into(), kind));
+                    if self.report_tasks.len() > MAX_TOOLS {
+                        self.report_tasks.pop_front();
                     }
                 }
                 // Headless Claude Code tells the model a task finished in a turn
@@ -3838,14 +3852,17 @@ impl Claude {
                         ItemContent::Tool { input, .. } => input.clone(),
                         _ => String::new(),
                     };
-                    let agent = self.agent_tasks.iter().any(|known| known == task);
-                    self.agent_tasks.retain(|known| known != task);
+                    let kind = self
+                        .report_tasks
+                        .iter()
+                        .find_map(|(known, kind)| (known == task).then_some(*kind));
+                    self.report_tasks.retain(|(known, _)| known != task);
                     let recorded = ["skip_transcript", "ambient"]
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
                     if recorded {
                         let content =
-                            self.deduplicate(live_notification(frame, &description, agent));
+                            self.deduplicate(live_notification(frame, &description, kind));
                         step.events.push(Event::Item(Item {
                             id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
                             role: Role::User,
@@ -6507,14 +6524,35 @@ mod tests {
         ] {
             let frame = json!({"task_id":"child", "status":status, "summary":"Findings"});
             assert!(
-                matches!(live_notification(&frame, description, true), ItemContent::Delivery { kind:DeliveryKind::Report, summary, body, .. } if summary == expected && body == "Findings")
+                matches!(live_notification(&frame, description, Some(ReportTask::Agent)), ItemContent::Delivery { kind:DeliveryKind::Report, summary, body, .. } if summary == expected && body == "Findings")
             );
         }
         let frame =
             json!({"task_id":"command", "status":"completed", "summary":"Command finished"});
         assert!(
-            matches!(live_notification(&frame, "Check", false), ItemContent::Delivery { kind:DeliveryKind::Notice, summary, .. } if summary == "Command finished")
+            matches!(live_notification(&frame, "Check", None), ItemContent::Delivery { kind:DeliveryKind::Notice, summary, .. } if summary == "Command finished")
         );
+    }
+
+    #[test]
+    fn native_task_reports_keep_their_explicit_origin_through_progress_frames() {
+        for (kind, heading, report) in [
+            ("local_agent", "Native subagent \"Review\" finished", true),
+            (
+                "local_workflow",
+                "Native workflow \"Review\" finished",
+                true,
+            ),
+            ("local_bash", "Findings", false),
+            ("unknown", "Findings", false),
+        ] {
+            let mut adapter = Claude::default();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
+            adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Making progress"}})).unwrap();
+            let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"})).unwrap();
+            assert!(done.events.iter().any(|event| matches!(event, Event::Item(Item {content:ItemContent::Delivery {kind, summary, body, .. }, .. }) if summary == heading && if report { *kind == DeliveryKind::Report && body == "Findings" } else { *kind == DeliveryKind::Notice && body.is_empty() })));
+            assert!(adapter.report_tasks.is_empty());
+        }
     }
 
     #[test]
