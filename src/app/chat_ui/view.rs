@@ -349,7 +349,7 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
     )
     .class(design::surface(
         Some(design::sunken),
-        [design::RADIUS_S; 4],
+        [design::RADIUS_M; 4],
         false,
     ))
     .padding([step::GAP_S as u16, step::GAP_M as u16])
@@ -3279,12 +3279,7 @@ impl Runtime {
             ))
             .class(design::surface(
                 Some(design::accent_wash),
-                [
-                    design::RADIUS_L,
-                    design::RADIUS_L,
-                    design::RADIUS_XS,
-                    design::RADIUS_L,
-                ],
+                [design::RADIUS_M; 4],
                 false,
             ))
             .padding([step::GAP_S as u16, step::GAP_M as u16])
@@ -3404,12 +3399,7 @@ impl Runtime {
         let message = widget::container(body)
             .class(design::surface(
                 (!attachment).then_some(design::accent_wash),
-                [
-                    design::RADIUS_L,
-                    design::RADIUS_L,
-                    design::RADIUS_XS,
-                    design::RADIUS_L,
-                ],
+                [design::RADIUS_M; 4],
                 attachment,
             ))
             .padding([step::GAP_S as u16, step::GAP_M as u16])
@@ -3564,12 +3554,7 @@ impl Runtime {
         )
         .class(design::surface(
             Some(design::sunken),
-            [
-                design::RADIUS_L,
-                design::RADIUS_L,
-                design::RADIUS_L,
-                design::RADIUS_XS,
-            ],
+            [design::RADIUS_M; 4],
             true,
         ))
         .padding([step::GAP_S as u16, step::GAP_M as u16])
@@ -3694,7 +3679,7 @@ impl Runtime {
                             text_color: Some(design::muted_color(theme)),
                             border: iced::Border {
                                 radius: if expanded {
-                                    design::RADIUS_S.into()
+                                    design::RADIUS_M.into()
                                 } else {
                                     Default::default()
                                 },
