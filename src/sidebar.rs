@@ -4692,21 +4692,12 @@ fn project_identity_row<'a>(
         } else {
             Cow::Owned(chrome.open_name.to_string())
         })
-        .on_press_maybe(gated(
-            if review_mode && project.github_ready {
-                SidebarAction::BrowsePullRequests {
-                    project_id: project.id,
-                }
-            } else if project.kind == ProjectKind::Folder {
-                SidebarAction::OpenRepository {
-                    project_id: project.id,
-                    repository: project.repository.clone(),
-                }
-            } else {
-                SidebarAction::ToggleProject(project.id)
-            },
-            modal_open,
-        ));
+        .on_press_maybe(
+            project_primary_action(
+                project,
+                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
+            ).and_then(|action| gated(action, modal_open)),
+        );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
     } else if compact {
@@ -4715,6 +4706,30 @@ fn project_identity_row<'a>(
         Cow::Owned(project.repository.display().to_string())
     };
     grid.mount(crate::interaction::tooltip(control, tip))
+}
+
+/// The primary action for a project row, shared by pointer and keyboard
+/// activation. An unreadable project offers retry rather than navigation.
+pub(crate) fn project_primary_action(
+    project: &SidebarProject,
+    filter: SidebarFilter,
+) -> Option<SidebarAction> {
+    if project.unreachable.is_some() {
+        return (!project.reloading).then(|| SidebarAction::RefreshProject {
+            project_id: project.id,
+            repository: project.repository.clone(),
+        });
+    }
+    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
+        SidebarAction::BrowsePullRequests { project_id: project.id }
+    } else if project.kind == ProjectKind::Folder {
+        SidebarAction::OpenRepository {
+            project_id: project.id,
+            repository: project.repository.clone(),
+        }
+    } else {
+        SidebarAction::ToggleProject(project.id)
+    })
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4929,17 +4944,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = (!project.reloading)
-        .then(|| {
-            gated(
-                SidebarAction::RefreshProject {
-                    project_id: project.id,
-                    repository: project.repository.clone(),
-                },
-                modal_open,
-            )
-        })
-        .flatten();
+    let reload = project_primary_action(project, state.filter)
+        .and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {

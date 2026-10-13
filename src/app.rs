@@ -11255,8 +11255,14 @@ impl Cagents {
     }
 
     fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
-        let action = match row {
-            sidebar::SelectionRow::Project(project) => Some(SidebarAction::ToggleProject(project)),
+        let action = self.sidebar_navigation_action(row);
+        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
+    }
+
+    fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
+        match row {
+            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
+                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -11274,8 +11280,7 @@ impl Cagents {
                     worktree_id,
                     path: worktree.path.clone(),
                 }),
-        };
-        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
+        }
     }
 
     /// The instant an animation in flight is measured against.
@@ -14145,13 +14150,13 @@ impl Application for Cagents {
                         iced::widget::operation::AbsoluteOffset { x: 0.0, y },
                     ).map(cosmic::Action::App),
                     SidebarAction::OpenFirstSearchResult => {
-                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let rows = self.visible_sidebar_rows();
                         let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
                             .or_else(|| rows.first()).copied();
                         row.map_or_else(Task::none, |row| self.open_sidebar_navigation_row(row))
                     }
                     SidebarAction::FocusFirstSearchResult => {
-                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let rows = self.visible_sidebar_rows();
                         let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
                             .or_else(|| rows.first()).copied();
                         row.map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
@@ -14170,15 +14175,7 @@ impl Application for Cagents {
                             }
                             return Task::none();
                         }
-                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
-                        let index = rows.iter().position(|candidate| *candidate == row).unwrap_or(0);
-                        let target = match key {
-                            Named::Home => 0,
-                            Named::End => rows.len().saturating_sub(1),
-                            Named::ArrowUp => index.saturating_sub(1),
-                            _ => (index + 1).min(rows.len().saturating_sub(1)),
-                        };
-                        rows.get(target).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(*row)).map(cosmic::Action::App))
+                        self.sidebar_keyboard_neighbor(row, key).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
                     }
                     SidebarAction::SelectRows { row, intent } => {
                         self.select_sidebar_rows(row, intent);

@@ -70,6 +70,51 @@ mod tests {
     }
 
     #[test]
+    fn compact_keyboard_navigation_skips_idle_children_and_stale_focus() {
+        use keyboard::key::Named;
+        let (mut app, project, ids) = fixture();
+        let next = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            next, RepositoryId::new(), "Next project".into(), "/next-project".into(),
+            Vec::new(), Vec::new(),
+        ));
+        let header = SelectionRow::Project(project);
+        let active = SelectionRow::Channel(ids[2]);
+        let idle = SelectionRow::Channel(ids[1]);
+        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::ArrowDown), Some(idle));
+        app.chrome_ui.projects_collapsed = true;
+        assert_eq!(app.sidebar_keyboard_neighbor(header, Named::ArrowDown), Some(active));
+        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::ArrowDown), Some(SelectionRow::Project(next)));
+        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::End), Some(SelectionRow::Project(next)));
+        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::Home), Some(header));
+        assert_eq!(app.sidebar_keyboard_neighbor(idle, Named::ArrowDown), None);
+        app.sidebar_state.apply(&SidebarAction::ToggleProject(project));
+        assert_eq!(app.sidebar_keyboard_neighbor(header, Named::ArrowDown), Some(SelectionRow::Project(next)));
+    }
+
+    #[test]
+    fn project_keyboard_activation_matches_folder_review_and_retry_actions() {
+        let (mut app, project, _) = fixture();
+        let row = SelectionRow::Project(project);
+        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::ToggleProject(project)));
+        app.sidebar_model.projects[0].kind = ProjectKind::Folder;
+        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::OpenRepository {
+            project_id: project, repository: "/selection-project".into(),
+        }));
+        app.sidebar_model.projects[0].kind = ProjectKind::Git;
+        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::PullRequests));
+        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::ToggleProject(project)));
+        app.sidebar_model.projects[0].github_ready = true;
+        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::BrowsePullRequests { project_id: project }));
+        app.sidebar_model.projects[0].unreachable = Some("Missing folder".into());
+        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::RefreshProject {
+            project_id: project, repository: "/selection-project".into(),
+        }));
+        app.sidebar_model.projects[0].reloading = true;
+        assert_eq!(app.sidebar_navigation_action(row), None);
+    }
+
+    #[test]
     fn group_confirmation_names_all_targets_and_preserves_unrelated_active_channel() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);
@@ -312,12 +357,32 @@ fn close_focus_id() -> widget::Id {
 }
 
 impl Cagents {
-    fn visible_sidebar_rows(&self) -> Vec<SelectionRow> {
+    pub(super) fn visible_sidebar_rows(&self) -> Vec<SelectionRow> {
         sidebar::visible_selection_rows(
             &self.sidebar_model,
             &self.sidebar_state,
             matches!(self.projects_sidebar_mode(), SidebarMode::Compact),
         )
+    }
+
+    /// Arrow navigation follows rendered rows, including the compact rail's
+    /// omission of idle destinations. A stale focus is no longer a source.
+    pub(super) fn sidebar_keyboard_neighbor(
+        &self,
+        row: SelectionRow,
+        key: keyboard::key::Named,
+    ) -> Option<SelectionRow> {
+        use keyboard::key::Named;
+        let rows = self.visible_sidebar_rows();
+        let index = rows.iter().position(|candidate| *candidate == row)?;
+        let target = match key {
+            Named::Home => 0,
+            Named::End => rows.len().saturating_sub(1),
+            Named::ArrowUp => index.saturating_sub(1),
+            Named::ArrowDown => (index + 1).min(rows.len().saturating_sub(1)),
+            _ => return None,
+        };
+        rows.get(target).copied()
     }
 
     pub(super) fn select_sidebar_rows(&mut self, row: SelectionRow, intent: SelectionIntent) {
