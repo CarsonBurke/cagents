@@ -434,6 +434,37 @@ enum Tone {
     Error,
 }
 
+/// A tracked task's state is independent of the tool that launched it.
+#[derive(Clone, Copy)]
+enum BackgroundState {
+    Working,
+    Waiting,
+    Failed,
+    Stopped,
+    Finished,
+}
+
+impl BackgroundState {
+    fn caption(self) -> &'static str {
+        match self {
+            Self::Working => "Working",
+            Self::Waiting => "Waiting for you",
+            Self::Failed => "Failed",
+            Self::Stopped => "Stopped",
+            Self::Finished => "Finished",
+        }
+    }
+
+    fn tool_status(self) -> ToolStatus {
+        match self {
+            Self::Working | Self::Waiting => ToolStatus::Running,
+            Self::Failed => ToolStatus::Failed,
+            Self::Stopped => ToolStatus::Stopped,
+            Self::Finished => ToolStatus::Succeeded,
+        }
+    }
+}
+
 fn status_caption(text: String, tone: Tone) -> Element<'static, Message> {
     let caption = design::caption(text);
     match tone {
@@ -694,6 +725,16 @@ impl Runtime {
         settings: markdown::Settings,
     ) {
         let reading = &coordinated.reading;
+        let background = self.background_state(coordinated);
+        // Use the observed task state while a native launch tool is still
+        // settling, but keep an explicit launch failure visible.
+        let indicator = match background
+            .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
+        {
+            Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
+            Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
+            None => self.card_indicator(status, Icon::Agent),
+        };
         // The task is what readers scan for. Agent origin and launch options
         // belong on their own secondary line, not inside the task name.
         let primary = match spawn.agents.as_slice() {
@@ -705,7 +746,7 @@ impl Runtime {
         };
         rows.push(
             widget::row::with_children(vec![
-                self.card_indicator(status, Icon::Agent),
+                indicator,
                 crate::interaction::tooltip(
                     chat_title(Self::short_description(
                         primary
@@ -795,6 +836,7 @@ impl Runtime {
         // How the run went, as far as this step saw it.
         let run = reading.outcome.run.as_ref();
         let line = match status {
+            ToolStatus::Running if background.is_some() => None,
             ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
             ToolStatus::Running => Some(("Starting…".to_owned(), Tone::Plain)),
             ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => {
@@ -819,11 +861,11 @@ impl Runtime {
 
     /// How the agents a step left running in the background are doing now,
     /// for as long as this conversation tracks them.
-    fn background_state(&self, coordinated: &Coordinated) -> Option<&'static str> {
+    fn background_state(&self, coordinated: &Coordinated) -> Option<BackgroundState> {
         let Kind::Spawn(spawn) = &coordinated.reading.kind else {
             return None;
         };
-        if spawn.waits {
+        if spawn.waits || coordinated.reading.cli {
             return None;
         }
         let agents: Vec<&chat::Subagent> = coordinated
@@ -839,15 +881,15 @@ impl Runtime {
             .iter()
             .any(|agent| agent.status == ToolStatus::Running && agent.waiting)
         {
-            Some("Waiting for you")
+            Some(BackgroundState::Waiting)
         } else if any(ToolStatus::Running) {
-            Some("Working in the background")
+            Some(BackgroundState::Working)
         } else if any(ToolStatus::Failed) {
-            Some("Failed")
+            Some(BackgroundState::Failed)
         } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
-            Some("Stopped")
+            Some(BackgroundState::Stopped)
         } else {
-            Some("Finished")
+            Some(BackgroundState::Finished)
         }
     }
 
@@ -1062,7 +1104,7 @@ impl Runtime {
             )
         } else {
             self.background_state(coordinated)
-                .map(str::to_owned)
+                .map(|state| state.caption().to_owned())
                 .or_else(|| cached.detail.clone())
         };
         if let Some(detail) = detail {
