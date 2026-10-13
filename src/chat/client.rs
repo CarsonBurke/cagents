@@ -84,6 +84,8 @@ type Pending = Arc<
         >,
     >,
 >;
+type FilePending =
+    Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
@@ -142,6 +144,7 @@ struct Inner {
     wake: Arc<dyn Fn(Wake) + Send + Sync>,
     reader: Mutex<Option<JoinHandle<()>>>,
     pending: Pending,
+    file_pending: FilePending,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -485,6 +488,7 @@ impl ClientHandle {
                 wake: Arc::new(|_| {}),
                 reader: Mutex::new(None),
                 pending: Arc::new(Mutex::new(BTreeMap::new())),
+                file_pending: Arc::new(Mutex::new(BTreeMap::new())),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             }),
@@ -929,6 +933,7 @@ impl ClientHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let visible = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -948,6 +953,7 @@ impl ClientHandle {
             visible: visible.clone(),
             reader: Mutex::new(None),
             pending: pending.clone(),
+            file_pending: file_pending.clone(),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -1033,8 +1039,19 @@ impl ClientHandle {
                     for (request,reply) in replies {
                         let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
+                    for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
                     wake(Wake::Changed);
                     return;
+                }
+                if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
+                    let result=match envelope.message {
+                        ServerMessage::Response{response:ServerResponse::ChatFileChanges{chat_id,summary}} if chat_id==id=>Ok(super::FileChangeReply::Files(summary)),
+                        ServerMessage::Response{response:ServerResponse::ChatFileChangePatches{chat_id,page}} if chat_id==id=>Ok(super::FileChangeReply::Patches(page)),
+                        ServerMessage::Error(error)=>Err(error.message),
+                        _=>Err("Unexpected file changes reply".into()),
+                    };
+                    let _=reply.try_send(result);
+                    continue;
                 }
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
                     let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
@@ -1118,6 +1135,9 @@ impl ClientHandle {
             let _=visibility_stop.try_send(());
             for (_, reply) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
                 let _ = reply.try_send(Err(failure.clone()));
+            }
+            for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
+                let _=reply.try_send(Err(failure.clone()));
             }
             wake(Wake::Disconnected(failure));
         }).map_err(|e| e.to_string())?;
@@ -1266,6 +1286,52 @@ impl ClientHandle {
             return Err("Replacement terminal has no matching daemon ownership proof".into());
         }
         Ok(terminal)
+    }
+    /// Read immutable cached edit data on this connection's own reply channel.
+    /// Call off the UI thread; no watch publication or provider state is mutated.
+    pub fn file_changes(&self, command: Command) -> Result<super::FileChangeReply, String> {
+        if !matches!(
+            &command,
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+        ) {
+            return Err("Expected a file changes cache query".into());
+        }
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err("Chat is disconnected; retained file pages remain readable".into());
+        }
+        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let (reply, response) = crossbeam_channel::bounded(1);
+        {
+            let mut pending = self
+                .inner
+                .file_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if pending.len() >= 64 {
+                return Err("File changes request capacity reached".into());
+            }
+            pending.insert(id, reply);
+        }
+        let result = transmit(
+            &self.inner.wire,
+            &self.inner.proof,
+            id,
+            ClientRequest::ChatCommand {
+                chat_id: self.inner.id,
+                command,
+            },
+        )
+        .and_then(|()| {
+            response
+                .recv_timeout(Duration::from_secs(40))
+                .map_err(|_| "File changes request timed out".to_string())?
+        });
+        self.inner
+            .file_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        result
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.request(ClientRequest::ChatCommand {
@@ -2645,6 +2711,7 @@ mod tests {
             ..Default::default()
         };
         let update = Presentation {
+            file_changes_unchanged: false,
             base_generation: 1,
             metadata: Snapshot {
                 sampled_at: Some(2000),
@@ -2731,6 +2798,7 @@ mod tests {
             );
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let malformed = Presentation {
+                file_changes_unchanged: false,
                 base_generation: 2,
                 metadata: Snapshot {
                     sampled_at: Some(999_999),
@@ -2841,5 +2909,214 @@ mod tests {
         );
         advance_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn file_changes_replies_are_request_specific_across_clients_and_coalesced_updates() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut handles = Vec::new();
+        let mut servers = Vec::new();
+        let mut finish = Vec::new();
+        for client_index in 0..2_u64 {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let ready_tx = ready_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            finish.push(done_tx);
+            servers.push(thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("file-query-host");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let respond =
+                    |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                        codec
+                            .write(
+                                server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id,
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response { response },
+                                },
+                            )
+                            .unwrap()
+                    };
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(connect.request_id),
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("start expected")
+                };
+                let chat_id = session.id;
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(start.request_id),
+                    ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            busy: true,
+                            read_only_reason: Some("cached fixture".into()),
+                            ..Default::default()
+                        },
+                    },
+                );
+                let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let second: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                // Watch publications intentionally coalesce before either query
+                // reply; immutable results still return through their request IDs.
+                for generation in [2, 3] {
+                    respond(
+                        &mut codec,
+                        &mut server,
+                        None,
+                        ServerResponse::ChatSnapshot {
+                            chat_id,
+                            snapshot: Some(Snapshot {
+                                generation,
+                                ..Default::default()
+                            }),
+                        },
+                    );
+                }
+                for request in [second, first] {
+                    let ClientRequest::ChatCommand { command, .. } = request.request else {
+                        panic!("cache query expected")
+                    };
+                    let response = match command {
+                        Command::LoadFileChanges { request_id, .. } => {
+                            ServerResponse::ChatFileChanges {
+                                chat_id,
+                                summary: super::super::FileChangesSummary {
+                                    request_id,
+                                    total_files: client_index as usize + 1,
+                                    ..Default::default()
+                                },
+                            }
+                        }
+                        Command::LoadFileChangePatches {
+                            request_id,
+                            key,
+                            cursor,
+                            ..
+                        } => ServerResponse::ChatFileChangePatches {
+                            chat_id,
+                            page: super::super::FileChangePage {
+                                request_id,
+                                key,
+                                revision: 4,
+                                patches: vec![],
+                                next: cursor,
+                                error: None,
+                            },
+                        },
+                        _ => panic!("unexpected provider command"),
+                    };
+                    respond(&mut codec, &mut server, Some(request.request_id), response);
+                }
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            handles.push(
+                ClientHandle::connect_on(
+                    client,
+                    omp_card(None, None),
+                    Intent::Start,
+                    None,
+                    false,
+                    None,
+                    None,
+                    |_| {},
+                )
+                .unwrap(),
+            );
+        }
+        for handle in &handles {
+            assert!(
+                handle
+                    .file_changes(Command::Interrupt)
+                    .unwrap_err()
+                    .contains("Expected a file changes cache query")
+            );
+        }
+        let mut queries = Vec::new();
+        for (client_index, handle) in handles.iter().enumerate() {
+            let a = handle.clone();
+            queries.push(thread::spawn(move || {
+                match a
+                    .file_changes(Command::LoadFileChanges {
+                        request_id: 100 + client_index as u64,
+                        after: None,
+                    })
+                    .unwrap()
+                {
+                    super::super::FileChangeReply::Files(summary) => {
+                        assert_eq!(summary.request_id, 100 + client_index as u64);
+                        assert_eq!(summary.total_files, client_index + 1);
+                    }
+                    _ => panic!("wrong query reply"),
+                }
+            }));
+            let b = handle.clone();
+            queries.push(thread::spawn(move || {
+                let key = super::super::FileChangeKey {
+                    source: super::super::FileChangeSource::Conversation,
+                    path: format!("file{client_index}.rs"),
+                };
+                let cursor = super::super::FilePatchCursor {
+                    ordinal: 9,
+                    file_index: 0,
+                    offset: client_index + 1,
+                };
+                match b
+                    .file_changes(Command::LoadFileChangePatches {
+                        request_id: 200 + client_index as u64,
+                        key: key.clone(),
+                        cursor: Some(cursor.clone()),
+                        revision: 4,
+                    })
+                    .unwrap()
+                {
+                    super::super::FileChangeReply::Patches(page) => {
+                        assert_eq!(page.request_id, 200 + client_index as u64);
+                        assert_eq!(page.key, key);
+                        assert_eq!(page.next, Some(cursor));
+                    }
+                    _ => panic!("wrong query reply"),
+                }
+            }));
+        }
+        for _ in 0..2 {
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for query in queries {
+            query.join().unwrap();
+        }
+        for done in finish {
+            done.send(()).unwrap();
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
     }
 }

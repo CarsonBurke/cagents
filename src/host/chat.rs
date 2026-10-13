@@ -2182,6 +2182,16 @@ fn process_inner(
                 }
                 attached(&state, client, chat_id)?.handle.clone()
             };
+            if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
+                return Ok(match reply {
+                    crate::chat::FileChangeReply::Files(summary) => {
+                        ServerResponse::ChatFileChanges { chat_id, summary }
+                    }
+                    crate::chat::FileChangeReply::Patches(page) => {
+                        ServerResponse::ChatFileChangePatches { chat_id, page }
+                    }
+                });
+            }
             handle.command(command).map_err(unavailable)?;
             Ok(ServerResponse::Accepted)
         }

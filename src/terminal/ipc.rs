@@ -141,7 +141,7 @@ use crate::{
 /// in sparse events and snapshots.
 /// Version 72 carries native fast-mode capabilities/state, its setting command,
 /// and separately labeled API-equivalent Codex cost estimates.
-pub const PROTOCOL_VERSION: u16 = 72;
+pub const PROTOCOL_VERSION: u16 = 73;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -767,6 +767,15 @@ pub enum ServerResponse {
     },
     DeviceOperation {
         reply: crate::device_service::Reply,
+    },
+    /// Cache-query replies go only to the requesting connection and request ID.
+    ChatFileChanges {
+        chat_id: TerminalId,
+        summary: crate::chat::FileChangesSummary,
+    },
+    ChatFileChangePatches {
+        chat_id: TerminalId,
+        page: crate::chat::FileChangePage,
     },
 }
 
@@ -2146,6 +2155,87 @@ mod tests {
         assert_eq!(restored.turn_generation, 7);
     }
 
+    #[test]
+    fn chat_file_changes_query_replies_and_old_snapshot_defaults_round_trip() {
+        use crate::chat::*;
+        let chat_id = TerminalId::new();
+        let key = FileChangeKey {
+            source: FileChangeSource::Subagent {
+                id: "delegate".into(),
+            },
+            path: "a.rs".into(),
+        };
+        let cursor = FilePatchCursor {
+            ordinal: 4,
+            file_index: 1,
+            offset: 9,
+        };
+        let commands = [
+            Command::LoadFileChanges {
+                request_id: 7,
+                after: Some(key.clone()),
+            },
+            Command::LoadFileChangePatches {
+                request_id: 8,
+                key: key.clone(),
+                cursor: Some(cursor.clone()),
+                revision: 5,
+            },
+        ];
+        for command in commands {
+            let request = ClientRequest::ChatCommand { chat_id, command };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &request).unwrap();
+            assert_eq!(
+                read_frame::<ClientRequest>(&mut Cursor::new(bytes))
+                    .unwrap()
+                    .unwrap(),
+                request
+            );
+        }
+        let responses = [
+            ServerResponse::ChatFileChanges {
+                chat_id,
+                summary: FileChangesSummary {
+                    request_id: 7,
+                    revision: 5,
+                    total_files: 1,
+                    applied_files: 1,
+                    ..Default::default()
+                },
+            },
+            ServerResponse::ChatFileChangePatches {
+                chat_id,
+                page: FileChangePage {
+                    request_id: 8,
+                    key,
+                    revision: 5,
+                    patches: vec![FileChangePatch {
+                        ownership_unverified: true,
+                        item_id: "edit".into(),
+                        kind: ChangeKind::Updated,
+                        status: ToolStatus::Succeeded,
+                        imported: false,
+                        offset: 9,
+                        total_bytes: 99,
+                        diff: "+λ\n".into(),
+                    }],
+                    next: Some(cursor),
+                    error: None,
+                },
+            },
+        ];
+        for response in responses {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &response).unwrap();
+            let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+            assert_eq!(decoded, response);
+        }
+        let mut legacy = serde_json::to_value(Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("file_changes");
+        let restored: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.file_changes.total_files, 0);
+    }
     #[test]
     fn framing_round_trips_and_rejects_oversized_prefixes() {
         let message = ClientEnvelope {

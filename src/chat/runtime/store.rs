@@ -1,5 +1,6 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+mod file_changes;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -49,6 +50,14 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    file_revision: u64,
+    child_file_ordinal: i64,
+    child_files_seen: bool,
+    file_index_incomplete: bool,
+    file_keys: usize,
+    applied_files: usize,
+    pub(super) file_cwd: Option<PathBuf>,
+    pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
     end: Option<Cursor>,
     first: Option<Cursor>,
@@ -133,7 +142,17 @@ impl Store {
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
+            db.execute_batch(file_changes::SCHEMA)
+                .map_err(|e| e.to_string())?;
             Ok(Self {
+                file_revision: 0,
+                child_file_ordinal: 0,
+                child_files_seen: false,
+                file_index_incomplete: false,
+                file_keys: 0,
+                applied_files: 0,
+                file_cwd: None,
+                presented_file_changes: None,
                 db,
                 directory: directory.clone(),
                 end: None,
@@ -190,9 +209,32 @@ impl Store {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if older && previous.is_some() {
-            return Ok(None);
-        }
+        let recovered_placeholder = if older && let Some((_, metadata, input_bytes)) = &previous {
+            let cached: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
+            // A completed result can arrive before its call metadata is known.
+            // An indexed replay may classify that exact fallback, but must not
+            // replace a known invocation or change its confirmed outcome.
+            let unclassified = matches!(&cached.content,ItemContent::Tool{name,input,status,..}
+                if name=="Tool"&&input.is_empty()&&*input_bytes==0&&*status!=crate::chat::ToolStatus::Running);
+            let classified = match &item.content {
+                ItemContent::Tool { name, input, .. } => {
+                    !name.is_empty() && (name != "Tool" || !input.is_empty())
+                }
+                ItemContent::Changes { .. } | ItemContent::Command { .. } => true,
+                _ => false,
+            };
+            if !unclassified
+                || !classified
+                || cached.id != item.id
+                || cached.role != item.role
+                || cached.content.status() != item.content.status()
+            {
+                return Ok(None);
+            }
+            true
+        } else {
+            false
+        };
         // An adapter cannot know wall-clock time, so a live observation is
         // stamped where the daemon actually sees it. Replayed history is not
         // something the daemon just watched happen, so it keeps whatever the
@@ -205,6 +247,9 @@ impl Store {
         if let Some((_, metadata, _)) = &previous {
             let old: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
             item.started_at = old.started_at.or(old.at).or(item.started_at);
+            if recovered_placeholder {
+                item.at = item.at.or(old.at);
+            }
             if let (
                 ItemContent::Tool { name, input, .. },
                 ItemContent::Tool { name: old_name, .. },
@@ -277,7 +322,8 @@ impl Store {
             },
         };
         let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
-        if metadata.len() > METADATA_LIMIT {
+        let shortened = metadata.len() > METADATA_LIMIT;
+        if shortened {
             // Every identity field a provider controls is trimmed rather than
             // dropping a turn of the conversation.
             shrink(&mut item.content);
@@ -293,6 +339,10 @@ impl Store {
             ));
         }
         if metadata.len() > METADATA_LIMIT {
+            if matches!(&item.content, ItemContent::Changes { .. }) {
+                self.file_index_incomplete = true;
+                self.files_removed(std::slice::from_ref(&item.id))?;
+            }
             return Ok(Some(format!(
                 "Provider item {} exceeds the 64 KiB identity budget and was not cached",
                 brief(&item.id)
@@ -304,6 +354,7 @@ impl Store {
             body0.len() as i64
         };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         if preserve_input {
@@ -319,6 +370,12 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
+            self.file_index_incomplete = true;
+            self.files_removed(std::slice::from_ref(&item.id))?;
+        } else {
+            self.index_file_item(&item, "", ordinal, older, &body0, &index_spans)?;
+        }
         self.changed(&item.id);
         self.dirty = true;
         Ok(warning)
@@ -508,8 +565,16 @@ impl Store {
         };
         transaction.execute_batch("UPDATE items SET ordinal=(SELECT temporary FROM ordinal_remap WHERE old=items.ordinal);
             UPDATE items SET ordinal=(SELECT new FROM ordinal_remap WHERE temporary=items.ordinal);
+            UPDATE file_edits SET ordinal=(SELECT new FROM ordinal_remap WHERE old=file_edits.ordinal) WHERE source='';
             DROP TABLE ordinal_remap;").map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "UPDATE file_totals SET revision=?1 WHERE source=''",
+                [self.file_revision.saturating_add(1)],
+            )
+            .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
+        self.file_revision = self.file_revision.saturating_add(1);
         self.end = end;
         self.first = first;
         self.newest = newest;
@@ -525,7 +590,7 @@ impl Store {
         let mut after = None;
         let mut warnings = Vec::new();
         for item in items {
-            if self.ordinal(&item.id)?.is_some() {
+            if let Some(ordinal) = self.ordinal(&item.id)? {
                 if !run.is_empty() {
                     let ordinals =
                         self.history_ordinals(Some(&item.id), after.as_deref(), run.len())?;
@@ -535,7 +600,13 @@ impl Store {
                         }
                     }
                 }
-                after = Some(item.id);
+                after = Some(item.id.clone());
+                // Existing rows normally remain untouched. put_at admits only
+                // the exact completed fallback classification repair, while
+                // preserving this row's ordinal as the history overlap anchor.
+                if let Some(warning) = self.put_at(item, true, Some(ordinal))? {
+                    warnings.push(warning);
+                }
             } else {
                 run.push(item);
             }
@@ -578,6 +649,7 @@ impl Store {
                 _ => {}
             }
         }
+        self.index_child_event(&event)?;
         let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
@@ -711,6 +783,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
                     transaction
@@ -721,6 +794,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
+                self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -1563,6 +1637,7 @@ mod tests {
         store.earlier().unwrap();
         let earlier = store.window_reusing(&mut latest.items).unwrap();
         let replayed = crate::chat::presentation::Presentation {
+            file_changes_unchanged: false,
             children: Vec::new(),
             base_generation: 1,
             metadata: crate::chat::Snapshot {
@@ -2800,5 +2875,157 @@ mod tests {
         assert_eq!(items[0].started_at, None);
         assert_eq!(items[1].at, Some(streamed));
         assert_eq!(items[1].started_at, Some(created));
+    }
+
+    #[test]
+    fn recovered_history_classifies_only_an_exact_completed_fallback_once() {
+        let mut store = Store::new().unwrap();
+        let generic = Item {
+            id: "edit".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "Tool".into(),
+                input: String::new(),
+                output: "done".into(),
+                status: crate::chat::ToolStatus::Succeeded,
+            },
+        };
+        store.apply(Event::Item(generic)).unwrap();
+        let original = store.window().unwrap().items[0].clone();
+        let ordinal = store.ordinal("edit").unwrap();
+        let recovered = Item {
+            id: "edit".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Changes {
+                changes: vec![change("a.rs", "@@ -1 +1 @@\n-old\n+new\n".into())],
+                status: crate::chat::ToolStatus::Succeeded,
+            },
+        };
+        store
+            .apply(Event::History {
+                items: vec![recovered.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        let mut snapshot = crate::chat::Snapshot::default();
+        store.publish_files(&mut snapshot).unwrap();
+        assert_eq!(snapshot.file_changes.applied_files, 1);
+        assert_eq!(snapshot.file_changes.files[0].succeeded, 1);
+        let revision = snapshot.file_changes.revision;
+        let upgraded = store.window().unwrap().items[0].clone();
+        assert!(matches!(&upgraded.content, ItemContent::Changes { .. }));
+        assert_eq!(upgraded.at, original.at);
+        assert_eq!(upgraded.started_at, original.started_at);
+        assert_eq!(store.ordinal("edit").unwrap(), ordinal);
+        store
+            .apply(Event::History {
+                items: vec![recovered],
+                has_earlier: false,
+            })
+            .unwrap();
+        store.publish_files(&mut snapshot).unwrap();
+        assert_eq!(snapshot.file_changes.revision, revision);
+        assert_eq!(snapshot.file_changes.files[0].succeeded, 1);
+    }
+    #[test]
+    fn recovered_history_cannot_replace_known_tools_roles_or_different_outcomes() {
+        use crate::chat::ToolStatus;
+        for (name, input, status, role, recovered_status) in [
+            (
+                "Tool",
+                "",
+                ToolStatus::Succeeded,
+                Role::Assistant,
+                ToolStatus::Failed,
+            ),
+            (
+                "Bash",
+                "",
+                ToolStatus::Succeeded,
+                Role::Assistant,
+                ToolStatus::Succeeded,
+            ),
+            (
+                "Tool",
+                "{}",
+                ToolStatus::Succeeded,
+                Role::Assistant,
+                ToolStatus::Succeeded,
+            ),
+            (
+                "Tool",
+                "",
+                ToolStatus::Running,
+                Role::Assistant,
+                ToolStatus::Running,
+            ),
+            (
+                "Tool",
+                "",
+                ToolStatus::Succeeded,
+                Role::User,
+                ToolStatus::Succeeded,
+            ),
+        ] {
+            let mut store = Store::new().unwrap();
+            let original = Item {
+                id: "edit".into(),
+                role,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: name.into(),
+                    input: input.into(),
+                    output: "original result".into(),
+                    status,
+                },
+            };
+            store.apply(Event::Item(original)).unwrap();
+            let before = store.window().unwrap().items[0].clone();
+            let recovered = Item {
+                id: "edit".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Changes {
+                    changes: vec![change("wrong.rs", "@@ -1 +1 @@\n-old\n+new\n".into())],
+                    status: recovered_status,
+                },
+            };
+            store
+                .apply(Event::History {
+                    items: vec![recovered],
+                    has_earlier: false,
+                })
+                .unwrap();
+            let after = store.window().unwrap().items[0].clone();
+            assert_eq!(after, before);
+            let mut snapshot = crate::chat::Snapshot::default();
+            store.publish_files(&mut snapshot).unwrap();
+            assert_eq!(snapshot.file_changes.total_files, 0);
+        }
+        let mut store = Store::new().unwrap();
+        store
+            .apply(change_set(vec![change(
+                "known.rs",
+                "@@ -1 +1 @@\n-old\n+new\n".into(),
+            )]))
+            .unwrap();
+        let original = store.window().unwrap().items[0].as_ref().clone();
+        let mut replacement = original.clone();
+        if let ItemContent::Changes { changes, .. } = &mut replacement.content {
+            changes[0].path = "wrong.rs".into();
+        }
+        store
+            .apply(Event::History {
+                items: vec![replacement],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(store.window().unwrap().items[0].as_ref(), &original);
     }
 }

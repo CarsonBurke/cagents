@@ -1815,6 +1815,8 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
+        ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
+        ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }

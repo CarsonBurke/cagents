@@ -106,6 +106,8 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatListed { .. }
                 | ServerResponse::ChatClosed { .. }
                 | ServerResponse::ChatTerminal { .. }
+                | ServerResponse::ChatFileChanges { .. }
+                | ServerResponse::ChatFileChangePatches { .. }
         }
     )
 }

@@ -1012,7 +1012,7 @@ impl Runtime {
             text
         }
     }
-    fn native_child_name(agent: &chat::Subagent) -> &str {
+    pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
         agent
             .description
             .lines()
@@ -1358,6 +1358,9 @@ impl Runtime {
             .iter()
             .map(|title| -> Element<'_, Message> { design::heading(title.as_str()).into() })
             .collect();
+        if self.changes.open {
+            content.push(self.changes_view(content_width));
+        }
         if self.branch_picker {
             let mut choices: Vec<Element<'_, Message>> = Vec::new();
             let codex = self.session.launch.provider == Provider::Codex;
@@ -2266,6 +2269,16 @@ impl Runtime {
             );
         }
         status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+        if snapshot.file_changes.total_files > 0
+            || snapshot.file_changes.coverage.has_uncached_changes
+            || self.changes.open
+        {
+            status.push(crate::interaction::tooltip(
+                crate::ui_controls::button::quiet(changes::footer_label(&snapshot.file_changes))
+                    .on_press(action(Action::ChangesPicker(target, !self.changes.open))),
+                "Review file edits reported in this conversation",
+            ));
+        }
         if snapshot.capabilities.branch {
             let available = available
                 && snapshot.ready
@@ -7078,5 +7091,410 @@ mod tests {
         assert_eq!(ids("Sonnet 4.5"), vec!["anthropic/claude-sonnet-4-5"]);
         assert_eq!(ids("  ").len(), 2, "an empty query lists every model");
         assert!(ids("haiku").is_empty());
+    }
+    #[test]
+    fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let key = chat::FileChangeKey {
+            source: chat::FileChangeSource::Subagent { id: "child".into() },
+            path: "src/renamed.rs".into(),
+        };
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.file_changes = Arc::new(chat::FileChangesSummary {
+            total_files: 1,
+            coverage: chat::FileChangesCoverage {
+                has_unloaded_history: true,
+                has_imported_history: true,
+                has_incomplete_delegated_history: true,
+                ..chat::FileChangesCoverage::default()
+            },
+            files: vec![chat::FileChangeSummary {
+                key: key.clone(),
+                resolved_path: None,
+                ownership_unverified: true,
+                revision: 1,
+                kind: chat::ChangeKind::Renamed {
+                    from: "src/old.rs".into(),
+                },
+                succeeded: 0,
+                pending: 1,
+                failed: 0,
+                additions: None,
+                deletions: None,
+                imported: 1,
+            }],
+            ..chat::FileChangesSummary::default()
+        });
+        runtime.snapshot = Arc::new(snapshot);
+        runtime.changes.open = true;
+        let renderer = crate::app::tests::headless_renderer();
+        for width in [360.0, 670.0, 960.0] {
+            runtime.changes.back();
+            let mut element = runtime.changes_view(width);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+            );
+            assert!(
+                node.size().width <= width,
+                "review must fit a narrow split pane"
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let labels: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect();
+            for expected in [
+                "Files changed",
+                "Proposed edit",
+                "Subagent: child",
+                "pending",
+                "from src/old.rs",
+                "Close",
+            ] {
+                assert!(
+                    labels.iter().any(|label| label.contains(expected)),
+                    "{width}: missing {expected}: {labels:?}"
+                );
+            }
+            assert!(
+                !labels.iter().any(|label| label == "Open file"),
+                "unresolved child-relative paths must not route to the parent"
+            );
+            drop(element);
+            runtime.changes.select(key.clone());
+            let mut selected = runtime.changes_view(width);
+            let mut selected_tree = Tree::new(selected.as_widget());
+            let selected_node = selected.as_widget_mut().layout(
+                &mut selected_tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+            );
+            let selected_accessible = selected.as_widget().a11y_nodes(
+                Layout::new(&selected_node),
+                &selected_tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let nodes: Vec<_> = selected_accessible
+                .root()
+                .iter()
+                .chain(selected_accessible.children())
+                .collect();
+            if width < 560.0 {
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node.node().label() == Some("Back to files")),
+                    "narrow detail view needs a visible return to the file list"
+                );
+                assert!(
+                    !nodes.iter().any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("View reported edits for"))),
+                    "narrow panes switch to the detail instead of stacking both scrollers"
+                );
+            } else {
+                let file = nodes
+                    .iter()
+                    .find(|node| {
+                        node.node()
+                            .label()
+                            .is_some_and(|label| label.starts_with("View reported edits for"))
+                    })
+                    .and_then(|node| node.node().bounds())
+                    .expect("file list stays mounted beside the detail");
+                let detail = nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some("The file location was not reported."))
+                    .and_then(|node| node.node().bounds())
+                    .expect("selected file detail is mounted");
+                assert!(
+                    file.x1 <= detail.x0,
+                    "{width}: default-width files and edits must sit side by side"
+                );
+            }
+            drop(selected);
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut full = runtime.view(
+                false,
+                true,
+                &shortcuts,
+                width,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut full_tree = Tree::new(full.as_widget());
+            let full_node = full.as_widget_mut().layout(
+                &mut full_tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+            );
+            let accessible = full.as_widget().a11y_nodes(
+                Layout::new(&full_node),
+                &full_tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            for label in ["Send message", "Reported edits 1"] {
+                let bounds = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| {
+                        node.node()
+                            .label()
+                            .is_some_and(|name| name.starts_with(label))
+                    })
+                    .and_then(|node| node.node().bounds())
+                    .unwrap_or_else(|| panic!("{width}: {label} must remain mounted"));
+                assert!(
+                    bounds.y0 >= 0.0 && bounds.y1 <= 600.0 && bounds.y1 > bounds.y0,
+                    "{width}: {label} must remain visible in a 600px window: {bounds:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn narrow_file_review_restores_actual_scroll_on_back_after_the_old_ui_operation_misses() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Id, Operation, Tree},
+        };
+        struct Offset {
+            id: Id,
+            y: Option<f32>,
+        }
+        impl Operation for Offset {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::scrollable::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.y = Some(translation.y);
+                }
+            }
+        }
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let key = chat::FileChangeKey {
+            source: chat::FileChangeSource::Conversation,
+            path: "src/file-036.rs".into(),
+        };
+        let rows = (0..128)
+            .map(|index| chat::FileChangeSummary {
+                key: chat::FileChangeKey {
+                    source: chat::FileChangeSource::Conversation,
+                    path: format!("src/file-{index:03}.rs"),
+                },
+                resolved_path: Some(format!("/project/src/file-{index:03}.rs")),
+                revision: 1,
+                kind: chat::ChangeKind::Updated,
+                succeeded: 1,
+                pending: 0,
+                failed: 0,
+                additions: Some(1),
+                deletions: Some(1),
+                imported: 0,
+                ownership_unverified: false,
+            })
+            .collect();
+        let summary = chat::FileChangesSummary {
+            request_id: 42,
+            revision: 1,
+            files: rows,
+            total_files: 128,
+            applied_files: 128,
+            ..Default::default()
+        };
+        Arc::make_mut(&mut runtime.snapshot).file_changes = Arc::new(summary.clone());
+        runtime.changes.list = Some(summary);
+        runtime.changes.show();
+        runtime.changes.list_scroll = 1000.0;
+        let original_epoch = runtime.changes.list_epoch;
+        let id = card_control_id(runtime.target.card, "chat-changes-files");
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 600.0));
+        let mut files = runtime.changes_view(360.0);
+        let mut tree = Tree::new(files.as_widget());
+        let node = files.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut offset = Offset {
+            id: id.clone(),
+            y: None,
+        };
+        files
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut offset);
+        assert_eq!(offset.y, Some(1000.0));
+        drop(files);
+        runtime.changes.select(key);
+        runtime
+            .changes
+            .record_scroll(42, 42, original_epoch, true, 0.0);
+        assert_eq!(
+            runtime.changes.list_scroll, 1000.0,
+            "a stale retiring list callback cannot overwrite the saved offset"
+        );
+        let mut detail = runtime.changes_view(360.0);
+        tree.diff(detail.as_widget_mut());
+        let node = detail.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut early = iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+            id.clone(),
+            iced::widget::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(1000.0),
+            },
+        );
+        detail
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut early);
+        let mut absent = Offset {
+            id: id.clone(),
+            y: None,
+        };
+        detail
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut absent);
+        assert_eq!(
+            absent.y, None,
+            "an operation before list remount cannot restore it"
+        );
+        drop(detail);
+        runtime.changes.back();
+        runtime
+            .changes
+            .record_scroll(42, 42, original_epoch, true, 0.0);
+        assert_eq!(
+            runtime.changes.list_scroll, 1000.0,
+            "late callbacks remain stale after Back makes the list visible again"
+        );
+        let mut files = runtime.changes_view(360.0);
+        tree.diff(files.as_widget_mut());
+        let node = files.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut restored = Offset {
+            id: id.clone(),
+            y: None,
+        };
+        files
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut restored);
+        assert_eq!(
+            restored.y,
+            Some(1000.0),
+            "first remount layout restores the real widget offset without any follow-up task"
+        );
+        let mut moved = iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+            id.clone(),
+            iced::widget::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(1100.0),
+            },
+        );
+        files
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut moved);
+        let node = files.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut unchanged = Offset { id, y: None };
+        files
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut unchanged);
+        assert_eq!(
+            unchanged.y,
+            Some(1100.0),
+            "later layouts cannot reset newer widget scroll before its callback arrives"
+        );
+    }
+    #[test]
+    fn switching_inline_review_and_fork_panels_keeps_the_composer_visible_at_600px() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let (mut live, _handle) = frame_cost::live_runtime(&[]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        live.target.card = card;
+        let target = live.target;
+        let snapshot = Arc::make_mut(&mut live.snapshot);
+        snapshot.ready = true;
+        snapshot.capabilities.branch = true;
+        Arc::make_mut(&mut snapshot.file_changes).total_files = 1;
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards.insert(card, CardRuntime::Chat(Box::new(live)));
+        let renderer = crate::app::tests::headless_renderer();
+        for mode in [
+            Action::ChangesPicker(target, true),
+            Action::BranchPicker(target, true),
+            Action::ChangesPicker(target, true),
+        ] {
+            drop(app.handle_chat_ui(mode));
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("fixture chat");
+            };
+            assert_ne!(
+                runtime.changes.open, runtime.branch_picker,
+                "only the selected inline panel is open"
+            );
+            for width in [360.0, 670.0] {
+                let mut element = runtime.view(
+                    false,
+                    true,
+                    &app.settings.keyboard_shortcuts,
+                    width,
+                    Place {
+                        name: "fixture".into(),
+                        branch: None,
+                        channel: None,
+                    },
+                    true,
+                    None,
+                    Vec::new(),
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let bounds = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| {
+                        node.node()
+                            .label()
+                            .is_some_and(|label| label.starts_with("Send message"))
+                    })
+                    .and_then(|node| node.node().bounds())
+                    .expect("composer send control remains mounted");
+                assert!(
+                    bounds.y0 >= 0.0 && bounds.y1 <= 600.0 && bounds.y1 > bounds.y0,
+                    "{width}: inline panels must not push the composer out of the window: {bounds:?}"
+                );
+            }
+        }
     }
 }

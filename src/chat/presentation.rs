@@ -6,6 +6,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presentation {
     pub base_generation: u64,
+    /// Unchanged immutable edit metadata is retained locally, not retransmitted
+    /// with every prose/tool delta. Full snapshots remain the resync boundary.
+    #[serde(default)]
+    pub file_changes_unchanged: bool,
     /// Everything except the parent transcript, whose items are updated below.
     pub metadata: Snapshot,
     pub order: Vec<String>,
@@ -186,6 +190,12 @@ impl Presentation {
             return Err("Transcript revision mismatch");
         }
         let mut metadata = self.metadata;
+        if self.file_changes_unchanged {
+            if !metadata.file_changes.files.is_empty() {
+                return Err("Retained file summary carries replacement rows");
+            }
+            metadata.file_changes = previous.file_changes.clone();
+        }
         metadata.items = apply_items(&previous.items, self.order, self.changes)?;
         let mut children = HashMap::new();
         for child in self.children {
@@ -233,6 +243,7 @@ mod tests {
         let retained_ui = installed.clone();
         let next = text("live", "hello tail");
         let update = Presentation {
+            file_changes_unchanged: false,
             base_generation: 1,
             metadata: Snapshot {
                 generation: 2,
@@ -311,6 +322,7 @@ mod tests {
         };
         metadata.subagents[0].items.clear();
         let update = Presentation {
+            file_changes_unchanged: false,
             base_generation: 1,
             metadata,
             order: vec!["tool".into()],
@@ -364,6 +376,7 @@ mod tests {
             ..Snapshot::default()
         };
         snapshot = Presentation {
+            file_changes_unchanged: false,
             children: Vec::new(),
             base_generation: 4,
             metadata,
@@ -405,6 +418,7 @@ mod tests {
             body_mut(&mut shell.content).unwrap().clear();
             assert!(
                 Presentation {
+                    file_changes_unchanged: false,
                     children: Vec::new(),
                     base_generation: generation,
                     metadata: Snapshot {
@@ -423,5 +437,35 @@ mod tests {
             );
             assert_eq!(snapshot, before);
         }
+    }
+
+    #[test]
+    fn unchanged_file_summary_is_shared_without_retransmitting_rows() {
+        let summary = std::sync::Arc::new(super::super::FileChangesSummary {
+            revision: 8,
+            total_files: 100,
+            applied_files: 99,
+            ..Default::default()
+        });
+        let previous = Snapshot {
+            generation: 1,
+            file_changes: summary.clone(),
+            ..Default::default()
+        };
+        let update = Presentation {
+            base_generation: 1,
+            file_changes_unchanged: true,
+            metadata: Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec![],
+            changes: vec![],
+            children: vec![],
+        };
+        assert!(postcard::to_stdvec(&update).unwrap().len() < 1024);
+        let current = update.apply(&previous).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&summary, &current.file_changes));
+        assert_eq!(current.file_changes.applied_files, 99);
     }
 }

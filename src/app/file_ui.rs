@@ -69,6 +69,30 @@ impl Cagents {
         }
     }
 
+    /// Open a provider-reported filesystem path without applying URL semantics.
+    /// Local callers resolve symlinks off-thread before creating the pane;
+    /// device callers retain components for resolution by the owning daemon.
+    pub(super) fn open_file_path(&mut self, source: CardId, path: PathBuf) -> Task<Message> {
+        if self.workspace.card(source).is_none() || self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+            self.status = Some(TransientNotice::error("The reported file path is invalid."));
+            return Task::none();
+        }
+        if self.refuse_in_deleting_worktree(&path) {
+            return Task::none();
+        }
+        if crate::device::is_remote() {
+            self.update_device(super::device_ui::Action::OpenFile {
+                path,
+                fragment: None,
+            })
+        } else {
+            self.open_local_file(Some(source), path, None)
+        }
+    }
+
     fn open_local_file(
         &mut self,
         source: Option<CardId>,
