@@ -2964,12 +2964,17 @@ fn live_notification(frame: &Value, description: &str, agent: bool) -> ItemConte
             body: String::new(),
         };
     }
-    let heading = match (description.is_empty(), status) {
-        (true, _) => "Agent finished".to_owned(),
-        (false, "failed") => format!("Agent \"{description}\" failed"),
-        (false, "stopped" | "killed") => format!("Agent \"{description}\" was stopped"),
-        (false, _) => format!("Agent \"{description}\" finished"),
+    let subject = if description.is_empty() {
+        "Native subagent".to_owned()
+    } else {
+        format!("Native subagent \"{description}\"")
     };
+    let outcome = match status {
+        "failed" => "failed",
+        "stopped" | "killed" => "was stopped",
+        _ => "finished",
+    };
+    let heading = format!("{subject} {outcome}");
     let (kind, body) = match pointer(summary) {
         _ if summary.is_empty() => (DeliveryKind::Notice, ""),
         Some(shown) => (DeliveryKind::Notice, shown),
@@ -6386,7 +6391,7 @@ mod tests {
                 content: ItemContent::Delivery { kind: DeliveryKind::Report, summary, body, .. },
                 ..
             }) if id == "claude-notification:agent1:n1"
-                && summary == "Agent \"Fruit report\" finished"
+                && summary == "Native subagent \"Fruit report\" finished"
                 && body == "## Fruit\nApples."
         )));
         let completed = adapter
@@ -6415,6 +6420,32 @@ mod tests {
                 "{flag} keeps the notification out of the transcript"
             );
         }
+    }
+
+    #[test]
+    fn live_native_report_headings_identify_origin_and_terminal_outcome() {
+        for (description, status, expected) in [
+            ("Review", "completed", "Native subagent \"Review\" finished"),
+            ("Review", "failed", "Native subagent \"Review\" failed"),
+            (
+                "Review",
+                "stopped",
+                "Native subagent \"Review\" was stopped",
+            ),
+            ("", "completed", "Native subagent finished"),
+            ("", "failed", "Native subagent failed"),
+            ("", "killed", "Native subagent was stopped"),
+        ] {
+            let frame = json!({"task_id":"child", "status":status, "summary":"Findings"});
+            assert!(
+                matches!(live_notification(&frame, description, true), ItemContent::Delivery { kind:DeliveryKind::Report, summary, body, .. } if summary == expected && body == "Findings")
+            );
+        }
+        let frame =
+            json!({"task_id":"command", "status":"completed", "summary":"Command finished"});
+        assert!(
+            matches!(live_notification(&frame, "Check", false), ItemContent::Delivery { kind:DeliveryKind::Notice, summary, .. } if summary == "Command finished")
+        );
     }
 
     #[test]
