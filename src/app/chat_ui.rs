@@ -1,3 +1,4 @@
+mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
@@ -193,6 +194,10 @@ pub enum Action {
     /// Brings forward the open session whose id starts with the given one,
     /// as an agent addressed it in a command.
     OpenSession(String),
+    SessionResolved(Result<session_links::Destination, String>),
+    SessionLinkOpened(Result<(), String>),
+    SessionLinkWindowBackend(String, TerminalId, bool),
+    SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
     OpenDocument(Target, String),
@@ -1002,7 +1007,8 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
-            coordination: coordination.map(|reading| Box::new(coordination::Coordinated::new(reading))),
+            coordination: coordination
+                .map(|reading| Box::new(coordination::Coordinated::new(reading))),
         };
         if cached.coordination.is_some() {
             cached.highlight(theme);
@@ -1124,25 +1130,32 @@ impl CachedItem {
             .iter()
             .flat_map(|coordinated| coordinated.contents())
             .flat_map(markdown::Content::items);
-        for_each_fence(self.markdown.items().iter().chain(coordinated), &mut |language, code| {
-            let key = fence_key(language.unwrap_or_default(), code);
-            last = Some(key);
-            if blocks.contains_key(&key) {
-                return;
-            }
-            let block = previous
-                .remove(&key)
-                .or_else(|| {
-                    let mut block = previous.remove(&open.take()?)?;
-                    block
-                        .extend(language.and_then(prose::fence_language), code)
-                        .then_some(block)
-                })
-                .unwrap_or_else(|| {
-                    prose::CodeBlock::open(language.and_then(prose::fence_language), code, theme)
-                });
-            blocks.insert(key, block);
-        });
+        for_each_fence(
+            self.markdown.items().iter().chain(coordinated),
+            &mut |language, code| {
+                let key = fence_key(language.unwrap_or_default(), code);
+                last = Some(key);
+                if blocks.contains_key(&key) {
+                    return;
+                }
+                let block = previous
+                    .remove(&key)
+                    .or_else(|| {
+                        let mut block = previous.remove(&open.take()?)?;
+                        block
+                            .extend(language.and_then(prose::fence_language), code)
+                            .then_some(block)
+                    })
+                    .unwrap_or_else(|| {
+                        prose::CodeBlock::open(
+                            language.and_then(prose::fence_language),
+                            code,
+                            theme,
+                        )
+                    });
+                blocks.insert(key, block);
+            },
+        );
         for (key, block) in &mut blocks {
             if Some(*key) != last {
                 block.settle();
@@ -3327,7 +3340,10 @@ impl Cagents {
                     .get(&item.id)
                     .and_then(|cached| cached.coordination.as_deref());
                 let mut unfolded = false;
-                for (part, text) in coordinated.map(coordination::Coordinated::parts).unwrap_or_default() {
+                for (part, text) in coordinated
+                    .map(coordination::Coordinated::parts)
+                    .unwrap_or_default()
+                {
                     if find::contains(text, query) {
                         unfolded = true;
                         runtime
@@ -7012,13 +7028,11 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime
-                        .find_disclosure
-                        .restore(
-                            &mut runtime.expanded,
-                            &mut runtime.unfolded,
-                            &mut runtime.opened,
-                        );
+                    runtime.find_disclosure.restore(
+                        &mut runtime.expanded,
+                        &mut runtime.unfolded,
+                        &mut runtime.opened,
+                    );
                     runtime.find = Some(query);
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
@@ -7028,13 +7042,11 @@ impl Cagents {
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
             Action::CloseFind(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime
-                        .find_disclosure
-                        .restore(
-                            &mut runtime.expanded,
-                            &mut runtime.unfolded,
-                            &mut runtime.opened,
-                        );
+                    runtime.find_disclosure.restore(
+                        &mut runtime.expanded,
+                        &mut runtime.unfolded,
+                        &mut runtime.opened,
+                    );
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
@@ -7235,7 +7247,10 @@ impl Cagents {
                                 previous,
                                 runtime.expanded.contains(&id),
                                 false,
-                                chat::coordination::recognize(item, runtime.session.launch.provider),
+                                chat::coordination::recognize(
+                                    item,
+                                    runtime.session.launch.provider,
+                                ),
                             ),
                         );
                     }
@@ -7296,9 +7311,9 @@ impl Cagents {
                             match card {
                                 // A message read from a file copies as the
                                 // command that sent it.
-                                Some(card) if matches!(part, CopyPart::Text) => card
-                                    .copy_text()
-                                    .or_else(|| copy_text(part, &item.content)),
+                                Some(card) if matches!(part, CopyPart::Text) => {
+                                    card.copy_text().or_else(|| copy_text(part, &item.content))
+                                }
                                 _ => copy_text(part, &item.content),
                             }
                         }),
@@ -7324,31 +7339,21 @@ impl Cagents {
                 }
             }
             Action::OpenSession(prefix) => {
-                let mut sessions = self
-                    .durable
-                    .cards
-                    .iter()
-                    .filter(|card| card.existence.is_open())
-                    .filter_map(notification_ui::card_session)
-                    .filter(|session| session.to_string().starts_with(&prefix));
-                let session = match (sessions.next(), sessions.next()) {
-                    (Some(session), None) => session,
-                    (None, _) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Session {prefix} is not open in this window."
-                        )));
-                        return Task::none();
-                    }
-                    (Some(_), Some(_)) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "More than one open session starts with {prefix}."
-                        )));
-                        return Task::none();
-                    }
-                };
-                return self.update_notifications(notification_ui::Action::Activated(
-                    crate::notifications::Target::Session(session),
-                ));
+                return self.open_session_link(prefix);
+            }
+            Action::SessionResolved(result) => {
+                return self.session_link_resolved(result);
+            }
+            Action::SessionLinkWindowBackend(slot, session, wayland) => {
+                return self.session_window_backend(slot, session, wayland);
+            }
+            Action::SessionLinkToken(slot, session, token) => {
+                return session_links::handoff_session_window(slot, session, token);
+            }
+            Action::SessionLinkOpened(result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::warning(error));
+                }
             }
             Action::OpenUrl(raw) => match Url::parse(&raw) {
                 Ok(url) if matches!(url.scheme(), "https" | "http" | "file") => {

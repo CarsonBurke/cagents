@@ -2212,6 +2212,63 @@ pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(live)
 }
 
+/// Read navigation identities without migrating or acquiring another window's
+/// writer. Closed chats remain navigable through the conversation resume path.
+pub fn read_navigable_session_ids(path: &Path) -> Result<Vec<TerminalId>> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    let transaction = connection.transaction()?;
+    let mut statement = transaction.prepare(
+        "SELECT c.kind_tag, c.content_json, c.existence_json, t.terminal_id
+         FROM cards c LEFT JOIN terminal_recipes t ON t.card_id = c.card_id
+         WHERE c.kind_tag IN ('chat', 'terminal')",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let identity: Result<Option<TerminalId>> = (|| {
+            let (kind, content, existence, terminal) = row?;
+            let open = from_json::<Existence>("session existence", &existence)?.is_open();
+            match kind.as_str() {
+                "terminal" if open => terminal.map(|id| parse_id("terminal", &id)).transpose(),
+                "chat" => {
+                    #[derive(serde::Deserialize)]
+                    struct Identity {
+                        id: TerminalId,
+                        launch: LaunchIdentity,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct LaunchIdentity {
+                        session_id: Option<String>,
+                    }
+                    let Some(content) = content else {
+                        return Ok(None);
+                    };
+                    let identity = from_json::<Identity>("chat identity", &content)?;
+                    Ok((open || identity.launch.session_id.is_some()).then_some(identity.id))
+                }
+                _ => Ok(None),
+            }
+        })();
+        match identity {
+            Ok(Some(id)) => ids.push(id),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "Skipping unreadable saved session identity"),
+        }
+    }
+    Ok(ids)
+}
+
 /// Saved ownership evidence from another window. Directory scopes are not
 /// project identities: callers must classify them against current shared roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6318,6 +6375,39 @@ mod tests {
     }
 
     #[test]
+    fn session_navigation_reads_open_terminals_and_closed_conversations_without_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("navigation.sqlite3");
+        let (mut workspace, session) = agent_workspace(crate::agent::Provider::Claude);
+        let store = StateStore::open(&path, boot("navigation")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let CardKind::Terminal(terminal) = &workspace.cards[0].kind else {
+            panic!("terminal fixture");
+        };
+        assert_eq!(
+            read_navigable_session_ids(&path).unwrap(),
+            vec![terminal.id]
+        );
+        workspace.cards[0].kind = CardKind::Chat(session.clone());
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        let before = store.stored_generations(workspace.id).unwrap().workspace;
+        assert_eq!(read_navigable_session_ids(&path).unwrap(), vec![session.id]);
+        assert_eq!(
+            store.stored_generations(workspace.id).unwrap().workspace,
+            before
+        );
+    }
+
+    #[test]
     fn saved_conversations_retain_closed_chats_after_restart_and_omit_drafts() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("resume.sqlite3");
@@ -6372,6 +6462,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.saved_conversations().unwrap().len(), 1);
+        assert_eq!(
+            read_navigable_session_ids(&path).unwrap(),
+            vec![saved[0].session.id]
+        );
     }
 
     #[test]
