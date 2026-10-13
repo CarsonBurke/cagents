@@ -372,6 +372,8 @@ fn create_inner(
             prediction_turn: None,
             predictions_unsupported: false,
             subagent_status: None,
+            subagent_waiting: false,
+            subagent_detail: String::new(),
             ready: false,
             attached: false,
             direct_input: false,
@@ -494,6 +496,8 @@ struct Codex {
     prediction_turn: Option<String>,
     predictions_unsupported: bool,
     subagent_status: Option<ToolStatus>,
+    subagent_waiting: bool,
+    subagent_detail: String,
     ready: bool,
     attached: bool,
     direct_input: bool,
@@ -589,6 +593,15 @@ impl Codex {
                 Pending::ChildResume(id.into()),
             )?;
         }
+        let model = metadata["model"]
+            .as_str()
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        if let Some(model) = &model
+            && let Some(child) = self.children.get_mut(id)
+        {
+            child.selected = Some(model.clone());
+        }
         let status = agent_status(&metadata["status"]);
         if let Some(status) = status
             && let Some(child) = self.children.get_mut(id)
@@ -597,6 +610,9 @@ impl Codex {
             child.subagent_status = Some(status);
         }
         step.events.push(Event::Subagent {
+            model,
+            waiting: None,
+            detail: None,
             id: id.into(),
             kind: metadata["agentNickname"]
                 .as_str()
@@ -621,10 +637,18 @@ impl Codex {
         if content.events.iter().any(|event| {
             matches!(
                 event,
-                Event::Status { .. } | Event::TurnFinished { .. } | Event::Ready(false)
+                Event::Status { .. }
+                    | Event::Waiting(_)
+                    | Event::Models { .. }
+                    | Event::TurnFinished { .. }
+                    | Event::Ready(false)
             )
         }) {
+            let child = self.children.get(id);
             step.events.push(Event::Subagent {
+                model: child.and_then(|child| child.selected.clone()),
+                waiting: child.map(|child| child.subagent_waiting),
+                detail: child.map(|child| child.subagent_detail.clone()),
                 id: id.into(),
                 kind: String::new(),
                 description: String::new(),
@@ -959,6 +983,32 @@ impl Codex {
             && (self.active_items.len() < MAX_ACTIVE_ITEMS
                 || self.active_items.contains_key(&item.id))
     }
+    /// An idle thread says nothing about whether its last turn succeeded.
+    /// Recover that outcome from the latest page, never an older page or while
+    /// live work is running. Buffered live notifications are replayed afterward.
+    fn child_history_outcome(&mut self, turn: Option<&Value>, step: &mut Step) {
+        if !self.is_child || self.busy {
+            return;
+        }
+        let Some(status) = turn.and_then(|turn| agent_status(&turn["status"])) else {
+            return;
+        };
+        if status == ToolStatus::Running || self.subagent_status == Some(status) {
+            return;
+        }
+        self.subagent_status = Some(status);
+        self.subagent_waiting = false;
+        self.subagent_detail = turn
+            .map(|turn| turn_detail(&turn["status"]))
+            .unwrap_or_default();
+        step.events.push(Event::Status {
+            busy: false,
+            detail: turn
+                .map(|turn| turn_detail(&turn["status"]))
+                .unwrap_or_default(),
+        });
+    }
+
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
         for turn in array(page, "data")?.iter().rev() {
@@ -1000,7 +1050,16 @@ impl Codex {
                         .filter_map(Value::as_str)
                         .take(32)
                     {
-                        self.discover_child(id, &value["agentsStates"][id], step)?;
+                        let mut metadata = value["agentsStates"][id].clone();
+                        // History describes the child at the time of this call.
+                        // A live subscription or prior hydration owns its current
+                        // outcome; paging an old spawn must not restart it.
+                        if self.children.contains_key(id)
+                            && let Some(metadata) = metadata.as_object_mut()
+                        {
+                            metadata.remove("status");
+                        }
+                        self.discover_child(id, &metadata, step)?;
                     }
                 }
                 for item in parse_item(value, !active, turn_id)? {
@@ -1019,6 +1078,9 @@ impl Codex {
                     items.push(item);
                 }
             }
+        }
+        if !earlier {
+            self.child_history_outcome(array(page, "data")?.first(), step);
         }
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
@@ -2040,6 +2102,11 @@ impl Adapter for Codex {
                     }
                     if let Some(child) = self.children.get_mut(&id) {
                         let mut content = Step::default();
+                        child.selected = result["model"]
+                            .as_str()
+                            .filter(|model| !model.is_empty())
+                            .map(str::to_owned)
+                            .or_else(|| child.selected.clone());
                         child.thread_state(&result["thread"], &mut content)?;
                         child.ready = true;
                         child.materialized = true;
@@ -2053,6 +2120,12 @@ impl Adapter for Codex {
                                     }
                                 }
                             }
+                            child.child_history_outcome(
+                                result["thread"]["turns"]
+                                    .as_array()
+                                    .and_then(|turns| turns.last()),
+                                &mut content,
+                            );
                             if result["thread"]["turns"]
                                 .as_array()
                                 .is_none_or(Vec::is_empty)
@@ -2284,6 +2357,8 @@ impl Adapter for Codex {
                     }
                     self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                     self.busy = method == "turn/started";
+                    self.subagent_waiting = false;
+                    self.subagent_detail = turn_detail(&turn["status"]);
                     self.subagent_status = if self.busy {
                         Some(ToolStatus::Running)
                     } else {
@@ -2483,6 +2558,8 @@ impl Adapter for Codex {
             "thread/closed" | "thread/deleted" => {
                 self.ready = false;
                 self.attached = false;
+                self.subagent_waiting = false;
+                self.subagent_detail = "Agent disconnected".into();
                 step.events.push(Event::Ready(false));
                 self.busy = false;
                 self.subagent_status = Some(
@@ -2592,6 +2669,8 @@ impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
         self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
         self.busy = status["type"] == "active";
+        self.subagent_waiting = waiting_on_user(status);
+        self.subagent_detail = status_detail(status);
         match status["type"].as_str() {
             Some("active") => self.subagent_status = Some(ToolStatus::Running),
             Some("systemError") => self.subagent_status = Some(ToolStatus::Failed),
@@ -2611,6 +2690,9 @@ impl Codex {
             return Err("Codex metadata belongs to a different thread".into());
         }
         self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
+        if let Some(model) = thread["model"].as_str().filter(|model| !model.is_empty()) {
+            self.selected = Some(model.to_owned());
+        }
         self.observe_thread_status(&thread["status"]);
         step.events
             .push(Event::Waiting(waiting_on_user(&thread["status"])));
@@ -3698,6 +3780,8 @@ mod tests {
             prediction_turn: None,
             predictions_unsupported: false,
             subagent_status: None,
+            subagent_waiting: false,
+            subagent_detail: String::new(),
             ready: true,
             attached: true,
             direct_input: true,
@@ -4331,6 +4415,100 @@ mod tests {
         assert!(adapter.children.contains_key("child"));
         assert!(adapter.children.contains_key("grandchild"));
         assert!(!adapter.children.contains_key("foreign"));
+    }
+
+    #[test]
+    fn child_history_recovers_failed_and_interrupted_outcomes_without_rewinding_live_work() {
+        for (outcome, expected) in [
+            ("failed", ToolStatus::Failed),
+            ("interrupted", ToolStatus::Stopped),
+            ("completed", ToolStatus::Succeeded),
+        ] {
+            let mut parent = adapter();
+            let mut discovered = Step::default();
+            parent
+                .discover_child("child", &json!({"status":"running"}), &mut discovered)
+                .unwrap();
+            let restored = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child","status":{"type":"idle"}},"initialTurnsPage":{"data":[{"id":"latest","status":outcome,"items":[]},{"id":"older","status":"completed","items":[]}],"nextCursor":null}}})).unwrap();
+            assert_eq!(parent.children["child"].subagent_status, Some(expected));
+            assert!(restored.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(status), .. } if id == "child" && *status == expected)));
+            let child = parent.children.get_mut("child").unwrap();
+            let mut page = Step::default();
+            child.page(&json!({"data":[{"id":"oldest","status":"completed","items":[]}],"nextCursor":null}), &mut page, true).unwrap();
+            assert_eq!(child.subagent_status, Some(expected));
+            child.observe_thread_status(&json!({"type":"active"}));
+            child.page(&json!({"data":[{"id":"latest","status":outcome,"items":[]}],"nextCursor":null}), &mut page, false).unwrap();
+            assert_eq!(child.subagent_status, Some(ToolStatus::Running));
+            assert!(child.busy);
+        }
+    }
+
+    #[test]
+    fn paging_historical_collaboration_cannot_restart_a_finished_child() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.is_child = true;
+        child.thread = Some("child".into());
+        child.subagent_status = Some(ToolStatus::Failed);
+        parent.children.insert("child".into(), Box::new(child));
+        let mut step = Step::default();
+        parent.page(&json!({"data":[{"id":"older","status":"completed","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-exact","receiverThreadIds":["child"],"agentsStates":{"child":{"status":"running","agentNickname":"Scout"}}}]}],"nextCursor":null}), &mut step, true).unwrap();
+        assert_eq!(
+            parent.children["child"].subagent_status,
+            Some(ToolStatus::Failed)
+        );
+        assert!(step.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, status:None, .. } if id == "child" && kind == "Scout")));
+        assert!(!step.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Running),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn child_model_and_waiting_state_follow_its_own_thread_lifecycle() {
+        let mut parent = adapter();
+        let mut discovered = Step::default();
+        parent
+            .discover_child("child", &json!({}), &mut discovered)
+            .unwrap();
+        assert!(
+            discovered
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Subagent { model: None, .. }))
+        );
+        let attached = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"model":"gpt-child","thread":{"id":"child","status":{"type":"active","activeFlags":["waitingOnApproval"]}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        assert!(attached.events.iter().any(|event| matches!(event, Event::Subagent { model:Some(model), waiting:Some(true), detail:Some(detail), .. } if model == "gpt-child" && detail == "Waiting for your approval")));
+        let answered = parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":[]}}})).unwrap();
+        assert!(answered.events.iter().any(|event| matches!(event, Event::Subagent { model:Some(model), waiting:Some(false), detail:Some(detail), status:Some(ToolStatus::Running), .. } if model == "gpt-child" && detail.is_empty())));
+        parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}})).unwrap();
+        let finished = parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"latest","status":"completed","items":[]}}})).unwrap();
+        assert!(finished.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                waiting: Some(false),
+                status: Some(ToolStatus::Succeeded),
+                ..
+            }
+        )));
+        assert_eq!(parent.selected.as_deref(), Some("model"));
+    }
+
+    #[test]
+    fn child_legacy_embedded_history_retains_the_latest_turn_outcome() {
+        let mut parent = adapter();
+        let mut discovered = Step::default();
+        parent
+            .discover_child("child", &json!({}), &mut discovered)
+            .unwrap();
+        parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child","status":{"type":"idle"},"turns":[{"id":"older","status":"completed","items":[]},{"id":"latest","status":"failed","items":[]}]}}})).unwrap();
+        assert_eq!(
+            parent.children["child"].subagent_status,
+            Some(ToolStatus::Failed)
+        );
     }
 
     #[test]

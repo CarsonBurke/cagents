@@ -2736,6 +2736,9 @@ mod tests {
                     sampled_at: Some(999_999),
                     generation: 3,
                     subagents: vec![super::super::Subagent {
+                        model: None,
+                        waiting: false,
+                        detail: String::new(),
                         id: "missing-child-patch".into(),
                         kind: "review".into(),
                         description: String::new(),

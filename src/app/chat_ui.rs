@@ -8941,6 +8941,9 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot)
             .subagents
             .push(chat::Subagent {
+                model: None,
+                waiting: false,
+                detail: String::new(),
                 id: "child".into(),
                 kind: "fixture".into(),
                 description: "Child".into(),
@@ -9068,6 +9071,9 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot)
             .subagents
             .push(chat::Subagent {
+                model: None,
+                waiting: false,
+                detail: String::new(),
                 id: "child".into(),
                 kind: "fixture".into(),
                 description: "Child".into(),
@@ -9511,6 +9517,9 @@ mod tests {
             items: vec![item("parent", body)],
             subagents: vec![
                 chat::Subagent {
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
                     id: "running-child".into(),
                     kind: "task".into(),
                     description: String::new(),
@@ -9519,6 +9528,9 @@ mod tests {
                     items: vec![item("child-first", body)],
                 },
                 chat::Subagent {
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
                     id: "finished-child".into(),
                     kind: "task".into(),
                     description: String::new(),
@@ -9655,6 +9667,9 @@ mod tests {
                 generation: 10,
                 ready: true,
                 subagents: vec![chat::Subagent {
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
                     id: "child".into(),
                     kind: "task".into(),
                     description: String::new(),
@@ -11934,6 +11949,9 @@ mod tests {
         snapshot.busy = true;
         snapshot.capabilities.interrupt_stops_background = true;
         snapshot.subagents.push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
             id: "background".into(),
             kind: String::new(),
             description: String::new(),

@@ -1174,6 +1174,9 @@ impl Claude {
                                 item.content.status().unwrap_or(ToolStatus::Running)
                             };
                             step.events.push(Event::Subagent {
+                                model: None,
+                                waiting: None,
+                                detail: None,
                                 id: tool_id.clone(),
                                 kind: String::new(),
                                 description: String::new(),
@@ -1260,6 +1263,9 @@ impl Claude {
             .collect();
         if let Some(parent) = child {
             step.events.push(Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
                 id: parent.into(),
                 kind: string(frame, "subagent_type").into(),
                 description: string(frame, "task_description").into(),
@@ -1492,6 +1498,9 @@ impl Adapter for Claude {
             statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
             for (id, status) in statuses {
                 history_step.events.push(Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: id.clone(),
                     kind: String::new(),
                     description: String::new(),
@@ -1505,6 +1514,9 @@ impl Adapter for Claude {
             for (parent, kind, description, frames) in history.subagent_frames().unwrap_or_default()
             {
                 history_step.events.push(Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     background: None,
                     id: parent.clone(),
                     kind,
@@ -3757,6 +3769,9 @@ impl Claude {
                 if let Some(parent) = parent {
                     let status = item.content.status().unwrap_or(ToolStatus::Running);
                     step.events.push(Event::Subagent {
+                        model: None,
+                        waiting: None,
+                        detail: None,
                         id: parent.clone(),
                         kind: String::new(),
                         description: String::new(),
@@ -3773,6 +3788,9 @@ impl Claude {
                     && let Some(tool) = known_tool
                 {
                     step.events.push(Event::Subagent {
+                        model: None,
+                        waiting: None,
+                        detail: None,
                         id: tool,
                         kind: String::new(),
                         description: String::new(),

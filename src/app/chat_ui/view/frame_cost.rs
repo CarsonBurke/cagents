@@ -477,6 +477,9 @@ fn long_streaming_block(background: bool) {
     pane.metadata.busy = !background;
     if background {
         pane.metadata.subagents.push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
             id: "streaming-child".into(),
             kind: "task".into(),
             description: "The child continues after its parent settled".into(),
