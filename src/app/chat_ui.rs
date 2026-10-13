@@ -6826,6 +6826,10 @@ impl Cagents {
                             text.push('\n');
                         }
                         text.push_str(provided);
+                        // Appending promotes the recalled prompt to the unsent
+                        // draft, just as typing or completing a word does.
+                        runtime.history_cursor = None;
+                        runtime.history_stash = None;
                         runtime.replace_draft(text_editor::Content::with_text(&text));
                     }
                 }
@@ -12000,6 +12004,34 @@ mod tests {
         assert!(runtime.snapshot.busy && runtime.snapshot.capabilities.steer);
         drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
         assert_eq!(chat_runtime(&app, card).composer.text(), original);
+    }
+
+    #[test]
+    fn appended_provider_draft_leaves_history_and_persists_the_visible_text() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("history"));
+        write(&mut app, card, "original unsent draft");
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["sent prompt".into()];
+            Arc::make_mut(&mut runtime.snapshot).composer = Some("provider suggestion".into());
+        }
+        drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+        drop(app.update(Message::ChatUi(Action::AppendProviderDraft(target))));
+
+        let expected = "sent prompt\nprovider suggestion";
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), expected);
+        assert_eq!(runtime.unsent_text(), expected);
+        assert_eq!(runtime.history_cursor, None);
+        assert!(runtime.history_stash.is_none());
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], expected);
+
+        drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+        assert_eq!(chat_runtime(&app, card).composer.text(), expected);
+        app.chat_forget(card);
+        assert_eq!(app.chat_ui.drafts[&card], expected);
     }
 
     #[test]
