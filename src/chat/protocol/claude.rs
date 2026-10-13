@@ -463,19 +463,14 @@ impl Claude {
             }
         }
     }
-    fn hide_task_rows_for_agent(&mut self, tool: &str, step: &mut Step) {
-        let ids: Vec<_> = self
-            .agent_task_calls
+    fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
+        self.agent_task_calls
             .iter()
             .filter(|(known, _)| known == tool)
             .map(|(_, task)| format!("claude-task:{task}"))
             .filter(|id| self.visible_task_rows.remove(id))
-            .collect();
-        if !ids.is_empty() {
-            step.events.push(Event::ItemsRemoved { ids });
-        }
+            .collect()
     }
-
     fn remember_tool_input(&mut self, id: &str, input: &Value) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
             return Ok(());
@@ -955,6 +950,7 @@ impl Claude {
             .as_str()
             .filter(|id| !id.is_empty());
         let event_start = step.events.len();
+        let mut global_task_removals = Vec::new();
         let role = if string(frame, "type") == "user" {
             Role::User
         } else {
@@ -1099,7 +1095,7 @@ impl Claude {
                                 .is_some_and(|status| status != ToolStatus::Running)
                         }) {
                             if string(block, "name") == "Agent" {
-                                self.hide_task_rows_for_agent(&tool_id, step);
+                                global_task_removals.extend(self.task_rows_for_agent(&tool_id));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -1275,6 +1271,14 @@ impl Claude {
             route_subagent_events(&mut step.events, event_start, parent);
         }
         self.track_carrier(carrier, ids, child);
+        // System task rows belong to the main transcript even if the Agent
+        // tool arrives in a nested transcript. Emit their removals only after
+        // routing that tool's own events to its parent agent.
+        if !global_task_removals.is_empty() {
+            step.events.push(Event::ItemsRemoved {
+                ids: global_task_removals,
+            });
+        }
         Ok(())
     }
     fn agent_call(&mut self, agent: &str, tool: &str) {
@@ -6720,6 +6724,23 @@ mod tests {
             )
         );
         assert!(adapter.visible_task_rows.is_empty());
+    }
+
+    #[test]
+    fn a_late_nested_agent_retracts_its_task_row_from_the_main_transcript() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"nested-task","tool_use_id":"nested-tool","task_type":"local_agent","description":"Inspect nested"})).unwrap();
+        assert!(started.events.iter().any(
+            |event| matches!(event, Event::Item(item) if item.id == "claude-task:nested-task")
+        ));
+        let agent = adapter.receive(json!({"type":"assistant","uuid":"nested-launch","parent_tool_use_id":"outer-agent","message":{"id":"nested-message","content":[{"type":"tool_use","id":"nested-tool","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(agent.events.iter().any(|event| matches!(event, Event::ItemsRemoved { ids } if ids == &["claude-task:nested-task"])));
+        assert!(!agent.events.iter().any(|event| matches!(event, Event::SubagentItemsRemoved { ids, .. } if ids.contains(&"claude-task:nested-task".into()))));
+        assert!(agent.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id == "outer-agent" && item.id == "nested-tool")));
+        let progress = adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"nested-task","patch":{"summary":"Checking nested"}})).unwrap();
+        assert!(!progress.events.iter().any(
+            |event| matches!(event, Event::Item(item) if item.id == "claude-task:nested-task")
+        ));
     }
 
     #[test]
