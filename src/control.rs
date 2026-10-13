@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+mod accounts;
+pub use accounts::AccountCommand;
 mod agents;
 pub use agents::AgentCommand;
 mod automations;
@@ -97,6 +99,11 @@ pub enum TopCommand {
     Linear(LinearCommand),
     /// Show this session, its parent and agents, and peers in the same checkout.
     Whoami,
+    /// Inspect account plan allowances and the calling session’s context.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
     /// List live agent sessions in this project, whoever started them.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
@@ -2031,6 +2038,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Project { .. }
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
+        | TopCommand::Account { .. }
         | TopCommand::Whoami
         | TopCommand::Sessions(_)
         | TopCommand::Send(_)
@@ -2091,6 +2099,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
+        TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),

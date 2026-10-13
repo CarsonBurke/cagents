@@ -141,7 +141,8 @@ use crate::{
 /// in sparse events and snapshots.
 /// Version 72 carries native fast-mode capabilities/state, its setting command,
 /// and separately labeled API-equivalent Codex cost estimates.
-pub const PROTOCOL_VERSION: u16 = 75;
+/// Version 76 exposes non-secret account usage through delegated execution.
+pub const PROTOCOL_VERSION: u16 = 76;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

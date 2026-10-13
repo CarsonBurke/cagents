@@ -378,6 +378,8 @@ pub enum Operation {
     },
     /// Read the caller and the sessions in a scope. Grants no control.
     Directory(directory::Scope),
+    /// Read non-secret cached account allowances and authenticated caller usage.
+    AccountInfo(crate::account::info::Query),
     /// The latest run's pending questions and approvals. Owner only.
     Requests(AgentId),
     /// Act on the latest run without a console. Owner only.
@@ -451,6 +453,7 @@ pub enum Reply {
     Closed(Agent),
     Console(Option<ConsoleView>),
     Directory(directory::Directory),
+    AccountInfo(crate::account::info::Report),
     /// Requests still pending after a read or a control.
     Requests(Vec<chat::Request>),
     Sent(mailbox::Sent),

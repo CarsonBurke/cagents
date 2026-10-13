@@ -373,10 +373,10 @@ pub fn database(environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf>
     root.is_absolute().then(|| root.join("agent.db"))
 }
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub use reader::{History, read};
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 mod reader {
     use std::path::Path;
     use std::time::Duration;

@@ -32,6 +32,7 @@ pub mod codex;
 pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod home;
+pub mod info;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
@@ -130,10 +131,21 @@ impl std::str::FromStr for AccountId {
         let Some((provider, key)) = value.split_once('/') else {
             return Err("Use a provider/account ID, such as claude/system".into());
         };
+        let brokered = provider == "omp"
+            && key.split_once('/').is_some_and(|(service, digest)| {
+                !service.is_empty()
+                    && service.as_bytes()[0].is_ascii_alphanumeric()
+                    && service.len() <= 128
+                    && service.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                    && digest.len() == 16
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
         if !Provider::ALL
             .iter()
             .any(|candidate| candidate.executable() == provider)
-            || !(key == "system" || uuid::Uuid::parse_str(key).is_ok())
+            || !(key == "system" || uuid::Uuid::parse_str(key).is_ok() || brokered)
         {
             return Err("Use a provider followed by /system or a registered account UUID".into());
         }

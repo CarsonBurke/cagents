@@ -67,6 +67,37 @@ Acceptance and its dispatch claim commit to the daemon's SQLite registry with `s
 
 If a daemon restart loses proof of an accepted prompt's outcome, the run becomes `Interrupted`. Its external effects may already have happened. It is never resent automatically and retains its concurrency reservation until explicitly reconciled/closed. A private pending launch record preserves ownership if a process started but its final descriptor could not be committed. Such a record is not exposed as an adoptable UI session. A startup failure that retains a known hosted session reports that descriptor; inspect or close it before deciding how to proceed.
 
+## Reading context and account budgets
+
+```sh
+cagents account info --json
+cagents account info --provider claude --json
+cagents account info --account claude/system --refresh --json
+```
+
+An agent can read its latest reported context usage and the cached plan allowances of
+its selected and other configured accounts. Caller identity is authenticated
+by the daemon; selected account identity comes from the existing session's
+captured effective execution environment, independent of the provider default for future chats. Native caller
+usage reads resident metadata and never loads the conversation transcript.
+Terminal caller context and selected account binding remain unknown: the
+foreground provider can inherit bindings changed after the shell started, so a
+PTY launch environment does not prove its current account. Cached allowances
+for the configured accounts remain available. Context tokens are occupancy, separate from cumulative input
+and output token counts. Occupancy can lag during a running turn; the daemon
+query time does not establish when that occupancy was observed.
+
+The default report is read-only and does not start provider probes. Explicit
+refresh requires a single account ID and uses the existing isolated provider
+usage query; it does not send a model prompt. The JSON report preserves source,
+observation time, age, stale windows, elapsed resets, identity conflicts, and
+unknown values. A selected archived account remains readable, marked archived,
+without becoming eligible for new work. Plan remaining fractions use reported
+rate limits; extra-usage balances and derived remaining money are separate.
+API-equivalent token costs cannot establish how much subscription allowance
+remains. See [account configuration](account-configuration.md#reading-usage-from-the-cli)
+for the full report contract.
+
 ## Finding other sessions
 
 `cagents sessions` (alias `ls`) lists the live provider conversations in the current project, whoever started them. That includes native chats, provider CLIs running in terminals, delegated agents, and automations. `--project PATH` selects another open project; `--all` lists every project. A directory outside every open project lists everything, and the reply's `scope` says so.

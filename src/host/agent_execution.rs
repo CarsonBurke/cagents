@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod account_info;
 mod directory;
 pub(super) mod mailbox;
 mod ownership;
@@ -850,6 +851,9 @@ pub(super) fn process(
         Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
+        }
+        Operation::AccountInfo(query) => {
+            account_info::read(host, &authority, query).map(Reply::AccountInfo)
         }
         Operation::Requests(id) => {
             let (_, _, handle) = owned_provider(host, &authority, id)?;
