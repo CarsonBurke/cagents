@@ -138,8 +138,16 @@ struct Omp {
 struct Execution {
     run: crate::model::RunId,
     request: String,
+    accepted: bool,
+    acknowledged_start: bool,
     observing: bool,
     settled: bool,
+    usage_before: chat::Usage,
+    session: Option<String>,
+    /// Older OMP builds emit a terminal agent_end but no correlated result.
+    /// Confirm its known outcome with the idle state requested after that end.
+    completion_probe: Option<(String, crate::notifications::Kind)>,
+    completion_outcome: Option<crate::notifications::Kind>,
 }
 struct Chunk {
     next: usize,
@@ -230,6 +238,13 @@ impl Omp {
         let id = format!("cagents-{}", self.sequence);
         if kind == "get_state" {
             self.state_request = Some(id.clone());
+            if let Some((probe, _)) = self
+                .execution
+                .as_mut()
+                .and_then(|execution| execution.completion_probe.as_mut())
+            {
+                *probe = id.clone();
+            }
         }
         if kind == "get_branch_messages" {
             self.branch_request = Some(id.clone());
@@ -690,8 +705,14 @@ impl Adapter for Omp {
         self.execution = Some(Execution {
             run,
             request: request.clone(),
+            accepted: false,
+            acknowledged_start: false,
             observing: false,
             settled: false,
+            usage_before: self.usage.clone(),
+            session: self.session_id.clone(),
+            completion_probe: None,
+            completion_outcome: None,
         });
         step.events.insert(
             0,
@@ -952,6 +973,13 @@ impl Adapter for Omp {
                     return Ok(step);
                 }
                 let data = &frame["data"];
+                if text(&frame, "command") == "prompt"
+                    && let Some(execution) = self.execution.as_mut().filter(|execution| {
+                        frame["id"].as_str() == Some(execution.request.as_str())
+                    })
+                {
+                    execution.accepted = true;
+                }
                 match text(&frame, "command") {
                     "negotiate_protocol" => step = self.refresh(),
                     "follow_up" => {
@@ -1064,6 +1092,18 @@ impl Adapter for Omp {
                         self.usage.context_tokens = usage["tokens"].as_u64().unwrap_or(0);
                         self.usage.context_limit = usage["contextWindow"].as_u64().unwrap_or(0);
                         step.events.push(Event::Usage(self.usage.clone()));
+                        if data["isStreaming"].as_bool() == Some(false)
+                            && data["isCompacting"].as_bool() == Some(false)
+                            && let Some((request, outcome)) =
+                                self.execution.as_ref().and_then(|execution| {
+                                    let (probe, outcome) = execution.completion_probe.as_ref()?;
+                                    (frame["id"].as_str() == Some(probe.as_str())
+                                        && execution.session.as_deref() == Some(id))
+                                    .then(|| (execution.request.clone(), *outcome))
+                                })
+                        {
+                            self.finish_execution(&request, outcome, &mut step);
+                        }
                     }
                     "get_available_models" => {
                         let models = data["models"]
@@ -1344,12 +1384,18 @@ impl Adapter for Omp {
                     step.events.push(Event::TurnStarted);
                     self.turn_outcome = None;
                     self.agent_turn_active = true;
+                    if let Some(execution) = &mut self.execution {
+                        // An old idle reply cannot finish a run after a newer
+                        // autonomous/extension turn has begun.
+                        execution.completion_probe = None;
+                    }
                     if let Some(execution) = self
                         .execution
                         .as_mut()
                         .filter(|execution| !execution.settled)
                     {
                         execution.observing = true;
+                        execution.acknowledged_start = execution.accepted;
                     }
                 }
                 self.busy = true;
@@ -1363,7 +1409,10 @@ impl Adapter for Omp {
                     .into(),
                 });
             }
-            "agent_end" if frame["isTerminal"].as_bool() == Some(false) => {
+            "agent_end"
+                if frame["isTerminal"].as_bool() == Some(false)
+                    || frame["willContinue"].as_bool() == Some(true) =>
+            {
                 // OMP can yield for maintenance or asynchronous delivery and
                 // resume the same run. Older runtimes omit this field, so only
                 // an explicit false excludes the terminal boundary below.
@@ -1383,6 +1432,19 @@ impl Adapter for Omp {
                 };
                 self.busy = false;
                 step = self.refresh();
+                if finished
+                    && let Some(execution) = self
+                        .execution
+                        .as_ref()
+                        .filter(|execution| !execution.settled)
+                    && let Some(usage) =
+                        terminal_run_usage(&execution.usage_before, &frame["messages"])
+                {
+                    self.usage.input_tokens = usage.input_tokens;
+                    self.usage.output_tokens = usage.output_tokens;
+                    self.usage.cost_microusd = usage.cost_microusd;
+                    step.events.push(Event::Usage(self.usage.clone()));
+                }
                 if finished {
                     step.events.push(Event::TurnSettled);
                 }
@@ -1400,10 +1462,25 @@ impl Adapter for Omp {
                 {
                     execution.settled = true;
                     execution.observing = false;
+                    if execution.acknowledged_start
+                        && let Some(outcome) = outcome
+                    {
+                        execution.completion_outcome = Some(outcome);
+                    }
                     step.events.push(Event::Execution {
                         run: execution.run,
                         event: crate::agent_execution::ProviderEvent::Settled,
                     });
+                }
+                if finished
+                    && let Some(execution) = self
+                        .execution
+                        .as_mut()
+                        .filter(|execution| execution.settled)
+                    && let Some(outcome) = execution.completion_outcome
+                    && let Some(probe) = &self.state_request
+                {
+                    execution.completion_probe = Some((probe.clone(), outcome));
                 }
                 step.events.push(Event::Status {
                     busy: false,
@@ -1420,6 +1497,9 @@ impl Adapter for Omp {
                         Some("completed") => crate::notifications::Kind::Succeeded,
                         Some("aborted") => crate::notifications::Kind::Cancelled,
                         Some("error") => crate::notifications::Kind::Failed,
+                        None if frame["agentInvoked"].as_bool() == Some(false) => {
+                            crate::notifications::Kind::Succeeded
+                        }
                         _ => {
                             return Err(
                                 "OMP completed an accepted prompt with an unknown outcome".into()
@@ -1456,6 +1536,28 @@ impl Adapter for Omp {
         Ok(step)
     }
 }
+fn terminal_run_usage(before: &chat::Usage, messages: &Value) -> Option<chat::Usage> {
+    let mut usage = before.clone();
+    let mut observed = false;
+    for message in messages
+        .as_array()?
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+    {
+        let input = message["usage"]["input"].as_u64()?;
+        let output = message["usage"]["output"].as_u64()?;
+        observed = true;
+        usage.input_tokens = usage.input_tokens.saturating_add(input);
+        usage.output_tokens = usage.output_tokens.saturating_add(output);
+        usage.cost_microusd = usage.cost_microusd.and_then(|before| {
+            let cost = message["usage"]["cost"]["total"].as_f64()?;
+            (cost.is_finite() && cost >= 0.0)
+                .then(|| before.saturating_add((cost * 1_000_000.0) as u64))
+        });
+    }
+    observed.then_some(usage)
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or_default()
 }
@@ -1799,6 +1901,355 @@ mod tests {
         assert!(thinking.events.iter().any(
             |event| matches!(event, Event::Models { reasoning:Some(level), .. } if level == "auto")
         ));
+    }
+
+    // Reduced from a real OMP 18.2.9 rpc-ui Muse capture. This build ACKs
+    // ordinary prompts and emits agent_end, but never emits prompt_result.
+    fn captured_legacy_run(
+        acknowledge: bool,
+        stop_reason: &str,
+    ) -> (Omp, crate::model::RunId, Value) {
+        let mut adapter = Omp {
+            ready: true,
+            started: true,
+            session_id: Some("01a131b1-7d42-7126-9a3c-e19d00316562".into()),
+            ..Omp::default()
+        };
+        adapter.usage.cost_microusd = Some(0);
+        let run = crate::model::RunId::new();
+        let prompt = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "Reply exactly: smoke test complete. Do not use tools.".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        if acknowledge {
+            adapter
+                .receive(json!({
+                    "id":prompt.writes[0]["id"],"type":"response","command":"prompt","success":true
+                }))
+                .unwrap();
+        }
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        let message = json!({
+            "role":"assistant","timestamp":1791835092020u64,
+            "content":[{"type":"text","text":"smoke test complete"}],
+            "usage":{"input":22426,"output":25,"cost":{"total":0.0022476}},
+            "stopReason":stop_reason
+        });
+        let step = adapter
+            .receive(json!({"type":"message_end","message":message}))
+            .unwrap();
+        assert!(step.events.iter().any(|event| matches!(event,
+            Event::Item(Item { content: ItemContent::Text { text, thinking:false, .. }, .. })
+                if text == "smoke test complete")));
+        assert!(step.events.iter().any(|event| matches!(event,
+            Event::Execution { run:actual, event:crate::agent_execution::ProviderEvent::Scope }
+                if *actual == run)));
+        (adapter, run, message)
+    }
+
+    #[test]
+    fn captured_legacy_terminal_turn_finishes_after_its_idle_probe_without_prompt_result() {
+        use crate::{agent_execution::ProviderEvent, notifications::Kind};
+        for (stop_reason, outcome) in [
+            ("stop", Kind::Succeeded),
+            ("aborted", Kind::Cancelled),
+            ("error", Kind::Failed),
+        ] {
+            let (mut adapter, run, message) = captured_legacy_run(true, stop_reason);
+            let end = adapter
+                .receive(json!({"type":"agent_end","isTerminal":true,"messages":[message]}))
+                .unwrap();
+            assert!(end.events.iter().any(|event| matches!(event,
+                Event::Execution { run: actual, event:ProviderEvent::Settled } if *actual == run)));
+            assert!(end.events.iter().any(|event| matches!(event,
+                Event::Usage(usage) if usage.input_tokens == 22426 && usage.output_tokens == 25)));
+            assert!(!end.events.iter().any(|event| matches!(
+                event,
+                Event::Execution {
+                    event: ProviderEvent::Finished { .. },
+                    ..
+                }
+            )));
+            let probe = end
+                .writes
+                .iter()
+                .find(|frame| frame["type"] == "get_state")
+                .unwrap();
+            let stale = adapter
+                .receive(
+                    json!({"type":"response","id":"old","command":"get_state","success":true,
+                "data":{"sessionId":adapter.session_id,"isStreaming":false,"isCompacting":false}}),
+                )
+                .unwrap();
+            assert!(stale.events.is_empty());
+            let finished = adapter
+                .receive(
+                    json!({"type":"response","id":probe["id"],"command":"get_state","success":true,
+                "data":{"sessionId":adapter.session_id,"isStreaming":false,"isCompacting":false}}),
+                )
+                .unwrap();
+            assert!(finished.events.iter().any(|event| matches!(event,
+                Event::Execution { run:actual, event:ProviderEvent::Finished { outcome:actual_outcome } }
+                    if *actual == run && *actual_outcome == outcome)));
+            assert!(adapter.execution.is_none());
+        }
+    }
+
+    #[test]
+    fn correlated_modern_result_wins_over_pending_legacy_probe() {
+        use crate::{agent_execution::ProviderEvent, notifications::Kind};
+        for (status, outcome) in [("aborted", Kind::Cancelled), ("error", Kind::Failed)] {
+            let (mut adapter, run, message) = captured_legacy_run(true, "stop");
+            let request = adapter.execution.as_ref().unwrap().request.clone();
+            let end = adapter
+                .receive(json!({"type":"agent_end","isTerminal":true,"messages":[message]}))
+                .unwrap();
+            let probe = end
+                .writes
+                .iter()
+                .find(|frame| frame["type"] == "get_state")
+                .unwrap();
+            let modern = adapter
+                .receive(json!({"type":"prompt_result","id":request,"status":status}))
+                .unwrap();
+            assert!(modern.events.iter().any(|event| matches!(event,
+                Event::Execution { run: actual, event:ProviderEvent::Finished { outcome: actual_outcome } }
+                    if *actual == run && *actual_outcome == outcome)));
+            let idle = adapter
+                .receive(
+                    json!({"type":"response","id":probe["id"],"command":"get_state","success":true,
+                "data":{"sessionId":adapter.session_id,"isStreaming":false,"isCompacting":false}}),
+                )
+                .unwrap();
+            assert!(!idle.events.iter().any(|event| matches!(
+                event,
+                Event::Execution {
+                    event: ProviderEvent::Finished { .. },
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn terminal_run_usage_adds_current_run_once_to_prior_totals() {
+        let (mut adapter, _, message) = captured_legacy_run(true, "stop");
+        let before = chat::Usage {
+            input_tokens: 100,
+            output_tokens: 200,
+            cost_microusd: Some(300),
+            ..chat::Usage::default()
+        };
+        adapter.execution.as_mut().unwrap().usage_before = before.clone();
+        adapter.usage = before;
+        let second =
+            json!({"role":"assistant","usage":{"input":50,"output":10,"cost":{"total":0.0001}}});
+        let end = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true,"messages":[message,second]}))
+            .unwrap();
+        assert!(end.events.iter().any(|event| matches!(event,
+            Event::Usage(usage) if usage.input_tokens == 22576 && usage.output_tokens == 235 && usage.cost_microusd == Some(2647))));
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        let later = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true,"messages":[second]}))
+            .unwrap();
+        assert!(
+            !later
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Usage(_)))
+        );
+        assert_eq!(adapter.usage.input_tokens, 22576);
+        assert_eq!(adapter.usage.output_tokens, 235);
+        assert_eq!(adapter.usage.cost_microusd, Some(2647));
+    }
+
+    #[test]
+    fn legacy_terminal_probe_requires_acknowledged_start_and_known_outcome() {
+        use crate::agent_execution::ProviderEvent;
+        for (acknowledge, stop_reason) in [(false, "stop"), (true, "toolUse"), (true, "")] {
+            let (mut adapter, _, message) = captured_legacy_run(acknowledge, stop_reason);
+            if !acknowledge {
+                // Even a later successful ACK cannot associate a turn that
+                // began before this request was accepted.
+                let request = adapter.execution.as_ref().unwrap().request.clone();
+                adapter
+                    .receive(
+                        json!({"type":"response","id":request,"command":"prompt","success":true}),
+                    )
+                    .unwrap();
+            }
+            let end = adapter
+                .receive(json!({"type":"agent_end","isTerminal":true,"messages":[message]}))
+                .unwrap();
+            let probe = end
+                .writes
+                .iter()
+                .find(|frame| frame["type"] == "get_state")
+                .unwrap();
+            let state = adapter
+                .receive(
+                    json!({"type":"response","id":probe["id"],"command":"get_state","success":true,
+                "data":{"sessionId":adapter.session_id,"isStreaming":false,"isCompacting":false}}),
+                )
+                .unwrap();
+            assert!(!state.events.iter().any(|event| matches!(
+                event,
+                Event::Execution {
+                    event: ProviderEvent::Finished { .. },
+                    ..
+                }
+            )));
+            assert!(adapter.execution.is_some());
+        }
+    }
+
+    #[test]
+    fn continuing_or_newer_turns_cannot_complete_a_legacy_terminal_probe() {
+        use crate::agent_execution::ProviderEvent;
+        for continuing in [json!({"isTerminal":false}), json!({"willContinue":true})] {
+            let (mut adapter, _, message) = captured_legacy_run(true, "stop");
+            let mut frame = continuing;
+            frame["type"] = "agent_end".into();
+            frame["messages"] = json!([message]);
+            let step = adapter.receive(frame).unwrap();
+            assert!(!step.events.iter().any(|event| matches!(
+                event,
+                Event::Execution {
+                    event: ProviderEvent::Settled | ProviderEvent::Finished { .. },
+                    ..
+                }
+            )));
+            assert!(adapter.execution.as_ref().unwrap().observing);
+            assert!(
+                adapter
+                    .execution
+                    .as_ref()
+                    .unwrap()
+                    .completion_probe
+                    .is_none()
+            );
+        }
+        let (mut adapter, _, message) = captured_legacy_run(true, "stop");
+        let end = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true,"messages":[message]}))
+            .unwrap();
+        let probe = end
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        let stale = adapter
+            .receive(
+                json!({"type":"response","id":probe["id"],"command":"get_state","success":true,
+            "data":{"sessionId":adapter.session_id,"isStreaming":false,"isCompacting":false}}),
+            )
+            .unwrap();
+        assert!(!stale.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished { .. },
+                ..
+            }
+        )));
+        // The old outcome remains available, but finishing it requires a new
+        // idle reply obtained after the newer turn's terminal boundary.
+        let later = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        let fresh = later
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let finished = adapter
+            .receive(
+                json!({"type":"response","id":fresh["id"],"command":"get_state","success":true,
+            "data":{"sessionId":adapter.session_id,"isStreaming":false,"isCompacting":false}}),
+            )
+            .unwrap();
+        assert!(finished.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished {
+                    outcome: crate::notifications::Kind::Succeeded
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn legacy_probe_requires_explicit_idle_in_the_original_conversation() {
+        use crate::agent_execution::ProviderEvent;
+        for state in [
+            json!({"isStreaming":false}),
+            json!({"isCompacting":false}),
+            json!({"isStreaming":true,"isCompacting":false}),
+            json!({"isStreaming":false,"isCompacting":true}),
+            json!({"sessionId":"other","isStreaming":false,"isCompacting":false}),
+        ] {
+            let (mut adapter, _, message) = captured_legacy_run(true, "stop");
+            let end = adapter
+                .receive(json!({"type":"agent_end","isTerminal":true,"messages":[message]}))
+                .unwrap();
+            let probe = end
+                .writes
+                .iter()
+                .find(|frame| frame["type"] == "get_state")
+                .unwrap();
+            let mut state = state;
+            if state.get("sessionId").is_none() {
+                state["sessionId"] = adapter.session_id.clone().into();
+            }
+            let reply = adapter.receive(json!({"type":"response","id":probe["id"],"command":"get_state","success":true,"data":state})).unwrap();
+            assert!(!reply.events.iter().any(|event| matches!(
+                event,
+                Event::Execution {
+                    event: ProviderEvent::Finished { .. },
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn legacy_statusless_consumed_prompt_is_correlated_and_finishes_once() {
+        use crate::{agent_execution::ProviderEvent, notifications::Kind};
+        let (mut adapter, run, _) = captured_legacy_run(true, "stop");
+        let request = adapter.execution.as_ref().unwrap().request.clone();
+        let unrelated = adapter
+            .receive(json!({"type":"prompt_result","id":"old","agentInvoked":false}))
+            .unwrap();
+        assert!(!unrelated.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished { .. },
+                ..
+            }
+        )));
+        let result = adapter
+            .receive(json!({"type":"prompt_result","id":request,"agentInvoked":false}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Execution { run:actual, event:ProviderEvent::Finished { outcome:Kind::Succeeded } } if *actual == run)));
+        let duplicate = adapter
+            .receive(json!({"type":"prompt_result","id":request,"agentInvoked":false}))
+            .unwrap();
+        assert!(!duplicate.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished { .. },
+                ..
+            }
+        )));
     }
 
     #[test]

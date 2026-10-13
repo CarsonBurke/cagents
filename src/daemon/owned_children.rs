@@ -42,6 +42,38 @@ impl OwnedChildren {
         }
     }
 
+    /// Reap adopted tools without consuming the provider leader's exit status.
+    /// Keeping that leader unreaped also reserves its process-group identifier
+    /// until `terminate` has sent the group's final signal.
+    pub(crate) fn reap_exited_descendants(&self) -> io::Result<()> {
+        for pid in direct_children()? {
+            if self
+                .child
+                .as_ref()
+                .is_some_and(|child| child.id() == pid as u32)
+            {
+                continue;
+            }
+            loop {
+                // This dedicated owner is the only reaper. Live children are
+                // untouched, and an exited child's PID cannot be reused before
+                // this wait consumes its status.
+                match unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } {
+                    result if result >= 0 => break,
+                    _ => {
+                        let error = io::Error::last_os_error();
+                        match error.raw_os_error() {
+                            Some(libc::EINTR) => continue,
+                            Some(libc::ECHILD) => break,
+                            _ => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn terminate(&mut self, timeout: Duration) -> io::Result<bool> {
         if !self.group_signalled {
             // The group leader is still our unreaped child, so this number
@@ -53,20 +85,7 @@ impl OwnedChildren {
         }
         let deadline = Instant::now() + timeout;
         loop {
-            let mut children = std::collections::BTreeSet::new();
-            for task in std::fs::read_dir("/proc/self/task")? {
-                let path = task?.path().join("children");
-                let raw = match std::fs::read_to_string(path) {
-                    Ok(raw) => raw,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                };
-                children.extend(
-                    raw.split_whitespace()
-                        .filter_map(|id| id.parse::<i32>().ok()),
-                );
-            }
-            for pid in children {
+            for pid in direct_children()? {
                 // No other thread or handler reaps children in this process.
                 // A child that exits stays a zombie until the loop below.
                 if unsafe { libc::kill(pid, libc::SIGKILL) } == -1
@@ -103,4 +122,21 @@ impl OwnedChildren {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
+    let mut children = std::collections::BTreeSet::new();
+    for task in std::fs::read_dir("/proc/self/task")? {
+        let path = task?.path().join("children");
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        children.extend(
+            raw.split_whitespace()
+                .filter_map(|id| id.parse::<i32>().ok()),
+        );
+    }
+    Ok(children)
 }

@@ -12,6 +12,27 @@ pub(super) fn worktree_root<'a>(
         .max_by_key(|root| root.components().count())
 }
 
+/// Resolve a directory by its ancestors rather than comparing it with every
+/// historical checkout. Built for one immutable workspace projection.
+pub(super) struct WorktreeRoots<'a> {
+    roots: HashMap<&'a Path, &'a Path>,
+}
+
+impl<'a> WorktreeRoots<'a> {
+    fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
+        Self {
+            roots: roots.map(|root| (root, root)).collect(),
+        }
+    }
+
+    fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+        directory
+            .ancestors()
+            .find_map(|ancestor| self.roots.get(ancestor).copied())
+            .or_else(|| self.roots.get(Path::new("")).copied())
+    }
+}
+
 /// Missing directories are not navigable worktrees. A permission or transient
 /// I/O failure is not evidence of deletion, so retain those rows for recovery.
 pub(super) fn worktree_directory_available(path: &Path) -> bool {
@@ -505,7 +526,7 @@ impl Cagents {
     }
 
     /// `card_worktree` for a card the caller already knows is in no channel.
-    fn unchanneled_card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
+    pub(super) fn unchanneled_card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
         if let Some(scope) = self
             .worktree_owners
             .get(&card.id)
@@ -529,6 +550,36 @@ impl Cagents {
             )
             .unwrap_or(directory),
         )
+    }
+
+    pub(super) fn indexed_worktree_roots(&self) -> WorktreeRoots<'_> {
+        WorktreeRoots::new(
+            self.known_worktree_roots
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(self.sidebar_model.projects.iter().flat_map(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .map(|worktree| worktree.path.as_path())
+                })),
+        )
+    }
+
+    pub(super) fn unchanneled_card_worktree_indexed<'a>(
+        &'a self,
+        card: &'a CardState,
+        roots: &WorktreeRoots<'a>,
+    ) -> Option<&'a Path> {
+        if let Some(scope) = self
+            .worktree_owners
+            .get(&card.id)
+            .or_else(|| self.durable.card_scopes.get(&card.id))
+        {
+            return Some(scope);
+        }
+        let directory = card_directory(card)?;
+        Some(roots.resolve(directory).unwrap_or(directory))
     }
 
     /// The directory a sidebar open of a project or worktree enters.
@@ -1907,6 +1958,35 @@ mod tests {
             worktree_root(Path::new("/repo-fix/src"), roots.into_iter()),
             None
         );
+    }
+
+    #[test]
+    fn indexed_roots_match_component_matching_for_nested_and_relative_paths() {
+        let roots = [
+            Path::new("/repo"),
+            Path::new("/repo/nested"),
+            Path::new("/repo/nested/../other"),
+            Path::new("relative"),
+            Path::new("relative/child"),
+            Path::new(""),
+        ];
+        let indexed = WorktreeRoots::new(roots.into_iter());
+        for directory in [
+            "/repo/nested/src",
+            "/repo/src",
+            "/repo-fix/src",
+            "/repo/nested/../other/file",
+            "relative/child/file",
+            "relative-other/file",
+            "",
+        ] {
+            let directory = Path::new(directory);
+            assert_eq!(
+                indexed.resolve(directory),
+                worktree_root(directory, roots.into_iter()),
+                "{directory:?}"
+            );
+        }
     }
 
     #[test]

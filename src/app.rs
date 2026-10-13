@@ -7447,7 +7447,7 @@ impl Cagents {
         }
         if self.card_chrome.len() != self.durable.cards.len() {
             self.card_chrome
-                .retain(|id, _| self.durable.cards.iter().any(|card| card.id == *id));
+                .retain(|id, _| self.card_indices.contains_key(id));
         }
         self.sync_window_title()
     }
@@ -7483,6 +7483,13 @@ impl Cagents {
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
         }
+        let title = crate::agent::codex_title_without_status(&card.title);
+        // Provider recognition can only change an empty or status-prefixed
+        // title. Most saved cards already have plain names; avoid decoding
+        // their recovery recipes on every update and redraw.
+        if !card.title.is_empty() && title == card.title {
+            return &card.title;
+        }
         if let CardKind::Terminal(session) = &card.kind
             && (self
                 .sidebar_state
@@ -7496,7 +7503,6 @@ impl Cagents {
                     .and_then(crate::agent::Provider::recognize_launch)
                     == Some(crate::agent::Provider::Codex))
         {
-            let title = crate::agent::codex_title_without_status(&card.title);
             return if title.is_empty() {
                 crate::agent::Provider::Codex.label()
             } else {
@@ -20280,6 +20286,54 @@ mod tests {
         assert_eq!(restored.focused(), Some(editor));
         drop(app.reorder_pane(editor, Some(CardId::new())));
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn card_display_title_preserves_plain_names_and_provider_status_semantics() {
+        let mut app = context_inspector_test_app(false);
+        let mut card = terminal_card_state();
+        let mut codex = launch_recipe("/repo");
+        codex.program = "codex".into();
+        codex.arguments = vec![
+            "resume".into(),
+            "01234567-89ab-cdef-0123-456789abcdef".into(),
+        ];
+        let hint = crate::model::agent_recovery::hint_from_launch(&codex).unwrap();
+        for via_hint in [false, true] {
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
+            if via_hint {
+                session.launch = launch_recipe("/repo");
+                session.resume_hint = Some(hint.clone());
+            } else {
+                session.launch = codex.clone();
+                session.resume_hint = None;
+            }
+            for (saved, expected) in [
+                ("Fix parser", "Fix parser"),
+                ("⠋ Fix parser", "Fix parser"),
+                ("[ ! ] Action Required | Fix parser", "Fix parser"),
+                ("[!] Action Required", "Codex"),
+                ("", "Codex"),
+            ] {
+                card.title = saved.into();
+                assert_eq!(app.card_display_title(&card), expected);
+            }
+        }
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!()
+        };
+        session.launch = launch_recipe("/repo");
+        session.resume_hint = None;
+        for title in ["Fix parser", "⠋ Fix parser", "[!] Action Required", ""] {
+            card.title = title.into();
+            assert_eq!(app.card_display_title(&card), title);
+        }
+        app.chrome_ui
+            .user_titles
+            .insert(card.id, "⠋ My name".into());
+        assert_eq!(app.card_display_title(&card), "⠋ My name");
     }
 
     #[test]
