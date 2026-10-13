@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn captured_escape_preserves_underlying_terminal_find() {
-        let mut app = super::super::tests::context_inspector_test_app(false);
+        let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         let directory = tempfile::tempdir().unwrap();
