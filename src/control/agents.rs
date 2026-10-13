@@ -1217,10 +1217,12 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
             state: None,
             timed_out: false,
             result: String::new(),
+            ..Default::default()
         });
     }
     let (agent, rest_of_head) = head.strip_prefix("agent ")?.split_once(' ')?;
-    let (_, after_run) = rest_of_head.split_once(" run ")?;
+    let (provider, after_run) = rest_of_head.split_once(" run ")?;
+    let provider = provider.strip_prefix('(')?.strip_suffix(')')?;
     let (_, state) = after_run.split_once(' ')?;
     let (state, timed_out) = match state.strip_suffix(" (wait timed out)") {
         Some(state) => (state, true),
@@ -1243,14 +1245,14 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
     let status = output
         .split_once(ARRIVED)
         .map_or(output, |(status, _)| status);
-    let result = status
-        .split_once("\n\n")
-        .map_or("", |(_, result)| result);
+    let result = status.split_once("\n\n").map_or("", |(_, result)| result);
     Some(crate::chat::coordination::Run {
         agent: agent.into(),
+        provider: provider.into(),
         state: Some(state),
         timed_out,
         result: result.trim().into(),
+        ..Default::default()
     })
 }
 

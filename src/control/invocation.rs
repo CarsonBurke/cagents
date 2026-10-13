@@ -48,7 +48,9 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
     Some(match cli.command {
         TopCommand::Send(send) => message(OutboundKind::Send, send.to, send.message, false),
         TopCommand::Ask(ask) => message(OutboundKind::Ask, ask.send.to, ask.send.message, true),
-        TopCommand::Reply(reply) => message(OutboundKind::Reply, reply.id, reply.message, reply.wait),
+        TopCommand::Reply(reply) => {
+            message(OutboundKind::Reply, reply.id, reply.message, reply.wait)
+        }
         TopCommand::Inbox(inbox) => Kind::Act(Act::Inbox { waits: inbox.wait }),
         TopCommand::Sessions(_) => Kind::Act(Act::Sessions),
         TopCommand::Whoami => Kind::Act(Act::Whoami),
@@ -64,6 +66,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 directory,
                 model,
                 reasoning_effort,
+                channel,
                 wait,
                 ..
             } => Kind::Spawn(Spawn {
@@ -82,6 +85,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 directory: directory
                     .map(|directory| directory.display().to_string())
                     .unwrap_or_default(),
+                channel,
                 waits: wait.wait,
             }),
             AgentCommand::Send {
@@ -124,6 +128,9 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
 
 /// What a command's `output` says about the step `kind` describes.
 pub(crate) fn outcome(kind: &Kind, output: &str) -> Outcome {
+    if let Some(outcome) = json_outcome(kind, output) {
+        return outcome;
+    }
     Outcome {
         // A failure prints as `cagents: …` just before the command exits.
         // So do an ask's sent line, when its wait times out, and notices
@@ -145,6 +152,130 @@ pub(crate) fn outcome(kind: &Kind, output: &str) -> Outcome {
     }
 }
 
+/// A successful launch reply is authoritative about resolved defaults. Human
+/// output only identifies a provider after waiting; model/channel stay unknown.
+pub(crate) fn enrich(kind: &mut Kind, outcome: &Outcome) {
+    let (Kind::Spawn(spawn), Some(run)) = (kind, &outcome.run) else {
+        return;
+    };
+    if !run.provider.is_empty() {
+        spawn.provider.clone_from(&run.provider);
+    }
+    if !run.model.is_empty() {
+        spawn.model.clone_from(&run.model);
+    }
+    if !run.effort.is_empty() {
+        spawn.effort.clone_from(&run.effort);
+    }
+    if run.channel.is_some() {
+        spawn.channel = run.channel;
+    }
+}
+
+/// Recognize only the CLI's complete envelope, not arbitrary JSON in an
+/// agent's result or a later command's output. Typed wire objects preserve the
+/// same IDs, enum values and optional defaults as the CLI's own replies.
+fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
+    let envelope: Value = serde_json::from_str(output.trim()).ok()?;
+    if !envelope["ok"].as_bool()? {
+        let message = envelope["error"]["message"].as_str()?;
+        // Timeout errors can include a sent receipt even though waiting failed.
+        let mut result = read(kind, message);
+        result.error = Some(message.to_owned());
+        return Some(result);
+    }
+    let expected = match kind {
+        Kind::Spawn(_) => "agent.spawn",
+        Kind::Message(message) => match message.kind {
+            OutboundKind::Prompt => "agent.send",
+            OutboundKind::Send => "send",
+            OutboundKind::Ask => "ask",
+            OutboundKind::Reply => "reply",
+            OutboundKind::Report => return None,
+        },
+        Kind::Act(Act::Status { .. }) => "agent.status",
+        Kind::Act(Act::Wait { .. }) => "agent.wait",
+        Kind::Act(Act::Inbox { .. }) => "inbox",
+        _ => return None,
+    };
+    if envelope["command"].as_str()? != expected {
+        return None;
+    }
+    let data = &envelope["data"];
+    let run = data
+        .get("agent")
+        .zip(data.get("run"))
+        .and_then(|(agent, run)| {
+            let agent: crate::agent_execution::Agent =
+                serde_json::from_value(agent.clone()).ok()?;
+            let run: crate::agent_execution::Run = serde_json::from_value(run.clone()).ok()?;
+            if run.agent != agent.id {
+                return None;
+            }
+            Some(crate::chat::coordination::Run {
+                agent: crate::agent_execution::mailbox::short(agent.id),
+                provider: agent.spec.provider.executable().to_owned(),
+                model: agent.spec.model.unwrap_or_default(),
+                effort: agent.spec.reasoning_effort.unwrap_or_default(),
+                channel: Some(agent.channel),
+                state: Some(run.state),
+                timed_out: data["timed_out"].as_bool().unwrap_or(false),
+                result: run.result.text,
+            })
+        });
+    let receipt = matches!(expected, "send" | "ask" | "reply")
+        .then(|| serde_json::from_value::<crate::agent_execution::mailbox::Sent>(data.clone()).ok())
+        .flatten()
+        .map(|sent| {
+            use crate::agent_execution::mailbox::Reach;
+            use crate::chat::coordination::{Arrival, Receipt};
+            Receipt {
+                message: crate::agent_execution::mailbox::short(sent.message.id),
+                recipient: sent.message.to.label(),
+                arrival: match (sent.reach, sent.message.to.lineage) {
+                    (_, None) => Arrival::User,
+                    (Reach::Conversation, _) => Arrival::WhenIdle,
+                    (Reach::Inbox, _) => Arrival::Inbox,
+                    (Reach::Offline, _) => Arrival::NextSession,
+                },
+            }
+        });
+    let messages = data
+        .get(
+            if matches!(
+                kind,
+                Kind::Message(Outbound {
+                    kind: OutboundKind::Send | OutboundKind::Ask | OutboundKind::Reply,
+                    ..
+                })
+            ) {
+                "replies"
+            } else {
+                "messages"
+            },
+        )
+        .and_then(|messages| {
+            serde_json::from_value::<Vec<crate::agent_execution::mailbox::Message>>(
+                messages.clone(),
+            )
+            .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|message| crate::chat::coordination::Received {
+            id: crate::agent_execution::mailbox::short(message.id),
+            from: message.from.label(),
+            body: message.body,
+        })
+        .collect();
+    Some(Outcome {
+        run,
+        receipt,
+        messages,
+        ..Outcome::default()
+    })
+}
+
 fn read(kind: &Kind, output: &str) -> Outcome {
     match kind {
         // A prompt or a spawn starts a run, and prints it ahead of any
@@ -163,7 +294,12 @@ fn read(kind: &Kind, output: &str) -> Outcome {
             messages: messages::read_messages(output),
             ..Outcome::default()
         },
+        Kind::Act(Act::Status { .. }) => Outcome {
+            run: agents::read_run(output.trim_start()),
+            ..Outcome::default()
+        },
         Kind::Act(Act::Wait { .. }) => Outcome {
+            run: agents::read_run(output.trim_start()),
             messages: arrived(output),
             ..Outcome::default()
         },
@@ -297,6 +433,151 @@ mod tests {
         assert_eq!(parse("cagents --help", None), None);
     }
 
+    fn json_run(command: &str, model: Option<&str>) -> serde_json::Value {
+        use crate::agent_execution::{
+            Agent, Origin, ResultSummary, Run, Spec, State, Surface, Target,
+        };
+        let agent = Agent {
+            name: Some("reviewer".into()),
+            id: crate::model::AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Codex,
+                account: None,
+                target: Target {
+                    repository: "/repo".into(),
+                    directory: "/repo".into(),
+                    channel: None,
+                },
+                surface: Surface::Chat,
+                model: model.map(str::to_owned),
+                permission_mode: None,
+                reasoning_effort: Some("low".into()),
+            },
+            channel: crate::model::ChannelId::new(),
+            session: None,
+            console: None,
+            created_ms: 0,
+            closed: false,
+        };
+        let run = Run {
+            id: crate::model::RunId::new(),
+            agent: agent.id,
+            state: State::Succeeded,
+            revision: 1,
+            accepted_ms: 0,
+            started_ms: Some(1),
+            finished_ms: Some(2),
+            provider_key: None,
+            result: ResultSummary {
+                text: "Reviewed.".into(),
+                ..Default::default()
+            },
+        };
+        serde_json::json!({"ok": true, "command": command, "data": {"agent": agent, "run": run, "timed_out": false}})
+    }
+
+    #[test]
+    fn json_run_resolves_launch_metadata_without_inventing_unknown_defaults() {
+        let mut spawn = parse("cagents --json agent spawn Review", None).unwrap();
+        let reply = json_run("agent.spawn", Some("gpt-6-luna"));
+        let result = super::outcome(&spawn, &reply.to_string());
+        let run = result.run.as_ref().unwrap();
+        assert_eq!(run.model, "gpt-6-luna");
+        assert_eq!(run.provider, "codex");
+        assert_eq!(run.result, "Reviewed.");
+        assert_eq!(run.state, Some(crate::agent_execution::State::Succeeded));
+        super::enrich(&mut spawn, &result);
+        let Kind::Spawn(spawn) = spawn else { panic!() };
+        assert_eq!(spawn.channel, run.channel);
+        assert!(spawn.channel.is_some());
+        assert_eq!(
+            (
+                spawn.provider.as_str(),
+                spawn.model.as_str(),
+                spawn.effort.as_str()
+            ),
+            ("codex", "gpt-6-luna", "low")
+        );
+
+        let mut unknown = parse("cagents --json agent spawn Review", None).unwrap();
+        let result = super::outcome(&unknown, &json_run("agent.spawn", None).to_string());
+        super::enrich(&mut unknown, &result);
+        let Kind::Spawn(unknown) = unknown else {
+            panic!()
+        };
+        assert!(unknown.model.is_empty());
+        let human = parse("cagents agent spawn Review", None).unwrap();
+        let result = super::outcome(&human, "Accepted agent 1a2b3c4d run 5e6f7a8b");
+        assert!(result.run.unwrap().channel.is_none());
+    }
+
+    #[test]
+    fn spawn_preserves_explicit_channel_and_model_before_a_reply_arrives() {
+        let channel = crate::model::ChannelId::new();
+        let Kind::Spawn(spawn) = parse(
+            &format!("cagents agent spawn --channel {channel} --model gpt-6-luna Review"),
+            None,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(spawn.channel, Some(channel));
+        assert_eq!(spawn.model, "gpt-6-luna");
+        assert!(spawn.provider.is_empty());
+    }
+
+    #[test]
+    fn json_run_rejects_another_commands_reply_and_mismatched_agent_identity() {
+        let spawn = parse("cagents --json agent spawn Review", None).unwrap();
+        let mut reply = json_run("agent.status", Some("gpt-6-luna"));
+        assert!(super::outcome(&spawn, &reply.to_string()).run.is_none());
+        reply["command"] = "agent.spawn".into();
+        reply["data"]["run"]["agent"] = serde_json::json!(crate::model::AgentId::new());
+        assert!(super::outcome(&spawn, &reply.to_string()).run.is_none());
+    }
+
+    #[test]
+    fn json_receipts_replies_and_failures_follow_the_cli_wire_objects() {
+        use crate::agent_execution::mailbox::{Message, Party, Reach, State};
+        let message = Message {
+            id: crate::model::MessageId::new(),
+            from: Party::user(),
+            to: Party::user(),
+            reply_to: None,
+            body: "Can you review?".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: 0,
+        };
+        let ask = parse("cagents --json ask peer hi", None).unwrap();
+        let output = serde_json::json!({"ok": true, "command": "ask", "data": {"message": message, "reach": Reach::Inbox, "replies": [message]}});
+        let result = super::outcome(&ask, &output.to_string());
+        assert_eq!(
+            result.receipt.unwrap().arrival,
+            crate::chat::coordination::Arrival::User
+        );
+        assert_eq!(result.messages[0].body, "Can you review?");
+        let inbox = parse("cagents --json inbox", None).unwrap();
+        let output =
+            serde_json::json!({"ok": true, "command": "inbox", "data": {"messages": [message]}});
+        assert_eq!(
+            super::outcome(&inbox, &output.to_string()).messages[0].body,
+            "Can you review?"
+        );
+        let failed = serde_json::json!({"ok":false,"error":{"kind":"handle","message":"No such recipient","details":null}});
+        assert_eq!(
+            super::outcome(&ask, &failed.to_string()).error.as_deref(),
+            Some("No such recipient")
+        );
+        let timed_out = serde_json::json!({"ok":false,"error":{"kind":"timeout","message":"Sent 45d4828a to session 95fcd1b9; it arrives as soon as that conversation is idle\nNo reply within 30 s."}});
+        assert!(
+            super::outcome(&ask, &timed_out.to_string())
+                .receipt
+                .is_some()
+        );
+    }
+
     #[test]
     fn a_spawn_reads_its_run_from_what_the_cli_printed() {
         let spawn = parse("cagents agent spawn hi", None).unwrap();
@@ -307,6 +588,9 @@ mod tests {
             "agent 1a2b3c4d (codex) run 5e6f7a8b Succeeded\n\nAll green.\n\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi",
         );
         let run = waited.run.unwrap();
+        assert_eq!(run.provider, "codex");
+        assert!(run.model.is_empty());
+        assert!(run.channel.is_none());
         assert_eq!(run.state, Some(crate::agent_execution::State::Succeeded));
         assert_eq!(run.result, "All green.");
         assert_eq!(waited.messages.len(), 1);

@@ -99,6 +99,9 @@ pub struct Spawn {
     pub model: String,
     pub effort: String,
     pub directory: String,
+    /// Explicit membership or the channel returned by the CLI. Unknown for
+    /// provider-native agents and commands whose output did not expose it.
+    pub channel: Option<crate::model::ChannelId>,
     /// Whether the step holds the turn until the agents finish.
     pub waits: bool,
 }
@@ -198,10 +201,16 @@ pub struct Received {
 }
 
 /// A started agent's run, as far as the command saw it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Run {
     /// The agent's short ID.
     pub agent: String,
+    /// Resolved launch metadata, where the CLI's reply exposed it. Empty
+    /// strings and an absent channel mean unknown, never inherited guesses.
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub channel: Option<crate::model::ChannelId>,
     /// Where the command waited on it, how the run stood when it stopped.
     pub state: Option<crate::agent_execution::State>,
     pub timed_out: bool,
@@ -241,9 +250,8 @@ impl Coordination {
     /// said so and confirmed nothing.
     pub fn status(&self, reported: ToolStatus) -> ToolStatus {
         let outcome = &self.outcome;
-        let confirmed = outcome.receipt.is_some()
-            || outcome.run.is_some()
-            || !outcome.messages.is_empty();
+        let confirmed =
+            outcome.receipt.is_some() || outcome.run.is_some() || !outcome.messages.is_empty();
         match (&self.kind, reported) {
             (Kind::Message(_) | Kind::Spawn(_), ToolStatus::Succeeded)
                 if outcome.error.is_some() && !confirmed =>
@@ -316,9 +324,11 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
         found = Some((argv, stdin));
     }
     let (argv, stdin) = found?;
-    let kind = crate::control::invocation::coordination(argv, stdin)?;
+    let mut kind = crate::control::invocation::coordination(argv, stdin)?;
+    let outcome = crate::control::invocation::outcome(&kind, output);
+    crate::control::invocation::enrich(&mut kind, &outcome);
     Some(Coordination {
-        outcome: crate::control::invocation::outcome(&kind, output),
+        outcome,
         kind,
         subagents: Vec::new(),
         cli: true,
@@ -417,6 +427,7 @@ fn claude(id: &str, name: &str, input: &str, output: &str) -> Option<Coordinatio
                     state: None,
                     timed_out: false,
                     result,
+                    ..Run::default()
                 });
             }
             Kind::Spawn(Spawn {
@@ -578,6 +589,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_cli_failures_cannot_hide_behind_a_successful_shell_pipeline() {
+        let failure = serde_json::json!({"ok": false, "error": {"kind": "handle", "message": "No such recipient"}});
+        let failed = cli(
+            "cagents --json send peer hi 2>&1 | tail -1",
+            &failure.to_string(),
+        )
+        .unwrap();
+        assert_eq!(failed.status(ToolStatus::Succeeded), ToolStatus::Failed);
+        assert_eq!(failed.outcome.error.as_deref(), Some("No such recipient"));
+        let timeout = serde_json::json!({"ok": false, "error": {"kind": "timeout", "message": "Sent 45d4828a to session 95fcd1b9; it arrives as soon as that conversation is idle\nNo reply within 30 s."}});
+        let sent = cli(
+            "cagents --json ask peer hi 2>&1 | tail -1",
+            &timeout.to_string(),
+        )
+        .unwrap();
+        assert!(sent.outcome.receipt.is_some());
+        // Waiting failed; delivery itself was confirmed, just as in human output.
+        assert_eq!(sent.status(ToolStatus::Succeeded), ToolStatus::Succeeded);
+        assert_eq!(sent.status(ToolStatus::Failed), ToolStatus::Failed);
+    }
+
+    #[test]
     fn a_sent_message_reads_its_recipient_body_and_receipt() {
         let sent = cli(
             r#"cagents send 95fcd1b9 "From the user: please stop sending" 2>&1 | tail -1"#,
@@ -621,7 +654,10 @@ mod tests {
             &format!("{notice}\nab12  from session 95fcd1b9\n  yes\n"),
         )
         .unwrap();
-        assert_eq!(answered.status(ToolStatus::Succeeded), ToolStatus::Succeeded);
+        assert_eq!(
+            answered.status(ToolStatus::Succeeded),
+            ToolStatus::Succeeded
+        );
         let noted = cli("cagents send peer hi 2>&1 | tail -1", &notice).unwrap();
         assert_eq!(noted.outcome.error, None);
         // Only a message or a launch is read for a failure its exit status
@@ -655,14 +691,19 @@ mod tests {
         assert!(cli("for s in a b; do\n  cagents send \"$s\" hi\ndone", "").is_none());
         assert!(cli("cagents send x hi || echo failed", "").is_some());
         // A checkout named for the program puts it in paths, not commands.
-        assert!(!names_program("cd ~/src/cagents/.worktrees/x && cargo test"));
-        assert!(names_program("~/src/cagents/target/debug/cagents send x hi"));
+        assert!(!names_program(
+            "cd ~/src/cagents/.worktrees/x && cargo test"
+        ));
+        assert!(names_program(
+            "~/src/cagents/target/debug/cagents send x hi"
+        ));
         assert!(names_program("echo hi|cagents"));
     }
 
     #[test]
     fn claude_agents_and_messages_read_their_input() {
-        let input = r#"{"description":"Review the PR","prompt":"Look at #12","subagent_type":"Explore"}"#;
+        let input =
+            r#"{"description":"Review the PR","prompt":"Look at #12","subagent_type":"Explore"}"#;
         let started = native(Provider::Claude, "toolu_1", "Agent", input, "Looks good.").unwrap();
         assert_eq!(started.subagents, ["toolu_1"]);
         let Kind::Spawn(spawn) = &started.kind else {
@@ -678,18 +719,23 @@ mod tests {
         // handed back as a message is shown where it arrives.
         let trailed = "Looks good.\nagentId: a1 (use SendMessage with to: 'a1')\n<usage>total_tokens: 9</usage>";
         assert_eq!(claude_report(trailed).as_deref(), Some("Looks good."));
-        let handed = "This agent's report was delivered to you as a message from \"a1\".\n\nagentId: a1";
+        let handed =
+            "This agent's report was delivered to you as a message from \"a1\".\n\nagentId: a1";
         assert_eq!(claude_report(handed), None);
 
         let background = r#"{"prompt":"x","run_in_background":true}"#;
-        let launched = native(Provider::Claude, "toolu_2", "Agent", background, "Launched").unwrap();
+        let launched =
+            native(Provider::Claude, "toolu_2", "Agent", background, "Launched").unwrap();
         assert!(launched.outcome.run.is_none());
         // Claude Code may background an agent it was not asked to; its
         // acknowledgement is not a report either.
         let acknowledged = "Async agent launched successfully. (This tool result is internal metadata.)\nagentId: a2 (internal ID)\nThe agent is working in the background.";
         let unasked = native(Provider::Claude, "toolu_5", "Agent", input, acknowledged).unwrap();
         assert!(unasked.outcome.run.is_none());
-        assert!(matches!(unasked.kind, Kind::Spawn(Spawn { waits: false, .. })));
+        assert!(matches!(
+            unasked.kind,
+            Kind::Spawn(Spawn { waits: false, .. })
+        ));
 
         let sent = native(
             Provider::Claude,
