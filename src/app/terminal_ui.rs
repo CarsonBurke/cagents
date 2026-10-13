@@ -270,7 +270,7 @@ mod tests {
             &mut tree,
             Layout::new(&node),
             &renderer,
-            &mut operation::focusable::focus::<Message>(input_id(card)),
+            &mut operation::focusable::focus::<()>(input_id(card)),
         );
         let mut published = Vec::new();
         let mut shell = Shell::new(&mut published);
