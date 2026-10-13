@@ -43,6 +43,44 @@ pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
 const NOTICE_LINES: usize = 3;
 
+const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
+const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
+
+/// Existing action footers provide separation. Count that space toward the
+/// next semantic boundary instead of adding another gap after an invisible row.
+struct TranscriptRows<'a> {
+    children: Vec<Element<'a, Message>>,
+    gap: f32,
+    trailing_footer: f32,
+}
+impl<'a> TranscriptRows<'a> {
+    fn new(gap: f32) -> Self {
+        Self {
+            children: Vec::new(),
+            gap,
+            trailing_footer: 0.0,
+        }
+    }
+    fn push(&mut self, row: Element<'a, Message>) -> usize {
+        self.push_with_gap(row, self.gap, 0.0)
+    }
+    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
+        self.push_with_gap(row, self.gap, footer)
+    }
+    fn push_with_gap(&mut self, row: Element<'a, Message>, gap: f32, footer: f32) -> usize {
+        if !self.children.is_empty() {
+            let gap = (gap - self.trailing_footer).max(0.0);
+            if gap > 0.0 {
+                self.children.push(widget::Space::new().height(gap).into());
+            }
+        }
+        let index = self.children.len();
+        self.children.push(row);
+        self.trailing_footer = footer;
+        index
+    }
+}
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// Iced's hover widget also keeps controls visible while keyboard-focused.
 pub(super) fn message_actions<'a>(
@@ -51,8 +89,11 @@ pub(super) fn message_actions<'a>(
     alignment: Alignment,
 ) -> Element<'a, Message> {
     iced::widget::hover(
-        widget::column::with_children(vec![message, widget::Space::new().height(24).into()])
-            .spacing(step::GAP_XS),
+        widget::column::with_children(vec![
+            message,
+            widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
+        ])
+        .spacing(step::GAP_XS),
         widget::container(actions)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1106,7 +1147,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut anchors = Vec::new();
-        let mut transcript = Vec::new();
+        let mut transcript = TranscriptRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             let provider = match self.session.launch.provider {
@@ -1185,8 +1226,7 @@ impl Runtime {
                 let Some(cached) = self.cache.get(&item.id) else {
                     continue;
                 };
-                anchors.push((transcript.len(), item.id.as_str()));
-                transcript.push(
+                let row_index = transcript.message(
                     if item.role == chat::Role::User && !item.content.is_step() {
                         if matches!(item.content, ItemContent::Delivery { .. }) {
                             self.delivery_view(item, cached, markdown_settings)
@@ -1215,7 +1255,19 @@ impl Runtime {
                             _ => self.step_view(item, cached, markdown_settings),
                         }
                     },
+                    if (item.role == chat::Role::User && !item.content.is_step())
+                        || matches!(item.content, ItemContent::Text { .. })
+                        || cached
+                            .coordination
+                            .as_deref()
+                            .is_some_and(Coordinated::is_card)
+                    {
+                        MESSAGE_ACTION_FOOTER
+                    } else {
+                        0.0
+                    },
                 );
+                anchors.push((row_index, item.id.as_str()));
             }
         } else {
             if snapshot.has_earlier {
@@ -1245,7 +1297,15 @@ impl Runtime {
                 transcript.push(notice_entry(error, target));
             }
             for turn in &self.turns {
-                transcript.push(self.turn_view(turn, markdown_settings, dark));
+                transcript.push_with_gap(
+                    self.turn_view(turn, markdown_settings, dark),
+                    if turn.prompt.is_empty() {
+                        step::GAP_M
+                    } else {
+                        step::GAP_L
+                    },
+                    self.turn_trailing_footer(turn),
+                );
                 for (_, error) in self
                     .failures
                     .iter()
@@ -1414,8 +1474,7 @@ impl Runtime {
                 .into(),
             );
         }
-        let transcript = widget::column::with_children(transcript)
-            .spacing(step::GAP_L)
+        let transcript = widget::column::with_children(transcript.children)
             .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
             .width(Length::Fill);
         let transcript_index = content.len();
@@ -3022,6 +3081,41 @@ impl Runtime {
         hasher.finish()
     }
 
+    fn prose_action_footer(item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
+        if matches!(item.content, ItemContent::Text { .. })
+            || (slot == turn::Slot::Card && cached.coordination.is_some())
+        {
+            MESSAGE_ACTION_FOOTER
+        } else {
+            0.0
+        }
+    }
+
+    fn turn_trailing_footer(&self, turn: &turn::Turn) -> f32 {
+        // Match the last row actually rendered, including cache misses during
+        // parsing, using the same footer classification as turn_rows.
+        for placed in turn.prose.iter().rev() {
+            if let Some(item) = self.snapshot.items.get(placed.index)
+                && let Some(cached) = self.cache.get(&item.id)
+            {
+                return Self::prose_action_footer(item, cached, placed.slot);
+            }
+        }
+        if !turn.steps.is_empty() {
+            return 0.0;
+        }
+        if turn.prompt.iter().rev().any(|index| {
+            self.snapshot.items.get(*index).is_some_and(|item| {
+                !matches!(item.content, ItemContent::Delivery { .. })
+                    || self.cache.contains_key(&item.id)
+            })
+        }) {
+            MESSAGE_ACTION_FOOTER
+        } else {
+            0.0
+        }
+    }
+
     /// The rows of one exchange, with `step` drawing each of its steps and
     /// `card` each of its messages to and launches of other agents.
     fn turn_rows<'s, 'a>(
@@ -3036,20 +3130,23 @@ impl Runtime {
             let item = items.get(index)?;
             Some((item, self.cache.get(&item.id)?))
         };
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        let mut rows = TranscriptRows::new(step::GAP_M);
         for index in &turn.prompt {
             let Some(item) = items.get(*index) else {
                 continue;
             };
             if !matches!(item.content, ItemContent::Delivery { .. }) {
-                rows.push(scroll::item(&item.id, self.prompt_view(item)));
+                rows.message(
+                    scroll::item(&item.id, self.prompt_view(item)),
+                    MESSAGE_ACTION_FOOTER,
+                );
             } else if let Some(cached) = self.cache.get(&item.id) {
                 // Drawn once its body is parsed, as an answer is; never in the
                 // user's own bubble.
-                rows.push(scroll::item(
-                    &item.id,
-                    self.delivery_view(item, cached, settings),
-                ));
+                rows.message(
+                    scroll::item(&item.id, self.delivery_view(item, cached, settings)),
+                    MESSAGE_ACTION_FOOTER,
+                );
             }
         }
         if !turn.steps.is_empty() {
@@ -3076,30 +3173,34 @@ impl Runtime {
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
-                rows.push(scroll::item(&item.id, card(item, cached, coordinated)));
+                rows.message(
+                    scroll::item(&item.id, card(item, cached, coordinated)),
+                    Self::prose_action_footer(item, cached, prose.slot),
+                );
                 continue;
             }
-            rows.push(scroll::item(
-                &item.id,
-                match &item.content {
-                    ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
-                    ItemContent::Image { .. } => self.image_preview(item, cached),
-                    // Anything else in the answer slot is a step the grouping did
-                    // not recognize, drawn the way a step is.
-                    _ => step(item, cached),
-                },
-            ));
+            rows.message(
+                scroll::item(
+                    &item.id,
+                    match &item.content {
+                        ItemContent::Text { .. } => {
+                            self.text_view(item, cached, prose.slot, settings)
+                        }
+                        ItemContent::Image { .. } => self.image_preview(item, cached),
+                        // Anything else in the answer slot is a step the grouping did
+                        // not recognize, drawn the way a step is.
+                        _ => step(item, cached),
+                    },
+                ),
+                Self::prose_action_footer(item, cached, prose.slot),
+            );
         }
-        widget::container(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_M)
-                .width(Length::Fill),
-        )
-        .id(iced::advanced::widget::Id::new(format!(
-            "chat-turn-{}-{}",
-            self.target.card, turn.key
-        )))
-        .into()
+        widget::container(widget::column::with_children(rows.children).width(Length::Fill))
+            .id(iced::advanced::widget::Id::new(format!(
+                "chat-turn-{}-{}",
+                self.target.card, turn.key
+            )))
+            .into()
     }
 
     /// What to call an attachment the reader just sent.
@@ -4527,6 +4628,171 @@ mod tests {
         };
         assert!(cooldown.enabled());
         assert!(fast_mode_tooltip(&cooldown).contains("temporarily cooling down"));
+    }
+
+    #[test]
+    fn assistant_activity_uses_action_footer_as_separation_without_hover_reflow() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct Probe {
+            summary: String,
+            bounds: HashMap<String, iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                text: &str,
+            ) {
+                if text == self.summary {
+                    self.bounds.insert("activity".into(), bounds);
+                }
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(state) = state.downcast_ref::<selectable_prose::State>() {
+                    for key in [
+                        "Before activity.",
+                        "After activity.",
+                        "New user exchange.\nA second line.",
+                    ] {
+                        if state.plain.as_ref() == key {
+                            self.bounds.insert(key.into(), bounds);
+                        }
+                    }
+                }
+            }
+        }
+        let text = |id: &str, role, text: &str| chat::Item {
+            id: id.into(),
+            role,
+            content: ItemContent::Text {
+                text: text.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        let items = vec![
+            text("before", chat::Role::Assistant, "Before activity."),
+            chat::Item {
+                id: "tool".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Command {
+                    label: "Check fixture".into(),
+                    command: "true".into(),
+                    working_directory: "/project".into(),
+                    action: chat::CommandAction::Run,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    output: "visible when expanded".into(),
+                },
+                at: None,
+                started_at: None,
+            },
+            text("after", chat::Role::Assistant, "After activity."),
+            text(
+                "new-prompt",
+                chat::Role::User,
+                "New user exchange.\nA second line.",
+            ),
+        ];
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for width in [360.0, 780.0] {
+            let (runtime, _handle) = frame_cost::live_runtime(&items);
+            let summary = runtime
+                .turns
+                .iter()
+                .find(|turn| !turn.steps.is_empty())
+                .unwrap()
+                .summary
+                .clone();
+            let mut element = runtime.view(
+                false,
+                true,
+                &shortcuts,
+                width,
+                Place {
+                    channel: None,
+                    name: "Spacing fixture".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0));
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut probe = Probe {
+                summary: summary.clone(),
+                bounds: Default::default(),
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            let before = probe.bounds["Before activity."];
+            let activity = probe.bounds["activity"];
+            let after = probe.bounds["After activity."];
+            let next_prompt = probe.bounds["New user exchange.\nA second line."];
+            let before_gap = activity.y - (before.y + before.height);
+            let after_gap = after.y - (activity.y + activity.height);
+            let exchange_gap = next_prompt.y - (after.y + after.height);
+            assert!(
+                (0.0..=40.0).contains(&before_gap),
+                "idle activity gap {before_gap} at width {width}"
+            );
+            assert!(
+                (8.0..=24.0).contains(&after_gap),
+                "activity-to-answer gap {after_gap} at width {width}"
+            );
+            assert!(
+                exchange_gap >= before_gap && exchange_gap <= 44.0,
+                "new exchange gap {exchange_gap} at width {width}"
+            );
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                    position: before.center(),
+                }),
+                Layout::new(&node),
+                iced::mouse::Cursor::Available(before.center()),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(width, 1000.0)),
+            );
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut hovered = Probe {
+                summary,
+                bounds: Default::default(),
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut hovered);
+            assert_eq!(
+                hovered.bounds, probe.bounds,
+                "hover controls must not move neighboring messages"
+            );
+        }
     }
 
     #[test]
