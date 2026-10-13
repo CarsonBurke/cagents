@@ -228,7 +228,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         fixture
             .root
             .path()
-            .join("home/.claude/skills/cagents-agents/SKILL.md")
+            .join("home/.claude/skills/cagents/SKILL.md")
             .is_file()
     );
     let closed = fixture.cli(&["agent", "close", agent]);
