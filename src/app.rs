@@ -21071,7 +21071,7 @@ mod tests {
 
     #[test]
     fn reset_settings_dialog_focus_cycles_and_escape_restores_origin() {
-        let mut app = context_inspector_test_app(false);
+        let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         app.cards.insert(card, CardRuntime::Settings);
