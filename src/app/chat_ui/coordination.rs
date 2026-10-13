@@ -551,12 +551,7 @@ impl Runtime {
         // reads as the other side of what it received.
         .class(design::surface(
             Some(design::raised),
-            [
-                design::RADIUS_L,
-                design::RADIUS_L,
-                design::RADIUS_L,
-                design::RADIUS_XS,
-            ],
+            [design::RADIUS_M; 4],
             true,
         ))
         .padding([step::GAP_S as u16, step::GAP_M as u16])
