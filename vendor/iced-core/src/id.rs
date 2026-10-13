@@ -150,7 +150,7 @@ impl std::hash::Hash for Internal {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             Self::Unique(id) => id.hash(state),
-            Self::Custom(name, _) => name.hash(state),
+            Self::Custom(_, name) => name.hash(state),
             Self::Set(ids) => ids.hash(state),
         }
     }
@@ -159,6 +159,40 @@ impl std::hash::Hash for Internal {
 #[cfg(test)]
 mod tests {
     use super::Id;
+
+    #[test]
+    fn custom_ids_with_equal_names_share_hash_map_entries() {
+        let first = Id::new("saved-message");
+        let rebuilt = Id::new("saved-message");
+        assert_eq!(first, rebuilt);
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(first, 1);
+        assert_eq!(entries.get(&rebuilt), Some(&1));
+        assert_eq!(entries.insert(rebuilt, 2), Some(1));
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn equal_unique_and_set_ids_hash_equally() {
+        use super::Internal;
+        use std::hash::{Hash, Hasher};
+        let hash = |id: &Id| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut hasher);
+            hasher.finish()
+        };
+        let unique = Id::unique();
+        assert_eq!(hash(&unique), hash(&unique.clone()));
+        let first =
+            Id(Internal::Set(vec![unique.0.clone(), Id::new("named").0]));
+        let rebuilt =
+            Id(Internal::Set(vec![unique.0.clone(), Id::new("named").0]));
+        assert_eq!(first, rebuilt);
+        assert_eq!(hash(&first), hash(&rebuilt));
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(first, "retained");
+        assert_eq!(entries.get(&rebuilt), Some(&"retained"));
+    }
 
     #[test]
     fn unique_generates_different_ids() {

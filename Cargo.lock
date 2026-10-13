@@ -4286,7 +4286,6 @@ dependencies = [
 [[package]]
 name = "iced_accessibility"
 version = "0.1.0"
-source = "git+https://github.com/pop-os/libcosmic.git?rev=caec74c2559924443f12fc6faf97a5bcefe6271d#caec74c2559924443f12fc6faf97a5bcefe6271d"
 dependencies = [
  "accesskit 0.22.0",
  "accesskit_winit",

@@ -28,3 +28,7 @@ Run the focused standalone timing regression with:
 cargo test --manifest-path vendor/iced-core/Cargo.toml \
   mouse::click::tests::consecutive_clicks_include_the_deadline_and_reset_after_it
 ```
+
+## Custom ID hashing
+
+Custom widget IDs now hash their names, matching their existing equality comparison. Regression tests cover rebuilt named IDs, unique IDs, and sets. This implementation is selected without accessibility; the corresponding accessibility ID implementation is patched in `vendor/iced-accessibility`.
