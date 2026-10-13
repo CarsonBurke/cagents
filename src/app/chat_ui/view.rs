@@ -1253,15 +1253,19 @@ impl Runtime {
                     .into(),
                     small_icon(
                         Icon::ChevronUp,
-                        "Previous match",
+                        "Previous match — Shift+Enter in search",
                         Action::FindNext(target, false),
                     ),
                     small_icon(
                         Icon::ChevronDown,
-                        "Next match",
+                        "Next match — Enter in search",
                         Action::FindNext(target, true),
                     ),
-                    small_icon(Icon::Close, "Close find", Action::CloseFind(target)),
+                    small_icon(
+                        Icon::Close,
+                        "Close find — Escape",
+                        Action::CloseFind(target),
+                    ),
                 ])
                 .align_y(Alignment::Center)
                 .spacing(step::GAP_S)

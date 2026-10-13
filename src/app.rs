@@ -2754,6 +2754,7 @@ pub enum SettingsField {
     ShortcutClonePane,
     ShortcutCloseFocusedColumn,
     ShortcutSearchProjects,
+    ShortcutFindInPane,
     ShortcutPreviousColumn,
     ShortcutNextColumn,
     ShortcutCyclePaneWidth,
@@ -2790,12 +2791,13 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 37] = [
+    const SHORTCUTS: [Self; 38] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
         Self::ShortcutCloseFocusedColumn,
         Self::ShortcutSearchProjects,
+        Self::ShortcutFindInPane,
         Self::ShortcutPreviousColumn,
         Self::ShortcutNextColumn,
         Self::ShortcutCyclePaneWidth,
@@ -2907,6 +2909,7 @@ impl SettingsField {
             Self::ShortcutClonePane => "Clone focused pane",
             Self::ShortcutCloseFocusedColumn => "Close focused pane",
             Self::ShortcutSearchProjects => "Search projects",
+            Self::ShortcutFindInPane => "Find in pane",
             Self::ShortcutPreviousColumn => "Previous pane",
             Self::ShortcutNextColumn => "Next pane",
             Self::ShortcutCyclePaneWidth => "Cycle pane width",
@@ -2991,6 +2994,7 @@ impl SettingsField {
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
             | Self::ShortcutSearchProjects
+            | Self::ShortcutFindInPane
             | Self::ShortcutPreviousColumn
             | Self::ShortcutNextColumn
             | Self::ShortcutCyclePaneWidth
@@ -3049,6 +3053,7 @@ struct ShortcutDraft {
     clone_pane: String,
     close_focused_column: String,
     search_projects: String,
+    find_in_pane: String,
     previous_column: String,
     next_column: String,
     cycle_pane_width: String,
@@ -3091,6 +3096,7 @@ impl ShortcutDraft {
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
             close_focused_column: settings::format_chords(&shortcuts.close_focused_column),
             search_projects: settings::format_chords(&shortcuts.search_projects),
+            find_in_pane: settings::format_chords(&shortcuts.find_in_pane),
             previous_column: settings::format_chords(&shortcuts.previous_column),
             next_column: settings::format_chords(&shortcuts.next_column),
             cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
@@ -3323,6 +3329,9 @@ impl SettingsDraft {
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
                 self.keyboard_shortcuts.close_focused_column = value;
+            }
+            SettingsField::ShortcutFindInPane => {
+                self.keyboard_shortcuts.find_in_pane = value;
             }
             SettingsField::ShortcutSearchProjects => {
                 self.keyboard_shortcuts.search_projects = value;
@@ -3704,6 +3713,10 @@ fn settings_update(
         }
         SettingsField::ShortcutCloseFocusedColumn => {
             next.keyboard_shortcuts.close_focused_column = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFindInPane => {
+            next.keyboard_shortcuts.find_in_pane = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutSearchProjects => {
@@ -9180,16 +9193,6 @@ impl Cagents {
                             else {
                                 return None;
                             };
-                            if modifiers.control()
-                                && !modifiers.alt()
-                                && !modifiers.logo()
-                                && !modifiers.shift()
-                                && key
-                                    .to_latin(physical_key)
-                                    .is_some_and(|key| key.eq_ignore_ascii_case(&'f'))
-                            {
-                                return Some(Message::TerminalFind(terminal_ui::Action::Open(id)));
-                            }
                             crate::interaction::font_zoom_chord(&key, physical_key, modifiers).map(
                                 |delta| Message::ZoomFont {
                                     card: id,
@@ -15956,14 +15959,6 @@ impl Application for Cagents {
                 }
             }
             Message::FocusProjectSearch => {
-                if let Some(task) = self.open_chat_find() {
-                    return task;
-                }
-                if let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
-                {
-                    return self.handle_terminal_find(terminal_ui::Action::Open(card));
-                }
                 // `focus` unfocuses every widget whose id does not match, so
                 // aiming it at an id the pane is not rendering would blur
                 // whatever the user was typing into and focus nothing. Only
@@ -23256,6 +23251,31 @@ mod tests {
             generation: 1,
             result: result.map(Box::new),
         }
+    }
+
+    #[test]
+    fn project_search_shortcut_does_not_redirect_to_focused_settings_find() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(card, CardRuntime::Settings);
+        app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+        app.sidebar_model.projects.push(restored_sidebar_project(
+            ProjectId::new(),
+            "Fixture",
+            Path::new("/fixture"),
+        ));
+        assert!(!app.sidebar_state.controls_expanded());
+        drop(app.run_workspace_command(
+            workspace_widget::GlobalShortcut::FindInPane,
+            keyboard::Modifiers::empty(),
+        ));
+        assert!(!app.sidebar_state.controls_expanded());
+        drop(app.run_workspace_command(
+            workspace_widget::GlobalShortcut::FocusProjectSearch,
+            keyboard::Modifiers::empty(),
+        ));
+        assert!(app.sidebar_state.controls_expanded());
+        assert_eq!(app.workspace.focused(), Some(card));
     }
 
     #[test]

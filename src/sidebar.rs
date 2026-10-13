@@ -3894,8 +3894,15 @@ fn view_inner<'a>(
         )
         .push(design::horizontal_rule())
         .push(
-            widget::container(header(model, state, compact, header_loading, modal_open))
-                .padding([0.0, space::XS]),
+            widget::container(header(
+                model,
+                state,
+                compact,
+                header_loading,
+                modal_open,
+                shortcuts,
+            ))
+            .padding([0.0, space::XS]),
         );
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
@@ -3960,6 +3967,7 @@ fn header<'a>(
     compact: bool,
     loading: bool,
     modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(4);
     if !model.projects.is_empty() {
@@ -3998,9 +4006,12 @@ fn header<'a>(
                 .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
             // Closing the controls also ends the search, so say so.
             if state.controls_expanded && state.search_filters_active() {
-                "Close and clear search"
+                "Close and clear search".to_owned()
             } else {
-                "Search projects"
+                crate::workspace_widget::shortcut_tooltip(
+                    crate::workspace_widget::GlobalShortcut::FocusProjectSearch,
+                    shortcuts,
+                )
             },
         );
         if compact {
@@ -4146,7 +4157,7 @@ fn utilities<'a>(
     .on_press_maybe(gated(SidebarAction::ToggleProjects, modal_open))
     .id(Id::new("command.toggle-projects"))
     .into();
-    let [settings, automations] = utility_controls(modal_open);
+    let [settings, automations] = utility_controls(modal_open, Some(shortcuts));
     if compact {
         let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations];
         return widget::column::with_children(children)
@@ -4173,9 +4184,21 @@ fn utilities<'a>(
     )
 }
 
-fn utility_controls<'a>(modal_open: bool) -> [Element<'a, SidebarAction>; 2] {
+fn utility_controls<'a>(
+    modal_open: bool,
+    shortcuts: Option<&crate::settings::KeyboardShortcuts>,
+) -> [Element<'a, SidebarAction>; 2] {
+    let label = shortcuts.map_or_else(
+        || "Settings".to_owned(),
+        |shortcuts| {
+            crate::workspace_widget::shortcut_tooltip(
+                crate::workspace_widget::GlobalShortcut::OpenSettings,
+                shortcuts,
+            )
+        },
+    );
     let settings: Element<'a, SidebarAction> =
-        crate::ui_controls::icon_button(Icon::Settings, "Settings")
+        crate::ui_controls::icon_button(Icon::Settings, label)
             .on_press_maybe(gated(SidebarAction::OpenSettings, modal_open))
             .id(stable_id("settings"))
             .into();
@@ -4188,7 +4211,7 @@ fn utility_controls<'a>(modal_open: bool) -> [Element<'a, SidebarAction>; 2] {
 
 // The standalone editor still mounts its utility controls below its file pane.
 fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
-    let [settings, automations] = utility_controls(modal_open);
+    let [settings, automations] = utility_controls(modal_open, None);
     if compact {
         widget::column::with_children(vec![automations, settings])
             .align_x(Alignment::Center)
@@ -14348,8 +14371,17 @@ pub(crate) mod tests {
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::SearchChanged("main".into()));
         for compact in [false, true] {
-            let actions =
-                frame_enter_presses(&renderer, header(&model, &state, compact, false, false));
+            let actions = frame_enter_presses(
+                &renderer,
+                header(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    false,
+                    &crate::settings::KeyboardShortcuts::default(),
+                ),
+            );
             assert_eq!(
                 actions,
                 vec![
@@ -14359,14 +14391,33 @@ pub(crate) mod tests {
                 ]
             );
             state.apply(&actions[0]);
-            let actions =
-                frame_enter_presses(&renderer, header(&model, &state, compact, false, false));
+            let actions = frame_enter_presses(
+                &renderer,
+                header(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    false,
+                    &crate::settings::KeyboardShortcuts::default(),
+                ),
+            );
             assert_eq!(actions[0], SidebarAction::SetFilter(SidebarFilter::All));
             state.apply(&actions[0]);
             assert_eq!(state.query(), "main", "attention does not overwrite search");
             assert!(
-                frame_enter_presses(&renderer, header(&model, &state, compact, false, true))
-                    .is_empty()
+                frame_enter_presses(
+                    &renderer,
+                    header(
+                        &model,
+                        &state,
+                        compact,
+                        false,
+                        true,
+                        &crate::settings::KeyboardShortcuts::default()
+                    )
+                )
+                .is_empty()
             );
         }
     }
@@ -14379,7 +14430,14 @@ pub(crate) mod tests {
         let mut shortcuts = crate::settings::KeyboardShortcuts::default();
         shortcuts.toggle_projects = vec!["Alt+B".into()];
         for loading in [false, true] {
-            let mut element = header(&model, &state, false, loading, false);
+            let mut element = header(
+                &model,
+                &state,
+                false,
+                loading,
+                false,
+                &crate::settings::KeyboardShortcuts::default(),
+            );
             let mut tree = Tree::new(&element);
             // The sidebar adds another four pixels of padding on each side.
             let width = EXPANDED_WIDTH_MIN - 8.0;
@@ -14735,7 +14793,14 @@ pub(crate) mod tests {
         // moving the window.
         for compact in [false, true] {
             for modal_open in [false, true] {
-                let mut element = header(&model, &state, compact, false, modal_open);
+                let mut element = header(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    modal_open,
+                    &crate::settings::KeyboardShortcuts::default(),
+                );
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(260.0, 44.0));
                 let node = element.as_widget_mut().layout(
