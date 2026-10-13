@@ -2157,6 +2157,14 @@ impl Runtime {
     /// Records a notice in the transcript, after the exchange it concerns.
     fn note(&mut self, notice: String) {
         let anchor = self.turns.last().map(|turn| turn.key.clone());
+        let provider = self.session.launch.provider;
+        if chat::requires_sign_in(provider, &notice) {
+            // An updated verification failure replaces this exchange's active
+            // auth warning; other exchanges and tool failures remain history.
+            self.failures.retain(|(previous, message)| {
+                previous != &anchor || !chat::requires_sign_in(provider, message)
+            });
+        }
         if self
             .failures
             .iter()
@@ -2493,6 +2501,26 @@ impl Runtime {
             &turns,
             &snapshot.items,
         );
+        let current_anchor = self.turns.last().map(|turn| turn.key.as_str());
+        if self
+            .snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| chat::requires_sign_in(self.session.launch.provider, error))
+            && snapshot.error.is_none()
+            && !self.snapshot.busy
+            && !snapshot.busy
+            && snapshot.ready
+            && !snapshot.exited
+            && snapshot.turn_generation == self.snapshot.turn_generation
+            && snapshot.session_id == self.snapshot.session_id
+            && current_anchor == turns.last().map(|turn| turn.key.as_str())
+        {
+            let provider = self.session.launch.provider;
+            self.failures.retain(|(anchor, message)| {
+                anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
+            });
+        }
         self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
         if snapshot.error != self.snapshot.error
@@ -16517,13 +16545,20 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
         runtime.error = Some(original.into());
-        assert_eq!(runtime.auth_error(), runtime.snapshot.error.as_deref(), "Resume must capture the authoritative latest failure, not a stale local copy");
+        assert_eq!(
+            runtime.auth_error(),
+            runtime.snapshot.error.as_deref(),
+            "Resume must capture the authoritative latest failure, not a stale local copy"
+        );
         assert_eq!(
             runtime.auth_verification_detail(),
             Some("Different login: open Accounts to resolve the identity")
         );
         assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_some());
-        app.chat_runtime_mut(target).unwrap().error = Some(chat::sign_in_verification_failure(original, "older verification detail"));
+        app.chat_runtime_mut(target).unwrap().error = Some(chat::sign_in_verification_failure(
+            original,
+            "older verification detail",
+        ));
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.error = Some(original.into());
         snapshot.generation += 1;
@@ -16531,7 +16566,11 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
         assert_eq!(runtime.auth_error(), Some(original));
-        assert_eq!(runtime.auth_verification_detail(), None, "a new plain failure suppresses older local verification detail");
+        assert_eq!(
+            runtime.auth_verification_detail(),
+            None,
+            "a new plain failure suppresses older local verification detail"
+        );
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.error = None;
         snapshot.generation += 1;
@@ -16540,5 +16579,97 @@ mod tests {
         runtime.refresh();
         runtime.error = None;
         assert_eq!(runtime.auth_verification_detail(), None);
+    }
+    #[test]
+    fn verified_idle_auth_recovery_removes_only_current_exchange_warning() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let failure = "Authentication required. Please sign in again.";
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.ready = true;
+        snapshot.busy = false;
+        snapshot.exited = false;
+        snapshot.error = Some(failure.into());
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        let current = runtime.turns.last().map(|turn| turn.key.clone());
+        runtime
+            .failures
+            .insert(0, (Some("older-exchange".into()), failure.into()));
+        runtime.note("Tool deployment failed with HTTP 401".into());
+        runtime.note(chat::sign_in_verification_failure(
+            failure,
+            "first failed verification",
+        ));
+        runtime.note(chat::sign_in_verification_failure(
+            failure,
+            "latest failed verification",
+        ));
+        assert_eq!(
+            runtime
+                .failures
+                .iter()
+                .filter(|(anchor, message)| anchor == &current
+                    && chat::requires_sign_in(Provider::Codex, message))
+                .count(),
+            1
+        );
+        let transcript = runtime.snapshot.items.clone();
+        snapshot.error = None;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.snapshot.items, transcript);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(
+            runtime.failures[0],
+            (Some("older-exchange".into()), failure.into())
+        );
+        assert!(
+            runtime
+                .failures
+                .iter()
+                .any(|(anchor, message)| anchor == &current
+                    && message == "Tool deployment failed with HTTP 401")
+        );
+    }
+
+    #[test]
+    fn auth_warning_remains_when_new_work_or_error_prevents_idle_recovery() {
+        for transition in 0..3 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target, handle) = history_fixture(&mut app);
+            let failure = "Authentication required. Please sign in again.";
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.ready = true;
+            snapshot.busy = false;
+            snapshot.error = Some(failure.into());
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot.clone());
+            app.chat_runtime_mut(target).unwrap().refresh();
+            let recorded = chat_runtime(&app, card).failures.clone();
+            snapshot.generation += 1;
+            snapshot.error = None;
+            match transition {
+                0 => snapshot.busy = true,
+                1 => {
+                    snapshot.turn_generation += 1;
+                    snapshot.items.push(Arc::new(chat::Item {
+                        id: "new-auth-turn".into(),
+                        role: chat::Role::User,
+                        content: text("new work"),
+                        at: None,
+                        started_at: None,
+                    }));
+                }
+                _ => snapshot.error = Some(failure.into()),
+            }
+            handle.publish_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert_eq!(chat_runtime(&app, card).failures, recorded);
+        }
     }
 }
