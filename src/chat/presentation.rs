@@ -288,6 +288,9 @@ mod tests {
             output: "final output".into(),
         };
         let agent = super::super::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
             id: "child".into(),
             kind: "review".into(),
             description: String::new(),

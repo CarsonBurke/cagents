@@ -925,6 +925,12 @@ pub struct Subagent {
     pub kind: String,
     pub description: String,
     pub status: ToolStatus,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub waiting: bool,
+    #[serde(default)]
+    pub detail: String,
     /// Whether it runs apart from the turn that started it, so that the turn
     /// ending, or being cancelled, does not of itself end it.
     #[serde(default)]
@@ -1000,7 +1006,13 @@ impl Snapshot {
     pub fn activity(&self) -> ActivityState {
         if self.exited {
             ActivityState::Unknown
-        } else if self.waiting || !self.requests.is_empty() {
+        } else if self.waiting
+            || !self.requests.is_empty()
+            || self
+                .subagents
+                .iter()
+                .any(|agent| agent.waiting && agent.status == ToolStatus::Running)
+        {
             ActivityState::Waiting
         } else if self.is_working() {
             ActivityState::Working
@@ -1649,6 +1661,9 @@ pub enum Event {
         description: String,
         status: Option<ToolStatus>,
         background: Option<bool>,
+        model: Option<String>,
+        waiting: Option<bool>,
+        detail: Option<String>,
     },
     SubagentItem {
         id: String,
@@ -1769,9 +1784,31 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn older_subagent_snapshots_default_to_unknown_model_and_child_waiting_is_visible() {
+        let mut agent: super::Subagent = serde_json::from_value(serde_json::json!({
+            "id":"child", "kind":"Codex agent", "description":"", "status":"Running", "items":[]
+        }))
+        .unwrap();
+        assert_eq!(agent.model, None);
+        assert!(!agent.waiting);
+        assert!(agent.detail.is_empty());
+        agent.waiting = true;
+        let mut snapshot = super::Snapshot::default();
+        snapshot.subagents.push(agent);
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Waiting);
+        snapshot.subagents[0].waiting = false;
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Working);
+        snapshot.subagents[0].status = super::ToolStatus::Succeeded;
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
+    }
+
+    #[test]
     fn delegated_work_keeps_card_active_without_blocking_parent_prompts() {
         let mut snapshot = super::Snapshot::default();
         snapshot.subagents.push(super::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
             id: "child".into(),
             kind: String::new(),
             description: String::new(),

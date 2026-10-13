@@ -2509,6 +2509,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             description,
             status,
             background,
+            model,
+            waiting,
+            detail,
         } => {
             let agent = subagent(state, &id);
             if let Some(background) = background {
@@ -2520,8 +2523,20 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             if !description.is_empty() {
                 agent.description = description;
             }
+            if let Some(model) = model {
+                agent.model = Some(model);
+            }
+            if let Some(waiting) = waiting {
+                agent.waiting = waiting;
+            }
+            if let Some(detail) = detail {
+                agent.detail = detail;
+            }
             if let Some(status) = status {
                 agent.status = status;
+                if status != ToolStatus::Running {
+                    agent.waiting = false;
+                }
             }
         }
         Event::SubagentItem { id, mut item } => {
@@ -2778,6 +2793,9 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
         return &mut state.subagents[index];
     }
     state.subagents.push(Subagent {
+        model: None,
+        waiting: false,
+        detail: String::new(),
         id: id.into(),
         kind: String::new(),
         description: String::new(),
@@ -3067,6 +3085,9 @@ mod tests {
         assert!(!attention.finish(&mut state, Some(20)));
         state.busy = false;
         state.subagents.push(crate::chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
             id: "child".into(),
             kind: "test".into(),
             description: "Background work".into(),
@@ -3178,6 +3199,9 @@ mod tests {
                     Command::Compact if self.started => Ok(Step {
                         events: (8..40)
                             .map(|index| Event::Subagent {
+                                model: None,
+                                waiting: None,
+                                detail: None,
                                 id: format!("late-background-{index}"),
                                 kind: String::new(),
                                 description: String::new(),
@@ -3194,6 +3218,9 @@ mod tests {
                         Ok(Step {
                             events: (0..40)
                                 .map(|index| Event::Subagent {
+                                    model: None,
+                                    waiting: None,
+                                    detail: None,
                                     id: format!("late-background-{index}"),
                                     kind: "Explore".into(),
                                     description: "Started after the caller observed idle".into(),
@@ -3209,6 +3236,9 @@ mod tests {
                         Ok(Step {
                             events: (0..40)
                                 .map(|index| Event::Subagent {
+                                    model: None,
+                                    waiting: None,
+                                    detail: None,
                                     id: format!("late-background-{index}"),
                                     kind: "Explore".into(),
                                     description: String::new(),
@@ -3363,6 +3393,9 @@ mod tests {
             &mut state,
             &mut indices,
             Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
                 id: "agent-tool".into(),
                 kind: "Explore".into(),
                 description: "Inspect".into(),
@@ -3409,6 +3442,9 @@ mod tests {
             &mut state,
             &mut indices,
             Event::Subagent {
+                model: None,
+                waiting: None,
+                detail: None,
                 id: "agent-tool".into(),
                 kind: String::new(),
                 description: String::new(),
@@ -3430,6 +3466,9 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: id.clone(),
                     kind: "Explore".into(),
                     description: "Background".into(),
@@ -3473,6 +3512,9 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: format!("child-{index}"),
                     kind: String::new(),
                     description: String::new(),
@@ -3511,6 +3553,9 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: format!("child-{index}"),
                     kind: String::new(),
                     description: String::new(),
@@ -4047,6 +4092,9 @@ mod tests {
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 self.0 += 1;
                 let child = |status| Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: "late-child".into(),
                     kind: "test".into(),
                     description: "Work".into(),

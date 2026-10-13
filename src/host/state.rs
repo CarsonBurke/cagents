@@ -6321,6 +6321,9 @@ for line in sys.stdin:
         impl BackgroundAdapter {
             fn task(id: &str, status: ToolStatus) -> Event {
                 Event::Subagent {
+                    model: None,
+                    waiting: None,
+                    detail: None,
                     id: id.into(),
                     kind: "Explore".into(),
                     description: id.into(),
