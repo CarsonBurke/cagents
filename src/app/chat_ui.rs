@@ -1,3 +1,4 @@
+mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
@@ -193,6 +194,10 @@ pub enum Action {
     /// Brings forward the open session whose id starts with the given one,
     /// as an agent addressed it in a command.
     OpenSession(String),
+    SessionResolved(Result<session_links::Destination, String>),
+    SessionLinkOpened(Result<(), String>),
+    SessionLinkWindowBackend(String, TerminalId, bool),
+    SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
     OpenDocument(Target, String),
@@ -7334,31 +7339,21 @@ impl Cagents {
                 }
             }
             Action::OpenSession(prefix) => {
-                let mut sessions = self
-                    .durable
-                    .cards
-                    .iter()
-                    .filter(|card| card.existence.is_open())
-                    .filter_map(notification_ui::card_session)
-                    .filter(|session| session.to_string().starts_with(&prefix));
-                let session = match (sessions.next(), sessions.next()) {
-                    (Some(session), None) => session,
-                    (None, _) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Session {prefix} is not open in this window."
-                        )));
-                        return Task::none();
-                    }
-                    (Some(_), Some(_)) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "More than one open session starts with {prefix}."
-                        )));
-                        return Task::none();
-                    }
-                };
-                return self.update_notifications(notification_ui::Action::Activated(
-                    crate::notifications::Target::Session(session),
-                ));
+                return self.open_session_link(prefix);
+            }
+            Action::SessionResolved(result) => {
+                return self.session_link_resolved(result);
+            }
+            Action::SessionLinkWindowBackend(slot, session, wayland) => {
+                return self.session_window_backend(slot, session, wayland);
+            }
+            Action::SessionLinkToken(slot, session, token) => {
+                return session_links::handoff_session_window(slot, session, token);
+            }
+            Action::SessionLinkOpened(result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::warning(error));
+                }
             }
             Action::OpenUrl(raw) => match Url::parse(&raw) {
                 Ok(url) if matches!(url.scheme(), "https" | "http" | "file") => {
@@ -13686,6 +13681,28 @@ mod tests {
         let _ = app.resume_saved_conversation(earlier(&app, card));
         assert!(app.workspace.pending_close().is_none());
         assert!(app.workspace.order().any(|id| id == card));
+    }
+
+    #[test]
+    fn a_closed_claude_conversation_can_reopen_as_history_without_its_directory() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let card = draft_in(&mut app, project.path());
+        let mut saved = earlier(&app, card);
+        saved.session.launch.provider = Provider::Claude;
+        saved.session.launch.recipe.program = "claude".into();
+        saved.session.launch.recipe.arguments.clear();
+        saved.session.launch.recipe.working_directory = project.path().join("removed");
+        let provider_id = saved.session.launch.session_id.clone();
+        let _ = app.resume_saved_conversation(saved);
+        let reopened = app.workspace.focused().unwrap();
+        assert_ne!(reopened, card);
+        let CardKind::Chat(session) = &app.card_state(reopened).unwrap().kind else {
+            panic!("the saved conversation reopens as a chat");
+        };
+        assert_eq!(session.launch.session_id, provider_id);
+        assert!(session.launch.needs_read_only_history());
+        assert!(app.resume_ui.error.is_none());
     }
 
     /// A `/resume` the picker cannot answer is left for the writer to send

@@ -134,7 +134,12 @@ use crate::{
 /// Version 66 adds daemon-fenced optional merged-worktree cleanup.
 /// Version 67 carries original-writer transcript location identity receipts.
 /// Version 68 adds lineage-scoped terminal mailbox attention.
-pub const PROTOCOL_VERSION: u16 = 69;
+/// Version 69 adds the reason a native chat is a read-only history viewer to
+/// `Snapshot`. Postcard peers require the matched layout even though older
+/// JSON snapshots can omit the defaulted field.
+/// Version 70 carries native subagent model, waiting state and status detail
+/// in sparse events and snapshots.
+pub const PROTOCOL_VERSION: u16 = 70;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

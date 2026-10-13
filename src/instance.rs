@@ -1069,6 +1069,28 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
     launch_window_at(&executable, new_window, slot, source)
 }
 
+/// Session ids belong to a daemon/device namespace. Never resolve a local
+/// coordination link against a different device's saved window.
+pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
+    match (crate::device::selected(), slot.starts_with("device-")) {
+        (None, device_slot) => Ok(!device_slot),
+        (Some(_), false) => Ok(false),
+        (Some(selected), true) => {
+            let mut identity = match owned_lock(
+                &runtime_directory()?.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
+                libc::LOCK_SH,
+            ) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let mut name = String::new();
+            (&mut identity.0).take(64).read_to_string(&mut name)?;
+            Ok(name == selected.name)
+        }
+    }
+}
+
 fn window_device_identity(
     runtime: &Path,
     slot: &str,
@@ -1217,6 +1239,7 @@ impl ApplicationLease {
 #[derive(Debug, Clone)]
 pub struct UiActivation {
     pub token: Option<String>,
+    pub session: Option<crate::model::TerminalId>,
     pub update: Option<UiUpdateRequest>,
 }
 
@@ -1359,6 +1382,45 @@ pub fn activate_window(slot: &str) -> io::Result<bool> {
 pub fn activate_window_with_token(slot: &str, token: Option<&str>) -> io::Result<bool> {
     validate_window_slot(slot)?;
     activate_window_at_with_token(&runtime_directory()?, slot, token)
+}
+
+/// Ask the owning window to navigate to this exact session. A missing window
+/// is reported to the caller, which may reopen its saved slot before retrying.
+pub fn activate_window_session(
+    slot: &str,
+    session: crate::model::TerminalId,
+    token: Option<&str>,
+) -> io::Result<bool> {
+    activate_window_session_in(&runtime_directory()?, slot, session, token)
+}
+
+fn activate_window_session_in(
+    runtime: &Path,
+    slot: &str,
+    session: crate::model::TerminalId,
+    token: Option<&str>,
+) -> io::Result<bool> {
+    validate_window_slot(slot)?;
+    require_owned_runtime_directory(runtime)?;
+    let mut stream = match UnixStream::connect(runtime.join(slot_socket_name(slot))) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    match token.filter(|token| valid_activation_token(token)) {
+        Some(token) => writeln!(stream, "session {session} {token}")?,
+        None => writeln!(stream, "session {session}")?,
+    }
+    Ok(read_capped_line(&stream)? == "ok")
 }
 
 pub fn activate_destination(
@@ -1604,6 +1666,21 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 if events
                     .send_blocking(UiActivation {
                         token,
+                        session: None,
+                        update: None,
+                    })
+                    .is_err()
+                {
+                    let _ = writeln!(&stream, "error: window is no longer accepting activations");
+                    break;
+                }
+                let _ = writeln!(&stream, "ok");
+            }
+            Ok(ActivationRequest::Session(session, token)) => {
+                if events
+                    .send_blocking(UiActivation {
+                        token,
+                        session: Some(session),
                         update: None,
                     })
                     .is_err()
@@ -1618,6 +1695,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 if events
                     .send_blocking(UiActivation {
                         token: None,
+                        session: None,
                         update: Some(UiUpdateRequest { action, response }),
                     })
                     .is_err()
@@ -1639,6 +1717,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
 #[cfg(feature = "ui")]
 enum ActivationRequest {
     Activate(Option<String>),
+    Session(crate::model::TerminalId, Option<String>),
     Shutdown,
     Update(UiUpdateAction),
 }
@@ -1675,6 +1754,20 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
         None if line == "update-prepare" => Ok(ActivationRequest::Update(UiUpdateAction::Prepare)),
         None if line == "update-cancel" => Ok(ActivationRequest::Update(UiUpdateAction::Cancel)),
         None if line == "update-commit" => Ok(ActivationRequest::Update(UiUpdateAction::Commit)),
+        Some(("session", identity)) => {
+            let (id, token) = identity
+                .split_once(' ')
+                .map_or((identity, None), |(id, token)| (id, Some(token)));
+            if token.is_some_and(|token| !valid_activation_token(token)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid activation token",
+                ));
+            }
+            id.parse::<crate::model::TerminalId>()
+                .map(|id| ActivationRequest::Session(id, token.map(str::to_owned)))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
         Some(("activate", token)) if !token.is_empty() => {
             Ok(ActivationRequest::Activate(Some(token.to_owned())))
         }
@@ -2430,6 +2523,39 @@ mod tests {
 
     #[cfg(feature = "ui")]
     #[test]
+    fn session_activation_delivers_the_originating_windows_token() {
+        let runtime = tempdir().unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        let session = crate::model::TerminalId::new();
+        assert!(
+            activate_window_session_in(
+                runtime.path(),
+                PRIMARY_WINDOW,
+                session,
+                Some("click-token")
+            )
+            .unwrap()
+        );
+        let activation = receiver.recv_blocking().unwrap();
+        assert_eq!(activation.session, Some(session));
+        assert_eq!(activation.token.as_deref(), Some("click-token"));
+        assert!(activation.update.is_none());
+        assert!(activate_window_session_in(runtime.path(), PRIMARY_WINDOW, session, None).unwrap());
+        let activation = receiver.recv_blocking().unwrap();
+        assert_eq!(activation.session, Some(session));
+        assert_eq!(activation.token, None);
+    }
+
+    #[test]
+    fn local_session_links_exclude_device_window_namespaces() {
+        assert!(window_matches_selected_device(PRIMARY_WINDOW).unwrap());
+        assert!(window_matches_selected_device("window-2").unwrap());
+        assert!(!window_matches_selected_device("device-0123456789abcdef").unwrap());
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
     fn activation_request_parses_focus_tokens_and_rejects_noise() {
         assert!(matches!(
             parse_activation_request("activate").unwrap(),
@@ -2439,6 +2565,16 @@ mod tests {
             parse_activation_request("activate wayland-token").unwrap(),
             ActivationRequest::Activate(Some(token)) if token == "wayland-token"
         ));
+        let session = crate::model::TerminalId::new();
+        assert!(
+            matches!(parse_activation_request(&format!("session {session}")).unwrap(), ActivationRequest::Session(id, None) if id == session)
+        );
+        assert!(parse_activation_request("session invalid").is_err());
+        assert!(
+            matches!(parse_activation_request(&format!("session {session} wayland-token")).unwrap(), ActivationRequest::Session(id, Some(token)) if id == session && token == "wayland-token")
+        );
+        assert!(parse_activation_request(&format!("session {session} ")).is_err());
+        assert!(parse_activation_request(&format!("session {session} token\nnoise")).is_err());
         assert!(matches!(
             parse_activation_request("shutdown").unwrap(),
             ActivationRequest::Shutdown

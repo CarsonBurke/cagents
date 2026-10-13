@@ -101,6 +101,24 @@ pub struct Launch {
 }
 
 impl Launch {
+    /// Claude's exact saved transcript remains readable after its working
+    /// directory is removed, without starting a provider in another directory.
+    pub(crate) fn needs_read_only_history(&self) -> bool {
+        self.provider == Provider::Claude
+            && self
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+            && self.recipe.working_directory.is_absolute()
+            && !self.recipe.working_directory.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            && matches!(std::fs::metadata(&self.recipe.working_directory), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
+
     /// Resume with the last provider-confirmed Claude policy. A permission
     /// change is session state, so an original CLI bypass must not restore it
     /// when the user returns from native chat.
@@ -797,6 +815,10 @@ pub struct Snapshot {
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
+    /// Why this snapshot shows saved history without an executable provider.
+    /// Carried over IPC so every client explains the same read-only state.
+    #[serde(default)]
+    pub read_only_reason: Option<String>,
     pub exited: bool,
     pub has_earlier: bool,
     pub has_later: bool,
@@ -1736,6 +1758,10 @@ pub enum Event {
     /// runs on. It is about the account, not the conversation: the runtime
     /// forwards it to every surface and keeps it out of the transcript.
     AccountUsage(crate::account::LiveReport),
+    /// The actor can page saved history but cannot execute provider commands.
+    ReadOnlyHistory {
+        reason: String,
+    },
     /// Whether the provider now takes commands. A provider refuses them
     /// while it connects or loads a conversation, and says so only by
     /// refusing, which a sender cannot tell from a refusal of the command.

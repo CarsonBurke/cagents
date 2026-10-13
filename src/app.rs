@@ -4158,6 +4158,10 @@ pub enum Message {
     ActivateUi {
         token: Option<String>,
     },
+    ActivateSession {
+        session: TerminalId,
+        token: Option<String>,
+    },
     OpenBrowser(Url),
     OpenBrowserInSystem(CardId),
     BrowserSystemOpened {
@@ -15195,6 +15199,23 @@ impl Application for Cagents {
                 self.sync_context_overlay_state()
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
+            Message::ActivateSession { session, token } => {
+                let activation = match token {
+                    Some(token) => self.activate_main_window(Some(token)),
+                    None => self
+                        .core
+                        .main_window_id()
+                        .map_or_else(Task::none, |window| {
+                            iced::window::minimize(window, false)
+                                .chain(iced::window::gain_focus(window))
+                                .map(cosmic::Action::App)
+                        }),
+                };
+                Task::batch([
+                    self.handle_chat_ui(chat_ui::Action::OpenSession(session.to_string())),
+                    activation,
+                ])
+            }
             Message::OpenBrowser(url) => self.add_browser(url),
             Message::OpenBrowserInSystem(card) => self.open_browser_in_system(card),
             Message::BrowserSystemOpened {
@@ -16443,8 +16464,14 @@ impl Application for Cagents {
             )
             .map(|activation| match activation.update {
                 Some(request) => Message::UiUpdate(request),
-                None => Message::ActivateUi {
-                    token: activation.token,
+                None => match activation.session {
+                    Some(session) => Message::ActivateSession {
+                        session,
+                        token: activation.token,
+                    },
+                    None => Message::ActivateUi {
+                        token: activation.token,
+                    },
                 },
             }),
             event::listen_with(|event, status, event_window| match event {
@@ -18742,6 +18769,7 @@ mod tests {
             activations
                 .send_blocking(instance::UiActivation {
                     token: None,
+                    session: None,
                     update: None,
                 })
                 .is_err()

@@ -1,5 +1,7 @@
 use crate::platform_specific::wayland::{
-    event_loop::state::SctkState, sctk_event::SctkEvent,
+    event_loop::state::SctkState,
+    handlers::activation::{ActivationInput, ActivationInputKind},
+    sctk_event::SctkEvent,
 };
 use cctk::sctk::{
     delegate_pointer,
@@ -39,6 +41,33 @@ impl PointerHandler for SctkState {
                 );
             }
 
+            // Winit forwards native-window input separately, but activation
+            // requests still need this seat's focus and latest press serial.
+            match e.kind {
+                PointerEventKind::Enter { .. } => {
+                    _ = my_seat.ptr_focus.replace(e.surface.clone());
+                }
+                PointerEventKind::Leave { .. } => {
+                    _ = my_seat.ptr_focus.take();
+                    _ = my_seat.active_icon = None;
+                }
+                PointerEventKind::Press {
+                    time,
+                    button,
+                    serial,
+                } => {
+                    _ = my_seat.last_ptr_press.replace((time, button, serial));
+                    my_seat.last_activation_input = Some(ActivationInput {
+                        received_at: std::time::Instant::now(),
+                        surface: e.surface.clone(),
+                        serial,
+                        kind: ActivationInputKind::Pointer,
+                    });
+                }
+                // TODO revisit events that ought to be handled and change internal state
+                _ => {}
+            }
+
             if is_active {
                 let id = winit::window::WindowId::from_raw(
                     e.surface.id().as_ptr() as usize,
@@ -56,24 +85,6 @@ impl PointerHandler for SctkState {
                     ptr_id: pointer.clone(),
                     seat_id: my_seat.seat.clone(),
                 });
-            }
-            match e.kind {
-                PointerEventKind::Enter { .. } => {
-                    _ = my_seat.ptr_focus.replace(e.surface.clone());
-                }
-                PointerEventKind::Leave { .. } => {
-                    _ = my_seat.ptr_focus.take();
-                    _ = my_seat.active_icon = None;
-                }
-                PointerEventKind::Press {
-                    time,
-                    button,
-                    serial,
-                } => {
-                    _ = my_seat.last_ptr_press.replace((time, button, serial));
-                }
-                // TODO revisit events that ought to be handled and change internal state
-                _ => {}
             }
         }
     }

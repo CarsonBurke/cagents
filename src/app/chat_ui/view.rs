@@ -1432,7 +1432,9 @@ impl Runtime {
                 } else if snapshot.exited && self.session.owns_codex_listener() {
                     "Chat attachment ended. The retained provider may still be running; your draft is retained."
                 } else if snapshot.exited {
-                    "Agent process exited. The transcript and draft are retained."
+                    snapshot.read_only_reason.as_deref().unwrap_or(
+                        "Agent process exited. The transcript and draft are retained.",
+                    )
                 } else {
                     "Disconnected. The daemon may still be working; your draft is retained."
                 })

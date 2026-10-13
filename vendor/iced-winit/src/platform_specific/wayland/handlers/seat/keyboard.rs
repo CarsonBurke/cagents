@@ -1,5 +1,6 @@
 use crate::platform_specific::wayland::{
     event_loop::state::SctkState,
+    handlers::activation::{ActivationInput, ActivationInputKind},
     sctk_event::{KeyboardEventVariant, SctkEvent},
 };
 use cctk::sctk::{
@@ -216,6 +217,14 @@ impl KeyboardHandler for SctkState {
         let seat_id = my_seat.seat.clone();
         let kbd_id = keyboard.clone();
         _ = my_seat.last_kbd_press.replace((event.clone(), serial));
+        if let Some(surface) = my_seat.kbd_focus.clone() {
+            my_seat.last_activation_input = Some(ActivationInput {
+                received_at: std::time::Instant::now(),
+                surface,
+                serial,
+                kind: ActivationInputKind::Keyboard,
+            });
+        }
         if is_active {
             if let Some(surface) = my_seat.kbd_focus.clone() {
                 self.request_redraw(&surface);
