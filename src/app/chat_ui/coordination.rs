@@ -543,9 +543,7 @@ impl Runtime {
     /// The glyph or spinner a card's heading opens with.
     fn card_indicator(&self, status: ToolStatus, icon: Icon) -> Element<'static, Message> {
         match status {
-            ToolStatus::Running => {
-                crate::ui_controls::activity_spinner(14.0, design::warning_color)
-            }
+            ToolStatus::Running => crate::ui_controls::activity_spinner(14.0, design::accent_color),
             ToolStatus::Failed => widget::icon(Icon::Error.handle())
                 .size(14)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
@@ -563,14 +561,14 @@ impl Runtime {
     fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
         let mut parts: Vec<Element<'static, Message>> = Vec::new();
         if !recipient.name.is_empty() {
-            parts.push(design::heading(recipient.name.clone()).into());
+            parts.push(chat_title(recipient.name.clone()).into());
         }
         let Some(session) = &recipient.session else {
             return parts;
         };
         let shown = short_id(session);
         let label: Element<'static, Message> = if recipient.name.is_empty() {
-            design::heading(format!("session {shown}")).into()
+            chat_title(format!("session {shown}")).into()
         } else {
             design::caption(shown.to_owned())
                 .font(iced::Font::MONOSPACE)
@@ -696,11 +694,36 @@ impl Runtime {
         settings: markdown::Settings,
     ) {
         let reading = &coordinated.reading;
-        let mut heading = vec![
-            self.card_indicator(status, Icon::Agent),
-            design::caption("Started").into(),
-            design::heading(started(spawn)).into(),
-        ];
+        // The task is what readers scan for. Agent origin and launch options
+        // belong on their own secondary line, not inside the task name.
+        let primary = match spawn.agents.as_slice() {
+            [agent] if !agent.name.trim().is_empty() && agent.name != agent.kind => {
+                agent.name.clone()
+            }
+            [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
+            _ => started(spawn),
+        };
+        rows.push(
+            widget::row::with_children(vec![
+                self.card_indicator(status, Icon::Agent),
+                crate::interaction::tooltip(
+                    chat_title(Self::short_description(
+                        primary
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())
+                            .unwrap_or(&primary),
+                        80,
+                    ))
+                    .width(Length::Fill),
+                    primary.clone(),
+                )
+                .into(),
+            ])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .into(),
+        );
         let observed_model = if !reading.cli {
             match reading.subagents.as_slice() {
                 [id] => self
@@ -714,13 +737,19 @@ impl Runtime {
         } else {
             None
         };
-        heading.push(design::caption(spawn_identity(reading, spawn, observed_model)).into());
+        let kind = match spawn.agents.as_slice() {
+            [agent] if !agent.kind.is_empty() && agent.kind != primary => {
+                format!(" · {}", agent.kind)
+            }
+            _ => String::new(),
+        };
         rows.push(
-            widget::row::with_children(heading)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .wrap()
-                .into(),
+            design::caption(format!(
+                "{}{}",
+                spawn_identity(reading, spawn, observed_model),
+                kind,
+            ))
+            .into(),
         );
         if !spawn.directory.is_empty() {
             rows.push(
@@ -730,14 +759,7 @@ impl Runtime {
             );
         }
         if let Some(brief) = &coordinated.brief {
-            rows.push(self.folded_markdown(
-                item,
-                cached,
-                "brief",
-                brief,
-                "Show the shared brief",
-                settings,
-            ));
+            rows.push(self.folded_markdown(item, cached, "brief", brief, "Shared brief", settings));
         }
         let several = spawn.agents.len() > 1;
         for (index, (agent, prompt)) in spawn.agents.iter().zip(&coordinated.prompts).enumerate() {
@@ -749,14 +771,16 @@ impl Runtime {
                         .filter(|name| !name.is_empty())
                         .cloned(),
                 );
-            } else if !agent.name.is_empty() && !agent.kind.is_empty() {
-                title.push(agent.kind.clone());
             }
-            if !agent.description.is_empty() {
+            if !agent.description.is_empty() && (several || agent.description != primary) {
                 title.push(agent.description.clone());
             }
             if !title.is_empty() {
-                rows.push(design::body(title.join(" · ")).into());
+                rows.push(if several {
+                    chat_title(title.join(" · ")).into()
+                } else {
+                    design::caption(title.join(" · ")).into()
+                });
             }
             rows.extend(self.text_block(
                 item,
@@ -950,7 +974,7 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-                self.folded_markdown(item, cached, part, content, "Show all of it", settings),
+                self.folded_markdown(item, cached, part, content, "Show more", settings),
             ])
             .spacing(step::GAP_XS),
         )
@@ -979,7 +1003,7 @@ impl Runtime {
                 continue;
             };
             let label = if coordinated.reading.subagents.len() == 1 {
-                "Open transcript".to_owned()
+                "Transcript".to_owned()
             } else {
                 format!("Open {}", self.agent_name(&agent.id))
             };
@@ -1008,9 +1032,9 @@ impl Runtime {
         };
         controls.push(
             widget::button::custom(design::caption(if open {
-                format!("Hide the {source}")
+                format!("Hide {source}")
             } else {
-                format!("Show the {source}")
+                format!("Show {source}")
             }))
             .class(crate::ui_controls::control_style(open, None))
             .padding([step::GAP_XS as u16, step::GAP_S as u16])
@@ -1043,7 +1067,17 @@ impl Runtime {
         };
         if let Some(detail) = detail {
             controls.push(widget::Space::new().width(Length::Fill).into());
-            controls.push(design::caption(detail).into());
+            let tone = match detail.as_str() {
+                "Failed" => cosmic::theme::Text::Custom(design::destructive_text),
+                "Waiting for you" => cosmic::theme::Text::Custom(design::warning_text),
+                _ => cosmic::theme::Text::default(),
+            };
+            controls.push(
+                design::heading(detail)
+                    .size(design::TEXT_CAPTION)
+                    .class(tone)
+                    .into(),
+            );
         }
         widget::row::with_children(controls)
             .spacing(step::GAP_XS)

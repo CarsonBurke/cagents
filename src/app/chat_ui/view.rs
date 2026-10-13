@@ -1109,10 +1109,41 @@ impl Runtime {
         let mut transcript = Vec::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
-            let heading = self.native_child_identity(agent);
-            let heading = design::caption(heading)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill);
+            let provider = match self.session.launch.provider {
+                Provider::Codex => "Codex",
+                Provider::Claude => "Claude",
+                Provider::Omp => "OMP",
+            };
+            let model = agent
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .unwrap_or("Model not reported");
+            let heading: Element<'_, Message> = widget::column::with_children(vec![
+                widget::row::with_children(vec![
+                    chat_title(Self::short_description(Self::native_child_name(agent), 80))
+                        .width(Length::Fill)
+                        .into(),
+                    design::heading(Self::native_child_status(agent))
+                        .size(design::TEXT_CAPTION)
+                        .into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+                crate::interaction::tooltip(
+                    design::caption(format!(
+                        "Native subagent · {provider} · {}",
+                        Self::short_description(model, 80)
+                    )),
+                    self.native_child_identity(agent),
+                )
+                .into(),
+            ])
+            .spacing(step::GAP_XS)
+            .width(Length::Fill)
+            .into();
             selected_identity = Some(
                 if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
                 {
@@ -2121,11 +2152,12 @@ impl Runtime {
         }
         if !state.is_empty() {
             status.push(
-                design::caption(if selected.is_some() {
+                design::heading(if selected.is_some() {
                     format!("Main: {state}")
                 } else {
                     state.to_owned()
                 })
+                .size(design::TEXT_CAPTION)
                 .class(
                     if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
                         cosmic::theme::Text::Custom(design::warning_text)
@@ -2140,11 +2172,8 @@ impl Runtime {
         if let Some(channel) = &place.channel {
             status.push(
                 crate::interaction::tooltip(
-                    design::caption(format!(
-                        "Channel · {}",
-                        Self::short_description(channel, 40)
-                    ))
-                    .wrapping(iced::widget::text::Wrapping::None),
+                    design::caption(format!("# {}", Self::short_description(channel, 24)))
+                        .wrapping(iced::widget::text::Wrapping::None),
                     format!("Channel: {channel}"),
                 )
                 .into(),
@@ -3491,10 +3520,10 @@ impl Runtime {
         let mut heading = vec![glyph(Icon::Chat)];
         let mut subtitle = None;
         if from.is_empty() && !summary.is_empty() {
-            heading.push(design::heading(summary.clone()).into());
+            heading.push(chat_title(summary.clone()).into());
         } else {
             heading.push(design::caption(kind.verb()).into());
-            heading.push(design::heading(chat::delivery_sender(from, sender)).into());
+            heading.push(chat_title(chat::delivery_sender(from, sender)).into());
             // A named sender's ID only tells two of the same name apart.
             if !from.is_empty() && !sender.is_empty() {
                 heading.push(
@@ -3630,32 +3659,55 @@ impl Runtime {
                 },
                 |elapsed| format!("Thought for {elapsed}"),
             );
-            let mut rows = vec![
-                widget::button::custom(design::caption(format!(
-                    "{} {label}",
-                    if expanded { "▾" } else { "▸" }
-                )))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Toggle(target, item.id.clone())))
-                .into(),
-            ];
+            let disclosure = widget::button::custom(
+                widget::row::with_children(vec![
+                    widget::icon(
+                        if expanded {
+                            Icon::PanDown
+                        } else {
+                            Icon::PanEnd
+                        }
+                        .handle(),
+                    )
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+                    design::caption(label.clone()).into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .name(label)
+            .class(crate::ui_controls::control_style(false, None))
+            .padding([step::GAP_XS as u16, step::GAP_S as u16])
+            .on_press(action(Action::Toggle(target, item.id.clone())));
+            // Preserve the disclosure's widget path across toggles so native
+            // keyboard focus and pressed state survive retained-tree diffs.
+            let mut rows = vec![disclosure.into()];
             if expanded {
                 rows.push(prose::view(cached, settings, target, self.find.as_deref()));
             }
             let message =
                 widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
-                    .class(cosmic::theme::Container::custom(|theme| {
+                    .class(cosmic::theme::Container::custom(move |theme| {
                         widget::container::Style {
-                            background: Some(design::sunken(theme).into()),
+                            background: expanded.then(|| design::sunken(theme).into()),
                             text_color: Some(design::muted_color(theme)),
                             border: iced::Border {
-                                radius: design::RADIUS_S.into(),
+                                radius: if expanded {
+                                    design::RADIUS_S.into()
+                                } else {
+                                    Default::default()
+                                },
                                 ..Default::default()
                             },
                             ..Default::default()
                         }
                     }))
-                    .padding([step::GAP_S as u16, step::GAP_M as u16])
+                    .padding(if expanded {
+                        iced::Padding::from([step::GAP_S, step::GAP_M])
+                    } else {
+                        iced::Padding::ZERO
+                    })
                     .max_width(design::READABLE_MEASURE)
                     .into();
             return widget::container(message_actions(
@@ -3663,7 +3715,6 @@ impl Runtime {
                 self.message_copy(item),
                 Alignment::Start,
             ))
-            .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)
             .into();
         }
@@ -4489,9 +4540,7 @@ mod tests {
             "{labels:?}"
         );
         assert!(
-            labels
-                .iter()
-                .any(|label| label.contains("Channel · Review")),
+            labels.iter().any(|label| label.contains("# Review")),
             "{labels:?}"
         );
         assert!(
@@ -4795,6 +4844,182 @@ mod tests {
                 runtime(&app, target).expanded.contains("live-thought"),
                 !expanded,
                 "published Toggle must update the mounted runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_disclosure_preserves_keyboard_focus_across_retained_toggles() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation},
+        };
+        #[derive(Default)]
+        struct FocusDisclosure(bool);
+        impl Operation for FocusDisclosure {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if !self.0 {
+                    state.focus();
+                    self.0 = true;
+                } else {
+                    state.unfocus();
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Probe {
+            focused: Option<bool>,
+            prose: Vec<String>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                self.focused.get_or_insert_with(|| state.is_focused());
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if bounds.width > 0.0
+                    && bounds.height > 0.0
+                    && let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                {
+                    self.prose.push(prose.plain.to_string());
+                }
+            }
+        }
+        fn runtime(app: &Cagents, target: Target) -> &Runtime {
+            match app.cards.get(&target.card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => panic!("the fixture chat remains mounted"),
+            }
+        }
+        let item = chat::Item {
+            id: "keyboard-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Keyboard reasoning body".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (mut live, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        Arc::make_mut(&mut live.snapshot).busy = true;
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let renderer = crate::app::tests::headless_renderer();
+        let view = |app: &Cagents| {
+            let runtime = runtime(app, target);
+            let item = &runtime.snapshot.items[0];
+            runtime.text_view(
+                item,
+                &runtime.cache[&item.id],
+                turn::Slot::Thinking,
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            )
+        };
+        let mut tree = Tree::new(view(&app).as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 800.0));
+        for (index, expanded) in [false, true, false].into_iter().enumerate() {
+            let mut element = view(&app);
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            if index == 0 {
+                // Native keyboard focus is assigned once. The second Enter
+                // must work through the same retained tree without refocusing.
+                let mut focus = FocusDisclosure::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut focus,
+                );
+                assert!(focus.0, "the mounted disclosure is focusable");
+            }
+            let mut probe = Probe::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            assert_eq!(
+                probe.focused,
+                Some(true),
+                "disclosure focus survives diff at stage {index}"
+            );
+            assert_eq!(
+                probe
+                    .prose
+                    .iter()
+                    .any(|text| text.contains("Keyboard reasoning body")),
+                expanded
+            );
+            assert_eq!(
+                runtime(&app, target).expanded.contains("keyboard-thought"),
+                expanded
+            );
+            if index == 2 {
+                break;
+            }
+            let enter = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &enter,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let mut toggles = messages.into_iter().filter_map(|message| match message {
+                Message::ChatUi(Action::Toggle(actual, id)) if actual == target => Some(id),
+                _ => None,
+            });
+            let id = toggles
+                .next()
+                .expect("Enter toggles the focused disclosure");
+            assert_eq!(id, "keyboard-thought");
+            assert!(toggles.next().is_none(), "one key emits one toggle");
+            drop(app.handle_chat_ui(Action::Toggle(target, id)));
+            assert_eq!(
+                runtime(&app, target).expanded.contains("keyboard-thought"),
+                !expanded
             );
         }
     }
