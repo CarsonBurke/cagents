@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+mod auth_recovery;
 mod changes;
 mod clipboard_image;
 mod completion;
@@ -167,6 +168,8 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    SignIn(Target, Account),
+    ResumeAfterSignIn(Target),
     /// Starts a new conversation in the same session directory and working
     /// directory as a saved one that cannot be resumed.
     ///
@@ -343,7 +346,7 @@ impl Action {
     /// The card whose provider session this action starts afresh.
     fn starts_session(&self) -> Option<CardId> {
         match self {
-            Self::Reconnect(target) => Some(target.card),
+            Self::Reconnect(target) | Self::ResumeAfterSignIn(target) => Some(target.card),
             Self::Switch(card) | Self::StartFresh(card) | Self::RecoverAccount(card, _) => {
                 Some(*card)
             }
@@ -358,6 +361,8 @@ impl Action {
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
+            | Self::SignIn(target, _)
+            | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
             | Self::AppendProviderDraft(target)
@@ -2152,6 +2157,13 @@ impl Runtime {
     /// Records a notice in the transcript, after the exchange it concerns.
     fn note(&mut self, notice: String) {
         let anchor = self.turns.last().map(|turn| turn.key.clone());
+        if self
+            .failures
+            .iter()
+            .any(|(previous, message)| previous == &anchor && message == &notice)
+        {
+            return;
+        }
         if self.failures.len() == 32 {
             self.failures.remove(0);
         }
@@ -6581,6 +6593,13 @@ impl Cagents {
                 self.commit_chat_session(target.card, session);
                 self.observe_agent_activity_for_card(target.card, None);
             }
+            Action::SignIn(target, account) => return self.sign_in_chat(target, account),
+            Action::ResumeAfterSignIn(target) => {
+                if !self.chat_auth_resume_enabled(target) {
+                    return Task::none();
+                }
+                return self.handle_chat_ui(Action::Reconnect(target));
+            }
             Action::Reconnect(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -10954,6 +10973,7 @@ mod tests {
             (alternate.clone(), account::UsageStatus::Ok),
         ] {
             let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                owner: app.account_ui.probe_owner(&id).unwrap(),
                 id,
                 outcome: account::probe::Outcome::Answered {
                     identity: None,
@@ -12749,6 +12769,7 @@ mod tests {
         let now = crate::chat::now_ms().unwrap();
         // Live figures refine a reading the account already has.
         let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+            owner: app.account_ui.probe_owner(&account).unwrap(),
             id: account.clone(),
             outcome: crate::account::probe::Outcome::Answered {
                 catalog: None,
@@ -16257,5 +16278,206 @@ mod tests {
         drop(app.handle_chat_ui(Action::BranchPicker(target, true)));
         assert!(!chat_runtime(&app, card).changes.open);
         assert!(chat_runtime(&app, card).branch_picker);
+    }
+    #[test]
+    fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.error = Some("Codex RPC error: Not logged in".into());
+        runtime.replace_draft(text_editor::Content::with_text("unsent recovery draft"));
+        let launch = runtime.session.launch.clone();
+        let wrong = app.account_ui.add_managed_fixture(Provider::Codex, 9901);
+        let wrong = app.known_account(&wrong).unwrap();
+        assert!(app.chat_auth_recovery_enabled(target));
+        drop(app.handle_chat_ui(Action::SignIn(target, wrong)));
+        let stale = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        drop(app.handle_chat_ui(Action::SignIn(stale, Account::system(Provider::Codex))));
+        drop(app.handle_chat_ui(Action::ResumeAfterSignIn(stale)));
+        assert_eq!(chat_runtime(&app, card).session.launch, launch);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "unsent recovery draft"
+        );
+        assert!(app.chat_ui.attempt(card).is_none());
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert(
+                "CODEX_HOME".into(),
+                "/unregistered/auth-recovery-home".into(),
+            );
+        assert!(!app.chat_auth_recovery_enabled(target));
+        assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+        drop(app.handle_chat_ui(Action::SignIn(target, Account::system(Provider::Codex))));
+        drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "unsent recovery draft"
+        );
+        assert!(app.chat_ui.attempt(card).is_none());
+    }
+    #[test]
+    fn auth_recovery_resume_preserves_session_and_draft_and_rejects_resolved_error() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("keep this unsent"));
+        let launch = runtime.session.launch.clone();
+        drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+        assert!(app.chat_ui.attempt(card).is_none());
+        app.chat_runtime_mut(target).unwrap().error = Some("Codex RPC error: Not logged in".into());
+        drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+        assert!(app.chat_ui.attempt(card).is_some());
+        assert_eq!(chat_runtime(&app, card).session.launch, launch);
+        assert_eq!(chat_runtime(&app, card).composer.text(), "keep this unsent");
+        assert!(chat_runtime(&app, card).queued.is_none());
+        let reconnect = app.chat_ui.attempt(card).unwrap().target;
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, reconnect, Ok(handle));
+        assert_eq!(chat_runtime(&app, card).session.launch, launch);
+        assert_eq!(chat_runtime(&app, card).composer.text(), "keep this unsent");
+        assert!(chat_runtime(&app, card).queued.is_none());
+    }
+    #[test]
+    fn auth_recovery_notice_dedup_is_scoped_to_its_turn() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (_, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let message = "Codex RPC error: Not logged in".to_owned();
+        runtime.note(message.clone());
+        runtime.note(message.clone());
+        assert_eq!(runtime.failures.len(), 1);
+        runtime.error = Some(message.clone());
+        assert!(runtime.active_auth_notice(&runtime.failures[0].0, &message));
+        // A later exchange must be able to report the same failure again.
+        let next = chat::Item {
+            id: "next-auth-exchange".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "next prompt".into(),
+                thinking: false,
+                phase: chat::Phase::default(),
+            },
+            at: None,
+            started_at: None,
+        };
+        runtime.turns = turn::group(&[next], &HashSet::new(), |_| None);
+        runtime.note(message.clone());
+        assert_eq!(runtime.failures.len(), 2);
+        assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &message));
+        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &message));
+        runtime.error = None;
+        assert!(!runtime.active_auth_notice(&runtime.failures[1].0, &message));
+    }
+    #[test]
+    fn auth_recovery_requires_the_recipe_to_bind_a_known_account_home() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let system = Account::system(Provider::Codex);
+        let home = system.resolved_home().unwrap();
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.error = Some("Codex RPC error: Not logged in".into());
+        runtime.replace_draft(text_editor::Content::with_text("preserved account draft"));
+        let mut recipe = runtime.session.launch.recipe.clone();
+        recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.display().to_string());
+        runtime.session.launch.recipe = recipe.clone();
+        assert!(app.chat_auth_recovery_enabled(target));
+        for (variable, value, unset) in [
+            ("CODEX_HOME", None, true),
+            ("CODEX_HOME", Some(""), false),
+            ("HOME", Some("/unknown/auth-recovery-home"), false),
+            ("HOME", None, true),
+        ] {
+            let mut changed = recipe.clone();
+            changed.environment.remove("CODEX_HOME");
+            if let Some(value) = value {
+                changed.environment.insert(variable.into(), value.into());
+            }
+            if unset {
+                changed.unset_environment.insert(variable.into());
+            }
+            app.chat_runtime_mut(target).unwrap().session.launch.recipe = changed;
+            assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+            drop(app.handle_chat_ui(Action::SignIn(target, system.clone())));
+            drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+            assert!(app.chat_ui.attempt(card).is_none());
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "preserved account draft"
+            );
+        }
+        recipe.environment.insert(
+            "HOME".into(),
+            "/different/home/with/explicit/provider-binding".into(),
+        );
+        app.chat_runtime_mut(target).unwrap().session.launch.recipe = recipe;
+        assert!(app.chat_auth_recovery_enabled(target));
+        // Contradictory explicit+unset provider binding is removed by ProcessSpec.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .session
+            .launch
+            .recipe
+            .unset_environment
+            .insert("CODEX_HOME".into());
+        assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+    }
+    #[test]
+    fn auth_recovery_changed_identity_keeps_sign_in_but_fences_resume() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 9902);
+        let account = app.known_account(&id).unwrap();
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.session.launch.recipe.environment.insert(
+            "CODEX_HOME".into(),
+            account.resolved_home().unwrap().display().to_string(),
+        );
+        runtime.error = Some("Codex RPC error: Not logged in".into());
+        runtime.replace_draft(text_editor::Content::with_text("keep expected login draft"));
+        let now = crate::chat::now_ms().unwrap();
+        for (email, changed) in [
+            ("other-dummy@example.test".to_owned(), true),
+            (
+                format!("{}@example.com", uuid::Uuid::from_u128(9902)),
+                false,
+            ),
+        ] {
+            drop(app.update(Message::AccountUi(account_ui::Action::Probed {
+                owner: app.account_ui.probe_owner(&id).unwrap(),
+                id: id.clone(),
+                outcome: account::probe::Outcome::Answered {
+                    identity: Some(account::Identity {
+                        email: Some(email),
+                        organization: None,
+                        plan: None,
+                    }),
+                    catalog: None,
+                    snapshot: account::UsageSnapshot::state(account::UsageStatus::Ok, "", now),
+                },
+            })));
+            assert!(
+                app.chat_auth_recovery_enabled(target),
+                "Sign in may recover the expected login"
+            );
+            assert_eq!(app.chat_auth_resume_enabled(target), !changed);
+            if changed {
+                drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+                assert!(app.chat_ui.attempt(card).is_none());
+                assert_eq!(
+                    chat_runtime(&app, card).composer.text(),
+                    "keep expected login draft"
+                );
+            }
+        }
     }
 }

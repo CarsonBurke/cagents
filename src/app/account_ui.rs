@@ -22,6 +22,9 @@
 //! the registry ([`crate::account::registry`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ACCOUNT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 use super::*;
 
@@ -39,7 +42,7 @@ use crate::account::{
     home::Homes,
     omp::{self, History},
     probe::{self, Outcome},
-    registry::{self, Registry, Store},
+    registry::{self, Registered, Registry, Store},
     schedule::{self, Millis, Schedule, Trigger},
 };
 use crate::agent::Provider;
@@ -104,6 +107,9 @@ pub(super) struct State {
     logins: Vec<Login>,
     /// Set before asynchronous CLI discovery/home creation, not after it.
     browser_preparing: bool,
+    /// Existing-account login preparation, fenced by account-home generation.
+    preparing_logins: BTreeSet<u64>,
+    preparing_browser_login: Option<u64>,
     /// Whether the daemon is being asked which sign-ins have ended.
     asking_host: bool,
     /// Not before this is the daemon asked again.
@@ -164,6 +170,14 @@ impl OmpRecord {
 }
 
 impl State {
+    pub(super) fn probe_owner(&self, id: &AccountId) -> Option<u64> {
+        self.account(id).map(|state| state.owner)
+    }
+
+    fn shown_in_switcher(&self, account: &AccountState) -> bool {
+        account.present || account.account.registry_key().is_some()
+    }
+
     pub(super) fn provider_status(&self, provider: Provider) -> &'static str {
         match self.installed.get(&provider) {
             None => "Checking provider…",
@@ -230,6 +244,8 @@ impl State {
             cache,
             logins: Vec::new(),
             browser_preparing: false,
+            preparing_logins: BTreeSet::new(),
+            preparing_browser_login: None,
             asking_host: false,
             next_host_check: 0,
             table: table::Table::default(),
@@ -413,6 +429,33 @@ impl State {
             }
         }
         None
+    }
+
+    fn reported_login_action(&self, account: &AccountState) -> Option<Action> {
+        if !matches!(
+            self.login_conflict(account),
+            Some(LoginConflict::Changed { .. })
+        ) {
+            return None;
+        }
+        Some(Action::UseReportedLogin {
+            id: account.id.clone(),
+            owner: account.owner,
+            identity: account.identity.clone()?,
+            expected: self.registry.find(account.account.registry_key()?)?.clone(),
+        })
+    }
+
+    fn account_origin(&self, account: &AccountState) -> &'static str {
+        if account.account.registry_key().is_none() && !account.account.is_brokered() {
+            "System default"
+        } else if account.account.is_linked() {
+            "Linked account"
+        } else if account.account.is_brokered() {
+            "Provider account"
+        } else {
+            "Managed account"
+        }
     }
 
     /// A current, unchanged login to retain when archiving a duplicate.
@@ -604,6 +647,13 @@ impl Default for State {
     }
 }
 
+/// Applied again against the latest durable registry by the save task.
+fn adopt_reported_login(registry: &mut Registry, expected: &Registered, identity: &Identity) {
+    if registry.find(expected.key) == Some(expected) {
+        registry.adopt_identity(expected.key, identity);
+    }
+}
+
 /// Why an account row does not stand for a login of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoginConflict {
@@ -641,6 +691,8 @@ impl LoginConflict {
 }
 
 struct AccountState {
+    /// Replacements get a new owner even when a home changes back to its old path.
+    owner: u64,
     account: Account,
     id: AccountId,
     /// Whether the account has anything to report: its CLI is installed and
@@ -665,8 +717,18 @@ struct AccountState {
 }
 
 impl AccountState {
+    fn begin_sign_in(&mut self, now: Millis) {
+        // A result from before this login cannot confirm the new login intent.
+        // Abandon that scheduling slot so a fresh verification can start.
+        self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
+        self.schedule.abandon();
+        self.schedule.await_login(now);
+        self.signing_in_from = self.identity.clone();
+    }
+
     fn new(account: Account) -> Self {
         Self {
+            owner: NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed),
             id: account.id(),
             account,
             present: false,
@@ -798,7 +860,7 @@ pub struct Restored {
 pub enum Action {
     RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
     RemoteLoaded(Result<crate::device_service::AccountSnapshot, String>),
-    RemoteLogin(AccountId, Result<LaunchRecipe, String>),
+    RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
     Install(Provider),
     Tick,
     Loaded(Loaded),
@@ -808,6 +870,7 @@ pub enum Action {
         installed: BTreeMap<Provider, bool>,
     },
     Probed {
+        owner: u64,
         id: AccountId,
         outcome: Outcome,
     },
@@ -832,9 +895,16 @@ pub enum Action {
     ShowAccount(AccountId),
     OpenPane,
     SignIn(AccountId),
+    UseReportedLogin {
+        id: AccountId,
+        owner: u64,
+        identity: Identity,
+        expected: Registered,
+    },
     SignInWithCode(AccountId),
     /// The CLI and browser callback were checked off the interface thread.
     LoginReady {
+        owner: u64,
         id: AccountId,
         provider: Provider,
         device: bool,
@@ -922,6 +992,7 @@ impl Action {
                 | Self::Popover(Some(_))
                 | Self::ShowAccount(_)
                 | Self::OpenPane
+                | Self::UseReportedLogin { .. }
                 | Self::SignIn(_)
                 | Self::SignInWithCode(_)
                 | Self::Add { .. }
@@ -1897,6 +1968,7 @@ impl Cagents {
         state.schedule.start(trigger, now);
         let account = state.account.clone();
         let id = state.id.clone();
+        let owner = state.owner;
         let probe = cosmic::task::future(async move {
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
@@ -1916,7 +1988,7 @@ impl Cagents {
             } else {
                 probe::run(account, cache, force).await
             };
-            Message::AccountUi(Action::Probed { id, outcome })
+            Message::AccountUi(Action::Probed { owner, id, outcome })
         });
         // The refresh control comes back the moment its debounce lifts,
         // rather than on whichever tick next reads the clock.
@@ -2178,7 +2250,10 @@ impl Cagents {
                     provisional: false,
                 }))
             }
-            Action::RemoteLogin(id, result) => {
+            Action::RemoteLogin(id, owner, result) => {
+                if !self.finish_login_preparation(&id, owner) {
+                    return Task::none();
+                }
                 let recipe = match result {
                     Ok(recipe) => recipe,
                     Err(error) => {
@@ -2198,8 +2273,7 @@ impl Cagents {
                 }
                 let now = now_ms();
                 if let Some(state) = self.account_ui.account_mut(&id) {
-                    state.schedule.await_login(now);
-                    state.signing_in_from = state.identity.clone();
+                    state.begin_sign_in(now);
                 }
                 let (task, terminal) = self.open_login_terminal(recipe, "Sign in on device".into());
                 if let Some(state) = self.account_ui.account_mut(&id) {
@@ -2253,7 +2327,7 @@ impl Cagents {
                 self.account_ui.restore(restored);
                 Task::none()
             }
-            Action::Probed { id, outcome } => self.account_probed(id, outcome),
+            Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
             Action::OmpRead(history) => {
                 let now = now_ms();
                 self.account_ui.now_ms = now;
@@ -2355,7 +2429,11 @@ impl Cagents {
                 let probe = self
                     .probe_account(&id, Trigger::Focus, now)
                     .unwrap_or_else(Task::none);
-                let save = if account.is_brokered() {
+                let conflict = self
+                    .account_ui
+                    .account(&id)
+                    .and_then(|state| self.account_ui.login_conflict(state));
+                let save = if account.is_brokered() || conflict.is_some() {
                     // Omp chooses its own account for new conversations.
                     Task::none()
                 } else {
@@ -2369,14 +2447,41 @@ impl Cagents {
                 let open = self.open_utility_card(CardKind::Accounts);
                 Task::batch([open, self.accounts_surface_changed()])
             }
+            Action::UseReportedLogin {
+                id,
+                owner,
+                identity,
+                expected,
+            } => {
+                let Some(state) = self.account_ui.account(&id) else {
+                    return Task::none();
+                };
+                if state.owner != owner
+                    || state.identity.as_ref() != Some(&identity)
+                    || state.account.registry_key() != Some(expected.key)
+                    || self.account_ui.registry.find(expected.key) != Some(&expected)
+                    || !expected.conflicts_with(&identity)
+                {
+                    return Task::none();
+                }
+                self.save_registry(move |registry| {
+                    adopt_reported_login(registry, &expected, &identity)
+                })
+            }
             Action::SignIn(id) => self.sign_in(id, false),
             Action::SignInWithCode(id) => self.sign_in(id, true),
             Action::LoginReady {
+                owner,
                 id,
                 provider,
                 device,
                 program,
-            } => self.open_login(&id, provider, device, program),
+            } => {
+                if !self.finish_login_preparation(&id, owner) {
+                    return Task::none();
+                }
+                self.open_login(&id, provider, device, program)
+            }
             Action::RegistryLoaded(result) => {
                 if let Ok(mut registry) = result {
                     let projects = self
@@ -2559,6 +2664,7 @@ impl Cagents {
                 let Some(account) = self
                     .account_ui
                     .account(&id)
+                    .filter(|state| self.account_ui.login_conflict(state).is_none())
                     .map(|state| state.account.clone())
                 else {
                     return Task::none();
@@ -2577,6 +2683,7 @@ impl Cagents {
                 let Some(account) = self
                     .account_ui
                     .account(&id)
+                    .filter(|state| self.account_ui.login_conflict(state).is_none())
                     .map(|state| state.account.clone())
                 else {
                     return Task::none();
@@ -2725,7 +2832,14 @@ impl Cagents {
         }
     }
 
-    fn account_probed(&mut self, id: AccountId, mut outcome: Outcome) -> Task<Message> {
+    fn account_probed(&mut self, id: AccountId, owner: u64, mut outcome: Outcome) -> Task<Message> {
+        if !self
+            .account_ui
+            .account(&id)
+            .is_some_and(|state| state.owner == owner)
+        {
+            return Task::none();
+        }
         let now = now_ms();
         self.refresh_login_watch(&id, now);
         self.account_ui.now_ms = now;
@@ -2760,8 +2874,9 @@ impl Cagents {
             Outcome::Answered {
                 identity, snapshot, ..
             } => {
-                // A login the reader started for this very account is theirs
-                // to choose, whoever it signs in as - once the home reports
+                // A changed identity confirms that the login attempt ended,
+                // but accepting that identity for this account is separate.
+                // The attempt ends once the home reports
                 // a login other than the one it had when they started it.
                 // Until then an answer is the home as it was, and the watch
                 // for the new login goes on - unless the home was signed
@@ -2797,7 +2912,7 @@ impl Cagents {
                 if let (Some(key), Some(identity)) =
                     (state.account.registry_key(), state.identity.as_ref())
                 {
-                    learned = Some((key, identity.clone(), signed_in_here));
+                    learned = Some((key, identity.clone()));
                 }
                 state.snapshot = Some(snapshot);
                 state.failure = None;
@@ -2813,9 +2928,7 @@ impl Cagents {
             self.account_ui.popover = None;
         }
         let remember = learned
-            .map(|(key, identity, signed_in_here)| {
-                self.remember_identity(&id, key, identity, signed_in_here)
-            })
+            .map(|(key, identity)| self.remember_identity(&id, key, identity))
             .unwrap_or_else(Task::none);
         Task::batch([remember, self.probe_queued(provider)])
     }
@@ -2825,25 +2938,18 @@ impl Cagents {
     /// A managed account's address is remembered, so the next sign-in can be
     /// told apart from it before this window has probed it. A home that
     /// reports another login than the one it was added with had its
-    /// credentials replaced: that is reported, never recorded, unless the
-    /// reader has just signed this account in themselves.
+    /// credentials replaced: that is reported and requires an explicit
+    /// acceptance, even when the reader started the sign-in themselves.
     fn remember_identity(
         &mut self,
         id: &AccountId,
         key: uuid::Uuid,
         identity: Identity,
-        signed_in_here: bool,
     ) -> Task<Message> {
         let Some(registered) = self.account_ui.registry.find(key) else {
             return Task::none();
         };
         if registered.conflicts_with(&identity) {
-            if signed_in_here {
-                self.account_ui.login_changes_reported.remove(id);
-                return self.save_registry(move |registry| {
-                    registry.adopt_identity(key, &identity);
-                });
-            }
             if self
                 .account_ui
                 .login_changes_reported
@@ -2908,7 +3014,7 @@ impl Cagents {
 
     /// A synchronous fence covering discovery and terminals awaiting spawn.
     fn codex_browser_busy(&self) -> bool {
-        self.account_ui.browser_preparing || self.durable.cards.iter().any(|card| {
+        self.account_ui.browser_preparing || self.account_ui.preparing_browser_login.is_some() || self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
                 && matches!(&card.kind, CardKind::Terminal(session)
@@ -2931,6 +3037,19 @@ impl Cagents {
             ));
             return Task::none();
         }
+        let owner = self
+            .account_ui
+            .account(&id)
+            .expect("account checked above")
+            .owner;
+        if account.provider == Provider::Codex && !device && self.codex_browser_busy() {
+            self.status = Some(TransientNotice::warning(account::login::BUSY));
+            return Task::none();
+        }
+        self.account_ui.preparing_logins.insert(owner);
+        if account.provider == Provider::Codex && !device {
+            self.account_ui.preparing_browser_login = Some(owner);
+        }
         if crate::device::is_remote() {
             self.account_ui.popover = None;
             self.account_ui.table.close_popups();
@@ -2946,15 +3065,8 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLogin(id, result))
+                Message::AccountUi(Action::RemoteLogin(id, owner, result))
             });
-        }
-        if account.provider == Provider::Codex && !device {
-            if self.codex_browser_busy() {
-                self.status = Some(TransientNotice::warning(account::login::BUSY));
-                return Task::none();
-            }
-            self.account_ui.browser_preparing = true;
         }
         self.account_ui.popover = None;
         self.account_ui.table.close_popups();
@@ -2974,6 +3086,7 @@ impl Cagents {
             .map_err(|error| error.to_string())
             .and_then(|result| result);
             Message::AccountUi(Action::LoginReady {
+                owner,
                 id,
                 provider,
                 device,
@@ -2985,13 +3098,10 @@ impl Cagents {
     fn open_login(
         &mut self,
         id: &AccountId,
-        provider: Provider,
+        _provider: Provider,
         device: bool,
         program: Result<PathBuf, String>,
     ) -> Task<Message> {
-        if provider == Provider::Codex && !device {
-            self.account_ui.browser_preparing = false;
-        }
         let program = match program {
             Ok(program) => Some(program),
             Err(error) => {
@@ -3025,8 +3135,7 @@ impl Cagents {
         let title = format!("Sign in to {}", state.name());
         let now = now_ms();
         if let Some(state) = self.account_ui.account_mut(id) {
-            state.schedule.await_login(now);
-            state.signing_in_from = state.identity.clone();
+            state.begin_sign_in(now);
         }
         let (task, terminal) = self.open_login_terminal(launch, title);
         if let Some(state) = self.account_ui.account_mut(id) {
@@ -3062,7 +3171,34 @@ impl Cagents {
         }
     }
 
-    fn account_sign_in_running(&self, account: &Account) -> bool {
+    fn finish_login_preparation(&mut self, id: &AccountId, owner: u64) -> bool {
+        // Release only this request's reservation, never a replacement home's.
+        self.account_ui.preparing_logins.remove(&owner);
+        if self.account_ui.preparing_browser_login == Some(owner) {
+            self.account_ui.preparing_browser_login = None;
+        }
+        self.account_ui
+            .account(id)
+            .is_some_and(|state| state.owner == owner)
+    }
+
+    pub(super) fn account_login_change(&self, account: &Account) -> Option<String> {
+        let state = self.account_ui.account(&account.id())?;
+        if &state.account != account {
+            return None;
+        }
+        match self.account_ui.login_conflict(state)? {
+            conflict @ LoginConflict::Changed { .. } => Some(conflict.detail()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn account_sign_in_running(&self, account: &Account) -> bool {
+        if self.account_ui.account(&account.id()).is_some_and(|state| {
+            state.account == *account && self.account_ui.preparing_logins.contains(&state.owner)
+        }) {
+            return true;
+        }
         let (Some(variable), Some(home)) = (
             account::home_variable(account.provider),
             account.resolved_home(),
@@ -4287,7 +4423,7 @@ impl Cagents {
         let state = &self.account_ui;
         let present: Vec<&AccountState> = state
             .of(provider)
-            .filter(|account| account.present)
+            .filter(|account| state.shown_in_switcher(account))
             .collect();
         let lead = present
             .iter()
@@ -4421,11 +4557,16 @@ impl Cagents {
         let state = &self.account_ui;
         let rows: Vec<Element<'a, Message>> = state
             .of(provider)
-            .filter(|account| account.present)
+            .filter(|account| state.shown_in_switcher(account))
             .map(|account| {
                 let selected = &account.id == shown;
+                let conflict = state.login_conflict(account);
                 let mut items: Vec<Element<'a, Message>> = Vec::new();
-                match account.selection_window() {
+                match conflict
+                    .is_none()
+                    .then(|| account.selection_window())
+                    .flatten()
+                {
                     Some(window) => {
                         items.push(crate::ui_controls::budget_radial(window.used));
                     }
@@ -4437,18 +4578,25 @@ impl Cagents {
                     ),
                 }
                 items.push(
-                    design::body(state.display_name(account))
-                        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill)
+                    widget::column::with_children(vec![
+                        design::body(state.display_name(account)).into(),
+                        design::caption(match &conflict {
+                            Some(_) => state.account_origin(account).to_owned(),
+                            None if !account.present => {
+                                format!("{} · Unavailable", state.account_origin(account))
+                            }
+                            None => state.account_origin(account).to_owned(),
+                        })
                         .into(),
+                    ])
+                    .width(Length::Fill)
+                    .into(),
                 );
                 items.push(
-                    design::caption(
-                        chip_with_window(account, account.name(), now, selection_window).text,
-                    )
+                    design::caption(conflict.as_ref().map_or_else(
+                        || chip_with_window(account, account.name(), now, selection_window).text,
+                        |conflict| conflict.label().to_owned(),
+                    ))
                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
                     .into(),
                 );
@@ -4457,7 +4605,7 @@ impl Cagents {
                         .spacing(space::S)
                         .align_y(Alignment::Center),
                 )
-                .name(if account.account.is_brokered() {
+                .name(if account.account.is_brokered() || conflict.is_some() {
                     format!("View {} usage", state.display_name(account))
                 } else {
                     format!("Use {} by default", state.display_name(account))
@@ -4486,6 +4634,46 @@ impl Cagents {
         let spacing = space::S;
         let mut rows: Vec<Element<'a, Message>> =
             vec![self.account_header(account, now, placement)];
+        rows.push(design::caption(self.account_ui.account_origin(account)).into());
+        if let Some(conflict) = self.account_ui.login_conflict(account) {
+            rows.push(
+                design::body(conflict.label())
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .into(),
+            );
+            rows.push(
+                design::caption(conflict.detail())
+                    .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+            );
+            if let LoginConflict::Changed { added_as, .. } = &conflict {
+                rows.push(
+                    crate::ui_controls::button::secondary(format!("Sign in as {added_as}"))
+                        .on_press_maybe(
+                            (!self.account_sign_in_running(&account.account))
+                                .then(|| Message::AccountUi(Action::SignIn(account.id.clone()))),
+                        )
+                        .into(),
+                );
+            }
+            rows.push(
+                crate::ui_controls::button::secondary("Open Accounts")
+                    .on_press(Message::AccountUi(Action::OpenPane))
+                    .into(),
+            );
+        }
+        if let Some(action) = self.account_ui.reported_login_action(account) {
+            let reported = account
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref())
+                .unwrap_or("reported login");
+            rows.push(
+                crate::ui_controls::button::secondary(format!("Use {reported} for this account"))
+                    .on_press(Message::AccountUi(action))
+                    .into(),
+            );
+        }
         if let Some(line) = account.identity.as_ref().and_then(identity_line) {
             rows.push(
                 design::caption(line)
@@ -4515,7 +4703,11 @@ impl Cagents {
                     );
                     rows.push(
                         crate::ui_controls::button::primary("Sign in")
-                            .on_press(Message::AccountUi(Action::SignIn(account.id.clone())))
+                            .on_press_maybe(
+                                (!self.account_sign_in_running(&account.account)).then(|| {
+                                    Message::AccountUi(Action::SignIn(account.id.clone()))
+                                }),
+                            )
                             .into(),
                     );
                 }
@@ -5486,7 +5678,7 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
         let state = app.account_ui.account_mut(&id).unwrap();
         state
@@ -5494,7 +5686,12 @@ mod app_tests {
             .await_login(now_ms() - 2 * account::schedule::LOGIN_WATCH);
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert!(state.sign_in_terminal.is_some());
-        let _ = app.update(signed_in_as(&id, "new@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "new@example.com"));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("work@example.com")
+        );
+        accept_reported_login(&mut app, &id);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("new@example.com")
@@ -5504,7 +5701,7 @@ mod app_tests {
         assert!(!state.schedule.awaiting_login(now_ms()));
         // Even if the auth terminal remains open, its completed intent cannot
         // authorize a later replacement of this home's credentials.
-        let _ = app.update(signed_in_as(&id, "unexpected@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "unexpected@example.com"));
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("new@example.com")
@@ -6035,8 +6232,9 @@ mod app_tests {
         accounts
     }
 
-    fn signed_in_as(id: &AccountId, email: &str) -> Message {
+    fn signed_in_as(app: &Cagents, id: &AccountId, email: &str) -> Message {
         Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6049,6 +6247,247 @@ mod app_tests {
         })
     }
 
+    fn accept_reported_login(app: &mut Cagents, id: &AccountId) {
+        let action = app
+            .account_ui
+            .reported_login_action(app.account_ui.account(id).unwrap())
+            .unwrap();
+        let _ = app.update(Message::AccountUi(action));
+    }
+
+    #[test]
+    fn stale_account_home_replies_cannot_update_or_open_a_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let original = app.account_ui.account(&id).unwrap().account.clone();
+        let stale_probe = signed_in_as(&app, &id, "wrong@example.com");
+        let old_owner = app.account_ui.account(&id).unwrap().owner;
+        app.account_ui.preparing_logins.insert(old_owner);
+        app.account_ui.preparing_browser_login = Some(old_owner);
+        let key = original.registry_key().unwrap();
+        let home_a = original.resolved_home().unwrap().to_path_buf();
+        let home_b = directory.path().join("replacement");
+        std::fs::create_dir(&home_b).unwrap();
+        for home in [home_b, home_a] {
+            let mut registry = app.account_ui.registry.clone();
+            registry.unregister(key);
+            registry
+                .link(Provider::Codex, key, home, None, None, 2)
+                .unwrap();
+            app.account_ui.set_registry(registry);
+        }
+        // Even A→B→A is a different owner; path equality alone would accept the old reply.
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        assert_ne!(owner, old_owner);
+        app.account_ui.preparing_logins.insert(owner);
+        let now = app.account_ui.now_ms;
+        let cards = app.durable.cards.len();
+        let _ = app.update(stale_probe);
+        assert_eq!(app.account_ui.now_ms, now);
+        assert!(app.account_ui.account(&id).unwrap().identity.is_none());
+        let _ = app.update(Message::AccountUi(Action::LoginReady {
+            owner: old_owner,
+            id: id.clone(),
+            provider: Provider::Codex,
+            device: false,
+            program: Err("stale failure".into()),
+        }));
+        assert!(app.status.is_none());
+        assert_eq!(app.durable.cards.len(), cards);
+        assert!(app.account_sign_in_running(&original));
+        assert!(app.account_ui.preparing_logins.contains(&owner));
+        assert!(!app.account_ui.preparing_logins.contains(&old_owner));
+        assert!(app.account_ui.preparing_browser_login.is_none());
+        let _ = app.update(Message::AccountUi(Action::RemoteLogin(
+            id.clone(),
+            old_owner,
+            Err("stale remote failure".into()),
+        )));
+        assert!(app.status.is_none());
+        assert_eq!(app.durable.cards.len(), cards);
+    }
+
+    #[test]
+    fn a_pre_login_probe_cannot_confirm_a_later_sign_in_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let old_owner = app.account_ui.probe_owner(&id).unwrap();
+        let old_reply = signed_in_as(&app, &id, "other@example.com");
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .schedule
+            .start(Trigger::Focus, now_ms());
+        let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_ne!(state.owner, old_owner);
+        assert!(!state.schedule.in_flight(now_ms()));
+        assert!(state.schedule.awaiting_login(now_ms()));
+        let _ = app.update(old_reply);
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(
+            state.identity.as_ref().unwrap().email.as_deref(),
+            Some("work@example.com")
+        );
+        assert!(state.schedule.awaiting_login(now_ms()));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("work@example.com")
+        );
+        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("work@example.com")
+        );
+        accept_reported_login(&mut app, &id);
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("other@example.com")
+        );
+    }
+
+    #[test]
+    fn sign_in_preparation_blocks_duplicates_and_releases_only_its_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let owner = app.account_ui.probe_owner(&id).unwrap();
+        let _ = app.sign_in(id.clone(), true);
+        assert!(app.account_sign_in_running(&account));
+        assert!(app.account_ui.preparing_logins.contains(&owner));
+        let cards = app.durable.cards.len();
+        let _ = app.sign_in(id.clone(), true);
+        assert_eq!(app.durable.cards.len(), cards);
+        assert_eq!(app.account_ui.preparing_logins.len(), 1);
+        // Another Add-account callback reservation is unrelated to this ready reply.
+        app.account_ui.browser_preparing = true;
+        let _ = app.update(Message::AccountUi(Action::LoginReady {
+            owner,
+            id,
+            provider: Provider::Codex,
+            device: true,
+            program: Err("CLI unavailable".into()),
+        }));
+        assert!(!app.account_sign_in_running(&account));
+        assert!(app.account_ui.browser_preparing);
+    }
+
+    #[test]
+    fn accepting_a_reported_login_requires_current_owner_identity_and_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["expected@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&app, &id, "actual@example.com"));
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        assert!(app.account_login_change(&account).is_some());
+        let captured = app
+            .account_ui
+            .reported_login_action(app.account_ui.account(&id).unwrap())
+            .unwrap();
+        assert!(captured.blocked_while_modal());
+        app.account_ui
+            .account_mut(&id)
+            .unwrap()
+            .begin_sign_in(now_ms());
+        let _ = app.update(Message::AccountUi(captured));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("expected@example.com")
+        );
+        let captured = app
+            .account_ui
+            .reported_login_action(app.account_ui.account(&id).unwrap())
+            .unwrap();
+        let _ = app.update(signed_in_as(&app, &id, "latest@example.com"));
+        let _ = app.update(Message::AccountUi(captured));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("expected@example.com")
+        );
+        let captured = app
+            .account_ui
+            .reported_login_action(app.account_ui.account(&id).unwrap())
+            .unwrap();
+        let mut changed = app.account_ui.registry.clone();
+        changed.set_label(&account, Some("Changed elsewhere".into()));
+        app.account_ui.set_registry(changed);
+        let _ = app.update(Message::AccountUi(captured));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("expected@example.com")
+        );
+        // The blocking save closure checks again against durable metadata.
+        let expected = app.account_ui.registry.find(key).unwrap().clone();
+        let identity = app
+            .account_ui
+            .account(&id)
+            .unwrap()
+            .identity
+            .clone()
+            .unwrap();
+        let mut durable = app.account_ui.registry.clone();
+        durable.set_label(&account, Some("A later rename".into()));
+        adopt_reported_login(&mut durable, &expected, &identity);
+        assert_eq!(
+            durable.find(key).unwrap().email.as_deref(),
+            Some("expected@example.com")
+        );
+        accept_reported_login(&mut app, &id);
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("latest@example.com")
+        );
+        assert!(app.account_login_change(&account).is_none());
+    }
+
+    #[test]
+    fn account_conflict_presentation_distinguishes_origin_and_expected_login() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (_, id) = linked_logins(&mut app, directory.path(), &["expected@example.com"])
+            .pop()
+            .unwrap();
+        app.account_ui.account_mut(&id).unwrap().present = false;
+        let unavailable = app.account_ui.account(&id).unwrap();
+        assert!(!unavailable.present);
+        assert!(app.account_ui.shown_in_switcher(unavailable));
+        let _ = app.update(signed_in_as(&app, &id, "actual@example.com"));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(app.account_ui.account_origin(state), "Linked account");
+        assert!(app.account_ui.shown_in_switcher(state));
+        let system = AccountState::new(Account::system(Provider::Codex));
+        assert_eq!(app.account_ui.account_origin(&system), "System default");
+        assert_eq!(
+            app.account_ui.display_name(state),
+            "home-0 · expected@example.com"
+        );
+        let conflict = app.account_ui.login_conflict(state).unwrap();
+        assert_eq!(conflict.label(), "Login changed");
+        assert!(conflict.detail().contains("Added as expected@example.com"));
+        assert!(
+            conflict
+                .detail()
+                .contains("signed in to actual@example.com")
+        );
+        let previous = app.account_ui.registry.clone();
+        let _ = app.update(Message::AccountUi(Action::SetDefault(id.clone())));
+        assert_eq!(app.account_ui.registry, previous);
+        let _ = app.update(Message::AccountUi(Action::ShowAccount(id)));
+        assert_eq!(app.account_ui.registry, previous);
+    }
+
     #[test]
     fn a_home_signed_in_to_another_login_is_flagged_rather_than_renamed() {
         let directory = tempfile::tempdir().unwrap();
@@ -6056,12 +6495,12 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // Something replaced the credentials in its home.
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         let recorded = |app: &Cagents| {
             app.account_ui
                 .registry
@@ -6087,7 +6526,7 @@ mod app_tests {
         );
         assert_eq!(login_changes_noticed(&app), 1, "reported, not absorbed");
         // Once per change, not on every probe.
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         assert_eq!(login_changes_noticed(&app), 1);
         assert_eq!(recorded(&app), "work@example.com");
 
@@ -6100,7 +6539,7 @@ mod app_tests {
             state.signing_in_from = state.identity.clone();
         };
         sign_in_again(&mut app);
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         assert_eq!(recorded(&app), "work@example.com");
         assert!(
             app.account_ui
@@ -6111,14 +6550,16 @@ mod app_tests {
             "the sign-in is still watched for"
         );
         // Signed back in to the login it was added with: nothing to adopt.
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         assert_eq!(recorded(&app), "work@example.com");
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
         assert!(!state.schedule.awaiting_login(now_ms()));
-        // Signed in to another login on purpose: that is its login now.
+        // A different login after sign-in still requires explicit acceptance.
         sign_in_again(&mut app);
-        let _ = app.update(signed_in_as(&id, "new@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "new@example.com"));
+        assert_eq!(recorded(&app), "work@example.com");
+        accept_reported_login(&mut app, &id);
         assert_eq!(recorded(&app), "new@example.com");
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
@@ -6131,9 +6572,10 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         // Its token expired: signed out, still the account it was.
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6153,23 +6595,23 @@ mod app_tests {
         state.signing_in_from = state.identity.clone();
 
         // Signed back in to the same login: the sign-in is over.
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         let state = app.account_ui.account(&id).unwrap();
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert_eq!(state.signing_in_from, None);
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // A login that replaces it afterwards is reported, not adopted.
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
         );
         assert_eq!(login_changes_noticed(&app), 1);
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         assert_eq!(login_changes_noticed(&app), 1, "once per login");
         // Replaced again, by yet another login: that is a change of its own.
-        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
         assert_eq!(login_changes_noticed(&app), 2);
     }
 
@@ -6194,7 +6636,7 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
         let changed = Identity {
             email: Some("personal@example.com".into()),
             ..Identity::default()
@@ -6202,7 +6644,7 @@ mod app_tests {
 
         // Another window signed it in to the login it now reports: the
         // registry it saved says so, and there is nothing to report.
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         assert_eq!(
             login_changes_noticed(&app),
             0,
@@ -6218,13 +6660,13 @@ mod app_tests {
         // Replaced behind every window's back: the registry still records
         // the login it was last signed in to, so the change is reported -
         // once, however many probes answer while the registry is read.
-        let _ = app.update(signed_in_as(&id, "other@example.com"));
-        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
         assert_eq!(app.account_ui.login_changes_unconfirmed.len(), 1);
         let on_disk = app.account_ui.registry.clone();
         let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(on_disk))));
         assert_eq!(login_changes_noticed(&app), 1);
-        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
         assert_eq!(login_changes_noticed(&app), 1);
     }
 
@@ -6236,8 +6678,8 @@ mod app_tests {
         let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&id, "work@example.com"));
-        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
         assert_eq!(login_changes_noticed(&app), 0);
         let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Err(
             "unreadable".into(),
@@ -6256,7 +6698,7 @@ mod app_tests {
             &["one@example.com", "two@example.com"],
         );
         for (_, id) in &accounts {
-            let _ = app.update(signed_in_as(id, "one@example.com"));
+            let _ = app.update(signed_in_as(&app, id, "one@example.com"));
         }
         let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
         // The second home was added as another login: that is the louder
@@ -6287,7 +6729,7 @@ mod app_tests {
             &["same@example.com", "same@example.com"],
         );
         for (_, id) in &accounts {
-            let _ = app.update(signed_in_as(id, "same@example.com"));
+            let _ = app.update(signed_in_as(&app, id, "same@example.com"));
         }
         let (_, duplicate) = &accounts[1];
         let home = app
@@ -6341,6 +6783,7 @@ mod app_tests {
             binding: false,
         }];
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6352,6 +6795,7 @@ mod app_tests {
         assert!(state.present);
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Failed("timed out".into()),
         }));
@@ -6364,6 +6808,7 @@ mod app_tests {
         let mut older = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW - 1);
         older.source = UsageSource::Cache;
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6448,6 +6893,7 @@ mod app_tests {
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "ok", now - 5_000);
         snapshot.source = UsageSource::Probe;
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&managed).unwrap().owner,
             id: managed.clone(),
             outcome: Outcome::Answered {
                 identity: None,
@@ -6543,6 +6989,7 @@ mod app_tests {
         probed.detail = None;
         probed.plan = Some("max".into());
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&managed).unwrap().owner,
             id: managed.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6659,13 +7106,13 @@ mod app_tests {
         })));
         for id in [&claude, &codex] {
             let state = app.account_ui.account(id).unwrap();
-            assert!(!state.present);
             assert!(state.snapshot.is_none());
         }
 
         let mut probed = cached(0.8).snapshot;
         probed.observed_at = now + 1;
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&codex).unwrap().owner,
             id: codex.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6727,6 +7174,7 @@ mod app_tests {
         let id = Account::system(Provider::Codex).id();
         let now = now_ms();
         let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,

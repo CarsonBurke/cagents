@@ -23,6 +23,61 @@ pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
 
+/// Whether a provider-level failure requires the reader to renew the login.
+/// Only explicit authentication failures qualify: a bare HTTP 401 can describe
+/// a tool or service unrelated to the conversation's provider account.
+pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
+    if provider != Provider::Codex {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    [
+        "access token could not be refreshed",
+        "refresh token has already been used",
+        "refresh token has been revoked",
+        "refresh token has expired",
+        "refresh token is expired",
+        "not logged in",
+        "authentication required",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+        || (["sign in again", "signing in again", "log in again"]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+            && ["token", "authentication", "logged out"]
+                .iter()
+                .any(|phrase| lower.contains(phrase)))
+}
+
+#[cfg(test)]
+mod authentication_tests {
+    use super::*;
+
+    #[test]
+    fn sign_in_recovery_requires_an_explicit_codex_authentication_failure() {
+        for message in [
+            "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.",
+            "Codex RPC error: refresh token has already been used",
+            "Authentication token expired. Please sign in again.",
+            "Codex RPC error: Not logged in",
+        ] {
+            assert!(requires_sign_in(Provider::Codex, message), "{message}");
+        }
+        for message in [
+            "HTTP 401 from the deployment tool",
+            "Connection refused",
+            "Permission denied",
+            "Please sign in again to the database",
+            "Token budget exhausted",
+        ] {
+            assert!(!requires_sign_in(Provider::Codex, message), "{message}");
+        }
+        assert!(!requires_sign_in(Provider::Claude, "Not logged in"));
+        assert!(!requires_sign_in(Provider::Omp, "Not logged in"));
+    }
+}
+
 /// Local wall-clock time for a conversation stamp, as `14:32`.
 ///
 /// A transcript is read while the work is happening, so the hour and minute

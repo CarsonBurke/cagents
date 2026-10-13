@@ -351,6 +351,7 @@ impl Pane {
         let refreshed = clock.elapsed();
         let clock = Instant::now();
         let element = self.runtime.view(
+            None,
             false,
             true,
             &self.shortcuts,
