@@ -653,8 +653,14 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
-            fn scrollable(&mut self, id: Option<&widget::Id>, _: iced::Rectangle,
-                _: iced::Rectangle, translation: iced::Vector) {
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
                 if id == Some(&self.id) {
                     self.offset = Some(translation.y);
                 }
@@ -667,23 +673,39 @@ mod tests {
             app.card_view(app.workspace.focused().unwrap(), true, false)
         };
         tree.diff(view.as_widget_mut());
-        let node = view.as_widget_mut().layout(tree, &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(800.0, 300.0)));
-        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let node = view.as_widget_mut().layout(
+            tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(800.0, 300.0)),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         executor.block_on(async {
             if let Some(mut stream) = iced::runtime::task::into_stream(task) {
                 while let Some(action) = stream.next().await {
                     if let iced::runtime::Action::Widget(mut operation) = action {
-                        view.as_widget_mut().operate(tree, Layout::new(&node), &renderer, operation.as_mut());
+                        view.as_widget_mut().operate(
+                            tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
                     }
                 }
             }
         });
         let mut probe = Probe {
-            id: if palette { widget::Id::new("palette.commands") } else { crate::settings_widgets::content_id() },
+            id: if palette {
+                widget::Id::new("palette.commands")
+            } else {
+                crate::settings_widgets::content_id()
+            },
             offset: None,
         };
-        view.as_widget_mut().operate(tree, Layout::new(&node), &renderer, &mut probe);
+        view.as_widget_mut()
+            .operate(tree, Layout::new(&node), &renderer, &mut probe);
         probe.offset.expect("the results scrollable is mounted")
     }
 
@@ -693,8 +715,12 @@ mod tests {
         let mut app = settings_focus_fixture();
         let _ = app.update_palette(Action::Open);
         let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
-        let scroll = || iced::widget::operation::scroll_to(widget::Id::new("palette.commands"),
-            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 });
+        let scroll = || {
+            iced::widget::operation::scroll_to(
+                widget::Id::new("palette.commands"),
+                iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 },
+            )
+        };
         assert!(scroll_fixture_step(&app, &mut tree, true, scroll()) > 0.0);
         // A space keeps every result, so clamping a shorter result set cannot
         // accidentally make this pass without applying the reveal operation.
@@ -711,9 +737,16 @@ mod tests {
         use iced::advanced::widget::Tree;
         let mut app = settings_focus_fixture();
         app.settings_category = SettingsCategory::Keyboard;
-        let mut tree = Tree::new(app.card_view(app.workspace.focused().unwrap(), true, false).as_widget());
-        let scroll = || iced::widget::operation::scroll_to(crate::settings_widgets::content_id(),
-            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 });
+        let mut tree = Tree::new(
+            app.card_view(app.workspace.focused().unwrap(), true, false)
+                .as_widget(),
+        );
+        let scroll = || {
+            iced::widget::operation::scroll_to(
+                crate::settings_widgets::content_id(),
+                iced::widget::operation::AbsoluteOffset { x: 0.0, y: 300.0 },
+            )
+        };
         assert!(scroll_fixture_step(&app, &mut tree, false, scroll()) > 0.0);
         let category = app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard));
         assert_eq!(scroll_fixture_step(&app, &mut tree, false, category), 0.0);

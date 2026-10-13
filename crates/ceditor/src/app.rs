@@ -6192,6 +6192,7 @@ mod tests {
                 _: iced::Rectangle,
                 _: iced::Rectangle,
                 translation: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
             ) {
                 if id == Some(&self.0) {
                     self.1 = Some(translation.y);
