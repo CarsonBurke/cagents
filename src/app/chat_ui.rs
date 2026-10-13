@@ -7786,20 +7786,23 @@ impl Cagents {
                     dropped => dropped,
                 };
                 let insertion = dropped.insertion(file_drop::Spelling::Plain);
-                if !insertion.text.is_empty() {
-                    runtime.revision = runtime.revision.wrapping_add(1);
-                    runtime.history_cursor = None;
-                    runtime.history_stash = None;
-                    runtime
-                        .composer
-                        .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                            Arc::new(insertion.text.clone()),
-                        )));
-                }
                 if let Some(refusal) = insertion.refusal() {
                     self.status = Some(TransientNotice::warning(refusal));
                 }
-                return cosmic::task::message(Message::FocusCard(target.card));
+                let edited = if insertion.text.is_empty() {
+                    Task::none()
+                } else {
+                    self.handle_chat_ui(Action::Composer(
+                        target,
+                        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                            insertion.text,
+                        ))),
+                    ))
+                };
+                return Task::batch([
+                    edited,
+                    cosmic::task::message(Message::FocusCard(target.card)),
+                ]);
             }
             Action::RemoveAttachment(target, index) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -12032,6 +12035,38 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).composer.text(), expected);
         app.chat_forget(card);
         assert_eq!(app.chat_ui.drafts[&card], expected);
+    }
+
+    #[test]
+    fn dropped_mentions_restart_completion_and_promote_the_recalled_prompt() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "original unsent draft");
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["sent prompt".into()];
+        }
+        drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.perform(text_editor::Action::Select(
+                text_editor::Motion::DocumentEnd,
+            ));
+            runtime.completion.dismissed = Some((0, 0));
+            assert!(runtime.files.is_none());
+        }
+        drop(app.update(Message::ChatUi(Action::Dropped(
+            target,
+            file_drop::Payload::new("text/plain".into(), b"@src".to_vec()),
+        ))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "@src");
+        assert_eq!(runtime.completion.dismissed, None);
+        assert!(runtime.files.is_some());
+        assert_eq!(runtime.history_cursor, None);
+        assert!(runtime.history_stash.is_none());
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], "@src");
     }
 
     #[test]
