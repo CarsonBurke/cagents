@@ -13633,6 +13633,28 @@ mod tests {
         assert!(app.workspace.order().any(|id| id == card));
     }
 
+    #[test]
+    fn a_closed_claude_conversation_can_reopen_as_history_without_its_directory() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let card = draft_in(&mut app, project.path());
+        let mut saved = earlier(&app, card);
+        saved.session.launch.provider = Provider::Claude;
+        saved.session.launch.recipe.program = "claude".into();
+        saved.session.launch.recipe.arguments.clear();
+        saved.session.launch.recipe.working_directory = project.path().join("removed");
+        let provider_id = saved.session.launch.session_id.clone();
+        let _ = app.resume_saved_conversation(saved);
+        let reopened = app.workspace.focused().unwrap();
+        assert_ne!(reopened, card);
+        let CardKind::Chat(session) = &app.card_state(reopened).unwrap().kind else {
+            panic!("the saved conversation reopens as a chat");
+        };
+        assert_eq!(session.launch.session_id, provider_id);
+        assert!(session.launch.needs_read_only_history());
+        assert!(app.resume_ui.error.is_none());
+    }
+
     /// A `/resume` the picker cannot answer is left for the writer to send
     /// again.
     #[test]

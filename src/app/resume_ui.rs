@@ -795,7 +795,9 @@ impl Cagents {
 
     fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
         let mut session = entry.session;
-        if !session.launch.recipe.working_directory.is_dir() {
+        if !session.launch.recipe.working_directory.is_dir()
+            && !session.launch.needs_read_only_history()
+        {
             self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
             return Task::none();
         }

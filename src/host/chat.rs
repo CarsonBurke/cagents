@@ -917,7 +917,8 @@ fn start_with_execution(
     // Classify a removed account before that read can mask it as missing
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
-    if session.launch.provider != Provider::Codex {
+    let saved_history_only = session.launch.needs_read_only_history();
+    if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
     }
     let allocator = host
@@ -977,13 +978,25 @@ fn start_with_execution(
             .err()
             .unwrap_or_else(|| error(message))
     })?;
+    if matches!(spec.transport, chat::protocol::TransportSpec::History)
+        && (source.is_some()
+            || terminate_source
+            || execution.is_some()
+            || selection.is_some()
+            || restart_launch.is_some())
+    {
+        return Err(error(
+            "Read-only history cannot take over a provider or execute an agent run",
+        ));
+    }
     if !matches!(
         &spec.transport,
-        chat::protocol::TransportSpec::UnixWebSocket { .. }
+        chat::protocol::TransportSpec::History
+            | chat::protocol::TransportSpec::UnixWebSocket { .. }
     ) {
         check_launch_account(&session.launch)?;
     }
-    if source.is_none() {
+    if source.is_none() && !matches!(spec.transport, chat::protocol::TransportSpec::History) {
         // A conversation with no proven source has no proven environment to
         // preserve, so it starts from the daemon's own native configuration
         // whether or not it names a stopped terminal. Requiring the absence of
@@ -1216,7 +1229,9 @@ fn start_with_execution(
             }
         }
         spec.execution = execution.clone();
-        if let Some(context) = &spec.execution {
+        if !matches!(spec.transport, chat::protocol::TransportSpec::History)
+            && let Some(context) = &spec.execution
+        {
             context
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
@@ -1227,7 +1242,8 @@ fn start_with_execution(
         // recipe. A fresh provider may delegate only as its real session.
         if !matches!(
             spec.transport,
-            chat::protocol::TransportSpec::UnixWebSocket { .. }
+            chat::protocol::TransportSpec::History
+                | chat::protocol::TransportSpec::UnixWebSocket { .. }
         ) && let Ok(registry) = super::agent_execution::registry(host)
         {
             let authority = registry
@@ -1258,7 +1274,8 @@ fn start_with_execution(
         let execution_instance = uuid::Uuid::new_v4();
         if !matches!(
             spec.transport,
-            chat::protocol::TransportSpec::UnixWebSocket { .. }
+            chat::protocol::TransportSpec::History
+                | chat::protocol::TransportSpec::UnixWebSocket { .. }
         ) {
             let _account = crate::account::registry::authorize_spawn(&spec.environment, None)
                 .map_err(|error| unavailable(error.to_string()))?;
@@ -2769,6 +2786,9 @@ pub(super) fn restore_upgrade(
         native_recovery::restore(host, 0, &saved.source)?;
         return Ok(());
     }
+    if saved.launch.needs_read_only_history() {
+        return Err("The saved Claude working directory is unavailable. No provider was restarted; open the saved pane to read its conversation history.".into());
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut session = saved.source.clone();
     session.launch = saved.launch.clone();
@@ -3355,6 +3375,91 @@ for line in sys.stdin:
                 previous_sources: Vec::new(),
             },
         )
+    }
+
+    #[test]
+    fn missing_claude_directory_restores_a_hosted_history_reader_without_authority() {
+        let (root, host, mut saved) = upgrade_fixture();
+        let cwd = root.path().join("deleted-project");
+        let config = root.path().join("claude-config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let transcript = config
+            .join("projects")
+            .join(project)
+            .join("12345678-1234-4234-8234-123456789abc.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, serde_json::json!({"type":"user","uuid":"saved-prompt","parentUuid":null,"sessionId":"12345678-1234-4234-8234-123456789abc","message":{"role":"user","content":"A prompt saved before the worktree was removed"}}).to_string() + "\n").unwrap();
+        saved.launch.provider = Provider::Claude;
+        saved.launch.recipe.program = "claude".into();
+        saved.launch.recipe.working_directory = cwd;
+        saved.launch.recipe.environment = BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".into(),
+            config.to_string_lossy().into_owned(),
+        )]);
+        saved.source.launch = saved.launch.clone();
+        saved.source.proof = None;
+        let response = start(
+            &host,
+            1,
+            saved.source.clone(),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+        let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
+            .handle
+            .clone();
+        handle.set_visible(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle.snapshot(None).unwrap().exited {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let snapshot = handle.snapshot(None).unwrap();
+        assert_eq!(snapshot.session_id, saved.launch.session_id);
+        assert_eq!(snapshot.items.len(), 1);
+        assert!(!handle.owns_work());
+        assert!(
+            handle.confirmed_session_id().is_none(),
+            "disk identity is not provider confirmation"
+        );
+        assert!(
+            !handle
+                .execution_environment()
+                .0
+                .contains_key(crate::agent_execution::AUTHORITY_ENV)
+        );
+        assert!(
+            handle
+                .command(chat::Command::Prompt {
+                    text: "do not run".into(),
+                    attachments: Vec::new(),
+                    mode: chat::PromptMode::Send
+                })
+                .unwrap_err()
+                .contains("read-only")
+        );
+        handle.command(chat::Command::Refresh).unwrap();
+        let failure = restore_upgrade(&host, &saved).unwrap_err();
+        assert!(failure.contains("No provider was restarted"));
+        assert!(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .upgrade_chats
+                .is_empty()
+        );
+        handle.close().unwrap();
     }
 
     #[test]
