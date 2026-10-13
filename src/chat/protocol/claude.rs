@@ -1089,6 +1089,9 @@ impl Claude {
                                     self.background_agents.insert(tool_id.clone());
                                 }
                                 step.events.push(Event::Subagent {
+                                    model: block["input"]["model"].as_str().map(str::to_owned),
+                                    waiting: None,
+                                    detail: None,
                                     id: tool_id.clone(),
                                     kind: string(&block["input"], "subagent_type").into(),
                                     description: string(&block["input"], "description").into(),
