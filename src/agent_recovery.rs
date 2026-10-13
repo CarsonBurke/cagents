@@ -526,6 +526,7 @@ fn observation_environment_key(name: &str) -> bool {
             | "OMP_PROFILE"
             | "PI_PROFILE"
             | "PI_CONFIG_DIR"
+            | "XDG_CONFIG_HOME"
             | "XDG_DATA_HOME"
             | "XDG_STATE_HOME"
             | "XDG_CACHE_HOME"
@@ -1490,6 +1491,21 @@ mod tests {
         let omp = fresh_recipe(&omp_launch).unwrap();
         assert_eq!(omp.arguments[0], "--session-dir");
         assert!(omp.arguments[1].ends_with("/sessions/native"));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn native_handoff_preserves_the_omp_xdg_configuration_directory() {
+        let environment = preserved_native_environment(
+            b"HOME=/source\0XDG_CONFIG_HOME=/selected/config\0XDG_DATA_HOME=/selected/data\0XDG_STATE_HOME=/selected/state\0",
+            Provider::Omp,
+            &BTreeMap::new(),
+        ).unwrap();
+        let mut recipe = launch("omp", &[]);
+        recipe.environment = environment;
+        assert_eq!(Provider::Omp.authored_content_root(&recipe), Some("/selected/config/omp".into()));
+        assert_eq!(Provider::Omp.session_root(&recipe), Some("/selected/data/omp".into()));
+        assert_eq!(Provider::Omp.session_state_root(&recipe), Some("/selected/state/omp".into()));
     }
 
     #[cfg(feature = "host")]
