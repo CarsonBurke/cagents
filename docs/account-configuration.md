@@ -3,6 +3,50 @@
 The Accounts pane creates a separate provider home for every added login.
 Existing system and linked homes are left unchanged.
 
+## Reading usage from the CLI
+
+```sh
+cagents account info --json
+cagents account info --provider codex --json
+cagents account info --account codex/system --refresh --json
+```
+
+`account info` reads account registry metadata and the usage observations the
+selected daemon already has. It does not sign in, inspect credential files,
+start a provider conversation, or probe providers by default. OMP allowances
+come from its bounded, read-only `usage_history` query. The human output is
+concise; `--json` uses the normal stable CLI envelope and includes each account's
+ID, provider, registered and observed identities, plan, allowance windows,
+credits, source, observation time, age, and stale/reset indicators.
+
+`--refresh` requires one explicit `--account` ID and reuses that provider CLI's
+isolated usage probe. It requests usage, without submitting a paid model turn.
+A busy or failed probe retains the previous observation and reports the reason.
+OMP uses its recorded usage and does not support this probe flag. Account IDs
+are distinct from email addresses: two homes can report the same email without
+becoming the same configured account. A changed observed login is reported
+separately from the registered identity.
+
+Inside a live cagents session, the report also includes authenticated caller
+latest reported context occupancy, its reported context limit, and the account selected by the
+session's captured effective execution environment. It does not substitute the default for new chats. Missing execution metadata or
+API credential overrides leave subscription account selection unknown.
+Providers which do not report context occupancy or limits leave those fields
+null. Terminal callers also leave account binding unknown, because foreground
+provider activity does not prove the environment it currently uses. All cached
+account allowances remain available. Occupancy can lag while a turn is running; the daemon query time is not
+the time that occupancy was observed. A CLI outside a hosted session has no caller context. A running account
+which has been archived remains readable and is marked `archived`; explicitly
+reading that account does not make it selectable for new work.
+
+Remaining plan fractions come from provider-reported usage windows. Expired
+resets and stale observations remain marked, without assuming a renewed
+allowance. Extra usage retains the provider's direct balance where available;
+derived monetary remaining amounts require identical currency and exponent
+for the reported limit and usage. Unlimited, missing, or incompatible values
+remain unknown. Conversation token counts and API-equivalent cost estimates
+are never converted into subscription plan allowance.
+
 New installations use **Automatic** for each provider. Add each subscription
 once with its provider's browser or device-code sign-in. Thereafter the CLI
 uses its saved login and refreshes its own tokens; cagents never reads or

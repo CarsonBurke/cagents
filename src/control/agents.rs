@@ -159,7 +159,7 @@ pub struct ShowArgs {
     tail: usize,
 }
 
-fn parse_provider(value: &str) -> Result<Provider, String> {
+pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
         .into_iter()
         .find(|provider| provider.executable() == value)
