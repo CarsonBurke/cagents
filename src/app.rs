@@ -15915,7 +15915,7 @@ impl Application for Cagents {
                         ..
                     } = &event
                 {
-                    if *key == keyboard::key::Named::Escape {
+                    if *key == keyboard::key::Named::Escape && !captured {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
                     }
                     if *key == keyboard::key::Named::Enter

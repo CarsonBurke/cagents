@@ -213,6 +213,88 @@ mod tests {
         assert!(user_message_blocked_during_update(&query));
     }
 
+    fn escape_event() -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn captured_escape_preserves_underlying_terminal_find() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                directory.path(),
+                TerminalId::new(),
+            )),
+        );
+        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        drop(app.update(Message::KeyEvent { event: escape_event(), captured: true }));
+        assert!(app.terminal_find[&card].open);
+        // With no focused field answering the key, Escape on the terminal
+        // surface still closes its open find bar.
+        drop(app.update(Message::KeyEvent { event: escape_event(), captured: false }));
+        assert!(!app.terminal_find[&card].open);
+    }
+
+    #[test]
+    fn focused_terminal_find_closes_on_its_first_escape_before_native_blur() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}},
+            mouse,
+        };
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        let renderer = super::super::tests::headless_renderer();
+        let mut element = app.terminal_find_view(card).unwrap();
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(iced::Size::new(600.0, 48.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<Message>(input_id(card)),
+        );
+        let mut published = Vec::new();
+        let mut shell = Shell::new(&mut published);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(escape_event()),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(shell.is_event_captured());
+        assert!(published.iter().any(|message| matches!(
+            message,
+            Message::TerminalFind(Action::Close(target)) if *target == card
+        )));
+        assert!(!published.iter().any(|message| matches!(
+            message,
+            Message::TerminalFind(Action::Focus(_, false))
+        )));
+    }
+
     #[test]
     fn paste_confirmation_dismisses_after_its_runtime_has_retired() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -586,12 +668,15 @@ impl Cagents {
     pub(super) fn terminal_find_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let find = self.terminal_find.get(&card).filter(|find| find.open)?;
         let message = |action| Message::TerminalFind(action);
-        let input = crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
-            .id(input_id(card))
-            .on_input(move |query| Message::TerminalFind(Action::Query(card, query)))
-            .on_focus(message(Action::Focus(card, true)))
-            .on_unfocus(message(Action::Focus(card, false)))
-            .width(Length::Fill);
+        let input = crate::interaction::focused_escape(
+            crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
+                .id(input_id(card))
+                .on_input(move |query| Message::TerminalFind(Action::Query(card, query)))
+                .on_focus(message(Action::Focus(card, true)))
+                .on_unfocus(message(Action::Focus(card, false)))
+                .width(Length::Fill),
+            move || Message::TerminalFind(Action::Close(card)),
+        );
         let count = if find.query.is_empty() {
             String::new()
         } else if find.matches.is_empty() {
