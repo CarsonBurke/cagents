@@ -153,6 +153,109 @@ mod tests {
     use cosmic::iced::{Rectangle, Size, Vector};
 
     #[test]
+    fn view_tab_click_survives_rebuild_between_press_and_release_inside_horizontal_strip() {
+        use cosmic::iced::advanced::{Shell, clipboard};
+        use cosmic::iced::{Event, Point, mouse};
+        fn tabs() -> Element<'static, u8> {
+            horizontal(
+                widget::Id::new("fixture-native-tabs"),
+                vec![
+                    crate::ui_controls::view_tab(
+                        crate::ui_controls::ViewTab {
+                            label: "Conversation".into(),
+                            description: "Main conversation".into(),
+                            count: None,
+                            selected: true,
+                            id: None,
+                            on_press: Some(0),
+                        },
+                        true,
+                        None,
+                    ),
+                    crate::ui_controls::view_tab(
+                        crate::ui_controls::ViewTab {
+                            label: "Native · Reviewer".into(),
+                            description: "Native child".into(),
+                            count: None,
+                            selected: false,
+                            id: None,
+                            on_press: Some(1),
+                        },
+                        true,
+                        Some(crate::ui_controls::passive_icon(
+                            crate::ui_controls::Icon::AgentWaiting,
+                            design::COMPACT_ICON_SIZE,
+                        )),
+                    ),
+                ],
+                crate::ui_controls::view_tab_height(true),
+                crate::ui_controls::view_tab_height(true) + design::BORDER_WIDTH,
+            )
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut view = tabs();
+        let mut tree = Tree::new(view.as_widget());
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 800.0));
+        let mut node = view
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits)
+            .move_to(Point::new(0.0, 500.0));
+        let accessible =
+            view.as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let bounds = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().label() == Some("Native child"))
+            .and_then(|node| node.node().bounds())
+            .expect("native child button is mounted");
+        let pointer = Point::new(
+            (bounds.x0 + bounds.x1) as f32 / 2.0,
+            (bounds.y0 + bounds.y1) as f32 / 2.0,
+        );
+        let viewport = Rectangle::with_size(Size::new(600.0, 800.0));
+        let mut messages = Vec::new();
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        ] {
+            view.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(messages.is_empty());
+        view = tabs();
+        tree.diff(view.as_widget_mut());
+        node = view
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits)
+            .move_to(Point::new(0.0, 500.0));
+        view.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(pointer),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert_eq!(
+            messages,
+            vec![1],
+            "a native child tab remains clickable across the redraw caused by pressing it"
+        );
+    }
+
+    #[test]
     fn horizontal_viewport_reaches_strip_edges_and_inset_belongs_to_content() {
         #[derive(Default)]
         struct Probe {

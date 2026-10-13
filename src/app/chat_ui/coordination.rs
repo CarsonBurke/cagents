@@ -333,13 +333,13 @@ fn run_line(run: &Run) -> Option<(String, Tone)> {
     let state = run.state.map(|state| {
         let mut state = state_phrase(state).to_owned();
         if run.timed_out {
-            state.push_str(", still running when the wait ended");
+            state.push_str(", wait timed out");
         }
         state
     });
     match (agent, state) {
         (Some(agent), Some(state)) => Some((format!("{state} as {agent}"), tone)),
-        (Some(agent), None) => Some((format!("Running on its own as {agent}"), tone)),
+        (Some(agent), None) => Some((format!("Launch accepted as {agent}"), tone)),
         (None, Some(state)) => Some((state, tone)),
         (None, None) => None,
     }
@@ -375,6 +375,42 @@ fn last_line(output: &str) -> &str {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default()
+}
+
+/// Describe only metadata reported for this launch; native children do not
+/// inherit the parent model merely because they share a provider.
+fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<&str>) -> String {
+    let mut parts = vec![
+        if reading.cli {
+            "cagents agent"
+        } else {
+            "Native subagent"
+        }
+        .to_owned(),
+    ];
+    if !spawn.provider.is_empty() {
+        parts.push(spawn.provider.clone());
+    }
+    parts.push(
+        observed_model
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or(if spawn.model.is_empty() {
+                "Model not reported"
+            } else {
+                &spawn.model
+            })
+            .to_owned(),
+    );
+    if !spawn.effort.is_empty() {
+        parts.push(spawn.effort.clone());
+    }
+    if reading.cli {
+        parts.push(spawn.channel.as_ref().map_or_else(
+            || "Channel not reported".to_owned(),
+            |channel| format!("Channel {}", channel),
+        ));
+    }
+    parts.join(" · ")
 }
 
 fn muted_glyph(icon: Icon) -> Element<'static, Message> {
@@ -665,18 +701,20 @@ impl Runtime {
             design::caption("Started").into(),
             design::heading(started(spawn)).into(),
         ];
-        // How it runs, as the agent asked for it.
-        let traits: Vec<&str> = [
-            spawn.provider.as_str(),
-            spawn.model.as_str(),
-            spawn.effort.as_str(),
-        ]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect();
-        if !traits.is_empty() {
-            heading.push(design::caption(traits.join(" · ")).into());
-        }
+        let observed_model = if !reading.cli {
+            match reading.subagents.as_slice() {
+                [id] => self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == id)
+                    .and_then(|agent| agent.model.as_deref()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        heading.push(design::caption(spawn_identity(reading, spawn, observed_model)).into());
         rows.push(
             widget::row::with_children(heading)
                 .spacing(step::GAP_XS)
@@ -764,16 +802,20 @@ impl Runtime {
         if spawn.waits {
             return None;
         }
-        let states: Vec<ToolStatus> = coordinated
+        let agents: Vec<&chat::Subagent> = coordinated
             .reading
             .subagents
             .iter()
             .filter_map(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
-            .map(|agent| agent.status)
             .collect();
-        let any = |wanted: ToolStatus| states.contains(&wanted);
-        if states.is_empty() {
+        let any = |wanted: ToolStatus| agents.iter().any(|agent| agent.status == wanted);
+        if agents.is_empty() {
             None
+        } else if agents
+            .iter()
+            .any(|agent| agent.status == ToolStatus::Running && agent.waiting)
+        {
+            Some("Waiting for you")
         } else if any(ToolStatus::Running) {
             Some("Working in the background")
         } else if any(ToolStatus::Failed) {
@@ -980,6 +1022,20 @@ impl Runtime {
         // its launch is.
         let detail = if overruled {
             Some("Failed".to_owned())
+        } else if let Kind::Spawn(spawn) = &coordinated.reading.kind
+            && coordinated.reading.cli
+            && !spawn.waits
+            && item.content.status() == Some(ToolStatus::Succeeded)
+        {
+            // Completing the launch command does not complete the separate
+            // session. Report its observed state, or only the accepted launch.
+            Some(
+                match coordinated.reading.outcome.run.as_ref() {
+                    Some(run) => run.state.map_or("Launch accepted", state_phrase),
+                    None => "Launch command finished",
+                }
+                .to_owned(),
+            )
         } else {
             self.background_state(coordinated)
                 .map(str::to_owned)
@@ -994,5 +1050,43 @@ impl Runtime {
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn launches_distinguish_native_children_and_separate_sessions_without_guessing() {
+        let mut spawn = Spawn::default();
+        let mut reading = Coordination {
+            kind: Kind::Spawn(spawn.clone()),
+            outcome: Default::default(),
+            subagents: Vec::new(),
+            cli: false,
+        };
+        assert_eq!(
+            spawn_identity(&reading, &spawn, None),
+            "Native subagent · Model not reported"
+        );
+        assert_eq!(
+            spawn_identity(&reading, &spawn, Some("gpt-child-reported")),
+            "Native subagent · gpt-child-reported"
+        );
+        reading.cli = true;
+        assert_eq!(
+            spawn_identity(&reading, &spawn, None),
+            "cagents agent · Model not reported · Channel not reported"
+        );
+        spawn.provider = "codex".into();
+        spawn.model = "gpt-reported".into();
+        spawn.effort = "low".into();
+        let channel = crate::model::ChannelId::new();
+        spawn.channel = Some(channel);
+        assert_eq!(
+            spawn_identity(&reading, &spawn, None),
+            format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
+        );
     }
 }

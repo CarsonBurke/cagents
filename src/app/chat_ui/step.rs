@@ -613,7 +613,7 @@ impl Runtime {
                     } else {
                         working_directory
                     },
-                    None,
+                    Some(Self::OUTPUT_HEIGHT),
                 ));
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());

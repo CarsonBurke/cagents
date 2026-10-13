@@ -436,7 +436,13 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             action,
             ..
         } => {
-            if label.is_empty() {
+            if *action == chat::CommandAction::Run {
+                first_line(if label.trim().is_empty() {
+                    command
+                } else {
+                    label
+                })
+            } else if label.is_empty() {
                 first_line(command)
             } else if label == command {
                 // Built-in reads/searches carry the exact target in both
@@ -1211,6 +1217,16 @@ mod tests {
         };
         assert_eq!(step_label(&content), "git add -A \\");
         assert_eq!(step_verb(&content), "Ran");
+    }
+
+    #[test]
+    fn multiline_shell_labels_do_not_expose_heredoc_payloads() {
+        let mut content = command("shell", ToolStatus::Running).content;
+        if let ItemContent::Command { label, command, .. } = &mut content {
+            *command = "cat > tests.rs <<'EOF'\nprivate payload\nEOF".into();
+            *label = command.clone();
+        }
+        assert_eq!(step_label(&content), "cat > tests.rs <<'EOF'");
     }
 
     #[test]

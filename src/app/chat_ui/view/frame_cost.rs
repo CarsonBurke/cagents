@@ -356,6 +356,7 @@ impl Pane {
             &self.shortcuts,
             720.0,
             Place {
+                channel: None,
                 name: "project".into(),
                 branch: None,
             },
@@ -722,4 +723,147 @@ fn a_refresh_of_a_full_window_with_metadata() {
 /// Installs `update` over `installed` as the reader thread does.
 fn install(update: chat::presentation::Presentation, installed: Arc<Snapshot>) -> Arc<Snapshot> {
     Arc::new(update.apply(&installed).expect("a patch that applies"))
+}
+
+/// Sparse child metadata must refresh a kept launch card even when neither
+/// its tool content nor the child's running status changed.
+#[test]
+fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct ReadLabels(Vec<String>);
+    impl Operation for ReadLabels {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            text: &str,
+        ) {
+            if bounds.width > 0.0 && bounds.height > 0.0 {
+                self.0.push(text.to_owned());
+            }
+        }
+    }
+    let items = vec![
+        item(
+            "first-prompt".into(),
+            chat::Role::User,
+            prose("Inspect parser".into(), false, chat::Phase::Final),
+        ),
+        item(
+            "native-child".into(),
+            chat::Role::Assistant,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                input: serde_json::json!({"prompt":"Inspect parser", "run_in_background":true})
+                    .to_string(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+        ),
+        item(
+            "first-answer".into(),
+            chat::Role::Assistant,
+            prose("The agent is checking.".into(), false, chat::Phase::Final),
+        ),
+        item(
+            "second-prompt".into(),
+            chat::Role::User,
+            prose("Another question".into(), false, chat::Phase::Final),
+        ),
+        item(
+            "second-answer".into(),
+            chat::Role::Assistant,
+            prose("Another answer".into(), false, chat::Phase::Final),
+        ),
+    ];
+    let (mut runtime, _handle) = live_runtime(&items);
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(chat::Subagent {
+            id: "native-child".into(),
+            kind: "Scout".into(),
+            description: "Inspect parser".into(),
+            status: chat::ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+    assert_eq!(runtime.turns.len(), 2);
+    assert!(runtime.retainable(&runtime.turns[0]));
+    let dark = cosmic::theme::is_dark();
+    let settings =
+        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
+    let renderer = crate::app::tests::headless_renderer();
+    let mut tree = Tree::new(
+        runtime
+            .turn_view(&runtime.turns[0], settings, dark)
+            .as_widget(),
+    );
+    let labels = |runtime: &Runtime, tree: &mut Tree| {
+        let mut element = runtime.turn_view(&runtime.turns[0], settings, dark);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(640.0, 2400.0)),
+        );
+        let mut labels = ReadLabels::default();
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), &renderer, &mut labels);
+        labels.0
+    };
+    let initial = labels(&runtime, &mut tree);
+    assert!(
+        initial
+            .iter()
+            .any(|label| label.contains("Model not reported")),
+        "{initial:?}"
+    );
+    assert!(
+        initial
+            .iter()
+            .any(|label| label.contains("Working in the background")),
+        "{initial:?}"
+    );
+    let unrelated = runtime.turn_fingerprint(&runtime.turns[1], dark);
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].model = Some("gpt-child-reported".into());
+    let hydrated = labels(&runtime, &mut tree);
+    assert!(
+        hydrated
+            .iter()
+            .any(|label| label.contains("gpt-child-reported")),
+        "{hydrated:?}"
+    );
+    assert!(
+        !hydrated
+            .iter()
+            .any(|label| label.contains("Model not reported")),
+        "{hydrated:?}"
+    );
+    assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+    let waiting = labels(&runtime, &mut tree);
+    assert!(
+        waiting
+            .iter()
+            .any(|label| label.contains("Waiting for you")),
+        "{waiting:?}"
+    );
+    assert!(
+        !waiting
+            .iter()
+            .any(|label| label.contains("Working in the background")),
+        "{waiting:?}"
+    );
+    assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
 }

@@ -3355,7 +3355,7 @@ impl Cagents {
                 // match is only in the command or output it was read from.
                 let raw = match coordinated {
                     Some(coordinated) if coordinated.is_card() => !unfolded,
-                    _ => turn.steps.contains(placed),
+                    _ => turn.steps.contains(placed) || placed.slot == turn::Slot::Thinking,
                 };
                 if raw
                     && contains_text(&item.content, query)
@@ -10330,6 +10330,33 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).active_scroll(), child);
         drop(app.handle_chat_ui(Action::Latest(target)));
         assert!(chat_runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn finding_collapsed_reasoning_reveals_it_and_restores_disclosure() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("find-reasoning"));
+        let target = chat_runtime(&app, card).target;
+        let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.busy = true;
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "reasoning".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Unique reasoning needle".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: None,
+            at: None,
+        })];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        assert!(chat_runtime(&app, card).expanded.contains("reasoning"));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
     }
 
     #[test]
