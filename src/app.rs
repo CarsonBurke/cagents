@@ -4904,6 +4904,8 @@ pub struct Cagents {
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
     settings_reset_confirm: bool,
+    settings_reset_focus_confirm: bool,
+    settings_reset_keyboard_nav: Option<bool>,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
     pull_request_dialog_generation: u64,
@@ -12625,6 +12627,43 @@ impl Cagents {
         Task::batch(tasks)
     }
 
+    fn settings_reset_on_top(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() {
+            return false;
+        }
+        self.settings_reset_confirm
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+            && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none()
+            && !self.session_recovery.open()
+            && !self.daemon_health_ui.confirmation
+            && self.update_ui.confirmation.is_none()
+            && !self.terminal_close_dialog_visible()
+    }
+
+    fn close_settings_reset(&mut self) -> Task<Message> {
+        if !std::mem::take(&mut self.settings_reset_confirm) {
+            return Task::none();
+        }
+        self.settings_reset_focus_confirm = false;
+        if let Some(restore) = self.settings_reset_keyboard_nav.take() {
+            self.core.set_keyboard_nav(restore);
+        }
+        let target = if self.settings_card_focused() {
+            widget::Id::new("settings.reset")
+        } else {
+            self.workspace.focused().map_or_else(
+                || widget::Id::new(TOOLBAR_FOCUS_ID),
+                |card| self.card_keyboard_focus(card),
+            )
+        };
+        iced::widget::operation::focus(target).map(cosmic::Action::App)
+    }
+
     fn reset_settings(&mut self) -> Task<Message> {
         let previous = std::mem::take(&mut self.settings);
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
@@ -12897,6 +12936,8 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            settings_reset_focus_confirm: false,
+            settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
@@ -15765,6 +15806,21 @@ impl Application for Cagents {
                             .map(cosmic::Action::App)
                     });
                 }
+                if self.settings_reset_on_top() {
+                    if is_escape_press(&event) {
+                        return self.close_settings_reset();
+                    }
+                    if is_tab_press(&event).is_some() {
+                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
+                        let target = if self.settings_reset_focus_confirm {
+                            "dialog.reset-settings.confirm"
+                        } else {
+                            "dialog.reset-settings.cancel"
+                        };
+                        return iced::widget::operation::focus(widget::Id::new(target))
+                            .map(cosmic::Action::App);
+                    }
+                }
                 if is_escape_press(&event) && !captured {
                     if self.transient_work_close.is_some() {
                         return cosmic::task::message(Message::CancelTransientWorkClose);
@@ -16101,16 +16157,23 @@ impl Application for Cagents {
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
             Message::ResetSettings => {
+                if self.settings_reset_confirm {
+                    return Task::none();
+                }
                 self.settings_reset_confirm = true;
-                Task::none()
+                self.settings_reset_focus_confirm = false;
+                self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
+                self.core.set_keyboard_nav(false);
+                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
+                    .map(cosmic::Action::App)
             }
-            Message::CancelResetSettings => {
-                self.settings_reset_confirm = false;
-                Task::none()
-            }
+            Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {
-                self.settings_reset_confirm = false;
-                self.reset_settings()
+                if !self.settings_reset_confirm {
+                    return Task::none();
+                }
+                let close = self.close_settings_reset();
+                close.chain(self.reset_settings())
             }
             Message::Lsp(event) => {
                 let navigation = if let LspEvent::Locations {
@@ -20980,6 +21043,70 @@ mod tests {
     }
 
     #[test]
+    fn reset_settings_dialog_focus_cycles_and_escape_restores_origin() {
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(card, CardRuntime::Settings);
+        app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+        app.settings_category = SettingsCategory::General;
+        app.core.set_keyboard_nav(true);
+        let task = app.update(Message::ResetSettings);
+        assert_eq!(
+            focused_element(cosmic::Application::dialog(&app).unwrap(), task),
+            Some(widget::Id::new("dialog.reset-settings.cancel"))
+        );
+        assert!(!app.core.keyboard_nav());
+        let press = |key, backwards| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(if key == keyboard::key::Named::Tab {
+                keyboard::key::Code::Tab
+            } else {
+                keyboard::key::Code::Escape
+            }),
+            location: keyboard::Location::Standard,
+            modifiers: if backwards {
+                keyboard::Modifiers::SHIFT
+            } else {
+                keyboard::Modifiers::empty()
+            },
+            text: None,
+            repeat: false,
+        };
+        // Both directions wrap within the two actions, even if a child has
+        // captured the key before the application receives it.
+        for (backwards, target) in [
+            (false, "dialog.reset-settings.confirm"),
+            (false, "dialog.reset-settings.cancel"),
+            (true, "dialog.reset-settings.confirm"),
+            (true, "dialog.reset-settings.cancel"),
+        ] {
+            let task = app.update(Message::KeyEvent {
+                event: press(keyboard::key::Named::Tab, backwards),
+                captured: true,
+            });
+            assert_eq!(
+                focused_element(cosmic::Application::dialog(&app).unwrap(), task),
+                Some(widget::Id::new(target))
+            );
+        }
+        let task = app.update(Message::KeyEvent {
+            event: press(keyboard::key::Named::Escape, false),
+            captured: true,
+        });
+        assert!(!app.settings_reset_confirm);
+        assert!(app.core.keyboard_nav());
+        assert_eq!(focused(&app, task), Some(widget::Id::new("settings.reset")));
+        // Backdrop and Cancel dispatch the same message and restore the same
+        // origin; closing an already closed dialog cannot disturb focus.
+        let _ = app.update(Message::ResetSettings);
+        let task = app.update(Message::CancelResetSettings);
+        assert_eq!(focused(&app, task), Some(widget::Id::new("settings.reset")));
+        assert!(app.settings_reset_keyboard_nav.is_none());
+    }
+
+    #[test]
     fn dirty_dialog_focus_is_stable_trapped_and_save_aware() {
         let mut focus = DirtyCloseControl::Cancel;
         focus = next_dirty_close_control(focus, false, false, true);
@@ -25073,6 +25200,8 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            settings_reset_focus_confirm: false,
+            settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
