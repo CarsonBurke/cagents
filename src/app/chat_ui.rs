@@ -216,6 +216,7 @@ pub enum Action {
     OpenUrl(String),
     OpenDocument(Target, String),
     OpenChangedFile(Target, PathBuf),
+    ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(Target, String),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
@@ -235,6 +236,8 @@ pub enum Action {
     ChangesPicker(Target, bool),
     ChangeFiles(Target, Option<chat::FileChangeKey>),
     ChangeSelect(Target, chat::FileChangeKey),
+    ChangeBack(Target),
+    ChangeListScrolled(Target, f32),
     ChangePatches(Target, Option<chat::FilePatchCursor>),
     ChangePatch(Target, usize),
     ChangesLoaded(Target, u64, Result<chat::FileChangeReply, String>),
@@ -309,6 +312,8 @@ impl Action {
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
+                | Self::ChangesLoaded(..)
+                | Self::ChangedFileResolved(..)
                 | Self::Attached(..)
                 | Self::PastedImage(..)
                 | Self::PastedText(..)
@@ -7261,6 +7266,24 @@ impl Cagents {
                 }
                 return self.chat_change_patches(target, None);
             }
+            Action::ChangeBack(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.changes.back();
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-changes-files"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(runtime.changes.list_scroll),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::ChangeListScrolled(target, offset) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.changes.list_scroll = offset;
+                }
+            }
             Action::ChangePatches(target, cursor) => {
                 return self.chat_change_patches(target, cursor);
             }
@@ -7271,8 +7294,25 @@ impl Cagents {
                 }
             }
             Action::ChangesLoaded(target, id, result) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.changes.complete(id, result);
+                let files = matches!(&result, Ok(chat::FileChangeReply::Files(_)));
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.changes.complete(id, result)
+                {
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(
+                            target.card,
+                            if files {
+                                "chat-changes-files"
+                            } else {
+                                "chat-changes-detail"
+                            },
+                        ),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
                 }
             }
             Action::BranchPicker(target, open) => {
@@ -7524,9 +7564,10 @@ impl Cagents {
                 }
             },
             Action::OpenChangedFile(target, path) => {
-                if self.chat_runtime_mut(target).is_some() {
-                    return self.open_file_path(target.card, path);
-                }
+                return self.chat_open_changed_file(target, path);
+            }
+            Action::ChangedFileResolved(target, id, reported, result) => {
+                return self.chat_changed_file_resolved(target, id, reported, result);
             }
             Action::OpenDocument(target, raw) => {
                 if self.chat_runtime_mut(target).is_some() {
@@ -16059,7 +16100,8 @@ mod tests {
             if let Some(mut stream) = iced::runtime::task::into_stream(task) {
                 while let Some(action) = stream.next().await {
                     if let iced::runtime::Action::Output(cosmic::Action::App(
-                        message @ Message::Repository(_),
+                        message @ (Message::Repository(_)
+                        | Message::ChatUi(Action::ChangedFileResolved(..))),
                     )) = action
                     {
                         pending.push(app.update(message));
@@ -16081,7 +16123,11 @@ mod tests {
                 .descriptor
                 .worktree
                 .join(runtime.selected_path().unwrap()),
-            reported
+            reported.canonicalize().unwrap()
+        );
+        assert!(
+            runtime.inspector_context().file_error.is_none(),
+            "the canonical file pane must finish listing without a symlink-root error"
         );
         let before = app.workspace.cards().len();
         drop(app.handle_chat_ui(Action::OpenChangedFile(
@@ -16090,5 +16136,41 @@ mod tests {
         )));
         assert_eq!(app.workspace.cards().len(), before);
         assert_eq!(app.workspace.focused(), Some(editor));
+    }
+    #[tokio::test]
+    async fn retired_chat_cannot_open_a_file_when_its_filesystem_resolution_returns() {
+        use cosmic::iced::futures::StreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file.txt");
+        std::fs::write(&file, "file").unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("retired-file-open"));
+        let target = chat_runtime(&app, card).target;
+        let before = app.workspace.cards().len();
+        let task = app.handle_chat_ui(Action::OpenChangedFile(target, file));
+        app.chat_runtime_mut(target).unwrap().target.generation += 1;
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    drop(app.update(message));
+                }
+            }
+        }
+        assert_eq!(app.workspace.cards().len(), before);
+        assert_eq!(app.workspace.focused(), Some(card));
+    }
+
+    #[test]
+    fn file_review_replies_finish_while_modal_input_is_blocked() {
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        assert!(Action::ChangesLoaded(target, 1, Err("reply".into())).allowed_while_modal());
+        assert!(
+            Action::ChangedFileResolved(target, 1, "/reported".into(), Err("reply".into()))
+                .allowed_while_modal()
+        );
+        assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
     }
 }

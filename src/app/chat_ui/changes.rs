@@ -9,6 +9,8 @@ static NEXT_REVIEW_REQUEST: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 pub(super) struct State {
     pub(super) open: bool,
+    pub(super) list_scroll: f32,
+    file_open_request: Option<u64>,
     selected: Option<FileChangeKey>,
     pub(super) resolved_path: Option<String>,
     pub(super) list: Option<chat::FileChangesSummary>,
@@ -25,6 +27,8 @@ pub(super) struct State {
 impl State {
     pub(super) fn close(&mut self) {
         self.open = false;
+        self.list_scroll = 0.0;
+        self.file_open_request = None;
         self.selected = None;
         self.resolved_path = None;
         self.list = None;
@@ -34,6 +38,19 @@ impl State {
         self.patch_request = None;
         self.list_request = None;
         self.waiting.clear();
+        self.error = None;
+    }
+
+    pub(super) fn back(&mut self) {
+        if let Some(previous) = self.patch_request.take() {
+            self.waiting.remove(&previous);
+        }
+        self.selected = None;
+        self.resolved_path = None;
+        self.page = None;
+        self.patch = None;
+        self.loaded_patch = None;
+        self.patch_index = 0;
         self.error = None;
     }
 
@@ -70,15 +87,21 @@ impl State {
         id
     }
 
-    pub(super) fn complete(&mut self, id: u64, result: Result<chat::FileChangeReply, String>) {
+    pub(super) fn complete(
+        &mut self,
+        id: u64,
+        result: Result<chat::FileChangeReply, String>,
+    ) -> bool {
         if !self.waiting.remove(&id) {
-            return;
+            return false;
         }
         match result {
             Ok(chat::FileChangeReply::Files(summary))
                 if self.list_request == Some(id) && summary.request_id == id =>
             {
                 self.list = Some(summary);
+                self.list_scroll = 0.0;
+                true
             }
             Ok(chat::FileChangeReply::Patches(page))
                 if self.patch_request == Some(id)
@@ -87,12 +110,17 @@ impl State {
             {
                 self.page = Some(Arc::new(page));
                 self.sync();
+                true
             }
             Ok(_) => {
                 self.error =
-                    Some("The requested edits were not returned. Refresh to try again.".into())
+                    Some("The requested edits were not returned. Refresh to try again.".into());
+                false
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
         }
     }
 
@@ -195,43 +223,70 @@ impl Runtime {
             .as_ref()
             .unwrap_or(self.snapshot.file_changes.as_ref());
         let readable = self.handle().is_some() && !self.disconnected;
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::row::with_children(vec![
-                design::heading("Files changed").width(Length::Fill).into(),
-                crate::ui_controls::button::quiet("Close")
-                    .id(card_control_id(target.card, "chat-changes-close"))
-                    .on_press(action(Action::ChangesPicker(target, false))).into(),
-            ]).align_y(Alignment::Center).spacing(space::S).into(),
-            design::caption("Changes reported in available conversation history. Line totals count reported edits, including repeated edits.").into(),
-        ];
-        if summary.coverage.has_unloaded_history {
-            rows.push(
-                design::caption(
-                    "Earlier chat history is not fully available; this list may be incomplete.",
-                )
-                .into(),
+        let narrow = width < 560.0;
+        let mut heading: Vec<Element<'_, Message>> = Vec::new();
+        if narrow && self.changes.selected.is_some() {
+            heading.push(
+                crate::ui_controls::button::quiet("Back to files")
+                    .on_press(action(Action::ChangeBack(target)))
+                    .into(),
             );
         }
-        if summary.coverage.has_imported_history {
-            rows.push(
-                design::caption(
-                    "Includes earlier conversation history, which may predate this chat or a fork.",
-                )
+        heading.push(design::heading("Files changed").width(Length::Fill).into());
+        heading.push(
+            crate::ui_controls::button::quiet("Close")
+                .id(card_control_id(target.card, "chat-changes-close"))
+                .on_press(action(Action::ChangesPicker(target, false)))
                 .into(),
+        );
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::row::with_children(heading)
+                .align_y(Alignment::Center)
+                .spacing(space::XS)
+                .into(),
+            crate::interaction::tooltip(
+                design::caption("Reported edits · line totals include repeated edits")
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    )),
+                "Changes reported in available conversation history. Line totals count reported edits, including repeated edits; they are not a net worktree diff.",
+            ),
+        ];
+        let mut coverage = Vec::new();
+        let mut explanation = Vec::new();
+        if summary.coverage.has_unloaded_history {
+            coverage.push("Partial history");
+            explanation
+                .push("Earlier chat history is not fully available; this list may be incomplete.");
+        }
+        if summary.coverage.has_imported_history {
+            coverage.push("Includes earlier edits");
+            explanation.push(
+                "Includes earlier conversation history, which may predate this chat or a fork.",
             );
         }
         if summary.coverage.has_incomplete_delegated_history {
-            rows.push(design::caption("Some earlier subagent edits may be unavailable.").into());
+            coverage.push("Partial subagent history");
+            explanation.push("Some earlier subagent edits may be unavailable.");
         }
         if summary.coverage.has_uncached_changes {
-            rows.push(
-                design::caption("Some reported edits could not be included in this list.").into(),
-            );
+            coverage.push("Some edits unavailable");
+            explanation.push("Some reported edits could not be included in this list.");
         }
         if summary.revision != self.snapshot.file_changes.revision {
-            rows.push(
-                design::caption("New edits were reported. Refresh files to include them.").into(),
-            );
+            coverage.push("New edits available");
+            explanation.push("New edits were reported. Refresh files to include them.");
+        }
+        if !coverage.is_empty() {
+            rows.push(crate::interaction::tooltip(
+                design::caption(coverage.join(" · "))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    )),
+                explanation.join(" "),
+            ));
         }
         let mut files: Vec<Element<'_, Message>> = Vec::new();
         if self
@@ -276,35 +331,49 @@ impl Runtime {
                 let mut file_rows: Vec<Element<'_, Message>> = vec![
                     design::body(&file.key.path)
                         .font(iced::Font::MONOSPACE)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
                         .into(),
-                    design::caption(detail).into(),
+                    design::caption(detail.clone())
+                        .width(Length::Fill)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(2),
+                        ))
+                        .into(),
                 ];
                 if let chat::ChangeKind::Renamed { from } = &file.kind {
-                    file_rows.push(design::caption(format!("from {from}")).into());
+                    file_rows.push(
+                        design::caption(format!("from {from}"))
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .ellipsize(iced::widget::text::Ellipsize::End(
+                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                            ))
+                            .into(),
+                    );
                 }
-                file_rows.push(
-                    crate::ui_controls::button::quiet(if selected {
-                        "Refresh edits"
-                    } else {
-                        "View edits"
-                    })
-                    .name(format!("View reported edits for {}", file.key.path))
-                    .on_press_maybe(
-                        readable.then(|| action(Action::ChangeSelect(target, file.key.clone()))),
-                    )
-                    .into(),
-                );
-                files.push(
-                    widget::container(widget::column::with_children(file_rows).spacing(space::XS))
-                        .padding(space::S)
+                files.push(crate::interaction::tooltip(
+                    widget::button::custom(widget::column::with_children(file_rows).spacing(2))
+                        .name(format!(
+                            "View reported edits for {}. {detail}{}",
+                            file.key.path,
+                            match &file.kind {
+                                chat::ChangeKind::Renamed { from } => format!(". from {from}"),
+                                _ => String::new(),
+                            }
+                        ))
+                        .selected(selected)
+                        .class(crate::ui_controls::control_style(selected, None))
+                        .padding([4, 8])
                         .width(Length::Fill)
-                        .class(if selected {
-                            cosmic::theme::Container::Card
-                        } else {
-                            cosmic::theme::Container::Transparent
-                        })
-                        .into(),
-                );
+                        .on_press_maybe(
+                            readable
+                                .then(|| action(Action::ChangeSelect(target, file.key.clone()))),
+                        ),
+                    format!("{}\n{detail}", file.key.path),
+                ));
             }
             if summary.files.is_empty() {
                 files.push(design::caption("No file edits have been reported.").into());
@@ -327,30 +396,52 @@ impl Runtime {
             );
         }
         let list: Element<'_, Message> =
-            widget::scrollable(widget::column::with_children(files).spacing(space::XS))
-                .height(Length::Fixed(if width >= 720.0 { 270.0 } else { 160.0 }))
+            widget::scrollable(widget::column::with_children(files).spacing(2))
+                .id(card_control_id(target.card, "chat-changes-files"))
+                .on_scroll(move |viewport| {
+                    action(Action::ChangeListScrolled(
+                        target,
+                        viewport.absolute_offset().y,
+                    ))
+                })
+                .height(Length::Fill)
                 .into();
-        let detail = self.change_detail(readable);
-        rows.push(if width >= 720.0 {
+        let body: Element<'_, Message> = if narrow {
+            if self.changes.selected.is_some() {
+                self.change_detail(readable)
+            } else {
+                list
+            }
+        } else {
             widget::row::with_children(vec![
-                widget::container(list).width(Length::FillPortion(2)).into(),
-                widget::container(detail)
+                widget::container(list)
+                    .width(Length::FillPortion(2))
+                    .height(Length::Fill)
+                    .into(),
+                widget::container(self.change_detail(readable))
                     .width(Length::FillPortion(3))
+                    .height(Length::Fill)
                     .into(),
             ])
             .spacing(space::S)
+            .height(Length::Fill)
             .into()
-        } else {
-            widget::column::with_children(vec![list, detail])
-                .spacing(space::S)
-                .into()
-        });
+        };
+        rows.push(body);
         if let Some(error) = &self.changes.error {
-            rows.push(design::caption(error.as_str()).into());
+            rows.push(crate::interaction::tooltip(
+                design::caption(error.as_str())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    )),
+                error.clone(),
+            ));
         }
         crate::interaction::focused_escape(
             widget::container(
-                widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
+                widget::column::with_children(rows)
+                    .spacing(space::XS)
                     .height(Length::Fixed(260.0)),
             )
             .padding(space::S)
@@ -425,7 +516,7 @@ impl Runtime {
                             } else {
                                 rows.push(block.view_from_start(
                                     self.syntax_theme,
-                                    160.0,
+                                    120.0,
                                     target,
                                     None,
                                 ));
@@ -472,12 +563,79 @@ impl Runtime {
             .into(),
         );
         widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
-            .height(Length::Fixed(270.0))
+            .id(card_control_id(target.card, "chat-changes-detail"))
+            .height(Length::Fill)
             .into()
     }
 }
 
 impl Cagents {
+    pub(super) fn chat_open_changed_file(
+        &mut self,
+        target: Target,
+        path: PathBuf,
+    ) -> Task<Message> {
+        if self.chat_runtime_mut(target).is_none() || self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+            self.status = Some(TransientNotice::error("The reported file path is invalid."));
+            return Task::none();
+        }
+        if self.refuse_in_deleting_worktree(&path) {
+            return Task::none();
+        }
+        if crate::device::is_remote() {
+            // The owning daemon canonicalizes the directory before selecting
+            // and reading this file; never resolve a device path on the UI host.
+            return self.open_file_path(target.card, path);
+        }
+        let id = NEXT_REVIEW_REQUEST.fetch_add(1, Ordering::Relaxed);
+        self.chat_runtime_mut(target)
+            .unwrap()
+            .changes
+            .file_open_request = Some(id);
+        cosmic::task::future(async move {
+            let reported = path.clone();
+            let result = tokio::task::spawn_blocking(move || std::fs::canonicalize(path))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::ChatUi(Action::ChangedFileResolved(target, id, reported, result))
+        })
+    }
+
+    pub(super) fn chat_changed_file_resolved(
+        &mut self,
+        target: Target,
+        id: u64,
+        reported: PathBuf,
+        result: Result<PathBuf, String>,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime.changes.file_open_request != Some(id) {
+            return Task::none();
+        }
+        runtime.changes.file_open_request = None;
+        if crate::device::is_remote()
+            || self.workspace_inputs_blocked()
+            || self.refuse_in_deleting_worktree(&reported)
+        {
+            return Task::none();
+        }
+        match result {
+            Ok(path) => self.open_file_path(target.card, path),
+            Err(error) => {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not open the reported file: {error}"
+                )));
+                Task::none()
+            }
+        }
+    }
+
     pub(super) fn chat_change_files(
         &mut self,
         target: Target,
@@ -710,5 +868,39 @@ mod tests {
             replacement.patch.as_ref().unwrap().text.as_ref(),
             "+current\n"
         );
+    }
+    #[test]
+    fn only_current_accepted_pages_reset_scroll_and_back_retains_the_file_list() {
+        let mut state = State::default();
+        let old = state.request(false);
+        let current = state.request(false);
+        state.list_scroll = 800.0;
+        let old_reply = chat::FileChangesSummary {
+            request_id: old,
+            ..Default::default()
+        };
+        assert!(!state.complete(old, Ok(chat::FileChangeReply::Files(old_reply))));
+        assert_eq!(
+            state.list_scroll, 800.0,
+            "a late page cannot scroll the current list"
+        );
+        let current_reply = chat::FileChangesSummary {
+            request_id: current,
+            ..Default::default()
+        };
+        assert!(state.complete(current, Ok(chat::FileChangeReply::Files(current_reply))));
+        assert_eq!(
+            state.list_scroll, 0.0,
+            "the accepted next page starts at its first file"
+        );
+        state.list_scroll = 80.0;
+        state.select(key("file.rs"));
+        let id = state.request(true);
+        assert!(state.complete(id, Ok(page(id, key("file.rs"), "+new\n", 0))));
+        state.back();
+        assert!(state.selected.is_none());
+        assert!(state.patch.is_none());
+        assert!(state.list.is_some());
+        assert_eq!(state.list_scroll, 80.0);
     }
 }

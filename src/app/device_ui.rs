@@ -624,6 +624,15 @@ impl Cagents {
                         self.device_ui.output.clear();
                         self.device_ui.worktree_output.clear();
                         if let Some(file) = self.device_ui.linked_file.clone() {
+                            // A linked file may resolve into a different worktree.
+                            // Recheck removal against the owning device's path.
+                            if self
+                                .refuse_in_deleting_worktree(&self.device_ui.directory.join(&file))
+                            {
+                                self.device_ui.linked_file = None;
+                                self.device_ui.linked_fragment = None;
+                                return Task::none();
+                            }
                             return self.update_device(Action::Read(file));
                         }
                         if self.device_ui.panel != Panel::Files {

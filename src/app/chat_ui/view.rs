@@ -7128,9 +7128,9 @@ mod tests {
         });
         runtime.snapshot = Arc::new(snapshot);
         runtime.changes.open = true;
-        runtime.changes.select(key);
         let renderer = crate::app::tests::headless_renderer();
-        for width in [360.0, 960.0] {
+        for width in [360.0, 670.0, 960.0] {
+            runtime.changes.back();
             let mut element = runtime.changes_view(width);
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -7170,6 +7170,60 @@ mod tests {
                 !labels.iter().any(|label| label == "Open file"),
                 "unresolved child-relative paths must not route to the parent"
             );
+            drop(element);
+            runtime.changes.select(key.clone());
+            let mut selected = runtime.changes_view(width);
+            let mut selected_tree = Tree::new(selected.as_widget());
+            let selected_node = selected.as_widget_mut().layout(
+                &mut selected_tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+            );
+            let selected_accessible = selected.as_widget().a11y_nodes(
+                Layout::new(&selected_node),
+                &selected_tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let nodes: Vec<_> = selected_accessible
+                .root()
+                .iter()
+                .chain(selected_accessible.children())
+                .collect();
+            if width < 560.0 {
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node.node().label() == Some("Back to files")),
+                    "narrow detail view needs a visible return to the file list"
+                );
+                assert!(
+                    !nodes.iter().any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("View reported edits for"))),
+                    "narrow panes switch to the detail instead of stacking both scrollers"
+                );
+            } else {
+                let file = nodes
+                    .iter()
+                    .find(|node| {
+                        node.node()
+                            .label()
+                            .is_some_and(|label| label.starts_with("View reported edits for"))
+                    })
+                    .and_then(|node| node.node().bounds())
+                    .expect("file list stays mounted beside the detail");
+                let detail = nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some("The file location was not reported."))
+                    .and_then(|node| node.node().bounds())
+                    .expect("selected file detail is mounted");
+                assert!(
+                    file.x1 <= detail.x0,
+                    "{width}: default-width files and edits must sit side by side"
+                );
+            }
+            drop(selected);
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             let mut full = runtime.view(
                 false,
