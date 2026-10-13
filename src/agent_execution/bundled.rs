@@ -116,7 +116,15 @@ fn in_account_home(root: &Path) -> bool {
 }
 
 fn install_at(root: &Path, create_root: bool) -> io::Result<()> {
-    let result = install_bundle(root, create_root, CONTENT.as_bytes(), BUNDLED);
+    let result = match install_bundle(root, create_root, CONTENT.as_bytes(), BUNDLED) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // A personal replacement is expected, not an installation failure.
+            tracing::debug!(path = %root.join("skills").join(NAME).join("SKILL.md").display(), %error,
+                "preserving personal agent skill");
+            Ok(())
+        }
+        result => result,
+    };
     // A personal cagents skill takes precedence over our fallback bundle, but
     // must not prevent retirement of the old bundle beside it.
     if root.is_dir() {
@@ -426,10 +434,7 @@ mod tests {
         install_at(directory.path(), false).unwrap();
         let path = directory.path().join("skills/cagents/SKILL.md");
         std::fs::write(&path, "user-authored skill").unwrap();
-        assert_eq!(
-            install_at(directory.path(), false).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
+        install_at(directory.path(), false).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "user-authored skill"
@@ -576,7 +581,7 @@ mod tests {
         let current = installed(directory.path());
         fs::create_dir_all(current.parent().unwrap()).unwrap();
         fs::write(&current, b"personal skill").unwrap();
-        assert_eq!(install_at(directory.path(), false).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        install_at(directory.path(), false).unwrap();
         assert!(!path.parent().unwrap().exists());
         assert_eq!(fs::read(&current).unwrap(), b"personal skill");
     }
