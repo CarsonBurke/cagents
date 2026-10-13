@@ -22,6 +22,7 @@ pub enum Action {
     ConfirmPaste(CardId, bool),
     SelectAll(CardId),
     Clear(CardId),
+    Refresh(CardId, u64),
 }
 
 #[cfg(test)]
@@ -56,6 +57,244 @@ mod tests {
         assert!(!find.truncated);
     }
 
+    fn output_snapshot(sequence: u64) -> crate::terminal::RenderSnapshot {
+        crate::terminal::RenderSnapshot {
+            activity: Some(crate::model::TerminalOutputActivity {
+                sequence,
+                last_output_at_unix_ms: 0,
+            }),
+            columns: 80,
+            rows: 24,
+            ..crate::terminal::RenderSnapshot::empty()
+        }
+    }
+
+    #[test]
+    fn live_find_coalesces_output_and_refreshes_the_latest_content() {
+        let first = SearchContent::of(&output_snapshot(1));
+        let mut find = Find {
+            open: true,
+            query: "needle".into(),
+            searched_content: Some(first),
+            ..Find::default()
+        };
+        assert_eq!(find.schedule_refresh(first), None);
+        let second = SearchContent::of(&output_snapshot(2));
+        let pending = find.schedule_refresh(second).unwrap();
+        let latest = SearchContent::of(&output_snapshot(3));
+        assert_eq!(find.schedule_refresh(latest), None);
+        assert!(find.begin_refresh(pending, latest));
+        assert_eq!(find.searched_content, Some(latest));
+        assert!(find.background_results);
+        assert_eq!(find.schedule_refresh(latest), None);
+        assert!(!find.begin_refresh(pending, latest));
+        assert!(find
+            .schedule_refresh(SearchContent::of(&output_snapshot(4)))
+            .is_some());
+    }
+
+    #[test]
+    fn live_find_observes_reflow_but_ignores_viewport_and_frame_changes() {
+        let mut snapshot = output_snapshot(7);
+        let original = SearchContent::of(&snapshot);
+        let mut find = Find {
+            open: true,
+            query: "needle".into(),
+            searched_content: Some(original),
+            ..Find::default()
+        };
+        snapshot.generation += 1;
+        snapshot.scroll.offset = 20;
+        assert_eq!(find.schedule_refresh(SearchContent::of(&snapshot)), None);
+        snapshot.columns = 40;
+        let pending = find.schedule_refresh(SearchContent::of(&snapshot)).unwrap();
+        assert!(find.begin_refresh(pending, SearchContent::of(&snapshot)));
+        snapshot.rows = 12;
+        let pending = find.schedule_refresh(SearchContent::of(&snapshot)).unwrap();
+        assert!(find.begin_refresh(pending, SearchContent::of(&snapshot)));
+        snapshot.scroll.total += 1;
+        assert!(find.schedule_refresh(SearchContent::of(&snapshot)).is_some());
+    }
+
+    #[test]
+    fn live_find_rejects_stale_timers_and_does_not_search_empty_or_closed_queries() {
+        let changed = SearchContent::of(&output_snapshot(2));
+        let mut find = Find {
+            open: true,
+            query: "needle".into(),
+            ..Find::default()
+        };
+        let stale = find.schedule_refresh(changed).unwrap();
+        find.invalidate_refresh();
+        assert!(!find.begin_refresh(stale, changed));
+        find.query.clear();
+        assert_eq!(find.schedule_refresh(changed), None);
+        find.query = "needle".into();
+        let stale = find.schedule_refresh(changed).unwrap();
+        find.open = false;
+        assert!(!find.begin_refresh(stale, changed));
+        assert_eq!(find.schedule_refresh(changed), None);
+    }
+
+    #[test]
+    fn background_find_results_preserve_the_selected_match_and_do_not_steal_focus() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let matched = |row| crate::terminal::SearchMatch {
+            start_row: row,
+            start_column: 0,
+            end_row: row,
+            end_column: 6,
+        };
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                query: "needle".into(),
+                request: 7,
+                matches: vec![matched(10), matched(20)].into(),
+                selected: 1,
+                background_results: true,
+                ..Find::default()
+            },
+        );
+        app.terminal_search_results(
+            card,
+            7,
+            "needle".into(),
+            vec![matched(5), matched(10), matched(20), matched(30)],
+            false,
+        );
+        let find = &app.terminal_find[&card];
+        assert_eq!(find.selected, 2);
+        assert_eq!(find.matches[find.selected], matched(20));
+        assert!(!find.focused);
+        assert!(!find.background_results);
+
+        let find = app.terminal_find.get_mut(&card).unwrap();
+        find.request = 8;
+        find.background_results = true;
+        app.terminal_search_results(card, 8, "needle".into(), vec![matched(30)], false);
+        assert_eq!(app.terminal_find[&card].selected, 0);
+        assert_eq!(app.terminal_find[&card].matches.len(), 1);
+    }
+
+    #[test]
+    fn live_find_refresh_consumes_its_timer_while_the_terminal_is_reconnecting() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let content = SearchContent::of(&output_snapshot(2));
+        let mut find = Find {
+            open: true,
+            query: "needle".into(),
+            searched_content: Some(SearchContent::of(&output_snapshot(1))),
+            ..Find::default()
+        };
+        let pending = find.schedule_refresh(content).unwrap();
+        app.terminal_find.insert(card, find);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.handle_terminal_find(Action::Refresh(card, pending)));
+        let find = app.terminal_find.get_mut(&card).unwrap();
+        assert_eq!(find.refresh_pending, None);
+        assert_eq!(find.searched_content, None);
+        let replacement = find.schedule_refresh(content).unwrap();
+        assert_ne!(replacement, pending);
+        assert!(find.begin_refresh(replacement, content));
+    }
+
+    #[test]
+    fn live_find_refresh_is_a_completion_during_modals_and_update_preparation() {
+        let card = CardId::new();
+        let refresh = Message::TerminalFind(Action::Refresh(card, 7));
+        assert!(!user_workspace_message_blocked_while_modal(&refresh));
+        assert!(!user_message_blocked_during_update(&refresh));
+        let query = Message::TerminalFind(Action::Query(card, "needle".into()));
+        assert!(user_workspace_message_blocked_while_modal(&query));
+        assert!(user_message_blocked_during_update(&query));
+    }
+
+    fn escape_event() -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn captured_escape_preserves_underlying_terminal_find() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                directory.path(),
+                TerminalId::new(),
+            )),
+        );
+        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        drop(app.update(Message::KeyEvent { event: escape_event(), captured: true }));
+        assert!(app.terminal_find[&card].open);
+        // With no focused field answering the key, Escape on the terminal
+        // surface still closes its open find bar.
+        drop(app.update(Message::KeyEvent { event: escape_event(), captured: false }));
+        assert!(!app.terminal_find[&card].open);
+    }
+
+    #[test]
+    fn focused_terminal_find_closes_on_its_first_escape_before_native_blur() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}},
+            mouse,
+        };
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        let renderer = super::super::tests::headless_renderer();
+        let mut element = app.terminal_find_view(card).unwrap();
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(iced::Size::new(600.0, 48.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(input_id(card)),
+        );
+        let mut published = Vec::new();
+        let mut shell = Shell::new(&mut published);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(escape_event()),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(shell.is_event_captured());
+        assert!(published.iter().any(|message| matches!(
+            message,
+            Message::TerminalFind(Action::Close(target)) if *target == card
+        )));
+        assert!(!published.iter().any(|message| matches!(
+            message,
+            Message::TerminalFind(Action::Focus(_, false))
+        )));
+    }
+
     #[test]
     fn paste_confirmation_dismisses_after_its_runtime_has_retired() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -80,6 +319,68 @@ pub(super) struct Find {
     pub select_all_request: u64,
     pub selection_reset: u64,
     pub pending_copy: Option<uuid::Uuid>,
+    searched_content: Option<SearchContent>,
+    refresh_generation: u64,
+    refresh_pending: Option<u64>,
+    background_results: bool,
+}
+
+/// Content changes independently of viewport movement and published frame
+/// generations. A search scrolling to a match must not schedule another scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SearchContent {
+    output: Option<u64>,
+    columns: u16,
+    rows: u16,
+    total: u64,
+    alternate_screen: bool,
+}
+
+impl SearchContent {
+    fn of(snapshot: &crate::terminal::RenderSnapshot) -> Self {
+        Self {
+            output: snapshot.activity.map(|activity| activity.sequence),
+            columns: snapshot.columns,
+            rows: snapshot.rows,
+            total: snapshot.scroll.total,
+            alternate_screen: snapshot.scroll.alternate_screen,
+        }
+    }
+}
+
+impl Find {
+    fn invalidate_refresh(&mut self) {
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_pending = None;
+        self.background_results = false;
+    }
+
+    fn schedule_refresh(&mut self, content: SearchContent) -> Option<u64> {
+        if !self.open
+            || self.query.is_empty()
+            || self.searched_content == Some(content)
+            || self.refresh_pending.is_some()
+        {
+            return None;
+        }
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_pending = Some(self.refresh_generation);
+        self.refresh_pending
+    }
+
+    fn begin_refresh(&mut self, generation: u64, content: SearchContent) -> bool {
+        if self.refresh_pending != Some(generation) {
+            return false;
+        }
+        self.refresh_pending = None;
+        if !self.open || self.query.is_empty() || self.searched_content == Some(content) {
+            return false;
+        }
+        self.searched_content = Some(content);
+        self.request = self.request.wrapping_add(1);
+        self.background_results = true;
+        true
+    }
 }
 
 pub(super) struct Context {
@@ -124,15 +425,34 @@ impl Cagents {
             | Action::Paste(card, _)
             | Action::ConfirmPaste(card, _)
             | Action::SelectAll(card)
-            | Action::Clear(card) => *card,
+            | Action::Clear(card)
+            | Action::Refresh(card, _) => *card,
         };
         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+            // Recovery may have parked the card while this timer was asleep.
+            // Consume it even then so the replacement handle can refresh find.
+            if let Action::Refresh(_, generation) = action
+                && let Some(find) = self.terminal_find.get_mut(&card)
+                && find.refresh_pending == Some(generation)
+            {
+                find.refresh_pending = None;
+                find.searched_content = None;
+            }
             return Task::none();
         };
         let opening = matches!(&action, Action::Open(_));
         let restore_query_focus = opening || matches!(&action, Action::Case(_));
         let find = self.terminal_find.entry(card).or_default();
         match action {
+            Action::Refresh(_, generation) => {
+                if find.begin_refresh(generation, SearchContent::of(&handle.snapshot()))
+                    && let Err(error) =
+                        handle.search(find.request, find.query.clone(), find.case_sensitive)
+                {
+                    self.status = Some(TransientNotice::error(error.to_string()));
+                }
+                return Task::none();
+            }
             Action::Context(_, point, selection, link) => {
                 self.terminal_context = Some(Context {
                     card,
@@ -201,6 +521,10 @@ impl Cagents {
                 let _ = handle.clear_scrollback();
                 // History rows are rebased by clearing scrollback.
                 find.selection_reset = find.selection_reset.wrapping_add(1);
+                find.invalidate_refresh();
+                // Clearing rebases history; the acknowledgement's snapshot
+                // will schedule a refresh even when no new PTY output arrives.
+                find.searched_content = None;
                 find.request = find.request.wrapping_add(1);
                 find.matches = Arc::default();
                 find.selected = 0;
@@ -217,6 +541,7 @@ impl Cagents {
                 // than reuse matches from before output changed or completion.
             }
             Action::Close(_) => {
+                find.invalidate_refresh();
                 find.open = false;
                 find.focused = false;
                 return iced::widget::operation::focus(workspace_widget::card_focus_id(card))
@@ -241,6 +566,8 @@ impl Cagents {
             Action::Query(_, query) => find.query = query,
             Action::Case(_) => find.case_sensitive = !find.case_sensitive,
         }
+        find.invalidate_refresh();
+        find.searched_content = Some(SearchContent::of(&handle.snapshot()));
         find.request = find.request.wrapping_add(1);
         find.matches = Arc::default();
         find.selected = 0;
@@ -271,6 +598,7 @@ impl Cagents {
 
     pub(super) fn refresh_completed_terminal_find(&mut self, card: CardId) {
         let find = self.terminal_find.entry(card).or_default();
+        find.invalidate_refresh();
         find.selection_reset = find.selection_reset.wrapping_add(1);
         find.request = find.request.wrapping_add(1);
         find.matches = Arc::default();
@@ -297,25 +625,58 @@ impl Cagents {
         if !find.open || find.request != request || find.query != query {
             return;
         }
+        let previous = find.matches.get(find.selected).copied();
+        let background = std::mem::take(&mut find.background_results);
+        let selected = background
+            .then(|| previous.and_then(|previous| matches.iter().position(|item| *item == previous)))
+            .flatten()
+            .unwrap_or_else(|| {
+                if background {
+                    find.selected.min(matches.len().saturating_sub(1))
+                } else {
+                    0
+                }
+            });
         find.matches = matches.into();
-        find.selected = 0;
+        find.selected = selected;
         find.truncated = truncated;
-        if let Some(first) = find.matches.first()
+        if !background
+            && let Some(first) = find.matches.first()
             && let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
         {
             let _ = handle.scroll_to_row(first.start_row);
         }
     }
 
+    pub(super) fn refresh_live_terminal_find(&mut self, card: CardId) -> Task<Message> {
+        let Some(find) = self.terminal_find.get_mut(&card) else {
+            return Task::none();
+        };
+        let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let Some(generation) = find.schedule_refresh(SearchContent::of(&handle.snapshot())) else {
+            return Task::none();
+        };
+        // Coalesce continuous output without postponing search indefinitely.
+        cosmic::task::future(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Message::TerminalFind(Action::Refresh(card, generation))
+        })
+    }
+
     pub(super) fn terminal_find_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let find = self.terminal_find.get(&card).filter(|find| find.open)?;
         let message = |action| Message::TerminalFind(action);
-        let input = crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
-            .id(input_id(card))
-            .on_input(move |query| Message::TerminalFind(Action::Query(card, query)))
-            .on_focus(message(Action::Focus(card, true)))
-            .on_unfocus(message(Action::Focus(card, false)))
-            .width(Length::Fill);
+        let input = crate::interaction::focused_escape(
+            crate::ui_controls::field::search("Find in terminal scrollback", &find.query)
+                .id(input_id(card))
+                .on_input(move |query| Message::TerminalFind(Action::Query(card, query)))
+                .on_focus(message(Action::Focus(card, true)))
+                .on_unfocus(message(Action::Focus(card, false)))
+                .width(Length::Fill),
+            move || Message::TerminalFind(Action::Close(card)),
+        );
         let count = if find.query.is_empty() {
             String::new()
         } else if find.matches.is_empty() {

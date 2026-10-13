@@ -378,110 +378,104 @@ fn settings_category_controls<'a>(
             )]
         }
         SettingsCategory::General => {
-            let mut controls = vec![
-                setting_field(
-                    "Reset all settings",
-                    "Restore default preferences; saved conversations and tabs are preserved.",
-                    crate::ui_controls::button::destructive("Reset all settings")
-                        .id(widget::Id::new("settings.reset"))
-                        .on_press(Message::ResetSettings)
-                        .into(),
+            let reset = setting_field(
+                "Reset all settings",
+                "Restore default preferences; saved conversations and tabs are preserved.",
+                crate::ui_controls::button::destructive("Reset all settings")
+                    .id(widget::Id::new("settings.reset"))
+                    .on_press(Message::ResetSettings)
+                    .into(),
+            );
+            let directory = setting_input(
+                "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
+                &draft.managed_worktree_directory,
+                SettingsField::ManagedWorktreeDirectory,
+                invalid,
+            );
+            let worktree_pane = settings_choice(
+                "Default worktree pane",
+                "Open this pane in an empty worktree. An unused native chat is removed when you switch worktrees.",
+                SettingsField::DefaultWorktreePane,
+                settings::DefaultPane::ALL.map(|pane| {
+                    (
+                        pane.label(),
+                        pane.key(),
+                        draft.default_worktree_pane == pane,
+                    )
+                }),
+            );
+            let cleanup = setting_field(
+                "Merged worktree cleanup",
+                "Delete clean, inactive GitHub worktrees after their exact current commit is merged. Cleanup waits until hosted processes have ended, preserves branches, and never discards changes.",
+                crate::settings_widgets::toggle(
+                    "Delete merged worktrees automatically",
+                    draft.auto_delete_merged_worktrees,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::AutoDeleteMergedWorktrees,
+                        value: enabled.to_string(),
+                    },
                 ),
-                setting_input(
-                    "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
-                    &draft.managed_worktree_directory,
-                    SettingsField::ManagedWorktreeDirectory,
-                    invalid,
-                ),
-                settings_choice(
-                    "Default worktree pane",
-                    "Open this pane in an empty worktree. An unused native chat is removed when you switch worktrees.",
-                    SettingsField::DefaultWorktreePane,
-                    settings::DefaultPane::ALL.map(|pane| {
-                        (
-                            pane.label(),
-                            pane.key(),
-                            draft.default_worktree_pane == pane,
-                        )
-                    }),
-                ),
-                setting_field(
-                    "Merged worktree cleanup",
-                    "Delete clean, inactive GitHub worktrees after their exact current commit is merged. Cleanup waits until hosted processes have ended, preserves branches, and never discards changes.",
-                    crate::settings_widgets::toggle(
-                        "Delete merged worktrees automatically",
-                        draft.auto_delete_merged_worktrees,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::AutoDeleteMergedWorktrees,
-                            value: enabled.to_string(),
-                        },
+            );
+            let channel_pane = settings_choice(
+                "Default channel pane",
+                "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",
+                SettingsField::DefaultChannelPane,
+                settings::DefaultPane::ALL
+                    .map(|pane| (pane.label(), pane.key(), draft.default_channel_pane == pane)),
+            );
+            let order = settings_choice(
+                "Worktree order",
+                "Main stays first. Imported worktrees with unknown creation dates follow dated worktrees, ordered by path.",
+                SettingsField::WorktreeSort,
+                [
+                    ("Newest", "newest", draft.worktree_sort == "newest"),
+                    ("Oldest", "oldest", draft.worktree_sort == "oldest"),
+                    (
+                        "Alphabetical",
+                        "alphabetical",
+                        draft.worktree_sort == "alphabetical",
                     ),
+                ],
+            );
+            let activation = setting_field(
+                "Pane activation",
+                "Focus a pane, without scrolling, once the pointer moves into it and stays in it for a moment. Typing before then keeps focus where it is.",
+                crate::settings_widgets::toggle(
+                    "Activate panes on hover",
+                    draft.focus_follows_mouse,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::FocusFollowsMouse,
+                        value: enabled.to_string(),
+                    },
                 ),
-                settings_choice(
-                    "Default channel pane",
-                    "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",
-                    SettingsField::DefaultChannelPane,
-                    settings::DefaultPane::ALL
-                        .map(|pane| (pane.label(), pane.key(), draft.default_channel_pane == pane)),
-                ),
-                settings_choice(
-                    "Worktree order",
-                    "Main stays first. Imported worktrees with unknown creation dates follow dated worktrees, ordered by path.",
-                    SettingsField::WorktreeSort,
-                    [
-                        ("Newest", "newest", draft.worktree_sort == "newest"),
-                        ("Oldest", "oldest", draft.worktree_sort == "oldest"),
-                        (
-                            "Alphabetical",
-                            "alphabetical",
-                            draft.worktree_sort == "alphabetical",
-                        ),
-                    ],
-                ),
-                setting_field(
-                    "Pane activation",
-                    "Focus a pane, without scrolling, once the pointer moves into it and stays in it for a moment. Typing before then keeps focus where it is.",
-                    crate::settings_widgets::toggle(
-                        "Activate panes on hover",
-                        draft.focus_follows_mouse,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::FocusFollowsMouse,
-                            value: enabled.to_string(),
-                        },
-                    ),
-                ),
-                setting_input(
-                    "At least 1 pane. Extra background panes may hibernate.",
-                    &draft.max_hot_cards,
-                    SettingsField::MaxHotCards,
-                    invalid,
-                ),
-                setting_input(
-                    "Milliseconds before an inactive pane hibernates; 0 suspends immediately.",
-                    &draft.hibernation_delay_ms,
-                    SettingsField::HibernationDelayMs,
-                    invalid,
-                ),
-            ];
-            let reset = controls.remove(0);
-            let performance = controls.split_off(5);
-            let activation = controls.pop().expect("activation control");
-            let channel = controls.remove(2);
+            );
+            let hot_panes = setting_input(
+                "At least 1 pane. Extra background panes may hibernate.",
+                &draft.max_hot_cards,
+                SettingsField::MaxHotCards,
+                invalid,
+            );
+            let hibernation = setting_input(
+                "Milliseconds before an inactive pane hibernates; 0 suspends immediately.",
+                &draft.hibernation_delay_ms,
+                SettingsField::HibernationDelayMs,
+                invalid,
+            );
             vec![
                 settings_group(
                     "Worktrees",
                     "Locations, ordering and the first pane in a worktree.",
-                    controls,
+                    vec![directory, worktree_pane, cleanup, order],
                 ),
                 settings_group(
                     "Workspace",
                     "Channels and pane focus.",
-                    vec![channel, activation],
+                    vec![channel_pane, activation],
                 ),
                 settings_group(
                     "Performance",
                     "Balance active panes and background resource use.",
-                    performance,
+                    vec![hot_panes, hibernation],
                 ),
                 settings_group(
                     "Reset",

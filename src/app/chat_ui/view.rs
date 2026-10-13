@@ -1436,7 +1436,7 @@ impl Runtime {
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
                         crate::ui_controls::field::search(
-                            "Find in conversation (case sensitive)",
+                            "Find in conversation",
                             query,
                         )
                         .id(card_control_id(target.card, "chat-find"))

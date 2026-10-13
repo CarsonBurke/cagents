@@ -2336,6 +2336,17 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     }
 }
 
+/// The first native size is reported as Opened, before any resize. Both
+/// events carry logical dimensions and replace the pre-map estimate.
+fn window_geometry_message(event: &window::Event) -> Option<Message> {
+    match event {
+        window::Event::Opened { size, .. } | window::Event::Resized(size) => {
+            Some(Message::WindowResized(size.width, size.height))
+        }
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -2499,7 +2510,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
-        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..)),
+        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
@@ -4856,7 +4867,7 @@ pub struct Cagents {
     window_scale_factor: f32,
     /// Starts at an estimate, because the pane density and the strip's viewport
     /// are both derived from it and the surface does not report a width until
-    /// it has been mapped. `Message::WindowResized` replaces it.
+    /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
     core: Core,
@@ -4904,6 +4915,8 @@ pub struct Cagents {
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
     settings_reset_confirm: bool,
+    settings_reset_focus_confirm: bool,
+    settings_reset_keyboard_nav: Option<bool>,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
     pull_request_dialog_generation: u64,
@@ -8680,7 +8693,7 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             return self.start_terminal(card, session, visible, false);
         }
-        clipboard_task
+        Task::batch([clipboard_task, self.refresh_live_terminal_find(card)])
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -11253,8 +11266,14 @@ impl Cagents {
     }
 
     fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
-        let action = match row {
-            sidebar::SelectionRow::Project(project) => Some(SidebarAction::ToggleProject(project)),
+        let action = self.sidebar_navigation_action(row);
+        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
+    }
+
+    fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
+        match row {
+            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
+                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -11272,8 +11291,7 @@ impl Cagents {
                     worktree_id,
                     path: worktree.path.clone(),
                 }),
-        };
-        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
+        }
     }
 
     /// The instant an animation in flight is measured against.
@@ -12625,6 +12643,43 @@ impl Cagents {
         Task::batch(tasks)
     }
 
+    fn settings_reset_on_top(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() {
+            return false;
+        }
+        self.settings_reset_confirm
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+            && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none()
+            && !self.session_recovery.open()
+            && !self.daemon_health_ui.confirmation
+            && self.update_ui.confirmation.is_none()
+            && !self.terminal_close_dialog_visible()
+    }
+
+    fn close_settings_reset(&mut self) -> Task<Message> {
+        if !std::mem::take(&mut self.settings_reset_confirm) {
+            return Task::none();
+        }
+        self.settings_reset_focus_confirm = false;
+        if let Some(restore) = self.settings_reset_keyboard_nav.take() {
+            self.core.set_keyboard_nav(restore);
+        }
+        let target = if self.settings_card_focused() {
+            widget::Id::new("settings.reset")
+        } else {
+            self.workspace.focused().map_or_else(
+                || widget::Id::new(TOOLBAR_FOCUS_ID),
+                |card| self.card_keyboard_focus(card),
+            )
+        };
+        iced::widget::operation::focus(target).map(cosmic::Action::App)
+    }
+
     fn reset_settings(&mut self) -> Task<Message> {
         let previous = std::mem::take(&mut self.settings);
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
@@ -12897,6 +12952,8 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            settings_reset_focus_confirm: false,
+            settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
@@ -14104,13 +14161,13 @@ impl Application for Cagents {
                         iced::widget::operation::AbsoluteOffset { x: 0.0, y },
                     ).map(cosmic::Action::App),
                     SidebarAction::OpenFirstSearchResult => {
-                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let rows = self.visible_sidebar_rows();
                         let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
                             .or_else(|| rows.first()).copied();
                         row.map_or_else(Task::none, |row| self.open_sidebar_navigation_row(row))
                     }
                     SidebarAction::FocusFirstSearchResult => {
-                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let rows = self.visible_sidebar_rows();
                         let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
                             .or_else(|| rows.first()).copied();
                         row.map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
@@ -14129,15 +14186,7 @@ impl Application for Cagents {
                             }
                             return Task::none();
                         }
-                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
-                        let index = rows.iter().position(|candidate| *candidate == row).unwrap_or(0);
-                        let target = match key {
-                            Named::Home => 0,
-                            Named::End => rows.len().saturating_sub(1),
-                            Named::ArrowUp => index.saturating_sub(1),
-                            _ => (index + 1).min(rows.len().saturating_sub(1)),
-                        };
-                        rows.get(target).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(*row)).map(cosmic::Action::App))
+                        self.sidebar_keyboard_neighbor(row, key).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
                     }
                     SidebarAction::SelectRows { row, intent } => {
                         self.select_sidebar_rows(row, intent);
@@ -14496,12 +14545,12 @@ impl Application for Cagents {
                         Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page)
                     }
                     SidebarAction::ToggleControls => {
-                        if self.sidebar_state.controls_expanded() {
-                            iced::widget::operation::focus(sidebar::search_focus_id())
-                                .map(cosmic::Action::App)
+                        let target = if self.sidebar_state.controls_expanded() {
+                            sidebar::search_focus_id()
                         } else {
-                            Task::none()
-                        }
+                            sidebar::search_toggle_focus_id()
+                        };
+                        iced::widget::operation::focus(target).map(cosmic::Action::App)
                     }
                     // Renaming and duplicating belong to standalone ceditor;
                     // this model never enables those menu items. The two copy
@@ -15765,6 +15814,21 @@ impl Application for Cagents {
                             .map(cosmic::Action::App)
                     });
                 }
+                if self.settings_reset_on_top() {
+                    if is_escape_press(&event) {
+                        return self.close_settings_reset();
+                    }
+                    if is_tab_press(&event).is_some() {
+                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
+                        let target = if self.settings_reset_focus_confirm {
+                            "dialog.reset-settings.confirm"
+                        } else {
+                            "dialog.reset-settings.cancel"
+                        };
+                        return iced::widget::operation::focus(widget::Id::new(target))
+                            .map(cosmic::Action::App);
+                    }
+                }
                 if is_escape_press(&event) && !captured {
                     if self.transient_work_close.is_some() {
                         return cosmic::task::message(Message::CancelTransientWorkClose);
@@ -15814,8 +15878,7 @@ impl Application for Cagents {
                         return cosmic::task::message(Message::CancelDialog);
                     }
                     if self.sidebar_state.controls_expanded() {
-                        self.sidebar_state.apply(&SidebarAction::ToggleControls);
-                        return Task::none();
+                        return self.update(Message::Sidebar(SidebarAction::ToggleControls));
                     }
                     if self.context_inspector_is_overlay() {
                         return cosmic::task::message(Message::ContextInspector(
@@ -15852,7 +15915,7 @@ impl Application for Cagents {
                         ..
                     } = &event
                 {
-                    if *key == keyboard::key::Named::Escape {
+                    if *key == keyboard::key::Named::Escape && !captured {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
                     }
                     if *key == keyboard::key::Named::Enter
@@ -16101,16 +16164,23 @@ impl Application for Cagents {
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
             Message::ResetSettings => {
+                if self.settings_reset_confirm {
+                    return Task::none();
+                }
                 self.settings_reset_confirm = true;
-                Task::none()
+                self.settings_reset_focus_confirm = false;
+                self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
+                self.core.set_keyboard_nav(false);
+                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
+                    .map(cosmic::Action::App)
             }
-            Message::CancelResetSettings => {
-                self.settings_reset_confirm = false;
-                Task::none()
-            }
+            Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {
-                self.settings_reset_confirm = false;
-                self.reset_settings()
+                if !self.settings_reset_confirm {
+                    return Task::none();
+                }
+                let close = self.close_settings_reset();
+                close.chain(self.reset_settings())
             }
             Message::Lsp(event) => {
                 let navigation = if let LspEvent::Locations {
@@ -16482,9 +16552,6 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
-                iced::Event::Window(window::Event::Resized(size)) => {
-                    Some(Message::WindowResized(size.width, size.height))
-                }
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
                 }
@@ -16497,6 +16564,7 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, false),
                 )),
+                iced::Event::Window(event) => window_geometry_message(&event),
                 _ => None,
             }),
         ];
@@ -20980,6 +21048,91 @@ mod tests {
     }
 
     #[test]
+    fn initial_native_window_size_replaces_estimated_inspector_geometry() {
+        for event in [
+            window::Event::Opened {
+                size: iced::Size::new(960.0, 600.0),
+                position: None,
+            },
+            window::Event::Resized(iced::Size::new(960.0, 600.0)),
+        ] {
+            let mut app = context_inspector_test_app(true);
+            assert!(!app.context_inspector_is_overlay());
+            let message = window_geometry_message(&event).expect("native geometry event");
+            let _ = app.update(message);
+            assert_eq!(app.window_width, 960.0);
+            assert_eq!(app.window_height, 600.0);
+            assert!(app.context_inspector_is_overlay());
+            assert!(app.workspace_inputs_blocked());
+        }
+        assert!(window_geometry_message(&window::Event::Focused).is_none());
+    }
+
+    #[test]
+    fn reset_settings_dialog_focus_cycles_and_escape_restores_origin() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(card, CardRuntime::Settings);
+        app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+        app.settings_category = SettingsCategory::General;
+        app.core.set_keyboard_nav(true);
+        let task = app.update(Message::ResetSettings);
+        assert_eq!(
+            focused_element(cosmic::Application::dialog(&app).unwrap(), task),
+            Some(widget::Id::new("dialog.reset-settings.cancel"))
+        );
+        assert!(!app.core.keyboard_nav());
+        let press = |key, backwards| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Code(if key == keyboard::key::Named::Tab {
+                keyboard::key::Code::Tab
+            } else {
+                keyboard::key::Code::Escape
+            }),
+            location: keyboard::Location::Standard,
+            modifiers: if backwards {
+                keyboard::Modifiers::SHIFT
+            } else {
+                keyboard::Modifiers::empty()
+            },
+            text: None,
+            repeat: false,
+        };
+        // Both directions wrap within the two actions, even if a child has
+        // captured the key before the application receives it.
+        for (backwards, target) in [
+            (false, "dialog.reset-settings.confirm"),
+            (false, "dialog.reset-settings.cancel"),
+            (true, "dialog.reset-settings.confirm"),
+            (true, "dialog.reset-settings.cancel"),
+        ] {
+            let task = app.update(Message::KeyEvent {
+                event: press(keyboard::key::Named::Tab, backwards),
+                captured: true,
+            });
+            assert_eq!(
+                focused_element(cosmic::Application::dialog(&app).unwrap(), task),
+                Some(widget::Id::new(target))
+            );
+        }
+        let task = app.update(Message::KeyEvent {
+            event: press(keyboard::key::Named::Escape, false),
+            captured: true,
+        });
+        assert!(!app.settings_reset_confirm);
+        assert!(app.core.keyboard_nav());
+        assert_eq!(focused(&app, task), Some(widget::Id::new("settings.reset")));
+        // Backdrop and Cancel dispatch the same message and restore the same
+        // origin; closing an already closed dialog cannot disturb focus.
+        let _ = app.update(Message::ResetSettings);
+        let task = app.update(Message::CancelResetSettings);
+        assert_eq!(focused(&app, task), Some(widget::Id::new("settings.reset")));
+        assert!(app.settings_reset_keyboard_nav.is_none());
+    }
+
+    #[test]
     fn dirty_dialog_focus_is_stable_trapped_and_save_aware() {
         let mut focus = DirtyCloseControl::Cancel;
         focus = next_dirty_close_control(focus, false, false, true);
@@ -25073,6 +25226,8 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            settings_reset_focus_confirm: false,
+            settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
