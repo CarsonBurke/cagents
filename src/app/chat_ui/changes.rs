@@ -185,15 +185,6 @@ fn kind(kind: &chat::ChangeKind) -> &'static str {
     }
 }
 
-pub(super) fn footer_label(summary: &chat::FileChangesSummary) -> String {
-    if summary.applied_files > 0 {
-        format!("Files changed {}", summary.applied_files)
-    } else if summary.total_files == 0 && summary.coverage.has_uncached_changes {
-        "Review file edits".into()
-    } else {
-        format!("Reported edits {}", summary.total_files)
-    }
-}
 
 fn totals(additions: Option<u64>, deletions: Option<u64>) -> String {
     match (additions, deletions) {
@@ -879,18 +870,6 @@ mod tests {
         assert_eq!(second.list.as_ref().unwrap().revision, 20);
     }
 
-    #[test]
-    fn pending_only_paths_are_reported_edits_and_footer_is_independent_of_resident_history() {
-        let mut snapshot = Snapshot::default();
-        Arc::make_mut(&mut snapshot.file_changes).total_files = 5;
-        assert_eq!(footer_label(&snapshot.file_changes), "Reported edits 5");
-        Arc::make_mut(&mut snapshot.file_changes).applied_files = 2;
-        assert_eq!(footer_label(&snapshot.file_changes), "Files changed 2");
-        snapshot.items.clear();
-        snapshot.has_earlier = true;
-        snapshot.has_later = true;
-        assert_eq!(footer_label(&snapshot.file_changes), "Files changed 2");
-    }
     #[test]
     fn delayed_retired_review_reply_is_rejected_by_a_replacement_on_the_same_card() {
         let mut retired = State::default();

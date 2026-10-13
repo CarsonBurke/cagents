@@ -732,6 +732,8 @@ enum PaneMenuCommand {
     CloseToRight,
     Close,
     Switch,
+    Fork(chat_ui::Target),
+    ReviewChanges(chat_ui::Target),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -750,6 +752,8 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
+            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
+            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
         })
     }
 }
@@ -2054,6 +2058,20 @@ impl Cagents {
                     self.chat_switch_label(id).into(),
                     None,
                     PaneMenu(id, PaneMenuCommand::Switch),
+                ));
+            }
+            if let Some(target) = self.chat_fork_target(id) {
+                entries.push(widget::menu::Item::Button(
+                    "Fork conversation…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::Fork(target)),
+                ));
+            }
+            if let Some(target) = self.chat_changes_target(id) {
+                entries.push(widget::menu::Item::Button(
+                    "Review file changes".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
                 ));
             }
             widget::menu::items(&HashMap::new(), entries)

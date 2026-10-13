@@ -4670,6 +4670,33 @@ impl Cagents {
             _ => self.chat_ui.fresh_offers.contains(&card),
         }
     }
+    pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        let snapshot = &runtime.snapshot;
+        (!self.chat_start_pending(card)
+            && !runtime.disconnected
+            && !snapshot.exited
+            && runtime.pending.is_none()
+            && runtime.queued.is_none()
+            && snapshot.ready
+            && !snapshot.busy
+            && snapshot.read_only_reason.is_none()
+            && snapshot.capabilities.branch)
+            .then_some(runtime.target)
+    }
+
+    pub(super) fn chat_changes_target(&self, card: CardId) -> Option<Target> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        (runtime.snapshot.file_changes.total_files > 0
+            || runtime.snapshot.file_changes.coverage.has_uncached_changes
+            || runtime.changes.open)
+            .then_some(runtime.target)
+    }
+
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
@@ -7275,19 +7302,22 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if open {
-                        runtime.branch_picker = false;
-                        runtime.changes.show();
-                    }
-                    if !open {
-                        runtime.changes.close();
-                        return iced::widget::operation::focus(card_control_id(
-                            target.card,
-                            "chat-composer",
-                        ))
-                        .map(cosmic::Action::App);
-                    }
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                    return Task::none();
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if open {
+                    runtime.branch_picker = false;
+                    runtime.changes.show();
+                } else {
+                    runtime.changes.close();
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ))
+                    .map(cosmic::Action::App);
                 }
                 return Task::batch([
                     self.chat_change_files(target, None),
@@ -7366,6 +7396,9 @@ impl Cagents {
                 }
             }
             Action::BranchPicker(target, open) => {
+                if open && self.chat_fork_target(target.card) != Some(target) {
+                    return Task::none();
+                }
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.branch_picker = open;
                     if open {
@@ -11070,6 +11103,51 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
+        fn assert_no_effects(task: Task<Message>) {
+            use cosmic::iced::futures::StreamExt;
+            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+                .block_on(async {
+                    match cosmic::iced::runtime::task::into_stream(task) {
+                        Some(stream) => stream.count().await,
+                        None => 0,
+                    }
+                });
+            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.ready = true;
+            snapshot.capabilities.branch = true;
+            Arc::make_mut(&mut snapshot.file_changes).total_files = 1;
+        }
+        assert_eq!(app.chat_fork_target(card), Some(target));
+        assert_eq!(app.chat_changes_target(card), Some(target));
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        assert_eq!(app.chat_fork_target(card), None);
+        let task = app.handle_chat_ui(Action::BranchPicker(target, true));
+        assert_no_effects(task);
+        assert!(!chat_runtime(&app, card).branch_picker);
+        let replaced = Target { generation: target.generation + 1, ..target };
+        for open in [true, false] {
+            let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
+            assert_no_effects(task);
+        }
+        assert!(!chat_runtime(&app, card).changes.open);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+            panic!("chat runtime");
+        };
+        app.chat_ui.parked.insert(card, runtime);
+        let task = app.handle_chat_ui(Action::ChangesPicker(target, true));
+        assert_no_effects(task);
+        assert!(!app.chat_ui.parked.get(&card).unwrap().changes.open);
     }
 
     #[test]
@@ -16298,6 +16376,9 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("review-picker-exclusion"));
         let target = chat_runtime(&app, card).target;
+        let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+        snapshot.ready = true;
+        snapshot.capabilities.branch = true;
         app.chat_runtime_mut(target).unwrap().branch_picker = true;
         drop(app.handle_chat_ui(Action::ChangesPicker(target, true)));
         assert!(chat_runtime(&app, card).changes.open);
