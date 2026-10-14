@@ -874,6 +874,8 @@ pub struct Snapshot {
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
     pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub outcome: Option<crate::agent::ActivityOutcome>,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
@@ -900,6 +902,8 @@ pub struct Snapshot {
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub provider_exit: Option<ProviderExitDiagnostic>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
     #[serde(default)]
@@ -944,6 +948,14 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+}
+
+/// Readable provider failure with a separately expandable bounded stderr tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitDiagnostic {
+    pub summary: String,
+    /// Last 64 KiB of readable stderr. The complete stream is in the debug log.
+    pub output: String,
 }
 
 /// When a provider takes a message it is holding.

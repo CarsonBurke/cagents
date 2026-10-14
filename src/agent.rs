@@ -37,6 +37,14 @@ pub enum ActivityState {
     Waiting,
 }
 
+/// Last provider-confirmed terminal result, independent of current activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityOutcome {
+    Succeeded,
+    Cancelled,
+    Failed { reason: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Activity {
     pub provider: Provider,
