@@ -1025,6 +1025,10 @@ impl CardSession {
     }
 
     fn paint(&mut self, events: &EventBus) {
+        if let Err(error) = self.rendering.prepare_for_paint() {
+            events.semantic(BrowserEvent::Error(error));
+            return;
+        }
         self.webview.paint();
         // The viewport source rectangle may only grow together with the buffer
         // it crops, and the rendering context's present attaches that buffer

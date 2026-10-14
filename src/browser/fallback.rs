@@ -768,6 +768,13 @@ pub(crate) struct FallbackSurface {
     pub lease: Box<dyn WaylandSubsurfaceLease>,
 }
 
+#[link(name = "EGL")]
+unsafe extern "C" {
+    fn eglGetCurrentDisplay() -> *mut c_void;
+    fn eglSwapInterval(display: *mut c_void, interval: i32) -> u32;
+    fn eglGetError() -> u32;
+}
+
 impl FallbackSurface {
     pub(crate) fn create(
         factory: &Arc<dyn WaylandSubsurfaceFactory>,
@@ -787,10 +794,43 @@ impl FallbackSurface {
             dpi::PhysicalSize::new(viewport.width, viewport.height),
         )
         .map_err(|error| BrowserError::Wayland(format!("hardware Servo context: {error:?}")))?;
-        Ok(Self {
+        let rendering = Self {
             context: Rc::new(context),
             lease,
-        })
+        };
+        rendering.prepare_for_paint()?;
+        Ok(rendering)
+    }
+
+    /// Keep presentation independent of a compositor frame callback. A hidden
+    /// Wayland child is allowed to retain such a callback indefinitely. Waiting
+    /// for it in EGL would block the shared Servo thread, including the command
+    /// that makes the child visible again and every other browser card.
+    ///
+    /// Servo's new-frame notifications and the engine animation cadence already
+    /// pace paints. Interval zero makes Mesa use a display sync callback instead
+    /// of a visibility-dependent surface callback. Apply it before the first
+    /// paint and each later paint because resizing can recreate the EGL surface
+    /// with its default swap interval.
+    pub(crate) fn prepare_for_paint(&self) -> Result<(), BrowserError> {
+        use servo::RenderingContext;
+
+        self.context
+            .make_current()
+            .map_err(|error| BrowserError::Wayland(format!("make Servo context current: {error:?}")))?;
+        // SAFETY: WindowRenderingContext is an EGL Wayland context, owned by
+        // this browser thread, and make_current above selected its live draw
+        // surface. EGL handles are opaque; no pointer is dereferenced here.
+        unsafe {
+            let display = eglGetCurrentDisplay();
+            if display.is_null() || eglSwapInterval(display, 0) == 0 {
+                return Err(BrowserError::Wayland(format!(
+                    "disable visibility-dependent EGL swap throttling: {:#x}",
+                    eglGetError()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
