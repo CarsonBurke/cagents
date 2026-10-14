@@ -2280,7 +2280,7 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "host", feature = "ui"))]
-    fn managed_claude_accounts_inherit_only_an_unset_permission_default() {
+    fn managed_claude_accounts_follow_the_current_global_permission_default() {
         let directory = tempfile::tempdir().unwrap();
         let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
         let account = homes.path(Provider::Claude, uuid::Uuid::new_v4());
@@ -2305,21 +2305,64 @@ mod tests {
             claude_configured_default_mode_in(recipe, Some(&homes), Some(&system))
         };
         assert_eq!(resolve(&recipe).as_deref(), Some("auto"));
-        for (settings, expected) in [
-            (r#"{"theme":"dark"}"#, Some("auto")),
-            (r#"{"permissions":{"defaultMode":"plan"}}"#, Some("plan")),
-            (r#"{"permissions":{"defaultMode":"default"}}"#, None),
-            (r#"{"permissions":{"defaultMode":"unknown"}}"#, None),
-            (r#"{"permissions":{"defaultMode":null}}"#, None),
-            (r#"{"permissions":null}"#, None),
-            (r#"{"permissions":"invalid"}"#, None),
-            ("null", None),
-            ("[]", None),
-            ("malformed", None),
+        for settings in [
+            r#"{"theme":"dark"}"#,
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+            r#"{"permissions":{"defaultMode":"default"}}"#,
+            r#"{"permissions":{"defaultMode":"unknown"}}"#,
+            r#"{"permissions":{"defaultMode":null}}"#,
+            "malformed",
         ] {
             std::fs::write(account.join("settings.json"), settings).unwrap();
+            assert_eq!(resolve(&recipe).as_deref(), Some("auto"), "{settings}");
+        }
+        for (settings, expected) in [
+            (
+                r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+                Some("bypassPermissions"),
+            ),
+            (r#"{"permissions":{"defaultMode":"plan"}}"#, Some("plan")),
+            (
+                r#"{"permissions":{"defaultMode":"default"}}"#,
+                Some("manual"),
+            ),
+            ("{}", Some("manual")),
+            (
+                r#"{"permissions":{"defaultMode":"unknown"}}"#,
+                Some("manual"),
+            ),
+            ("malformed", Some("manual")),
+        ] {
+            std::fs::write(system.join("settings.json"), settings).unwrap();
             assert_eq!(resolve(&recipe).as_deref(), expected, "{settings}");
         }
+        std::fs::write(
+            account.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(system.join("settings.json")).unwrap();
+        std::fs::create_dir(system.join("settings.json")).unwrap();
+        assert_eq!(resolve(&recipe).as_deref(), Some("manual"));
+        std::fs::remove_dir(system.join("settings.json")).unwrap();
+        assert_eq!(resolve(&recipe).as_deref(), Some("manual"));
+        recipe
+            .environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into(), "auto".into());
+        assert_eq!(resolve(&recipe), None);
+        recipe
+            .unset_environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into());
+        assert_eq!(resolve(&recipe).as_deref(), Some("manual"));
+        recipe.environment.remove("CLAUDE_CODE_PERMISSION_MODE");
+        recipe
+            .unset_environment
+            .remove("CLAUDE_CODE_PERMISSION_MODE");
+        std::fs::write(
+            system.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
         std::fs::write(account.join("settings.json"), "{}").unwrap();
         std::fs::create_dir(project.join(".claude")).unwrap();
         std::fs::write(
@@ -2334,6 +2377,14 @@ mod tests {
             directory.path().join("linked").display().to_string(),
         );
         assert_eq!(resolve(&recipe), None);
+        let linked = directory.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(
+            linked.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve(&recipe).as_deref(), Some("plan"));
         recipe.environment.insert(
             "CLAUDE_CONFIG_DIR".into(),
             homes
@@ -2574,9 +2625,10 @@ pub(crate) fn fresh_session(
         Provider::Claude => {
             // Claude's stream-json/print transport reports `default` even when
             // the interactive CLI's configured default is Auto. Pin the
-            // account's user choice before the first native prompt so the
-            // two surfaces start with the same permissions. Project settings
-            // are left to Claude's own trust and policy handling.
+            // configured user choice before the first native prompt. Managed
+            // logins follow the current global default; independent homes
+            // retain their own. Explicit environment choices and project
+            // settings remain under Claude's own handling.
             if let Some(mode) = claude_configured_default_mode(&recipe) {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
@@ -2653,6 +2705,11 @@ fn claude_configured_default_mode_in(
             .flatten()
             .filter(|value| !value.is_empty())
     };
+    if environment("CLAUDE_CODE_PERMISSION_MODE").is_some() {
+        // This explicit choice outranks settings; do not pin a CLI default
+        // during fresh creation or when converting an older launch.
+        return None;
+    }
     let resolve = |path: std::path::PathBuf| {
         if path.is_absolute() {
             path
@@ -2700,16 +2757,30 @@ fn claude_configured_default_mode_in(
         }
     }
 
+    // A managed home isolates a login, not the user's permission preference.
+    // Its settings were copied when the account was created and may now be
+    // stale. Read the current system choice; explicit launch and project
+    // choices still take precedence. Linked homes keep independent settings.
+    if homes.is_some_and(|homes| {
+        homes
+            .managed_identity(&root)
+            .is_some_and(|(provider, _)| provider == Provider::Claude)
+    }) {
+        let mode = system_home
+            .and_then(|home| setting(&home.join("settings.json")).ok())
+            .flatten();
+        // Pin Manual too when the global choice is absent/default, otherwise
+        // Claude would fall back to a stale managed-home permission default.
+        // Invalid/unreadable global settings must not resurrect stale YOLO.
+        return Some(match mode {
+            Some(mode) if mode != "default" => mode,
+            _ => "manual".to_owned(),
+        });
+    }
+
     // Local settings belong to a project; a settings.local.json beside the
     // account's user settings is not a user configuration layer.
-    let mode = setting(&root.join("settings.json")).ok()?.or_else(|| {
-        // Older managed homes predate configuration seeding. Inherit the
-        // reader's system default only when this account has no choice of
-        // its own; linked and external CLI homes remain independent.
-        homes?
-            .managed_identity(&root)
-            .filter(|(provider, _)| *provider == Provider::Claude)?;
-        setting(&system_home?.join("settings.json")).ok().flatten()
-    });
-    mode.filter(|mode| mode != "default")
+    setting(&root.join("settings.json"))
+        .ok()?
+        .filter(|mode| mode != "default")
 }
