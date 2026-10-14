@@ -76,6 +76,7 @@ pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;
+pub mod layout_metrics;
 pub mod model;
 pub mod notifications;
 pub mod performance;
@@ -98,7 +99,6 @@ mod selected_file_path;
 mod separator;
 #[cfg(feature = "ui")]
 pub mod session;
-#[cfg(feature = "ui")]
 pub mod settings;
 #[cfg(feature = "ui")]
 pub mod settings_widgets;
