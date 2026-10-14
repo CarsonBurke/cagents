@@ -18,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod worktree_safety;
+pub use worktree_safety::{WorktreeSafetySnapshot, default_disposable_ignored_directories};
+
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
 use crate::persistence::{PendingOperation, PendingOperationStatus, StateStore, StoreError};

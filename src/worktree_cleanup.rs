@@ -112,6 +112,11 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
     if status.untracked_omitted || status.dirty.is_dirty() || !status.entries.is_empty() {
         return Err("Worktree has changes or untracked files".into());
     }
+    let ignored = service.notable_ignored_files(&request.path, &cancellation)
+        .map_err(|error| error.to_string())?;
+    if !ignored.is_empty() {
+        return Err(format!("Kept: ignored files {}", ignored.iter().take(5).map(ToString::to_string).collect::<Vec<_>>().join(", ")));
+    }
     Ok(record.clone())
 }
 
@@ -616,6 +621,14 @@ mod tests {
         request.repository = repository.clone();
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
+        checked_record(&request).unwrap();
+        std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\n").unwrap();
+        std::fs::write(worktree.join(".env"), "preserve secret").unwrap();
+        assert!(checked_record(&request).unwrap_err().contains("ignored files .env"));
+        assert_eq!(std::fs::read_to_string(worktree.join(".env")).unwrap(), "preserve secret");
+        std::fs::remove_file(worktree.join(".env")).unwrap();
+        std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
+        std::fs::write(worktree.join("target/nested/generated"), "disposable").unwrap();
         checked_record(&request).unwrap();
         std::fs::write(worktree.join("tracked"), "changed").unwrap();
         assert!(checked_record(&request).is_err());
