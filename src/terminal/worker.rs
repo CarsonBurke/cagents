@@ -9,7 +9,7 @@ use close_processes::{FrozenFamily, RootIdentity};
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{BufWriter, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -54,6 +54,11 @@ use super::{
 
 const PTY_READ_SIZE: usize = 16 * 1024;
 const PTY_BATCH_LIMIT: usize = 256 * 1024;
+/// At most two maximum pastes can await a child that stopped reading.
+const PTY_WRITE_CAPACITY: usize = 2 * 1024 * 1024 + 32;
+const PTY_WRITE_RETRY: Duration = Duration::from_millis(10);
+/// Includes graceful child escalation and reader cleanup, with scheduling slack.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Marker appended once when a transcript hits its size cap.
 const TRANSCRIPT_TRUNCATED_MARKER: &[u8] = b"\n[cagents transcript truncated: size cap reached]\n";
 /// Foreground observation cadence. Every tick descends `/proc` over the PTY
@@ -366,6 +371,9 @@ struct PublishedState {
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     completed: AtomicBool,
     shutdown_requested: AtomicBool,
+    interrupt_requested: AtomicBool,
+    interrupt_key: Mutex<Option<KeyInput>>,
+    shutdown_pidfd: OnceLock<File>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
@@ -410,6 +418,9 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             completed: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            interrupt_requested: AtomicBool::new(false),
+            interrupt_key: Mutex::new(None),
+            shutdown_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
             transcript_location: OnceLock::new(),
@@ -666,9 +677,26 @@ impl Drop for HandleInner {
             && let Some(worker) = worker.take()
             && worker.thread().id() != thread::current().id()
         {
-            let _ = worker.join();
+            join_worker_bounded(worker, &self.published);
         }
     }
+}
+
+/// A stalled worker cannot indefinitely hold daemon shutdown or a last-handle
+/// drop. Escalation uses the original root pidfd; detaching never claims exit.
+fn join_worker_bounded(worker: JoinHandle<()>, published: &PublishedState) -> bool {
+    let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if !worker.is_finished() {
+        if let Some(pidfd) = published.shutdown_pidfd.get() {
+            let _ = close_processes::signal(pidfd, libc::SIGKILL);
+        }
+        tracing::error!("terminal worker exceeded shutdown deadline; root escalation requested");
+        return false;
+    }
+    worker.join().is_ok()
 }
 
 #[derive(Clone)]
@@ -956,7 +984,13 @@ impl TerminalHandle {
     }
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
-        self.try_command(Command::Input(bytes.into()))
+        let bytes = bytes.into();
+        if bytes == [3] {
+            self.inner.published.interrupt_requested.store(true, Ordering::Release);
+            let _ = self.inner.published.capture_tx.try_send(());
+            return Ok(());
+        }
+        self.try_command(Command::Input(bytes))
     }
 
     pub fn paste(
@@ -968,6 +1002,15 @@ impl TerminalHandle {
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
+        if key.action != KeyAction::Release && key.modifiers.control
+            && !key.modifiers.alt && !key.modifiers.super_key
+            && matches!(key.key, TerminalKey::Character('c' | 'C'))
+        {
+            *self.inner.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
+            self.inner.published.interrupt_requested.store(true, Ordering::Release);
+            let _ = self.inner.published.capture_tx.try_send(());
+            return Ok(());
+        }
         self.try_command(Command::Key(key))
     }
 
@@ -1209,7 +1252,9 @@ impl TerminalHandle {
             && let Some(worker) = worker.take()
             && worker.thread().id() != thread::current().id()
         {
-            let _ = worker.join();
+            if !join_worker_bounded(worker, &self.inner.published) {
+                return Err(TerminalSendError::Closed);
+            }
         }
         if self.is_completed() {
             self.release_completed_holder();
@@ -1353,6 +1398,10 @@ impl TerminalHandle {
     }
 }
 
+fn is_pty_input(command: &Command) -> bool {
+    matches!(command, Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_))
+}
+
 fn command_channel(capacity: usize) -> (Sender<Command>, Receiver<Command>) {
     crossbeam_channel::bounded(capacity.max(1))
 }
@@ -1412,6 +1461,8 @@ struct Worker {
     published: Arc<PublishedState>,
     master: holder::PtyMaster,
     writer: File,
+    pending_input: VecDeque<u8>,
+    retained_commands: VecDeque<Command>,
     child: holder::HeldChild,
     child_exit_rx: Receiver<ChildExit>,
     child_identity: Option<RootIdentity>,
@@ -1678,6 +1729,15 @@ impl Worker {
                 .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
         };
         let writer = File::from(duplicate("writing")?);
+        // Duplicates share the master file description. Reader and detached
+        // holder paths also tolerate WouldBlock after readiness races.
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe {
+            libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        } < 0 {
+            return Err(format!("make PTY nonblocking: {}", std::io::Error::last_os_error()));
+        }
+        let _ = published.shutdown_pidfd.set(held.child.shutdown_pidfd()?);
         // Output an adopted terminal produced between daemons comes first, as
         // any other output would.
         let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
@@ -1757,6 +1817,8 @@ impl Worker {
             published,
             master: held.master,
             writer,
+            pending_input: VecDeque::new(),
+            retained_commands: VecDeque::new(),
             child: held.child,
             child_exit_rx,
             child_identity,
@@ -1810,14 +1872,18 @@ impl Worker {
                 shutting_down = true;
                 break;
             }
+            if self.published.interrupt_requested.swap(false, Ordering::AcqRel) {
+                if carried_command.as_ref().is_some_and(is_pty_input) { carried_command = None; }
+                self.interrupt_input();
+            }
+            self.flush_pty_input();
             self.publish_bell();
             // Output or a busy input queue must not keep resetting discovery's
             // timeout: an agent can start in an existing shell's process group.
             if self.last_foreground_observation.elapsed() >= self.foreground_poll {
                 self.observe_foreground();
             }
-            let event = carried_command
-                .take()
+            let event = self.retained_commands.pop_front().or_else(|| carried_command.take())
                 .map(|command| WorkerEvent::Command(Some(command)))
                 .unwrap_or_else(|| {
                     wait_for_worker_event(
@@ -1832,6 +1898,7 @@ impl Worker {
                         self.synchronized_release_after()
                             .into_iter()
                             .chain(self.bell.release_after())
+                            .chain((!self.pending_input.is_empty()).then_some(PTY_WRITE_RETRY))
                             .min(),
                     )
                 });
@@ -2261,7 +2328,7 @@ impl Worker {
                 let process = self.observe_agent_process().cloned();
                 let _ = sender.send(process);
             }
-            Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
+            Command::Input(bytes) => { self.write_pty(&bytes, "write terminal input"); },
             Command::Paste(text, origin) => self.paste(&text, origin),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
@@ -2284,7 +2351,7 @@ impl Worker {
                     focus::Event::Lost
                 };
                 match event.encode(&mut buffer) {
-                    Ok(written) => self.write_pty(&buffer[..written], "write focus report"),
+                    Ok(written) => { self.write_pty(&buffer[..written], "write focus report"); },
                     Err(error) => self.error("encode focus report", error.to_string()),
                 }
             }
@@ -2368,7 +2435,7 @@ impl Worker {
 
     fn encode_key(&mut self, input: KeyInput) {
         match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
-            Ok(encoded) => self.write_pty(&encoded, "write encoded key"),
+            Ok(encoded) => { self.write_pty(&encoded, "write encoded key"); },
             Err(error) => self.error("encode key", error.to_string()),
         }
     }
@@ -2423,7 +2490,7 @@ impl Worker {
             });
         let mut encoded = Vec::with_capacity(32);
         match self.mouse_encoder.encode_to_vec(&event, &mut encoded) {
-            Ok(()) => self.write_pty(&encoded, "write encoded mouse event"),
+            Ok(()) => { self.write_pty(&encoded, "write encoded mouse event"); },
             Err(error) => self.error("encode mouse event", error.to_string()),
         }
     }
@@ -2678,7 +2745,7 @@ impl Worker {
         let effects = std::mem::take(&mut *self.effects.borrow_mut());
         for effect in effects.ordered {
             match effect {
-                Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
+                Effect::PtyWrite(bytes) => { self.write_pty(&bytes, "write terminal response"); },
                 Effect::Bell => {
                     self.bell.pending = true;
                     self.publish_bell();
@@ -2959,17 +3026,65 @@ impl Worker {
         }
     }
 
-    fn write_pty(&mut self, bytes: &[u8], operation: &'static str) {
-        if bytes.is_empty() {
-            return;
+    /// True means the entire input was admitted, not necessarily consumed.
+    fn write_pty(&mut self, bytes: &[u8], operation: &'static str) -> bool {
+        self.flush_pty_input();
+        if bytes.len() > PTY_WRITE_CAPACITY.saturating_sub(self.pending_input.len()) {
+            self.error(operation, format!(
+                "Terminal isn't reading input; {} KiB pending. Press Ctrl+C to cancel pending input.",
+                self.pending_input.len().div_ceil(1024),
+            ));
+            return false;
         }
-        if let Err(error) = self
-            .writer
-            .write_all(bytes)
-            .and_then(|()| self.writer.flush())
-        {
-            self.error(operation, error.to_string());
+        self.pending_input.extend(bytes);
+        self.flush_pty_input();
+        true
+    }
+
+    /// Poll before bounded nonblocking writes. The retry deadline participates
+    /// in the command/output select, so a full input buffer never stalls parsing.
+    fn flush_pty_input(&mut self) {
+        let mut budget = PTY_BATCH_LIMIT;
+        while !self.pending_input.is_empty() && budget > 0 {
+            let mut ready = libc::pollfd {
+                fd: self.writer.as_raw_fd(), events: libc::POLLOUT, revents: 0,
+            };
+            if unsafe { libc::poll(&mut ready, 1, 0) } <= 0
+                || ready.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+                break;
+            }
+            let (front, _) = self.pending_input.as_slices();
+            match self.writer.write(&front[..front.len().min(budget)]) {
+                Ok(0) => break,
+                Ok(written) => { self.pending_input.drain(..written); budget -= written; }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.pending_input.clear();
+                    self.error("write terminal input", error.to_string());
+                    break;
+                }
+            }
         }
+    }
+
+    fn interrupt_input(&mut self) {
+        let pending = !self.pending_input.is_empty();
+        self.pending_input.clear();
+        while let Ok(command) = self.commands.try_recv() {
+            if !is_pty_input(&command) { self.retained_commands.push_back(command); }
+        }
+        if pending {
+            // TIOCSIG is authorized by this exact PTY master, targets its
+            // foreground group and bypasses a full slave input buffer.
+            let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
+            if result < 0 { self.error("interrupt terminal", std::io::Error::last_os_error().to_string()); }
+        } else {
+            let key = self.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(key) = key { self.encode_key(key); }
+            else { self.write_pty(&[3], "interrupt terminal"); }
+        }
+        self.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 
     fn emit(&self, event: TerminalEvent) {
@@ -3459,7 +3574,7 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: Owned
                     return;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => {}
             Err(error) => {
                 let _ = sender.send(PtyMessage::Error(error.to_string()));
                 return;
@@ -5492,6 +5607,50 @@ mod tests {
             Some(TerminalEvent::Error { .. })
         ));
         let _ = exits.recv_timeout(CHILD_SHUTDOWN_DEADLINE);
+    }
+
+    #[test]
+    fn nonreading_child_keeps_publishing_and_interrupt_bypasses_backpressure() {
+        let handle = TerminalHandle::spawn(
+            shell_session("stty -echo -icanon; trap 'echo interrupted; exit 0' INT; echo ready; while :; do echo tick; sleep 0.05; done"),
+            TerminalConfig::default(), |_| {},
+        ).unwrap();
+        wait_for_text(&handle, "ready");
+        let before = handle.snapshot().generation;
+        for _ in 0..3 {
+            handle.paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut backpressure = false;
+        while std::time::Instant::now() < deadline {
+            let snapshot = handle.snapshot();
+            handle.acknowledge_redraw(snapshot.generation);
+            backpressure |= handle.events().try_iter().any(|event| matches!(event,
+                TerminalEvent::Error { message, .. } if message.contains("isn't reading input")));
+            if backpressure && snapshot.generation > before { break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(backpressure, "pending byte bound must report backpressure to client");
+        assert!(handle.snapshot().generation > before, "output stalled behind PTY write");
+        handle.input(vec![3]).unwrap();
+        wait_for_text(&handle, "interrupted");
+        let started = std::time::Instant::now();
+        handle.shutdown().unwrap();
+        assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn nonreading_child_shutdown_is_bounded_with_a_full_pending_paste() {
+        let handle = TerminalHandle::spawn(
+            shell_session("stty -echo -icanon; echo ready; exec sleep 600"),
+            TerminalConfig::default(), |_| {},
+        ).unwrap();
+        wait_for_text(&handle, "ready");
+        handle.paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        handle.shutdown().unwrap();
+        assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_millis(100));
     }
 
     #[test]
