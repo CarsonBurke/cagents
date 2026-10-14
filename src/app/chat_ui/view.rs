@@ -2274,58 +2274,6 @@ impl Runtime {
             );
         }
         status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
-        if snapshot.file_changes.total_files > 0
-            || snapshot.file_changes.coverage.has_uncached_changes
-            || self.changes.open
-        {
-            status.push(crate::interaction::tooltip(
-                crate::ui_controls::button::quiet(changes::footer_label(&snapshot.file_changes))
-                    .on_press(action(Action::ChangesPicker(target, !self.changes.open))),
-                "Review file edits reported in this conversation",
-            ));
-        }
-        if snapshot.capabilities.branch {
-            let available = available
-                && snapshot.ready
-                && !snapshot.busy
-                && snapshot.read_only_reason.is_none();
-            status.push(crate::interaction::tooltip(
-                crate::ui_controls::button::quiet("Fork chat").on_press_maybe(
-                    available.then(|| action(Action::BranchPicker(target, !self.branch_picker))),
-                ),
-                "Start a new conversation from this chat's history",
-            ));
-        }
-        if let Some(mode) = &snapshot.fast_mode {
-            let available = available
-                && snapshot.ready
-                && snapshot.capabilities.fast_mode
-                && snapshot.read_only_reason.is_none()
-                && mode.changeable();
-            let label = match mode.state {
-                crate::chat::FastModeState::Off => "Fast: off",
-                crate::chat::FastModeState::On => "Fast: on",
-                crate::chat::FastModeState::Cooldown => "Fast: cooldown",
-            };
-            let tooltip = if !snapshot.ready {
-                "Connect to this chat to change fast mode.".into()
-            } else if !snapshot.capabilities.fast_mode && mode.disabled_reason.is_none() {
-                "The provider does not advertise fast mode for this chat's selected model.".into()
-            } else {
-                fast_mode_tooltip(mode)
-            };
-            status.push(crate::interaction::tooltip(
-                crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
-                    action(Action::Command(
-                        target,
-                        Command::SetFastMode {
-                            enabled: !mode.enabled(),
-                        },
-                    ))
-                })),
-                tooltip,
-            ));
-        }
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
@@ -2860,6 +2808,11 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
+        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+            Cow::Owned(format!("{label} · Fast"))
+        } else {
+            label
+        };
         let anchor = widget::button::custom(
             widget::row::with_children(vec![
                 widget::icon(crate::ui_controls::provider_icon(
@@ -2918,13 +2871,41 @@ impl Runtime {
                 models: &self.snapshot.models,
             }]
         };
-        Some(model_list(
+        let models = model_list(
             self.target,
             &offers,
             draft,
             (provider, self.snapshot.selected_model.as_deref()),
             query,
-        ))
+        );
+        let Some(mode) = &self.snapshot.fast_mode else {
+            return Some(models);
+        };
+        let available = !self.disconnected
+            && !self.snapshot.exited
+            && self.pending.is_none()
+            && self.queued.is_none()
+            && self.snapshot.ready
+            && self.snapshot.capabilities.fast_mode
+            && self.snapshot.read_only_reason.is_none()
+            && mode.changeable();
+        let label = match mode.state {
+            crate::chat::FastModeState::Off => "Fast mode: off",
+            crate::chat::FastModeState::On => "Fast mode: on",
+            crate::chat::FastModeState::Cooldown => "Fast mode: cooldown",
+        };
+        let control = crate::interaction::tooltip(
+            crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
+                action(Action::Command(
+                    self.target,
+                    Command::SetFastMode { enabled: !mode.enabled() },
+                ))
+            })),
+            fast_mode_tooltip(mode),
+        );
+        Some(widget::column::with_children(vec![models, control])
+            .spacing(step::GAP_XS)
+            .into())
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -7318,7 +7299,12 @@ mod tests {
                 &full_tree,
                 iced::mouse::Cursor::Unavailable,
             );
-            for label in ["Send message", "Reported edits 1"] {
+            assert!(
+                !accessible.root().iter().chain(accessible.children()).any(|node|
+                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                "file review must not add a permanent footer action"
+            );
+            for label in ["Send message", "Close"] {
                 let bounds = accessible
                     .root()
                     .iter()
