@@ -64,8 +64,26 @@ struct Plan {
     pane: CardId,
     source: Scope,
     revision: u64,
+    /// The pane it goes before, if it was asked to.
+    anchor: Option<CardId>,
     /// `None` when the pane already sits where it was asked to go.
     change: Option<Change>,
+}
+
+/// Whether `pane` sits directly before `anchor` in `view`.
+fn precedes(view: &View, pane: CardId, anchor: CardId) -> bool {
+    view.panes
+        .windows(2)
+        .any(|pair| pair[0].id == pane && pair[1].id == anchor)
+}
+
+fn order(model: &WorkspaceModel, scope: &Scope) -> Vec<CardId> {
+    model
+        .views
+        .iter()
+        .find(|view| &view.scope == scope)
+        .map(|view| view.panes.iter().map(|pane| pane.id).collect())
+        .unwrap_or_default()
 }
 
 /// Decides one move against one model read, refusing a move across projects
@@ -123,15 +141,18 @@ fn plan(
             before,
         })
     } else {
-        before.map(|before| Change::Move {
-            id: moving.id,
-            before: Some(before),
-        })
+        before
+            .filter(|&before| !precedes(view, moving.id, before))
+            .map(|before| Change::Move {
+                id: moving.id,
+                before: Some(before),
+            })
     };
     Ok(Plan {
         pane: moving.id,
         source: view.scope.clone(),
         revision: view.revision,
+        anchor: before,
         change,
     })
 }
@@ -158,10 +179,11 @@ pub(super) fn move_pane(
             operation,
             change,
         }) {
-            Ok(model) => {
-                // The registry treats a destination deleted mid-move as a
-                // no-op, so success is read from where the pane is now.
-                let (view, _) = locate(&model, plan.pane.as_uuid())?;
+            Ok(after) => {
+                // The registry treats a destination deleted mid-move, or an
+                // anchor moved away, as a no-op, so success is read from where
+                // the pane is now.
+                let (view, _) = locate(&after, plan.pane.as_uuid())?;
                 if view.scope != Scope::Channel(to) {
                     return Err(AppError::new(
                         "target",
@@ -172,7 +194,20 @@ pub(super) fn move_pane(
                         ),
                     ));
                 }
-                return Ok(output(&plan, true, model.sequence));
+                if let Some(anchor) = plan.anchor
+                    && !precedes(view, plan.pane, anchor)
+                {
+                    return Err(AppError::new(
+                        "target",
+                        format!(
+                            "{} moved into channel {to}, but {anchor} left its place before the pane could follow",
+                            plan.pane
+                        ),
+                    ));
+                }
+                let moved = !matches!(plan.change, Some(Change::Move { .. }))
+                    || order(&model, &plan.source) != order(&after, &plan.source);
+                return Ok(output(&plan, moved, after.sequence));
             }
             Err(ControlError::Remote {
                 code: ProtocolErrorCode::ViewConflict,
@@ -278,6 +313,7 @@ mod tests {
                     pane: moving.id,
                     source: Scope::Channel(source.id),
                     revision: 3,
+                    anchor: Some(anchor.id),
                     change: Some(Change::Transfer {
                         id: moving.id,
                         destination: Scope::Channel(destination.id),
@@ -307,6 +343,22 @@ mod tests {
             })
         );
         assert!(plan_for(Some(moving.id.as_uuid())).is_err());
+        let anchored = WorkspaceModel {
+            views: vec![view(&destination, vec![moving.clone(), anchor.clone()])],
+            ..model.clone()
+        };
+        assert_eq!(
+            plan(
+                &anchored,
+                moving.id.as_uuid(),
+                destination.id,
+                Some(anchor.id.as_uuid())
+            )
+            .unwrap()
+            .change,
+            None,
+            "a pane already before its anchor stays put"
+        );
     }
 
     #[test]

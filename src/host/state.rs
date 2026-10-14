@@ -599,10 +599,22 @@ impl HostState {
             scope,
             expected_revision,
             operation,
-            ..
+            change,
         } = &edit
         {
             let registry = self.registry()?;
+            // A request the registry can never accept is the caller's error,
+            // not an unavailable model, and a retry would be refused alike.
+            if let Some(refusal) = registry
+                .view_change_refusal(scope, change)
+                .map_err(model_unavailable)?
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    refusal,
+                    false,
+                ));
+            }
             if !registry
                 .view_operation_seen(*operation)
                 .map_err(model_unavailable)?

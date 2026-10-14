@@ -70,6 +70,30 @@ fn exists(db: &Connection, scope: &Scope) -> Result<bool, String> {
     }
     .map_err(|error| error.to_string())
 }
+/// Why the registry refuses `change` to `scope`, if it does.
+///
+/// A channel belongs to one project, so nothing moves into a channel from
+/// another project's view. Worktree views follow the path a window resolves
+/// for a pane, which a nested project can change, so they stay unrestricted.
+pub(super) fn refusal(
+    db: &Connection,
+    scope: &Scope,
+    change: &Change,
+) -> Result<Option<String>, String> {
+    let Change::Transfer {
+        destination: destination @ Scope::Channel(_),
+        ..
+    } = change
+    else {
+        return Ok(None);
+    };
+    if destination == scope || !exists(db, scope)? || !exists(db, destination)? {
+        return Ok(None);
+    }
+    Ok((project(db, scope)? != project(db, destination)?)
+        .then(|| "A pane moves into a channel only from a view of the same project".to_owned()))
+}
+
 /// The project key that owns an existing scope.
 fn project(db: &Connection, scope: &Scope) -> Result<String, String> {
     match scope {
@@ -201,8 +225,8 @@ pub(super) fn apply(
                     } else if let Some(pane) =
                         view.panes.iter().find(|pane| pane.id == *id).cloned()
                     {
-                        if project(transaction, scope)? != project(transaction, destination)? {
-                            return Err("A pane moves only between views of one project".into());
+                        if let Some(refusal) = refusal(transaction, scope, change)? {
+                            return Err(refusal);
                         }
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
@@ -239,7 +263,11 @@ pub(super) fn apply(
                             "pane already belongs to another view; use an atomic transfer".into(),
                         );
                     }
-                    view.apply(change)?
+                    let inserted = view.apply(change)?;
+                    if inserted {
+                        super::execution::relocate_agent(transaction, pane.id, scope)?;
+                    }
+                    inserted
                 }
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {
                     false
@@ -297,6 +325,13 @@ impl Registry {
     }
     pub(crate) fn view_operation_seen(&self, operation: Uuid) -> Result<bool, String> {
         operation_seen(&self.db, operation)
+    }
+    pub(crate) fn view_change_refusal(
+        &self,
+        scope: &Scope,
+        change: &Change,
+    ) -> Result<Option<String>, String> {
+        refusal(&self.db, scope, change)
     }
 }
 
@@ -542,7 +577,7 @@ mod tests {
         assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
     }
     #[test]
-    fn transfer_refuses_a_view_in_another_project() {
+    fn transfer_into_a_channel_of_another_project_is_refused() {
         let (mut r, _, a, _) = setup();
         r.apply(&ModelEdit::OpenProject {
             repository: "/other".into(),
@@ -561,31 +596,36 @@ mod tests {
         let p = pane();
         seed(&mut r, a, vec![p.clone()]);
         let revision = r.view_revision(&Scope::Channel(a)).unwrap();
-        for destination in [
-            Scope::Channel(foreign),
-            Scope::Worktree {
-                repository: "/other".into(),
-                path: "/other".into(),
-            },
-        ] {
-            let transfer = edit(
-                &mut r,
-                a,
-                Change::Transfer {
-                    id: p.id,
-                    destination: destination.clone(),
-                    before: None,
-                },
-            );
-            assert!(r.apply(&transfer).is_err());
-            assert!(read(&r.db, &destination).unwrap().panes.is_empty());
-        }
+        let into = |destination: Scope| Change::Transfer {
+            id: p.id,
+            destination,
+            before: None,
+        };
+        let refused = into(Scope::Channel(foreign));
+        assert!(
+            r.view_change_refusal(&Scope::Channel(a), &refused)
+                .unwrap()
+                .is_some()
+        );
+        let transfer = edit(&mut r, a, refused);
+        assert!(r.apply(&transfer).is_err());
+        assert!(read(&r.db, &Scope::Channel(foreign)).unwrap().panes.is_empty());
         assert_eq!(
             read(&r.db, &Scope::Channel(a)).unwrap().panes,
             vec![p.clone()]
         );
         assert_eq!(r.view_revision(&Scope::Channel(a)).unwrap(), revision);
         assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(a)));
+
+        // A window re-resolves a worktree pane by its path, which a nested
+        // project can change; that transfer stays allowed.
+        let nested = Scope::Worktree {
+            repository: "/other".into(),
+            path: "/other".into(),
+        };
+        let transfer = edit(&mut r, a, into(nested.clone()));
+        r.apply(&transfer).unwrap();
+        assert_eq!(owner(&r.db, p.id).unwrap(), Some(nested));
     }
     #[test]
     fn transfer_is_atomic_unique_and_reversible() {

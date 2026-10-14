@@ -230,21 +230,26 @@ fn a_pane_moves_between_channels_of_its_project_intact_and_durably() {
     assert_eq!(retried["moved"], false, "a retry changes nothing");
 
     // Placed before an anchor in the destination, named by its pane id.
-    let anchor = staying.id.to_string();
-    fixture.cli(&["channel", "move", &anchor, "--to", &destination]);
-    let reordered = fixture.cli(&[
+    let (arriving, anchor) = (staying.id.to_string(), moving.id.to_string());
+    fixture.cli(&["channel", "move", &arriving, "--to", &destination]);
+    let reorder = [
         "channel",
         "move",
-        &moving.id.to_string(),
+        &arriving,
         "--to",
         &destination,
         "--before",
         &anchor,
-    ]);
-    assert_eq!(reordered["moved"], true);
+    ];
+    assert_eq!(fixture.cli(&reorder)["moved"], true);
     assert_eq!(
         panes(&fixture.model(), &destination),
-        vec![moving.clone(), staying.clone()]
+        vec![staying.clone(), moving.clone()]
+    );
+    assert_eq!(
+        fixture.cli(&reorder)["moved"],
+        false,
+        "a retried reorder changes nothing"
     );
 
     let error = fixture.refused(&["channel", "move", &session, "--to", &foreign]);
@@ -263,5 +268,5 @@ fn a_pane_moves_between_channels_of_its_project_intact_and_durably() {
     let model = fixture.model();
     assert!(panes(&model, &source).is_empty());
     assert!(panes(&model, &foreign).is_empty());
-    assert_eq!(panes(&model, &destination), vec![moving, staying]);
+    assert_eq!(panes(&model, &destination), vec![staying, moving]);
 }

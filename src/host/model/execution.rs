@@ -448,7 +448,7 @@ impl Registry {
             )
             .map_err(|error| error.to_string())?;
         if decode::<Run>(&stored)? != accepted.run
-            || read_agent(&tx, accepted.agent.id)? != accepted.agent
+            || !same_execution(&read_agent(&tx, accepted.agent.id)?, &accepted.agent)
         {
             return Err(
                 "The accepted agent run changed before dispatch; nothing was submitted".into(),
@@ -912,7 +912,7 @@ impl Registry {
     pub(crate) fn validate_agent_dispatch(&self, accepted: &Accepted) -> Result<(), String> {
         let agent = self.agent(accepted.agent.id)?;
         let run = self.agent_run(accepted.run.id)?;
-        if agent.closed || run != accepted.run || agent != accepted.agent {
+        if agent.closed || run != accepted.run || !same_execution(&agent, &accepted.agent) {
             return Err("The accepted execution changed before provider dispatch".into());
         }
         require_placement(&self.db, &agent.placement, &agent.spec.target.repository)
@@ -1418,6 +1418,12 @@ pub(super) fn relocate_agent(
     if agent.placement == *placement {
         return Ok(false);
     }
+    // A view in another project is no placement the agent can be validated
+    // against; its old one keeps follow-ups working.
+    if let Err(error) = require_placement(db, placement, &agent.spec.target.repository) {
+        tracing::warn!(agent = %agent.id, %error, "kept an agent placement its pane left");
+        return Ok(false);
+    }
     agent.placement = placement.clone();
     db.execute(
         "UPDATE agents SET record = ?2 WHERE id = ?1",
@@ -1454,6 +1460,16 @@ impl Registry {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(moved)
     }
+}
+
+/// Whether `stored` is still the execution `accepted` captured. A pane moved
+/// in the meantime changes only where the agent is shown, which dispatch
+/// re-validates on its own.
+fn same_execution(stored: &Agent, accepted: &Agent) -> bool {
+    Agent {
+        placement: accepted.placement.clone(),
+        ..stored.clone()
+    } == *accepted
 }
 
 fn require_channel(
@@ -1867,7 +1883,7 @@ mod tests {
         registry
             .apply(&ModelEdit::ChangeView {
                 expected_revision: registry.view_revision(&launched).unwrap(),
-                scope: launched,
+                scope: launched.clone(),
                 operation: uuid::Uuid::new_v4(),
                 change: Change::Transfer {
                     id: pane.id,
@@ -1898,6 +1914,88 @@ mod tests {
             registry.agent(accepted.agent.id).unwrap().placement,
             Scope::Channel(destination)
         );
+        assert_eq!(registry.reconcile_agent_placements().unwrap(), 0);
+
+        // A window that removes the pane and inserts it elsewhere moves it too.
+        let change = |registry: &mut Registry, scope: &Scope, change| {
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    expected_revision: registry.view_revision(scope).unwrap(),
+                    scope: scope.clone(),
+                    operation: uuid::Uuid::new_v4(),
+                    change,
+                })
+                .unwrap()
+        };
+        change(
+            &mut registry,
+            &Scope::Channel(destination),
+            Change::Remove { id: pane.id },
+        );
+        let third = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: third,
+                repository: directory.path().into(),
+                title: "third".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let third = Scope::Channel(third);
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: third.clone(),
+                panes: vec![],
+                closed: vec![],
+            })
+            .unwrap();
+        change(
+            &mut registry,
+            &third,
+            Change::Insert {
+                pane: pane.clone(),
+                before: None,
+            },
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, third);
+
+        // Into another project's view, the pane goes but the agent keeps the
+        // placement its follow-ups validate against.
+        let elsewhere = tempfile::tempdir().unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: elsewhere.path().into(),
+                name: "elsewhere".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let foreign = Scope::Worktree {
+            repository: elsewhere.path().into(),
+            path: elsewhere.path().into(),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: foreign.clone(),
+                panes: vec![],
+                closed: vec![],
+            })
+            .unwrap();
+        change(
+            &mut registry,
+            &third,
+            Change::Transfer {
+                id: pane.id,
+                destination: foreign.clone(),
+                before: None,
+            },
+        );
+        assert_eq!(
+            super::super::views::read(&registry.db, &foreign)
+                .unwrap()
+                .panes,
+            vec![pane]
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, third);
         assert_eq!(registry.reconcile_agent_placements().unwrap(), 0);
     }
 

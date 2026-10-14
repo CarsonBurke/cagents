@@ -347,8 +347,9 @@ pub enum ChannelCommand {
     /// Move a pane into another channel of its project.
     ///
     /// The pane's session keeps running: its conversation, draft and terminal
-    /// move with it in every window, without a restart. Moving a pane into the
-    /// channel that already holds it changes nothing, so a retry is safe.
+    /// move with it in every window, without a restart. A pane already in the
+    /// channel stays where it is unless `--before` reorders it, so a retry is
+    /// safe.
     Move {
         /// The pane, or the session or agent it hosts.
         pane: uuid::Uuid,
