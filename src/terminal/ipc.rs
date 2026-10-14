@@ -497,7 +497,8 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty scrollback page budget in bytes (allocated lazily).
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -509,7 +510,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: 16 * 1024 * 1024,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -523,7 +524,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }

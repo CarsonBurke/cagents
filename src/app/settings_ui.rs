@@ -769,9 +769,9 @@ fn settings_category_controls<'a>(
                 "History",
                 "Keep enough output to investigate a task without retaining unlimited terminal history.",
                 vec![setting_input(
-                    "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
-                    &draft.terminal_scrollback_lines,
-                    SettingsField::TerminalScrollbackLines,
+                    "0–1,024 MiB per new terminal, allocated as output arrives. Row count depends on width and content.",
+                    &draft.terminal_scrollback_mib,
+                    SettingsField::TerminalScrollbackMib,
                     invalid,
                 )],
             ),
