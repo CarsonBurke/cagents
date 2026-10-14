@@ -429,6 +429,7 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 #[derive(Default)]
 pub(crate) struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
+    resolved: BTreeMap<PathBuf, PathBuf>,
     requested: std::collections::BTreeSet<PathBuf>,
     ready: Option<crate::instance::OwnedLock>,
     retry_after: Option<std::time::Instant>,
@@ -446,6 +447,8 @@ impl WindowProtections {
 
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
         if let Some(protection) = protect(directory)? {
+            self.resolved
+                .insert(directory.to_owned(), protection.directory.clone());
             self.directories
                 .insert(protection.directory.clone(), protection);
         }
@@ -484,9 +487,12 @@ impl WindowProtections {
         ready: impl FnOnce() -> io::Result<crate::instance::OwnedLock>,
     ) -> io::Result<()> {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-        let requested = directories.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let requested = directories
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         let changed = requested != self.requested;
-        if !changed && self.retry_after.is_none_or(|deadline| now < deadline)
+        if !changed
+            && self.retry_after.is_none_or(|deadline| now < deadline)
             && (self.ready.is_some() || self.retry_after.is_some())
         {
             return Ok(());
@@ -505,6 +511,12 @@ impl WindowProtections {
                 Ok(directory) => directory,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     missing.insert(path.clone());
+                    // The path may have moved while an editor still uses its
+                    // open descriptor. Keep its old inode lease until that
+                    // requested scope leaves, without resolving the old path.
+                    if let Some(previous) = self.resolved.get(path) {
+                        needed.insert(previous.clone());
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -514,9 +526,14 @@ impl WindowProtections {
             };
             if !self.directories.contains_key(&directory) {
                 match protect(&directory) {
-                    Ok(guard) => { self.directories.insert(directory.clone(), guard); }
+                    Ok(guard) => {
+                        self.directories.insert(directory.clone(), guard);
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         missing.insert(path.clone());
+                        if let Some(previous) = self.resolved.get(path) {
+                            needed.insert(previous.clone());
+                        }
                         continue;
                     }
                     Err(error) => {
@@ -525,10 +542,16 @@ impl WindowProtections {
                     }
                 }
             }
+            self.resolved.insert(path.clone(), directory.clone());
             needed.insert(directory);
         }
+        self.resolved
+            .retain(|path, _| self.requested.contains(path));
         if missing != self.missing && !missing.is_empty() {
-            tracing::debug!(?missing, "missing window directories need no worktree cleanup protection");
+            tracing::debug!(
+                ?missing,
+                "window directories are missing; retaining any existing worktree leases"
+            );
         }
         self.missing = missing;
         if errors.is_empty() {
@@ -539,7 +562,8 @@ impl WindowProtections {
                 }
             }
             if errors.is_empty() {
-                self.directories.retain(|directory, _| needed.contains(directory));
+                self.directories
+                    .retain(|directory, _| needed.contains(directory));
                 self.retry_after = (!self.missing.is_empty()).then_some(now + RETRY_DELAY);
                 self.last_failure = None;
                 return Ok(());
@@ -846,6 +870,61 @@ mod tests {
     }
 
     #[test]
+    fn sync_retains_moved_directory_inode_lease_until_scope_leaves() {
+        let runtime = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("original");
+        let moved = fixture.path().join("moved");
+        let present = fixture.path().join("present");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&present).unwrap();
+        let mut window = WindowProtections::default();
+        let now = std::time::Instant::now();
+        let sync = |window: &mut WindowProtections, paths: Vec<PathBuf>, now| {
+            window.sync_with(
+                paths,
+                now,
+                |path| path.canonicalize(),
+                |path| acquire(runtime.path(), path, false),
+                || {
+                    crate::instance::owned_lock(
+                        &runtime.path().join("ready"),
+                        libc::LOCK_EX | libc::LOCK_NB,
+                    )
+                },
+            )
+        };
+        sync(&mut window, vec![original.clone()], now).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        // A changed set forces a refresh while the old requested path is
+        // missing. Readiness survives, and the moved inode remains protected.
+        sync(&mut window, vec![original.clone(), present.clone()], now).unwrap();
+        assert!(window.ready.is_some());
+        assert_eq!(
+            acquire(runtime.path(), &moved, true).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Timer-driven retries retain the same lease as well.
+        sync(
+            &mut window,
+            vec![original, present.clone()],
+            now + std::time::Duration::from_secs(31),
+        )
+        .unwrap();
+        assert_eq!(
+            acquire(runtime.path(), &moved, true).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        sync(
+            &mut window,
+            vec![present],
+            now + std::time::Duration::from_secs(32),
+        )
+        .unwrap();
+        acquire(runtime.path(), &moved, true).unwrap();
+    }
+
+    #[test]
     fn directory_protection_blocks_removal_until_every_window_releases_it() {
         let runtime = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -884,19 +963,39 @@ mod tests {
         let paths = vec![present.path().to_owned(), missing.clone()];
         let mut window = WindowProtections::default();
         let now = std::time::Instant::now();
-        window.sync_with(paths.clone(), now, |path| path.canonicalize(),
-            |path| acquire(runtime.path(), path, false),
-            || crate::instance::owned_lock(&runtime.path().join("ready"), libc::LOCK_EX | libc::LOCK_NB),
-        ).unwrap();
+        window
+            .sync_with(
+                paths.clone(),
+                now,
+                |path| path.canonicalize(),
+                |path| acquire(runtime.path(), path, false),
+                || {
+                    crate::instance::owned_lock(
+                        &runtime.path().join("ready"),
+                        libc::LOCK_EX | libc::LOCK_NB,
+                    )
+                },
+            )
+            .unwrap();
         assert!(window.ready.is_some());
         assert!(window.missing.contains(&missing));
         assert_eq!(window.directories.len(), 1);
-        assert_eq!(acquire(runtime.path(), present.path(), true).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            acquire(runtime.path(), present.path(), true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         for _ in 0..100 {
-            window.sync_with(paths.clone(), now, |_| panic!("unchanged scopes performed filesystem I/O"),
-                |_| panic!("unchanged scopes acquired a lease"),
-                || panic!("unchanged scopes republished readiness"),
-            ).unwrap();
+            window
+                .sync_with(
+                    paths.clone(),
+                    now,
+                    |_| panic!("unchanged scopes performed filesystem I/O"),
+                    |_| panic!("unchanged scopes acquired a lease"),
+                    || panic!("unchanged scopes republished readiness"),
+                )
+                .unwrap();
         }
     }
 
@@ -905,16 +1004,36 @@ mod tests {
         let paths = vec![PathBuf::from("/scope")];
         let mut window = WindowProtections::default();
         let now = std::time::Instant::now();
-        assert!(window.sync_with(paths.clone(), now, |path| Ok(path.to_owned()),
-            |_| Err(io::Error::other("lease busy")), || panic!("failed scopes cannot be ready"),
-        ).is_err());
-        window.sync_with(paths.clone(), now, |_| panic!("cached failure performed I/O"),
-            |_| panic!("cached failure acquired a lease"), || panic!("failed scopes cannot be ready"),
-        ).unwrap();
+        assert!(
+            window
+                .sync_with(
+                    paths.clone(),
+                    now,
+                    |path| Ok(path.to_owned()),
+                    |_| Err(io::Error::other("lease busy")),
+                    || panic!("failed scopes cannot be ready"),
+                )
+                .is_err()
+        );
+        window
+            .sync_with(
+                paths.clone(),
+                now,
+                |_| panic!("cached failure performed I/O"),
+                |_| panic!("cached failure acquired a lease"),
+                || panic!("failed scopes cannot be ready"),
+            )
+            .unwrap();
         // The same failure after the retry deadline is not emitted again.
-        window.sync_with(paths, now + std::time::Duration::from_secs(31), |path| Ok(path.to_owned()),
-            |_| Err(io::Error::other("lease busy")), || panic!("failed scopes cannot be ready"),
-        ).unwrap();
+        window
+            .sync_with(
+                paths,
+                now + std::time::Duration::from_secs(31),
+                |path| Ok(path.to_owned()),
+                |_| Err(io::Error::other("lease busy")),
+                || panic!("failed scopes cannot be ready"),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -923,10 +1042,20 @@ mod tests {
         let now = std::time::Instant::now();
         let mut attempts = 0;
         for paths in [vec![PathBuf::from("/one")], vec![PathBuf::from("/two")]] {
-            assert!(window.sync_with(paths, now, |path| Ok(path.to_owned()),
-                |_| { attempts += 1; Err(io::Error::other("lease busy")) },
-                || panic!("failed scopes cannot be ready"),
-            ).is_err());
+            assert!(
+                window
+                    .sync_with(
+                        paths,
+                        now,
+                        |path| Ok(path.to_owned()),
+                        |_| {
+                            attempts += 1;
+                            Err(io::Error::other("lease busy"))
+                        },
+                        || panic!("failed scopes cannot be ready"),
+                    )
+                    .is_err()
+            );
         }
         assert_eq!(attempts, 2);
     }
@@ -938,13 +1067,31 @@ mod tests {
         let paths = vec![directory.path().to_owned()];
         let mut window = WindowProtections::default();
         let now = std::time::Instant::now();
-        assert!(window.sync_with(paths.clone(), now, |path| path.canonicalize(),
-            |_| Err(io::Error::other("lease busy")), || panic!("failed scopes cannot be ready"),
-        ).is_err());
-        window.sync_with(paths, now + std::time::Duration::from_secs(31), |path| path.canonicalize(),
-            |path| acquire(runtime.path(), path, false),
-            || crate::instance::owned_lock(&runtime.path().join("ready"), libc::LOCK_EX | libc::LOCK_NB),
-        ).unwrap();
+        assert!(
+            window
+                .sync_with(
+                    paths.clone(),
+                    now,
+                    |path| path.canonicalize(),
+                    |_| Err(io::Error::other("lease busy")),
+                    || panic!("failed scopes cannot be ready"),
+                )
+                .is_err()
+        );
+        window
+            .sync_with(
+                paths,
+                now + std::time::Duration::from_secs(31),
+                |path| path.canonicalize(),
+                |path| acquire(runtime.path(), path, false),
+                || {
+                    crate::instance::owned_lock(
+                        &runtime.path().join("ready"),
+                        libc::LOCK_EX | libc::LOCK_NB,
+                    )
+                },
+            )
+            .unwrap();
         assert!(window.ready.is_some());
         assert!(window.last_failure.is_none());
         assert!(window.retry_after.is_none());
