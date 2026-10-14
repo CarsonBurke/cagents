@@ -443,9 +443,14 @@ impl Cagents {
         else {
             return Vec::new();
         };
+        // A pane closing, starting, or still an unused default has no settled
+        // shared descriptor to transfer.
         let movable = self
             .card_state(card)
-            .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility());
+            .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
+            && self.workspace.pending_close().is_none()
+            && !self.durable.pending_terminal_creations.contains(&card)
+            && !self.shared_views.defaults.contains_key(&card);
         if !movable || !source.cards.contains(&card) {
             return Vec::new();
         }
@@ -530,7 +535,7 @@ impl Cagents {
             .channels
             .iter()
             .find(|channel| channel.id == destination)
-            .map(|channel| channel.title.clone())
+            .map(|channel| channel_display_title(channel).to_owned())
             .unwrap_or_default();
         let moved = match self.unmount_pane_surface(card) {
             Some(update) => self.apply_viewport(update, true, true),

@@ -243,7 +243,10 @@ impl Cagents {
         if let Some(card) = self.workspace.focused() {
             for channel in self.pane_move_destinations(card) {
                 entries.push((
-                    format!("{MOVE_PANE_LABEL}{}", channel.title),
+                    format!(
+                        "{MOVE_PANE_LABEL}{}",
+                        channel_ui::channel_display_title(channel)
+                    ),
                     String::new(),
                     Message::MovePaneToChannel {
                         card,

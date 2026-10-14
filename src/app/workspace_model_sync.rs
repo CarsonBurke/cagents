@@ -453,7 +453,7 @@ impl Cagents {
                 tracing::warn!(?scope, %operation, %error, "the registry refused a view edit");
                 self.shared_views.refused(operation);
                 self.status = Some(TransientNotice::warning(format!(
-                    "Another window or the daemon refused this pane change: {error}"
+                    "The pane change was not applied: {error}"
                 )));
                 // The registry still holds the view as it was, so projecting
                 // it again puts the pane back where every other window sees it.

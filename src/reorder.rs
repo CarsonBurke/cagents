@@ -229,6 +229,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                 || (*alt && !state.modifiers.alt());
             if cancel && state.drag.take().is_some() {
                 state.suppress_release = true;
+                // Told now, before a release in the same batch reaches a
+                // target outside the strip.
+                if state.announced.take().is_some()
+                    && let Some(dragging) = dragging
+                {
+                    shell.publish(dragging(None));
+                }
                 shell.request_redraw();
             }
             if matches!(
@@ -504,7 +511,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
 ///
 /// A strip captures pointer events while it drags, and a sibling sees them
 /// before or after it depending on where it sits in the tree, so this ignores
-/// capture: it is only mounted while a drag is held.
+/// capture: it is only mounted while a drag is held. A press that starts on
+/// the target is a click, so its release goes to `content` instead.
 pub fn drop_target<'a, Message: Clone + 'a>(
     content: impl Into<Element<'a, Message>>,
     dropped: Message,
@@ -521,7 +529,11 @@ struct DropTarget<'a, Message> {
 }
 
 #[derive(Default)]
-struct Over(bool);
+struct Over {
+    over: bool,
+    /// A press began on the target itself, so its release is a click.
+    pressed: bool,
+}
 
 impl<Message: Clone> Widget<Message, Theme, Renderer> for DropTarget<'_, Message> {
     fn tag(&self) -> tree::Tag {
@@ -576,21 +588,24 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for DropTarget<'_, Message
             .intersection(viewport)
             .is_some_and(|bounds| cursor.is_over(bounds));
         let state = tree.state.downcast_mut::<Over>();
-        if state.0 != over {
-            state.0 = over;
+        if state.over != over {
+            state.over = over;
             shell.request_redraw();
         }
-        if over
-            && matches!(
-                event,
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-            )
-        {
-            state.0 = false;
-            shell.publish(self.dropped.clone());
-            shell.capture_event();
-            shell.request_redraw();
-            return;
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                state.pressed = over;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if std::mem::take(&mut state.pressed) => {}
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if over => {
+                state.over = false;
+                shell.publish(self.dropped.clone());
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+            _ => {}
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -611,7 +626,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for DropTarget<'_, Message
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        if tree.state.downcast_ref::<Over>().0 {
+        if tree.state.downcast_ref::<Over>().over {
             return mouse::Interaction::Grabbing;
         }
         self.content.as_widget().mouse_interaction(
@@ -645,7 +660,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for DropTarget<'_, Message
             return;
         };
         // Every target reads as one at rest; the one under the pointer fills.
-        let over = tree.state.downcast_ref::<Over>().0;
+        let over = tree.state.downcast_ref::<Over>().over;
         let accent = design::accent_color(theme);
         renderer.with_layer(clipped, |renderer| {
             renderer.fill_quad(
@@ -1161,10 +1176,10 @@ mod tests {
         assert_eq!(released, vec![Action::Dragging(None)]);
         assert!(surface.moved(50.0).is_empty(), "the end is told once");
 
-        // Cancelled by Escape, the end is told on the next event.
+        // Cancelled by Escape, the end is told at once.
         surface.press(10.0);
         assert_eq!(surface.moved(30.0), vec![Action::Dragging(Some(ids[0]))]);
-        surface.event(
+        let cancelled = surface.event(
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
@@ -1176,7 +1191,8 @@ mod tests {
             }),
             30.0,
         );
-        assert_eq!(surface.moved(40.0), vec![Action::Dragging(None)]);
+        assert_eq!(cancelled, vec![Action::Dragging(None)]);
+        assert!(surface.moved(40.0).is_empty());
     }
 
     #[test]
@@ -1189,8 +1205,7 @@ mod tests {
                 .on_press(Action::Select(target)),
             Action::Drop(target, None),
         ));
-        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
-        let mut released = |cursor, captured: bool| {
+        let mut send = |button: mouse::Event, y: f32, captured: bool| {
             let mut messages = Vec::new();
             let mut shell = Shell::new(&mut messages);
             if captured {
@@ -1198,9 +1213,9 @@ mod tests {
             }
             surface.element.as_widget_mut().update(
                 &mut surface.tree,
-                &release,
+                &Event::Mouse(button),
                 Layout::new(&surface.node),
-                cursor,
+                mouse::Cursor::Available(Point::new(10.0, y)),
                 &surface.renderer,
                 &mut clipboard::Null,
                 &mut shell,
@@ -1208,10 +1223,19 @@ mod tests {
             );
             messages
         };
-        assert!(released(mouse::Cursor::Available(Point::new(10.0, 300.0)), false).is_empty());
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+        assert!(send(release, 300.0, false).is_empty(), "released elsewhere");
         assert_eq!(
-            released(mouse::Cursor::Available(Point::new(10.0, 15.0)), true),
-            vec![Action::Drop(target, None)]
+            send(release, 15.0, true),
+            vec![Action::Drop(target, None)],
+            "a drag from the strip, whose release it captured"
+        );
+        assert!(send(press, 15.0, false).is_empty());
+        assert_eq!(
+            send(release, 15.0, false),
+            vec![Action::Select(target)],
+            "a click on the target stays a click"
         );
     }
 }

@@ -2540,23 +2540,40 @@ mod tests {
             generation: generation.wrapping_add(1),
             card: Some(pane.id),
         }));
-        assert!(!app.sidebar_state.pane_drop_armed(b), "a stale strip arms nothing");
+        assert!(
+            !app.sidebar_state.pane_drop_armed(pane.id, b),
+            "a stale strip arms nothing"
+        );
         drop(app.update(Message::PaneDrag {
             generation,
             card: Some(pane.id),
         }));
-        assert!(app.sidebar_state.pane_drop_armed(b));
-        assert!(!app.sidebar_state.pane_drop_armed(a));
+        assert!(app.sidebar_state.pane_drop_armed(pane.id, b));
+        assert!(!app.sidebar_state.pane_drop_armed(pane.id, a));
         assert!(
             app.palette_entries()
                 .iter()
                 .any(|(label, _, _)| label == "Move pane to channel: view")
         );
+        // A cancel in the batch disarms the targets before its release lands.
+        drop(app.update(Message::PaneDrag {
+            generation,
+            card: None,
+        }));
         drop(app.update(Message::Sidebar(SidebarAction::DropPane {
             card: pane.id,
             channel_id: b,
         })));
-        assert!(!app.sidebar_state.pane_drop_armed(b));
+        assert_eq!(members(&app, a), vec![pane.id], "a cancelled drag drops nothing");
+        drop(app.update(Message::PaneDrag {
+            generation,
+            card: Some(pane.id),
+        }));
+        drop(app.update(Message::Sidebar(SidebarAction::DropPane {
+            card: pane.id,
+            channel_id: b,
+        })));
+        assert!(!app.sidebar_state.pane_drop_armed(pane.id, b));
         assert_eq!(members(&app, b), vec![pane.id]);
         assert!(rx.try_recv().is_ok());
     }

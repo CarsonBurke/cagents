@@ -1421,7 +1421,7 @@ pub(super) fn relocate_agent(
     // A view in another project is no placement the agent can be validated
     // against; its old one keeps follow-ups working.
     if let Err(error) = require_placement(db, placement, &agent.spec.target.repository) {
-        tracing::warn!(agent = %agent.id, %error, "kept an agent placement its pane left");
+        tracing::debug!(agent = %agent.id, %error, "kept an agent placement its pane left");
         return Ok(false);
     }
     agent.placement = placement.clone();
@@ -1452,10 +1452,15 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let mut moved = 0;
         for (id, scope) in owned {
-            let pane = id
+            // One unreadable record must not hold back every other agent.
+            let relocated = id
                 .parse()
-                .map_err(|error| format!("stored agent id `{id}` is unreadable: {error}"))?;
-            moved += usize::from(relocate_agent(&tx, pane, &decode(&scope)?)?);
+                .map_err(|error| format!("unreadable agent id: {error}"))
+                .and_then(|pane| relocate_agent(&tx, pane, &decode(&scope)?));
+            match relocated {
+                Ok(relocated) => moved += usize::from(relocated),
+                Err(error) => tracing::warn!(agent = %id, %error, "kept an agent placement"),
+            }
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(moved)
@@ -1465,7 +1470,7 @@ impl Registry {
 /// Whether `stored` is still the execution `accepted` captured. A pane moved
 /// in the meantime changes only where the agent is shown, which dispatch
 /// re-validates on its own.
-fn same_execution(stored: &Agent, accepted: &Agent) -> bool {
+pub(super) fn same_execution(stored: &Agent, accepted: &Agent) -> bool {
     Agent {
         placement: accepted.placement.clone(),
         ..stored.clone()

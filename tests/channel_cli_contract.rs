@@ -1,11 +1,12 @@
 #![cfg(feature = "host")]
 
+use cagents::terminal::ipc::ProtocolErrorCode;
 use cagents::{
-    control::ControlClient,
+    control::{ControlClient, ControlError},
     model::{BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind},
     workspace_model::{
         ModelEdit, WorkspaceModel,
-        views::{Pane, Scope},
+        views::{Change, Pane, Scope},
     },
 };
 use serde_json::Value;
@@ -259,6 +260,38 @@ fn a_pane_moves_between_channels_of_its_project_intact_and_durably() {
             .unwrap()
             .contains("only within one project"),
         "{error}"
+    );
+    // The daemon refuses it alike when a client skips the CLI's check.
+    let scope = Scope::Channel(destination.parse().unwrap());
+    let refused = fixture
+        .client()
+        .edit_workspace_model(ModelEdit::ChangeView {
+            expected_revision: fixture
+                .model()
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .revision,
+            scope,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Transfer {
+                id: moving.id,
+                destination: Scope::Channel(foreign.parse().unwrap()),
+                before: None,
+            },
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            ControlError::Remote {
+                code: ProtocolErrorCode::InvalidRequest,
+                retryable: false,
+                ..
+            }
+        ),
+        "{refused:?}"
     );
     let unknown = uuid::Uuid::new_v4().to_string();
     fixture.refused(&["channel", "move", &unknown, "--to", &destination]);

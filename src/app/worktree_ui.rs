@@ -738,6 +738,8 @@ impl Cagents {
         self.set_workspace_surfaces_visible(false);
         self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
+        // The strip a drag came from is gone, and with it the drag.
+        self.arm_pane_drop(None);
         // Iced inherits old anonymous IDs during diff. A named generation ID
         // forces a new scroll state so operations address this worktree's strip.
         self.workspace_scroll_id = widget::Id::new(format!(

@@ -435,7 +435,8 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        if &agent != expected
+        // A pane moved meanwhile changes only where the agent is shown.
+        if !super::execution::same_execution(&agent, expected)
             || firing.agent != Some(agent.id)
             || firing.run.map(|id| id.to_string()).as_deref() != Some(latest.as_str())
             || automation.active_firing != Some(firing.id)

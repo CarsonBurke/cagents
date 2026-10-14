@@ -2919,11 +2919,11 @@ impl SidebarState {
         self.pane_drop = drop.filter(|(_, channels)| !channels.is_empty());
     }
 
-    #[cfg(test)]
-    pub fn pane_drop_armed(&self, channel: ChannelId) -> bool {
+    /// Whether `channel` is armed to take `card`.
+    pub fn pane_drop_armed(&self, card: CardId, channel: ChannelId) -> bool {
         self.pane_drop
             .as_ref()
-            .is_some_and(|(_, channels)| channels.contains(&channel))
+            .is_some_and(|(armed, channels)| *armed == card && channels.contains(&channel))
     }
 
     pub fn worktree_has_panes(&self, project: ProjectId, worktree: WorktreeId) -> bool {

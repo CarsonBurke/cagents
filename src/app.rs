@@ -14348,9 +14348,14 @@ impl Application for Cagents {
                     SidebarAction::DeleteChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
                     }
-                    SidebarAction::DropPane { card, channel_id } => {
+                    // A drop counts only while its drag is held: a cancel in
+                    // the same batch disarms the target before this arrives.
+                    SidebarAction::DropPane { card, channel_id }
+                        if self.sidebar_state.pane_drop_armed(card, channel_id) =>
+                    {
                         self.move_pane_to_channel(card, channel_id)
                     }
+                    SidebarAction::DropPane { .. } => Task::none(),
                     SidebarAction::FilesPage { key, .. } => Self::reset_files_scroll(&key),
                     SidebarAction::FilesQueryChanged { key, .. } => {
                         let reload = if self.folder_scope(&key) {

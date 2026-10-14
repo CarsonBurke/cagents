@@ -2089,7 +2089,7 @@ impl Cagents {
             if destinations.len() <= MENU_MOVE_DESTINATIONS {
                 entries.extend(destinations.into_iter().map(|channel| {
                     widget::menu::Item::Button(
-                        format!("Move to {}", channel.title),
+                        format!("Move to {}", channel_ui::channel_display_title(channel)),
                         None,
                         PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
                     )
