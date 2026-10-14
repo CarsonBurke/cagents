@@ -722,6 +722,9 @@ enum RenameTarget {
     Channel(crate::model::ChannelId),
 }
 
+/// How many channels a pane's menu lists before deferring to the palette.
+const MENU_MOVE_DESTINATIONS: usize = 5;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaneMenuCommand {
     Rename,
@@ -734,6 +737,8 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    MoveTo(crate::model::ChannelId),
+    MoveToChannel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -754,6 +759,8 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
             PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
             PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::MoveTo(channel) => return Message::MovePaneToChannel { card: id, channel },
+            PaneMenuCommand::MoveToChannel => return Message::Palette(palette_ui::Action::MovePane(id)),
         })
     }
 }
@@ -1664,6 +1671,7 @@ impl Cagents {
                     generation,
                     event: WorkspaceViewportEvent::Reordered { card, before },
                 }),
+                dragging: Some(Box::new(move |card| Message::PaneDrag { generation, card })),
             },
         );
         let actions = widget::row::with_children(self.workflow_header())
@@ -2072,6 +2080,25 @@ impl Cagents {
                     "Review file changes".into(),
                     None,
                     PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
+                ));
+            }
+            let destinations = self.pane_move_destinations(id);
+            if !destinations.is_empty() {
+                entries.push(widget::menu::Item::Divider);
+            }
+            if destinations.len() <= MENU_MOVE_DESTINATIONS {
+                entries.extend(destinations.into_iter().map(|channel| {
+                    widget::menu::Item::Button(
+                        format!("Move to {}", channel.title),
+                        None,
+                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
+                    )
+                }));
+            } else {
+                entries.push(widget::menu::Item::Button(
+                    "Move to channel…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::MoveToChannel),
                 ));
             }
             widget::menu::items(&HashMap::new(), entries)

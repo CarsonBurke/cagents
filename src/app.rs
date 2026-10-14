@@ -4121,6 +4121,15 @@ pub enum Message {
         generation: u64,
         event: WorkspaceViewportEvent,
     },
+    /// A tab drag passed its threshold (`Some`) or ended (`None`).
+    PaneDrag {
+        generation: u64,
+        card: Option<CardId>,
+    },
+    MovePaneToChannel {
+        card: CardId,
+        channel: crate::model::ChannelId,
+    },
     #[cfg(feature = "latency-harness")]
     LatencyRedraw {
         generation: crate::performance::Generation,
@@ -14339,6 +14348,9 @@ impl Application for Cagents {
                     SidebarAction::DeleteChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
                     }
+                    SidebarAction::DropPane { card, channel_id } => {
+                        self.move_pane_to_channel(card, channel_id)
+                    }
                     SidebarAction::FilesPage { key, .. } => Self::reset_files_scroll(&key),
                     SidebarAction::FilesQueryChanged { key, .. } => {
                         let reload = if self.folder_scope(&key) {
@@ -15108,6 +15120,12 @@ impl Application for Cagents {
                 self.commit_card_removal(id, None)
                     .unwrap_or_else(Task::none)
             }
+            Message::PaneDrag { generation, card } => {
+                // Only a pane of the strip on screen arms other channels.
+                self.arm_pane_drop(card.filter(|_| generation == self.workspace_view_generation));
+                Task::none()
+            }
+            Message::MovePaneToChannel { card, channel } => self.move_pane_to_channel(card, channel),
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
                 // must never mutate the newly selected strip.
@@ -15115,6 +15133,7 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 if let WorkspaceViewportEvent::Reordered { card, before } = event {
+                    self.arm_pane_drop(None);
                     return self.reorder_pane(card, before);
                 }
                 if matches!(event, WorkspaceViewportEvent::DragScrolled(_))

@@ -34,6 +34,18 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Whether edits to `scope` publish against an adopted registry view.
+    pub(super) fn synchronized(&self, scope: &Scope) -> bool {
+        self.initialized.contains(scope)
+            && !self.seeding.contains(scope)
+            && !self.blocked.contains(scope)
+    }
+
+    /// Forgets an edit the registry refused, so it is no longer replayed.
+    pub(super) fn refused(&mut self, operation: uuid::Uuid) {
+        self.pending.retain(|(id, _, _)| *id != operation);
+    }
+
     pub(super) fn prune_restoration_requests(&mut self, workspace: &WorkspaceState) {
         if self.restoration_requests.is_empty() {
             return;
@@ -1150,6 +1162,30 @@ impl Cagents {
         self.sidebar_state.clear_agent_activity(id);
     }
 
+    /// Takes a pane's surface off the strip, leaving the actor and its local
+    /// runtime available to the view it moved into.
+    pub(super) fn unmount_pane_surface(&mut self, id: CardId) -> Option<ViewportUpdate> {
+        match self.cards.get_mut(&id) {
+            Some(CardRuntime::Terminal(surface)) => {
+                let _ = surface.focus(false);
+                let _ = surface.hide();
+            }
+            Some(CardRuntime::Chat(runtime)) => {
+                let _ = runtime.set_visible(false);
+            }
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(browser)) => {
+                let _ = browser.handle.set_visible(false);
+            }
+            _ => {}
+        }
+        if let Some(state) = self.card_state_mut(id) {
+            state.exposure = Exposure::Offscreen;
+        }
+        self.workspace.request_close(id).ok()?;
+        self.workspace.commit_close(id).ok()
+    }
+
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
@@ -1161,30 +1197,7 @@ impl Cagents {
             .filter(|id| !visible.contains(id))
             .collect::<Vec<_>>();
         for id in removed {
-            // A transfer removes only this surface, leaving the actor and its
-            // local runtime available in the destination view.
-            match self.cards.get_mut(&id) {
-                Some(CardRuntime::Terminal(surface)) => {
-                    let _ = surface.focus(false);
-                    let _ = surface.hide();
-                }
-                Some(CardRuntime::Chat(runtime)) => {
-                    let _ = runtime.set_visible(false);
-                }
-                #[cfg(feature = "integrated-browser")]
-                Some(CardRuntime::Browser(browser)) => {
-                    let _ = browser.handle.set_visible(false);
-                }
-                _ => {}
-            }
-            if let Some(state) = self.card_state_mut(id) {
-                state.exposure = Exposure::Offscreen;
-            }
-            if self.workspace.request_close(id).is_ok() {
-                if let Ok(update) = self.workspace.commit_close(id) {
-                    updates.push(update);
-                }
-            }
+            updates.extend(self.unmount_pane_surface(id));
         }
         for (index, pane) in panes.iter().enumerate() {
             if self.workspace.card(pane.id).is_none() {
@@ -2409,5 +2422,142 @@ mod tests {
         ));
         app.acknowledge_view_edit(Scope::Channel(a), None);
         assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
+    }
+
+    /// A pane of the active channel, projected from the registry, with every
+    /// edit the window publishes captured.
+    fn moving() -> (
+        Cagents,
+        ChannelId,
+        ChannelId,
+        Pane,
+        async_channel::Receiver<ModelEdit>,
+    ) {
+        let (mut app, a, b, pane) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(a);
+        let mut view = View::empty(a);
+        view.panes.push(pane.clone());
+        app.workspace_model.views = vec![view, View::empty(b)];
+        drop(app.reconcile_shared_views());
+        assert_eq!(app.workspace.focused(), Some(pane.id));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        (app, a, b, pane, rx)
+    }
+
+    fn members(app: &Cagents, channel: ChannelId) -> Vec<CardId> {
+        app.durable
+            .channels
+            .iter()
+            .find(|candidate| candidate.id == channel)
+            .unwrap()
+            .cards
+            .clone()
+    }
+
+    #[test]
+    fn moving_a_pane_publishes_one_transfer_and_keeps_its_runtime() {
+        let (mut app, a, b, pane, rx) = moving();
+        assert_eq!(
+            app.pane_move_destinations(pane.id)
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![b]
+        );
+        drop(app.move_pane_to_channel(pane.id, b));
+        assert!(members(&app, a).is_empty(), "a move keeps the emptied channel");
+        assert_eq!(members(&app, b), vec![pane.id]);
+        assert!(app.workspace.card(pane.id).is_none());
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            matches!(
+                edits.as_slice(),
+                [ModelEdit::ChangeView {
+                    scope,
+                    change: Change::Transfer { id, destination, before: None },
+                    ..
+                }] if *scope == Scope::Channel(a)
+                    && *id == pane.id
+                    && *destination == Scope::Channel(b)
+            ),
+            "{edits:?}"
+        );
+    }
+
+    #[test]
+    fn a_pane_moves_only_into_a_synchronized_channel_of_its_project() {
+        let (mut app, a, b, pane, rx) = moving();
+        let foreign = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: foreign,
+                project_id: ProjectId::new(),
+                title: "elsewhere".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![],
+                focused: None,
+            });
+        app.shared_views.initialized.insert(Scope::Channel(foreign));
+        drop(app.move_pane_to_channel(pane.id, foreign));
+        app.shared_views.initialized.remove(&Scope::Channel(b));
+        drop(app.move_pane_to_channel(pane.id, b));
+        assert_eq!(members(&app, a), vec![pane.id]);
+        assert!(members(&app, b).is_empty() && members(&app, foreign).is_empty());
+        assert_eq!(app.workspace.focused(), Some(pane.id));
+        assert!(rx.try_recv().is_err(), "nothing was published");
+    }
+
+    #[test]
+    fn a_refused_move_returns_the_pane_to_where_the_registry_keeps_it() {
+        let (mut app, a, b, pane, rx) = moving();
+        drop(app.move_pane_to_channel(pane.id, b));
+        let Ok(ModelEdit::ChangeView { operation, .. }) = rx.try_recv() else {
+            panic!("the move published no transfer");
+        };
+        drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::ViewRefused {
+            scope: Scope::Channel(a),
+            operation,
+            error: "refused".into(),
+        }));
+        assert!(app.shared_views.pending.is_empty());
+        assert_eq!(members(&app, a), vec![pane.id]);
+        assert!(members(&app, b).is_empty());
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(app.workspace.card(pane.id).is_some(), "back on the strip");
+    }
+
+    #[test]
+    fn a_dragged_pane_arms_its_projects_other_channels_and_drops_into_one() {
+        let (mut app, a, b, pane, rx) = moving();
+        let generation = app.workspace_view_generation;
+        drop(app.update(Message::PaneDrag {
+            generation: generation.wrapping_add(1),
+            card: Some(pane.id),
+        }));
+        assert!(!app.sidebar_state.pane_drop_armed(b), "a stale strip arms nothing");
+        drop(app.update(Message::PaneDrag {
+            generation,
+            card: Some(pane.id),
+        }));
+        assert!(app.sidebar_state.pane_drop_armed(b));
+        assert!(!app.sidebar_state.pane_drop_armed(a));
+        assert!(
+            app.palette_entries()
+                .iter()
+                .any(|(label, _, _)| label == "Move pane to channel: view")
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::DropPane {
+            card: pane.id,
+            channel_id: b,
+        })));
+        assert!(!app.sidebar_state.pane_drop_armed(b));
+        assert_eq!(members(&app, b), vec![pane.id]);
+        assert!(rx.try_recv().is_ok());
     }
 }

@@ -20,12 +20,15 @@ pub enum Action {
     Query(String),
     Run(MessageBox),
     Submit,
+    /// Opens on the channels a pane can move into.
+    MovePane(CardId),
 }
 // Box breaks the recursive Message/Action representation.
 #[derive(Debug, Clone)]
 pub struct MessageBox(pub Box<Message>);
 
 const ROW_HEIGHT: f32 = 40.0;
+const MOVE_PANE_LABEL: &str = "Move pane to channel: ";
 const ROW_SPACING: f32 = space::XXS;
 
 impl Cagents {
@@ -45,6 +48,14 @@ impl Cagents {
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::MovePane(card) => {
+                let focus = self.update(Message::FocusCard(card));
+                let open = self.update_palette(Action::Open);
+                if self.palette.query.is_some() {
+                    self.palette.query = Some(MOVE_PANE_LABEL.to_owned());
+                }
+                Task::batch([focus, open])
             }
             Action::Close => {
                 self.palette.recording = None;
@@ -199,7 +210,7 @@ impl Cagents {
         )
     }
 
-    fn palette_entries(&self) -> Vec<(String, String, Message)> {
+    pub(super) fn palette_entries(&self) -> Vec<(String, String, Message)> {
         let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.action != Command::CommandPalette)
@@ -226,6 +237,18 @@ impl Cagents {
                     format!("Focus pane: {}", self.card_display_title(card)),
                     String::new(),
                     Message::FocusCard(id),
+                ));
+            }
+        }
+        if let Some(card) = self.workspace.focused() {
+            for channel in self.pane_move_destinations(card) {
+                entries.push((
+                    format!("{MOVE_PANE_LABEL}{}", channel.title),
+                    String::new(),
+                    Message::MovePaneToChannel {
+                        card,
+                        channel: channel.id,
+                    },
                 ));
             }
         }

@@ -54,6 +54,7 @@ pub fn strip<'a, Message: 'a>(
     scroll: Option<Box<dyn Fn(f32) -> Message + 'a>>,
     select: impl Fn(CardId) -> Message + 'a,
     dropped: impl Fn(CardId, Option<CardId>) -> Message + 'a,
+    dragging: Option<Box<dyn Fn(Option<CardId>) -> Message + 'a>>,
 ) -> Element<'a, Message> {
     Element::new(Reorder {
         content: content.into(),
@@ -64,6 +65,7 @@ pub fn strip<'a, Message: 'a>(
             scroll,
             select: Box::new(select),
             dropped: Box::new(dropped),
+            dragging,
         },
     })
 }
@@ -77,6 +79,9 @@ enum Kind<'a, Message> {
         scroll: Option<Box<dyn Fn(f32) -> Message + 'a>>,
         select: Box<dyn Fn(CardId) -> Message + 'a>,
         dropped: Box<dyn Fn(CardId, Option<CardId>) -> Message + 'a>,
+        /// Told when a drag passes its threshold (`Some`) and once it ends
+        /// (`None`), so targets outside the strip can accept the pane.
+        dragging: Option<Box<dyn Fn(Option<CardId>) -> Message + 'a>>,
     },
 }
 struct Reorder<'a, Message> {
@@ -88,6 +93,8 @@ struct State {
     modifiers: keyboard::Modifiers,
     drag: Option<Drag>,
     suppress_release: bool,
+    /// The drag `dragging` was last told about, until it hears it ended.
+    announced: Option<CardId>,
 }
 struct Drag {
     source: CardId,
@@ -192,9 +199,18 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
             scroll,
             select,
             dropped,
+            dragging,
         } = &self.kind
         {
             let state = tree.state.downcast_mut::<State>();
+            // A drag ends by release, cancel or a strip rebuilt under it; the
+            // next event after any of them reports the end.
+            if state.drag.is_none()
+                && state.announced.take().is_some()
+                && let Some(dragging) = dragging
+            {
+                shell.publish(dragging(None));
+            }
             if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
                 state.modifiers = *modifiers;
             }
@@ -274,11 +290,22 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                     drag.position = point;
                     drag.moved |= point.distance(drag.origin) >= THRESHOLD;
                 }
+                if drag.moved && state.announced != Some(drag.source) {
+                    state.announced = Some(drag.source);
+                    if let Some(dragging) = dragging {
+                        shell.publish(dragging(Some(drag.source)));
+                    }
+                }
                 if matches!(
                     event,
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
                 ) {
                     let drag = state.drag.take().unwrap();
+                    if state.announced.take().is_some()
+                        && let Some(dragging) = dragging
+                    {
+                        shell.publish(dragging(None));
+                    }
                     if cursor
                         .position()
                         .is_some_and(|point| clipped.is_some_and(|bounds| bounds.contains(point)))
@@ -385,6 +412,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                 .as_ref()
                 .filter(|drag| drag.moved)
             && let Some(clipped) = layout.bounds().intersection(viewport)
+            && cursor.position().is_some_and(|point| clipped.contains(point))
         {
             let bounds = layout.bounds();
             let successor = before(items, drag.source, drag.position.x - bounds.x);
@@ -471,6 +499,197 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
     }
 }
 
+/// Takes a pane dragged out of a strip, while one is held, by publishing
+/// `dropped` when it is released over `content`.
+///
+/// A strip captures pointer events while it drags, and a sibling sees them
+/// before or after it depending on where it sits in the tree, so this ignores
+/// capture: it is only mounted while a drag is held.
+pub fn drop_target<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    dropped: Message,
+) -> Element<'a, Message> {
+    Element::new(DropTarget {
+        content: content.into(),
+        dropped,
+    })
+}
+
+struct DropTarget<'a, Message> {
+    content: Element<'a, Message>,
+    dropped: Message,
+}
+
+#[derive(Default)]
+struct Over(bool);
+
+impl<Message: Clone> Widget<Message, Theme, Renderer> for DropTarget<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Over>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(Over::default())
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let over = layout
+            .bounds()
+            .intersection(viewport)
+            .is_some_and(|bounds| cursor.is_over(bounds));
+        let state = tree.state.downcast_mut::<Over>();
+        if state.0 != over {
+            state.0 = over;
+            shell.request_redraw();
+        }
+        if over
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            )
+        {
+            state.0 = false;
+            shell.publish(self.dropped.clone());
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        if tree.state.downcast_ref::<Over>().0 {
+            return mouse::Interaction::Grabbing;
+        }
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+        let Some(clipped) = layout.bounds().intersection(viewport) else {
+            return;
+        };
+        // Every target reads as one at rest; the one under the pointer fills.
+        let over = tree.state.downcast_ref::<Over>().0;
+        let accent = design::accent_color(theme);
+        renderer.with_layer(clipped, |renderer| {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds(),
+                    border: cosmic::iced::Border {
+                        color: accent.scale_alpha(if over { 1.0 } else { 0.4 }),
+                        width: 1.0,
+                        radius: theme.cosmic().corner_radii.radius_s.into(),
+                    },
+                    ..Default::default()
+                },
+                accent.scale_alpha(if over { 0.15 } else { 0.0 }),
+            );
+        });
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,9 +707,14 @@ mod tests {
         Close(CardId),
         Drop(CardId, Option<CardId>),
         Scroll(f32),
+        Dragging(Option<CardId>),
     }
 
     fn tabs(ids: &[CardId], alt: bool) -> Element<'static, Action> {
+        announcing(ids, alt, false)
+    }
+
+    fn announcing(ids: &[CardId], alt: bool, announce: bool) -> Element<'static, Action> {
         let row = widget::row::with_children(ids.iter().map(|&id| {
             crate::tab_strip::middle_click_close(
                 widget::row::with_children(vec![
@@ -528,6 +752,7 @@ mod tests {
             alt.then(|| Box::new(Action::Scroll) as Box<dyn Fn(f32) -> Action>),
             Action::Select,
             Action::Drop,
+            announce.then(|| Box::new(Action::Dragging) as Box<dyn Fn(Option<CardId>) -> Action>),
         );
         crate::interaction::horizontal_wheel(
             widget::scrollable::horizontal(content)
@@ -548,6 +773,9 @@ mod tests {
     }
     impl Surface {
         fn new(ids: &[CardId], alt: bool) -> Self {
+            Self::with(tabs(ids, alt))
+        }
+        fn with(mut element: Element<'static, Action>) -> Self {
             let renderer = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -558,7 +786,6 @@ mod tests {
                     Some("tiny-skia"),
                 ))
                 .unwrap();
-            let mut element = tabs(ids, alt);
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -909,5 +1136,82 @@ mod tests {
         surface.tree.diff(replacement.as_widget_mut());
         surface.element = replacement;
         assert!(surface.release(140.0).is_empty());
+    }
+
+    #[test]
+    fn a_drag_announces_itself_past_the_threshold_and_once_it_ends() {
+        let ids = [CardId::new(), CardId::new()];
+        let mut surface = Surface::with(announcing(&ids, false, true));
+        assert!(surface.press(10.0).is_empty());
+        assert!(surface.moved(12.0).is_empty(), "below the threshold");
+        assert_eq!(surface.moved(30.0), vec![Action::Dragging(Some(ids[0]))]);
+        assert!(surface.moved(40.0).is_empty(), "announced once");
+        // Released outside the strip, where a sidebar channel takes the drop.
+        let mut released = Vec::new();
+        surface.element.as_widget_mut().update(
+            &mut surface.tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            Layout::new(&surface.node),
+            mouse::Cursor::Levitating(Point::new(10.0, 300.0)),
+            &surface.renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut released),
+            &Rectangle::with_size(Size::new(160.0, 30.0)),
+        );
+        assert_eq!(released, vec![Action::Dragging(None)]);
+        assert!(surface.moved(50.0).is_empty(), "the end is told once");
+
+        // Cancelled by Escape, the end is told on the next event.
+        surface.press(10.0);
+        assert_eq!(surface.moved(30.0), vec![Action::Dragging(Some(ids[0]))]);
+        surface.event(
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            30.0,
+        );
+        assert_eq!(surface.moved(40.0), vec![Action::Dragging(None)]);
+    }
+
+    #[test]
+    fn a_drop_target_takes_a_release_over_it_even_once_captured() {
+        let target = CardId::new();
+        let mut surface = Surface::with(drop_target(
+            widget::button::custom(cosmic::iced::widget::Space::new())
+                .width(160)
+                .height(30)
+                .on_press(Action::Select(target)),
+            Action::Drop(target, None),
+        ));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let mut released = |cursor, captured: bool| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            if captured {
+                shell.capture_event();
+            }
+            surface.element.as_widget_mut().update(
+                &mut surface.tree,
+                &release,
+                Layout::new(&surface.node),
+                cursor,
+                &surface.renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(Size::new(160.0, 30.0)),
+            );
+            messages
+        };
+        assert!(released(mouse::Cursor::Available(Point::new(10.0, 300.0)), false).is_empty());
+        assert_eq!(
+            released(mouse::Cursor::Available(Point::new(10.0, 15.0)), true),
+            vec![Action::Drop(target, None)]
+        );
     }
 }

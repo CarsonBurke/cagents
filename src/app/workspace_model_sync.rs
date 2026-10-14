@@ -55,6 +55,13 @@ pub enum ModelUpdate {
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
     },
+    /// The registry refused a view edit outright, so the window's optimistic
+    /// copy of it has to be dropped rather than replayed.
+    ViewRefused {
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        error: String,
+    },
     NavigationFailed(String),
     Ranked {
         channel: ChannelId,
@@ -206,6 +213,16 @@ fn publish(
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
+                    }
+                    if let ModelEdit::ChangeView {
+                        scope, operation, ..
+                    } = &request
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                            scope: scope.clone(),
+                            operation: *operation,
+                            error: error.to_string(),
+                        });
                     }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
@@ -427,6 +444,20 @@ impl Cagents {
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::ViewRefused {
+                scope,
+                operation,
+                error,
+            } => {
+                tracing::warn!(?scope, %operation, %error, "the registry refused a view edit");
+                self.shared_views.refused(operation);
+                self.status = Some(TransientNotice::warning(format!(
+                    "Another window or the daemon refused this pane change: {error}"
+                )));
+                // The registry still holds the view as it was, so projecting
+                // it again puts the pane back where every other window sees it.
+                self.reconcile_shared_views()
             }
             ModelUpdate::Read(model) => {
                 if model.identity == self.workspace_model.identity

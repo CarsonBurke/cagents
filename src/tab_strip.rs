@@ -63,6 +63,7 @@ pub struct Reordering<'a, Message> {
     pub enabled: bool,
     pub select: Box<dyn Fn(crate::model::CardId) -> Message + 'a>,
     pub dropped: Box<dyn Fn(crate::model::CardId, Option<crate::model::CardId>) -> Message + 'a>,
+    pub dragging: Option<Box<dyn Fn(Option<crate::model::CardId>) -> Message + 'a>>,
 }
 
 pub fn reorderable<'a, Message: 'a>(
@@ -114,6 +115,7 @@ fn strip<'a, Message: 'a>(
             None,
             config.select,
             config.dropped,
+            config.dragging,
         ),
         None => row.into(),
     };

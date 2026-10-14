@@ -2753,6 +2753,8 @@ pub struct SidebarState {
     /// after its updates, never while drawing, so each row's read is one
     /// lookup however many cards are open.
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
+    /// A pane dragged from the tab strip and the channels that take it.
+    pane_drop: Option<(CardId, BTreeSet<ChannelId>)>,
     commit_draft: CommitDraft,
     parked_commit_drafts: BTreeMap<PathBuf, CommitDraft>,
     commit_generation: u64,
@@ -2910,6 +2912,18 @@ impl SidebarState {
     /// Replaces the worktrees that hold an open pane.
     pub fn set_worktrees_with_panes(&mut self, worktrees: BTreeSet<(ProjectId, WorktreeId)>) {
         self.worktrees_with_panes = worktrees;
+    }
+
+    /// Arms `channels` to take `card`, or disarms every channel.
+    pub fn set_pane_drop(&mut self, drop: Option<(CardId, BTreeSet<ChannelId>)>) {
+        self.pane_drop = drop.filter(|(_, channels)| !channels.is_empty());
+    }
+
+    #[cfg(test)]
+    pub fn pane_drop_armed(&self, channel: ChannelId) -> bool {
+        self.pane_drop
+            .as_ref()
+            .is_some_and(|(_, channels)| channels.contains(&channel))
     }
 
     pub fn worktree_has_panes(&self, project: ProjectId, worktree: WorktreeId) -> bool {
@@ -3350,6 +3364,7 @@ impl SidebarState {
             | SidebarAction::NewWorktree { .. }
             | SidebarAction::NewChannel { .. }
             | SidebarAction::OpenChannel { .. }
+            | SidebarAction::DropPane { .. }
             | SidebarAction::DeleteChannel { .. }
             | SidebarAction::ReorderMember { .. }
             | SidebarAction::ReorderProject { .. }
@@ -3482,6 +3497,11 @@ pub enum SidebarAction {
         project_id: ProjectId,
     },
     OpenChannel {
+        channel_id: ChannelId,
+    },
+    /// A pane dragged from the tab strip was dropped on a channel.
+    DropPane {
+        card: CardId,
         channel_id: ChannelId,
     },
     /// Asks to delete a channel. The application confirms before removing
@@ -3805,6 +3825,7 @@ struct NavigationSnapshot {
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
+    pane_drop: Option<(CardId, BTreeSet<ChannelId>)>,
 }
 
 impl NavigationSnapshot {
@@ -3823,6 +3844,7 @@ impl NavigationSnapshot {
             && self.agent_updates == state.agent_updates
             && self.agent_activity == state.agent_activity
             && self.worktrees_with_panes == state.worktrees_with_panes
+            && self.pane_drop == state.pane_drop
     }
 
     fn capture(model: &SidebarModel, state: &SidebarState) -> Self {
@@ -3841,6 +3863,7 @@ impl NavigationSnapshot {
             agent_updates: state.agent_updates.clone(),
             agent_activity: state.agent_activity.clone(),
             worktrees_with_panes: state.worktrees_with_panes.clone(),
+            pane_drop: state.pane_drop.clone(),
         }
     }
 }
@@ -5173,15 +5196,19 @@ fn project_view<'a>(
                 crate::workspace_model::NavigationItem::Channel(channel.id),
                 SelectionRow::Channel(channel.id),
                 RowInteraction::selectable(
-                    channel_view(
-                        channel,
-                        modal_open,
-                        false,
-                        project
-                            .state
-                            .rows
-                            .group_size(SelectionRow::Channel(channel.id)),
-                        &project.state.query,
+                    pane_drop(
+                        channel_view(
+                            channel,
+                            modal_open,
+                            false,
+                            project
+                                .state
+                                .rows
+                                .group_size(SelectionRow::Channel(channel.id)),
+                            &project.state.query,
+                        ),
+                        channel.id,
+                        project.state,
                     ),
                     SelectionRow::Channel(channel.id),
                     project.state,
@@ -5323,15 +5350,19 @@ fn compact_project<'a>(
                 || channel.deletion.is_some())
     }) {
         column = column.push(RowInteraction::selectable(
-            channel_view(
-                channel,
-                modal_open,
-                true,
-                project
-                    .state
-                    .rows
-                    .group_size(SelectionRow::Channel(channel.id)),
-                &project.state.query,
+            pane_drop(
+                channel_view(
+                    channel,
+                    modal_open,
+                    true,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Channel(channel.id)),
+                    &project.state.query,
+                ),
+                channel.id,
+                project.state,
             ),
             SelectionRow::Channel(channel.id),
             project.state,
@@ -5583,6 +5614,24 @@ fn with_deletion_name<'a>(
         Some(RowDeletion::Failed(reason)) => {
             Cow::Owned(format!("{name}, could not be deleted: {reason}"))
         }
+    }
+}
+
+/// Arms a channel row to take the pane being dragged, if it can.
+fn pane_drop<'a>(
+    row: Element<'a, SidebarAction>,
+    channel_id: ChannelId,
+    state: &SidebarState,
+) -> Element<'a, SidebarAction> {
+    match &state.pane_drop {
+        Some((card, channels)) if channels.contains(&channel_id) => crate::reorder::drop_target(
+            row,
+            SidebarAction::DropPane {
+                card: *card,
+                channel_id,
+            },
+        ),
+        _ => row,
     }
 }
 

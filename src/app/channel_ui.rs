@@ -433,6 +433,127 @@ impl Cagents {
         self.delete_channels(emptied)
     }
 
+    /// The other channels of the active channel's project that `card` can
+    /// move into, in sidebar order.
+    pub(super) fn pane_move_destinations(&self, card: CardId) -> Vec<&ProjectChannel> {
+        let Some(source) = self
+            .durable
+            .active_channel
+            .and_then(|id| self.durable.channels.iter().find(|channel| channel.id == id))
+        else {
+            return Vec::new();
+        };
+        let movable = self
+            .card_state(card)
+            .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility());
+        if !movable || !source.cards.contains(&card) {
+            return Vec::new();
+        }
+        self.durable
+            .channels
+            .iter()
+            .filter(|channel| {
+                channel.id != source.id
+                    && channel.project_id == source.project_id
+                    && !self.channel_ui.is_deleting(channel.id)
+                    && !self.channel_ui.was_deleted(channel.id)
+            })
+            .collect()
+    }
+
+    /// Arms the sidebar's channels that can take `card` as drop targets, or
+    /// disarms them.
+    pub(super) fn arm_pane_drop(&mut self, card: Option<CardId>) {
+        let drop = card.map(|card| {
+            let channels = self
+                .pane_move_destinations(card)
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect();
+            (card, channels)
+        });
+        self.sidebar_state.set_pane_drop(drop);
+    }
+
+    /// Moves a pane out of the active channel into another channel of its
+    /// project, keeping its session, runtime and draft.
+    ///
+    /// Membership changes locally and the shared-view diff publishes it as
+    /// one atomic transfer. The source channel is kept even when emptied: a
+    /// move is not a close.
+    pub(super) fn move_pane_to_channel(
+        &mut self,
+        card: CardId,
+        destination: ChannelId,
+    ) -> Task<Message> {
+        self.arm_pane_drop(None);
+        if self.workspace_inputs_blocked()
+            || !self
+                .pane_move_destinations(card)
+                .iter()
+                .any(|channel| channel.id == destination)
+        {
+            return Task::none();
+        }
+        let Some(source) = self.durable.active_channel else {
+            return Task::none();
+        };
+        // An unsynchronized scope would publish a removal and an insertion
+        // rather than one transfer, which another window could observe apart.
+        if self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+            && [source, destination].into_iter().any(|channel| {
+                !self
+                    .shared_views
+                    .synchronized(&crate::workspace_model::views::Scope::Channel(channel))
+            })
+        {
+            self.status = Some(TransientNotice::warning(
+                "That channel is still syncing. Try the move again in a moment.",
+            ));
+            return Task::none();
+        }
+        let durable = Arc::make_mut(&mut self.durable);
+        for channel in &mut durable.channels {
+            if channel.id == source {
+                channel.cards.retain(|id| *id != card);
+                if channel.focused == Some(card) {
+                    channel.focused = channel.cards.first().copied();
+                }
+            } else if channel.id == destination {
+                channel.cards.retain(|id| *id != card);
+                channel.cards.push(card);
+                channel.focused = Some(card);
+            }
+        }
+        let title = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == destination)
+            .map(|channel| channel.title.clone())
+            .unwrap_or_default();
+        let moved = match self.unmount_pane_surface(card) {
+            Some(update) => self.apply_viewport(update, true, true),
+            None => {
+                self.persist();
+                Task::none()
+            }
+        };
+        self.status = Some(TransientNotice::success(if title.is_empty() {
+            "Moved the pane to another channel".to_owned()
+        } else {
+            format!("Moved the pane to {title}")
+        }));
+        let focus = iced::widget::operation::focus(
+            self.workspace
+                .focused()
+                .map(|card| self.card_keyboard_focus(card))
+                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+        )
+        .map(cosmic::Action::App);
+        Task::batch([moved, focus])
+    }
+
     /// The channels `retired` would leave without an open card.
     ///
     /// Channel membership is pruned of closed cards whenever the scope is
