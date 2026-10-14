@@ -430,13 +430,23 @@ mod tests {
         for (state, code) in [
             (ProposalState::Pending, 3),
             (ProposalState::Declined, 4),
-            (ProposalState::Approved { automation: Uuid::new_v4(), execution_revision: 1 }, 0),
+            (
+                ProposalState::Approved {
+                    automation: Uuid::new_v4(),
+                    execution_revision: 1,
+                },
+                0,
+            ),
         ] {
-            assert_eq!(CommandOutput {
-                command: "automation.propose",
-                data: json!({"outcome": proposal_outcome(&state)}),
-                human: String::new(),
-            }.exit_code(), ExitCode::from(code));
+            assert_eq!(
+                CommandOutput {
+                    command: "automation.propose",
+                    data: json!({"outcome": proposal_outcome(&state)}),
+                    human: String::new(),
+                }
+                .exit_code(),
+                ExitCode::from(code)
+            );
         }
     }
 

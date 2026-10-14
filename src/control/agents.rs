@@ -492,7 +492,7 @@ impl ControlClient {
                         if any && ready(reply) {
                             break;
                         }
-                    },
+                    }
                     Err(error) if is_timeout_error(&error) => {
                         return waited(replies, true, Vec::new());
                     }
@@ -1164,7 +1164,10 @@ fn submitted(
         data["run"] = json!(run);
         data["timed_out"] = json!(timed_out);
         data["outcome"] = json!(wait_outcome(
-            &[run.state], false, timed_out, !messages.is_empty(),
+            &[run.state],
+            false,
+            timed_out,
+            !messages.is_empty(),
         ));
         if !messages.is_empty() {
             data["messages"] = json!(messages);
@@ -1194,8 +1197,12 @@ fn wait_outcome(
     messages: bool,
 ) -> WaitOutcome {
     if any && !timed_out && !messages {
-        return states.iter().copied().find(|state| state.wait_ready())
-            .map(run_outcome).unwrap_or(WaitOutcome::TimedOut);
+        return states
+            .iter()
+            .copied()
+            .find(|state| state.wait_ready())
+            .map(run_outcome)
+            .unwrap_or(WaitOutcome::TimedOut);
     }
     let outcomes: Vec<_> = states.iter().copied().map(run_outcome).collect();
     if outcomes.contains(&WaitOutcome::Failed) {
@@ -1210,7 +1217,10 @@ fn wait_outcome(
 }
 
 fn wait_data(statuses: &[(Agent, Run)], any: bool, timed_out: bool, ended_by: &str) -> Value {
-    let states = statuses.iter().map(|(_, run)| run.state).collect::<Vec<_>>();
+    let states = statuses
+        .iter()
+        .map(|(_, run)| run.state)
+        .collect::<Vec<_>>();
     json!({
         "results": statuses.iter().map(|(agent, run)| json!({
             "agent": agent, "run": run, "outcome": if timed_out && !run.state.wait_ready() {
@@ -1410,15 +1420,31 @@ mod tests {
             let data = wait_data(&one, false, timed_out, "runs");
             assert_eq!(data["results"][0]["outcome"], outcome);
             let two = wait_data(&[one[0].clone(), one[0].clone()], false, timed_out, "runs");
-            assert_eq!(data.as_object().unwrap().keys().collect::<Vec<_>>(),
-                two.as_object().unwrap().keys().collect::<Vec<_>>());
-            assert_eq!(CommandOutput { command: "agent.wait", data, human: String::new() }.exit_code(),
-                ExitCode::from(code));
+            assert_eq!(
+                data.as_object().unwrap().keys().collect::<Vec<_>>(),
+                two.as_object().unwrap().keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                CommandOutput {
+                    command: "agent.wait",
+                    data,
+                    human: String::new()
+                }
+                .exit_code(),
+                ExitCode::from(code)
+            );
             // Spawn and send use this same outcome calculation after acceptance.
             for command in ["agent.spawn", "agent.send"] {
                 let outcome = wait_outcome(&[state], false, timed_out, false);
-                assert_eq!(CommandOutput { command, data: json!({"outcome": outcome}), human: String::new() }.exit_code(),
-                    ExitCode::from(code));
+                assert_eq!(
+                    CommandOutput {
+                        command,
+                        data: json!({"outcome": outcome}),
+                        human: String::new()
+                    }
+                    .exit_code(),
+                    ExitCode::from(code)
+                );
             }
         }
     }
@@ -1426,11 +1452,26 @@ mod tests {
     #[test]
     fn wait_any_uses_first_ready_run_and_all_uses_worst_outcome() {
         use crate::agent_execution::State::*;
-        assert_eq!(wait_outcome(&[Running, Succeeded, Failed], true, false, false), WaitOutcome::Succeeded);
-        assert_eq!(wait_outcome(&[Running, Waiting, Failed], true, false, false), WaitOutcome::Waiting);
-        assert_eq!(wait_outcome(&[Succeeded, Failed, Waiting], false, false, false), WaitOutcome::Failed);
-        assert_eq!(wait_outcome(&[Succeeded, Running], false, true, false), WaitOutcome::TimedOut);
-        assert_eq!(wait_outcome(&[Running], false, false, true), WaitOutcome::Waiting);
+        assert_eq!(
+            wait_outcome(&[Running, Succeeded, Failed], true, false, false),
+            WaitOutcome::Succeeded
+        );
+        assert_eq!(
+            wait_outcome(&[Running, Waiting, Failed], true, false, false),
+            WaitOutcome::Waiting
+        );
+        assert_eq!(
+            wait_outcome(&[Succeeded, Failed, Waiting], false, false, false),
+            WaitOutcome::Failed
+        );
+        assert_eq!(
+            wait_outcome(&[Succeeded, Running], false, true, false),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            wait_outcome(&[Running], false, false, true),
+            WaitOutcome::Waiting
+        );
     }
 
     #[test]
