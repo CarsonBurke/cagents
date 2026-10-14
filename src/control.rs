@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+mod worktrees;
+pub use worktrees::WorktreeCommand;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
@@ -152,6 +154,11 @@ pub enum TopCommand {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Create, inspect and safely remove daemon-owned Git worktrees.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
     },
     /// Manage the channels every window shares.
     Channel {
@@ -2036,6 +2043,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Ui { .. }
         | TopCommand::Terminal { .. }
         | TopCommand::Project { .. }
+        | TopCommand::Worktree { .. }
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
         | TopCommand::Account { .. }
@@ -2163,6 +2171,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
         TopCommand::Project { command } => execute_project(command),
+        TopCommand::Worktree { command } => worktrees::execute(command),
         TopCommand::Channel { command } => execute_channel(command),
         TopCommand::UpdateWorker { job_id } => {
             crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;

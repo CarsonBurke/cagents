@@ -11004,9 +11004,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_sync(store, request, generation, cancellation, |event| {
+            let _ = progress.try_send(event);
+        })
+    }
+
+    /// The daemon and GUI share journal ownership and recovery semantics.
+    pub fn create_worktree_journaled_sync(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: impl Fn(WorktreeProgressEvent),
+    ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
-            let _ = progress.try_send(WorktreeProgressEvent {
+            progress(WorktreeProgressEvent {
                 operation_id: request.operation_id,
                 generation,
                 stage,
