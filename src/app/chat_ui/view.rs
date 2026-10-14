@@ -1381,15 +1381,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -2857,7 +2854,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2947,14 +2949,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -5770,6 +5776,132 @@ mod tests {
     }
 
     #[test]
+    fn reading_column_is_stable_across_transcript_states() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Probe {
+            composer: widget::Id,
+            transcript: widget::Id,
+            editor: Option<iced::Rectangle>,
+            viewport: Option<iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.composer) {
+                    self.editor = Some(bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.transcript) {
+                    self.viewport = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for width in [280.0_f32, 600.0, 956.0, 1440.0] {
+            let mut baseline = None;
+            for state in 0..7 {
+                let mut items = if state == 0 {
+                    vec![]
+                } else {
+                    frame_cost::transcript(1)
+                };
+                if state == 5 || state == 6 {
+                    if let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content {
+                        *text = if state == 5 {
+                            "w".repeat(3000)
+                        } else {
+                            format!("```rust\n{}\n```", "long_code_token".repeat(1000))
+                        };
+                    }
+                }
+                let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+                if state == 2 {
+                    Arc::make_mut(&mut runtime.snapshot)
+                        .requests
+                        .push(chat::Request {
+                            kind: chat::RequestKind::Approval,
+                            id: "approval".into(),
+                            title: "Command approval".into(),
+                            description: "Run cargo test".into(),
+                            fields: vec![],
+                            actions: vec![],
+                        });
+                }
+                if state == 3 {
+                    runtime.opened.insert(runtime.turns[0].key.clone(), true);
+                }
+                if state == 4 {
+                    Arc::make_mut(&mut runtime.snapshot).ready = false;
+                }
+                let mut element = runtime.view(
+                    None,
+                    false,
+                    true,
+                    &shortcuts,
+                    width,
+                    Place {
+                        channel: None,
+                        name: "Fixture".into(),
+                        branch: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                );
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
+                );
+                let mut probe = Probe {
+                    composer: card_control_id(runtime.target.card, "chat-composer"),
+                    transcript: card_control_id(runtime.target.card, "chat-transcript"),
+                    editor: None,
+                    viewport: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut probe,
+                );
+                let editor = probe.editor.expect("composer");
+                let viewport = probe.viewport.expect("transcript");
+                let column_width = width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
+                let geometry = (viewport.x, viewport.width, editor.x, editor.width);
+                assert_eq!(viewport.width, column_width, "state {state}");
+                assert_eq!(editor.x, viewport.x + step::GAP_M, "state {state}");
+                assert_eq!(
+                    editor.width,
+                    viewport.width - 2.0 * step::GAP_M,
+                    "state {state}"
+                );
+                assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");
+            }
+        }
+    }
+
+    #[test]
     fn prompt_notice_and_raw_output_share_transcript_selection() {
         use iced::advanced::{
             layout,
@@ -7349,8 +7481,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7600,10 +7738,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(

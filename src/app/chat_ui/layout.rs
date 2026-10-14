@@ -1,4 +1,4 @@
-//! Use the preferred reading width unless the footer needs more room.
+//! One reading column, determined by available space rather than its contents.
 use super::*;
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
@@ -39,19 +39,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pane<'_> {
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        // Measure only the footer, not the transcript. Its widgets know their
-        // actual font and control extents; character-count estimates do not.
-        let natural = self.children[1].as_widget_mut().layout(
-            &mut tree.children[1],
-            renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, limits.max().height)),
-        );
+        // Both the transcript and composer are laid out at this exact width.
+        // A permission request, resumed conversation or wider status label must
+        // never move the column. The footer's flex row wraps within that room.
         let width = self
             .preferred
-            // Flex layout rounds child positions to pixels. Reserve a pixel
-            // beyond the measured extent so fractional text widths still fit.
-            .max(natural.size().width.ceil() + 1.0)
-            .min(limits.max().width);
+            .min(design::READABLE_MEASURE + 2.0 * step::GAP_M)
+            .min(limits.max().width)
+            .max(0.0);
         let mut footer = self.children[1].as_widget_mut().layout(
             &mut tree.children[1],
             renderer,
@@ -248,63 +243,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn footer_expands_the_reading_width_before_wrapping() {
+    fn contents_do_not_change_the_reading_column() {
         let renderer = crate::app::tests::headless_renderer();
-        for (preferred, available, expected_width, wrapped) in [
-            (400.0, 800.0, 400.0, false),
-            (100.0, 800.0, 311.0, false),
-            (100.0, 200.0, 200.0, true),
-        ] {
-            let footer = widget::flex_row(vec![
-                widget::Space::new().width(150).height(20).into(),
-                widget::Space::new().width(150).height(20).into(),
-            ])
-            .spacing(10)
-            .into();
-            let mut element = pane(
-                widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
-                footer,
-                preferred,
-            );
-            let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(available, 600.0)),
-            );
-            assert_eq!(node.children()[0].size().width, expected_width);
-            assert_eq!(node.children()[1].size().height > 20.0, wrapped);
-            assert_eq!(
-                node.children()[1].bounds().y + node.children()[1].size().height,
-                600.0
-            );
-            assert_eq!(
-                node.children()[0].bounds().x,
-                (available - expected_width) / 2.0
-            );
+        for available in [280.0, 600.0, 956.0, 1440.0] {
+            let expected = available.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
+            for footer_width in [0.0, 150.25, 900.0, 3000.0] {
+                let footer = widget::flex_row(vec![
+                    widget::Space::new().width(footer_width).height(20).into(),
+                    widget::Space::new().width(150).height(20).into(),
+                ])
+                .spacing(10)
+                .into();
+                let mut element = pane(
+                    widget::Space::new()
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into(),
+                    footer,
+                    available,
+                );
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(available, 600.0)),
+                );
+                let body = &node.children()[0];
+                let footer = &node.children()[1];
+                assert_eq!(body.size().width, expected);
+                assert_eq!(body.bounds().x, (available - expected) / 2.0);
+                assert_eq!(footer.bounds().x, body.bounds().x);
+                assert!(footer.size().width <= expected);
+                assert_eq!(footer.bounds().y + footer.size().height, 600.0);
+            }
         }
-    }
-
-    #[test]
-    fn fractional_footer_extents_do_not_force_a_second_row() {
-        let renderer = crate::app::tests::headless_renderer();
-        let footer = widget::flex_row(vec![
-            widget::Space::new().width(150.25).height(20).into(),
-            widget::Space::new().width(150.25).height(20).into(),
-        ])
-        .spacing(10)
-        .into();
-        let mut element = pane(widget::Space::new().into(), footer, 100.0);
-        let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(800.0, 600.0)),
-        );
-        assert!(node.children()[0].size().width >= 310.5);
-        assert_eq!(node.children()[1].size().height, 20.0);
     }
 }
