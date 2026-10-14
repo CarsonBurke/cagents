@@ -20,7 +20,7 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLLBACK_MIB: usize = 1024;
 pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 /// The longest terminal font family name, in bytes.
 pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
@@ -620,8 +620,19 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
-const fn default_terminal_scrollback_lines() -> usize {
+/// Previous line values are migrated at 1 KiB per requested line, rounded up
+/// to MiB. The old setting reached Ghostty as bytes, so this intentionally
+/// restores useful retention rather than preserving the broken tiny budget.
+const fn legacy_scrollback_mib(lines: usize) -> usize {
+    lines.saturating_add(1023) / 1024
+}
+
+const fn default_legacy_terminal_scrollback_lines() -> usize {
     10_000
+}
+
+const fn default_terminal_scrollback_mib() -> usize {
+    16
 }
 
 const fn default_terminal_scroll_size() -> usize {
@@ -819,8 +830,8 @@ pub struct AppSettings {
     pub sidebar_width: f32,
     pub inspector_width: f32,
     pub default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
-    pub terminal_scrollback_lines: usize,
+    #[serde(default = "default_terminal_scrollback_mib")]
+    pub terminal_scrollback_mib: usize,
     #[serde(default)]
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
@@ -943,7 +954,7 @@ impl Default for AppSettings {
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
-            terminal_scrollback_lines: 10_000,
+            terminal_scrollback_mib: default_terminal_scrollback_mib(),
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
@@ -1117,7 +1128,7 @@ struct V2TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
+    #[serde(default = "default_legacy_terminal_scrollback_lines")]
     terminal_scrollback_lines: usize,
     #[serde(default)]
     link_open_destination: LinkOpenDestination,
@@ -1541,7 +1552,7 @@ impl From<V2TomlSettings> for AppSettings {
             sidebar_width: previous.sidebar_width,
             inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
-            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            terminal_scrollback_mib: legacy_scrollback_mib(previous.terminal_scrollback_lines),
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
             // A version-2 file predates language servers, so it can hold no
@@ -1696,9 +1707,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
-        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+        if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
-                "terminal_scrollback_lines must be between 0 and 1000000",
+                "terminal_scrollback_mib must be between 0 and 1024",
             ));
         }
         if self.managed_worktree_directory.trim().is_empty()
@@ -2007,6 +2018,17 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// preference. Its value represented lines per wheel notch, so it is the same
 /// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    if !table.contains_key("terminal_scrollback_mib")
+        && let Some(toml::Value::Integer(lines)) = table.get("terminal_scrollback_lines")
+        && let Ok(lines) = usize::try_from(*lines)
+    {
+        table.insert(
+            "terminal_scrollback_mib".into(),
+            toml::Value::Integer(legacy_scrollback_mib(lines) as i64),
+        );
+        table.remove("terminal_scrollback_lines");
+    }
+
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
@@ -4071,14 +4093,30 @@ new_thread = "Alt+Shift+G"
     }
 
     #[test]
+    fn legacy_scrollback_lines_migrate_to_explicit_memory_budget() {
+        for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
+            let mut table = toml::Table::new();
+            table.insert("terminal_scrollback_lines".into(), toml::Value::Integer(lines));
+            normalize_current(&mut table);
+            assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(mib));
+            assert!(!table.contains_key("terminal_scrollback_lines"));
+        }
+        let mut table = toml::Table::new();
+        table.insert("terminal_scrollback_lines".into(), toml::Value::Integer(10_000));
+        table.insert("terminal_scrollback_mib".into(), toml::Value::Integer(32));
+        normalize_current(&mut table);
+        assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(32));
+    }
+
+    #[test]
     fn terminal_scrollback_is_bounded() {
         let at_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB,
             ..AppSettings::default()
         };
         assert!(at_limit.validate().is_ok());
         let above_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB + 1,
             ..AppSettings::default()
         };
         assert!(matches!(

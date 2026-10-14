@@ -17,7 +17,8 @@ pub struct TerminalConfig {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty scrollback page budget in bytes (allocated lazily).
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
     pub command_capacity: usize,
@@ -45,7 +46,7 @@ impl Default for TerminalConfig {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: 16 * 1024 * 1024,
             initially_visible: true,
             theme: TerminalTheme::default(),
             command_capacity: DEFAULT_COMMAND_CAPACITY,

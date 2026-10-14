@@ -3578,7 +3578,7 @@ fn start_terminal_view_owned(
         rows: options.rows,
         cell_width_px: options.cell_width_px,
         cell_height_px: options.cell_height_px,
-        max_scrollback: options.max_scrollback,
+        max_scrollback_bytes: options.max_scrollback_bytes,
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
@@ -3775,7 +3775,7 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
         || !(1..=500).contains(&options.rows)
         || !(1..=4096).contains(&options.cell_width_px)
         || !(1..=4096).contains(&options.cell_height_px)
-        || options.max_scrollback > 1_000_000
+        || options.max_scrollback_bytes > 1024 * 1024 * 1024
     {
         return Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,

@@ -370,3 +370,16 @@ Cagents installation untouched. Existing private builds remain available to
 running windows and daemons; update Ceditor with its original installer, not the
 Cagents self-updater. Opening an alert for the other application requires that
 application to be installed alongside the daemon or in an absolute PATH directory.
+
+## Terminal history memory
+
+`terminal_scrollback_mib` sets the Ghostty scrollback page budget per terminal
+in MiB (default 16, maximum 1024). Pages are allocated as output arrives;
+this is a retention budget, not an eager allocation or a fixed row count.
+Row width, styles and graphemes affect how many rows fit. Resizing preserves
+the same byte budget. Ghostty may keep a small minimum page pool at zero.
+
+The previous `terminal_scrollback_lines` preference incorrectly supplied a
+line count as bytes. On load it migrates at 1 KiB per requested line, rounded
+up to whole MiB; 10,000 becomes 10 MiB and zero remains zero. Explicit new
+memory settings take precedence. Fresh settings use 16 MiB.
