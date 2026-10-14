@@ -55,9 +55,11 @@ tasks require fresh update confirmation.
 
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
-Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status and single-handle wait return `data.agent`, `data.run`, and `data.timed_out`; a multi-handle wait returns `data.results` (each with `agent` and `run`) and `data.timed_out`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
+Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status returns `data.agent`, `data.run`, and `data.timed_out`; wait always returns `data.results` (each with `agent`, `run`, and `outcome`), `data.timed_out`, `data.ended_by`, and the aggregate `data.outcome`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
 
 `wait` returns once every handle has settled or is waiting for input, or with `--any` once one has. `--wait` on spawn or send does the same for the run just accepted. Both are bounded by `--timeout` seconds (60 by default) and report the last known state when it passes; a waiting run is polled until then, so one answered meanwhile is not reported stale.
+
+Waiting commands use exit code **0** for success, **3** for timeout, **4** for failed, cancelled or interrupted work, and **5** for input, approval or an arrived message requiring attention. General errors remain **1** and usage errors **2**. This applies to `agent wait`, `agent spawn --wait`, `agent send --wait`, and `automation propose --wait` / `automation proposal --wait` (pending at the deadline is 3; declined is 4). `terminal wait` timeout also returns 3. An uncompleted wait never returns success. With `--any`, the first ready run in polling order determines the outcome. With all handles, failure outranks input/approval, which outranks timeout, which outranks success. Results retain each run's individual outcome.
 
 `requests` lists what an agent is waiting on: each request's ID, its actions, and its fields with their choices. `answer` sends one of the listed actions, with `--field FIELD=VALUE` repeated for several fields or values; the daemon rejects a request, action, or field the agent did not ask for. Field values are command arguments, visible to other local processes, so do not pass secrets this way. `interrupt` stops the active run. Both act only while the agent's latest run is active, and as its owner rather than as a person taking it over, so the agent stays under its owner's control. Once a person has taken the agent over in cagents or its console, they are refused: its turns and the questions they raise are that person's. Secret field values the provider prefilled are never returned.
 
@@ -182,3 +184,14 @@ A personal `cagents` skill takes precedence over the bundled fallback. Managed C
 Launch also removes the retired `cagents-agents` bundle only when its directory contains nothing but a regular, single-link `SKILL.md` matching a recorded legacy hash; edited copies, links, and additional resources are preserved. Provider discovery opt-outs still apply.
 
 These locations follow the providers' documented skill discovery: [Claude skills](https://code.claude.com/docs/en/skills), [Codex skills](https://learn.chatgpt.com/docs/build-skills), and [OMP skills](https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md). The same installed instructions appear in cagents' native filesystem skill catalog and provider terminal sessions.
+
+## CLI compatibility changes
+
+Agent waits now always return `data.results`, including a single handle; consumers
+that previously read `data.agent` / `data.run` for a one-handle wait should read
+`data.results[0].agent` / `data.results[0].run`. Each result includes an `outcome`;
+a run still active when `--any` returns has `pending`, while an active run at the
+deadline has `timed_out`. Waiting commands now return the nonzero exit codes
+above while retaining their normal JSON success envelope and last known results.
+The envelope's `ok` means the command was processed; use the exit code or
+`data.outcome` to determine whether the work completed successfully.

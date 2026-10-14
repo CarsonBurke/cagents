@@ -83,6 +83,10 @@ pub enum AgentCommand {
     ///
     /// Each handle is an agent, standing for its latest run, or a run, by ID
     /// or a unique prefix of it.
+    ///
+    /// Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or interrupted;
+    /// 5 waiting for input, approval or an arrived message. With --any, use
+    /// the first ready run; otherwise failure outranks input, then timeout.
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
         handles: Vec<String>,
@@ -142,7 +146,8 @@ pub struct RetryArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WaitArgs {
-    /// Wait for the run to settle or ask for input before returning.
+    /// Wait for the run. Exit: 0 success, 3 timeout, 4 failure/cancellation,
+    /// 5 input or approval needed.
     #[arg(long)]
     pub(super) wait: bool,
     /// How long `--wait` waits.
@@ -482,7 +487,12 @@ impl ControlClient {
                     continue;
                 }
                 match self.agent_before(authority.clone(), Operation::Run(*run), Some(deadline)) {
-                    Ok(current) => *reply = current,
+                    Ok(current) => {
+                        *reply = current;
+                        if any && ready(reply) {
+                            break;
+                        }
+                    },
                     Err(error) if is_timeout_error(&error) => {
                         return waited(replies, true, Vec::new());
                     }
@@ -1007,22 +1017,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 .collect::<Vec<_>>()
                 .join("\n\n");
             human.push_str(&arrived_lines(&messages));
-            let mut data = match statuses.as_slice() {
-                [(agent, run)] => json!({
-                    "agent": agent,
-                    "run": run,
-                    "timed_out": timed_out,
-                    "ended_by": ended_by,
-                }),
-                _ => json!({
-                    "results": statuses
-                        .iter()
-                        .map(|(agent, run)| json!({"agent": agent, "run": run}))
-                        .collect::<Vec<_>>(),
-                    "timed_out": timed_out,
-                    "ended_by": ended_by,
-                }),
-            };
+            let mut data = wait_data(&statuses, any, timed_out, ended_by);
             if !messages.is_empty() {
                 data["messages"] = json!(messages);
             }
@@ -1168,6 +1163,9 @@ fn submitted(
         data["agent"] = json!(agent);
         data["run"] = json!(run);
         data["timed_out"] = json!(timed_out);
+        data["outcome"] = json!(wait_outcome(
+            &[run.state], false, timed_out, !messages.is_empty(),
+        ));
         if !messages.is_empty() {
             data["messages"] = json!(messages);
         }
@@ -1176,6 +1174,52 @@ fn submitted(
         command,
         data,
         human,
+    })
+}
+
+fn run_outcome(state: crate::agent_execution::State) -> WaitOutcome {
+    use crate::agent_execution::State;
+    match state {
+        State::Succeeded => WaitOutcome::Succeeded,
+        State::Failed | State::Cancelled | State::Interrupted => WaitOutcome::Failed,
+        State::Waiting => WaitOutcome::Waiting,
+        State::Accepted | State::Running => WaitOutcome::Pending,
+    }
+}
+
+fn wait_outcome(
+    states: &[crate::agent_execution::State],
+    any: bool,
+    timed_out: bool,
+    messages: bool,
+) -> WaitOutcome {
+    if any && !timed_out && !messages {
+        return states.iter().copied().find(|state| state.wait_ready())
+            .map(run_outcome).unwrap_or(WaitOutcome::TimedOut);
+    }
+    let outcomes: Vec<_> = states.iter().copied().map(run_outcome).collect();
+    if outcomes.contains(&WaitOutcome::Failed) {
+        WaitOutcome::Failed
+    } else if messages || outcomes.contains(&WaitOutcome::Waiting) {
+        WaitOutcome::Waiting
+    } else if timed_out || outcomes.contains(&WaitOutcome::Pending) {
+        WaitOutcome::TimedOut
+    } else {
+        WaitOutcome::Succeeded
+    }
+}
+
+fn wait_data(statuses: &[(Agent, Run)], any: bool, timed_out: bool, ended_by: &str) -> Value {
+    let states = statuses.iter().map(|(_, run)| run.state).collect::<Vec<_>>();
+    json!({
+        "results": statuses.iter().map(|(agent, run)| json!({
+            "agent": agent, "run": run, "outcome": if timed_out && !run.state.wait_ready() {
+                WaitOutcome::TimedOut
+            } else { run_outcome(run.state) },
+        })).collect::<Vec<_>>(),
+        "timed_out": timed_out,
+        "ended_by": ended_by,
+        "outcome": wait_outcome(&states, any, timed_out, ended_by == "messages"),
     })
 }
 
@@ -1347,6 +1391,56 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_contract_has_one_shape_and_outcome_exit_codes() {
+        use crate::agent_execution::State;
+        for (state, timed_out, code, outcome) in [
+            (State::Succeeded, false, 0, "succeeded"),
+            (State::Failed, false, 4, "failed"),
+            (State::Cancelled, false, 4, "failed"),
+            (State::Interrupted, false, 4, "failed"),
+            (State::Running, true, 3, "timed_out"),
+            (State::Waiting, false, 5, "waiting"),
+        ] {
+            let (_, reply) = running();
+            let (agent, mut run) = status_reply(reply).unwrap();
+            run.state = state;
+            let one = vec![(agent, run)];
+            let data = wait_data(&one, false, timed_out, "runs");
+            assert_eq!(data["results"][0]["outcome"], outcome);
+            let two = wait_data(&[one[0].clone(), one[0].clone()], false, timed_out, "runs");
+            assert_eq!(data.as_object().unwrap().keys().collect::<Vec<_>>(),
+                two.as_object().unwrap().keys().collect::<Vec<_>>());
+            assert_eq!(CommandOutput { command: "agent.wait", data, human: String::new() }.exit_code(),
+                ExitCode::from(code));
+            // Spawn and send use this same outcome calculation after acceptance.
+            for command in ["agent.spawn", "agent.send"] {
+                let outcome = wait_outcome(&[state], false, timed_out, false);
+                assert_eq!(CommandOutput { command, data: json!({"outcome": outcome}), human: String::new() }.exit_code(),
+                    ExitCode::from(code));
+            }
+        }
+    }
+
+    #[test]
+    fn wait_any_uses_first_ready_run_and_all_uses_worst_outcome() {
+        use crate::agent_execution::State::*;
+        assert_eq!(wait_outcome(&[Running, Succeeded, Failed], true, false, false), WaitOutcome::Succeeded);
+        assert_eq!(wait_outcome(&[Running, Waiting, Failed], true, false, false), WaitOutcome::Waiting);
+        assert_eq!(wait_outcome(&[Succeeded, Failed, Waiting], false, false, false), WaitOutcome::Failed);
+        assert_eq!(wait_outcome(&[Succeeded, Running], false, true, false), WaitOutcome::TimedOut);
+        assert_eq!(wait_outcome(&[Running], false, false, true), WaitOutcome::Waiting);
+    }
+
+    #[test]
+    fn wait_help_documents_every_exit_code() {
+        let error = Cli::try_parse_from(["cagents", "agent", "wait", "--help"]).unwrap_err();
+        let help = error.to_string();
+        for text in ["0 succeeded", "3 timed out", "4 failed", "5 waiting"] {
+            assert!(help.contains(text), "missing {text}: {help}");
+        }
+    }
 
     fn proof() -> HostSessionProof {
         HostSessionProof {
