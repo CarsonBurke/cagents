@@ -119,13 +119,11 @@ pub fn surface(
     })
 }
 
-pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
-pub const NAVIGATION_MIN_WIDTH: f32 = 220.0;
-pub const NAVIGATION_MAX_WIDTH: f32 = 420.0;
+pub use crate::layout_metrics::{
+    INSPECTOR_DEFAULT_WIDTH, INSPECTOR_MAX_WIDTH, INSPECTOR_MIN_WIDTH,
+    NAVIGATION_DEFAULT_WIDTH, NAVIGATION_MAX_WIDTH, NAVIGATION_MIN_WIDTH,
+};
 pub const NAVIGATION_RAIL_WIDTH: f32 = 52.0;
-pub const INSPECTOR_MIN_WIDTH: f32 = 320.0;
-pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
-pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
 ///
