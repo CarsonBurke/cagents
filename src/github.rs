@@ -26,6 +26,7 @@ use crate::repository::{
 pub mod avatar;
 pub mod review_requests;
 pub mod polling;
+pub mod review_actions;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
@@ -1165,6 +1166,16 @@ pub trait GitHubReviewApi: Send + Sync {
         request: &ListPullRequestsRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequest>, GitHubError>;
+
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        _query: &str,
+        _cursor: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        Err(GitHubError::Inspection("Repository search is unavailable".into()))
+    }
 
     fn pull_request_page(
         &self,
@@ -2313,6 +2324,16 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequest, GitHubError> {
         self.view(key, cancellation)
     }
+    fn search_pull_requests(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        self.search_pull_request_page(repository, query, cursor, cancellation)
+    }
+
     fn pull_request_page(
         &self,
         repository: &GitHubRepoKey,

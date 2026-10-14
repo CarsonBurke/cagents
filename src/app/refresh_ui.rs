@@ -254,7 +254,7 @@ impl Cagents {
             tasks.push(
                 self.apply_pull_request_review(
                     card,
-                    pull_request_review::Action::RefreshIfDue(now),
+                    if regained_focus { pull_request_review::Action::BrowserFocused } else { pull_request_review::Action::RefreshIfDue(now) },
                 ),
             );
         }
