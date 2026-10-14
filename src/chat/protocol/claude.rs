@@ -487,10 +487,13 @@ impl Claude {
         step.events.push(Event::RequestResolved { id: id.clone() });
         // Busy outside a turn means only decisions the ended turn left behind;
         // resolving the last of them completes it as an empty queue would have.
+        // An interrupt sent meanwhile had no turn to stop, so the next turn
+        // must not inherit it as its own cancellation.
         if self.busy
             && self.pending.is_empty()
             && self.started_generation != Some(self.attention_generation)
         {
+            self.interruption = None;
             self.status(false, "Claude turn complete", step);
         }
         self.retired.push_back(id);
@@ -5690,6 +5693,73 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    /// A decision a background agent leaves past the end of its parent's turn
+    /// keeps Claude busy only until it is answered, and an interrupt sent in
+    /// between does not cancel the next turn.
+    #[test]
+    fn a_decision_left_past_its_turn_frees_claude_once_answered() {
+        for interrupted in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                ..Claude::default()
+            };
+            adapter
+                .send_prompt("hello".into(), vec![], PromptMode::Send)
+                .unwrap();
+            adapter
+                .receive(approval("background-1", "Bash", json!({"command":"true"})))
+                .unwrap();
+            adapter
+                .receive(json!({"type":"result","is_error":false}))
+                .unwrap();
+            assert!(adapter.busy, "the decision outlives the turn");
+            assert!(
+                adapter
+                    .send_prompt("too soon".into(), vec![], PromptMode::Send)
+                    .is_err()
+            );
+            let interrupt = interrupted.then(|| adapter.command(Command::Interrupt).unwrap());
+            let answered = adapter
+                .command(Command::Answer {
+                    request_id: "background-1".into(),
+                    action: "deny".into(),
+                    answers: vec![],
+                })
+                .unwrap();
+            assert!(!adapter.busy);
+            assert!(
+                answered
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Status { busy: false, .. }))
+            );
+            if let Some(interrupt) = interrupt {
+                adapter
+                    .receive(reply(
+                        interrupt.writes[0]["request_id"].as_str().unwrap(),
+                        json!({}),
+                    ))
+                    .unwrap();
+            }
+            adapter
+                .send_prompt("next".into(), vec![], PromptMode::Send)
+                .unwrap();
+            let finished = adapter
+                .receive(json!({"type":"result","subtype":"success","is_error":false}))
+                .unwrap();
+            assert!(
+                finished.events.iter().any(|event| matches!(
+                    event,
+                    Event::TurnFinished { outcome, .. }
+                        if *outcome != crate::notifications::Kind::Cancelled
+                )),
+                "{:?}",
+                finished.events
+            );
+            assert!(!adapter.busy);
         }
     }
 
