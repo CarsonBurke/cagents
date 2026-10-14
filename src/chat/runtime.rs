@@ -2038,10 +2038,7 @@ impl Actor {
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
-                Command::Answer { action, .. } => !matches!(
-                    action.as_str(),
-                    "deny" | "decline" | "reject" | "cancel" | "abort"
-                ),
+                Command::Answer { action, .. } => !super::declines(action),
                 _ => false,
             };
             if authorizes_work

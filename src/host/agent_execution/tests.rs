@@ -78,7 +78,17 @@ while IFS= read -r frame; do
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       ;;
     *'"type":"control_response"'*)
-      # The answer to a permission request raised below finishes its turn.
+      # The answer to a permission request raised below finishes its turn;
+      # a background one is only recorded, since its turn already ended.
+      case "$frame" in
+        *'"background-'*)
+          case "$frame" in
+            *'"behavior":"allow"'*) printf 'allow\n' >> "$HOME/../decisions" ;;
+            *) printf 'deny\n' >> "$HOME/../decisions" ;;
+          esac
+          continue
+          ;;
+      esac
       case "$frame" in
         *'"behavior":"allow"'*) printf 'allow\n' >> "$HOME/../decisions" ;;
         *) printf 'deny\n' >> "$HOME/../decisions" ;;
@@ -89,6 +99,12 @@ while IFS= read -r frame; do
     *'"type":"user"'*)
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
+      case "$frame" in
+        *BACKGROUND_PERMISSION*)
+          # A background subagent asks, then the main turn ends without it.
+          printf '{"type":"control_request","request_id":"background-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
+          ;;
+      esac
       case "$frame" in
         *ASK_PERMISSION*)
           printf '{"type":"control_request","request_id":"permission-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
@@ -1922,6 +1938,94 @@ fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it() {
+    if isolated(
+        "an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let owner = Authority::default();
+    request.prompt = "BACKGROUND_PERMISSION while the turn ends".into();
+    let accepted = submit(&host, &owner, request).unwrap();
+    let agent = accepted.agent.id;
+    let control = |command| -> Result<Vec<chat::Request>, String> {
+        match process(&host, owner.clone(), Operation::Control { agent, command })? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    let answer = |request_id: &str, action: &str| Control::Answer {
+        request_id: request_id.into(),
+        action: action.into(),
+        answers: Vec::new(),
+    };
+    let asked = pending_requests(&host, agent);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    assert_eq!(
+        pending_requests(&host, agent).len(),
+        1,
+        "the decision outlives the turn"
+    );
+
+    for refused in [
+        answer(&asked.id, "allow"),
+        Control::Interrupt {
+            including_subagents: true,
+        },
+    ] {
+        let error = control(refused).unwrap_err();
+        assert!(error.contains("no active run"), "{error}");
+    }
+    let root = path.parent().unwrap();
+    assert!(!root.join("decisions").exists(), "nothing was approved");
+
+    assert!(control(answer(&asked.id, "deny")).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(root.join("decisions")).unwrap_or_default() != "deny\n" {
+        assert!(Instant::now() < deadline, "the denial never reached the provider");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    // Resolved, the session is idle again and takes its owner's next prompt.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        process(&host, owner.clone(), Operation::Requests(agent)),
+        Ok(Reply::Requests(requests)) if requests.is_empty()
+    ) {
+        assert!(Instant::now() < deadline, "the request was never resolved");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let followup = submit(
+        &host,
+        &owner,
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: "after the denial".into(),
+            idempotency_key: "after-denial".into(),
+        },
+    )
+    .unwrap();
+    let after = settled(&host, followup.run.id);
+    assert_eq!(after.state, State::Succeeded, "{after:?}");
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap(),
+        "the owner keeps the agent"
+    );
 }
 
 #[test]

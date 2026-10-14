@@ -485,6 +485,14 @@ impl Claude {
     fn retire(&mut self, id: String, step: &mut Step) {
         self.pending.remove(&id);
         step.events.push(Event::RequestResolved { id: id.clone() });
+        // Busy outside a turn means only decisions the ended turn left behind;
+        // resolving the last of them completes it as an empty queue would have.
+        if self.busy
+            && self.pending.is_empty()
+            && self.started_generation != Some(self.attention_generation)
+        {
+            self.status(false, "Claude turn complete", step);
+        }
         self.retired.push_back(id);
         if self.retired.len() > 512 {
             self.retired.pop_front();
