@@ -1393,6 +1393,69 @@ pub(super) fn require_placement(
     }
 }
 
+/// Keeps an agent's durable placement with the pane a transfer moved.
+///
+/// An agent pane's card id is its agent id. Follow-ups and session bindings
+/// validate the placement, and a window adopting the agent places it there,
+/// so a placement left behind would strand the agent with its old view.
+pub(super) fn relocate_agent(
+    db: &Connection,
+    pane: crate::model::CardId,
+    placement: &Placement,
+) -> Result<bool, String> {
+    let record: Option<String> = db
+        .query_row(
+            "SELECT record FROM agents WHERE id = ?1 AND closed = 0",
+            [pane.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    let mut agent: Agent = decode(&record)?;
+    if agent.placement == *placement {
+        return Ok(false);
+    }
+    agent.placement = placement.clone();
+    db.execute(
+        "UPDATE agents SET record = ?2 WHERE id = ?1",
+        params![agent.id.to_string(), encode(&agent)?],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+impl Registry {
+    /// Moves every open agent's placement to the view that owns its pane.
+    ///
+    /// Transfers committed before placement followed the pane left records
+    /// naming the view the pane had left.
+    pub(crate) fn reconcile_agent_placements(&mut self) -> Result<usize, String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let owned = tx
+            .prepare(
+                "SELECT agents.id, shared_view_panes.scope FROM agents
+                 JOIN shared_view_panes ON shared_view_panes.id = agents.id
+                 WHERE agents.closed = 0",
+            )
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut moved = 0;
+        for (id, scope) in owned {
+            let pane = id
+                .parse()
+                .map_err(|error| format!("stored agent id `{id}` is unreadable: {error}"))?;
+            moved += usize::from(relocate_agent(&tx, pane, &decode(&scope)?)?);
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(moved)
+    }
+}
+
 fn require_channel(
     db: &Connection,
     channel: ChannelId,
@@ -1765,6 +1828,77 @@ mod tests {
             idempotency_key: "first-request".into(),
         };
         (registry, directory, request)
+    }
+
+    #[test]
+    fn a_transferred_agent_pane_carries_its_placement() {
+        use crate::workspace_model::views::{Change, Pane, Scope};
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let launched = accepted.agent.placement.clone();
+        let destination = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: destination,
+                repository: directory.path().into(),
+                title: "destination".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let pane = Pane {
+            id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+            title: "Claude agent".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: crate::model::CardKind::Chat(match source() {
+                HostedSession::Chat(session) => session,
+                HostedSession::Terminal(_) => unreachable!(),
+            }),
+            scope: None,
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: launched.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                expected_revision: registry.view_revision(&launched).unwrap(),
+                scope: launched,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id: pane.id,
+                    destination: Scope::Channel(destination),
+                    before: None,
+                },
+            })
+            .unwrap();
+        let moved = registry.agent(accepted.agent.id).unwrap();
+        assert_eq!(moved.placement, Scope::Channel(destination));
+        assert_eq!(
+            moved.spec, accepted.agent.spec,
+            "the accepted request stays the record of what was asked"
+        );
+        let model = registry.model().unwrap();
+        assert_eq!(model.agents[0].placement, Scope::Channel(destination));
+
+        // A daemon that predates this left the placement behind.
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![accepted.agent.id.to_string(), encode(&accepted.agent).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(registry.reconcile_agent_placements().unwrap(), 1);
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().placement,
+            Scope::Channel(destination)
+        );
+        assert_eq!(registry.reconcile_agent_placements().unwrap(), 0);
     }
 
     #[test]

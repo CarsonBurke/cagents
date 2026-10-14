@@ -65,7 +65,13 @@ impl Registry {
     pub(crate) fn open() -> Result<Self, String> {
         let dirs = crate::instance::project_dirs()
             .ok_or_else(|| "the data directory is unavailable".to_owned())?;
-        Self::at(&dirs.data_dir().join("workspace-model.sqlite3"))
+        let mut registry = Self::at(&dirs.data_dir().join("workspace-model.sqlite3"))?;
+        match registry.reconcile_agent_placements() {
+            Ok(0) => {}
+            Ok(moved) => tracing::info!(moved, "agent placements now follow their panes"),
+            Err(error) => tracing::warn!(%error, "agent placements were not reconciled"),
+        }
+        Ok(registry)
     }
 
     /// Opens or creates the registry at `path`.

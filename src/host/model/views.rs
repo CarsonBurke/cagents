@@ -70,6 +70,19 @@ fn exists(db: &Connection, scope: &Scope) -> Result<bool, String> {
     }
     .map_err(|error| error.to_string())
 }
+/// The project key that owns an existing scope.
+fn project(db: &Connection, scope: &Scope) -> Result<String, String> {
+    match scope {
+        Scope::Channel(id) => db
+            .query_row(
+                "SELECT repository FROM channels WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string()),
+        Scope::Worktree { repository, .. } => Ok(repository_key(repository)?.to_owned()),
+    }
+}
 fn register(db: &Connection, scope: &Scope) -> Result<(), String> {
     let (channel, repository) = match scope {
         Scope::Channel(id) => (Some(id.to_string()), None),
@@ -188,6 +201,9 @@ pub(super) fn apply(
                     } else if let Some(pane) =
                         view.panes.iter().find(|pane| pane.id == *id).cloned()
                     {
+                        if project(transaction, scope)? != project(transaction, destination)? {
+                            return Err("A pane moves only between views of one project".into());
+                        }
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         target.retired.retain(|retired| retired != id);
@@ -206,6 +222,7 @@ pub(super) fn apply(
                                 params![key(destination)?, id.to_string()],
                             )
                             .map_err(|error| error.to_string())?;
+                        super::execution::relocate_agent(transaction, *id, destination)?;
                         view.apply(&Change::Remove { id: *id })?
                     } else {
                         false
@@ -523,6 +540,52 @@ mod tests {
         r.apply(&removal).unwrap();
         seed(&mut r, a, vec![p]);
         assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
+    }
+    #[test]
+    fn transfer_refuses_a_view_in_another_project() {
+        let (mut r, _, a, _) = setup();
+        r.apply(&ModelEdit::OpenProject {
+            repository: "/other".into(),
+            name: "other".into(),
+            kind: Default::default(),
+        })
+        .unwrap();
+        let foreign = ChannelId::new();
+        r.apply(&ModelEdit::CreateChannel {
+            id: foreign,
+            repository: "/other".into(),
+            title: "foreign".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+        let p = pane();
+        seed(&mut r, a, vec![p.clone()]);
+        let revision = r.view_revision(&Scope::Channel(a)).unwrap();
+        for destination in [
+            Scope::Channel(foreign),
+            Scope::Worktree {
+                repository: "/other".into(),
+                path: "/other".into(),
+            },
+        ] {
+            let transfer = edit(
+                &mut r,
+                a,
+                Change::Transfer {
+                    id: p.id,
+                    destination: destination.clone(),
+                    before: None,
+                },
+            );
+            assert!(r.apply(&transfer).is_err());
+            assert!(read(&r.db, &destination).unwrap().panes.is_empty());
+        }
+        assert_eq!(
+            read(&r.db, &Scope::Channel(a)).unwrap().panes,
+            vec![p.clone()]
+        );
+        assert_eq!(r.view_revision(&Scope::Channel(a)).unwrap(), revision);
+        assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(a)));
     }
     #[test]
     fn transfer_is_atomic_unique_and_reversible() {

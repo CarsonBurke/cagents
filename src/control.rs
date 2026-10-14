@@ -29,6 +29,7 @@ mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
+mod panes;
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
@@ -343,6 +344,22 @@ pub enum ChannelCommand {
     },
     /// Delete a channel everywhere.
     Close { channel_id: ChannelId },
+    /// Move a pane into another channel of its project.
+    ///
+    /// The pane's session keeps running: its conversation, draft and terminal
+    /// move with it in every window, without a restart. Moving a pane into the
+    /// channel that already holds it changes nothing, so a retry is safe.
+    Move {
+        /// The pane, or the session or agent it hosts.
+        pane: uuid::Uuid,
+        /// The channel to move it into.
+        #[arg(long)]
+        to: ChannelId,
+        /// Place it before this pane, session or agent in the destination.
+        /// The pane goes last by default.
+        #[arg(long)]
+        before: Option<uuid::Uuid>,
+    },
 }
 
 /// A `--project` value: a path, made absolute, or the name of an open
@@ -3226,6 +3243,11 @@ enum ResolvedChannel {
     Close {
         channel_id: ChannelId,
     },
+    Move {
+        pane: uuid::Uuid,
+        to: ChannelId,
+        before: Option<uuid::Uuid>,
+    },
 }
 
 impl ChannelCommand {
@@ -3256,6 +3278,7 @@ impl ChannelCommand {
                     .transpose()?,
             },
             Self::Close { channel_id } => ResolvedChannel::Close { channel_id },
+            Self::Move { pane, to, before } => ResolvedChannel::Move { pane, to, before },
         })
     }
 }
@@ -3341,6 +3364,7 @@ fn channel_output(
                 human: format!("closed {channel_id}"),
             })
         }
+        ResolvedChannel::Move { pane, to, before } => panes::move_pane(client, pane, to, before),
     }
 }
 
