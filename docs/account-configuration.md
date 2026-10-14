@@ -99,7 +99,11 @@ device before joining its account list.
 New Claude homes receive a one-time copy of `settings.json` and user-scoped
 `mcpServers`. This preserves hooks, permissions, status-line settings and MCP
 definitions while allowing Claude to replace its settings file normally.
-Subsequent edits are independent. Instructions and extension directories remain
+Subsequent edits are independent, except that new native chats in managed Claude
+homes use the current system `permissions.defaultMode`, rather than the copied
+account default. Explicit chat or agent permission choices and project settings
+take precedence. Existing conversations keep their selected mode; linked Claude
+homes keep their own defaults. Instructions and extension directories remain
 linked. Provider login data and project trust state are not copied. User-authored
 settings and MCP definitions can themselves include environment values or headers;
 those configuration values remain in the private local account home.
