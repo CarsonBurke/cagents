@@ -199,6 +199,43 @@ mod tests {
     }
 
     #[test]
+    fn settles_only_after_a_census_and_its_histories_for_the_current_viewer() {
+        let mut scan = Scan::default();
+        assert!(!scan.settled());
+        let work = scan.next();
+        page(&mut scan, &work, vec![entry(1, None)], Some("page2"));
+        assert!(!scan.settled());
+        let work = scan.next();
+        page(&mut scan, &work, vec![entry(2, Some(request("active")))], None);
+        assert!(!scan.settled(), "the new request's history is unread");
+        let history = scan.next();
+        scan.history(
+            &history,
+            HistoryPage {
+                viewer: viewer("reader"),
+                current: Some(request("active")),
+                events: Vec::new(),
+                previous_cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(scan.settled());
+        let work = scan.next();
+        page(&mut scan, &work, Vec::new(), Some("page2"));
+        let work = scan.next();
+        scan.page(
+            &work,
+            Page {
+                viewer: viewer("other"),
+                entries: Vec::new(),
+                next_cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(!scan.settled(), "a new viewer starts without a census");
+    }
+
+    #[test]
     fn timeline_failure_preserves_request_and_completed_scan_retires_missing_requests() {
         let mut scan = Scan::default();
         let work = scan.next();
@@ -357,6 +394,8 @@ pub struct Scan {
     seen: BTreeSet<u64>,
     histories: VecDeque<PendingHistory>,
     history_next: bool,
+    /// Whether this viewer's census has ever reached the last page.
+    censused: bool,
 }
 
 impl Scan {
@@ -460,6 +499,7 @@ impl Scan {
                 .retain(|history| self.seen.contains(&history.number));
             self.seen.clear();
             self.cursors.clear();
+            self.censused = true;
         }
         Ok(())
     }
@@ -532,6 +572,13 @@ impl Scan {
             self.histories.push_back(pending);
         }
         Ok(())
+    }
+
+    /// Whether this pass has read every page and classified every request it
+    /// found. Until then it has work worth doing as soon as the budget allows.
+    /// A scan reset for a new viewer has read nothing, so it is not settled.
+    pub fn settled(&self) -> bool {
+        self.censused && self.cursor.is_none() && self.histories.is_empty()
     }
 
     /// An unavailable timeline never revokes the authoritative current request.
