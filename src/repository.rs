@@ -3114,6 +3114,9 @@ impl BaseRevision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorktreeRequest {
+    /// Explicit ticket context, persisted with creation for crash-safe linking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_issue: Option<crate::linear::context::LinkedIssue>,
     pub repository: PathBuf,
     pub managed_root: PathBuf,
     pub destination: PathBuf,
@@ -5723,6 +5726,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::DestinationOccupied.into());
         }
         Ok(CreateWorktreeRequest {
+            linear_issue: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
@@ -7545,6 +7549,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
+            linear_issue: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: destination.clone(),
@@ -7575,6 +7580,7 @@ mod tests {
     fn tracking_is_configured_after_creation_from_the_validated_ref() {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
+            linear_issue: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: root.path().join("feature"),
@@ -9333,6 +9339,7 @@ mod tests {
         let managed = tempfile::tempdir().unwrap();
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
+                linear_issue: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
                 destination: managed.path().join("feature"),
@@ -11750,6 +11757,20 @@ fn finish_worktree_journal(
     created: i64,
     emit: &impl Fn(WorktreeProgressStage),
 ) -> WorktreeOperationReport {
+    let mut journal = journal.clone();
+    // Linking precedes the Applied journal transition: recovery repeats this
+    // idempotent write if the process exits between the two durable writes.
+    if journal.state == WorktreeOperationState::Created
+        && let Some(issue) = &journal.request.linear_issue
+        && let Err(error) = crate::linear::context::link_at(
+            &journal.request.destination,
+            &issue.issue_id,
+            issue.workspace.as_deref(),
+        )
+    {
+        journal.state = WorktreeOperationState::ReconcileRequired;
+        journal.detail = format!("Worktree created; Linear linking requires reconciliation: {error}");
+    }
     let mut report = journal.report(created);
     if let Err(error) = journal.persist(store, prior) {
         report.state = WorktreeOperationState::JournalWriteFailed;
@@ -11814,6 +11835,7 @@ mod worktree_journal_tests {
             .unwrap();
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
+                linear_issue: None,
                 repository,
                 managed_root: root.clone(),
                 destination: root.join("feature"),
@@ -11959,6 +11981,27 @@ mod worktree_journal_tests {
                 &sender,
             )
         }
+    }
+
+    #[test]
+    fn created_worktree_has_its_requested_linear_link_before_settlement() {
+        let mut fixture = Fixture::new();
+        let issue = crate::linear::context::LinkedIssue {
+            issue_id: "ENG-123".into(),
+            workspace: Some("TEST".into()),
+        };
+        fixture.request.linear_issue = Some(issue.clone());
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination).unwrap(),
+            issue,
+        );
+        assert_eq!(fixture.journal(fixture.request.operation_id).request.linear_issue, Some(issue));
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.repository).unwrap_err().kind,
+            "linear_issue_required",
+        );
     }
 
     /// Deleting a created worktree in the app frees its identity, so the same
