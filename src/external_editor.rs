@@ -2,6 +2,7 @@
 use crate::sidebar::SidebarEditor;
 use std::{
     env, fs,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -150,12 +151,29 @@ fn desktop_icon(path: &Path) -> Option<String> {
 
 /// Launch a previously discovered editor, passing paths as a single argv value.
 pub fn launch(editor: &Editor, path: &Path) -> Result<(), String> {
+    launch_at(editor, path, None)
+}
+
+/// Positions use one-based lines and columns, as external editors do.
+pub fn arguments(editor: &str, path: &Path, position: Option<(usize, usize)>) -> Vec<OsString> {
+    let Some((line, column)) = position else { return vec!["--".into(), path.into()]; };
+    let (line, column) = (line.max(1), column.max(1));
+    let located = || { let mut p = path.as_os_str().to_os_string(); p.push(format!(":{line}:{column}")); p };
+    match editor {
+        "code" | "codium" | "cursor" => vec!["-g".into(), located()],
+        "zed" | "zeditor" | "sublime" | "subl" => vec!["--".into(), located()],
+        "vim" | "nvim" => vec![format!("+{line}").into(), "--".into(), path.into()],
+        "emacs" => vec![format!("+{line}:{column}").into(), "--".into(), path.into()],
+        _ => vec!["--".into(), path.into()],
+    }
+}
+
+pub fn launch_at(editor: &Editor, path: &Path, position: Option<(usize, usize)>) -> Result<(), String> {
     if !path.is_absolute() || !path.exists() {
         return Err("The selected file or directory is unavailable.".into());
     }
     let mut child = Command::new(&editor.executable)
-        .arg("--")
-        .arg(path)
+        .args(arguments(&editor.choice.id, path, position))
         .current_dir(if path.is_file() {
             path.parent().unwrap_or(path)
         } else {
@@ -176,4 +194,22 @@ pub fn launch(editor: &Editor, path: &Path) -> Result<(), String> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn positions_are_separate_arguments_and_known_editors_keep_the_caret() {
+        let path = Path::new("/tmp/some file.rs");
+        for name in ["code", "codium", "cursor"] {
+            assert_eq!(arguments(name, path, Some((120, 8))), vec![OsString::from("-g"), OsString::from("/tmp/some file.rs:120:8")]);
+        }
+        for name in ["zed", "subl"] {
+            assert_eq!(arguments(name, path, Some((120, 8)))[1], "/tmp/some file.rs:120:8");
+        }
+        for name in ["vim", "nvim"] { assert_eq!(arguments(name, path, Some((120, 8)))[0], "+120"); }
+        assert_eq!(arguments("emacs", path, Some((120, 8)))[0], "+120:8");
+        assert_eq!(arguments("unknown", path, Some((120, 8))), arguments("unknown", path, None));
+    }
 }

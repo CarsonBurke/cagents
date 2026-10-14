@@ -537,6 +537,10 @@ pub enum RepositoryAction {
         card: CardId,
         editor_id: String,
     },
+    OpenSystem { card: CardId },
+    RevealFile { card: CardId },
+    BinaryPage { card: CardId, offset: u64 },
+    BinaryPageLoaded { identity: AsyncIdentity, result: Result<crate::editor::BinaryPreview, FileIoError> },
     StageSelected {
         card: CardId,
         stage: bool,
@@ -693,6 +697,9 @@ impl RepositoryAction {
             | Self::Redo { card }
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
+            | Self::OpenSystem { card }
+            | Self::RevealFile { card }
+            | Self::BinaryPage { card, .. }
             | Self::StageSelected { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
@@ -732,6 +739,7 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::BinaryPageLoaded { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
@@ -3624,6 +3632,14 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
+    /// One-based character coordinates for external editor launchers.
+    pub fn editor_caret(&self) -> Option<(usize, usize)> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        let cursor = document.content.cursor().position;
+        let column = document.content.with_line(cursor.line, |line, _| line[..cursor.column.min(line.len())].chars().count() + 1)?;
+        Some((cursor.line + 1, column))
+    }
+
     /// The file the open buffer really is, when the selected path is a
     /// symbolic link to it; `None` for a buffer that is its own file.
     ///
@@ -4698,6 +4714,26 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::BinaryPage { card, offset } => {
+                let DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(_) } = &self.document else { return Task::none(); };
+                let identity = self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
+                let worktree = self.descriptor.worktree.clone();
+                let path = path.clone();
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || crate::editor::load_binary_page(&worktree, &path, offset)).await
+                        .map_err(|error| FileIoError::Io(error.to_string())).and_then(|result| result);
+                    RepositoryAction::BinaryPageLoaded { identity, result }
+                })
+            }
+            RepositoryAction::BinaryPageLoaded { identity, result } => {
+                if self.accepts_selected(&identity)
+                    && let DocumentState::ReadOnly { reason, .. } = &mut self.document
+                {
+                    match result { Ok(preview) => *reason = ReadOnlyReason::BinaryPreview(preview), Err(error) => { if let ReadOnlyReason::BinaryPreview(preview) = reason { preview.error = Some(error.to_string()); } } }
+                }
+                Task::none()
+            }
+            RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. } => Task::none(),
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
             RepositoryAction::SearchDirectory { card, query } => self.search_directory(card, query),
@@ -7992,6 +8028,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         DocumentState::Failed { path, message } => {
             information_state(format!("Could not open {}", path.display()), message)
         }
+        DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(preview) } => binary_file_view(card, path, preview),
         DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
         DocumentState::Editable(document) => editable_document_view(card, runtime, document),
         DocumentState::Image {
@@ -10396,6 +10433,32 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     }
 }
 
+fn binary_file_view(card: CardId, path: &Path, preview: &crate::editor::BinaryPreview) -> Element<'static, RepositoryAction> {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(preview.data.len() * 5);
+    for (row, bytes) in preview.data.chunks(16).enumerate() {
+        let _ = write!(hex, "{:08x}  ", preview.offset + (row * 16) as u64);
+        for index in 0..16 { match bytes.get(index) { Some(byte) => { let _ = write!(hex, "{byte:02x} "); }, None => hex.push_str("   ") } }
+        hex.push_str(" | ");
+        for byte in bytes { hex.push(if byte.is_ascii_graphic() || *byte == b' ' { *byte as char } else { '.' }); }
+        hex.push('\n');
+    }
+    let modified = preview.modified.and_then(|time| jiff::Timestamp::try_from(time).ok()).map(|time| time.to_string()).unwrap_or_else(|| "unknown".into());
+    let actions = widget::row::with_children(vec![
+        crate::ui_controls::button::secondary("Open with system app").on_press_maybe((!crate::device::is_remote()).then_some(RepositoryAction::OpenSystem { card })).into(),
+        crate::ui_controls::button::secondary("Reveal in file manager").on_press_maybe((!crate::device::is_remote()).then_some(RepositoryAction::RevealFile { card })).into(),
+        crate::ui_controls::button::secondary("Previous 64 KiB").on_press_maybe((preview.offset > 0).then_some(RepositoryAction::BinaryPage { card, offset: preview.offset.saturating_sub(crate::editor::BINARY_PREVIEW_BYTES) })).into(),
+        crate::ui_controls::button::secondary("Load more (next 64 KiB)").on_press_maybe((preview.offset + (preview.data.len() as u64) < preview.bytes).then_some(RepositoryAction::BinaryPage { card, offset: preview.offset + crate::editor::BINARY_PREVIEW_BYTES })).into(),
+    ]).spacing(space::S);
+    widget::container(widget::column::with_children(vec![
+        crate::design::body(format!("{} · {} bytes · {}", path.display(), preview.bytes, preview.mime)).into(),
+        crate::design::caption(format!("Modified {modified} · bytes {}–{}", preview.offset, preview.offset + preview.data.len() as u64)).into(),
+        crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
+        actions.into(),
+        widget::scrollable(widget::text(hex).font(cosmic::iced::Font::MONOSPACE)).width(Length::Fill).height(Length::Fill).into(),
+    ]).spacing(space::M)).padding(space::M).width(Length::Fill).height(Length::Fill).into()
+}
+
 /// The sentence under the read-only title, about the file that was classified.
 fn read_only_detail(path: &Path, reason: &ReadOnlyReason) -> String {
     match reason {
@@ -10412,6 +10475,7 @@ fn read_only_detail(path: &Path, reason: &ReadOnlyReason) -> String {
                 LinkRefusal::TooManyLinks => "which leads through too many links to follow.",
             }
         ),
+        ReadOnlyReason::BinaryPreview(preview) => format!("{} · {} bytes · {}", path.display(), preview.bytes, preview.mime),
         ReadOnlyReason::Binary => format!("{} contains binary data.", path.display()),
         ReadOnlyReason::InvalidUtf8 => format!("{} is not valid UTF-8.", path.display()),
         ReadOnlyReason::Image(message) | ReadOnlyReason::Document(message) => {
