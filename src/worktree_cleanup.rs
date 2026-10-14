@@ -431,12 +431,17 @@ pub(crate) struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
     requested: std::collections::BTreeSet<PathBuf>,
     ready: Option<crate::instance::OwnedLock>,
+    retry_after: Option<std::time::Instant>,
+    last_failure: Option<String>,
+    missing: std::collections::BTreeSet<PathBuf>,
 }
 
 impl WindowProtections {
     fn suspend_readiness(&mut self) {
         self.ready = None;
         self.requested.clear();
+        self.retry_after = None;
+        self.last_failure = None;
     }
 
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
@@ -459,37 +464,95 @@ impl WindowProtections {
             self.suspend_readiness();
             return Ok(());
         }
-        let requested = directories
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        if self.ready.is_some() && requested == self.requested {
+        self.sync_with(
+            directories,
+            std::time::Instant::now(),
+            |path| path.canonicalize(),
+            |path| protect(path)?.ok_or_else(|| io::Error::other("window protection unavailable")),
+            crate::instance::window_protection_ready,
+        )
+    }
+
+    /// Missing paths and failed leases are revisited on a slow timer. The
+    /// ordinary unchanged-message path never touches the filesystem.
+    fn sync_with(
+        &mut self,
+        directories: impl IntoIterator<Item = PathBuf>,
+        now: std::time::Instant,
+        mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
+        mut protect: impl FnMut(&Path) -> io::Result<Protection>,
+        ready: impl FnOnce() -> io::Result<crate::instance::OwnedLock>,
+    ) -> io::Result<()> {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+        let requested = directories.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let changed = requested != self.requested;
+        if !changed && self.retry_after.is_none_or(|deadline| now < deadline)
+            && (self.ready.is_some() || self.retry_after.is_some())
+        {
             return Ok(());
         }
-        // Install every replacement before retiring any earlier protection.
-        // A failed acquisition removes readiness, so cleanup fails closed.
-        let result = (|| {
-            let mut needed = std::collections::BTreeSet::new();
-            for directory in &requested {
-                let directory = directory.canonicalize()?;
-                if !self.directories.contains_key(&directory) {
-                    let guard = protect(&directory)?
-                        .ok_or_else(|| io::Error::other("window protection unavailable"))?;
-                    self.directories.insert(directory.clone(), guard);
-                }
-                needed.insert(directory);
-            }
-            self.directories
-                .retain(|directory, _| needed.contains(directory));
-            if self.ready.is_none() {
-                self.ready = Some(crate::instance::window_protection_ready()?);
-            }
-            self.requested = requested;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.ready = None;
+        if changed {
+            self.last_failure = None;
         }
-        result
+        self.requested = requested;
+        let mut needed = std::collections::BTreeSet::new();
+        let mut missing = std::collections::BTreeSet::new();
+        let mut errors = Vec::new();
+        // Continue after individual failures so every resolvable scope keeps
+        // its lease. Preserve earlier guards until the replacement set is safe.
+        for path in &self.requested {
+            let directory = match canonicalize(path) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing.insert(path.clone());
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if !self.directories.contains_key(&directory) {
+                match protect(&directory) {
+                    Ok(guard) => { self.directories.insert(directory.clone(), guard); }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        missing.insert(path.clone());
+                        continue;
+                    }
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", path.display()));
+                        continue;
+                    }
+                }
+            }
+            needed.insert(directory);
+        }
+        if missing != self.missing && !missing.is_empty() {
+            tracing::debug!(?missing, "missing window directories need no worktree cleanup protection");
+        }
+        self.missing = missing;
+        if errors.is_empty() {
+            if self.ready.is_none() {
+                match ready() {
+                    Ok(guard) => self.ready = Some(guard),
+                    Err(error) => errors.push(error.to_string()),
+                }
+            }
+            if errors.is_empty() {
+                self.directories.retain(|directory, _| needed.contains(directory));
+                self.retry_after = (!self.missing.is_empty()).then_some(now + RETRY_DELAY);
+                self.last_failure = None;
+                return Ok(());
+            }
+        }
+        self.ready = None;
+        self.retry_after = Some(now + RETRY_DELAY);
+        let failure = errors.join("; ");
+        if self.last_failure.as_ref() == Some(&failure) {
+            return Ok(());
+        }
+        self.last_failure = Some(failure.clone());
+        Err(io::Error::other(failure))
     }
 }
 
@@ -814,6 +877,80 @@ mod tests {
     }
 
     #[test]
+    fn missing_scope_keeps_other_scopes_ready_without_message_driven_io() {
+        let runtime = tempfile::tempdir().unwrap();
+        let present = tempfile::tempdir().unwrap();
+        let missing = present.path().join("missing");
+        let paths = vec![present.path().to_owned(), missing.clone()];
+        let mut window = WindowProtections::default();
+        let now = std::time::Instant::now();
+        window.sync_with(paths.clone(), now, |path| path.canonicalize(),
+            |path| acquire(runtime.path(), path, false),
+            || crate::instance::owned_lock(&runtime.path().join("ready"), libc::LOCK_EX | libc::LOCK_NB),
+        ).unwrap();
+        assert!(window.ready.is_some());
+        assert!(window.missing.contains(&missing));
+        assert_eq!(window.directories.len(), 1);
+        assert_eq!(acquire(runtime.path(), present.path(), true).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        for _ in 0..100 {
+            window.sync_with(paths.clone(), now, |_| panic!("unchanged scopes performed filesystem I/O"),
+                |_| panic!("unchanged scopes acquired a lease"),
+                || panic!("unchanged scopes republished readiness"),
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_scope_is_cached_and_logs_only_once_until_its_failure_changes() {
+        let paths = vec![PathBuf::from("/scope")];
+        let mut window = WindowProtections::default();
+        let now = std::time::Instant::now();
+        assert!(window.sync_with(paths.clone(), now, |path| Ok(path.to_owned()),
+            |_| Err(io::Error::other("lease busy")), || panic!("failed scopes cannot be ready"),
+        ).is_err());
+        window.sync_with(paths.clone(), now, |_| panic!("cached failure performed I/O"),
+            |_| panic!("cached failure acquired a lease"), || panic!("failed scopes cannot be ready"),
+        ).unwrap();
+        // The same failure after the retry deadline is not emitted again.
+        window.sync_with(paths, now + std::time::Duration::from_secs(31), |path| Ok(path.to_owned()),
+            |_| Err(io::Error::other("lease busy")), || panic!("failed scopes cannot be ready"),
+        ).unwrap();
+    }
+
+    #[test]
+    fn changed_scope_set_retries_before_backoff_expires() {
+        let mut window = WindowProtections::default();
+        let now = std::time::Instant::now();
+        let mut attempts = 0;
+        for paths in [vec![PathBuf::from("/one")], vec![PathBuf::from("/two")]] {
+            assert!(window.sync_with(paths, now, |path| Ok(path.to_owned()),
+                |_| { attempts += 1; Err(io::Error::other("lease busy")) },
+                || panic!("failed scopes cannot be ready"),
+            ).is_err());
+        }
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn failed_scope_retries_after_backoff_and_restores_readiness() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = vec![directory.path().to_owned()];
+        let mut window = WindowProtections::default();
+        let now = std::time::Instant::now();
+        assert!(window.sync_with(paths.clone(), now, |path| path.canonicalize(),
+            |_| Err(io::Error::other("lease busy")), || panic!("failed scopes cannot be ready"),
+        ).is_err());
+        window.sync_with(paths, now + std::time::Duration::from_secs(31), |path| path.canonicalize(),
+            |path| acquire(runtime.path(), path, false),
+            || crate::instance::owned_lock(&runtime.path().join("ready"), libc::LOCK_EX | libc::LOCK_NB),
+        ).unwrap();
+        assert!(window.ready.is_some());
+        assert!(window.last_failure.is_none());
+        assert!(window.retry_after.is_none());
+    }
+
+    #[test]
     fn device_switch_revokes_readiness_without_exposing_retained_local_editors() {
         let runtime = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -826,6 +963,7 @@ mod tests {
             ready: Some(
                 crate::instance::owned_lock(&marker, libc::LOCK_EX | libc::LOCK_NB).unwrap(),
             ),
+            ..Default::default()
         };
         window.suspend_readiness();
         assert!(window.ready.is_none());
