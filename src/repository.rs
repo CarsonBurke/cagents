@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod managed_worktrees;
 mod worktree_safety;
 pub use worktree_safety::{WorktreeSafetySnapshot, default_disposable_ignored_directories};
 
@@ -5688,7 +5689,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let configured = input.managed_directory.trim();
         let configured = Path::new(if configured.is_empty() {
-            "worktrees/"
+            ".worktrees/"
         } else {
             configured
         });
@@ -11243,6 +11244,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            self.ensure_managed_directory_ignored(&journal.request.repository, &journal.request.managed_root, cancellation)?;
+            self.ignore_legacy_managed_worktrees(&journal.request.repository, cancellation)?;
             fs::create_dir_all(&journal.request.managed_root)
                 .map_err(|e| ValidationError::Io(e.to_string()))?;
             let plan = self.plan_worktree_creation(&journal.request)?;
