@@ -1362,62 +1362,6 @@ impl Runtime {
         if self.changes.open {
             content.push(self.changes_view(content_width));
         }
-        if self.branch_picker {
-            let mut choices: Vec<Element<'_, Message>> = Vec::new();
-            let codex = self.session.launch.provider == Provider::Codex;
-            choices.push(design::heading("Fork chat").into());
-            choices.push(
-                design::caption(if codex {
-                    "Start a new chat after a completed turn, or copy the whole conversation."
-                } else {
-                    "Start a new chat before a prompt, then edit or resend its draft."
-                })
-                .into(),
-            );
-            if codex {
-                choices.push(
-                    crate::ui_controls::button::quiet("Fork entire conversation")
-                        .on_press_maybe(
-                            (available
-                                && snapshot.ready
-                                && !snapshot.busy
-                                && snapshot.read_only_reason.is_none())
-                            .then(|| action(Action::Command(target, Command::Branch { id: None }))),
-                        )
-                        .into(),
-                );
-            }
-            for point in &snapshot.branch_points {
-                choices.push(
-                    crate::ui_controls::button::quiet(&point.label)
-                        .on_press_maybe(
-                            (available
-                                && snapshot.ready
-                                && !snapshot.busy
-                                && snapshot.read_only_reason.is_none())
-                            .then(|| {
-                                action(Action::Command(
-                                    target,
-                                    Command::Branch {
-                                        id: Some(point.id.clone()),
-                                    },
-                                ))
-                            }),
-                        )
-                        .into(),
-                );
-            }
-            choices.push(
-                crate::ui_controls::button::quiet("Close")
-                    .on_press(action(Action::BranchPicker(target, false)))
-                    .into(),
-            );
-            content.push(
-                widget::scrollable(widget::column::with_children(choices).spacing(step::GAP_XS))
-                    .height(Length::Fixed(200.0))
-                    .into(),
-            );
-        }
         // A plan is consulted rather than read, so it is pinned above the
         // transcript that scrolls under it. Inside the transcript it went out
         // of reach with the first thing the agent did after publishing it,
@@ -1975,6 +1919,13 @@ impl Runtime {
                     {
                         return None;
                     }
+                    if (self.composer_actions || self.branch_picker)
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(
+                            Action::ComposerActions(target, false),
+                        )));
+                    }
                     // An open completion list has the keys a reader uses to
                     // pick from it ahead of sending and history.
                     if let Some(open) = &open
@@ -2036,6 +1987,9 @@ impl Runtime {
                 .into()
         };
         let mut actions = Vec::new();
+        if snapshot.capabilities.branch || snapshot.capabilities.compact {
+            actions.push(self.composer_actions(available));
+        }
         if !snapshot.capabilities.interrupt_modes.is_empty() {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
             let next = if mode == "wait" { "immediate" } else { "wait" };
@@ -2063,19 +2017,6 @@ impl Runtime {
                 "Attach files",
                 available && !self.attachment_chooser_pending,
                 Action::Attach(target),
-            ));
-        }
-        if snapshot.capabilities.compact {
-            // A four-corner collapse glyph reads as a window control, which is
-            // what made the one control here that rewrites the conversation
-            // look like something that resizes it. The tooltip names the
-            // effect rather than the mechanism: what a reader wants from this
-            // is the context figure back.
-            actions.push(icon(
-                Icon::Compress,
-                "Compact the conversation: summarize earlier turns to free context",
-                available && !snapshot.busy,
-                Action::Command(target, Command::Compact),
             ));
         }
         // Commands are reached by typing `/`, which is how every agent surface
@@ -2492,6 +2433,114 @@ impl Runtime {
             ))
             .width(Length::Fill)
             .into(),
+        )
+    }
+
+    fn composer_actions(&self, available: bool) -> Element<'_, Message> {
+        let target = self.target;
+        let snapshot = &self.snapshot;
+        let open = self.composer_actions || self.branch_picker;
+        let enabled =
+            available && snapshot.ready && !snapshot.busy && snapshot.read_only_reason.is_none();
+        let anchor = crate::ui_controls::icon_button(Icon::Plus, "Conversation actions")
+            .id(card_control_id(target.card, "chat-actions"))
+            .selected(open)
+            .on_press(action(Action::ComposerActions(target, !open)));
+        let popup = open.then(|| {
+            let content: Element<'_, Message> = if self.branch_picker {
+                let mut choices: Vec<Element<'_, Message>> = Vec::new();
+                let codex = self.session.launch.provider == Provider::Codex;
+                choices.push(design::heading("Fork chat").into());
+                choices.push(
+                    design::caption(if codex {
+                        "Start a new chat after a completed turn, or copy the whole conversation."
+                    } else {
+                        "Start a new chat before a prompt, then edit or resend its draft."
+                    })
+                    .into(),
+                );
+                if codex {
+                    choices.push(
+                        crate::ui_controls::button::secondary("Fork entire conversation")
+                            .width(Length::Fill)
+                            .on_press_maybe(enabled.then(|| {
+                                action(Action::Command(target, Command::Branch { id: None }))
+                            }))
+                            .into(),
+                    );
+                }
+                for point in &snapshot.branch_points {
+                    choices.push(crate::interaction::tooltip(
+                        crate::ui_controls::button::secondary(Self::short_description(
+                            &point.label,
+                            36,
+                        ))
+                        .name(point.label.as_str())
+                        .width(Length::Fill)
+                        .on_press_maybe(enabled.then(|| {
+                            action(Action::Command(
+                                target,
+                                Command::Branch {
+                                    id: Some(point.id.clone()),
+                                },
+                            ))
+                        })),
+                        point.label.as_str(),
+                    ));
+                }
+                choices.push(
+                    crate::ui_controls::button::secondary("Back")
+                        .on_press(action(Action::BranchPicker(target, false)))
+                        .into(),
+                );
+                widget::column::with_children(choices)
+                    .spacing(step::GAP_S)
+                    .into()
+            } else {
+                let mut choices: Vec<Element<'_, Message>> = Vec::new();
+                if snapshot.capabilities.branch {
+                    choices.push(
+                        crate::ui_controls::button::secondary("Fork conversation…")
+                            .icon(Icon::Branch)
+                            .id(card_control_id(target.card, "chat-actions-fork"))
+                            .width(Length::Fill)
+                            .on_press_maybe(
+                                enabled.then(|| action(Action::BranchPicker(target, true))),
+                            )
+                            .into(),
+                    );
+                }
+                if snapshot.capabilities.compact {
+                    choices.push(
+                        crate::ui_controls::button::secondary("Compact conversation")
+                            .icon(Icon::Compress)
+                            .id(card_control_id(target.card, "chat-actions-compact"))
+                            .name(
+                                "Compact the conversation: summarize earlier turns to free context",
+                            )
+                            .width(Length::Fill)
+                            .on_press_maybe(
+                                enabled.then(|| action(Action::Command(target, Command::Compact))),
+                            )
+                            .into(),
+                    );
+                }
+                widget::column::with_children(choices)
+                    .spacing(step::GAP_S)
+                    .into()
+            };
+            widget::scrollable(content).height(Length::Shrink).into()
+        });
+        crate::ui_controls::popover(
+            anchor,
+            popup.map(|content: Element<'_, Message>| {
+                widget::container(content)
+                    .width(320)
+                    .max_height(260.0)
+                    .into()
+            }),
+            widget::popover::Position::Top,
+            action(Action::ComposerActions(target, false)),
         )
     }
 
@@ -7479,7 +7528,96 @@ mod tests {
         );
     }
     #[test]
-    fn switching_inline_review_and_fork_panels_keeps_the_composer_visible_at_600px() {
+    fn busy_composer_escape_dismisses_actions_before_interrupting() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(620.0, 720.0));
+        for (actions_open, fork_open) in [(false, false), (true, false), (true, true)] {
+            let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.ready = true;
+            snapshot.busy = true;
+            snapshot.capabilities.branch = true;
+            snapshot.capabilities.compact = true;
+            runtime.composer_actions = actions_open;
+            // An already-open fork picker can remain visible as a turn starts.
+            runtime.branch_picker = fork_open;
+            let target = runtime.target;
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                viewport.width,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                    target.card,
+                    "chat-composer",
+                )),
+            );
+            let escape = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &escape,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            if actions_open {
+                assert!(messages.iter().any(|message| matches!(
+                    message,
+                    Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
+                )));
+                assert!(!messages.iter().any(|message| matches!(
+                    message,
+                    Message::ChatUi(Action::Interrupt(..))
+                )));
+            } else {
+                assert!(
+                    messages.iter().any(|message| matches!(
+                        message,
+                        Message::ChatUi(Action::Interrupt(actual)) if *actual == target
+                    )),
+                    "the focused busy composer otherwise handles Escape as interruption"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn switching_review_and_fork_popover_keeps_the_composer_visible_at_600px() {
         use iced::advanced::{Layout, layout, widget::Tree};
         let (mut live, _handle) = frame_cost::live_runtime(&[]);
         let mut app = crate::app::tests::context_inspector_test_app(true);

@@ -235,6 +235,7 @@ pub enum Action {
     /// named, or the newest that can be taken back.
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
+    ComposerActions(Target, bool),
     BranchPicker(Target, bool),
     ChangesPicker(Target, bool),
     ChangeFiles(Target, Option<chat::FileChangeKey>),
@@ -1485,6 +1486,7 @@ pub(super) struct Runtime {
     /// How the draft was queued before it was taken back, which is how
     /// sending it again queues it unless the reader chooses otherwise.
     resend: Option<PromptMode>,
+    composer_actions: bool,
     branch_picker: bool,
     changes: changes::State,
     fork_requested: bool,
@@ -2070,6 +2072,7 @@ impl Runtime {
             recalling: Vec::new(),
             taken_back: Vec::new(),
             resend: None,
+            composer_actions: false,
             branch_picker: false,
             changes: changes::State::default(),
             fork_requested: false,
@@ -4303,10 +4306,14 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
-            || runtime.account_picker;
+            || runtime.account_picker
+            || runtime.composer_actions
+            || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.account_picker = false;
+        runtime.composer_actions = false;
+        runtime.branch_picker = false;
         runtime.picker_keyboard = false;
         open
     }
@@ -5814,6 +5821,8 @@ impl Cagents {
             }
             Action::AccountPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions = false;
+                    runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.account_picker = open && runtime.choosing();
                     runtime.model_picker = None;
@@ -7129,6 +7138,8 @@ impl Cagents {
             }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions = false;
+                    runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
                     if open {
@@ -7252,6 +7263,12 @@ impl Cagents {
                 }
             }
             Action::Command(target, command) => {
+                if matches!(command, Command::Compact | Command::Branch { .. })
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    runtime.composer_actions = false;
+                    runtime.branch_picker = false;
+                }
                 if command == Command::LoadEarlier {
                     if let Some(runtime) = self.chat_runtime_mut(target) {
                         if runtime.selected_subagent.is_some() {
@@ -7309,6 +7326,7 @@ impl Cagents {
                     return Task::none();
                 };
                 if open {
+                    runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.changes.show();
                 } else {
@@ -7395,11 +7413,27 @@ impl Cagents {
                     .map(cosmic::Action::App);
                 }
             }
+            Action::ComposerActions(target, open) => {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                    return Task::none();
+                }
+                if open {
+                    self.dismiss_chat_picker();
+                }
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions = open;
+                    runtime.branch_picker = false;
+                }
+            }
             Action::BranchPicker(target, open) => {
                 if open && self.chat_fork_target(target.card) != Some(target) {
                     return Task::none();
                 }
+                if open {
+                    self.dismiss_chat_picker();
+                }
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions = true;
                     runtime.branch_picker = open;
                     if open {
                         runtime.changes.close();
@@ -8344,6 +8378,8 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                runtime.composer_actions = false;
+                runtime.branch_picker = false;
                 runtime.picker_keyboard = false;
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
@@ -8370,6 +8406,8 @@ impl Cagents {
             }
             Action::ReasoningPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions = false;
+                    runtime.branch_picker = false;
                     runtime.reasoning_picker = open;
                     runtime.model_picker = None;
                     runtime.account_picker = false;
@@ -16371,6 +16409,63 @@ mod tests {
         );
         assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
     }
+    #[test]
+    fn composer_actions_navigate_dismiss_and_ignore_stale_targets() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("composer-actions"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+        snapshot.ready = true;
+        snapshot.capabilities.branch = true;
+        snapshot.capabilities.compact = true;
+
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        assert!(chat_runtime(&app, card).composer_actions);
+        let stale = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        drop(app.handle_chat_ui(Action::ComposerActions(stale, true)));
+        assert!(chat_runtime(&app, card).composer_actions);
+
+        drop(app.handle_chat_ui(Action::BranchPicker(target, true)));
+        assert!(chat_runtime(&app, card).branch_picker);
+        drop(app.handle_chat_ui(Action::BranchPicker(target, false)));
+        assert!(chat_runtime(&app, card).composer_actions);
+        assert!(!chat_runtime(&app, card).branch_picker);
+        assert!(app.dismiss_chat_picker());
+        assert!(!chat_runtime(&app, card).composer_actions);
+        assert!(!app.dismiss_chat_picker());
+
+        // Busy chats can inspect the menu, but cannot enter the fork picker.
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::BranchPicker(target, true)));
+        assert!(!chat_runtime(&app, card).branch_picker);
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        }));
+        assert!(!chat_runtime(&app, card).composer_actions);
+        assert!(chat_runtime(&app, card).snapshot.busy);
+
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = false;
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::Command(target, Command::Compact)));
+        assert!(!chat_runtime(&app, card).composer_actions);
+        assert!(!chat_runtime(&app, card).branch_picker);
+    }
+
     #[test]
     fn inline_fork_and_file_review_actions_never_leave_both_panels_open() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
