@@ -6120,6 +6120,37 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
+    /// Open a repository-relative location, even before the directory listing
+    /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
+    /// The requested range is clamped when the asynchronous file read finishes.
+    pub fn open_file_location(&mut self, card: CardId, path: PathBuf, line: usize, column: usize, selection_bytes: usize) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() { return Task::none(); }
+        let caret = text_editor::Position { line, column };
+        let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &mut self.document
+        {
+            document.content.set_cursor(text_editor::Cursor { position: caret, selection });
+            document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        if self.blocks_navigation() { return Task::none(); }
+        let loading_same = self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same { Task::none() } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile { path: path.clone(), ..RepositoryFile::default() });
+            if file.directory { return Task::none(); }
+            self.open_file_entry(card, file)
+        };
+        self.pending_editor_navigation = Some((path, crate::model::EditorNavigation {
+            caret: crate::model::EditorPosition { line, column },
+            selection: selection.map(|position| crate::model::EditorPosition { line: position.line, column: position.column }),
+            scroll_line: line.saturating_sub(10), scroll_vertical: 0.0, scroll_horizontal: 0.0,
+        }));
+        task
+    }
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
