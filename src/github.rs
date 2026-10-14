@@ -25,6 +25,7 @@ use crate::repository::{
 #[cfg(feature = "ui")]
 pub mod avatar;
 pub mod review_requests;
+pub mod polling;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
@@ -545,6 +546,7 @@ pub struct PullRequestReviewThread {
 
 #[derive(Debug, Clone, Default)]
 pub struct PullRequestConversation {
+    pub threads_truncated: bool,
     pub threads: Vec<PullRequestReviewThread>,
     pub comments: Vec<PullRequestComment>,
     pub reviews: Vec<PullRequestReview>,
@@ -798,7 +800,7 @@ pub struct PullRequestFilePage {
 
 /// The viewer's unsubmitted review, if one exists. GitHub keeps at most one
 /// per viewer per pull request, and only its owner can see it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     pub id: String,
     pub comment_count: u64,
@@ -808,7 +810,7 @@ pub struct PendingReview {
 /// What a review pane needs before its first mutation: the node id every
 /// mutation addresses, the endpoints its diff must match, and whether a
 /// pending review already exists to adopt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewContext {
     pub pull_request_id: String,
     pub head_oid: String,
@@ -1202,6 +1204,8 @@ pub trait GitHubReviewApi: Send + Sync {
 
 #[derive(Debug, Error)]
 pub enum GitHubError {
+    #[error("{limit}")]
+    RateLimited { limit: polling::RateLimit },
     #[error(transparent)]
     Validation(#[from] GitHubValidationError),
     #[error(transparent)]
@@ -1234,6 +1238,17 @@ pub enum GitHubError {
     Inspection(String),
 }
 
+impl GitHubError {
+    pub fn rate_limit(&self) -> Option<polling::RateLimit> {
+        match self {
+            Self::RateLimited { limit } => Some(limit.clone()),
+            Self::InvalidResponse { source, process } => source.rate_limit().or_else(|| polling::RateLimit::classify(&format!("{}\n{}", String::from_utf8_lossy(&process.stdout), String::from_utf8_lossy(&process.stderr)), polling::now())),
+            Self::Process(failure) => polling::RateLimit::classify(&format!("{}\n{}\n{}", failure.message, String::from_utf8_lossy(&failure.stdout), String::from_utf8_lossy(&failure.stderr)), polling::now()),
+            _ => polling::RateLimit::classify(&self.to_string(), polling::now()),
+        }
+    }
+}
+
 /// Authority to mutate is the repository identity established by the last
 /// completed successful refresh. It therefore survives an in-flight refresh,
 /// which `Loading` carries forward, and is revoked only by a completed refresh
@@ -1254,6 +1269,7 @@ pub enum GitHubAvailability {
         pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
         refreshed_at: i64,
     },
+    RateLimited { limit: polling::RateLimit },
     Failed {
         detail: String,
     },
@@ -1267,6 +1283,7 @@ impl GitHubAvailability {
             Self::Unauthenticated => "GitHub CLI is not signed in. Run gh auth login in a terminal, then refresh.".into(),
             Self::NotAssociated => "This repository has no supported GitHub remote. Add a GitHub remote, then refresh.".into(),
             Self::Loading { .. } => "Connecting to GitHub…".into(),
+            Self::RateLimited { limit } => limit.to_string(),
             Self::Failed { detail } => format!("Could not connect to GitHub: {detail}. Check your connection and refresh to retry."),
             Self::Ready { .. } => self.label().into(),
         }
@@ -1290,6 +1307,7 @@ impl GitHubAvailability {
                 "GitHub is up to date; no open pull requests."
             }
             Self::Ready { .. } => "GitHub is up to date.",
+            Self::RateLimited { .. } => "GitHub rate limit reached. Waiting until reset.",
             Self::Failed { .. } => {
                 "Could not connect to GitHub. Check your connection and refresh."
             }
@@ -1297,6 +1315,7 @@ impl GitHubAvailability {
     }
 
     pub fn from_error(error: GitHubError) -> Self {
+        if let Some(limit) = error.rate_limit() { return Self::RateLimited { limit }; }
         match error {
             GitHubError::UnsupportedAuthStatus { .. } => Self::UnsupportedCli,
             GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Spawn => {
@@ -1764,7 +1783,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<serde_json::Value, GitHubError> {
         let command = self.graphql_command(repository, query, variables);
         let output = self.run_checked(&command, repository, cancellation)?;
-        attach_process(parse_graphql(&output.stdout), &output)
+        let result = attach_process(parse_graphql(&output.stdout), &output);
+        if let Err(error) = &result { polling::failed(&repository.host, error); }
+        result
     }
 
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
@@ -1851,6 +1872,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 }
                 if page == 3 {
                     result.truncated = true;
+                    result.threads_truncated |= section == "reviewThreads";
                     break;
                 }
                 cursor = Some(next_cursor(&info, cursor.as_deref())?);
@@ -2065,8 +2087,10 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
-        let output = self.execute(command, cancellation)?;
-        self.checked_output(output, repository)
+        let result = self.execute(command, cancellation).map_err(GitHubError::from)
+            .and_then(|output| self.checked_output(output, repository));
+        if let Err(error) = &result { polling::failed(&repository.host, error); }
+        result
     }
 
     fn checked_output(
@@ -2074,6 +2098,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         output: ProcessOutput,
         repository: &GitHubRepoKey,
     ) -> Result<ProcessOutput, GitHubError> {
+        if !output.success && let Some(limit) = polling::RateLimit::classify(&format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)), polling::now()) {
+            return Err(GitHubError::RateLimited { limit });
+        }
         if output.success {
             Ok(output)
         } else if output.exit_code == Some(4) {
@@ -2902,6 +2929,9 @@ fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, Git
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
     let mut envelope: serde_json::Value = parse_json(output)?;
+    if let Some(limit) = polling::RateLimit::classify(&envelope.get("errors").map(ToString::to_string).unwrap_or_default(), polling::now()) {
+        return Err(GitHubError::RateLimited { limit });
+    }
     if let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array)
         && !errors.is_empty()
     {
