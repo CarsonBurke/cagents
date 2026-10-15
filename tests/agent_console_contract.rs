@@ -39,6 +39,10 @@ impl Fixture {
     }
 
     fn new() -> Self {
+        Self::with_provider(include_str!("fixtures/execution-console-claude.sh"))
+    }
+
+    fn with_provider(script: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         for directory in [
             "home/.claude",
@@ -54,11 +58,7 @@ impl Fixture {
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         let provider = root.path().join("bin/claude");
-        fs::write(
-            &provider,
-            include_str!("fixtures/execution-console-claude.sh"),
-        )
-        .unwrap();
+        fs::write(&provider, script).unwrap();
         fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
         let log = fs::File::create(root.path().join("daemon.log")).unwrap();
         let daemon = Self::command(root.path(), Path::new(env!("CARGO_BIN_EXE_cagentsd")))
@@ -109,6 +109,19 @@ impl Fixture {
         child.wait_with_output().unwrap()
     }
 
+    fn wait(&self, arguments: &[&str], expected_code: i32) -> Value {
+        let output = self.output(arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{arguments:?}: {output:?}"
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["results"].as_array().unwrap().len(), 1);
+        value["data"]["results"][0].clone()
+    }
+
     fn cli(&self, arguments: &[&str]) -> Value {
         let output = self.output(arguments);
         assert!(output.status.success(), "{arguments:?}: {output:?}");
@@ -157,7 +170,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     ]);
     let agent = accepted["agent"]["id"].as_str().unwrap();
     let first_run = accepted["run"]["id"].as_str().unwrap();
-    let waiting = fixture.cli(&["agent", "wait", first_run, "--timeout", "10"]);
+    let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
     // PTY snapshots can split the heading from its following instructions.
@@ -192,7 +205,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "--timeout",
         "10",
     ]);
-    let completed = fixture.cli(&["agent", "wait", first_run, "--timeout", "10"]);
+    let completed = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 0);
     assert_eq!(completed["run"]["state"], "Succeeded", "{completed}");
     assert_eq!(completed["run"]["result"]["text"], "CONSOLE_RESULT_1");
     fixture.cli(&["terminal", "write", terminal, "second prompt\n"]);
@@ -273,7 +286,7 @@ fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
     ]);
     let agent = accepted["agent"]["id"].as_str().unwrap();
     let run = accepted["run"]["id"].as_str().unwrap();
-    let failed = fixture.cli(&["agent", "wait", run, "--timeout", "10"]);
+    let failed = fixture.wait(&["agent", "wait", run, "--timeout", "10"], 4);
     assert_eq!(failed["run"]["state"], "Failed", "{failed}");
     assert!(
         failed["run"]["result"]["diagnostic"]
@@ -354,7 +367,7 @@ fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
         let agent = accepted["agent"]["id"].as_str().unwrap();
         let run = accepted["run"]["id"].as_str().unwrap();
         assert_eq!(
-            fixture.cli(&["agent", "wait", run, "--timeout", "10"])["run"]["state"],
+            fixture.wait(&["agent", "wait", run, "--timeout", "10"], 5)["run"]["state"],
             "Waiting"
         );
         fixture.cli(&["agent", "close", agent]);
@@ -394,7 +407,7 @@ fn an_owner_drives_its_agent_by_short_handles() {
     let agent = &accepted["agent"]["id"].as_str().unwrap()[..8];
     let run = &accepted["run"]["id"].as_str().unwrap()[..8];
 
-    let waiting = fixture.cli(&["agent", "wait", agent, "--timeout", "10"]);
+    let waiting = fixture.wait(&["agent", "wait", agent, "--timeout", "10"], 5);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let requests = fixture.cli(&["agent", "requests", agent]);
     assert_eq!(
@@ -405,7 +418,7 @@ fn an_owner_drives_its_agent_by_short_handles() {
     assert!(!refused.status.success(), "{refused:?}");
     let answered = fixture.cli(&["agent", "answer", agent, "console-approval", "allow"]);
     assert_eq!(answered["requests"], serde_json::json!([]));
-    let completed = fixture.cli(&["agent", "wait", run, "--timeout", "10"]);
+    let completed = fixture.wait(&["agent", "wait", run, "--timeout", "10"], 0);
     assert_eq!(completed["run"]["state"], "Succeeded", "{completed}");
     assert_eq!(completed["run"]["result"]["text"], "CONSOLE_RESULT_1");
 
@@ -426,4 +439,66 @@ fn an_owner_drives_its_agent_by_short_handles() {
         fixture.cli(&["agent", "close", agent])["agent"]["closed"],
         true
     );
+}
+
+#[test]
+fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
+    let fixture = Fixture::with_provider(include_str!("fixtures/wait-outcomes-claude.sh"));
+    let project_path = fixture.root.path().join("project");
+    let project = project_path.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let output = fixture.output(&[
+        "agent",
+        "spawn",
+        "CLI_WAIT_BUSY",
+        "--provider",
+        "claude",
+        "--project",
+        project,
+        "--wait",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let accepted: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let accepted = &accepted["data"];
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let run = accepted["run"]["id"].as_str().unwrap();
+    assert_eq!(accepted["outcome"], "timed_out");
+    let timed = fixture.output(&["agent", "wait", run, "--timeout", "1"]);
+    assert_eq!(timed.status.code(), Some(3), "{timed:?}");
+    let one: Value = serde_json::from_slice(&timed.stdout).unwrap();
+    let many = fixture.output(&["agent", "wait", run, run, "--timeout", "0.1"]);
+    assert_eq!(many.status.code(), Some(3), "{many:?}");
+    let many: Value = serde_json::from_slice(&many.stdout).unwrap();
+    assert_eq!(
+        one["data"].as_object().unwrap().keys().collect::<Vec<_>>(),
+        many["data"].as_object().unwrap().keys().collect::<Vec<_>>()
+    );
+    fixture.cli(&["agent", "interrupt", agent]);
+    let cancelled = fixture.wait(&["agent", "wait", run, "--timeout", "10"], 4);
+    assert_eq!(cancelled["run"]["state"], "Cancelled");
+    let follow = fixture.output(&[
+        "agent",
+        "send",
+        agent,
+        "CLI_WAIT_FAIL",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    assert_eq!(follow.status.code(), Some(4), "{follow:?}");
+    let follow: Value = serde_json::from_slice(&follow.stdout).unwrap();
+    assert_eq!(follow["data"]["outcome"], "failed");
+    let success = fixture.cli(&[
+        "agent",
+        "send",
+        agent,
+        "CLI_WAIT_SUCCESS",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    assert_eq!(success["outcome"], "succeeded");
+    fixture.cli(&["agent", "close", agent]);
 }
