@@ -18,10 +18,10 @@ enum Owner {
 impl Handle {
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
-    pub(crate) fn native_holder_record(&self)->Option<&crate::daemon::holder_registry::Record> {
+    pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         match &self.0 {
-            Owner::Local(local)=>local.native_holder_record(),
-            Owner::Remote(remote)=>Some(remote.native_holder_record()),
+            Owner::Local(local) => local.native_holder_record(),
+            Owner::Remote(remote) => Some(remote.native_holder_record()),
         }
     }
     #[cfg(test)]
@@ -593,13 +593,21 @@ impl Handle {
             Owner::Remote(remote) => remote.close(),
         }
     }
-    pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: std::time::Instant) -> Result<(), String> {
+    pub(crate) fn fence_session_stop_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.fence_session_stop_until(actor_id, deadline),
             Owner::Remote(remote) => remote.fence_session_stop_until(actor_id, deadline),
         }
     }
-    pub(crate) fn stop_session_until(&self, actor_id: uuid::Uuid, deadline: std::time::Instant) -> Result<(), String> {
+    pub(crate) fn stop_session_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
         self.fence_session_stop_until(actor_id, deadline)?;
         self.close_until(deadline)
     }

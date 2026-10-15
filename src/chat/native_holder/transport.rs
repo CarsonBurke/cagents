@@ -199,7 +199,9 @@ pub(crate) struct Holder {
 
 impl Holder {
     /// Exact discovery metadata; observing it grants no release authority.
-    pub(crate) fn record(&self)->&Record { &self.identity.record }
+    pub(crate) fn record(&self) -> &Record {
+        &self.identity.record
+    }
 
     pub fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
         if !self.identity.record.build.as_ref().is_some_and(|build| {
@@ -249,14 +251,21 @@ impl Holder {
     }
 
     #[cfg(test)]
-    pub(in crate::chat) fn replace_control_for_test(&mut self,stream:UnixStream)->super::Detached {
-        self.control=Some(stream);
+    pub(in crate::chat) fn replace_control_for_test(
+        &mut self,
+        stream: UnixStream,
+    ) -> super::Detached {
+        self.control = Some(stream);
         self.identity.clone()
     }
 
     #[cfg(test)]
     pub(in crate::chat) fn disconnect_control_for_test(&self) {
-        self.control.as_ref().unwrap().shutdown(std::net::Shutdown::Both).unwrap();
+        self.control
+            .as_ref()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
     }
 
     pub fn preserve(mut self) -> super::Detached {
@@ -305,11 +314,11 @@ impl Holder {
                 self.identity.close()
             };
         };
-        let response=send(control, &Request::Release, TIMEOUT)
-            .and_then(|()|receive(control, TIMEOUT));
-        let response=match response {
-            Ok(response)=>response,
-            Err(error)=> {
+        let response =
+            send(control, &Request::Release, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
                 // A retry must inspect/adopt this exact retained holder instead
                 // of repeatedly writing to an irrecoverably broken stream.
                 self.control.take();
@@ -329,7 +338,7 @@ impl Holder {
             _ => {
                 self.control.take();
                 Err("Native holder did not acknowledge server teardown".into())
-            },
+            }
         }
     }
 }

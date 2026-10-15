@@ -273,10 +273,14 @@ pub(crate) fn verified_codex_version(user_agent: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_source()->super::Session {tests::recovery().source}
+pub(crate) fn fixture_source() -> super::Session {
+    tests::recovery().source
+}
 
 #[cfg(test)]
-pub(crate) fn fixture_identity()->super::protocol::ServerIdentity {tests::server_identity()}
+pub(crate) fn fixture_identity() -> super::protocol::ServerIdentity {
+    tests::server_identity()
+}
 
 #[cfg(test)]
 mod tests {

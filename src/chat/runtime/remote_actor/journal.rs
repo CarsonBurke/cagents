@@ -57,10 +57,16 @@ pub(super) struct Journal {
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
-fn valid_attention_context(evidence:&crate::notifications::Evidence,content:&crate::notifications::Content)->bool {
-    let bounded=|text:&str,limit| text.chars().take(limit+1).count()<=limit && !text.chars().any(char::is_control);
-    bounded(&content.conversation,80) && bounded(&content.preview,240)
-        && (content.request.is_none() || evidence.kind==crate::notifications::Kind::Waiting)
+fn valid_attention_context(
+    evidence: &crate::notifications::Evidence,
+    content: &crate::notifications::Content,
+) -> bool {
+    let bounded = |text: &str, limit| {
+        text.chars().take(limit + 1).count() <= limit && !text.chars().any(char::is_control)
+    };
+    bounded(&content.conversation, 80)
+        && bounded(&content.preview, 240)
+        && (content.request.is_none() || evidence.kind == crate::notifications::Kind::Waiting)
 }
 impl Journal {
     pub fn open(directory: &Path) -> Result<Self, String> {
@@ -161,16 +167,25 @@ impl Journal {
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
-        if !matches!(update, Update::Execution { .. } | Update::Attention(_) | Update::AttentionContext {..}) {
+        if !matches!(
+            update,
+            Update::Execution { .. } | Update::Attention(_) | Update::AttentionContext { .. }
+        ) {
             return Ok(());
         }
         // Keep bounded supplied context byte-for-byte. Never consult a later
         // snapshot or modify evidence to repair malformed optional display data.
-        let metadata_only=match update {
-            Update::AttentionContext {evidence,content:Some(content)} if !valid_attention_context(evidence,content)=>Some(Update::AttentionContext {evidence:evidence.clone(),content:None}),
-            _=>None,
+        let metadata_only = match update {
+            Update::AttentionContext {
+                evidence,
+                content: Some(content),
+            } if !valid_attention_context(evidence, content) => Some(Update::AttentionContext {
+                evidence: evidence.clone(),
+                content: None,
+            }),
+            _ => None,
         };
-        let update=metadata_only.as_ref().unwrap_or(update);
+        let update = metadata_only.as_ref().unwrap_or(update);
         if self.loss()?.is_some() {
             return Err("Actor outcome journal already has a recorded loss".into());
         }
@@ -438,46 +453,90 @@ impl Journal {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if matches!(state,InputState::Acknowledged(_)) {self.acknowledged_inputs.insert(identity.sequence);}
+        if matches!(state, InputState::Acknowledged(_)) {
+            self.acknowledged_inputs.insert(identity.sequence);
+        }
         Ok(())
     }
-    pub fn acknowledged_input_count(&self)->usize {self.acknowledged_inputs.len()}
-    pub fn acknowledged_input_page(&self)->Result<Vec<InputReceipt>,String> {
-        let mut page=Vec::new();
+    pub fn acknowledged_input_count(&self) -> usize {
+        self.acknowledged_inputs.len()
+    }
+    pub fn acknowledged_input_page(&self) -> Result<Vec<InputReceipt>, String> {
+        let mut page = Vec::new();
         for sequence in self.acknowledged_inputs.iter().take(64) {
-            let (id,hash,state):(String,Vec<u8>,Vec<u8>)=self.db.query_row("SELECT id,hash,state FROM inputs WHERE sequence=?1",[sequence],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|error|error.to_string())?;
-            let identity=InputIdentity {sequence:*sequence,id:uuid::Uuid::parse_str(&id).map_err(|error|error.to_string())?,hash:hash.try_into().map_err(|_|"Invalid retained input digest")?};
-            let state=serde_json::from_slice(&state).map_err(|error|error.to_string())?;
-            if !matches!(state,InputState::Acknowledged(_)) {return Err("Input acknowledgement cache lost its terminal-state proof".into());}
-            page.push(InputReceipt {identity,state});
+            let (id, hash, state): (String, Vec<u8>, Vec<u8>) = self
+                .db
+                .query_row(
+                    "SELECT id,hash,state FROM inputs WHERE sequence=?1",
+                    [sequence],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            let identity = InputIdentity {
+                sequence: *sequence,
+                id: uuid::Uuid::parse_str(&id).map_err(|error| error.to_string())?,
+                hash: hash
+                    .try_into()
+                    .map_err(|_| "Invalid retained input digest")?,
+            };
+            let state = serde_json::from_slice(&state).map_err(|error| error.to_string())?;
+            if !matches!(state, InputState::Acknowledged(_)) {
+                return Err("Input acknowledgement cache lost its terminal-state proof".into());
+            }
+            page.push(InputReceipt { identity, state });
         }
         Ok(page)
     }
     /// Retire exact terminal receipts independently: an earlier unknown or
     /// partially written input must not block cleanup of unrelated outcomes.
     /// The durable high-water sequence continues refusing all retired replay.
-    pub fn retire_acknowledged_inputs(&mut self, identities: &[InputIdentity]) -> Result<(), String> {
-        if identities.len()>64 {return Err("Input retirement batch exceeds capacity".into());}
+    pub fn retire_acknowledged_inputs(
+        &mut self,
+        identities: &[InputIdentity],
+    ) -> Result<(), String> {
+        if identities.len() > 64 {
+            return Err("Input retirement batch exceeds capacity".into());
+        }
         for identity in identities {
-            let row:Option<(String,Vec<u8>,Vec<u8>)>=self.db.query_row(
-                "SELECT id,hash,state FROM inputs WHERE sequence=?1",[identity.sequence],
-                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
-                .optional().map_err(|error|error.to_string())?;
+            let row: Option<(String, Vec<u8>, Vec<u8>)> = self
+                .db
+                .query_row(
+                    "SELECT id,hash,state FROM inputs WHERE sequence=?1",
+                    [identity.sequence],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
             match row {
-                Some((id,hash,state))=> {
-                    if id!=identity.id.to_string() || hash.as_slice()!=identity.hash.as_slice() {return Err("Input retirement identity differs from its retained command".into());}
-                    if !matches!(serde_json::from_slice::<InputState>(&state).map_err(|error|error.to_string())?,InputState::Acknowledged(_)) {
+                Some((id, hash, state)) => {
+                    if id != identity.id.to_string() || hash.as_slice() != identity.hash.as_slice()
+                    {
+                        return Err(
+                            "Input retirement identity differs from its retained command".into(),
+                        );
+                    }
+                    if !matches!(
+                        serde_json::from_slice::<InputState>(&state)
+                            .map_err(|error| error.to_string())?,
+                        InputState::Acknowledged(_)
+                    ) {
                         return Err("Accepted or unknown inputs must retain their receipt".into());
                     }
                 }
-                None if identity.sequence>0 && identity.sequence<=self.input_sequence=> {},
-                None=>return Err("Input retirement exceeds the admitted sequence".into()),
+                None if identity.sequence > 0 && identity.sequence <= self.input_sequence => {}
+                None => return Err("Input retirement exceeds the admitted sequence".into()),
             }
         }
-        let transaction=self.db.transaction().map_err(|error|error.to_string())?;
-        for identity in identities {transaction.execute("DELETE FROM inputs WHERE sequence=?1",[identity.sequence]).map_err(|error|error.to_string())?;}
-        transaction.commit().map_err(|error|error.to_string())?;
-        for identity in identities {self.acknowledged_inputs.remove(&identity.sequence);}
+        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        for identity in identities {
+            transaction
+                .execute("DELETE FROM inputs WHERE sequence=?1", [identity.sequence])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        for identity in identities {
+            self.acknowledged_inputs.remove(&identity.sequence);
+        }
         Ok(())
     }
 
@@ -501,7 +560,8 @@ impl Journal {
         self.db
             .execute("DELETE FROM inputs WHERE sequence<=?1", [through])
             .map_err(|error| error.to_string())?;
-        self.acknowledged_inputs.retain(|sequence|*sequence>through);
+        self.acknowledged_inputs
+            .retain(|sequence| *sequence > through);
         Ok(())
     }
     pub fn next_input(&self) -> Result<u64, String> {
@@ -593,43 +653,112 @@ mod tests {
     use super::*;
     #[test]
     fn immutable_attention_context_repeats_verbatim_until_full_ack() {
-        let dir=tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut journal=Journal::with_budget(dir.path(),16*1024).unwrap();
-        let evidence=crate::notifications::Evidence {key:"exact-provider-turn".into(),kind:crate::notifications::Kind::Waiting};
-        let content=crate::notifications::Content {conversation:"名".repeat(80),preview:"😀".repeat(240),request:Some(crate::notifications::RequestType::Question)};
-        let update=Update::AttentionContext {evidence:evidence.clone(),content:Some(content.clone())};
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), 16 * 1024).unwrap();
+        let evidence = crate::notifications::Evidence {
+            key: "exact-provider-turn".into(),
+            kind: crate::notifications::Kind::Waiting,
+        };
+        let content = crate::notifications::Content {
+            conversation: "名".repeat(80),
+            preview: "😀".repeat(240),
+            request: Some(crate::notifications::RequestType::Question),
+        };
+        let update = Update::AttentionContext {
+            evidence: evidence.clone(),
+            content: Some(content.clone()),
+        };
         journal.append(&update).unwrap();
-        let first=journal.page(0).unwrap();let second=journal.page(0).unwrap();
-        assert_eq!(serde_json::to_value(&first).unwrap(),serde_json::to_value(&second).unwrap());
-        assert!(matches!(&first[0].update,Update::AttentionContext {evidence:at,content:Some(at_content)} if at==&evidence && at_content==&content));
+        let first = journal.page(0).unwrap();
+        let second = journal.page(0).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert!(
+            matches!(&first[0].update,Update::AttentionContext {evidence:at,content:Some(at_content)} if at==&evidence && at_content==&content)
+        );
         // The committed bytes themselves retain the immutable payload; this
         // helper never reconstructs its Store or journal during daemon adoption.
-        let bytes:Vec<u8>=journal.db.query_row("SELECT payload FROM outcomes WHERE sequence=1",[],|row|row.get(0)).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),serde_json::to_value(&update).unwrap());
-        journal.append(&Update::PastAttention(evidence.clone())).unwrap();
+        let bytes: Vec<u8> = journal
+            .db
+            .query_row("SELECT payload FROM outcomes WHERE sequence=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::to_value(&update).unwrap()
+        );
+        journal
+            .append(&Update::PastAttention(evidence.clone()))
+            .unwrap();
         journal.append(&Update::Presentation).unwrap();
-        assert_eq!(journal.latest().unwrap(),1,"old-turn evidence/stream wakes never become current attention");
-        journal.ack(1).unwrap();assert!(journal.page(1).unwrap().is_empty());
+        assert_eq!(
+            journal.latest().unwrap(),
+            1,
+            "old-turn evidence/stream wakes never become current attention"
+        );
+        journal.ack(1).unwrap();
+        assert!(journal.page(1).unwrap().is_empty());
     }
 
     #[test]
     fn malformed_optional_context_keeps_exact_semantic_evidence_without_later_enrichment() {
-        use crate::notifications::{Content,Evidence,Kind,RequestType};
+        use crate::notifications::{Content, Evidence, Kind, RequestType};
         for content in [
-            Content {conversation:"x".repeat(81),..Default::default()},
-            Content {preview:"x".repeat(241),..Default::default()},
-            Content {preview:"line\ncontrol".into(),..Default::default()},
-            Content {conversation:"\u{1b}title".into(),..Default::default()},
-            Content {request:Some(RequestType::Approval),..Default::default()},
+            Content {
+                conversation: "x".repeat(81),
+                ..Default::default()
+            },
+            Content {
+                preview: "x".repeat(241),
+                ..Default::default()
+            },
+            Content {
+                preview: "line\ncontrol".into(),
+                ..Default::default()
+            },
+            Content {
+                conversation: "\u{1b}title".into(),
+                ..Default::default()
+            },
+            Content {
+                request: Some(RequestType::Approval),
+                ..Default::default()
+            },
         ] {
-            let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),4096).unwrap();
-            let evidence=Evidence {key:"known-final-turn".into(),kind:Kind::Succeeded};
-            journal.append(&Update::AttentionContext {evidence:evidence.clone(),content:Some(content)}).unwrap();
-            let page=journal.page(0).unwrap();
-            assert!(matches!(&page[0].update,Update::AttentionContext {evidence:at,content:None} if at==&evidence));
-            assert!(journal.continuity_loss().unwrap().is_none(),"invalid optional display data does not make known execution uncertain");
-            journal.append(&Update::Attention(Evidence {key:"legacy-turn".into(),kind:Kind::Cancelled})).unwrap();
-            assert_eq!(journal.latest().unwrap(),2,"legacy/new metadata evidence coexist without later Snapshot reads");
+            let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+            let evidence = Evidence {
+                key: "known-final-turn".into(),
+                kind: Kind::Succeeded,
+            };
+            journal
+                .append(&Update::AttentionContext {
+                    evidence: evidence.clone(),
+                    content: Some(content),
+                })
+                .unwrap();
+            let page = journal.page(0).unwrap();
+            assert!(
+                matches!(&page[0].update,Update::AttentionContext {evidence:at,content:None} if at==&evidence)
+            );
+            assert!(
+                journal.continuity_loss().unwrap().is_none(),
+                "invalid optional display data does not make known execution uncertain"
+            );
+            journal
+                .append(&Update::Attention(Evidence {
+                    key: "legacy-turn".into(),
+                    kind: Kind::Cancelled,
+                }))
+                .unwrap();
+            assert_eq!(
+                journal.latest().unwrap(),
+                2,
+                "legacy/new metadata evidence coexist without later Snapshot reads"
+            );
         }
     }
 
@@ -700,41 +829,113 @@ mod tests {
     }
     #[test]
     fn exact_retirement_survives_more_than_capacity_and_preserves_uncertain_holes() {
-        let directory=tempfile::tempdir().unwrap();
-        let mut journal=Journal::open(directory.path()).unwrap();
-        let identity=|sequence|InputIdentity {sequence,id:uuid::Uuid::new_v4(),hash:[7;32]};
-        let accepted=identity(1);journal.admit(&accepted).unwrap();
-        let unknown=identity(2);journal.admit(&unknown).unwrap();journal.finish(&unknown,InputState::Unknown("write outcome is unknown".into())).unwrap();
-        let mut last=None;
-        for sequence in 3..(MAX_INPUTS as u64+35) {
-            let input=identity(sequence);journal.admit(&input).unwrap();journal.finish(&input,InputState::Acknowledged(Ok(()))).unwrap();
-            let page=journal.acknowledged_input_page().unwrap();assert_eq!(page.len(),1);assert_eq!(page[0].identity,input);
-            assert!(matches!(&page[0].state,InputState::Acknowledged(Ok(()))));
-            assert!(journal.retire_acknowledged_inputs(&[input.clone(),unknown.clone()]).is_err());
-            assert_eq!(journal.acknowledged_input_count(),1,"failed batch cannot remove an earlier terminal receipt");
-            let mut changed=input.clone();changed.hash=[8;32];
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(directory.path()).unwrap();
+        let identity = |sequence| InputIdentity {
+            sequence,
+            id: uuid::Uuid::new_v4(),
+            hash: [7; 32],
+        };
+        let accepted = identity(1);
+        journal.admit(&accepted).unwrap();
+        let unknown = identity(2);
+        journal.admit(&unknown).unwrap();
+        journal
+            .finish(
+                &unknown,
+                InputState::Unknown("write outcome is unknown".into()),
+            )
+            .unwrap();
+        let mut last = None;
+        for sequence in 3..(MAX_INPUTS as u64 + 35) {
+            let input = identity(sequence);
+            journal.admit(&input).unwrap();
+            journal
+                .finish(&input, InputState::Acknowledged(Ok(())))
+                .unwrap();
+            let page = journal.acknowledged_input_page().unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].identity, input);
+            assert!(matches!(&page[0].state, InputState::Acknowledged(Ok(()))));
+            assert!(
+                journal
+                    .retire_acknowledged_inputs(&[input.clone(), unknown.clone()])
+                    .is_err()
+            );
+            assert_eq!(
+                journal.acknowledged_input_count(),
+                1,
+                "failed batch cannot remove an earlier terminal receipt"
+            );
+            let mut changed = input.clone();
+            changed.hash = [8; 32];
             assert!(journal.retire_acknowledged_inputs(&[changed]).is_err());
             assert!(journal.input(&input).unwrap().is_some());
-            journal.retire_acknowledged_inputs(std::slice::from_ref(&input)).unwrap();
-            journal.retire_acknowledged_inputs(std::slice::from_ref(&input)).unwrap();
-            assert!(journal.admit(&input).is_err(),"a retired sequence must never invoke the command again");
-            last=Some(input);
+            journal
+                .retire_acknowledged_inputs(std::slice::from_ref(&input))
+                .unwrap();
+            journal
+                .retire_acknowledged_inputs(std::slice::from_ref(&input))
+                .unwrap();
+            assert!(
+                journal.admit(&input).is_err(),
+                "a retired sequence must never invoke the command again"
+            );
+            last = Some(input);
         }
-        assert!(journal.retire_acknowledged_inputs(std::slice::from_ref(&accepted)).is_err());
-        assert!(journal.retire_acknowledged_inputs(std::slice::from_ref(&unknown)).is_err());
-        assert_eq!(journal.input(&accepted).unwrap().unwrap().state,InputState::Accepted);
-        assert!(matches!(journal.input(&unknown).unwrap().unwrap().state,InputState::Unknown(_)));
-        assert_eq!(journal.acknowledged_input_count(),0);
+        assert!(
+            journal
+                .retire_acknowledged_inputs(std::slice::from_ref(&accepted))
+                .is_err()
+        );
+        assert!(
+            journal
+                .retire_acknowledged_inputs(std::slice::from_ref(&unknown))
+                .is_err()
+        );
+        assert_eq!(
+            journal.input(&accepted).unwrap().unwrap().state,
+            InputState::Accepted
+        );
+        assert!(matches!(
+            journal.input(&unknown).unwrap().unwrap().state,
+            InputState::Unknown(_)
+        ));
+        assert_eq!(journal.acknowledged_input_count(), 0);
         assert!(journal.acknowledged_input_page().unwrap().is_empty());
-        let next=journal.next_input().unwrap();let retired=last.unwrap();drop(journal);
+        let next = journal.next_input().unwrap();
+        let retired = last.unwrap();
+        drop(journal);
         // Reopening the live actor itself is intentionally forbidden. Inspect
         // its durable high-water tombstone without reconstructing a reducer.
-        let database=Connection::open(directory.path().join("actor-journal.sqlite")).unwrap();
-        let highwater:String=database.query_row("SELECT value FROM metadata WHERE key='input_sequence'",[],|row|row.get(0)).unwrap();
-        assert_eq!(highwater.parse::<u64>().unwrap()+1,next);
-        let count:u64=database.query_row("SELECT COUNT(*) FROM inputs WHERE sequence=?1",[retired.sequence],|row|row.get(0)).unwrap();assert_eq!(count,0);
-        let state:Vec<u8>=database.query_row("SELECT state FROM inputs WHERE sequence=?1",[accepted.sequence],|row|row.get(0)).unwrap();
-        assert_eq!(serde_json::from_slice::<InputState>(&state).unwrap(),InputState::Accepted);
+        let database = Connection::open(directory.path().join("actor-journal.sqlite")).unwrap();
+        let highwater: String = database
+            .query_row(
+                "SELECT value FROM metadata WHERE key='input_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(highwater.parse::<u64>().unwrap() + 1, next);
+        let count: u64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM inputs WHERE sequence=?1",
+                [retired.sequence],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let state: Vec<u8> = database
+            .query_row(
+                "SELECT state FROM inputs WHERE sequence=?1",
+                [accepted.sequence],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<InputState>(&state).unwrap(),
+            InputState::Accepted
+        );
     }
 
     #[test]

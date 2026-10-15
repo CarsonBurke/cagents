@@ -76,7 +76,8 @@ impl RemoteActor {
 }
 impl Server {
     pub(super) fn restart(&mut self, request: Request) -> Result<RestartReceipt, String> {
-        let hash = payload_digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
+        let hash =
+            payload_digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
         let previous = self
             .journal
             .lock()

@@ -80,7 +80,9 @@ enum ActorCommand {
     CloseIfRevision {
         revision: u64,
     },
-    StopSession { actor_id: uuid::Uuid },
+    StopSession {
+        actor_id: uuid::Uuid,
+    },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
         run: Option<crate::model::RunId>,
@@ -191,7 +193,9 @@ impl Drop for OwnedSocket {
 }
 
 impl LocalHandle {
-    pub(crate) fn native_holder_record(&self)->Option<&crate::daemon::holder_registry::Record> {self.0.native_holder_record.as_ref()}
+    pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
+        self.0.native_holder_record.as_ref()
+    }
 
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -215,8 +219,8 @@ struct Inner {
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    worker_joining:AtomicBool,
-    worker_join_failed:AtomicBool,
+    worker_joining: AtomicBool,
+    worker_join_failed: AtomicBool,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
@@ -492,7 +496,7 @@ impl LocalHandle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
-        let session_stop=Arc::new(Mutex::new(None));
+        let session_stop = Arc::new(Mutex::new(None));
         let (urgent_commands, urgent_incoming) = crossbeam_channel::bounded(1);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
@@ -521,7 +525,7 @@ impl LocalHandle {
         let store = retained_store.unwrap_or_else(|| Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
-        let ownership_admission=Arc::new(Mutex::new(()));
+        let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -535,11 +539,11 @@ impl LocalHandle {
                 .and_then(|context| context.directory_descriptor()),
         ));
         let inner = Arc::new(Inner {
-            native_holder_record:native_holder.as_ref().map(|holder|holder.record().clone()),
+            native_holder_record: native_holder.as_ref().map(|holder| holder.record().clone()),
             pinned_directory: pinned_directory.clone(),
             provider_process: provider_process.clone(),
             commands,
-            session_stop:session_stop.clone(),
+            session_stop: session_stop.clone(),
             urgent_commands,
             wake: Mutex::new(wake),
             state: state.clone(),
@@ -552,8 +556,8 @@ impl LocalHandle {
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
-            worker_joining:AtomicBool::new(false),
-            worker_join_failed:AtomicBool::new(false),
+            worker_joining: AtomicBool::new(false),
+            worker_join_failed: AtomicBool::new(false),
             store: store.clone(),
             notify: notify.clone(),
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
@@ -561,7 +565,7 @@ impl LocalHandle {
             ),
             launch_account_scope,
             recovery_environment,
-            ownership_admission:ownership_admission.clone(),
+            ownership_admission: ownership_admission.clone(),
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
@@ -1035,62 +1039,102 @@ impl LocalHandle {
 
     /// Fence one actor lifetime after explicit consent to stop all its work.
     /// Cleanup is separate and must run outside global control admission.
-    pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
-        if Instant::now() >= deadline {return Err("Session stop budget expired; no cleanup is confirmed".into());}
+    pub(crate) fn fence_session_stop_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("Session stop budget expired; no cleanup is confirmed".into());
+        }
         // A deadline-bearing owner command must not hydrate Snapshot or wait
         // behind publication/diagnostic metadata. Contention preserves ownership.
-        let (observed_id,unobserved)=match self.0.close_state.try_lock() {
-            Ok(close)=>(close.actor_id,close.unobserved_native),
-            Err(std::sync::TryLockError::Poisoned(p))=>{let close=p.into_inner();(close.actor_id,close.unobserved_native)},
-            Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider identity is being updated; retain its owner and retry session stop".into()),
-        };
+        let (observed_id, unobserved) =
+            match self.0.close_state.try_lock() {
+                Ok(close) => (close.actor_id, close.unobserved_native),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    let close = p.into_inner();
+                    (close.actor_id, close.unobserved_native)
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return Err(
+                    "Provider identity is being updated; retain its owner and retry session stop"
+                        .into(),
+                ),
+            };
         if observed_id != actor_id {
             return Err("The provider actor was replaced; its replacement was preserved".into());
         }
         if self.0.preserve_native.load(Ordering::Acquire) {
-            return Err("Provider ownership is being preserved for a successor; refresh before stopping it".into());
+            return Err(
+                "Provider ownership is being preserved for a successor; refresh before stopping it"
+                    .into(),
+            );
         }
         if self.is_completed() || self.0.stop.load(Ordering::Acquire) {
-            let _admission=match self.0.ownership_admission.try_lock() {
-                Ok(admission)=>admission,
-                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider ownership admission is busy; retain its owner and retry".into()),
+            let _admission = match self.0.ownership_admission.try_lock() {
+                Ok(admission) => admission,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(
+                        "Provider ownership admission is busy; retain its owner and retry".into(),
+                    );
+                }
             };
             return if self.0.preserve_native.load(Ordering::Acquire) {
                 Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
             } else if unobserved {
                 Err("Retained provider ownership must be reattached before session stop".into())
             } else {
-                self.0.release_native.store(true,Ordering::Release);
+                self.0.release_native.store(true, Ordering::Release);
                 Ok(())
             };
         }
         if self.0.draining.load(Ordering::Acquire) {
             return Err("Provider ownership is changing; refresh before stopping it".into());
         }
-        if Instant::now() >= deadline {return Err("Session stop budget expired; no cleanup is confirmed".into());}
+        if Instant::now() >= deadline {
+            return Err("Session stop budget expired; no cleanup is confirmed".into());
+        }
         let (reply, response) = crossbeam_channel::bounded(1);
         {
-            let mut pending=match self.0.session_stop.try_lock() {
-                Ok(pending)=>pending,
-                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock)=>return Err("Session stop admission is busy; retain its owner and retry".into()),
+            let mut pending = match self.0.session_stop.try_lock() {
+                Ok(pending) => pending,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err("Session stop admission is busy; retain its owner and retry".into());
+                }
             };
-            if pending.is_some() {return Err("A session stop is already pending; retain its owner and refresh".into());}
+            if pending.is_some() {
+                return Err(
+                    "A session stop is already pending; retain its owner and refresh".into(),
+                );
+            }
             // Whole-session consent includes queued work and bypasses stdin
             // backpressure. One bounded owner slot cannot accumulate requests.
-            *pending=Some((ActorCommand::StopSession {actor_id},reply));
+            *pending = Some((ActorCommand::StopSession { actor_id }, reply));
         }
         match self.0.wake.try_lock() {
-            Ok(mut wake) => { let _ = wake.write(&[1]); },
-            Err(std::sync::TryLockError::Poisoned(p)) => { let _ = p.into_inner().write(&[1]); },
-            Err(std::sync::TryLockError::WouldBlock) => {},
+            Ok(mut wake) => {
+                let _ = wake.write(&[1]);
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let _ = p.into_inner().write(&[1]);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
-        response.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| "Session stop acknowledgement is unconfirmed; its exact owner is retained for retry".to_string())?
+        response
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| {
+                "Session stop acknowledgement is unconfirmed; its exact owner is retained for retry"
+                    .to_string()
+            })?
     }
 
-    pub(crate) fn stop_session_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
+    pub(crate) fn stop_session_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: Instant,
+    ) -> Result<(), String> {
         self.fence_session_stop_until(actor_id, deadline)?;
         self.close_until(deadline)
     }
@@ -1621,12 +1665,16 @@ impl LocalHandle {
         self.close_inner(true, None)
     }
 
-    fn claim_native_preservation(&self)->Result<(),String> {
-        let _admission=self.0.ownership_admission.lock().unwrap_or_else(|p|p.into_inner());
+    fn claim_native_preservation(&self) -> Result<(), String> {
+        let _admission = self
+            .0
+            .ownership_admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if self.0.release_native.load(Ordering::Acquire) {
             return Err("Native provider session stop already owns cleanup".into());
         }
-        self.0.preserve_native.store(true,Ordering::Release);
+        self.0.preserve_native.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1656,30 +1704,48 @@ impl LocalHandle {
         self.close_inner(false, Some(deadline))
     }
 
-    fn join_worker_until(&self,deadline:Instant)->Result<(),String> {
+    fn join_worker_until(&self, deadline: Instant) -> Result<(), String> {
         loop {
             if !self.0.worker_joining.load(Ordering::Acquire) {
-                let ready=match self.0.worker.try_lock() {
-                    Ok(mut worker)=> {
-                        if self.0.worker_joining.load(Ordering::Acquire) {false}
-                        else if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {worker_join::request(self,&mut worker)?;false}
-                        else {worker.is_none()}
+                let ready = match self.0.worker.try_lock() {
+                    Ok(mut worker) => {
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
                     }
-                    Err(std::sync::TryLockError::Poisoned(poisoned))=> {
-                        let mut worker=poisoned.into_inner();
-                        if self.0.worker_joining.load(Ordering::Acquire) {false}
-                        else if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {worker_join::request(self,&mut worker)?;false}
-                        else {worker.is_none()}
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        let mut worker = poisoned.into_inner();
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
                     }
-                    Err(std::sync::TryLockError::WouldBlock)=>false,
+                    Err(std::sync::TryLockError::WouldBlock) => false,
                 };
                 if ready {
                     return if self.0.worker_join_failed.load(Ordering::Acquire) {
                         Err("Native chat worker did not shut down cleanly; provider state is unconfirmed".into())
-                    } else {Ok(())};
+                    } else {
+                        Ok(())
+                    };
                 }
             }
-            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
             };
             thread::sleep(remaining.min(Duration::from_millis(5)));
@@ -1965,14 +2031,16 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let retained=match self.retained_native.try_lock() {
-            Ok(mut owner)=>owner.take(),
-            Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner().take(),
+        let retained = match self.retained_native.try_lock() {
+            Ok(mut owner) => owner.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
             // A still-active actor owns the shared Arc/guard. Never wait on
             // that exact owner's retained holder from a frontend destructor.
-            Err(std::sync::TryLockError::WouldBlock)=>None,
+            Err(std::sync::TryLockError::WouldBlock) => None,
         };
-        if let Some(holder)=retained {native_reconcile::retire_final(holder);}
+        if let Some(holder) = retained {
+            native_reconcile::retire_final(holder);
+        }
         let _ = self
             .wake
             .get_mut()
@@ -1987,7 +2055,9 @@ impl Drop for Inner {
             // Even a finished Rust packet may have blocking TLS cleanup.
             // Dropping the JoinHandle detaches; it never proves OS teardown.
             drop(worker);
-            tracing::warn!("Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed");
+            tracing::warn!(
+                "Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed"
+            );
         }
     }
 }
@@ -2324,8 +2394,16 @@ impl TurnAttention {
                     kind: *outcome,
                 });
             }
-            Event::PastTurnFinished {key:Some(key),outcome}=>return Some(crate::notifications::Evidence {key:key.clone(),kind:*outcome}),
-            Event::PastTurnFinished {key:None,..}=>return None,
+            Event::PastTurnFinished {
+                key: Some(key),
+                outcome,
+            } => {
+                return Some(crate::notifications::Evidence {
+                    key: key.clone(),
+                    kind: *outcome,
+                });
+            }
+            Event::PastTurnFinished { key: None, .. } => return None,
 
             _ => {}
         }
@@ -2764,12 +2842,18 @@ impl Actor {
             // queued write: a provider that reads stdin only between turns keeps
             // `pending` non-empty for the whole turn, and refusing to drain there left
             // UI commands unacknowledged until the caller's 10 second timeout.
-            let priority=self.session_stop.lock().unwrap_or_else(|p|p.into_inner()).take();
-            let request=priority.or_else(||self.urgent_incoming.try_recv().ok()).or_else(|| {
-                (self.queued <= QUEUE_BACKPRESSURE)
-                    .then(|| self.incoming.try_recv().ok())
-                    .flatten()
-            });
+            let priority = self
+                .session_stop
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            let request = priority
+                .or_else(|| self.urgent_incoming.try_recv().ok())
+                .or_else(|| {
+                    (self.queued <= QUEUE_BACKPRESSURE)
+                        .then(|| self.incoming.try_recv().ok())
+                        .flatten()
+                });
             let Some((command, reply)) = request else {
                 break;
             };
@@ -2797,7 +2881,9 @@ impl Actor {
                 continue;
             }
             #[cfg(test)]
-            if matches!(&command,ActorCommand::CloseIfRevision{..}) {self.adapter.after_close_input_drained();}
+            if matches!(&command, ActorCommand::CloseIfRevision { .. }) {
+                self.adapter.after_close_input_drained();
+            }
             let (run, command) = match command {
                 ActorCommand::CaptureExecutionDirectory { directory, proof } => {
                     let result = directory::capture(self, &directory);
@@ -2910,10 +2996,11 @@ impl Actor {
                     });
                     continue;
                 }
-                ActorCommand::CloseIfRevision {revision} => {
-                    let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
-                    let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-                    let unchanged=close.revision==revision && close.directory_identity.is_some();
+                ActorCommand::CloseIfRevision { revision } => {
+                    let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+                    let unchanged =
+                        close.revision == revision && close.directory_identity.is_some();
                     // Empty input and the actor's FIFO cannot fence work that
                     // the provider starts immediately after the final poll.
                     // No supported adapter currently supplies an authoritative
@@ -2926,15 +3013,18 @@ impl Actor {
                     }));
                     continue;
                 }
-                ActorCommand::StopSession {actor_id} => {
-                    let _admission=self.ownership_admission.lock().unwrap_or_else(|p|p.into_inner());
-                    let close = self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                ActorCommand::StopSession { actor_id } => {
+                    let _admission = self
+                        .ownership_admission
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
                     let result = if self.preserve_native.load(Ordering::Acquire) {
                         Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
                     } else if close.actor_id != actor_id {
                         Err("The provider actor was replaced; its replacement was preserved".into())
                     } else {
-                        self.release_native.store(true,Ordering::Release);
+                        self.release_native.store(true, Ordering::Release);
                         self.stop.store(true, Ordering::Release);
                         Ok(())
                     };
@@ -5001,108 +5091,268 @@ mod tests {
 
     #[test]
     fn native_stop_and_preservation_have_one_admission_winner() {
-        for preserve_first in [false,true] {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-            let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-            let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-            let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
-            let actor=handle.close_observation().actor_id;
+        for preserve_first in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut initial = Step {
+                events: vec![Event::Ready(true)],
+                ..Default::default()
+            };
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle =
+                LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            until(&handle, |state| state.ready);
+            let actor = handle.close_observation().actor_id;
             if preserve_first {
                 handle.claim_native_preservation().unwrap();
-                assert!(handle.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(2)).is_err());
+                assert!(
+                    handle
+                        .fence_session_stop_until(actor, Instant::now() + Duration::from_secs(2))
+                        .is_err()
+                );
                 assert!(!handle.0.stop.load(Ordering::Acquire));
             } else {
-                handle.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(2)).unwrap();
-                assert!(handle.0.release_native.load(Ordering::Acquire),"release ownership must be fenced before stop ACK and gate release");
+                handle
+                    .fence_session_stop_until(actor, Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+                assert!(
+                    handle.0.release_native.load(Ordering::Acquire),
+                    "release ownership must be fenced before stop ACK and gate release"
+                );
                 assert!(handle.claim_native_preservation().is_err());
             }
-            handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+            handle
+                .close_until(Instant::now() + Duration::from_secs(5))
+                .unwrap();
         }
     }
 
     #[test]
     fn whole_session_stop_checks_actor_identity_then_fences_all_later_work() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step {events:vec![Event::Ready(true),Event::TurnStarted],..Default::default()};
-        let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
-        until(&handle,|state|state.ready);
-        let observed=handle.close_observation();
-        assert!(handle.fence_session_stop_until(uuid::Uuid::new_v4(),Instant::now()+Duration::from_secs(2)).is_err());
-        assert!(!handle.0.stop.load(Ordering::Acquire),"a replacement refusal must not stop the original actor");
-        handle.fence_session_stop_until(observed.actor_id,Instant::now()+Duration::from_secs(2)).unwrap();
-        assert!(handle.0.stop.load(Ordering::Acquire),"the stop fence must be published before acknowledgement");
-        assert!(handle.enqueue_command(Command::Prompt{text:"must never run".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}).is_err());
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: Some(observed_fixture_directory(directory.path())),
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true), Event::TurnStarted],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let observed = handle.close_observation();
+        assert!(
+            handle
+                .fence_session_stop_until(
+                    uuid::Uuid::new_v4(),
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .is_err()
+        );
+        assert!(
+            !handle.0.stop.load(Ordering::Acquire),
+            "a replacement refusal must not stop the original actor"
+        );
+        handle
+            .fence_session_stop_until(observed.actor_id, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            handle.0.stop.load(Ordering::Acquire),
+            "the stop fence must be published before acknowledgement"
+        );
+        assert!(
+            handle
+                .enqueue_command(Command::Prompt {
+                    text: "must never run".into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send
+                })
+                .is_err()
+        );
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
         assert!(handle.is_completed());
-        handle.stop_session_until(observed.actor_id,Instant::now()+Duration::from_secs(2)).unwrap();
+        handle
+            .stop_session_until(observed.actor_id, Instant::now() + Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]
     fn completed_stop_cleanup_does_not_wait_for_resident_proof_publication() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
-        let metadata=handle.0.close_state.lock().unwrap();
-        let stopped=handle.clone();let (reply,result)=crossbeam_channel::bounded(1);
-        let call=thread::spawn(move|| {let started=Instant::now();let outcome=stopped.close_until(started+Duration::from_millis(40));let _=reply.send((outcome,started.elapsed()));});
-        let bounded=result.recv_timeout(Duration::from_millis(250));
-        drop(metadata);call.join().unwrap();
-        let (outcome,elapsed)=bounded.expect("completed cleanup must not wait past its budget on held metadata");
-        assert!(outcome.is_err(),"contended proof publication is retryable, never false success");
-        assert!(elapsed<Duration::from_millis(250));
-        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let metadata = handle.0.close_state.lock().unwrap();
+        let stopped = handle.clone();
+        let (reply, result) = crossbeam_channel::bounded(1);
+        let call = thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = stopped.close_until(started + Duration::from_millis(40));
+            let _ = reply.send((outcome, started.elapsed()));
+        });
+        let bounded = result.recv_timeout(Duration::from_millis(250));
+        drop(metadata);
+        call.join().unwrap();
+        let (outcome, elapsed) =
+            bounded.expect("completed cleanup must not wait past its budget on held metadata");
+        assert!(
+            outcome.is_err(),
+            "contended proof publication is retryable, never false success"
+        );
+        assert!(elapsed < Duration::from_millis(250));
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]
     fn whole_session_stop_preempts_saturated_commands_and_blocked_provider_stdin() {
         struct Stalled {
-            entered:crossbeam_channel::Sender<()>, release:crossbeam_channel::Receiver<()>,
-            prompts:Arc<std::sync::atomic::AtomicUsize>,
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            prompts: Arc<std::sync::atomic::AtomicUsize>,
         }
         impl Adapter for Stalled {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
-            fn command(&mut self,command:Command)->Result<Step,String> {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
                 match command {
-                    Command::SetFastMode {..}=> {
-                        self.entered.send(()).unwrap();self.release.recv().unwrap();
+                    Command::SetFastMode { .. } => {
+                        self.entered.send(()).unwrap();
+                        self.release.recv().unwrap();
                         // Two individually legal frames exceed normal outbound
                         // backpressure while the real provider never reads stdin.
-                        let frame=serde_json::Value::String("x".repeat(17*1024*1024));
-                        Ok(Step {writes:vec![frame.clone(),frame],..Default::default()})
+                        let frame = serde_json::Value::String("x".repeat(17 * 1024 * 1024));
+                        Ok(Step {
+                            writes: vec![frame.clone(), frame],
+                            ..Default::default()
+                        })
                     }
-                    Command::Prompt {..}=> {self.prompts.fetch_add(1,Ordering::AcqRel);Ok(Step::default())},
-                    _=>Err("Unexpected stalled fixture command".into()),
+                    Command::Prompt { .. } => {
+                        self.prompts.fetch_add(1, Ordering::AcqRel);
+                        Ok(Step::default())
+                    }
+                    _ => Err("Unexpected stalled fixture command".into()),
                 }
             }
-            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sleep".into(),arguments:vec!["600".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let (entered,waiting)=crossbeam_channel::bounded(1);let (release,resume)=crossbeam_channel::bounded(1);
-        let prompts=Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Stalled {entered,release:resume,prompts:prompts.clone()}),initial,store,None,|_|{}).unwrap();
-        until(&handle,|state|state.ready);
-        let command=handle.enqueue_command(Command::SetFastMode {enabled:true}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: Some(observed_fixture_directory(directory.path())),
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sleep".into(),
+            arguments: vec!["600".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let (entered, waiting) = crossbeam_channel::bounded(1);
+        let (release, resume) = crossbeam_channel::bounded(1);
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(Stalled {
+                entered,
+                release: resume,
+                prompts: prompts.clone(),
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
+        let command = handle
+            .enqueue_command(Command::SetFastMode { enabled: true })
+            .unwrap();
         waiting.recv_timeout(Duration::from_secs(2)).unwrap();
         for _ in 0..64 {
-            let (reply,_)=crossbeam_channel::bounded(1);
-            handle.0.commands.try_send((ActorCommand::Provider {run:None,command:Command::Prompt {text:"queued work".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}},reply)).unwrap();
+            let (reply, _) = crossbeam_channel::bounded(1);
+            handle
+                .0
+                .commands
+                .try_send((
+                    ActorCommand::Provider {
+                        run: None,
+                        command: Command::Prompt {
+                            text: "queued work".into(),
+                            attachments: Vec::new(),
+                            mode: super::super::PromptMode::Send,
+                        },
+                    },
+                    reply,
+                ))
+                .unwrap();
         }
         assert!(handle.0.commands.is_full());
-        let stopping=handle.clone();let actor=handle.close_observation().actor_id;
-        let stop=thread::spawn(move||stopping.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(15)));
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while handle.0.session_stop.lock().unwrap().is_none() {assert!(Instant::now()<deadline);thread::yield_now();}
+        let stopping = handle.clone();
+        let actor = handle.close_observation().actor_id;
+        let stop = thread::spawn(move || {
+            stopping.fence_session_stop_until(actor, Instant::now() + Duration::from_secs(15))
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.0.session_stop.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         release.send(()).unwrap();
-        command.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        command
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
         stop.join().unwrap().unwrap();
-        assert_eq!(prompts.load(Ordering::Acquire),0,"whole-session stop must preempt every queued authorizing command");
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            prompts.load(Ordering::Acquire),
+            0,
+            "whole-session stop must preempt every queued authorizing command"
+        );
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
     }
 
     #[test]
@@ -5323,20 +5573,41 @@ mod tests {
         assert!(autonomous.turn_generation > admitted.turn_generation);
         assert!(handle.close_if_revision(admitted.close_revision).is_err());
         assert!(!handle.close_observation().closing);
-        assert!(handle.close_if_revision(autonomous.close_revision).unwrap_err().contains("work is unchanged"));
-        assert!(!handle.close_observation().closing);handle.close().unwrap();
+        assert!(
+            handle
+                .close_if_revision(autonomous.close_revision)
+                .unwrap_err()
+                .contains("work is unchanged")
+        );
+        assert!(!handle.close_observation().closing);
+        handle.close().unwrap();
     }
 
     #[test]
     fn uncorrelated_past_outcome_never_borrows_current_attention_identity() {
-        let mut attention=TurnAttention::default();
+        let mut attention = TurnAttention::default();
         attention.apply(&Event::TurnStarted);
-        let current=attention.key.clone();
-        assert!(attention.apply(&Event::PastTurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled}).is_none());
-        assert_eq!(attention.key,current);
-        assert_eq!(attention.apply(&Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Succeeded}).unwrap().key,current);
+        let current = attention.key.clone();
+        assert!(
+            attention
+                .apply(&Event::PastTurnFinished {
+                    key: None,
+                    outcome: crate::notifications::Kind::Cancelled
+                })
+                .is_none()
+        );
+        assert_eq!(attention.key, current);
+        assert_eq!(
+            attention
+                .apply(&Event::TurnFinished {
+                    key: None,
+                    outcome: crate::notifications::Kind::Succeeded
+                })
+                .unwrap()
+                .key,
+            current
+        );
     }
-
 
     #[test]
     fn delayed_old_turn_outcome_notifies_without_mutating_current_turn_metadata() {
@@ -5417,9 +5688,11 @@ mod tests {
         assert_eq!(after.outcome, before.outcome);
         assert_eq!(after.finished_at, before.finished_at);
         assert_eq!(after.activity(), ActivityState::Waiting);
-        let updates=receive.try_iter().collect::<Vec<_>>();
+        let updates = receive.try_iter().collect::<Vec<_>>();
         assert!(updates.iter().any(|update|matches!(update,Update::PastAttention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
-        assert!(!updates.iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result")));
+        assert!(!updates.iter().any(
+            |update| matches!(update,Update::Attention(evidence) if evidence.key=="old-result")
+        ));
         handle.close().unwrap();
     }
 
@@ -5527,7 +5800,12 @@ mod tests {
             .unwrap();
         let completed = handle.close_observation();
         assert_eq!(completed.activity, ActivityState::Idle);
-        assert!(handle.close_if_revision(completed.close_revision).unwrap_err().contains("work is unchanged"));
+        assert!(
+            handle
+                .close_if_revision(completed.close_revision)
+                .unwrap_err()
+                .contains("work is unchanged")
+        );
         handle.close().unwrap();
     }
 
@@ -5665,44 +5943,87 @@ mod tests {
             state.turn_generation > consent.turn_generation
         });
         assert!(handle.close_if_revision(consent.close_revision).is_err());
-        assert!(handle.close_if_revision(handle.close_observation().close_revision).unwrap_err().contains("work is unchanged"));
+        assert!(
+            handle
+                .close_if_revision(handle.close_observation().close_revision)
+                .unwrap_err()
+                .contains("work is unchanged")
+        );
         handle.close().unwrap();
     }
 
     #[test]
     fn conditional_close_refuses_work_started_after_the_final_empty_input_poll() {
-        struct AfterPoll { directory:std::path::PathBuf }
+        struct AfterPoll {
+            directory: std::path::PathBuf,
+        }
         impl Adapter for AfterPoll {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Default::default())}
-            fn receive(&mut self,value:Value)->Result<Step,String> {
-                Ok(Step {events:if value["turn"]==true {vec![Event::TurnStarted]} else {Vec::new()},..Default::default()})
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Default::default())
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: if value["turn"] == true {
+                        vec![Event::TurnStarted]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                })
             }
             fn after_close_input_drained(&mut self) {
                 // This callback runs after the successful poll and before the
                 // actor compares consent. The provider then starts new work
                 // without any corresponding local command admission.
-                std::fs::write(self.directory.join("release"),b"").unwrap();
-                let deadline=Instant::now()+Duration::from_secs(5);
+                std::fs::write(self.directory.join("release"), b"").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
                 while !self.directory.join("emitted").exists() {
-                    assert!(Instant::now()<deadline,"provider did not emit its post-poll turn");
+                    assert!(
+                        Instant::now() < deadline,
+                        "provider did not emit its post-poll turn"
+                    );
                     thread::sleep(Duration::from_millis(5));
                 }
             }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf '{\"turn\":true}\\n'; : > \"$1/emitted\"; exec cat".into(),"fixture".into(),directory.path().to_string_lossy().into_owned()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(AfterPoll {directory:directory.path().into()}),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
-        let consent=handle.close_observation();
-        let refusal=handle.close_if_revision(consent.close_revision).unwrap_err();
-        assert!(directory.path().join("emitted").exists(),"the provider crossed the exact post-poll gap");
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(AfterPoll {
+                directory: directory.path().into(),
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
+        let consent = handle.close_observation();
+        let refusal = handle
+            .close_if_revision(consent.close_revision)
+            .unwrap_err();
+        assert!(
+            directory.path().join("emitted").exists(),
+            "the provider crossed the exact post-poll gap"
+        );
         assert!(refusal.contains("work is unchanged"));
-        assert!(!handle.is_completed());assert!(!handle.close_observation().closing);
-        until(&handle,|state|state.turn_generation>consent.turn_generation);
+        assert!(!handle.is_completed());
+        assert!(!handle.close_observation().closing);
+        until(&handle, |state| {
+            state.turn_generation > consent.turn_generation
+        });
         handle.close().unwrap();
     }
-
 
     #[test]
     fn unobserved_native_ownership_stays_visible_without_waiting_for_holder_io() {
@@ -8295,128 +8616,286 @@ mod tests {
     #[test]
     fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
         use std::os::unix::fs::OpenOptionsExt;
-        const CHILD:&str="CAGENTS_RETAINED_CLOSE_RETRY_TEST";
+        const CHILD: &str = "CAGENTS_RETAINED_CLOSE_RETRY_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let output=Process::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::tests::bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure","--nocapture"])
                 .env(CHILD,"1").env("XDG_RUNTIME_DIR",directory.path()).env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CONFIG_HOME",directory.path().join("config")).env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         for scenario in 0..3 {
-        let broken_control=scenario==1;
-        let mut source=super::super::native_holder::fixture_source();
-        let boot=crate::daemon::read_boot_id().unwrap();
-        source.proof.as_mut().unwrap().boot_id=boot.clone();
-        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id=boot;
-        let paths=crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::OwnedUnixWebSocket {socket:source.owned_codex_listener.as_ref().unwrap().socket.clone()},program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
-        let root=crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
-        let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
-        assert!(record.root.is_current());
-        let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
-        if scenario!=0 {
-            holder.confirm(uuid::Uuid::new_v4().to_string(),super::super::native_holder::fixture_identity(),record.root.clone()).unwrap();
-            if broken_control {holder.disconnect_control_for_test();}
-        } else {
-            let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
-            invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
-        }
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
-        handle.close().unwrap();
-        if scenario==2 {
-            let (stalled,peer)=UnixStream::pair().unwrap();
-            let identity=holder.replace_control_for_test(stalled);
-            *handle.0.retained_native.lock().unwrap()=Some(holder);
-            let started=Instant::now();drop(handle);
-            assert!(started.elapsed()<Duration::from_secs(1),"final Inner field destruction must not perform retained Holder RPC");
-            assert!(record.root.is_current(),"returning from Drop is not a cleanup receipt");
-            drop(peer);
-            let deadline=Instant::now()+Duration::from_secs(5);
-            loop {
-                if identity.close().is_ok() {break;}
-                assert!(Instant::now()<deadline,"the exact preserved registry owner must remain cleanable");
+            let broken_control = scenario == 1;
+            let mut source = super::super::native_holder::fixture_source();
+            let boot = crate::daemon::read_boot_id().unwrap();
+            source.proof.as_mut().unwrap().boot_id = boot.clone();
+            source
+                .owned_codex_listener
+                .as_mut()
+                .unwrap()
+                .allocator
+                .boot_id = boot;
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let _lease =
+                crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::OwnedUnixWebSocket {
+                    socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+                },
+                program: "/bin/sleep".into(),
+                arguments: vec!["60".into()],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut holder = super::super::native_holder::spawn(spec, source.clone()).unwrap();
+            let root = crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native,
+            )
+            .unwrap();
+            let record = crate::daemon::holder_registry::evidence(
+                &crate::daemon::holder_registry::socket(&root, source.id),
+                crate::daemon::holder_registry::Kind::Native,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(record.root.is_current());
+            let receipt = root.join(format!(
+                "{}-{}-{}.closed",
+                source.id, record.holder.pid, record.holder.start
+            ));
+            if scenario != 0 {
+                holder
+                    .confirm(
+                        uuid::Uuid::new_v4().to_string(),
+                        super::super::native_holder::fixture_identity(),
+                        record.root.clone(),
+                    )
+                    .unwrap();
+                if broken_control {
+                    holder.disconnect_control_for_test();
+                }
+            } else {
+                let mut invalid = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&receipt)
+                    .unwrap();
+                invalid
+                    .write_all(b"transient invalid cleanup receipt")
+                    .unwrap();
+                drop(invalid);
+            }
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut initial = Step::default();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle =
+                LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            handle.close().unwrap();
+            if scenario == 2 {
+                let (stalled, peer) = UnixStream::pair().unwrap();
+                let identity = holder.replace_control_for_test(stalled);
+                *handle.0.retained_native.lock().unwrap() = Some(holder);
+                let started = Instant::now();
+                drop(handle);
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "final Inner field destruction must not perform retained Holder RPC"
+                );
+                assert!(
+                    record.root.is_current(),
+                    "returning from Drop is not a cleanup receipt"
+                );
+                drop(peer);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if identity.close().is_ok() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the exact preserved registry owner must remain cleanable"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(!record.root.is_current());
+                continue;
+            }
+            *handle.0.retained_native.lock().unwrap() = Some(holder);
+            handle.0.completed.store(false, Ordering::Release);
+            *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
+            assert!(
+                handle
+                    .close_until(Instant::now() + Duration::from_secs(2))
+                    .is_err()
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while handle.0.native_reconciling.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
                 thread::sleep(Duration::from_millis(5));
             }
-            assert!(!record.root.is_current());
-            continue;
-        }
-        *handle.0.retained_native.lock().unwrap()=Some(holder);
-        handle.0.completed.store(false,Ordering::Release);
-        *handle.0.failure.lock().unwrap()=Some("Native teardown remains unconfirmed".into());
-        assert!(handle.close_until(Instant::now()+Duration::from_secs(2)).is_err());
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while handle.0.native_reconciling.load(Ordering::Acquire) {
-            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
-        }
-        assert!(handle.0.retained_native.lock().unwrap().is_some());
-        assert!(record.root.is_current(),"the failed attempt must retain the same actual provider owner");
-        assert!(!handle.is_completed());assert!(handle.owns_work());
-        if !broken_control {std::fs::remove_file(&receipt).unwrap();}
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
-        assert!(handle.0.retained_native.lock().unwrap().is_none());assert!(handle.is_completed());
-        assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
+            assert!(handle.0.retained_native.lock().unwrap().is_some());
+            assert!(
+                record.root.is_current(),
+                "the failed attempt must retain the same actual provider owner"
+            );
+            assert!(!handle.is_completed());
+            assert!(handle.owns_work());
+            if !broken_control {
+                std::fs::remove_file(&receipt).unwrap();
+            }
+            handle
+                .close_until(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert!(handle.0.retained_native.lock().unwrap().is_none());
+            assert!(handle.is_completed());
+            assert!(
+                !record.root.is_current(),
+                "the later same close API must progress through exact native cleanup"
+            );
         }
     }
 
-    pub(super) fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
-        struct TlsCleanup {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>,finished:crossbeam_channel::Sender<()>}
+    pub(super) fn worker_blocked_in_tls_destruction() -> (
+        JoinHandle<()>,
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ) {
+        struct TlsCleanup {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            finished: crossbeam_channel::Sender<()>,
+        }
         impl Drop for TlsCleanup {
-            fn drop(&mut self) {let _=self.entered.send(());let _=self.release.recv_timeout(Duration::from_secs(5));let _=self.finished.send(());}
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                let _ = self.finished.send(());
+            }
         }
         thread_local! {static CLEANUP:std::cell::RefCell<Option<TlsCleanup>>=const {std::cell::RefCell::new(None)};}
-        let (entered,entered_cleanup)=crossbeam_channel::bounded(1);
-        let (release,released)=crossbeam_channel::bounded(1);
-        let (finished,finished_cleanup)=crossbeam_channel::bounded(1);
-        let worker=thread::spawn(move||CLEANUP.with(|cleanup|*cleanup.borrow_mut()=Some(TlsCleanup {entered,release:released,finished})));
-        entered_cleanup.recv_timeout(Duration::from_secs(1)).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(1);
-        while !worker.is_finished() {assert!(Instant::now()<deadline,"fixture must reach the post-packet TLS destructor boundary");thread::yield_now();}
+        let (entered, entered_cleanup) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let (finished, finished_cleanup) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            CLEANUP.with(|cleanup| {
+                *cleanup.borrow_mut() = Some(TlsCleanup {
+                    entered,
+                    release: released,
+                    finished,
+                })
+            })
+        });
+        entered_cleanup
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture must reach the post-packet TLS destructor boundary"
+            );
+            thread::yield_now();
+        }
         assert!(finished_cleanup.try_recv().is_err());
-        (worker,release,finished_cleanup)
+        (worker, release, finished_cleanup)
     }
 
     #[test]
     fn bounded_close_does_not_join_a_latched_tls_destructor_on_its_caller() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         handle.close().unwrap();
-        let (worker,release,finished)=worker_blocked_in_tls_destruction();
-        *handle.0.worker.lock().unwrap()=Some(worker);
-        let started=Instant::now();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(40)).is_err());
-        assert!(started.elapsed()<Duration::from_secs(1));
-        assert!(handle.0.worker_joining.load(Ordering::Acquire),"bounded owner service retains the actual unreturned OS thread");
+        let (worker, release, finished) = worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap() = Some(worker);
+        let started = Instant::now();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(40))
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            handle.0.worker_joining.load(Ordering::Acquire),
+            "bounded owner service retains the actual unreturned OS thread"
+        );
         assert!(finished.try_recv().is_err());
-        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         assert!(!handle.0.worker_joining.load(Ordering::Acquire));
     }
 
     #[test]
     fn final_handle_drop_does_not_join_even_after_finished_packet_precedes_tls_cleanup() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         handle.close().unwrap();
-        let (worker,release,finished)=worker_blocked_in_tls_destruction();
-        *handle.0.worker.lock().unwrap()=Some(worker);
-        let shared_native=handle.0.retained_native.clone();let held_native=shared_native.lock().unwrap();
-        let started=Instant::now();drop(handle);
-        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join TLS or wait for actor-owned native metadata");
+        let (worker, release, finished) = worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap() = Some(worker);
+        let shared_native = handle.0.retained_native.clone();
+        let held_native = shared_native.lock().unwrap();
+        let started = Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "destruction must not join TLS or wait for actor-owned native metadata"
+        );
         drop(held_native);
-        assert!(finished.try_recv().is_err(),"dropping the frontend is not proof that cleanup finished");
-        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            finished.try_recv().is_err(),
+            "dropping the frontend is not proof that cleanup finished"
+        );
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
