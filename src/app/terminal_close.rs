@@ -1030,7 +1030,7 @@ fn revalidate_and_close_at(intent: &CloseIntent, allow_active: bool, path: &Path
     if let Some(source) = &intent.live_source {
         // Preserve the established exact current-daemon close route, including
         // native returned terminals and accepted execution consoles.
-        let current = close_hosted_terminal_at(path, intent.terminal, &intent.proof, allow_active);
+        let current = close_hosted_terminal_source_at(path, intent.terminal, &intent.proof, allow_active, Some(source));
         if !matches!(current, CloseOutcome::Stale) { return current; }
         let run = || -> Result<CloseOutcome, String> {
             let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
@@ -1061,6 +1061,10 @@ pub(super) fn close_hosted_terminal(
 }
 
 fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessionProof, allow_active: bool) -> CloseOutcome {
+    close_hosted_terminal_source_at(path, terminal, proof, allow_active, None)
+}
+
+fn close_hosted_terminal_source_at(path: &Path, terminal: TerminalId, proof: &HostSessionProof, allow_active: bool, source: Option<&TerminalSession>) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
         let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
         if client.proof() != proof || !proof.is_complete() {
@@ -1073,6 +1077,13 @@ fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessi
         else {
             return Ok(CloseOutcome::Stale);
         };
+        if let Some(source) = source {
+            let mut current = descriptor.session.clone();
+            current.continuity = source.continuity.clone();
+            if source.continuity.live_proof().as_ref() != Some(proof) || current != *source {
+                return Ok(CloseOutcome::Unreachable("The terminal's saved source changed. Its current process was preserved; reconnect before closing it.".into()));
+            }
+        }
         match &descriptor.session.continuity {
             TerminalContinuity::Exited { .. }
             | TerminalContinuity::RelaunchAvailable {
@@ -1110,7 +1121,7 @@ mod paired_close_regression {
     use crate::terminal_ipc::{ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, read_frame, write_frame};
     #[test]
     fn current_native_and_execution_console_close_keep_the_established_checked_route() {
-        for native_listener in [true, false] {
+        for (native_listener, stale_source) in [(true, false), (false, false), (true, true), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -1123,6 +1134,7 @@ mod paired_close_regression {
                 descriptor.session.owned_codex_listener = Some(crate::chat::OwnedCodexListener { socket: "/private/native.sock".into(), allocator: proof.clone() });
             }
             let intent = CloseIntent { card: CardId::new(), terminal: id, proof: proof.clone(), completed_source: None, live_source: Some(descriptor.session.clone()), generation: 1, restore_card: None, pending: true, active: false, dont_ask_again: false, detail: None, focus: 0, restore_keyboard_nav: false };
+            if stale_source { descriptor.session.launch.arguments.push("different-current-recipe".into()); }
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
@@ -1135,6 +1147,10 @@ mod paired_close_regression {
                 let list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                 assert_eq!(list.request, ClientRequest::List, "a known current console must not enter ordinary orphan adoption");
                 send(&mut stream, list.request_id, ServerResponse::Listed { terminals: vec![descriptor.clone()] });
+                if stale_source {
+                    assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None, "a mismatched source cannot issue Close or fall back to ID-only reconciliation");
+                    return;
+                }
                 let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                 assert!(matches!(attach.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == id));
                 send(&mut stream, attach.request_id, ServerResponse::Attached { terminal: descriptor });
@@ -1146,7 +1162,9 @@ mod paired_close_regression {
                 assert_eq!(detach.request, ClientRequest::Detach { terminal_id: id });
                 send(&mut stream, detach.request_id, ServerResponse::Detached);
             });
-            assert!(matches!(revalidate_and_close_at(&intent, false, &socket), CloseOutcome::Active));
+            let outcome = revalidate_and_close_at(&intent, false, &socket);
+            if stale_source { assert!(matches!(outcome, CloseOutcome::Unreachable(_))); }
+            else { assert!(matches!(outcome, CloseOutcome::Active)); }
             server.join().unwrap();
         }
     }

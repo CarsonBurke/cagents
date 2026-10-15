@@ -765,6 +765,7 @@ pub(super) fn process_request(
             } else { handle.close_checked(allow_active) };
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock().unwrap_or_else(|p| p.into_inner()).close_terminal_attention(session.id, Some(&handle));
+                super::chat::close_for_terminal(host, session.id)?;
             }
             Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id, outcome }, Vec::new(), false))
         }
