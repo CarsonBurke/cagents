@@ -1522,3 +1522,6 @@ for line in sys.stdin:
         handle.close().unwrap();
     }
 }
+
+#[cfg(test)]
+mod retry_actor_tests;

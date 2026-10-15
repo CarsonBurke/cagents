@@ -233,6 +233,7 @@ pub trait Adapter: Send {
     }
     /// Non-authoritative attachment labels for this one prompt. Adapters may
     /// use only their basename as provider document titles, never as byte paths.
+    fn cancel_original_restoration(&mut self) -> Option<Step> { None }
     fn prompt_attachment_names(&mut self, _names: Vec<Option<PathBuf>>) {}
     fn original_command(&mut self, _command_id: Option<String>) {}
     fn discard_undispatched(&mut self) -> Result<Option<Step>, String> {

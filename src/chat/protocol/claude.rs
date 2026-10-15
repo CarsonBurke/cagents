@@ -450,6 +450,7 @@ impl Claude {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            original_retry: self.retry_capability(),
             steer: self.async_input,
             queue: self.async_input,
             queue_remove: self.async_input,
@@ -1647,6 +1648,9 @@ impl Adapter for Claude {
     fn retry_original(&mut self, settings: &chat::annotations::OriginalSettings, command: Command) -> Result<Step, String> {
         self.begin_original_retry(settings, command)
     }
+    fn cancel_original_restoration(&mut self) -> Option<Step> {
+        self.cancel_original_retry("Retry was cancelled by a newer operator action")
+    }
     fn prompt_attachment_names(&mut self,names:Vec<Option<PathBuf>>) { self.attachment_names=names; }
     fn original_command(&mut self, id: Option<String>) {
         self.originals.staged = id;
@@ -1655,7 +1659,7 @@ impl Adapter for Claude {
         std::mem::take(&mut self.originals.updates)
     }
     fn discard_undispatched(&mut self) -> Result<Option<Step>, String> {
-        let mut step = self.cancel_original_retry("The conversation closed before Retry dispatch");
+        let mut step = self.drop_original_retry("The conversation closed before Retry dispatch");
         if let Some(original) = self.original_abort(true)? {
             let merged = step.get_or_insert_with(Step::default);
             merged.writes.extend(original.writes);
@@ -1824,9 +1828,16 @@ impl Adapter for Claude {
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
+        if self.retry_is_pending() && matches!(&command, Command::Refresh) {
+            return self.refresh_cancelled_retry();
+        }
         let retry_aborted = self.cancel_original_retry("Retry was cancelled by a newer operator action");
-        if matches!(&command, Command::Interrupt) && retry_aborted.is_some() && !self.busy {
-            return Ok(retry_aborted.unwrap());
+        if retry_aborted.is_some() {
+            if matches!(&command, Command::Interrupt) {
+                if !self.busy { return Ok(retry_aborted.unwrap()); }
+            } else {
+                return self.merge_retry_abort(Err("Wait for effective settings reconciliation before sending new work".into()),retry_aborted);
+            }
         }
         if matches!(
             &command,
@@ -5232,6 +5243,15 @@ pub(crate) fn annotation_test_adapter() -> Box<dyn Adapter> {
         ..Claude::default()
     })
 }
+#[cfg(test)]
+pub(crate) fn annotation_test_retry_adapter(timeout:std::time::Duration) -> Box<dyn Adapter> {
+    let mut adapter=Claude {ready:true,async_input:true,cwd:std::env::temp_dir(),..Claude::default()};
+    adapter.originals.wait_timeout=Some(std::time::Duration::from_secs(10));
+    adapter.retry.capability=true;
+    adapter.retry.timeout=Some(timeout);
+    Box::new(adapter)
+}
+
 #[cfg(test)]
 pub(crate) fn annotation_test_async_adapter() -> Box<dyn Adapter> {
     let mut adapter = Claude {

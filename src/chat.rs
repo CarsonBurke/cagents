@@ -935,6 +935,12 @@ pub struct Snapshot {
     pub skills: Vec<Skill>,
     pub usage: Usage,
     pub busy: bool,
+    /// Local exact-original restoration, independent of provider turn activity.
+    #[serde(default)]
+    pub original_retry_pending: bool,
+    /// A scoped restoration diagnostic; never replaces the provider root error.
+    #[serde(default)]
+    pub original_retry_diagnostic: Option<String>,
     pub detail: String,
     pub session_id: Option<String>,
     #[serde(default)]
@@ -2146,6 +2152,8 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// Local held Retry/reconciliation state, never native turn acceptance.
+    OriginalRetryState { pending: bool, diagnostic: Option<String> },
 }
 
 #[cfg(test)]

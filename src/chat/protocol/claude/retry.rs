@@ -10,22 +10,27 @@ use std::time::{Duration, Instant};
 pub(super) struct RetryState {
     pending: Option<Pending>,
     deferred: Option<(u64, Step)>,
+    #[cfg(test)]
+    pub(super) capability: bool,
+    #[cfg(test)]
+    pub(super) timeout: Option<Duration>,
 }
 struct Pending {
-    id: String,
+    id: Option<String>,
     session: String,
     generation: u64,
     revision: u64,
     deadline: Instant,
     request: String,
     phase: Phase,
-    prompt: Command,
+    prompt: Option<Command>,
     names: Vec<Option<PathBuf>>,
     settings: OriginalSettings,
     applied: Option<Value>,
+    cancelled: Option<String>,
 }
 #[derive(Clone, Copy)]
-enum Phase { Model, Reasoning, Fast, Permission, Applied, Policy }
+enum Phase { Model, Reasoning, Fast, Permission, Applied, Policy, Blocked }
 
 impl Claude {
     pub(super) fn begin_original_retry(&mut self, settings: &OriginalSettings, prompt: Command) -> Result<Step, String> {
@@ -58,25 +63,72 @@ impl Claude {
             Err(error) => { self.originals.staged = Some(id); self.attachment_names = names; return Err(error); }
         };
         self.retry.pending = Some(Pending {
-            id, session, generation:self.attention_generation, revision:self.originals.revision,
-            deadline:Instant::now()+Duration::from_secs(20), request:step.writes[0]["request_id"].as_str().unwrap().into(),
-            phase:Phase::Model, prompt, names, settings:settings.clone(), applied:None,
+            id:Some(id), session, generation:self.attention_generation, revision:self.originals.revision,
+            deadline:Instant::now()+self.retry_timeout(), request:step.writes[0]["request_id"].as_str().unwrap().into(),
+            phase:Phase::Model, prompt:Some(prompt), names, settings:settings.clone(), applied:None, cancelled:None,
         });
+        let mut step=step;
+        step.events.push(Event::OriginalRetryState {pending:true,diagnostic:None});
         Ok(step)
     }
+    pub(super) fn retry_capability(&self) -> bool {
+        #[cfg(test)] { return self.retry.capability; }
+        #[cfg(not(test))] { false }
+    }
+    fn retry_timeout(&self) -> Duration {
+        #[cfg(test)] if let Some(timeout)=self.retry.timeout { return timeout; }
+        Duration::from_secs(20)
+    }
+    pub(super) fn retry_is_pending(&self) -> bool { self.retry.pending.is_some() }
     pub(super) fn cancel_original_retry(&mut self, reason: &str) -> Option<Step> {
-        let pending = self.retry.pending.take()?;
-        self.controls.remove(&pending.request);
-        self.originals.verified_retry = None;
-        self.originals.updates.push(OriginalUpdate::Rejected { command_id:pending.id });
-        // No prompt was submitted and no native turn began. Settle only the
-        // local optimistic busy indicator; never manufacture an old turn fate.
-        let mut step = Step::default();
-        if self.attention_generation == pending.generation && !self.busy {
-            self.status(false, reason, &mut step);
+        let pending=self.retry.pending.as_mut()?;
+        if pending.cancelled.is_none() {
+            pending.cancelled=Some(reason.into());
+            pending.prompt=None;
+            pending.names.clear();
+            if let Some(id)=pending.id.take() {
+                self.originals.updates.push(OriginalUpdate::Rejected {command_id:id});
+            }
         }
-        step.events.push(Event::Error { message:reason.into(), fatal:false });
+        // An already-written setter cannot be undone by dropping its ACK.
+        // Keep its correlation, then read effective settings before admitting
+        // newer work. This is a local operation, never a provider turn/error.
+        Some(Step {events:vec![Event::OriginalRetryState {pending:true,diagnostic:Some(format!("{reason}. Reconciling effective settings before accepting more input"))}],..Step::default()})
+    }
+    pub(super) fn drop_original_retry(&mut self, reason:&str) -> Option<Step> {
+        let mut step=self.cancel_original_retry(reason)?;
+        let pending=self.retry.pending.take().unwrap();
+        self.controls.remove(&pending.request);
+        self.originals.verified_retry=None;
+        self.retry.deferred=None;
+        step.events=vec![Event::OriginalRetryState {pending:false,diagnostic:Some(reason.into())}];
         Some(step)
+    }
+    fn block_retry_reconciliation(&mut self, reason:&str) -> Step {
+        let mut step=self.cancel_original_retry(reason).unwrap();
+        let pending=self.retry.pending.as_mut().unwrap();
+        if !matches!(pending.phase,Phase::Model|Phase::Reasoning|Phase::Fast|Phase::Permission) {
+            self.controls.remove(&pending.request);
+            pending.request.clear();
+        }
+        pending.phase=Phase::Blocked;
+        step.events=vec![Event::OriginalRetryState {pending:true,diagnostic:Some(format!("{reason}. Native settings remain unverified; refresh the conversation before sending more input"))}];
+        step
+    }
+    pub(super) fn refresh_cancelled_retry(&mut self) -> Result<Step,String> {
+        if !self.retry.pending.as_ref().is_some_and(|pending|matches!(pending.phase,Phase::Blocked)) {
+            return Err("Exact Retry settings reconciliation is still pending".into());
+        }
+        if !self.retry.pending.as_ref().unwrap().request.is_empty() {
+            return Err("A prior native setter has not settled; settings cannot yet be revalidated".into());
+        }
+        let mut step=self.control(json!({"subtype":"get_settings"}))?;
+        let timeout=Duration::from_secs(20);
+        let pending=self.retry.pending.as_mut().unwrap();
+        pending.phase=Phase::Applied;pending.deadline=Instant::now()+timeout;
+        pending.request=step.writes[0]["request_id"].as_str().unwrap().into();
+        step.events.push(Event::OriginalRetryState {pending:true,diagnostic:Some("Refreshing effective native settings; no original prompt will be sent".into())});
+        Ok(step)
     }
     pub(super) fn merge_retry_abort(&mut self, result:Result<Step,String>, aborted:Option<Step>) -> Result<Step,String> {
         match (result, aborted) {
@@ -96,21 +148,26 @@ impl Claude {
     }
     pub(super) fn retry_deadline(&self) -> Option<Instant> {
         if self.retry.deferred.is_some() { Some(Instant::now()) }
-        else { self.retry.pending.as_ref().map(|pending|pending.deadline) }
+        else { self.retry.pending.as_ref().filter(|pending|!matches!(pending.phase,Phase::Blocked)).map(|pending|pending.deadline) }
     }
     pub(super) fn retry_maintenance(&mut self) -> Step {
         if let Some((generation, step)) = self.retry.deferred.take() {
             // A late settlement belongs only to its held local attempt.
             // It cannot clear busy/error state of a newly observed native turn.
-            return if generation == self.attention_generation && !self.busy { step } else { Step::default() };
+            let _=generation;
+            return step;
         }
-        if self.retry.pending.as_ref().is_some_and(|pending|Instant::now() >= pending.deadline) {
-            return self.cancel_original_retry("Exact Retry timed out before dispatch; no prompt was sent").unwrap();
+        if self.retry.pending.as_ref().is_some_and(|pending|!matches!(pending.phase,Phase::Blocked)&&Instant::now() >= pending.deadline) {
+            return self.block_retry_reconciliation("Exact Retry timed out before dispatch; no prompt was sent");
         }
         Step::default()
     }
     pub(super) fn retry_observe_frame(&mut self, frame:&Value) -> Step {
         if self.retry.pending.is_none() { return Step::default(); }
+        let pending=self.retry.pending.as_ref().unwrap();
+        if frame["type"]=="conversation_reset" || (frame["type"]!="prompt_suggestion" && frame["session_id"].as_str().is_some_and(|session|session!=pending.session)) {
+            return self.drop_original_retry("The native conversation identity changed before Retry dispatch").unwrap();
+        }
         let changed = match frame["type"].as_str() {
             Some("keep_alive" | "prompt_suggestion" | "rate_limit_event" | "control_response") => false,
             Some("system") => frame["subtype"] != "session_state_changed" || frame["state"] != "idle",
@@ -124,18 +181,37 @@ impl Claude {
         if frame["type"] != "control_response" || self.retry.pending.as_ref().is_none_or(|pending|
             frame["response"]["request_id"].as_str() != Some(pending.request.as_str()))
         { return Ok(None); }
-        let pending = self.retry.pending.as_ref().unwrap();
-        if Instant::now() >= pending.deadline || self.busy || self.session_id.as_deref() != Some(pending.session.as_str())
-            || self.original_retry_session() != Some(pending.session.as_str())
-            || self.attention_generation != pending.generation || self.originals.revision != pending.revision
-            || !self.pending.is_empty() || !self.queued.is_empty() || !self.submissions.is_empty()
-            || !self.background_agents.is_empty()
-        { return Ok(self.cancel_original_retry("Retry dispatch guard changed; no prompt was sent")); }
-        if frame["response"]["subtype"] != "success" {
-            return Ok(self.cancel_original_retry("Claude refused exact settings restoration; no prompt was sent"));
+        let pending=self.retry.pending.as_ref().unwrap();
+        if matches!(pending.phase,Phase::Blocked) {
+            let request=pending.request.clone();self.controls.remove(&request);
+            self.retry.pending.as_mut().unwrap().request.clear();
+            return Ok(Some(Step {events:vec![Event::OriginalRetryState {pending:true,diagnostic:Some("The prior native setter settled; refresh to reconcile effective settings before sending input".into())}],..Step::default()}));
         }
-        self.controls.remove(&pending.request.clone());
-        let pending = self.retry.pending.as_mut().unwrap();
+        if Instant::now() >= pending.deadline {
+            return Ok(Some(self.block_retry_reconciliation("Exact Retry timed out before dispatch; no prompt was sent")));
+        }
+        if self.session_id.as_deref()!=Some(pending.session.as_str()) || self.original_retry_session()!=Some(pending.session.as_str()) {
+            return Ok(self.drop_original_retry("The confirmed native session changed before Retry dispatch"));
+        }
+        let guard_valid=!self.busy && self.session_id.as_deref()==Some(pending.session.as_str())
+            && self.original_retry_session()==Some(pending.session.as_str())
+            && self.attention_generation==pending.generation && self.originals.revision==pending.revision
+            && self.pending.is_empty() && self.queued.is_empty() && self.submissions.is_empty()
+            && self.background_agents.is_empty();
+        if !guard_valid { self.cancel_original_retry("Retry dispatch guard changed; no prompt was sent"); }
+        let successful=frame["response"]["subtype"]=="success";
+        let pending=self.retry.pending.as_ref().unwrap();
+        if !successful && matches!(pending.phase,Phase::Applied|Phase::Policy) {
+            return Ok(Some(self.block_retry_reconciliation("Claude refused effective settings readback; no prompt was sent")));
+        }
+        if !successful { self.cancel_original_retry("Claude refused exact settings restoration; no prompt was sent"); }
+        let request=self.retry.pending.as_ref().unwrap().request.clone();self.controls.remove(&request);
+        let pending=self.retry.pending.as_mut().unwrap();
+        // After cancellation or a setter refusal, wait for the in-flight
+        // setter receipt, then stop restoring and reconcile actual values.
+        if pending.cancelled.is_some() && matches!(pending.phase,Phase::Model|Phase::Reasoning|Phase::Fast|Phase::Permission) {
+            pending.phase=Phase::Permission;
+        }
         let next = match pending.phase {
             Phase::Model => { pending.phase=Phase::Reasoning; json!({"subtype":"apply_flag_settings","settings":{"effortLevel":match &pending.settings.reasoning {Setting::Value(value)=>value,_=>unreachable!()}}}) }
             Phase::Reasoning => { pending.phase=Phase::Fast; json!({"subtype":"apply_flag_settings","settings":{"fastMode":match &pending.settings.fast {Setting::Value(value)=>*value,_=>unreachable!()}}}) }
@@ -147,7 +223,13 @@ impl Claude {
                 let valid=model_effort.as_ref().is_ok_and(|applied|
                     pending.settings.model==Setting::Value(applied.model.clone())
                     && pending.settings.reasoning==Setting::Value(applied.effort.clone()));
-                if !valid { return Ok(self.cancel_original_retry("Claude effective model or effort differs from the original; no prompt was sent")); }
+                if !valid && pending.cancelled.is_none() {
+                    self.cancel_original_retry("Claude effective model or effort differs from the original; no prompt was sent");
+                }
+                let pending=self.retry.pending.as_mut().unwrap();
+                if model_effort.is_err() {
+                    return Ok(Some(self.block_retry_reconciliation("Claude did not report effective model and effort; no prompt was sent")));
+                }
                 // Retain only the small confirmed fields, never the arbitrary
                 // settings response or credentials/permission tree.
                 let applied=model_effort.unwrap();
@@ -161,23 +243,29 @@ impl Claude {
                     pending.applied.as_ref().unwrap(),
                     response["current_permission_mode"].as_str().unwrap_or(""),
                     response["fast_mode_state"].as_str().unwrap_or(""));
-                if response["session_state"] != "idle" || effective.as_ref().ok() != Some(&pending.settings) {
-                    return Ok(self.cancel_original_retry("Claude did not confirm idle state and exact original policy; no prompt was sent"));
+                let can_dispatch=response["session_state"]=="idle" && effective.as_ref().ok()==Some(&pending.settings);
+                if !can_dispatch && pending.cancelled.is_none() {
+                    self.cancel_original_retry("Claude did not confirm idle state and exact original policy; no prompt was sent");
                 }
+                let effective=match effective {
+                    Ok(settings)=>settings,
+                    Err(_)=>return Ok(Some(self.block_retry_reconciliation("Claude did not report effective permission and fast policy; no prompt was sent"))),
+                };
                 let pending=self.retry.pending.take().unwrap();
                 self.original_connection_policy(response);
-                let mut metadata = Step::default();
-                if let Setting::Value(model) = &pending.settings.model { self.selected = Some(model.clone()); }
-                if let Setting::Value(reasoning) = &pending.settings.reasoning { self.reasoning = Some(reasoning.clone()); }
-                self.metadata(&Value::Null, &mut metadata);
-                self.fast_mode_metadata(response, &mut metadata);
-                if let Setting::Value(mode) = &pending.settings.permission {
-                    metadata.events.push(Event::PermissionMode(Some(mode.clone())));
-                }
-                self.originals.staged=Some(pending.id.clone());
-                self.originals.verified_retry=Some((pending.id.clone(),pending.settings));
+                let mut metadata=Step::default();
+                if let Setting::Value(model)=&effective.model {self.selected=Some(model.clone());}
+                if let Setting::Value(reasoning)=&effective.reasoning {self.reasoning=Some(reasoning.clone());}
+                self.metadata(&Value::Null,&mut metadata);
+                self.fast_mode_metadata(response,&mut metadata);
+                if let Setting::Value(mode)=&effective.permission {metadata.events.push(Event::PermissionMode(Some(mode.clone())));}
+                metadata.events.push(Event::OriginalRetryState {pending:false,diagnostic:pending.cancelled.clone().map(|reason|format!("{reason}. Effective native settings have been refreshed"))});
+                if pending.cancelled.is_some() {return Ok(Some(metadata));}
+                let id=pending.id.unwrap();
+                self.originals.staged=Some(id.clone());
+                self.originals.verified_retry=Some((id.clone(),pending.settings));
                 self.attachment_names=pending.names;
-                match self.command(pending.prompt) {
+                match self.command(pending.prompt.unwrap()) {
                     Ok(mut dispatched) => {
                         metadata.writes.append(&mut dispatched.writes);
                         metadata.events.append(&mut dispatched.events);
@@ -186,23 +274,23 @@ impl Claude {
                         self.originals.staged=None;
                         self.originals.verified_retry=None;
                         self.attachment_names.clear();
-                        self.submissions.remove(&pending.id);
-                        self.queued.retain(|message|message.id!=pending.id);
-                        self.turn_inputs.discard_undispatched(&pending.id);
-                        self.originals.updates.push(OriginalUpdate::Rejected {command_id:pending.id});
-                        self.status(false, "Exact Retry input could not be encoded; no prompt was sent", &mut metadata);
-                        metadata.events.push(Event::Error {message:"Exact Retry input could not be encoded; no prompt was sent".into(),fatal:false});
+                        self.submissions.remove(&id);
+                        self.queued.retain(|message|message.id!=id);
+                        self.turn_inputs.discard_undispatched(&id);
+                        self.originals.updates.push(OriginalUpdate::Rejected {command_id:id});
+                        metadata.events.push(Event::OriginalRetryState {pending:false,diagnostic:Some("Exact Retry input could not be encoded; no prompt was sent".into())});
                     }
                 }
                 return Ok(Some(metadata));
             }
+            Phase::Blocked=>return Ok(None),
         };
         match self.control(next) {
             Ok(step) => {
                 self.retry.pending.as_mut().unwrap().request=step.writes[0]["request_id"].as_str().unwrap().into();
                 Ok(Some(step))
             }
-            Err(_) => Ok(self.cancel_original_retry("Claude Retry control admission failed; no prompt was sent")),
+            Err(_) => Ok(Some(self.block_retry_reconciliation("Claude Retry control admission failed; no prompt was sent"))),
         }
     }
 }
@@ -288,7 +376,7 @@ mod tests {
                 let mut adapter=ready_adapter();let first=begin(&mut adapter);let final_read=advance_to_policy(&mut adapter,first);
                 let mut report=policy();if missing {report.as_object_mut().unwrap().remove(field);}else{report[field]=json!("different");}
                 let refused=adapter.receive(response(&final_read,report)).unwrap();
-                assert!(refused.writes.is_empty());assert!(adapter.retry.pending.is_none());assert!(adapter.controls.is_empty());
+                assert!(refused.writes.is_empty());
                 assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Rejected{command_id} if command_id=="exact-retry-command")));
             }
         }
@@ -299,22 +387,36 @@ mod tests {
             let mut adapter=ready_adapter();let mut step=begin(&mut adapter);
             for _ in 0..4 {step=adapter.receive(response(&step,json!({}))).unwrap();}
             let refused=adapter.receive(response(&step,json!({"applied":applied}))).unwrap();
-            assert!(refused.writes.is_empty());assert!(adapter.retry.pending.is_none());
+            assert!(refused.writes.is_empty());assert!(matches!(adapter.retry.pending.as_ref().unwrap().phase,Phase::Blocked));
         }
     }
     #[test]
-    fn retry_timeout_and_refusal_have_no_optional_send_fallback_or_late_reply() {
-        for timeout in [false,true] {
-            let mut adapter=ready_adapter();let first=begin(&mut adapter);let late=response(&first,json!({}));
-            let refused=if timeout {
-                adapter.retry.pending.as_mut().unwrap().deadline=Instant::now();adapter.maintenance().unwrap()
-            }else{
-                let mut refused=late.clone();refused["response"]["subtype"]=json!("error");adapter.receive(refused).unwrap()
-            };
-            assert!(refused.writes.is_empty());assert!(!adapter.busy);
-            assert!(adapter.receive(late).unwrap().writes.is_empty());assert!(adapter.maintenance().unwrap().writes.is_empty());
-            assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Rejected{..})));
-        }
+    fn retry_timeout_fences_unsettled_setter_before_refresh_and_never_sends_late_input() {
+        let mut adapter=ready_adapter();let first=begin(&mut adapter);let late=response(&first,json!({}));
+        adapter.retry.pending.as_mut().unwrap().deadline=Instant::now();
+        let refused=adapter.maintenance().unwrap();assert!(refused.writes.is_empty());
+        assert!(adapter.command(Command::Refresh).is_err(),"unsettled setter must fence readback");
+        assert!(adapter.receive(late).unwrap().writes.is_empty());
+        let refreshed=adapter.command(Command::Refresh).unwrap();
+        assert_eq!(refreshed.writes[0]["request"]["subtype"],"get_settings");
+        let policy_read=adapter.receive(response(&refreshed,json!({"applied":{"model":"partially-restored","effort":"high"}}))).unwrap();
+        let reconciled=adapter.receive(response(&policy_read,json!({"current_permission_mode":"bypassPermissions","fast_mode_state":"on","session_state":"idle"}))).unwrap();
+        assert!(reconciled.writes.is_empty());assert!(adapter.retry.pending.is_none());
+        assert_eq!(adapter.selected.as_deref(),Some("partially-restored"));
+        assert_eq!(adapter.reasoning.as_deref(),Some("high"));
+        assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Rejected{..})));
+    }
+    #[test]
+    fn retry_setter_refusal_reconciles_partial_native_settings_without_provider_error() {
+        let mut adapter=ready_adapter();let first=begin(&mut adapter);
+        let mut refused=response(&first,json!({}));refused["response"]["subtype"]=json!("error");
+        let refresh=adapter.receive(refused).unwrap();
+        assert_eq!(refresh.writes[0]["request"]["subtype"],"get_settings");
+        let final_read=adapter.receive(response(&refresh,json!({"applied":{"model":"partially-restored","effort":"high"}}))).unwrap();
+        let reconciled=adapter.receive(response(&final_read,policy())).unwrap();
+        assert!(reconciled.writes.is_empty());assert!(adapter.retry.pending.is_none());
+        assert_eq!(adapter.selected.as_deref(),Some("partially-restored"));
+        assert!(reconciled.events.iter().all(|event|!matches!(event,Event::Error{..}|Event::TurnStarted|Event::TurnFinished{..})));
     }
     #[test]
     fn retry_interrupt_close_and_newer_native_work_retire_exact_unsent_intent() {
@@ -325,23 +427,31 @@ mod tests {
                 "close"=>adapter.discard_undispatched().unwrap().unwrap(),
                 _=>adapter.receive(json!({"type":"system","subtype":"session_state_changed","session_id":SESSION,"state":"working"})).unwrap(),
             };
-            assert!(stopped.writes.is_empty());assert!(adapter.retry.pending.is_none());
-            assert!(adapter.receive(late).unwrap().writes.is_empty());
+            assert!(stopped.writes.is_empty());
+            assert!(stopped.events.iter().all(|event|!matches!(event,Event::Error{..})));
+            let read=adapter.receive(late).unwrap();
+            if action=="close" { assert!(read.writes.is_empty()); }
+            else {
+                assert_eq!(read.writes[0]["request"]["subtype"],"get_settings");
+                let final_read=adapter.receive(response(&read,json!({"applied":{"model":"original-model","effort":"low"}}))).unwrap();
+                assert!(adapter.receive(response(&final_read,policy())).unwrap().writes.is_empty());
+            }
+            assert!(adapter.retry.pending.is_none());
             assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Rejected{command_id} if command_id=="exact-retry-command")));
             assert_eq!(adapter.busy,action=="native");
         }
     }
     #[test]
-    fn retry_new_queued_input_remains_distinct_and_refused_actions_settle_held_attempt() {
-        let mut adapter=ready_adapter();let first=begin(&mut adapter);let late=response(&first,json!({}));
+    fn retry_rejects_new_queued_input_until_effective_settings_reconciliation() {
+        let mut adapter=ready_adapter();let first=begin(&mut adapter);
+        assert!(adapter.command(prompt(PromptMode::Queue)).is_err());
+        let pending=adapter.maintenance().unwrap();assert!(pending.writes.is_empty());
+        assert!(pending.events.iter().any(|event|matches!(event,Event::OriginalRetryState{pending:true,..})));
+        let read=adapter.receive(response(&first,json!({}))).unwrap();
+        let final_read=adapter.receive(response(&read,json!({"applied":{"model":"original-model","effort":"low"}}))).unwrap();
+        assert!(adapter.receive(response(&final_read,policy())).unwrap().writes.is_empty());
         let queued=adapter.command(prompt(PromptMode::Queue)).unwrap();
         assert_eq!(queued.writes.len(),1);assert_eq!(queued.writes[0]["type"],"user");
         assert_ne!(queued.writes[0]["uuid"],"exact-retry-command");
-        assert!(adapter.receive(late).unwrap().writes.is_empty());
-        let mut adapter=ready_adapter();begin(&mut adapter);
-        assert!(adapter.command(Command::SetModel{model:"unadvertised".into(),reasoning:None}).is_err());
-        assert!(adapter.maintenance_deadline().is_some());
-        let settled=adapter.maintenance().unwrap();assert!(settled.writes.is_empty());
-        assert!(settled.events.iter().any(|event|matches!(event,Event::Status{busy:false,..})));
     }
 }

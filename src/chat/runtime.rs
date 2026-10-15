@@ -2134,6 +2134,14 @@ impl Actor {
                 ),
                 _ => false,
             };
+            let restoring_original=self.state.lock().unwrap_or_else(|p|p.into_inner()).original_retry_pending;
+            if authorizes_work && restoring_original {
+                if let Some(cancelled) = self.adapter.cancel_original_restoration() {
+                    self.step(cancelled)?;
+                }
+                let _ = reply.send(Err("Retry was cancelled; wait for effective settings reconciliation before sending new work".into()));
+                continue;
+            }
             if authorizes_work
                 && let Some(context) = &self.launch_context
                 && let Err(error) = context.verify_directory(&self.working_directory)
@@ -2193,6 +2201,7 @@ impl Actor {
                     && state.turn_generation == *turn_generation
                     && state.session_id.as_deref() == Some(session_id.as_str())
                     && state.capabilities.original_retry
+                    && !state.original_retry_pending
                     && self.pending.is_empty()
                     && self.output.is_empty();
                 drop(state);
@@ -2263,7 +2272,7 @@ impl Actor {
                     let result = self.step(step);
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
-                    let started = starts_turn && result.is_ok();
+                    let started = starts_turn && !is_retry && result.is_ok();
                     if started {
                         self.apply(Event::Status {
                             busy: true,
@@ -2304,7 +2313,7 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
-        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
+        } else if state.original_retry_pending || state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
@@ -2754,6 +2763,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             | Event::SubagentItemsRemoved { .. }
     );
     match event {
+        Event::OriginalRetryState { pending, diagnostic } => {
+            state.original_retry_pending = pending;
+            state.original_retry_diagnostic = diagnostic;
+        }
         Event::OutputDelta { id, offset, delta } => {
             if let Some(&index) = indices.get(&id) {
                 let item = Arc::make_mut(&mut state.items[index]);
@@ -2807,6 +2820,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),
         Event::Reset { reason } => {
+            state.original_retry_pending = false;
+            state.original_retry_diagnostic = None;
             state.finished_at = None;
             state.turn_started_at = None;
             state.prompt_suggestion = None;
