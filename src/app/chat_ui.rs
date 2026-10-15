@@ -1003,6 +1003,7 @@ struct CachedItem {
     /// palette is the runtime's, applied when the block is highlighted, so a
     /// change of syntax theme rehighlights rather than restyles.
     blocks: HashMap<u64, prose::CodeBlock>,
+    palette_views:Option<prose::Palettes>,
     /// The key of the last fence the Markdown held when its blocks were last
     /// prepared. Only that fence can still be growing, and its key changes
     /// with every byte it gains, so this is how the next pass finds the block
@@ -1166,6 +1167,7 @@ impl CachedItem {
             markdown: markdown::Content::new(),
             flow_cache, reader_memory, reader_context,
             blocks: HashMap::new(),
+            palette_views:None,
             open: None,
             detail: None,
             stamp: None,
@@ -1250,11 +1252,10 @@ impl CachedItem {
     /// Parses the part of `body` not yet seen, `body` being what was parsed
     /// before with more appended, and `growing` whether more may follow.
     ///
-    /// `markdown::Content` re-parses only its trailing block, and the rewrite
-    /// the parser is given resumes from the last whole line, so a streamed
-    /// answer costs its new bytes per frame instead of its whole length. The
-    /// exception is text that turned out to be something else than it was
-    /// first handed over as, which is parsed again from the top.
+    /// The normalizer and parser preserve their trailing state. Plain tails
+    /// and open fences have incremental paths; unfinished rich paragraphs
+    /// can still require full trailing-block reparsing. Large changed prose
+    /// uses the background preparation engine rather than this UI helper.
     fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
         self.find_paint = None;
         match self.source.advance_append(body, growing) {
@@ -1292,6 +1293,7 @@ impl CachedItem {
     /// refresh usually prepares again, and it is continued from its last
     /// whole line rather than highlighted from its first.
     fn highlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        self.palette_views=None;
         let mut previous = std::mem::take(&mut self.blocks);
         let mut open = self.open.take();
         let mut blocks = HashMap::new();
@@ -2402,6 +2404,7 @@ impl Runtime {
                 // Keep logical text/selection while the new palette is
                 // prepared, without highlighting all historical fences here.
                 cached.blocks.clear();
+                cached.palette_views=None;
                 cached.open=None;
                 cached.preparing=true;
                 cached.revision=CachedItem::next_revision();

@@ -200,6 +200,7 @@ pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
     blocks: HashMap<u64, prose::CodeBlock>,
+    palettes:prose::Palettes,
     #[cfg(test)]
     syntax_work: (usize, usize),
     // Retain the source lease through queued output as well as execution.
@@ -213,7 +214,7 @@ impl Prepared {
     pub(super) fn item(&self) -> &Arc<chat::Item> { &self.request.item }
     pub(super) fn growing(&self) -> bool { self.request.growing }
     pub(super) fn discard(self) {
-        retire(Retired { _parsed:self.parsed,_blocks:self.blocks,_item:Some(self.request.item),
+        retire(Retired { _parsed:self.parsed,_blocks:self.blocks,_palettes:Some(self.palettes),_item:Some(self.request.item),
             _owner:self._owner,_permit:self._permit });
     }
     pub(super) fn install(self, cached: &mut CachedItem, managed: bool) {
@@ -225,6 +226,7 @@ impl Prepared {
                 markdown: std::mem::replace(&mut cached.markdown,self.parsed.markdown),
             },
             _blocks: std::mem::replace(&mut cached.blocks,self.blocks),
+            _palettes:std::mem::replace(&mut cached.palette_views,Some(self.palettes)),
             _item: cached.item.replace(self.request.item.clone()),
             _owner: self._owner,
             _permit: self._permit,
@@ -245,6 +247,7 @@ impl Prepared {
 struct Retired {
     _parsed: Parsed,
     _blocks: HashMap<u64,prose::CodeBlock>,
+    _palettes:Option<prose::Palettes>,
     _item: Option<Arc<chat::Item>>,
     _owner: Arc<Shared>,
     // Declared last so retirement completes before the next parser is admitted.
@@ -385,7 +388,8 @@ fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Resu
             *shared.canonical.lock().unwrap_or_else(|e| e.into_inner())=Some(canonical);
             (parsed,blocks)
         } else {(canonical.parsed,canonical.blocks)};
-        Ok(Prepared { request, parsed, blocks, #[cfg(test)] syntax_work, _owner: shared, _permit: permit })
+        let palettes=prose::palettes(&blocks);
+        Ok(Prepared { request, parsed, blocks, palettes, #[cfg(test)] syntax_work, _owner: shared, _permit: permit })
 }
 
 /// Rendering fixtures explicitly complete the production engine before
