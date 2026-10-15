@@ -1972,6 +1972,7 @@ impl Editor {
                 LspIntent::Change { version, text } => {
                     self.lsp_navigation.requests.remove(&id);
                     self.lsp_navigation.results.remove(&id);
+                    self.lsp_navigation.resolving.remove(&id);
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
                         self.lsp.change(doc, version, &[], &text);
                     }
@@ -1997,6 +1998,7 @@ impl Editor {
     fn close_document(&mut self, id: CardId) {
         self.lsp_navigation.requests.remove(&id);
         self.lsp_navigation.results.remove(&id);
+        self.lsp_navigation.resolving.remove(&id);
         if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
             self.lsp.close(doc);
         }

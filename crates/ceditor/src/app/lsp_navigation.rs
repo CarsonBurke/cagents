@@ -23,7 +23,7 @@ fn location_label_path(text: &str) -> String {
 pub enum Action {
     Select { card: CardId, request: LspRequestId, index: usize },
     Dismiss(CardId),
-    Resolved { card: CardId, request: LspRequestId, result: Result<Resolved, String> },
+    Resolved { card: CardId, request: LspRequestId, ticket: u64, result: Result<Resolved, String> },
 }
 
 #[derive(Debug, Clone)]
@@ -51,11 +51,13 @@ pub(super) struct State {
     pub(super) requests: HashMap<CardId, Origin>,
     pub(super) results: HashMap<CardId, Results>,
     jumps: HashMap<CardId, PendingJump>,
+    pub(super) resolving: HashMap<CardId, (LspRequestId, u64)>,
+    next_resolution: u64,
 }
 
 impl State {
     pub(super) fn remove_tab(&mut self, card: CardId) {
-        self.requests.remove(&card); self.results.remove(&card); self.jumps.remove(&card);
+        self.requests.remove(&card); self.results.remove(&card); self.jumps.remove(&card); self.resolving.remove(&card);
     }
 }
 
@@ -79,6 +81,7 @@ impl Editor {
         let Some(version) = self.lsp.document_version(doc) else { return Task::none(); };
         if let Some(old) = self.lsp_navigation.requests.remove(&card) { self.lsp.cancel(old.request); }
         self.lsp_navigation.results.remove(&card);
+        self.lsp_navigation.resolving.remove(&card);
         let request = match kind {
             LocationKind::Definition => self.lsp.request_definition(doc, at),
             LocationKind::References => self.lsp.request_references(doc, at),
@@ -115,6 +118,7 @@ impl Editor {
             Action::Dismiss(card) => {
                 if let Some(origin) = self.lsp_navigation.requests.remove(&card) { self.lsp.cancel(origin.request); }
                 self.lsp_navigation.results.remove(&card);
+                self.lsp_navigation.resolving.remove(&card);
                 Task::none()
             }
             Action::Select { card, request, index } => {
@@ -128,6 +132,9 @@ impl Editor {
                     LspTarget::External { path } => (path, true),
                     LspTarget::Uri { .. } => { self.notice = Some("This location is not a local file and cannot be opened as source.".into()); return Task::none(); }
                 };
+                self.lsp_navigation.next_resolution = self.lsp_navigation.next_resolution.wrapping_add(1).max(1);
+                let ticket = self.lsp_navigation.next_resolution;
+                self.lsp_navigation.resolving.insert(card, (request, ticket));
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         let path = path.canonicalize().map_err(|error| format!("Cannot open source: {error}"))?;
@@ -136,10 +143,12 @@ impl Editor {
                         let external = force_external || !path.starts_with(&root);
                         Ok(Resolved { path, external, at: item.range.start, coordinates: item.coordinates })
                     }).await.map_err(|error| error.to_string()).and_then(|result| result);
-                    Message::Navigation(Action::Resolved { card, request, result })
+                    Message::Navigation(Action::Resolved { card, request, ticket, result })
                 })
             }
-            Action::Resolved { card, request, result } => {
+            Action::Resolved { card, request, ticket, result } => {
+                if self.lsp_navigation.resolving.get(&card) != Some(&(request, ticket)) { return Task::none(); }
+                self.lsp_navigation.resolving.remove(&card);
                 let Some(results) = self.lsp_navigation.results.get(&card) else { return Task::none(); };
                 if results.origin.request != request || !self.navigation_origin_current(card, &results.origin) { return Task::none(); }
                 let resolved = match result { Ok(resolved) => resolved, Err(error) => { self.notice = Some(error); return Task::none(); } };
@@ -305,11 +314,29 @@ mod tests {
     }
 
     #[test]
+    fn an_older_resolution_cannot_consume_the_latest_explicit_choice() {
+        let mut app = editor();
+        let card = CardId::new();
+        let request = LspRequestId(17);
+        app.lsp_navigation.resolving.insert(card, (request, 2));
+        let stale = Action::Resolved { card, request, ticket: 1, result: Err("old choice failed".into()) };
+        drop(app.update_navigation(stale));
+        assert_eq!(app.lsp_navigation.resolving.get(&card), Some(&(request, 2)));
+        assert!(app.notice.is_none());
+        assert!(app.tabs.is_empty());
+        drop(app.update_navigation(Action::Dismiss(card)));
+        assert!(!app.lsp_navigation.resolving.contains_key(&card));
+        drop(app.update_navigation(Action::Resolved { card, request, ticket: 2, result: Err("dismissed choice failed".into()) }));
+        assert!(app.notice.is_none());
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
     fn dismissed_or_unowned_location_callbacks_cannot_open_tabs() {
         let mut app = editor();
         let card = CardId::new();
         let request = LspRequestId(17);
-        drop(app.update_navigation(Action::Resolved { card, request, result: Ok(Resolved { path: "/tmp/unrequested.rs".into(), external: true, at: LspPosition::new(0, 0), coordinates: LspCoordinates::Scalar }) }));
+        drop(app.update_navigation(Action::Resolved { card, request, ticket: 1, result: Ok(Resolved { path: "/tmp/unrequested.rs".into(), external: true, at: LspPosition::new(0, 0), coordinates: LspCoordinates::Scalar }) }));
         assert!(app.tabs.is_empty());
         let event = LspEvent::Locations { doc: LspDocumentId(3), request, kind: LocationKind::Definition, items: vec![] };
         assert!(app.navigation_event(&event).is_none());
