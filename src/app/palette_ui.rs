@@ -621,6 +621,23 @@ impl Cagents {
         crate::interaction::reveal_list_region(widget::Id::new("palette.commands"), top, ROW_HEIGHT)
     }
 
+    fn palette_pane_label(&self, card: &CardState) -> String {
+        let title = self.card_chrome.get(&card.id).map_or_else(|| self.card_display_title(card), |chrome| chrome.title.as_str());
+        if self.palette.panes_only { return title.to_owned(); }
+        let place = self.durable.channels.iter().find(|channel| channel.cards.contains(&card.id)).map(|channel| {
+            self.sidebar_model.project(channel.project_id).map_or_else(|| channel.title.clone(), |project| {
+                let branch = project.channels.iter().find(|row| row.id == channel.id).and_then(|row| row.worktree.as_ref()).map_or_else(String::new, |(_, branch)| format!(" · {branch}"));
+                format!("{}{} · {}", channel.title, branch, project.name)
+            })
+        }).or_else(|| self.card_worktree(card).map(|path| {
+            self.sidebar_model.worktree_at(path).and_then(|key| self.sidebar_model.project(key.project_id).map(|project| {
+                let name = project.worktrees.iter().find(|worktree| worktree.id == key.worktree_id).map_or_else(|| path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned(), |worktree| worktree.label().to_owned());
+                format!("{name} · {}", project.name)
+            })).unwrap_or_else(|| path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned())
+        })).unwrap_or_else(|| "Global".into());
+        format!("Focus pane: {title} · {place}")
+    }
+
     fn pane_attention_label(&self, card: CardId) -> &'static str {
         use sidebar::AttentionState;
         let unread = self.sidebar_state.has_card_update(card);
@@ -671,7 +688,7 @@ impl Cagents {
         } else { Vec::new() };
         for id in &attention {
             if let Some(card) = self.card_state(*id).filter(|card| card.existence.is_open()) {
-                entries.push((format!("Focus pane: {}", self.card_display_title(card)), self.pane_attention_label(*id).to_owned(), Message::FocusAttention(*id)));
+                entries.push((self.palette_pane_label(card), self.pane_attention_label(*id).to_owned(), Message::FocusAttention(*id)));
             }
         }
         let current_order: HashMap<_, _> = self
@@ -686,29 +703,9 @@ impl Cagents {
                 && !attention.contains(&card.id)
                 && (!self.palette.panes_only || current_order.contains_key(&card.id))
         }) {
-            let place = self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.cards.contains(&card.id))
-                .map(|channel| channel.title.clone())
-                .or_else(|| {
-                    self.card_worktree(card).map(|path| {
-                        path.file_name()
-                            .unwrap_or(path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-                })
-                .unwrap_or_else(|| "Global".into());
             let status = self.pane_attention_label(card.id);
-            let title = self.card_chrome.get(&card.id).map_or_else(|| self.card_display_title(card), |chrome| chrome.title.as_str());
             entries.push((
-                if self.palette.panes_only {
-                    title.to_owned()
-                } else {
-                    format!("Focus pane: {title} · {place}")
-                },
+                self.palette_pane_label(card),
                 status.into(),
                 Message::Palette(Action::FocusPane(card.id)),
             ));
@@ -2003,6 +2000,10 @@ mod tests {
             .card_scopes
             .insert(other.id, path.clone());
         Arc::make_mut(&mut app.durable).cards.push(other.clone());
+        app.sidebar_state.observe_agent_update(other.id, ProjectId::new(), crate::model::WorktreeId::new());
+        drop(app.update_palette(Action::Open));
+        let attention = app.palette_entries().into_iter().find(|entry| matches!(entry.2, Message::FocusAttention(id) if id == other.id)).expect("inactive attention pane is reachable");
+        assert!(attention.0.contains("palette-inactive-worktree"), "attention rows retain workspace attribution");
         let _ = app.update_palette(Action::Open);
         let _ = app.update_palette(Action::Query("@migration".into()));
         let entries = app.palette_entries();
