@@ -151,12 +151,8 @@ impl Builder {
             let mut key = path.to_vec();
             key.push(index as u32);
             match node {
-                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => {
-                    self.plain(item, &key, text.plain())
-                }
-                markdown::Item::CodeBlock { code, .. } => {
-                    self.plain(item, &key, Arc::from(code.as_str()))
-                }
+                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => self.plain(item, &key, text.plain()),
+                markdown::Item::CodeBlock { source, .. } => self.plain(item, &key, source.clone()),
                 markdown::Item::Quote(items) => self.markdown(item, &key, items),
                 markdown::Item::List { start, bullets } => {
                     for (index, bullet) in bullets.iter().enumerate() {
