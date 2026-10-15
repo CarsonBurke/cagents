@@ -1185,7 +1185,7 @@ mod tests {
         // Explicit user resolution moves the retained original out. Retry then
         // cleans the exact original holding under the retained parent, never B.
         fs::rename(
-            parked.join(holding_name).join("previous"),
+            held_path.join("previous"),
             parked.join("recovered-original"),
         )
         .unwrap();
@@ -1227,6 +1227,47 @@ mod tests {
             b"late"
         );
         assert!(!authority.is_resolved());
+    }
+
+    #[test]
+    fn save_acquisition_refuses_actual_holding_moved_into_source_before_acquisition() {
+        let (directory, root) = fixture();
+        let moved = directory.path().join("moved-private");
+        let mut original = None;
+        let error = hook_save(&root, || {
+            let outside = holding(directory.path());
+            original = Some(outside.clone());
+            fs::rename(&outside, &moved)?;
+            fs::create_dir(&outside)?;
+            fs::write(outside.join("foreign"), b"preserve")
+        }, false).unwrap_err();
+        assert!(error.recovery_authority().is_some());
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
+        assert!(!moved.join("previous").exists(), "refusal must precede public source acquisition");
+        assert!(error.recovery_authority().unwrap().retry().is_err());
+        let original = original.unwrap();
+        let foreign = original.with_extension("foreign");
+        fs::rename(&original, &foreign).unwrap();
+        fs::rename(&moved, &original).unwrap();
+        // Explicit fixture/user resolution of our retained private replacement.
+        for entry in fs::read_dir(&original).unwrap() { fs::remove_file(entry.unwrap().path()).unwrap(); }
+        error.recovery_authority().unwrap().retry().unwrap();
+        assert_eq!(fs::read(foreign.join("foreign")).unwrap(), b"preserve");
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
+    }
+
+    #[test]
+    fn save_acquisition_removed_holding_retry_only_syncs_retained_parents() {
+        let (_directory, root) = fixture();
+        let context = fixture_context(&root);
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let mut holding = Holding::create(&root, &source, &context).unwrap();
+        holding.publication.cleanup_empty().unwrap();
+        assert!(holding.publication.is_removed());
+        assert_eq!(holding.root.metadata().unwrap().nlink(), 0);
+        // Model a failed parent fsync after known removal: an unlinked inode
+        // must not strand the retained sync retry by demanding live ancestry.
+        holding.retry_cleanup().unwrap();
     }
 
     #[test]
