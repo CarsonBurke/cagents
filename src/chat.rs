@@ -265,7 +265,7 @@ impl Launch {
         }
         self.provider.append_resume(&mut arguments, id.into());
         recipe.arguments = arguments;
-        crate::model::agent_recovery::resume_recipe(&recipe)
+        crate::model::agent_recovery::resume_recipe_for_provider(&recipe, self.provider)
     }
 }
 
@@ -2157,6 +2157,23 @@ mod tests {
             delivery_heading(Notice, "", "", ""),
             "Background work changed state"
         );
+    }
+
+    #[test]
+    fn terminal_handoff_keeps_configured_wrapper_and_exact_provider_identity() {
+        let launch = Launch {
+            provider: Provider::Claude,
+            recipe: LaunchRecipe {
+                program: "/home/example/bin/claude-wrapper".into(),
+                arguments: vec!["--model".into(), "fixture-model".into()],
+                working_directory: "/project".into(), environment: Default::default(), unset_environment: Default::default(),
+            },
+            session_id: Some("d1714898-6c54-4727-8113-0d5b9db7aeb9".into()),
+        };
+        let recipe = launch.terminal_recipe().expect("typed native provider supports its configured wrapper");
+        assert_eq!(recipe.program, launch.recipe.program);
+        assert_eq!(recipe.arguments, ["--model", "fixture-model", "--resume", "d1714898-6c54-4727-8113-0d5b9db7aeb9"]);
+        assert!(crate::model::agent_recovery::resume_recipe(&recipe).is_none(), "untyped arbitrary commands must remain unrecognized");
     }
 
     #[test]

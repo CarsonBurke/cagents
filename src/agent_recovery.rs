@@ -41,6 +41,13 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
     interactive_recipe(launch, Selector::Exact)
 }
 
+/// A native conversation already records its provider independently of its
+/// executable. Keep a configured wrapper's name without inferring providers
+/// from arbitrary shell commands. The same conservative argv policy applies.
+pub(crate) fn resume_recipe_for_provider(launch: &LaunchRecipe, provider: Provider) -> Option<LaunchRecipe> {
+    interactive_recipe_for_provider(launch, Selector::Exact, provider)
+}
+
 /// Start an independent conversation with the same supported configuration,
 /// never a second writer to the source conversation or a replayed prompt.
 pub fn fresh_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
@@ -88,7 +95,10 @@ enum Selector {
 }
 
 fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<LaunchRecipe> {
-    let provider = Provider::from_program(&launch.program)?;
+    interactive_recipe_for_provider(launch, selector, Provider::from_program(&launch.program)?)
+}
+
+fn interactive_recipe_for_provider(launch: &LaunchRecipe, selector: Selector, provider: Provider) -> Option<LaunchRecipe> {
     if launch.arguments.len() > 128
         || launch.arguments.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
     {
