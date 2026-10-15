@@ -41,11 +41,43 @@ pub(super) fn reserve() -> Result<Reservation, String> {
         .map_err(|_| "Terminal cleanup capacity is full; wait for retained workers to finish before starting another terminal".to_owned())?;
     Ok(Reservation { _private: () })
 }
-static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Job>, String>> = OnceLock::new();
+struct Service {
+    joins: crossbeam_channel::Sender<Job>,
+    deadlines: crossbeam_channel::Sender<Arc<PublishedState>>,
+}
+static SERVICE: OnceLock<Result<Service, String>> = OnceLock::new();
 
-fn service() -> Result<&'static crossbeam_channel::Sender<Job>, String> {
+fn service() -> Result<&'static Service, String> {
     SERVICE.get_or_init(|| {
         let (sender, receiver) = crossbeam_channel::bounded::<Job>(capacity());
+        let (deadlines, pending) = crossbeam_channel::bounded::<Arc<PublishedState>>(capacity());
+        // Actual pthread joins can remain blocked in TLS destruction. One
+        // independent supervisor owns escalation for active AND queued jobs,
+        // so neither a deadline caller nor final Drop must wait for a join.
+        thread::Builder::new().name("terminal-join-deadlines".into()).spawn(move || {
+            let mut active: Vec<Arc<PublishedState>> = Vec::with_capacity(capacity());
+            loop {
+                match pending.recv_timeout(Duration::from_millis(5)) {
+                    Ok(owner) => active.push(owner),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {},
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) if active.is_empty() => return,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => thread::sleep(Duration::from_millis(5)),
+                }
+                active.extend(pending.try_iter());
+                active.retain(|owner| {
+                    if matches!(owner.worker_join.load(Ordering::Acquire), 2 | 3) { return false; }
+                    if owner.join_escalation_at.get().is_some_and(|deadline| Instant::now() >= *deadline) {
+                        // Handoff and deadline signaling share input ownership
+                        // admission: a successor's root must never be killed.
+                        if !escalate_owned_root(owner) { return true; }
+                        // The actual-join job continues retaining the exact
+                        // slot, original pidfd and reservation after signaling.
+                        return false;
+                    }
+                    true
+                });
+            }
+        }).map_err(|error| format!("Terminal deadline service unavailable: {error}"))?;
         for index in 0..WORKERS {
             let receiver = receiver.clone();
             thread::Builder::new().name(format!("terminal-join-{index}")).spawn(move || {
@@ -59,7 +91,7 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Job>, String> {
                 }
             }).map_err(|error| format!("Terminal join service unavailable: {error}"))?;
         }
-        Ok(sender)
+        Ok(Service { joins: sender, deadlines })
     }).as_ref().map_err(Clone::clone)
 }
 
@@ -69,14 +101,22 @@ pub(super) fn initialize() -> Result<(), String> { service().map(|_| ()) }
 /// task retains that slot and pidfd beyond the caller's deadline. Concurrent
 /// callers report pending rather than waiting behind the first caller's join.
 pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, deadline: Instant, escalate: bool, wait: bool) -> bool {
+    if escalate { let _ = published.join_escalation_at.set(deadline); }
     match published.worker_join.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {},
         Err(2) => return true,
         Err(_) => return false,
     }
-    let queued = service().and_then(|sender| sender.try_send(Job {
-        worker: Arc::clone(worker), published: Arc::clone(published),
-    }).map_err(|_| "Terminal join capacity is busy; its exact worker remains retained".to_owned()));
+    let queued = service().and_then(|service| {
+        service.joins.try_send(Job {
+            worker: Arc::clone(worker), published: Arc::clone(published),
+        }).map_err(|_| "Terminal join capacity is busy; its exact worker remains retained".to_owned())?;
+        // Each reserved worker admits only one join job. Queue plus active
+        // tickets cannot exceed reservations, so this has a reserved slot too.
+        service.deadlines.try_send(Arc::clone(published))
+            .expect("a reserved terminal join must retain its escalation owner");
+        Ok(())
+    });
     if let Err(error) = queued {
         published.worker_join.store(0, Ordering::Release);
         tracing::warn!(%error);
@@ -90,12 +130,24 @@ pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, d
             _ => {},
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            if escalate && let Some(pidfd) = published.shutdown_pidfd.get() {
-                let _ = close_processes::signal(pidfd, libc::SIGKILL);
-            }
+            if escalate { let _ = escalate_owned_root(published); }
             tracing::error!(escalate, timeout_seconds = WORKER_JOIN_TIMEOUT.as_secs(), "Terminal worker join remains pending; its exact owner is retained");
             return false;
         };
         thread::sleep(remaining.min(Duration::from_millis(5)));
     }
+}
+
+// A contended ownership fence keeps the supervisor ticket alive for retry.
+// Known handoff disarms escalation without inventing actual join completion.
+fn escalate_owned_root(published: &PublishedState) -> bool {
+    let order = match published.input_order.try_lock() {
+        Ok(order) => order,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    if !order.handoff && let Some(pidfd) = published.shutdown_pidfd.get() {
+        let _ = close_processes::signal(pidfd, libc::SIGKILL);
+    }
+    true
 }
