@@ -1380,12 +1380,10 @@ mod tests {
                 },
             },
         );
-        let mut state = State {
-            target: Some(target.clone()),
-            generation: 9,
-            loaded: true,
-            ..State::default()
-        };
+        let mut state = State::default();
+        state.target = Some(target.clone());
+        state.generation = 9;
+        state.loaded = true;
         drop(state.update(Action::Refresh));
         assert!(!state.loading);
         assert!(state.loaded);
@@ -1412,11 +1410,9 @@ mod tests {
         );
         app.context_inspector_open = true;
         app.context_tab = ContextTab::PullRequest;
-        app.pull_request_inspector = State {
-            target: Some(target),
-            generation: 5,
-            ..State::default()
-        };
+        app.pull_request_inspector = State::default();
+        app.pull_request_inspector.target = Some(target);
+        app.pull_request_inspector.generation = 5;
         drop(app.maybe_refresh_pull_request());
         assert!(!app.pull_request_inspector.loading);
         assert_eq!(app.pull_request_inspector.generation, 5);
