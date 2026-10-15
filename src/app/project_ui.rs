@@ -375,6 +375,14 @@ impl Cagents {
                 });
                 let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).ok()?;
                 let crate::device_service::Reply::MergedWorktreeRemoved(Ok(removed)) = reply else { return None; };
+                // The default local context can become a selected device
+                // while the RPC is pending. A remote reply cannot retire
+                // the original local window's creation metadata.
+                let retirements = if crate::device::selected().is_none() {
+                    retirements
+                } else {
+                    retirements.map(|_| Err("Worktree was removed, but local creation metadata was retained because the device context changed or is remote".to_owned()))
+                };
                 if let Some(Err(errors)) = retirements.map(|captured| captured
                     .map_err(|error| vec![error])
                     .and_then(|capture| capture.finish(&removed)
@@ -1519,6 +1527,11 @@ impl Cagents {
                         store, &request.repository, &request.path, &CancellationToken::new())
                 });
                 let removed = delete_worktree(&request)?;
+                let retirements = if crate::device::selected().is_none() {
+                    retirements
+                } else {
+                    retirements.map(|_| Err("Worktree was removed, but local creation metadata was retained because the device context changed or is remote".to_owned()))
+                };
                 if let Some(removed) = removed
                     && let Some(Err(errors)) = retirements.map(|captured| captured
                         .map_err(|error| vec![error])
