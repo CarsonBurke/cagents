@@ -309,12 +309,17 @@ fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
-pub(super) fn try_scoped_control_write(gate: &RwLock<()>) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ProtocolError> {
+pub(super) fn try_scoped_control_write(
+    gate: &RwLock<()>,
+) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ProtocolError> {
     match gate.try_write() {
         Ok(guard) => Ok(guard),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(ProtocolErrorCode::Internal,
-            "The daemon is finishing another operation. Wait for it and retry.", true)),
+        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "The daemon is finishing another operation. Wait for it and retry.",
+            true,
+        )),
     }
 }
 
@@ -394,7 +399,10 @@ pub(super) fn process_request(
     }
     // Install only the physical token under a short writer. Provider and
     // registry work runs outside global admission while related starts refuse.
-    if let ClientRequest::DeviceOperation { operation: crate::device_service::Operation::AccountLifecycle { operation } } = &request {
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountLifecycle { operation },
+    } = &request
+    {
         {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
@@ -402,8 +410,16 @@ pub(super) fn process_request(
         }
         let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
         let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
-            .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
-        return Ok((ServerResponse::DeviceOperation { reply: crate::device_service::Reply::AccountLifecycle(value) }, Vec::new(), false));
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountLifecycle(value),
+            },
+            Vec::new(),
+            false,
+        ));
     }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
@@ -428,18 +444,41 @@ pub(super) fn process_request(
     match request {
         ClientRequest::DeviceOperation { operation } => {
             match &operation {
-                crate::device_service::Operation::AccountLifecycle { .. } => return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest, "Account operations require daemon admission", false)),
+                crate::device_service::Operation::AccountLifecycle { .. } => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Account operations require daemon admission",
+                        false,
+                    ));
+                }
                 crate::device_service::Operation::Skills { launch } => {
-                    super::account_lifecycle::ensure_launch(host, &launch.recipe.working_directory,
-                        &launch.recipe.environment, &Default::default(), true)?;
-                    super::account_lifecycle::ensure_launch(host, &launch.recipe.working_directory,
-                        &launch.recipe.environment, &crate::account::launch_credential_overrides(&launch.recipe), true)?;
+                    super::account_lifecycle::ensure_launch(
+                        host,
+                        &launch.recipe.working_directory,
+                        &launch.recipe.environment,
+                        &Default::default(),
+                        true,
+                    )?;
+                    super::account_lifecycle::ensure_launch(
+                        host,
+                        &launch.recipe.working_directory,
+                        &launch.recipe.environment,
+                        &crate::account::launch_credential_overrides(&launch.recipe),
+                        true,
+                    )?;
                 }
                 crate::device_service::Operation::AccountsUpdate { registry, .. } => {
-                    let proposed = serde_json::from_value(registry.clone()).map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, format!("Invalid account preferences: {error}"), false))?;
+                    let proposed = serde_json::from_value(registry.clone()).map_err(|error| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            format!("Invalid account preferences: {error}"),
+                            false,
+                        )
+                    })?;
                     super::account_lifecycle::ensure_update(host, &proposed)?;
                 }
-                crate::device_service::Operation::AccountLogin { account } | crate::device_service::Operation::AccountProbe { account, .. } => {
+                crate::device_service::Operation::AccountLogin { account }
+                | crate::device_service::Operation::AccountProbe { account, .. } => {
                     super::account_lifecycle::ensure_paths(host, account.resolved_home())?;
                 }
                 _ => {}
@@ -1254,7 +1293,9 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
-        if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() { continue; }
+        if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
+            continue;
+        }
         let (terminal, events) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {

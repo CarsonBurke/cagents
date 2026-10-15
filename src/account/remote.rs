@@ -58,11 +58,20 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
                 homes.path(*provider, *key),
             )))
         }
-        Operation::Link { provider, key, path } => {
+        Operation::Link {
+            provider,
+            key,
+            path,
+        } => {
             let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?).join(relative)
-            } else { std::path::PathBuf::from(path.trim()) };
-            if !chosen.is_absolute() { return Err("Enter an absolute account home path".into()); }
+                std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?)
+                    .join(relative)
+            } else {
+                std::path::PathBuf::from(path.trim())
+            };
+            if !chosen.is_absolute() {
+                return Err("Enter an absolute account home path".into());
+            }
             // Keep the user's ORIGINAL operand. Home capture resolves and pins
             // it while retaining this spelling for every later revalidation.
             Ok(Some(Account::linked(*provider, *key, chosen)))
@@ -80,8 +89,13 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
 
 #[cfg(feature = "host")]
 pub(crate) fn affected_accounts(operation: &Operation) -> Result<Vec<super::Account>, String> {
-    let provider = match operation { Operation::Create { provider, .. } | Operation::Link { provider, .. }
-        | Operation::Register { provider, .. } | Operation::Abandon { provider, .. } => Some(provider), _ => None };
+    let provider = match operation {
+        Operation::Create { provider, .. }
+        | Operation::Link { provider, .. }
+        | Operation::Register { provider, .. }
+        | Operation::Abandon { provider, .. } => Some(provider),
+        _ => None,
+    };
     if provider.is_some_and(|provider| !super::Account::PROVIDERS.contains(provider)) {
         return Err("Omp manages its own logins".into());
     }
@@ -90,7 +104,9 @@ pub(crate) fn affected_accounts(operation: &Operation) -> Result<Vec<super::Acco
     // identity. Reserve both before either probe; an idempotent completed
     // registration has no probe and therefore needs no System reservation.
     if let Operation::Register { provider, .. } = operation {
-        if !accounts.is_empty() { accounts.push(super::Account::system(*provider)); }
+        if !accounts.is_empty() {
+            accounts.push(super::Account::system(*provider));
+        }
     }
     Ok(accounts)
 }
@@ -125,7 +141,10 @@ pub(crate) fn execute(_operation: Operation) -> Result<serde_json::Value, String
 
 /// The opaque host reservation remains borrowed throughout provider I/O.
 #[cfg(feature = "host")]
-pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::AccountReservation) -> Result<serde_json::Value, String> {
+pub(crate) fn execute_reserved(
+    operation: Operation,
+    reservation: &crate::host::AccountReservation,
+) -> Result<serde_json::Value, String> {
     use super::{home::Homes, registry::Store};
     let homes = Homes::installation().ok_or("The device has no account data directory")?;
     let store = Store::installation().ok_or("The device has no account registry")?;
@@ -133,9 +152,18 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
 }
 
 #[cfg(feature = "host")]
-fn execute_at(operation: Operation, reservation: &crate::host::AccountReservation,
-    homes: super::home::Homes, store: super::registry::Store) -> Result<serde_json::Value, String> {
-    use super::{Account, UsageStatus, home::CodexConfig, probe::{self, Outcome}, registry::Registered};
+fn execute_at(
+    operation: Operation,
+    reservation: &crate::host::AccountReservation,
+    homes: super::home::Homes,
+    store: super::registry::Store,
+) -> Result<serde_json::Value, String> {
+    use super::{
+        Account, UsageStatus,
+        home::CodexConfig,
+        probe::{self, Outcome},
+        registry::Registered,
+    };
     let now = crate::chat::now_ms().unwrap_or_default();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -154,10 +182,11 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
             let program = probe::find_executable(provider.executable(), search.as_deref())
                 .ok_or("The provider CLI is not installed on this device")?;
             let system = Account::system(provider).resolved_home();
-            let (key, home) = reservation.commit(|| store
-                .try_create_pending_reserved(reservation, &homes, provider, now, || {
+            let (key, home) = reservation.commit(|| {
+                store.try_create_pending_reserved(reservation, &homes, provider, now, || {
                     reservation.create_home(
-                        &homes, provider,
+                        &homes,
+                        provider,
                         system.as_deref(),
                         if copy_codex_config {
                             CodexConfig::Copy
@@ -165,12 +194,16 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
                             CodexConfig::Shared
                         },
                     )
-                }))?;
+                })
+            })?;
             let account = Account::managed(provider, key, home.clone());
             let recipe = match login_recipe(&account, program) {
                 Ok(recipe) => recipe,
                 Err(error) => {
-                    return Err(format!("{error}; the new account home and pending registration were retained at {}. Retry sign-in after fixing the launch configuration.", home.display()));
+                    return Err(format!(
+                        "{error}; the new account home and pending registration were retained at {}. Retry sign-in after fixing the launch configuration.",
+                        home.display()
+                    ));
                 }
             };
             serde_json::to_value(Created { key, home, recipe }).map_err(|error| error.to_string())
@@ -200,7 +233,9 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
             let system = Account::system(provider).resolved_home();
             let (registry, result) = reservation.commit(|| {
                 let _lifecycle = homes.try_lifecycle_lock()?;
-                store.try_update_reserved(reservation, |registry| registry.link(provider, key, path, system.as_deref(), Some(&homes), now))
+                store.try_update_reserved(reservation, |registry| {
+                    registry.link(provider, key, path, system.as_deref(), Some(&homes), now)
+                })
             })?;
             let key = result?;
             serde_json::to_value((registry, key)).map_err(|error| error.to_string())
@@ -243,7 +278,9 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
-                let (registry, ()) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.abandon(key)))?;
+                let (registry, ()) = reservation.commit(|| {
+                    store.try_update_reserved(reservation, |registry| registry.abandon(key))
+                })?;
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
             }
@@ -275,7 +312,9 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
                     .and_then(|identity| identity.organization.clone()),
                 added_at: now,
             };
-            let (registry, registered) = reservation.commit(|| store.try_register_pending_reserved(reservation, &homes, managed, &system_identity))?;
+            let (registry, registered) = reservation.commit(|| {
+                store.try_register_pending_reserved(reservation, &homes, managed, &system_identity)
+            })?;
             let settled = match registered {
                 Ok(()) => Settled::Registered {
                     registry,
@@ -283,7 +322,9 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
                     snapshot: Some(snapshot),
                 },
                 Err(existing) => {
-                    let (registry, ()) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.abandon(key)))?;
+                    let (registry, ()) = reservation.commit(|| {
+                        store.try_update_reserved(reservation, |registry| registry.abandon(key))
+                    })?;
                     Settled::Duplicate {
                         existing,
                         registry: Some(registry),
@@ -301,7 +342,9 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
             {
                 return Err("This pending sign-in changed on the device".into());
             }
-            let (registry, ()) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.abandon(key)))?;
+            let (registry, ()) = reservation.commit(|| {
+                store.try_update_reserved(reservation, |registry| registry.abandon(key))
+            })?;
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
         }
@@ -316,8 +359,12 @@ fn execute_at(operation: Operation, reservation: &crate::host::AccountReservatio
                 .registry_key()
                 .ok_or("System accounts cannot be removed")?;
             let (registry, error) = if account.is_linked() {
-                let (registry, removed) = reservation.commit(|| store.try_update_reserved(reservation, |registry| registry.unregister(key)))?;
-                removed.ok_or("The linked account registration changed before it could be forgotten")?;
+                let (registry, removed) = reservation.commit(|| {
+                    store.try_update_reserved(reservation, |registry| registry.unregister(key))
+                })?;
+                removed.ok_or(
+                    "The linked account registration changed before it could be forgotten",
+                )?;
                 (registry, None::<String>)
             } else {
                 return Err("File deletion is not available in this build. Your account and its files were kept.".into());
@@ -364,7 +411,14 @@ fn login_recipe(
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
-    use crate::{account::{Account, home::Homes, registry::{Store, Registered}}, agent::Provider};
+    use crate::{
+        account::{
+            Account,
+            home::Homes,
+            registry::{Registered, Store},
+        },
+        agent::Provider,
+    };
     use std::os::unix::fs::MetadataExt;
 
     #[test]
@@ -372,43 +426,161 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
         let store = Store::at(root.path().join("registry"));
-        let system = root.path().join("system"); std::fs::create_dir(&system).unwrap();
+        let system = root.path().join("system");
+        std::fs::create_dir(&system).unwrap();
         let credential_file = ["auth", ".json"].concat();
         std::fs::write(system.join(&credential_file), b"synthetic-private-login").unwrap();
-        let (key, home) = store.create_pending(&homes, Provider::Codex, 1, || homes.create(Provider::Codex, Some(&system))).unwrap();
-        let recipe = login_recipe(&Account::managed(Provider::Codex,key,home.clone()), "/bin/false".into()).unwrap();
+        let (key, home) = store
+            .create_pending(&homes, Provider::Codex, 1, || {
+                homes.create(Provider::Codex, Some(&system))
+            })
+            .unwrap();
+        let recipe = login_recipe(
+            &Account::managed(Provider::Codex, key, home.clone()),
+            "/bin/false".into(),
+        )
+        .unwrap();
         assert_eq!(recipe.arguments, ["login", "--device-auth"]);
-        assert_eq!(recipe.environment.get("CODEX_HOME"), Some(&home.display().to_string()));
+        assert_eq!(
+            recipe.environment.get("CODEX_HOME"),
+            Some(&home.display().to_string())
+        );
         assert!(!home.join(&credential_file).exists());
-        let value=serde_json::to_string(&Created {key,home:home.clone(),recipe}).unwrap();
+        let value = serde_json::to_string(&Created {
+            key,
+            home: home.clone(),
+            recipe,
+        })
+        .unwrap();
         assert!(!value.contains("synthetic-private-login"));
         std::fs::write(home.join("provider-payload"), b"keep managed history").unwrap();
-        store.update(|registry| registry.register(Registered {key,provider:Provider::Codex,linked_home:None,label:None,email:None,organization:None,added_at:1}, &[])).unwrap().1.unwrap();
-        let account = Account::managed(Provider::Codex,key,home.clone());
+        store
+            .update(|registry| {
+                registry.register(
+                    Registered {
+                        key,
+                        provider: Provider::Codex,
+                        linked_home: None,
+                        label: None,
+                        email: None,
+                        organization: None,
+                        added_at: 1,
+                    },
+                    &[],
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
+        let account = Account::managed(Provider::Codex, key, home.clone());
         let host = crate::host::AccountReservation::test_host();
-        let reservation = crate::host::AccountReservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
-        let settled: Settled=serde_json::from_value(execute_at(Operation::Register {provider:Provider::Codex,key},&reservation,homes.clone(),store.clone()).unwrap()).unwrap();
-        assert!(matches!(settled,Settled::Registered {..}));
-        let before = store.load().unwrap(); let inode = home.metadata().unwrap().ino();
-        let error = execute_at(Operation::Remove {id:account.id()}, &reservation, homes.clone(), store.clone()).unwrap_err();
+        let reservation = crate::host::AccountReservation::test_install(
+            &host,
+            &[account.clone()],
+            store.clone(),
+            &homes,
+        )
+        .unwrap();
+        let settled: Settled = serde_json::from_value(
+            execute_at(
+                Operation::Register {
+                    provider: Provider::Codex,
+                    key,
+                },
+                &reservation,
+                homes.clone(),
+                store.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(settled, Settled::Registered { .. }));
+        let before = store.load().unwrap();
+        let inode = home.metadata().unwrap().ino();
+        let error = execute_at(
+            Operation::Remove { id: account.id() },
+            &reservation,
+            homes.clone(),
+            store.clone(),
+        )
+        .unwrap_err();
         assert!(error.contains("Your account and its files were kept"));
-        assert_eq!(before,store.load().unwrap()); assert_eq!(inode,home.metadata().unwrap().ino());
-        assert_eq!(std::fs::read(home.join("provider-payload")).unwrap(), b"keep managed history");
+        assert_eq!(before, store.load().unwrap());
+        assert_eq!(inode, home.metadata().unwrap().ino());
+        assert_eq!(
+            std::fs::read(home.join("provider-payload")).unwrap(),
+            b"keep managed history"
+        );
         drop(reservation);
-        let (pending_key,pending_home)=store.create_pending(&homes,Provider::Codex,2,||homes.create(Provider::Codex,None)).unwrap();
-        let pending=Account::managed(Provider::Codex,pending_key,pending_home.clone());
-        let pending_reservation=crate::host::AccountReservation::test_install(&host,&[pending],store.clone(),&homes).unwrap();
-        execute_at(Operation::Abandon {provider:Provider::Codex,key:pending_key},&pending_reservation,homes.clone(),store.clone()).unwrap();
-        assert!(pending_home.is_dir(),"abandoned sign-in metadata grants no file deletion proof");
-        assert!(store.load().unwrap().pending().iter().all(|pending|pending.key!=pending_key));
+        let (pending_key, pending_home) = store
+            .create_pending(&homes, Provider::Codex, 2, || {
+                homes.create(Provider::Codex, None)
+            })
+            .unwrap();
+        let pending = Account::managed(Provider::Codex, pending_key, pending_home.clone());
+        let pending_reservation =
+            crate::host::AccountReservation::test_install(&host, &[pending], store.clone(), &homes)
+                .unwrap();
+        execute_at(
+            Operation::Abandon {
+                provider: Provider::Codex,
+                key: pending_key,
+            },
+            &pending_reservation,
+            homes.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        assert!(
+            pending_home.is_dir(),
+            "abandoned sign-in metadata grants no file deletion proof"
+        );
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .pending()
+                .iter()
+                .all(|pending| pending.key != pending_key)
+        );
         drop(pending_reservation);
-        let linked = root.path().join("linked"); std::fs::create_dir(&linked).unwrap();
-        std::fs::write(linked.join("history"),b"keep linked history").unwrap(); let linked_key=uuid::Uuid::new_v4();
-        store.update(|registry| registry.link(Provider::Codex, linked_key, linked.clone(), None, Some(&homes), 1)).unwrap().1.unwrap();
-        let account=Account::linked(Provider::Codex,linked_key,linked.clone());
-        let reservation=crate::host::AccountReservation::test_install(&host,&[account.clone()],store.clone(),&homes).unwrap();
-        execute_at(Operation::Remove {id:account.id()},&reservation,homes,store.clone()).unwrap();
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(linked.join("history"), b"keep linked history").unwrap();
+        let linked_key = uuid::Uuid::new_v4();
+        store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    linked_key,
+                    linked.clone(),
+                    None,
+                    Some(&homes),
+                    1,
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
+        let account = Account::linked(Provider::Codex, linked_key, linked.clone());
+        let reservation = crate::host::AccountReservation::test_install(
+            &host,
+            &[account.clone()],
+            store.clone(),
+            &homes,
+        )
+        .unwrap();
+        execute_at(
+            Operation::Remove { id: account.id() },
+            &reservation,
+            homes,
+            store.clone(),
+        )
+        .unwrap();
         assert!(store.load().unwrap().find(linked_key).is_none());
-        assert_eq!(std::fs::read(linked.join("history")).unwrap(),b"keep linked history");
+        assert_eq!(
+            std::fs::read(linked.join("history")).unwrap(),
+            b"keep linked history"
+        );
     }
 }

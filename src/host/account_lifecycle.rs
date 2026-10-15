@@ -15,7 +15,10 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -31,9 +34,12 @@ pub(super) type Reservations = Arc<Mutex<Map>>;
 /// the same operation token. A newly enrolled inode must never hide behind an
 /// unchanged token-only CAS.
 fn same_basis(observed: &Map, current: &Map) -> bool {
-    observed.len() == current.len() && observed.iter().all(|(token, scope)| {
-        current.get(token).is_some_and(|current| Arc::ptr_eq(scope, current))
-    })
+    observed.len() == current.len()
+        && observed.iter().all(|(token, scope)| {
+            current
+                .get(token)
+                .is_some_and(|current| Arc::ptr_eq(scope, current))
+        })
 }
 
 #[derive(Clone)]
@@ -64,7 +70,11 @@ impl Home {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(format!("Cannot reserve account home: {error}")),
         };
-        let identity = pin.as_ref().map(|pin| pin.metadata()).transpose().map_err(|e| e.to_string())?
+        let identity = pin
+            .as_ref()
+            .map(|pin| pin.metadata())
+            .transpose()
+            .map_err(|e| e.to_string())?
             .map(|metadata| (metadata.dev(), metadata.ino()));
         let ancestors = physical_ancestors(&canonical, pin.as_deref())?;
         let home = Self {
@@ -97,8 +107,11 @@ impl Home {
         if let Some(pin) = &self.pin {
             // Once cleanup unlinks this exact root, it has no current
             // descendants; retain the original lexical guard until Drop.
-            if pin.metadata().map_err(|error| error.to_string())?.nlink() == 0 { return Ok(()); }
-            self.ancestors.extend(physical_ancestors(&self.canonical, Some(pin.as_ref()))?);
+            if pin.metadata().map_err(|error| error.to_string())?.nlink() == 0 {
+                return Ok(());
+            }
+            self.ancestors
+                .extend(physical_ancestors(&self.canonical, Some(pin.as_ref()))?);
         }
         Ok(())
     }
@@ -106,10 +119,13 @@ impl Home {
     fn overlaps(&self, other: &Self) -> bool {
         self.canonical.starts_with(&other.canonical)
             || other.canonical.starts_with(&self.canonical)
-            || self.identity.is_some_and(|identity| other.ancestors.contains(&identity))
-            || other.identity.is_some_and(|identity| self.ancestors.contains(&identity))
+            || self
+                .identity
+                .is_some_and(|identity| other.ancestors.contains(&identity))
+            || other
+                .identity
+                .is_some_and(|identity| self.ancestors.contains(&identity))
     }
-
 }
 
 /// Walk the actual directory parent chain through descriptors. Lexical
@@ -120,13 +136,20 @@ fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, 
     } else {
         let mut existing = path;
         loop {
-            match std::fs::OpenOptions::new().read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(existing) {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(existing)
+            {
                 Ok(file) => break file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    existing = existing.parent().ok_or("Account scope has no existing directory ancestor")?;
+                    existing = existing
+                        .parent()
+                        .ok_or("Account scope has no existing directory ancestor")?;
                 }
-                Err(error) => return Err(format!("Cannot capture account scope ancestry: {error}")),
+                Err(error) => {
+                    return Err(format!("Cannot capture account scope ancestry: {error}"));
+                }
             }
         }
     };
@@ -134,11 +157,24 @@ fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, 
     for _ in 0..256 {
         let metadata = cursor.metadata().map_err(|error| error.to_string())?;
         let identity = (metadata.dev(), metadata.ino());
-        if !identities.insert(identity) { return Ok(identities); }
+        if !identities.insert(identity) {
+            return Ok(identities);
+        }
         // SAFETY: the parent component is fixed and the owned descriptor
         // outlives openat; the returned descriptor is newly owned.
-        let parent = unsafe { libc::openat(cursor.as_raw_fd(), c"..".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-        if parent < 0 { return Err(format!("Cannot capture account scope parent: {}", std::io::Error::last_os_error())); }
+        let parent = unsafe {
+            libc::openat(
+                cursor.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if parent < 0 {
+            return Err(format!(
+                "Cannot capture account scope parent: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         cursor = unsafe { File::from_raw_fd(parent) };
     }
     Err("Account scope ancestry exceeds the directory bound".into())
@@ -211,11 +247,25 @@ impl Reservation {
     /// prevent this writer from overtaking their check/effect boundary.
     pub(super) fn install(host: &SharedHost, accounts: &[Account]) -> Result<Self, ProtocolError> {
         let store = Store::installation().ok_or_else(|| refusal("Account registry unavailable"))?;
-        Self::install_with_store(host, accounts, store, crate::account::home::Homes::installation().as_ref())
+        Self::install_with_store(
+            host,
+            accounts,
+            store,
+            crate::account::home::Homes::installation().as_ref(),
+        )
     }
 
-    fn install_with_store(host: &SharedHost, accounts: &[Account], store: Store, installed_homes: Option<&crate::account::home::Homes>) -> Result<Self, ProtocolError> {
-        let gate = host.lock().unwrap_or_else(|p| p.into_inner()).control_gate.clone();
+    fn install_with_store(
+        host: &SharedHost,
+        accounts: &[Account],
+        store: Store,
+        installed_homes: Option<&crate::account::home::Homes>,
+    ) -> Result<Self, ProtocolError> {
+        let gate = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
         super::client::ensure_control_open(host)?;
         let map = host
             .lock()
@@ -232,18 +282,29 @@ impl Reservation {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(refusal)?;
-        let registry = store.try_load()
+        let registry = store
+            .try_load()
             .map_err(|error| refusal(error.to_string()))?;
         // The request's account lookup happened before this snapshot. Never
         // pair an old linked path with a newer registration under the same ID.
         let current_accounts = registry.all_accounts(installed_homes);
         for account in accounts {
             if let Some(key) = account.registry_key() {
-                if registry.find(key).is_some() && !current_accounts.iter().any(|current| current == account) {
-                    return Err(refusal("The selected account registration changed during admission; reload and retry"));
+                if registry.find(key).is_some()
+                    && !current_accounts.iter().any(|current| current == account)
+                {
+                    return Err(refusal(
+                        "The selected account registration changed during admission; reload and retry",
+                    ));
                 }
-                if registry.pending().iter().any(|pending| pending.key == key && pending.provider != account.provider) {
-                    return Err(refusal("The selected pending provider changed during admission; reload and retry"));
+                if registry
+                    .pending()
+                    .iter()
+                    .any(|pending| pending.key == key && pending.provider != account.provider)
+                {
+                    return Err(refusal(
+                        "The selected pending provider changed during admission; reload and retry",
+                    ));
                 }
             }
         }
@@ -266,21 +327,33 @@ impl Reservation {
         let token = uuid::Uuid::new_v4();
         let (previous_basis, mut previous_homes) = {
             let entries = map.lock().unwrap_or_else(|p| p.into_inner());
-            (entries.clone(), entries.values().flat_map(|entry| entry.homes.iter().cloned()).collect::<Vec<_>>())
+            (
+                entries.clone(),
+                entries
+                    .values()
+                    .flat_map(|entry| entry.homes.iter().cloned())
+                    .collect::<Vec<_>>(),
+            )
         };
-        for home in &mut previous_homes { home.refresh_ancestors().map_err(refusal)?; }
+        for home in &mut previous_homes {
+            home.refresh_ancestors().map_err(refusal)?;
+        }
         let writer = super::client::try_scoped_control_write(&gate)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {
-            return Err(refusal("Account operations changed during reservation; retry"));
+            return Err(refusal(
+                "Account operations changed during reservation; retry",
+            ));
         }
         if entries.len() >= 64 {
             return Err(refusal(
                 "Too many account operations are already pending; wait and retry",
             ));
         }
-        if previous_homes.iter().any(|other| homes.iter().any(|home| home.overlaps(other)))
+        if previous_homes
+            .iter()
+            .any(|other| homes.iter().any(|home| home.overlaps(other)))
         {
             return Err(refusal(
                 "An operation is already changing this account home. Wait for it to finish, then retry.",
@@ -307,10 +380,17 @@ impl Reservation {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_host() -> SharedHost { tests::host() }
+    pub(crate) fn test_host() -> SharedHost {
+        tests::host()
+    }
 
     #[cfg(test)]
-    pub(crate) fn test_install(host: &SharedHost, accounts: &[Account], store: Store, homes: &crate::account::home::Homes) -> Result<Self, ProtocolError> {
+    pub(crate) fn test_install(
+        host: &SharedHost,
+        accounts: &[Account],
+        store: Store,
+        homes: &crate::account::home::Homes,
+    ) -> Result<Self, ProtocolError> {
         Self::install_with_store(host, accounts, store, Some(homes))
     }
 
@@ -320,21 +400,44 @@ impl Reservation {
         // outside that lock and outside the global control writer.
         let owners = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let mut owners = state.terminals.values().filter(|record| !record.handle.is_completed()).map(|record| (
-                record.session.launch.working_directory.clone(),
-                record.execution_environment.as_ref().map(|value|value.0.clone()).unwrap_or_else(||record.session.launch.environment.clone()),
-                crate::account::launch_credential_overrides(&record.session.launch),
-                record.execution_environment.is_none(),
-            )).collect::<Vec<_>>();
-            owners.extend(state.chats.values().filter(|record|record.handle.owns_work()).map(|record|(
-                record.session.launch.recipe.working_directory.clone(), record.handle.execution_environment().0,
-                crate::account::launch_credential_overrides(&record.session.launch.recipe), false,
-            )));
+            let mut owners = state
+                .terminals
+                .values()
+                .filter(|record| !record.handle.is_completed())
+                .map(|record| {
+                    (
+                        record.session.launch.working_directory.clone(),
+                        record
+                            .execution_environment
+                            .as_ref()
+                            .map(|value| value.0.clone())
+                            .unwrap_or_else(|| record.session.launch.environment.clone()),
+                        crate::account::launch_credential_overrides(&record.session.launch),
+                        record.execution_environment.is_none(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            owners.extend(
+                state
+                    .chats
+                    .values()
+                    .filter(|record| record.handle.owns_work())
+                    .map(|record| {
+                        (
+                            record.session.launch.recipe.working_directory.clone(),
+                            record.handle.execution_environment().0,
+                            crate::account::launch_credential_overrides(
+                                &record.session.launch.recipe,
+                            ),
+                            false,
+                        )
+                    }),
+            );
             owners
         };
-        for (cwd,environment,unset,inherit) in owners {
-            require_absolute_roots(&environment,&unset,inherit)?;
-            ensure_launch(host,&cwd,&environment,&unset,inherit)?;
+        for (cwd, environment, unset, inherit) in owners {
+            require_absolute_roots(&environment, &unset, inherit)?;
+            ensure_launch(host, &cwd, &environment, &unset, inherit)?;
         }
         Ok(())
     }
@@ -342,45 +445,92 @@ impl Reservation {
     /// Reserve the exact future home BEFORE mkdir. The random key is only a
     /// negative admission target; creation still requires a successful actual
     /// nonrecursive mkdir and its original receipt, never an existing home.
-    pub(super) fn for_operation(host: &SharedHost, operation: &crate::account::remote::Operation) -> Result<Self, ProtocolError> {
+    pub(super) fn for_operation(
+        host: &SharedHost,
+        operation: &crate::account::remote::Operation,
+    ) -> Result<Self, ProtocolError> {
         let mut accounts = crate::account::remote::affected_accounts(operation).map_err(refusal)?;
         let create = if let crate::account::remote::Operation::Create { provider, .. } = operation {
-            let homes = crate::account::home::Homes::installation().ok_or_else(|| refusal("Account homes unavailable"))?;
+            let homes = crate::account::home::Homes::installation()
+                .ok_or_else(|| refusal("Account homes unavailable"))?;
             let key = uuid::Uuid::new_v4();
             accounts.push(Account::managed(*provider, key, homes.path(*provider, key)));
             Some((*provider, key))
-        } else { None };
+        } else {
+            None
+        };
         let mut reservation = Self::install(host, &accounts)?;
-        if create.is_some() && reservation.current().map_err(refusal)?.homes.last().is_some_and(|home| home.pin.is_some()) {
-            return Err(refusal("The planned new home already exists; it was not adopted or changed"));
+        if create.is_some()
+            && reservation
+                .current()
+                .map_err(refusal)?
+                .homes
+                .last()
+                .is_some_and(|home| home.pin.is_some())
+        {
+            return Err(refusal(
+                "The planned new home already exists; it was not adopted or changed",
+            ));
         }
         reservation.create = create;
         Ok(reservation)
     }
 
     fn current(&self) -> Result<Arc<Reserved>, String> {
-        self.map.lock().unwrap_or_else(|p| p.into_inner()).get(&self.token).cloned()
-            .ok_or_else(|| "The account mutation reservation was released; reload accounts and retry".into())
+        self.map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&self.token)
+            .cloned()
+            .ok_or_else(|| {
+                "The account mutation reservation was released; reload accounts and retry".into()
+            })
     }
 
-    pub(crate) fn create_home(&self, homes: &crate::account::home::Homes, provider: crate::agent::Provider,
-        system: Option<&Path>, config: crate::account::home::CodexConfig) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+    pub(crate) fn create_home(
+        &self,
+        homes: &crate::account::home::Homes,
+        provider: crate::agent::Provider,
+        system: Option<&Path>,
+        config: crate::account::home::CodexConfig,
+    ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
         self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
     }
 
-    fn create_home_initialized(&self, homes: &crate::account::home::Homes, provider: crate::agent::Provider,
-        system: Option<&Path>, config: crate::account::home::CodexConfig,
-        initialized: impl FnOnce(&crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()>) -> std::io::Result<(uuid::Uuid, PathBuf)> {
-        let (planned_provider, key) = self.create.ok_or_else(|| std::io::Error::other("Account creation has no reserved fresh home"))?;
+    fn create_home_initialized(
+        &self,
+        homes: &crate::account::home::Homes,
+        provider: crate::agent::Provider,
+        system: Option<&Path>,
+        config: crate::account::home::CodexConfig,
+        initialized: impl FnOnce(&crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()>,
+    ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+        let (planned_provider, key) = self
+            .create
+            .ok_or_else(|| std::io::Error::other("Account creation has no reserved fresh home"))?;
         let path = homes.path(provider, key);
-        if provider != planned_provider || !self.accounts.iter().any(|account| account.provider == provider && account.registry_key() == Some(key) && account.resolved_home().as_ref() == Some(&path)) {
-            return Err(std::io::Error::other("Account creation does not match its planned home"));
+        if provider != planned_provider
+            || !self.accounts.iter().any(|account| {
+                account.provider == provider
+                    && account.registry_key() == Some(key)
+                    && account.resolved_home().as_ref() == Some(&path)
+            })
+        {
+            return Err(std::io::Error::other(
+                "Account creation does not match its planned home",
+            ));
         }
         let current = self.current().map_err(std::io::Error::other)?;
-        let original_system = self.accounts.iter().position(|account| account.provider == provider && account.is_system())
-            .and_then(|index| current.homes.get(index)).map(|home| home.path.as_path());
+        let original_system = self
+            .accounts
+            .iter()
+            .position(|account| account.provider == provider && account.is_system())
+            .and_then(|index| current.homes.get(index))
+            .map(|home| home.path.as_path());
         if system != original_system {
-            return Err(std::io::Error::other("Account seeding does not match its reserved System home"));
+            return Err(std::io::Error::other(
+                "Account seeding does not match its reserved System home",
+            ));
         }
         homes.create_planned_with_config_initialized(provider, key, system, config, |created| {
             self.enroll_created_home(created)?;
@@ -398,36 +548,92 @@ impl Reservation {
     /// Never load the registry here. Observe original FDs/maps off the control
     /// writer, then atomically replace this immutable roster under a brief
     /// try-write. Busy/failure retains the fresh files and publishes no row.
-    fn enroll_created_home(&self, created: &crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()> {
+    fn enroll_created_home(
+        &self,
+        created: &crate::account::home::NewHomeCreationReceipt,
+    ) -> std::io::Result<()> {
         use std::io;
-        if self.create != Some((created.provider(), created.key())) { return Err(io::Error::other("Fresh home does not match its creation reservation")); }
+        if self.create != Some((created.provider(), created.key())) {
+            return Err(io::Error::other(
+                "Fresh home does not match its creation reservation",
+            ));
+        }
         created.revalidate()?;
-        let host = self.host.upgrade().ok_or_else(|| io::Error::other("The account host is no longer available"))?;
+        let host = self
+            .host
+            .upgrade()
+            .ok_or_else(|| io::Error::other("The account host is no longer available"))?;
         let basis = self.map.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let original = basis.get(&self.token).ok_or_else(|| io::Error::other("The creation reservation was released"))?;
-        let index = self.accounts.iter().position(|account| account.provider == created.provider() && account.registry_key() == Some(created.key()))
-            .ok_or_else(|| io::Error::other("The planned home is absent from its creation reservation"))?;
-        let planned = original.homes.get(index).ok_or_else(|| io::Error::other("The planned home scope changed"))?;
-        if planned.pin.is_some() || planned.canonical != created.home() { return Err(io::Error::other("Fresh home differs from its original planned directory")); }
+        let original = basis
+            .get(&self.token)
+            .ok_or_else(|| io::Error::other("The creation reservation was released"))?;
+        let index = self
+            .accounts
+            .iter()
+            .position(|account| {
+                account.provider == created.provider()
+                    && account.registry_key() == Some(created.key())
+            })
+            .ok_or_else(|| {
+                io::Error::other("The planned home is absent from its creation reservation")
+            })?;
+        let planned = original
+            .homes
+            .get(index)
+            .ok_or_else(|| io::Error::other("The planned home scope changed"))?;
+        if planned.pin.is_some() || planned.canonical != created.home() {
+            return Err(io::Error::other(
+                "Fresh home differs from its original planned directory",
+            ));
+        }
         let pin = Arc::new(created.directory().try_clone()?);
         let metadata = pin.metadata()?;
-        let actual = Home { path: planned.path.clone(), canonical: created.home().to_owned(),
+        let actual = Home {
+            path: planned.path.clone(),
+            canonical: created.home().to_owned(),
             ancestors: physical_ancestors(created.home(), Some(&pin)).map_err(io::Error::other)?,
-            identity: Some((metadata.dev(), metadata.ino())), pin: Some(pin) };
+            identity: Some((metadata.dev(), metadata.ino())),
+            pin: Some(pin),
+        };
         actual.verify().map_err(io::Error::other)?;
-        for (i, home) in original.homes.iter().enumerate() { if i != index { home.verify().map_err(io::Error::other)?; } }
-        let mut other_homes = basis.iter().filter(|(token, _)| **token != self.token)
-            .flat_map(|(_, scope)| scope.homes.iter().cloned()).collect::<Vec<_>>();
-        for home in &mut other_homes { home.refresh_ancestors().map_err(io::Error::other)?; }
-        if other_homes.iter().any(|home| actual.overlaps(home)) { return Err(io::Error::other("Another account operation overlaps the new home")); }
-        let mut updated = (**original).clone(); updated.homes[index] = actual;
-        let gate = host.lock().unwrap_or_else(|p| p.into_inner()).control_gate.clone();
-        let writer = super::client::try_scoped_control_write(&gate).map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
-        super::client::ensure_control_open(&host).map_err(|error| io::Error::other(error.message))?;
+        for (i, home) in original.homes.iter().enumerate() {
+            if i != index {
+                home.verify().map_err(io::Error::other)?;
+            }
+        }
+        let mut other_homes = basis
+            .iter()
+            .filter(|(token, _)| **token != self.token)
+            .flat_map(|(_, scope)| scope.homes.iter().cloned())
+            .collect::<Vec<_>>();
+        for home in &mut other_homes {
+            home.refresh_ancestors().map_err(io::Error::other)?;
+        }
+        if other_homes.iter().any(|home| actual.overlaps(home)) {
+            return Err(io::Error::other(
+                "Another account operation overlaps the new home",
+            ));
+        }
+        let mut updated = (**original).clone();
+        updated.homes[index] = actual;
+        let gate = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        let writer = super::client::try_scoped_control_write(&gate)
+            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
+        super::client::ensure_control_open(&host)
+            .map_err(|error| io::Error::other(error.message))?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        if !same_basis(&basis, &entries) { return Err(io::Error::other("Account reservations changed during home enrollment; retry creation")); }
+        if !same_basis(&basis, &entries) {
+            return Err(io::Error::other(
+                "Account reservations changed during home enrollment; retry creation",
+            ));
+        }
         entries.insert(self.token, Arc::new(updated));
-        drop(entries); drop(writer);
+        drop(entries);
+        drop(writer);
         created.revalidate()?;
         Ok(())
     }
@@ -435,7 +641,12 @@ impl Reservation {
     /// Match the exact request operand/provider/key captured by this host
     /// reservation. The original alias must still name its pinned directory;
     /// return the captured canonical operand, never resolve a new request path.
-    pub(crate) fn link_home(&self, provider: crate::agent::Provider, key: uuid::Uuid, operand: &Path) -> Result<PathBuf, String> {
+    pub(crate) fn link_home(
+        &self,
+        provider: crate::agent::Provider,
+        key: uuid::Uuid,
+        operand: &Path,
+    ) -> Result<PathBuf, String> {
         let current = self.current()?;
         let home = self.accounts.iter().zip(&current.homes).find_map(|(account, home)| {
             (account.provider == provider && matches!(&account.home,
@@ -450,18 +661,27 @@ impl Reservation {
     /// global reader/writer spans slow storage, so unrelated Input remains
     /// independent even when another scoped writer is awaiting admission.
     /// Store revalidates relevant metadata under its actual mutation lease.
-    pub(crate) fn commit<T>(&self, effect: impl FnOnce() -> std::io::Result<T>) -> Result<T, String> {
+    pub(crate) fn commit<T>(
+        &self,
+        effect: impl FnOnce() -> std::io::Result<T>,
+    ) -> Result<T, String> {
         self.verify()?;
         effect().map_err(|error| error.to_string())
     }
 
     /// Call outside HostState and before each destructive stage/final commit.
     pub(crate) fn verify(&self) -> Result<(), String> {
-        if !self.map.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&self.token) {
-            return Err("The account mutation reservation was released; reload accounts and retry".into());
+        if !self
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&self.token)
+        {
+            return Err(
+                "The account mutation reservation was released; reload accounts and retry".into(),
+            );
         }
-        let registry = self.store.try_load()
-            .map_err(|error| error.to_string())?;
+        let registry = self.store.try_load().map_err(|error| error.to_string())?;
         self.verify_registry(&registry)
     }
 
@@ -470,7 +690,9 @@ impl Reservation {
     /// lease in commit(), while this cut closes concurrent metadata races.
     pub(crate) fn verify_registry(&self, registry: &Registry) -> Result<(), String> {
         let current = self.current()?;
-        for home in &current.homes { home.verify()?; }
+        for home in &current.homes {
+            home.verify()?;
+        }
         for (key, account, pending, archived) in &self.registered {
             if registry.find(*key) != account.as_ref()
                 || registry.pending().iter().find(|value| value.key == *key) != pending.as_ref()
@@ -507,7 +729,9 @@ pub(super) fn ensure_paths(
     if reserved.is_empty() {
         return Ok(());
     }
-    for home in &mut reserved { home.refresh_ancestors().map_err(refusal)?; }
+    for home in &mut reserved {
+        home.refresh_ancestors().map_err(refusal)?;
+    }
     for path in paths {
         let home = Home::capture(path).map_err(refusal)?;
         if reserved.iter().any(|other| home.overlaps(other)) {
@@ -551,7 +775,9 @@ pub(super) fn ensure_launch(
     }
     ensure_paths(host, paths)?;
     if unknown_root && reservations_active(host) {
-        return Err(refusal("Cannot establish both provider credential directories while an account operation is pending. Set absolute HOME or provider homes, or wait for that operation to finish."));
+        return Err(refusal(
+            "Cannot establish both provider credential directories while an account operation is pending. Set absolute HOME or provider homes, or wait for that operation to finish.",
+        ));
     }
     Ok(())
 }
@@ -570,10 +796,14 @@ pub(super) fn ensure_launch_at_directory(
 ) -> Result<(), ProtocolError> {
     if let Some(directory) = execution_directory {
         let metadata = directory.metadata().map_err(|error| {
-            refusal(format!("Cannot inspect the pinned terminal directory: {error}"))
+            refusal(format!(
+                "Cannot inspect the pinned terminal directory: {error}"
+            ))
         })?;
         if !metadata.is_dir() || metadata.nlink() == 0 {
-            return Err(refusal("The pinned terminal directory is no longer available"));
+            return Err(refusal(
+                "The pinned terminal directory is no longer available",
+            ));
         }
         require_absolute_roots(environment, unset, inherit)?;
     }
@@ -581,43 +811,66 @@ pub(super) fn ensure_launch_at_directory(
     ensure_launch(host, cwd, environment, unset, inherit)
 }
 
-fn require_absolute_roots(environment: &BTreeMap<String, String>, unset: &BTreeSet<String>, inherit: bool) -> Result<(), ProtocolError> {
-        let effective = |name: &str| {
-            if unset.contains(name) {
-                None
-            } else {
-                environment.get(name).map(std::ffi::OsString::from)
-                    .or_else(|| inherit.then(|| std::env::var_os(name)).flatten())
-            }
-        };
-        // Both providers remain usable from an ordinary terminal, regardless
-        // of which provider initiated the handoff or owns a reserved account.
-        for variable in ["CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
-            let selected = effective(variable).filter(|value| !value.is_empty());
-            let (name, root) = match selected {
-                Some(root) => (variable, Some(root)),
-                None => ("HOME", effective("HOME").filter(|value| !value.is_empty())),
-            };
-            if root.as_ref().is_some_and(|root| Path::new(root).is_relative()) {
-                return Err(refusal(format!(
-                    "Cannot launch with relative {name} while using a pinned working directory. Set an absolute credential directory and retry."
-                )));
-            }
+fn require_absolute_roots(
+    environment: &BTreeMap<String, String>,
+    unset: &BTreeSet<String>,
+    inherit: bool,
+) -> Result<(), ProtocolError> {
+    let effective = |name: &str| {
+        if unset.contains(name) {
+            None
+        } else {
+            environment
+                .get(name)
+                .map(std::ffi::OsString::from)
+                .or_else(|| inherit.then(|| std::env::var_os(name)).flatten())
         }
+    };
+    // Both providers remain usable from an ordinary terminal, regardless
+    // of which provider initiated the handoff or owns a reserved account.
+    for variable in ["CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
+        let selected = effective(variable).filter(|value| !value.is_empty());
+        let (name, root) = match selected {
+            Some(root) => (variable, Some(root)),
+            None => ("HOME", effective("HOME").filter(|value| !value.is_empty())),
+        };
+        if root
+            .as_ref()
+            .is_some_and(|root| Path::new(root).is_relative())
+        {
+            return Err(refusal(format!(
+                "Cannot launch with relative {name} while using a pinned working directory. Set an absolute credential directory and retry."
+            )));
+        }
+    }
     Ok(())
 }
 
 fn reservations_active(host: &SharedHost) -> bool {
-    let map = host.lock().unwrap_or_else(|p| p.into_inner()).account_lifecycle.clone();
+    let map = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .account_lifecycle
+        .clone();
     !map.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
 }
 
 /// Legacy adopted terminals have no newly observed process environment or cwd.
 /// Absolute captured roots are usable; unknown/relative provenance waits until
 /// account mutation completes rather than guessing from today's daemon HOME.
-pub(super) fn ensure_terminal_adoption(host: &SharedHost, environment: Option<&BTreeMap<String, String>>, unset: &BTreeSet<String>) -> Result<(), ProtocolError> {
-    if !reservations_active(host) { return Ok(()); }
-    let Some(environment) = environment else { return Err(refusal("The retained terminal has no captured account environment; wait for the account operation to finish")); };
+pub(super) fn ensure_terminal_adoption(
+    host: &SharedHost,
+    environment: Option<&BTreeMap<String, String>>,
+    unset: &BTreeSet<String>,
+) -> Result<(), ProtocolError> {
+    if !reservations_active(host) {
+        return Ok(());
+    }
+    let Some(environment) = environment else {
+        return Err(refusal(
+            "The retained terminal has no captured account environment; wait for the account operation to finish",
+        ));
+    };
     require_absolute_roots(environment, unset, false)
 }
 
@@ -683,14 +936,20 @@ pub(super) fn ensure_terminal(
     Ok(())
 }
 
-pub(super) fn admit(host: &SharedHost, request: &crate::terminal_ipc::ClientRequest) -> Result<(), ProtocolError> {
+pub(super) fn admit(
+    host: &SharedHost,
+    request: &crate::terminal_ipc::ClientRequest,
+) -> Result<(), ProtocolError> {
     use crate::terminal_ipc::ClientRequest;
     match request {
         ClientRequest::Attach { terminal_id, .. } => ensure_terminal(host, *terminal_id)?,
-        ClientRequest::ChatAttach { .. } | ClientRequest::ChatReturnTerminal { .. }
+        ClientRequest::ChatAttach { .. }
+        | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatRecoverAccount { .. } => ensure_idle(host)?,
-        ClientRequest::PrepareUpgrade { .. } | ClientRequest::PrepareConfirmedUpgrade { .. }
-        | ClientRequest::Shutdown | ClientRequest::ShutdownV1 { .. } => ensure_idle(host)?,
+        ClientRequest::PrepareUpgrade { .. }
+        | ClientRequest::PrepareConfirmedUpgrade { .. }
+        | ClientRequest::Shutdown
+        | ClientRequest::ShutdownV1 { .. } => ensure_idle(host)?,
         _ => {}
     }
     Ok(())
@@ -699,110 +958,376 @@ pub(super) fn admit(host: &SharedHost, request: &crate::terminal_ipc::ClientRequ
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{agent::Provider, account::{home::{Homes,CodexConfig}, AccountHome},model::{HostSessionProof,HostSessionId,HostIncarnation}};
+    use crate::{
+        account::{
+            AccountHome,
+            home::{CodexConfig, Homes},
+        },
+        agent::Provider,
+        model::{HostIncarnation, HostSessionId, HostSessionProof},
+    };
     pub(crate) fn host() -> SharedHost {
-        let host=Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(HostSessionProof {
-            host_session_id:HostSessionId::new("account-admission"),boot_id:crate::daemon::read_boot_id().unwrap(),host_incarnation:HostIncarnation::new("fixture")
-        })));
-        host.lock().unwrap().register_client(1); host
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("account-admission"),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: HostIncarnation::new("fixture"),
+            }),
+        ));
+        host.lock().unwrap().register_client(1);
+        host
     }
     #[test]
     fn original_inode_and_physical_ancestry_block_aliases_after_rename() {
-        let root=tempfile::tempdir().unwrap(); let homes=Homes::at(root.path().join("homes")); let store=Store::at(root.path().join("registry"));
-        let directory=root.path().join("original");std::fs::create_dir_all(directory.join("child")).unwrap();
-        let alias=root.path().join("alias");std::os::unix::fs::symlink(&directory,&alias).unwrap(); let host=host();
-        let reservation=Reservation::test_install(&host,&[Account::linked(Provider::Claude,uuid::Uuid::new_v4(),alias)],store,&homes).unwrap();
-        assert!(ensure_paths(&host,[directory.join("child")]).is_err());
-        let moved=root.path().join("moved");std::fs::rename(&directory,&moved).unwrap();std::fs::create_dir(&directory).unwrap();
-        assert!(ensure_paths(&host,[moved.join("child")]).is_err());assert!(reservation.verify().is_err());
-        assert!(ensure_paths(&host,[root.path().join("unrelated")]).is_ok());drop(reservation);
-        ensure_paths(&host,[moved]).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let directory = root.path().join("original");
+        std::fs::create_dir_all(directory.join("child")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let host = host();
+        let reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                alias,
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
+        assert!(ensure_paths(&host, [directory.join("child")]).is_err());
+        let moved = root.path().join("moved");
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(ensure_paths(&host, [moved.join("child")]).is_err());
+        assert!(reservation.verify().is_err());
+        assert!(ensure_paths(&host, [root.path().join("unrelated")]).is_ok());
+        drop(reservation);
+        ensure_paths(&host, [moved]).unwrap();
     }
     #[test]
     fn create_reserves_future_home_and_actual_inode_before_seeding() {
-        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
-        let system=root.path().join("system");std::fs::create_dir(&system).unwrap();std::fs::write(system.join("settings.json"),b"{\"fixture\":true}").unwrap();
-        let key=uuid::Uuid::new_v4();let target=homes.path(Provider::Claude,key);let alias=root.path().join("alias");std::os::unix::fs::symlink(&target,&alias).unwrap();
-        let accounts=[Account {provider:Provider::Claude,home:AccountHome::SystemAt {path:system.clone()}},Account::managed(Provider::Claude,key,target.clone())];
-        let mut reservation=Reservation::test_install(&host,&accounts,store.clone(),&homes).unwrap();reservation.create=Some((Provider::Claude,key));
-        assert!(ensure_paths(&host,[target.clone()]).is_err());
-        let (ready_rx,release_tx,worker)={
-            let (ready_tx,ready_rx)=std::sync::mpsc::sync_channel(1);let (release_tx,release_rx)=std::sync::mpsc::sync_channel(1);
-            let homes=homes.clone();let system=system.clone();let store=store.clone();
-            let worker=std::thread::spawn(move || {
-                store.try_create_pending_reserved(&reservation,&homes,Provider::Claude,1,||reservation.create_home_initialized(&homes,Provider::Claude,Some(&system),CodexConfig::Shared,|created| {
-                    assert!(std::fs::read_dir(created.home())?.next().is_none());ready_tx.send(()).map_err(std::io::Error::other)?;
-                    release_rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(std::io::Error::other)?;Ok(())
-                }))
-            });(ready_rx,release_tx,worker)
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let system = root.path().join("system");
+        std::fs::create_dir(&system).unwrap();
+        std::fs::write(system.join("settings.json"), b"{\"fixture\":true}").unwrap();
+        let key = uuid::Uuid::new_v4();
+        let target = homes.path(Provider::Claude, key);
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let accounts = [
+            Account {
+                provider: Provider::Claude,
+                home: AccountHome::SystemAt {
+                    path: system.clone(),
+                },
+            },
+            Account::managed(Provider::Claude, key, target.clone()),
+        ];
+        let mut reservation =
+            Reservation::test_install(&host, &accounts, store.clone(), &homes).unwrap();
+        reservation.create = Some((Provider::Claude, key));
+        assert!(ensure_paths(&host, [target.clone()]).is_err());
+        let (ready_rx, release_tx, worker) = {
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let homes = homes.clone();
+            let system = system.clone();
+            let store = store.clone();
+            let worker = std::thread::spawn(move || {
+                store.try_create_pending_reserved(&reservation, &homes, Provider::Claude, 1, || {
+                    reservation.create_home_initialized(
+                        &homes,
+                        Provider::Claude,
+                        Some(&system),
+                        CodexConfig::Shared,
+                        |created| {
+                            assert!(std::fs::read_dir(created.home())?.next().is_none());
+                            ready_tx.send(()).map_err(std::io::Error::other)?;
+                            release_rx
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .map_err(std::io::Error::other)?;
+                            Ok(())
+                        },
+                    )
+                })
+            });
+            (ready_rx, release_tx, worker)
         };
-        ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        let recipe=crate::model::LaunchRecipe { program:"/bin/false".into(),arguments:vec![],working_directory:root.path().to_owned(),
-            environment:BTreeMap::from([("HOME".into(),root.path().display().to_string()),("CLAUDE_CONFIG_DIR".into(),alias.display().to_string())]),unset_environment:Default::default() };
-        let terminal=crate::model::TerminalSession {id:crate::model::TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,
-            continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe:recipe.clone(),last_exit:None},launch:recipe,transcript_path:None,resume_hint:None};
-        let refused=super::super::client::process_request(&host,1,crate::terminal_ipc::ClientRequest::Spawn {session:terminal,options:Default::default()})
-            .unwrap_err().message.contains("account home is being changed");
-        let unrelated=ensure_paths(&host,[root.path().join("other")]).is_ok();
-        let gate=host.lock().unwrap().control_gate.clone();let reader=gate.try_read().is_ok();
-        let moved=root.path().join("moved");std::fs::rename(&target,&moved).unwrap();let moved_refused=ensure_paths(&host,[moved.clone()]).is_err();std::fs::rename(&moved,&target).unwrap();
-        let _=release_tx.send(());let result=worker.join().unwrap().unwrap();
-        assert!(refused&&unrelated&&reader&&moved_refused);assert_eq!(result,(key,target.clone()));
-        assert_eq!(std::fs::read(target.join("settings.json")).unwrap(),b"{\"fixture\":true}");assert!(store.load().unwrap().pending().iter().any(|pending|pending.key==key));
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/false".into(),
+            arguments: vec![],
+            working_directory: root.path().to_owned(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.path().display().to_string()),
+                ("CLAUDE_CONFIG_DIR".into(), alias.display().to_string()),
+            ]),
+            unset_environment: Default::default(),
+        };
+        let terminal = crate::model::TerminalSession {
+            id: crate::model::TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: recipe.clone(),
+                last_exit: None,
+            },
+            launch: recipe,
+            transcript_path: None,
+            resume_hint: None,
+        };
+        let refused = super::super::client::process_request(
+            &host,
+            1,
+            crate::terminal_ipc::ClientRequest::Spawn {
+                session: terminal,
+                options: Default::default(),
+            },
+        )
+        .unwrap_err()
+        .message
+        .contains("account home is being changed");
+        let unrelated = ensure_paths(&host, [root.path().join("other")]).is_ok();
+        let gate = host.lock().unwrap().control_gate.clone();
+        let reader = gate.try_read().is_ok();
+        let moved = root.path().join("moved");
+        std::fs::rename(&target, &moved).unwrap();
+        let moved_refused = ensure_paths(&host, [moved.clone()]).is_err();
+        std::fs::rename(&moved, &target).unwrap();
+        let _ = release_tx.send(());
+        let result = worker.join().unwrap().unwrap();
+        assert!(refused && unrelated && reader && moved_refused);
+        assert_eq!(result, (key, target.clone()));
+        assert_eq!(
+            std::fs::read(target.join("settings.json")).unwrap(),
+            b"{\"fixture\":true}"
+        );
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .pending()
+                .iter()
+                .any(|pending| pending.key == key)
+        );
     }
     #[test]
     fn failed_enrollment_retains_unseeded_home_without_publication() {
-        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
-        let key=uuid::Uuid::new_v4();let target=homes.path(Provider::Codex,key);
-        let mut reservation=Reservation::test_install(&host,&[Account::managed(Provider::Codex,key,target.clone())],store.clone(),&homes).unwrap();reservation.create=Some((Provider::Codex,key));
-        let gate=host.lock().unwrap().control_gate.clone();let held=gate.read().unwrap();
-        assert!(store.try_create_pending_reserved(&reservation,&homes,Provider::Codex,1,||reservation.create_home(&homes,Provider::Codex,None,CodexConfig::Shared)).is_err());
-        assert!(target.is_dir());assert!(std::fs::read_dir(&target).unwrap().next().is_none());assert!(store.try_load().unwrap().pending().is_empty());drop(held);
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let key = uuid::Uuid::new_v4();
+        let target = homes.path(Provider::Codex, key);
+        let mut reservation = Reservation::test_install(
+            &host,
+            &[Account::managed(Provider::Codex, key, target.clone())],
+            store.clone(),
+            &homes,
+        )
+        .unwrap();
+        reservation.create = Some((Provider::Codex, key));
+        let gate = host.lock().unwrap().control_gate.clone();
+        let held = gate.read().unwrap();
+        assert!(
+            store
+                .try_create_pending_reserved(&reservation, &homes, Provider::Codex, 1, || {
+                    reservation.create_home(&homes, Provider::Codex, None, CodexConfig::Shared)
+                })
+                .is_err()
+        );
+        assert!(target.is_dir());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+        assert!(store.try_load().unwrap().pending().is_empty());
+        drop(held);
     }
     #[test]
     fn scoped_registry_mutation_refuses_changed_relevant_metadata() {
-        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let directory=root.path().join("linked");std::fs::create_dir(&directory).unwrap();
-        let key=uuid::Uuid::new_v4();store.update(|registry|registry.link(Provider::Codex,key,directory.clone(),None,Some(&homes),1)).unwrap().1.unwrap();
-        let account=Account::linked(Provider::Codex,key,directory);let host=host();let reservation=Reservation::test_install(&host,&[account.clone()],store.clone(),&homes).unwrap();
-        store.update(|registry|registry.set_label(&account,Some("external edit".into()))).unwrap();let mut effects=0;
-        assert!(store.try_update_reserved(&reservation, |_|effects+=1).is_err());assert_eq!(effects,0);assert_eq!(store.load().unwrap().label(&account),Some("external edit"));
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let directory = root.path().join("linked");
+        std::fs::create_dir(&directory).unwrap();
+        let key = uuid::Uuid::new_v4();
+        store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    key,
+                    directory.clone(),
+                    None,
+                    Some(&homes),
+                    1,
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
+        let account = Account::linked(Provider::Codex, key, directory);
+        let host = host();
+        let reservation =
+            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
+        store
+            .update(|registry| registry.set_label(&account, Some("external edit".into())))
+            .unwrap();
+        let mut effects = 0;
+        assert!(
+            store
+                .try_update_reserved(&reservation, |_| effects += 1)
+                .is_err()
+        );
+        assert_eq!(effects, 0);
+        assert_eq!(store.load().unwrap().label(&account), Some("external edit"));
     }
     #[test]
     fn unknown_and_relative_pinned_roots_cannot_bypass_reservation() {
-        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
-        let reservation=Reservation::test_install(&host,&[Account::linked(Provider::Codex,uuid::Uuid::new_v4(),root.path().join("reserved"))],store,&homes).unwrap();
-        assert!(ensure_launch(&host,root.path(),&BTreeMap::new(),&BTreeSet::new(),false).is_err());
-        let directory=File::open(root.path()).unwrap();
-        assert!(ensure_launch_at_directory(&host,root.path(),&BTreeMap::from([("HOME".into(),"relative".into())]),&BTreeSet::new(),false,Some(&directory)).is_err());
-        drop(reservation);ensure_launch(&host,root.path(),&BTreeMap::new(),&BTreeSet::new(),false).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Codex,
+                uuid::Uuid::new_v4(),
+                root.path().join("reserved"),
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
+        assert!(
+            ensure_launch(
+                &host,
+                root.path(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false
+            )
+            .is_err()
+        );
+        let directory = File::open(root.path()).unwrap();
+        assert!(
+            ensure_launch_at_directory(
+                &host,
+                root.path(),
+                &BTreeMap::from([("HOME".into(), "relative".into())]),
+                &BTreeSet::new(),
+                false,
+                Some(&directory)
+            )
+            .is_err()
+        );
+        drop(reservation);
+        ensure_launch(
+            &host,
+            root.path(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
     }
     #[test]
     fn resumed_history_raw_unset_selector_refuses_before_constructor_reads() {
-        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
-        let selected=root.path().join("selected");std::fs::create_dir(&selected).unwrap();
-        let _reservation=Reservation::test_install(&host,&[Account::linked(Provider::Claude,uuid::Uuid::new_v4(),selected.clone())],store,&homes).unwrap();
-        let session=crate::chat::Session {id:crate::model::TerminalId::new(),native_continuity:Default::default(),owned_codex_listener:None,proof:None,terminal:None,
-            launch:crate::chat::Launch {provider:Provider::Claude,session_id:Some(uuid::Uuid::new_v4().to_string()),recipe:crate::model::LaunchRecipe {
-                program:"/does-not-exist/claude".into(),arguments:vec![],working_directory:root.path().to_owned(),
-                environment:BTreeMap::from([("HOME".into(),root.path().display().to_string()),("CLAUDE_CONFIG_DIR".into(),selected.display().to_string())]),
-                unset_environment:BTreeSet::from(["CLAUDE_CONFIG_DIR".into()]),
-            }}};
-        let failure=super::super::client::process_request(&host,1,crate::terminal_ipc::ClientRequest::ChatStart {session,source:None,terminate_source:false,execution_environment:Default::default()}).unwrap_err();
-        assert!(failure.message.contains("account home is being changed"),"{}",failure.message);
-        assert!(host.lock().unwrap().chats.is_empty());assert!(host.lock().unwrap().chat_spawning.is_empty());assert!(std::fs::read_dir(selected).unwrap().next().is_none());
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let selected = root.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let _reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                selected.clone(),
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
+        let session = crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            proof: None,
+            terminal: None,
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                recipe: crate::model::LaunchRecipe {
+                    program: "/does-not-exist/claude".into(),
+                    arguments: vec![],
+                    working_directory: root.path().to_owned(),
+                    environment: BTreeMap::from([
+                        ("HOME".into(), root.path().display().to_string()),
+                        ("CLAUDE_CONFIG_DIR".into(), selected.display().to_string()),
+                    ]),
+                    unset_environment: BTreeSet::from(["CLAUDE_CONFIG_DIR".into()]),
+                },
+            },
+        };
+        let failure = super::super::client::process_request(
+            &host,
+            1,
+            crate::terminal_ipc::ClientRequest::ChatStart {
+                session,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            failure.message.contains("account home is being changed"),
+            "{}",
+            failure.message
+        );
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        assert!(std::fs::read_dir(selected).unwrap().next().is_none());
     }
 
     #[test]
     fn automatic_worktree_cleanup_refuses_while_account_operands_are_reserved() {
-        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
-        let account=Account::linked(Provider::Claude,uuid::Uuid::new_v4(),root.path().join("linked-account"));
-        let reservation=Reservation::test_install(&host,&[account],store,&homes).unwrap();
-        let gate=host.lock().unwrap().control_gate.clone();let _writer=super::super::client::try_scoped_control_write(&gate).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let account = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            root.path().join("linked-account"),
+        );
+        let reservation = Reservation::test_install(&host, &[account], store, &homes).unwrap();
+        let gate = host.lock().unwrap().control_gate.clone();
+        let _writer = super::super::client::try_scoped_control_write(&gate).unwrap();
         assert!(ensure_idle(&host).is_err());
-        let error=host.lock().unwrap().allow_automatic_worktree_cleanup(1,&[]).unwrap_err();
-        assert!(error.contains("account operation"));drop(reservation);
+        let error = host
+            .lock()
+            .unwrap()
+            .allow_automatic_worktree_cleanup(1, &[])
+            .unwrap_err();
+        assert!(error.contains("account operation"));
+        drop(reservation);
         assert!(ensure_idle(&host).is_ok());
-        assert_eq!(host.lock().unwrap().allow_automatic_worktree_cleanup(1,&[]).unwrap_err(),"A window has not established directory protection");
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .allow_automatic_worktree_cleanup(1, &[])
+                .unwrap_err(),
+            "A window has not established directory protection"
+        );
     }
-
 }

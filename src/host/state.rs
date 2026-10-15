@@ -1386,7 +1386,12 @@ impl HostState {
     ) -> Result<(), String> {
         // Account probes/creation now retain a physical reservation instead
         // of the global writer. They can still own operands inside this tree.
-        if !self.account_lifecycle.lock().unwrap_or_else(|p|p.into_inner()).is_empty() {
+        if !self
+            .account_lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
             return Err("An account operation is still using its credential directories".into());
         }
         let verified = |id: &ClientId| {
@@ -3445,11 +3450,22 @@ fn start_terminal_view_owned(
         session.launch.remove_unset_environment(&mut environment.0);
     }
     if adoption.is_some() {
-        super::account_lifecycle::ensure_terminal_adoption(shared, execution_environment.as_ref().map(|value| &value.0), &crate::account::launch_credential_overrides(&session.launch))?;
+        super::account_lifecycle::ensure_terminal_adoption(
+            shared,
+            execution_environment.as_ref().map(|value| &value.0),
+            &crate::account::launch_credential_overrides(&session.launch),
+        )?;
     }
-    super::account_lifecycle::ensure_launch(shared, &session.launch.working_directory,
-        execution_environment.as_ref().map(|value| &value.0).unwrap_or(&session.launch.environment),
-        &crate::account::launch_credential_overrides(&session.launch), execution_environment.is_none())?;
+    super::account_lifecycle::ensure_launch(
+        shared,
+        &session.launch.working_directory,
+        execution_environment
+            .as_ref()
+            .map(|value| &value.0)
+            .unwrap_or(&session.launch.environment),
+        &crate::account::launch_credential_overrides(&session.launch),
+        execution_environment.is_none(),
+    )?;
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();

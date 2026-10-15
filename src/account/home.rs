@@ -126,7 +126,10 @@ impl Homes {
     /// Host short admission must never wait behind another process's flock.
     pub(crate) fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.root)?;
-        crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX | libc::LOCK_NB)
+        crate::instance::owned_lock(
+            &self.root.join(".lifecycle.lock"),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
     }
 
     fn provider_directory(&self, provider: Provider) -> PathBuf {
@@ -171,17 +174,30 @@ impl Homes {
     /// callback only enrolls its actual directory in the existing reservation;
     /// no production export bootstrap or read grant is enabled here.
     pub(crate) fn create_with_config_initialized(
-        &self, provider: Provider, system_home: Option<&Path>, codex_config: CodexConfig,
+        &self,
+        provider: Provider,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
         initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
     ) -> io::Result<(Uuid, PathBuf)> {
-        self.create_planned_with_config_initialized(provider, Uuid::new_v4(), system_home, codex_config, initialize)
+        self.create_planned_with_config_initialized(
+            provider,
+            Uuid::new_v4(),
+            system_home,
+            codex_config,
+            initialize,
+        )
     }
 
     /// Host admission chooses the fresh UUID before mkdir so its exact future
     /// home can be reserved. This argument grants no creation/read authority;
     /// the nonrecursive mkdir must still succeed and mint the actual receipt.
     pub(crate) fn create_planned_with_config_initialized(
-        &self, provider: Provider, key: Uuid, system_home: Option<&Path>, codex_config: CodexConfig,
+        &self,
+        provider: Provider,
+        key: Uuid,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
         initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
     ) -> io::Result<(Uuid, PathBuf)> {
         let parent = self.provider_directory(provider);
@@ -190,9 +206,13 @@ impl Homes {
         let path = self.path(provider, key);
         let created = creation::create(&parent, provider, key)?;
         if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
-            return Err(io::Error::new(error.kind(), format!(
-                "Account initialization failed; files were retained at {} for explicit recovery: {error}", path.display(),
-            )));
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Account initialization failed; files were retained at {} for explicit recovery: {error}",
+                    path.display(),
+                ),
+            ));
         }
         if let Some(system_home) = system_home {
             let seeded = match provider {
@@ -203,7 +223,10 @@ impl Homes {
                 _ => Ok(()),
             };
             if let Err(error) = seeded {
-                return Err(io::Error::other(format!("{error}; the new home was retained at {} for recovery", path.display())));
+                return Err(io::Error::other(format!(
+                    "{error}; the new home was retained at {} for recovery",
+                    path.display()
+                )));
             }
             link_shared(provider, system_home, &path);
         }

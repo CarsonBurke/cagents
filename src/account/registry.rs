@@ -889,12 +889,18 @@ impl Store {
 
     #[cfg(feature = "host")]
     pub(crate) fn try_create_pending_reserved(
-        &self, reservation: &crate::host::AccountReservation, homes: &Homes,
-        provider: Provider, started_at: u64,
+        &self,
+        reservation: &crate::host::AccountReservation,
+        homes: &Homes,
+        provider: Provider,
+        started_at: u64,
         create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
     ) -> io::Result<(Uuid, PathBuf)> {
-        self.create_pending_with_mode(homes, provider, started_at, create, true,
-            |registry| reservation.verify_registry(registry).map_err(io::Error::other))
+        self.create_pending_with_mode(homes, provider, started_at, create, true, |registry| {
+            reservation
+                .verify_registry(registry)
+                .map_err(io::Error::other)
+        })
     }
 
     fn create_pending_with_mode(
@@ -906,8 +912,16 @@ impl Store {
         nonblocking: bool,
         validate: impl FnOnce(&Registry) -> io::Result<()>,
     ) -> io::Result<(Uuid, PathBuf)> {
-        let _lifecycle = if nonblocking { homes.try_lifecycle_lock()? } else { homes.lifecycle_lock()? };
-        let _lock = if nonblocking { self.try_lock()? } else { self.lock()? };
+        let _lifecycle = if nonblocking {
+            homes.try_lifecycle_lock()?
+        } else {
+            homes.lifecycle_lock()?
+        };
+        let _lock = if nonblocking {
+            self.try_lock()?
+        } else {
+            self.lock()?
+        };
         let mut registry = read(&self.path())?;
         if registry.is_newer() {
             return Err(io::Error::new(
@@ -928,7 +942,10 @@ impl Store {
                 write(&self.directory, &self.path(), &registry)
             });
         if let Err(error) = result {
-            return Err(io::Error::other(format!("{error}; the new account home was retained at {} for recovery", home.display())));
+            return Err(io::Error::other(format!(
+                "{error}; the new account home was retained at {} for recovery",
+                home.display()
+            )));
         }
         Ok((key, home))
     }
@@ -987,11 +1004,17 @@ impl Store {
 
     #[cfg(feature = "host")]
     pub(crate) fn try_register_pending_reserved(
-        &self, reservation: &crate::host::AccountReservation, homes: &Homes,
-        account: Registered, system: &[(Provider, Identity)],
+        &self,
+        reservation: &crate::host::AccountReservation,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
-        self.register_pending_with_mode(homes, account, system, true,
-            |registry| reservation.verify_registry(registry).map_err(io::Error::other))
+        self.register_pending_with_mode(homes, account, system, true, |registry| {
+            reservation
+                .verify_registry(registry)
+                .map_err(io::Error::other)
+        })
     }
 
     fn register_pending_with_mode(
@@ -1002,26 +1025,31 @@ impl Store {
         nonblocking: bool,
         validate: impl FnOnce(&Registry) -> io::Result<()>,
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
-        let _lifecycle = if nonblocking { homes.try_lifecycle_lock()? } else { homes.lifecycle_lock()? };
-        self.update_checked_with_mode(|registry| {
-            validate(registry)?;
-            if registry.find(account.key).is_some_and(|existing| {
-                existing.provider == account.provider && existing.linked_home.is_none()
-            }) {
-                return Ok(Ok(()));
-            }
-            if !registry
-                .pending
-                .iter()
-                .any(|pending| pending.key == account.key && pending.provider == account.provider)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "The pending sign-in was removed before it completed",
-                ));
-            }
-            Ok(registry.register(account, system))
-        }, nonblocking)
+        let _lifecycle = if nonblocking {
+            homes.try_lifecycle_lock()?
+        } else {
+            homes.lifecycle_lock()?
+        };
+        self.update_checked_with_mode(
+            |registry| {
+                validate(registry)?;
+                if registry.find(account.key).is_some_and(|existing| {
+                    existing.provider == account.provider && existing.linked_home.is_none()
+                }) {
+                    return Ok(Ok(()));
+                }
+                if !registry.pending.iter().any(|pending| {
+                    pending.key == account.key && pending.provider == account.provider
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "The pending sign-in was removed before it completed",
+                    ));
+                }
+                Ok(registry.register(account, system))
+            },
+            nonblocking,
+        )
     }
 
     fn path(&self) -> PathBuf {
@@ -1034,13 +1062,18 @@ impl Store {
     }
 
     #[cfg(all(test, feature = "host"))]
-    pub(crate) fn hold_registry_lock_for_account_test(&self) -> io::Result<crate::instance::OwnedLock> {
+    pub(crate) fn hold_registry_lock_for_account_test(
+        &self,
+    ) -> io::Result<crate::instance::OwnedLock> {
         self.lock()
     }
 
     fn try_lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
-        crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX | libc::LOCK_NB)
+        crate::instance::owned_lock(
+            &self.directory.join(LOCK_NAME),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
     }
 
     #[cfg(feature = "host")]
@@ -1050,19 +1083,28 @@ impl Store {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn try_update<T>(&self, change: impl FnOnce(&mut Registry) -> T) -> io::Result<(Registry, T)> {
+    pub(crate) fn try_update<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> T,
+    ) -> io::Result<(Registry, T)> {
         self.update_checked_with_mode(|registry| Ok(change(registry)), true)
     }
 
     #[cfg(feature = "host")]
     pub(crate) fn try_update_reserved<T>(
-        &self, reservation: &crate::host::AccountReservation,
+        &self,
+        reservation: &crate::host::AccountReservation,
         change: impl FnOnce(&mut Registry) -> T,
     ) -> io::Result<(Registry, T)> {
-        self.update_checked_with_mode(|registry| {
-            reservation.verify_registry(registry).map_err(io::Error::other)?;
-            Ok(change(registry))
-        }, true)
+        self.update_checked_with_mode(
+            |registry| {
+                reservation
+                    .verify_registry(registry)
+                    .map_err(io::Error::other)?;
+                Ok(change(registry))
+            },
+            true,
+        )
     }
 
     /// The registry as it stands. A missing file is an empty registry; a
@@ -1092,7 +1134,11 @@ impl Store {
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
         nonblocking: bool,
     ) -> io::Result<(Registry, T)> {
-        let _lock = if nonblocking { self.try_lock()? } else { self.lock()? };
+        let _lock = if nonblocking {
+            self.try_lock()?
+        } else {
+            self.lock()?
+        };
         let path = self.path();
         let mut registry = read(&path)?;
         if registry.version > VERSION {
@@ -1119,7 +1165,6 @@ impl Store {
     pub fn load_and_sweep(&self, _homes: &Homes) -> io::Result<Registry> {
         self.load()
     }
-
 }
 
 fn read(path: &Path) -> io::Result<Registry> {
@@ -1306,7 +1351,10 @@ mod tests {
         for index in [0, 1, 2, 3, 4] {
             assert!(homes_created[index].1.is_dir());
         }
-        assert!(homes_created[3].1.is_dir(), "orphan status grants no deletion proof");
+        assert!(
+            homes_created[3].1.is_dir(),
+            "orphan status grants no deletion proof"
+        );
         let recipe = account_recipe(&directory.path().join("unmanaged"));
         assert!(
             store
