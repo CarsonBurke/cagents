@@ -51,6 +51,59 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct CountReader {
+        inner:Arc<dyn CanonicalItemReader>,
+        reads:Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl CanonicalItemReader for CountReader {
+        fn read(&self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
+            self.reads.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            self.inner.read(key)
+        }
+    }
+    fn commit(store:&Arc<Mutex<Store>>,adapter:&mut dyn crate::chat::protocol::Adapter,step:crate::chat::protocol::Step) {
+        for event in step.events {store.lock().unwrap().apply(event).unwrap();}
+        adapter.committed();
+    }
+    #[test]
+    fn byte_evicted_write_results_and_replayed_calls_keep_the_exact_original_patch() {
+        use crate::chat::{ToolStatus,protocol::Adapter};
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source=reader(&store);
+        let mut adapter=crate::chat::protocol::claude::fixture_adapter();
+        adapter.bind_item_reader(Arc::new(CountReader {inner:source.clone(),reads:reads.clone()}));
+        let call=|index:usize|json!({"type":"assistant","uuid":format!("carrier-{index}"),"message":{"id":format!("message-{index}"),"content":[{"type":"tool_use","id":format!("write-{index}"),"name":"Write","input":{"file_path":format!("file-{index}.txt"),"content":"x".repeat(1024*1024)}}]}});
+        for index in 0..3 {let step=adapter.receive(call(index)).unwrap();commit(&store,adapter.as_mut(),step);}
+        let before=source.read(&CanonicalItemKey::new(None,"write-0")).unwrap().unwrap();
+        let lookup_before=reads.load(std::sync::atomic::Ordering::Relaxed);
+        let step=adapter.receive(json!({"type":"user","uuid":"result-carrier","message":{"content":[{"type":"tool_result","tool_use_id":"write-0","content":"created","is_error":false}]}})).unwrap();
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed)>lookup_before,"a byte-evicted result must recover from canonical source");
+        commit(&store,adapter.as_mut(),step);
+        let after=source.read(&CanonicalItemKey::new(None,"write-0")).unwrap().unwrap();
+        let (ItemContent::Changes {changes:before,..},ItemContent::Changes {changes:after_changes,status})=(&before.content,&after.content) else {panic!("Write must remain an exact file edit rather than become a generic Tool");};
+        assert_eq!(status,&ToolStatus::Succeeded);assert_eq!(after_changes,before);
+        let replay=adapter.receive(call(0)).unwrap();commit(&store,adapter.as_mut(),replay);
+        assert_eq!(source.read(&CanonicalItemKey::new(None,"write-0")).unwrap().unwrap().content,after.content,"an older call replay cannot revive a completed byte-evicted tool");
+        drop(store);
+        let missing=adapter.receive(json!({"type":"user","uuid":"late","message":{"content":[{"type":"tool_result","tool_use_id":"write-1","content":"late"}]}})).unwrap();
+        assert!(missing.events.iter().any(|event|matches!(event,Event::Error {fatal:false,..})),"unavailable canonical source is explicit");
+        assert!(!missing.events.iter().any(|event|matches!(event,Event::Item(_))),"source failure cannot invent a replacement tool");
+    }
+    #[test]
+    fn oversized_same_frame_call_and_result_are_available_until_store_commit() {
+        use crate::chat::ToolStatus;
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
+        let step=adapter.receive(json!({"type":"user","uuid":"same-frame","message":{"content":[{"type":"tool_use","id":"large-same-frame","name":"Write","input":{"file_path":"same.txt","content":"x".repeat(3*1024*1024)}},{"type":"tool_result","tool_use_id":"large-same-frame","content":"created","is_error":false}]}})).unwrap();
+        assert!(!step.events.iter().any(|event|matches!(event,Event::Error {..})));
+        commit(&store,adapter.as_mut(),step);
+        let item=reader(&store).read(&CanonicalItemKey::new(None,"large-same-frame")).unwrap().unwrap();
+        assert!(matches!(item.content,ItemContent::Changes {status:ToolStatus::Succeeded,..}));
+    }
+
     #[test]
     fn canonical_tool_reader_restores_large_body_without_paging_or_retaining_store() {
         let mut store=Store::new().unwrap();
