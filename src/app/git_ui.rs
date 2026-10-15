@@ -3540,7 +3540,7 @@ mod tests {
                 drop(app.update(failed.clone()));
                 let row = &app.sidebar_model.projects[0].worktrees[0];
                 assert!(row.status_error.is_some());
-                assert!(row.chrome.tooltip.contains("Last known:"));
+                assert!(row.status_tooltip_for_test().contains("Last known:"));
                 let entry = app.refresh_ui.git.entries.get_mut(&key.project_id).unwrap();
                 assert!(entry.snapshot.status_errors.contains_key(&key.worktree_id));
                 assert!(entry.failed_status_attempts.contains_key(&key.worktree_id));

@@ -1043,6 +1043,11 @@ impl SidebarWorktree {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn status_tooltip_for_test(&self) -> &str {
+        &self.chrome.tooltip
+    }
+
     fn status_description(&self) -> String {
         let mut status = status_summary(
             self.detached,
