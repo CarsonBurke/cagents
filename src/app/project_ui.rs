@@ -179,11 +179,15 @@ impl State {
                 "dialog.project.cleanup.directories"
             });
         }
-        if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.cancel");
+        if let Some(removal) = &self.remove_dialog {
+            return removal_control_id(removal.request, "cancel");
         }
         widget::Id::new("dialog.project.close")
     }
+}
+
+fn removal_control_id(request: crate::model::OperationId, role: &str) -> widget::Id {
+    widget::Id::new(format!("dialog.project.remove.{role}.{request}"))
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +346,7 @@ pub enum Action {
         result: Result<(), String>,
     },
     ConfirmRemove(crate::model::OperationId),
+    DismissRemove(crate::model::OperationId),
     RemovedProject {
         repository: PathBuf,
         result: Result<crate::workspace_model::WorkspaceModel, String>,
@@ -396,6 +401,7 @@ impl Action {
                 | Self::CleanupPolicyChanged(..)
                 | Self::SaveCleanupPolicy(_)
                 | Self::ConfirmRemove(_)
+                | Self::DismissRemove(_)
                 | Self::RetryDelete(_)
                 | Self::Dismiss
         )
@@ -1314,12 +1320,15 @@ impl Cagents {
             Action::ConfirmDelete(_)
             | Action::DeleteBranchChanged(..)
             | Action::BusyAgentsConfirmed(..) => !self.worktree_delete_dialog_on_top(),
-            Action::ConfirmRemove(request) => {
+            Action::ConfirmRemove(request) | Action::DismissRemove(request) => {
                 self.project_ui.removal_request() != Some(*request)
                     || !self.project_ui.force_branches.is_empty()
                     || self.project_ui.cleanup_dialog.is_some()
                     || self.project_ui.dialog.is_some()
             }
+            Action::Dismiss => self.project_ui.remove_dialog.is_some()
+                && self.project_ui.force_branches.is_empty()
+                && self.project_ui.cleanup_dialog.is_none(),
             _ => false,
         };
         if hidden_control {
@@ -1733,13 +1742,16 @@ impl Cagents {
                     }
                 }
             }
+            Action::DismissRemove(_) => {
+                self.project_ui.remove_dialog = None;
+                return self.project_dialog_closed();
+            }
             Action::Dismiss => {
                 if self.project_ui.force_branches.pop_front().is_some() {
                     return self.project_dialog_closed();
                 }
                 self.project_ui.cleanup_dialog = None;
                 self.project_ui.pending_delete.clear();
-                self.project_ui.remove_dialog = None;
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to
                 // it, so its row stops asking.
@@ -2870,6 +2882,33 @@ impl Cagents {
         ))
     }
 
+    pub(super) fn project_dialog_dismiss_action(&self) -> Action {
+        if self.project_ui.force_branches.is_empty() && self.project_ui.cleanup_dialog.is_none()
+            && let Some(request) = self.project_ui.removal_request()
+        {
+            return Action::DismissRemove(request);
+        }
+        Action::Dismiss
+    }
+
+    pub(super) fn project_dialog_overlay(&self) -> Option<Element<'_, Message>> {
+        let surface = self.project_dialog_view()?;
+        let dismiss = self.project_dialog_dismiss_action();
+        let request = match &dismiss {
+            Action::DismissRemove(request) => Some(*request),
+            _ => None,
+        };
+        let overlay = super::dialog_ui::overlay(surface, Some(Message::ProjectUi(dismiss)), 1.0);
+        Some(if let Some(request) = request {
+            // Replace unnamed native press state too. Named controls also carry
+            // this request because iced restores their state outside keyed diff.
+            iced::widget::keyed::Column::with_children([(request, overlay)])
+                .width(Length::Fill).height(Length::Fill).into()
+        } else {
+            overlay
+        })
+    }
+
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
         if let Some((request, detail)) = self.project_ui.force_branches.front() {
             return Some(super::dialog_ui::surface(widget::column::with_children(vec![
@@ -2949,10 +2988,10 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
-                            .id(widget::Id::new("dialog.project.remove.cancel"))
-                            .on_press(Message::ProjectUi(Action::Dismiss)),
+                            .id(removal_control_id(removal.request, "cancel"))
+                            .on_press(Message::ProjectUi(Action::DismissRemove(removal.request))),
                         crate::ui_controls::button::destructive("Remove project")
-                            .id(widget::Id::new("dialog.project.remove.confirm"))
+                            .id(removal_control_id(removal.request, "confirm"))
                             .on_press(Message::ProjectUi(Action::ConfirmRemove(removal.request))),
                     ),
                 ])
@@ -4762,6 +4801,115 @@ mod tests {
         drop(close); // The production close worker is deliberately unpolled.
     }
 
+    fn removal_fixture() -> (Cagents, tempfile::TempDir, ProjectId) {
+        let repository = PathBuf::from("/request-repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        deletable_app(&repository, &linked, &primary)
+    }
+
+    fn open_removal(app: &mut Cagents, project: ProjectId) -> crate::model::OperationId {
+        drop(app.handle_project_action(Action::Command { project_id: project, worktree_id: None, command: ProjectCommand::Remove }));
+        app.project_ui.removal_request().unwrap()
+    }
+
+    fn removal_native_frame(
+        element: &mut Element<'_, Message>,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+    ) -> (cosmic::iced::advanced::layout::Node, HashMap<String, cosmic::iced::Rectangle>) {
+        use cosmic::iced::advanced::{Layout, layout, widget::{Operation, operation::Focusable}};
+        struct Bounds(HashMap<String, cosmic::iced::Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn focusable(&mut self, id: Option<&widget::Id>, bounds: cosmic::iced::Rectangle, _: &mut dyn Focusable) {
+                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
+            }
+        }
+        let node = element.as_widget_mut().layout(tree, renderer, &layout::Limits::new(
+            cosmic::iced::Size::ZERO, cosmic::iced::Size::new(1000.0, 900.0)));
+        let mut bounds = Bounds(HashMap::new());
+        element.as_widget_mut().operate(tree, Layout::new(&node), renderer, &mut bounds);
+        (node, bounds.0)
+    }
+
+    fn removal_pointer_event(
+        element: &mut Element<'_, Message>, tree: &mut cosmic::iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer, node: &cosmic::iced::advanced::layout::Node,
+        point: cosmic::iced::Point, event: cosmic::iced::mouse::Event,
+    ) -> Vec<Message> {
+        use cosmic::iced::{Event, Rectangle, Size, mouse, advanced::{Layout, Shell, clipboard}};
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(tree, &Event::Mouse(event), Layout::new(node),
+            mouse::Cursor::Available(point), renderer, &mut clipboard::Null,
+            &mut Shell::new(&mut messages), &Rectangle::with_size(Size::new(1000.0, 900.0)));
+        messages
+    }
+
+    #[test]
+    fn removal_old_cancel_and_backdrop_cannot_dismiss_the_reopened_request() {
+        use cosmic::iced::{Point, mouse, advanced::widget::Tree};
+        for role in [None, Some("cancel")] {
+            let (mut app, _directory, project) = removal_fixture();
+            let old = open_removal(&mut app, project);
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.dialog().unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let (node, bounds) = removal_native_frame(&mut element, &mut tree, &renderer);
+            let point = role.map(|role| bounds[&removal_control_id(old, role).to_string()].center()).unwrap_or(Point::new(4.0,4.0));
+            let mut messages = removal_pointer_event(&mut element, &mut tree, &renderer, &node, point, mouse::Event::ButtonPressed(mouse::Button::Left));
+            messages.extend(removal_pointer_event(&mut element, &mut tree, &renderer, &node, point, mouse::Event::ButtonReleased(mouse::Button::Left)));
+            assert_eq!(messages.len(), 1);
+            assert!(matches!(&messages[0], Message::ProjectUi(Action::DismissRemove(request)) if *request == old));
+            drop(element);
+            let current = open_removal(&mut app, project);
+            assert_ne!(old, current);
+            for message in messages { drop(app.update(message)); }
+            drop(app.handle_project_action(Action::Dismiss)); // old untyped controls are not new consent
+            assert_eq!(app.project_ui.removal_request(), Some(current));
+            assert!(app.project_ui.removing.is_empty());
+            assert!(app.project_ui.close_started.is_empty());
+            drop(app.handle_project_action(Action::DismissRemove(current)));
+            assert!(app.project_ui.removal_request().is_none());
+        }
+    }
+
+    #[test]
+    fn removal_native_press_does_not_transfer_to_a_reopened_request() {
+        use cosmic::iced::{mouse, advanced::widget::{Tree, tree}};
+        for role in ["cancel", "confirm"] {
+            let (mut app, _directory, project) = removal_fixture();
+            let old = open_removal(&mut app, project);
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.dialog().unwrap();
+            let mut state = Tree::new(element.as_widget());
+            let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
+            let point = bounds[&removal_control_id(old, role).to_string()].center();
+            assert!(removal_pointer_event(&mut element, &mut state, &renderer, &node, point, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty());
+            drop(element);
+            let current = open_removal(&mut app, project);
+            let mut element = app.dialog().unwrap();
+            // Match the pinned iced runtime: named widget state is lifted before
+            // keyed diff and restored afterward. A key alone is insufficient.
+            tree::NAMED.with(|named| *named.borrow_mut() = state.take_all_named());
+            state.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut state);
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
+            let current_point = bounds[&removal_control_id(current, role).to_string()].center();
+            assert_eq!(point, current_point);
+            assert!(removal_pointer_event(&mut element, &mut state, &renderer, &node, current_point, mouse::Event::ButtonReleased(mouse::Button::Left)).is_empty());
+            assert!(removal_pointer_event(&mut element, &mut state, &renderer, &node, current_point, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty());
+            let messages = removal_pointer_event(&mut element, &mut state, &renderer, &node, current_point, mouse::Event::ButtonReleased(mouse::Button::Left));
+            assert_eq!(messages.len(), 1, "the actual current button still works");
+            assert!(match &messages[0] {
+                Message::ProjectUi(Action::DismissRemove(request)) if role == "cancel" => *request == current,
+                Message::ProjectUi(Action::ConfirmRemove(request)) if role == "confirm" => *request == current,
+                _ => false,
+            });
+        }
+    }
+
     #[test]
     fn opened_project_and_worktree_removal_focus_the_cancel_button() {
         let repository = PathBuf::from("/focus-repo");
@@ -4783,7 +4931,7 @@ mod tests {
         });
         assert_eq!(
             super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
-            Some(widget::Id::new("dialog.project.remove.cancel")),
+            Some(removal_control_id(app.project_ui.removal_request().unwrap(), "cancel")),
         );
         // The primary worktree refusal is synchronous, so the actual opening
         // task contains only focus operations and cannot start a daemon.

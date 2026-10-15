@@ -15864,7 +15864,8 @@ impl Application for Cagents {
                         ));
                     }
                     if self.project_ui.modal_open() {
-                        return self.handle_project_action(project_ui::Action::Dismiss);
+                        let action = self.project_dialog_dismiss_action();
+                        return self.handle_project_action(action);
                     }
                     if self.sidebar_selection_ui.dialog.is_some() {
                         return self
@@ -16856,12 +16857,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(surface) = self.project_dialog_view() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
-                1.0,
-            ));
+        if let Some(dialog) = self.project_dialog_overlay() {
+            return Some(dialog);
         }
         if let Some(surface) = self.channel_dialog_view() {
             return Some(dialog_ui::overlay(
