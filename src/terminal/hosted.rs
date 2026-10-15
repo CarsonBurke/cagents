@@ -1061,6 +1061,9 @@ impl HostedTerminalHandle {
         })
     }
 
+    #[cfg(feature = "ui")]
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool { Arc::ptr_eq(&self.inner, &other.inner) }
+
     pub fn terminal_id(&self) -> TerminalId {
         self.inner.terminal_id
     }

@@ -41,6 +41,8 @@ impl TerminalSurface {
         self.handle.terminal_id()
     }
 
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool { self.handle.same_attachment(&other.handle) }
+
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
         self.handle.snapshot()
     }

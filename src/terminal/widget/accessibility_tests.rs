@@ -956,3 +956,98 @@ fn key_released_during_review_pairs_after_exit_without_requiring_a_blur() {
     dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::RedrawRequested(Instant::now())));
     assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key { .. })));
 }
+
+
+#[test]
+fn unmounted_pressed_keys_remain_owned_across_review_and_replacement_widgets() {
+    let original=Peer::new(); let replacement=Peer::new(); let renderer=renderer();
+    let shared=ReviewInputBarrier::default();
+    let mut old=widget(&original,"same-card",shared.clone(),true,false);
+    old.on_shortcut=None;
+    let mut old_tree=widget_tree(&old);
+    dispatch(&mut old,&mut old_tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
+    assert_eq!(original.fence().iter().filter(|request| matches!(request,ClientRequest::Key { input,.. } if input.action==KeyAction::Press)).count(),1);
+    drop(old_tree); drop(old);
+    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"tree Drop must not emit PTY input");
+    shared.flush_orphans(true);
+    let release=key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,false);
+    let Event::Keyboard(released)=&release else { unreachable!() };
+    shared.observe_key_event(released);
+    shared.flush_orphans(true);
+    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"Review keeps orphan cleanup deferred");
+    let mut current=widget(&replacement,"same-card",shared.clone(),true,true);
+    current.on_shortcut=None;
+    let mut current_tree=widget_tree(&current);
+    dispatch(&mut current,&mut current_tree,&renderer,Event::Window(window::Event::RedrawRequested(Instant::now())));
+    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })));
+    current.suppress_focus_reports=false; current.review_active=false; current.review_revision=1;
+    dispatch(&mut current,&mut current_tree,&renderer,Event::Window(window::Event::RedrawRequested(Instant::now())));
+    assert_eq!(original.fence().iter().filter(|request| matches!(request,ClientRequest::Key { input,.. } if input.action==KeyAction::Release)).count(),1);
+    dispatch(&mut current,&mut current_tree,&renderer,release);
+    assert!(!replacement.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"an old physical release cannot target a replacement attachment");
+    shared.flush_orphans(false);
+    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"cleanup is admitted once");
+}
+
+#[test]
+fn window_activation_property_survives_a_real_inactive_window_diff() {
+    let peer=Peer::new(); let renderer=renderer();
+    let mut widget=widget(&peer,"window-focus",ReviewInputBarrier::default(),true,false);
+    widget.on_shortcut=None;
+    let mut tree=widget_tree(&widget);
+    dispatch(&mut widget,&mut tree,&renderer,Event::Window(window::Event::Unfocused));
+    widget.window_focused=false;
+    widget.diff(&mut tree);
+    dispatch(&mut widget,&mut tree,&renderer,Event::Window(window::Event::RedrawRequested(Instant::now())));
+    assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()),"window activation must not erase native widget focus");
+    dispatch(&mut widget,&mut tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
+    assert!(!peer.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })));
+    widget.window_focused=true; widget.diff(&mut tree);
+    dispatch(&mut widget,&mut tree,&renderer,Event::Window(window::Event::Focused));
+    dispatch(&mut widget,&mut tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
+    dispatch(&mut widget,&mut tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,false));
+    assert_eq!(peer.fence().iter().filter(|request| matches!(request,ClientRequest::Key { .. })).count(),2);
+}
+
+#[test]
+fn window_key_ownership_has_a_fixed_admission_budget() {
+    let peer=Peer::new(); let surface=TerminalSurface::from(peer.handle.clone());
+    let barrier=ReviewInputBarrier::default();
+    let input=key_press(&keyboard::Key::Named(keyboard::key::Named::Enter),&keyboard::Key::Named(keyboard::key::Named::Enter),
+        keyboard::key::Physical::Code(keyboard::key::Code::Enter),keyboard::Modifiers::empty(),None,false);
+    for code in 0..512 {
+        let physical=keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(code));
+        assert!(barrier.can_admit(physical,&surface));
+        barrier.admitted(physical,&surface,input.clone());
+    }
+    let extra=keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(513));
+    assert!(!barrier.can_admit(extra,&surface));
+    let first=keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(0));
+    barrier.paired(first,&surface);
+    assert!(barrier.can_admit(extra,&surface));
+}
+
+
+#[test]
+fn native_release_observation_cannot_clear_a_newer_review_press_from_an_old_app_message() {
+    let peer=Peer::new(); let renderer=renderer(); let shared=ReviewInputBarrier::default();
+    let trace=crate::input_trace::InputTrace::default(); trace.bind_terminal_keys(shared.clone());
+    let mut old=widget(&peer,"batched-old",shared.clone(),true,false); old.on_shortcut=None;
+    let mut old_tree=widget_tree(&old);
+    dispatch(&mut old,&mut old_tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
+    peer.fence(); drop(old_tree); drop(old);
+    let release=key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,false);
+    trace.record(&release);
+    // A later native press can run before the queued message for the release.
+    let mut current=widget(&peer,"batched-new",shared.clone(),true,true);
+    let mut tree=widget_tree(&current);
+    let press=key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true);
+    trace.record(&press);
+    dispatch(&mut current,&mut tree,&renderer,press.clone());
+    assert!(shared.owns_keyboard(&press));
+    // App update only attempts deferred cleanup. It never re-observes an old
+    // physical release after the newer native press has already been seen.
+    shared.flush_orphans(true);
+    assert!(shared.owns_keyboard(&press));
+    assert_no_pty_input(&peer.fence());
+}
