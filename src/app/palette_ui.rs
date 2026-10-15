@@ -3735,9 +3735,11 @@ mod tests {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             if account { app.settings.keyboard_shortcuts.open_agent_accounts = vec!["F10".into()]; }
             else { app.settings.keyboard_shortcuts.open_automations = vec!["F10".into()]; }
-            assert_eq!(workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts), vec!["F10".to_owned()]);
+            assert_eq!(workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts), "F10");
             assert!(app.command_available(command));
-            assert!(app.palette_entries(Some(">" )).iter().any(|entry| matches!(entry, Entry::Item(item) if matches!(&item.action, Message::Palette(Action::RunCommand(found)) if *found == command))));
+            app.palette.query = Some(">".into());
+            assert!(app.palette_entries().iter().any(|(_, _, message)| matches!(message, Message::RunCommand(found) if *found == command)));
+            drop(app.update_palette(Action::Close));
             drop(app.update(Message::RunCommand(command)));
             assert!(app.durable.cards.iter().any(|card| card.existence.is_open() && if account { matches!(card.kind, CardKind::Accounts) } else { matches!(card.kind, CardKind::Automations) }));
         }
