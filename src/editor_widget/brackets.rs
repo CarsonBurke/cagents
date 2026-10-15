@@ -8,18 +8,19 @@ fn lifetime(text: &str, index: usize) -> bool {
     length > 0 && tail.get(length) != Some(&b'\'')
 }
 
-pub(super) fn on_line(text: &str, mut block: bool) -> (Vec<(usize, char)>, bool, bool) {
-    let bytes = text.as_bytes(); let mut tokens = Vec::new(); let mut index = 0; let mut starts_in_block = block;
+pub(super) fn on_line(text: &str, mut block: usize) -> (Vec<(usize, char)>, usize) {
+    let bytes = text.as_bytes(); let mut tokens = Vec::new(); let mut index = 0;
     while index < bytes.len() {
-        if block {
-            if bytes.get(index..index+2) == Some(b"*/") { block = false; index += 2; } else { index += 1; }
+        if block > 0 {
+            if bytes.get(index..index+2) == Some(b"/*") { block += 1; index += 2; }
+            else if bytes.get(index..index+2) == Some(b"*/") { block -= 1; index += 2; }
+            else { index += 1; }
             continue;
         }
         match bytes[index] {
             b'/' if bytes.get(index+1) == Some(&b'/') => break,
             b'#' if text[..index].trim().is_empty() && !bytes.get(index+1).is_some_and(|next| matches!(next, b'[' | b'!')) => break,
-            b'/' if bytes.get(index+1) == Some(&b'*') => { block = true; index += 2; },
-            b'*' if bytes.get(index+1) == Some(&b'/') => { starts_in_block = true; tokens.clear(); index += 2; },
+            b'/' if bytes.get(index+1) == Some(&b'*') => { block = 1; index += 2; },
             quote @ (b'"' | b'\'') if quote == b'"' || (!lifetime(text, index) && bytes[index+1..].contains(&quote)) => {
                 index += 1;
                 while index < bytes.len() {
@@ -32,7 +33,7 @@ pub(super) fn on_line(text: &str, mut block: bool) -> (Vec<(usize, char)>, bool,
             _ => index += 1,
         }
     }
-    (tokens, block, starts_in_block)
+    (tokens, block)
 }
 
 #[cfg(test)]
@@ -40,11 +41,14 @@ mod tests {
     use super::*;
     #[test]
     fn comments_quotes_and_rust_lifetimes_do_not_hide_real_code_brackets() {
-        assert_eq!(on_line("fn a<'a>() { let x = \"}\"; /* { */", false).0.iter().map(|(_, bracket)| *bracket).collect::<String>(), "(){");
-        assert_eq!(on_line("// {", false).0, vec![]);
-        assert_eq!(on_line("fn a<'a>(x: &'a str) {", false).0.iter().map(|(_, bracket)| *bracket).collect::<String>(), "(){");
-        assert!(on_line("/* {", false).1);
-        let (tokens, block, started) = on_line("} */ real()", false);
-        assert_eq!(tokens.iter().map(|(_, bracket)| *bracket).collect::<String>(), "()"); assert!(!block); assert!(started);
+        assert_eq!(on_line("fn a<'a>() { let x = \"}\"; /* { */", 0).0.iter().map(|(_, bracket)| *bracket).collect::<String>(), "(){");
+        assert_eq!(on_line("// {", 0).0, vec![]);
+        assert_eq!(on_line("fn a<'a>(x: &'a str) {", 0).0.iter().map(|(_, bracket)| *bracket).collect::<String>(), "(){");
+        assert_eq!(on_line("/* {", 0).1, 1);
+        let (tokens, block) = on_line("} */ real()", 1);
+        assert_eq!(tokens.iter().map(|(_, bracket)| *bracket).collect::<String>(), "()"); assert_eq!(block, 0);
+        let (_, block) = on_line("/* outer /* inner */", 0);
+        assert_eq!(block, 1);
+        assert!(on_line("} inside outer", block).0.is_empty());
     }
 }
