@@ -661,7 +661,7 @@ impl Cagents {
             // lease. Reloading the displayed scope must keep its watch alive.
             .chain(
                 self.worktree_selection
-                    .pending_directory()
+                    .pending_paths()
                     .map(Path::to_owned),
             )
             .collect::<HashSet<_>>();

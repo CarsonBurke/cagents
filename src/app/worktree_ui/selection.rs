@@ -3,6 +3,9 @@ use super::*;
 use crate::chat;
 use std::sync::Mutex;
 
+mod resume;
+use crate::app::resume_ui::placement;
+
 #[derive(Default)]
 pub(in crate::app) struct State {
     generation: u64,
@@ -12,6 +15,7 @@ pub(in crate::app) struct State {
     pub(super) inflight: HashSet<u64>,
     /// Keep lexical and physical watches alive until this navigation retires.
     requested: Option<PathBuf>,
+    additional_paths: HashSet<PathBuf>,
     #[cfg(test)]
     local_window_override: Option<bool>,
     #[cfg(test)]
@@ -25,14 +29,15 @@ impl State {
         self.generation
     }
 
-    pub(super) fn pending_directory(&self) -> Option<&Path> {
-        self.requested.as_deref()
+    pub(super) fn pending_paths(&self) -> impl Iterator<Item = &Path> {
+        self.requested.iter().chain(self.additional_paths.iter()).map(PathBuf::as_path)
     }
 
     pub(in crate::app) fn cancel(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
         self.requested = None;
+        self.additional_paths.clear();
     }
 }
 
@@ -65,6 +70,11 @@ pub(in crate::app) enum Intent {
         beside: Option<CardId>,
         ephemeral: bool,
     },
+    ResumePlacement {
+        entry: crate::persistence::SavedConversation,
+        replace: Option<CardId>,
+        snapshot: placement::Snapshot,
+    },
     Resume {
         entry: crate::persistence::SavedConversation,
         replace: Option<CardId>,
@@ -89,6 +99,7 @@ struct Prepared {
     path: PathBuf,
     canonical: Vec<(PathBuf, PathBuf)>,
     guard: Option<crate::worktree_cleanup::Protection>,
+    resume: Option<placement::Resolved>,
 }
 
 #[derive(Clone)]
@@ -193,6 +204,10 @@ impl Cagents {
         create: bool,
         intent: Intent,
     ) -> Task<Message> {
+        let intent = match intent {
+            Intent::ResumePlacement { entry, replace, .. } => return self.select_resume_then(entry, replace),
+            other => other,
+        };
         let local_window = crate::instance::window_is_initialized() && !crate::device::is_remote();
         #[cfg(test)]
         let local_window = self.worktree_selection.local_window_override.unwrap_or(local_window);
@@ -231,7 +246,7 @@ impl Cagents {
         // existing synchronous navigation semantics; production takes the
         // exact same commit path after off-thread preparation.
         if !local_window {
-            let scope = self.commit_worktree_selection_scope(path, create, &intent);
+            let scope = self.commit_worktree_selection_scope(path, create, &intent, None);
             let initialization = self.initialize_prepared_scope_runtimes();
             let after = self.finish_worktree_selection(intent);
             return Task::batch([
@@ -360,6 +375,7 @@ impl Cagents {
                             Intent::Channel { id, path, .. } => {
                                 self.channel_scope_path(*id).as_ref() == Some(path)
                             }
+                            Intent::ResumePlacement { entry, snapshot, .. } => snapshot.still_current(self, entry.card, &entry.session),
                             _ => true,
                         }
                         && result.is_ok()
@@ -386,6 +402,20 @@ impl Cagents {
         > + Send
         + 'static,
     ) -> Task<Message> {
+        self.prepare_worktree_selection_receipt(generation, path, create, intent, epoch, move |path| {
+            prepare(path).map(|(path, canonical, guard)| Prepared { path, canonical, guard, resume: None })
+        })
+    }
+
+    fn prepare_worktree_selection_receipt(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        create: bool,
+        intent: Intent,
+        epoch: u64,
+        prepare: impl FnOnce(PathBuf) -> Result<Prepared, String> + Send + 'static,
+    ) -> Task<Message> {
         self.worktree_selection.inflight.insert(generation);
         self.worktree_selection.requested = Some(path.clone());
         let roots = self.known_worktree_roots.clone();
@@ -394,12 +424,7 @@ impl Cagents {
             let result = tokio::task::spawn_blocking(move || prepare(path))
                 .await
                 .map_err(|error| error.to_string())
-                .and_then(|value| value)
-                .map(|(path, canonical, guard)| Prepared {
-                    path,
-                    canonical,
-                    guard,
-                });
+                .and_then(|value| value);
             Message::WorktreeSelectionPrepared {
                 generation,
                 create,
@@ -417,6 +442,9 @@ impl Cagents {
         receipt: Receipt,
     ) -> Task<Message> {
         let task = self.apply_worktree_selection_prepared(generation, create, receipt);
+        if generation == self.worktree_selection.generation && !self.worktree_selection.pending {
+            self.worktree_selection.additional_paths.clear();
+        }
         // The consumed receipt and every uninstalled guard have dropped before
         // a deletion continuation can attempt its exclusive directory lease.
         self.worktree_selection.inflight.remove(&generation);
@@ -443,6 +471,28 @@ impl Cagents {
         self.refresh_worktree_owners(Some(&requested));
         if roots != self.known_worktree_roots || epoch != self.worktree_owner_paths.watch.epoch() {
             return self.select_worktree_then(requested, create, intent);
+        }
+        if let Intent::ResumePlacement { entry, snapshot, .. } = &intent
+            && !snapshot.still_current(self, entry.card, &entry.session)
+        {
+            drop(result);
+            if let Intent::ResumePlacement { entry, replace, .. } = intent {
+                return self.select_resume_then(entry, replace);
+            }
+            unreachable!();
+        }
+        if let Intent::ResumePlacement { entry, .. } = &intent
+            && result.is_ok()
+            && self.existing_conversation_card(&entry.session).is_some()
+        {
+            // Another adoption may have opened this exact logical session
+            // while its directory was being inspected. Reuse it through the
+            // protected focus path before creating a channel or another pane.
+            drop(result);
+            if let Intent::ResumePlacement { entry, .. } = intent {
+                return self.resume_saved_conversation(entry);
+            }
+            unreachable!();
         }
         if let Intent::Channel { id, path, .. } = &intent
             && self.channel_scope_path(*id).as_ref() != Some(path)
@@ -485,7 +535,7 @@ impl Cagents {
         self.worktree_protection_sync.invalidate();
         self.worktree_owner_paths
             .install_prepared(prepared.canonical);
-        let selected = self.commit_worktree_selection_scope(prepared.path, create, &intent);
+        let selected = self.commit_worktree_selection_scope(prepared.path, create, &intent, prepared.resume.as_ref());
         let initialization = self.initialize_prepared_scope_runtimes();
         let after = self.finish_worktree_selection_with_context(intent, context_scope);
         Task::batch([
@@ -510,8 +560,12 @@ impl Cagents {
         path: PathBuf,
         create: bool,
         intent: &Intent,
+        resume: Option<&placement::Resolved>,
     ) -> Task<Message> {
         match intent {
+            Intent::ResumePlacement { entry, .. } => self.commit_resumed_selection_scope(
+                resume.expect("resume destination travels with its physical guard"), &entry.title,
+            ),
             Intent::Channel { id, .. } => self.select_channel_inner(*id),
             _ => self.select_worktree_inner(path, create),
         }
@@ -577,7 +631,7 @@ impl Cagents {
                 beside,
                 ephemeral,
             } => self.insert_chat_card_with_lifetime(session, beside, ephemeral, None),
-            Intent::Resume { entry, replace } => self.commit_resumed_conversation(entry, replace),
+            Intent::ResumePlacement { entry, replace, .. } | Intent::Resume { entry, replace } => self.commit_resumed_conversation(entry, replace),
             Intent::Focus { card, activate } => {
                 self.set_terminal_review_owner(None);
                 let focus = self.focus_workspace_card(card);

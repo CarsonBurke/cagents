@@ -723,7 +723,7 @@ impl Cagents {
         state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
     }
 
-    fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
+    pub(super) fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
         self.durable
             .cards
             .iter()
@@ -808,12 +808,6 @@ impl Cagents {
 
     fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
         let mut session = entry.session;
-        if !session.launch.recipe.working_directory.is_dir()
-            && !session.launch.needs_read_only_history()
-        {
-            self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
-            return Task::none();
-        }
         if !matches!(
             session.native_continuity,
             chat::NativeContinuity::Durable { .. }
@@ -826,11 +820,7 @@ impl Cagents {
         let replace = self.resume_ui.replace;
         self.close_resume();
         let entry = SavedConversation { session, ..entry };
-        self.select_worktree_then(
-            entry.session.launch.recipe.working_directory.clone(),
-            false,
-            worktree_ui::selection::Intent::Resume { entry, replace },
-        )
+        self.select_resume_then(entry, replace)
     }
 
     pub(super) fn commit_resumed_conversation(
@@ -1092,7 +1082,9 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let entry = saved(directory.path());
         let original = entry.session.clone();
-        let _ = app.resume_saved_conversation(entry);
+        let prepare = app.resume_saved_conversation(entry);
+        let prepared = crate::app::tests::task_app_message(prepare);
+        drop(app.update(prepared));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         let CardKind::Chat(session) = &card.kind else {
             panic!("native conversation")
