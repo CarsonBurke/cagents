@@ -160,6 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_pins_the_callers_descriptor_and_rolls_back_on_a_racing_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();
+        let mut registry = Registry::at(&fixture.path().join("registry.sqlite3")).unwrap();
+        let first = accepted(&mut registry, &old, "original");
+        let pinned = registry.agent_directory(first.agent.id).unwrap().unwrap();
+        let request = registry.agent_request(first.run.id).unwrap();
+        let moved = fixture.path().join("moved"); std::fs::rename(&old, &moved).unwrap(); std::fs::create_dir(&old).unwrap();
+        let mut racing = request;
+        racing.idempotency_key = "racing-replacement".into();
+        let before = registry.agents(None).unwrap().len();
+        assert!(registry.submit_agent_with_directory(&Origin::User, &racing, None, Some(pinned), 2).unwrap_err().contains("changed during acceptance"));
+        assert_eq!(registry.agents(None).unwrap().len(), before);
+    }
+
+    #[test]
     fn wrong_inode_locate_retains_state_and_refuses_existing_execution() {
         let fixture = tempfile::tempdir().unwrap();
         let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();

@@ -668,11 +668,29 @@ impl Registry {
         selected: Option<&crate::agent_execution::Spec>,
         now_ms: u64,
     ) -> Result<Accepted, String> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
+        self.submit_agent_with_directory(origin, request, selected, None, now_ms)
+    }
+
+    /// The UI/CLI selected directory is opened before acceptance and retained
+    /// through dispatch. Pin that exact descriptor's identity in this same
+    /// acceptance transaction; a racing path replacement rolls back acceptance.
+    pub(crate) fn submit_agent_with_directory(
+        &mut self,
+        origin: &Origin,
+        request: &Submit,
+        selected: Option<&crate::agent_execution::Spec>,
+        directory: Option<crate::agent_execution::DirectoryIdentity>,
+        now_ms: u64,
+    ) -> Result<Accepted, String> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
         let accepted = Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms)?;
+        if accepted.created && matches!(request.destination, Destination::New(_)) {
+            if let Some(directory) = directory {
+                let stored: Option<String> = tx.query_row("SELECT directory FROM agent_policies WHERE agent=?1", [accepted.agent.id.to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?.flatten();
+                if stored.map(|value| decode::<crate::agent_execution::DirectoryIdentity>(&value)).transpose()?.is_some_and(|stored| stored != directory) { return Err("The selected agent directory changed during acceptance".into()); }
+                tx.execute("INSERT INTO agent_policies(agent,directory) VALUES (?1,?2) ON CONFLICT(agent) DO UPDATE SET directory=excluded.directory", params![accepted.agent.id.to_string(), encode(&directory)?]).map_err(|error| error.to_string())?;
+            }
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
