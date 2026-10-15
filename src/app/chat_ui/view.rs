@@ -4638,12 +4638,33 @@ mod tests {
 
     #[test]
     fn recorded_timestamp_changes_refresh_retained_footer_without_heartbeat_churn() {
+        use iced::advanced::{Layout, layout, widget::{Operation, Tree}};
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) { self.0.push(text.to_owned()); }
+        }
         let at = 1_700_000_000_000;
         let item = chat::Item { id: "dated-retained-answer".into(), role: chat::Role::Assistant, at: Some(at), started_at: Some(at - 120_000),
             content: ItemContent::Text { text: "Finished answer".into(), thinking: false, phase: chat::Phase::Final } };
         let (mut runtime, handle) = frame_cost::live_runtime(&[item]);
         let mut before = runtime.turn_fingerprint(&runtime.turns[0], false);
         let revision = runtime.cache["dated-retained-answer"].revision;
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(runtime.find_turn_view_for_test().as_widget());
+        let inspect = |runtime: &Runtime, tree: &mut Tree| {
+            let mut element = runtime.find_turn_view_for_test();
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1000.0)));
+            let mut texts = Texts::default();
+            element.as_widget_mut().operate(tree, Layout::new(&node), &renderer, &mut texts);
+            texts.0
+        };
+        let initial = runtime.cache["dated-retained-answer"].stamp.as_ref().unwrap().1.clone();
+        assert!(inspect(&runtime, &mut tree).contains(&initial));
+        let mut previous_label = Some(initial);
         for (recorded, changes_label) in [(Some(at + 1), false), (Some(at + 60_000), true), (None, true)] {
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
@@ -4654,6 +4675,13 @@ mod tests {
             let after = runtime.turn_fingerprint(&runtime.turns[0], false);
             assert_eq!(after != before, changes_label, "retained footer tracks its visible time, not subminute observations");
             before = after;
+            let texts = inspect(&runtime, &mut tree);
+            let label = runtime.cache["dated-retained-answer"].stamp.as_ref().map(|stamp| stamp.1.clone());
+            if let Some(label) = &label { assert!(texts.contains(label), "same retained Tree draws current recorded label"); }
+            if let Some(previous) = &previous_label && label.as_ref() != Some(previous) {
+                assert!(!texts.contains(previous), "same retained Tree withdraws obsolete recorded time");
+            }
+            previous_label = label;
         }
     }
 
