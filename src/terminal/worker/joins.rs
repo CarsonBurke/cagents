@@ -61,9 +61,10 @@ fn service() -> Result<&'static Service, String> {
             loop {
                 active.extend(pending.try_iter());
                 let mut retry_at = None;
+                let observed_at = Instant::now();
                 active.retain(|owner| {
                     if matches!(owner.worker_join.load(Ordering::Acquire), 2 | 3) { return false; }
-                    if owner.join_escalation_at.get().is_some_and(|deadline| Instant::now() >= *deadline) {
+                    if owner.join_escalation_at.get().is_some_and(|deadline| observed_at >= *deadline) {
                         // Handoff and signaling share ownership admission.
                         // Retry only an expired, currently contended fence.
                         if !escalate_owned_root(owner) {
@@ -75,7 +76,7 @@ fn service() -> Result<&'static Service, String> {
                     true
                 });
                 let next = active.iter().filter_map(|owner|owner.join_escalation_at.get().copied())
-                    .filter(|deadline|*deadline>Instant::now()).chain(retry_at).min();
+                    .filter(|deadline|*deadline>observed_at).chain(retry_at).min();
                 let timer = next.map(|deadline|crossbeam_channel::after(deadline.saturating_duration_since(Instant::now())))
                     .unwrap_or_else(crossbeam_channel::never);
                 crossbeam_channel::select! {
