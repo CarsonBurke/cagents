@@ -519,24 +519,34 @@ impl Cagents {
         let mut loaded = HashMap::new();
         for project in &self.sidebar_model.projects {
             if let Some(key) = project.folder_key() {
-                loaded.entry(project.repository.as_path())
+                loaded
+                    .entry(project.repository.as_path())
                     .or_insert((key.project_id, key.worktree_id));
             }
             for worktree in &project.worktrees {
-                loaded.entry(worktree.path.as_path())
+                loaded
+                    .entry(worktree.path.as_path())
                     .or_insert((project.id, worktree.id));
             }
         }
-        let attention = self.sidebar_state.attention_cards().collect::<HashSet<_>>()
-            .into_iter().map(|id| {
-                let owner = self.card_state(id)
-                    .filter(|card| card.existence.is_open()
-                        && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
-                        && !channeled.contains(&id))
+        let attention = self
+            .sidebar_state
+            .attention_cards()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|id| {
+                let owner = self
+                    .card_state(id)
+                    .filter(|card| {
+                        card.existence.is_open()
+                            && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                            && !channeled.contains(&id)
+                    })
                     .and_then(|card| self.unchanneled_card_worktree_indexed(card, &roots))
                     .and_then(|directory| loaded.get(directory).copied());
                 (id, owner)
-            }).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         self.sidebar_state.set_worktrees_with_panes(worktrees);
         for (id, owner) in attention {
             self.sidebar_state.reattribute_card_attention(id, owner);

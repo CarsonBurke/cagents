@@ -421,52 +421,92 @@ fn stable_activity_and_unread_move_on_structural_ownership_changes() {
 
 #[test]
 fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing() {
-    use crate::{agent::{Activity, ActivityState, Provider}, model::{ProjectKind, WorktreeId},
-        repository::RepositoryId, sidebar::{SidebarProject, SidebarWorktree}};
+    use crate::{
+        agent::{Activity, ActivityState, Provider},
+        model::{ProjectKind, WorktreeId},
+        repository::RepositoryId,
+        sidebar::{SidebarProject, SidebarWorktree},
+    };
     let mut app = super::tests::context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
-    let root = card_directory(app.card_state(card).unwrap()).unwrap().to_path_buf();
+    let root = card_directory(app.card_state(card).unwrap())
+        .unwrap()
+        .to_path_buf();
     let nested = root.join("nested-owner");
     let first = ProjectId::new();
     let second = ProjectId::new();
     let first_row = WorktreeId::new();
     let second_row = WorktreeId::new();
     let nested_row = WorktreeId::new();
-    let row = |id, path: PathBuf| SidebarWorktree::new(id, path, None, false, false, None, None, None);
+    fn row(id: WorktreeId, path: PathBuf) -> SidebarWorktree {
+        SidebarWorktree::new(id, path, None, false, false, None, None, None)
+    }
     app.sidebar_model.projects = vec![
-        SidebarProject::new(first, RepositoryId::new(), "Folder".into(), root.clone(),
-            vec![row(first_row, root.clone())], vec![]).with_kind(ProjectKind::Folder),
-        SidebarProject::new(second, RepositoryId::new(), "Repository".into(), root.clone(),
-            vec![row(second_row, root.clone()), row(nested_row, nested.clone())], vec![]),
+        SidebarProject::new(
+            first,
+            RepositoryId::new(),
+            "Folder".into(),
+            root.clone(),
+            vec![row(first_row, root.clone())],
+            vec![],
+        )
+        .with_kind(ProjectKind::Folder),
+        SidebarProject::new(
+            second,
+            RepositoryId::new(),
+            "Repository".into(),
+            root.clone(),
+            vec![row(second_row, root.clone()), row(nested_row, nested.clone())],
+            vec![],
+        ),
     ];
     let folder = app.sidebar_model.projects[0].folder_key().unwrap();
-    let working = Activity { provider: Provider::Claude, state: ActivityState::Working };
+    let working = Activity {
+        provider: Provider::Claude,
+        state: ActivityState::Working,
+    };
     app.sidebar_state.set_card_activity(card, working);
     app.sidebar_state.observe_card_update(card);
     app.refresh_sidebar_worktree_panes();
-    assert_eq!(app.sidebar_state.agent_activity(first, folder.worktree_id), Some(ActivityState::Working));
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        Some(ActivityState::Working)
+    );
     assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
     assert_eq!(app.sidebar_state.agent_activity(second, second_row), None);
     assert!(app.sidebar_state.worktree_has_panes(first, first_row));
     assert!(app.sidebar_state.worktree_has_panes(second, second_row));
     app.worktree_owners.insert(card, nested.clone());
-    Arc::make_mut(&mut app.durable).card_scopes.insert(card, root.clone());
+    Arc::make_mut(&mut app.durable)
+        .card_scopes
+        .insert(card, root.clone());
     app.refresh_sidebar_worktree_panes();
-    assert_eq!(app.sidebar_state.agent_activity(first, folder.worktree_id), None);
-    assert_eq!(app.sidebar_state.agent_activity(second, nested_row), Some(ActivityState::Working));
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        None
+    );
+    assert_eq!(
+        app.sidebar_state.agent_activity(second, nested_row),
+        Some(ActivityState::Working)
+    );
     assert!(app.sidebar_state.has_agent_update(second, nested_row));
     assert!(!app.sidebar_state.worktree_has_panes(first, first_row));
     assert!(app.sidebar_state.worktree_has_panes(second, nested_row));
     app.worktree_owners.remove(&card);
     Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
     app.known_worktree_roots.clear();
-    for project in &mut app.sidebar_model.projects { project.worktrees.clear(); }
+    for project in &mut app.sidebar_model.projects {
+        project.worktrees.clear();
+    }
     if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
         session.launch.working_directory = root.join("unregistered-child");
     }
     app.refresh_sidebar_worktree_panes();
-    assert_eq!(app.sidebar_state.agent_activity(first, folder.worktree_id), None,
-        "an exact folder key is not a newly discovered ancestor root");
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        None,
+        "an exact folder key is not a newly discovered ancestor root"
+    );
     assert!(app.sidebar_state.has_card_update(card));
     assert_eq!(app.sidebar_state.card_activity(card), Some(working));
 }
@@ -475,53 +515,106 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
 fn duplicate_full_reads_skip_projection_but_view_acknowledgements_do_not() {
     use crate::workspace_model::{WorkspaceModel, views::Scope};
     let mut app = super::tests::context_inspector_test_app(false);
-    let model = WorkspaceModel { identity: uuid::Uuid::new_v4(), sequence: 3,
-        ..WorkspaceModel::default() };
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Connected(model.clone()))));
+    let model = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 3,
+        ..WorkspaceModel::default()
+    };
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Connected(model.clone()),
+    )));
     reset();
     let durable = Arc::clone(&app.durable);
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model.clone()))));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(model.clone()),
+    )));
     assert_eq!(counts(), (0, 0));
     assert!(Arc::ptr_eq(&durable, &app.durable));
     let mut stale = model.clone();
     stale.sequence -= 1;
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(stale))));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(stale),
+    )));
     assert_eq!(counts(), (0, 0));
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::ViewApplied {
-        scope: Scope::Channel(crate::model::ChannelId::new()), operation: Some(uuid::Uuid::new_v4()),
-        model,
-    })));
-    assert_eq!(counts(), (1, 1), "equal contents cannot suppress the acknowledgement handler");
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::ViewApplied {
+            scope: Scope::Channel(crate::model::ChannelId::new()),
+            operation: Some(uuid::Uuid::new_v4()),
+            model,
+        },
+    )));
+    assert_eq!(
+        counts(),
+        (1, 1),
+        "equal contents cannot suppress the acknowledgement handler"
+    );
 }
 
 #[test]
 fn a_folded_agents_edge_does_not_hide_the_same_sequence_full_inventory() {
-    use crate::{agent::Provider, agent_execution::{Agent, Origin, Spec, Surface, Target},
-        workspace_model::{ModelEdit, WorkspaceModel, views::Scope}};
+    use crate::{
+        agent::Provider,
+        agent_execution::{Agent, Origin, Spec, Surface, Target},
+        workspace_model::{ModelEdit, WorkspaceModel, views::Scope},
+    };
     let mut app = super::tests::context_inspector_test_app(false);
-    let model = WorkspaceModel { identity: uuid::Uuid::new_v4(), sequence: 3,
-        ..WorkspaceModel::default() };
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Connected(model))));
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Edited {
-        sequence: 4, edit: ModelEdit::AgentsChanged,
-    })));
+    let model = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 3,
+        ..WorkspaceModel::default()
+    };
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Connected(model),
+    )));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Edited {
+            sequence: 4,
+            edit: ModelEdit::AgentsChanged,
+        },
+    )));
     assert_eq!(app.workspace_model.sequence, 4);
     assert!(app.workspace_model.agents.is_empty());
     let mut full = app.workspace_model.clone();
     let path = PathBuf::from("/inventory-fixture");
     full.agents.push(Agent {
-        id: crate::model::AgentId::new(), name: None, origin: Origin::User,
-        spec: Spec { provider: Provider::Claude, account: None,
-            target: Target { repository: path.clone(), directory: path.clone(), placement: None },
-            surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None },
-        placement: Scope::Worktree { repository: path.clone(), path },
-        session: None, console: None, created_ms: 0, closed: true,
+        id: crate::model::AgentId::new(),
+        name: None,
+        origin: Origin::User,
+        spec: Spec {
+            provider: Provider::Claude,
+            account: None,
+            target: Target {
+                repository: path.clone(),
+                directory: path.clone(),
+                placement: None,
+            },
+            surface: Surface::Chat,
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement: Scope::Worktree {
+            repository: path.clone(),
+            path,
+        },
+        session: None,
+        console: None,
+        created_ms: 0,
+        closed: true,
     });
     reset();
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(full.clone()))));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(full.clone()),
+    )));
     assert_eq!(app.workspace_model, full);
-    assert_eq!(counts(), (1, 1), "folding the edge did not provide its inventory");
+    assert_eq!(
+        counts(),
+        (1, 1),
+        "folding the edge did not provide its inventory"
+    );
     reset();
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(full))));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(full),
+    )));
     assert_eq!(counts(), (0, 0));
 }
