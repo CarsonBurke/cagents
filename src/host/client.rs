@@ -98,6 +98,7 @@ impl Drop for Registration {
         let client_id = self.client_id;
         let retired = self.retired.take();
         crate::terminal::transport::retire(move || {
+            super::deferred::disconnected(&host, client_id);
             disconnect_client(&host, client_id);
             if let Some(retired) = retired { retired(); }
         });
@@ -149,6 +150,7 @@ pub(crate) fn spawn(
 
 fn request_class(request: &ClientRequest) -> crate::terminal::transport::WorkClass {
     use crate::terminal::transport::WorkClass;
+    if super::deferred::is_deferred(request) { return WorkClass::Input; }
     match request {
         ClientRequest::Input { .. } | ClientRequest::Paste { .. } | ClientRequest::Key { .. }
         | ClientRequest::Mouse { .. } | ClientRequest::Focus { .. } | ClientRequest::Scroll { .. }
@@ -264,7 +266,13 @@ impl Session {
         // A request that panics has released every guard it held by the time
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
-        let request = envelope.request;
+        let prepared=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||super::deferred::try_defer(&host,client_id,request_id,delivery.clone(),envelope.request)))
+            .unwrap_or_else(|_|Err(ProtocolError::new(ProtocolErrorCode::Internal,"the daemon failed while admitting this provider control",false)));
+        let request=match prepared {
+            Ok(Some(request))=>request,
+            Ok(None) => return true,
+            Err(error) => return push_error(&delivery, &host, request_id, error).is_ok(),
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle(&host, client_id, request)
         }))

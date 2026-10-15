@@ -129,6 +129,7 @@ impl Handle {
 }
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
+    urgent_commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
@@ -285,6 +286,7 @@ impl Handle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
+        let (urgent_commands, urgent_incoming)=crossbeam_channel::bounded(1);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
             ..Snapshot::default()
@@ -306,6 +308,7 @@ impl Handle {
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
             commands,
+            urgent_commands,
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
@@ -356,6 +359,7 @@ impl Handle {
                     observe_next,
                     stop,
                     incoming,
+                    urgent_incoming,
                     wake: reader,
                     notify,
                     output: Vec::new(),
@@ -605,6 +609,18 @@ impl Handle {
             Err(_) => {} // The host publishes the still-owned interactive actor.
         }
         Ok(handle)
+    }
+    /// Admit a command without tying up an IPC input worker during provider
+    /// acknowledgement. The shared completion broker owns the bounded wait.
+    pub(crate) fn enqueue_command(&self, command:Command) -> Result<crossbeam_channel::Receiver<Result<(),String>>,String> {
+        if self.is_completed() || self.0.draining.load(Ordering::Acquire) {return Err("Provider process exited; restart the session to continue".into());}
+        if self.0.stop.load(Ordering::Acquire) {return Err("Chat is closing".into());}
+        let urgent=matches!(&command,Command::Interrupt);
+        let (reply,response)=crossbeam_channel::bounded(1);
+        let sender=if urgent {&self.0.urgent_commands} else {&self.0.commands};
+        sender.try_send((ActorCommand::Provider {run:None,command},reply)).map_err(|error|format!("Chat command queue unavailable: {error}"))?;
+        self.wake();
+        Ok(response)
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command).map_err(String::from)
@@ -1609,6 +1625,7 @@ struct Actor {
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
+    urgent_incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
@@ -2044,12 +2061,10 @@ impl Actor {
             // queued write: a provider that reads stdin only between turns keeps
             // `pending` non-empty for the whole turn, and refusing to drain there left
             // UI commands unacknowledged until the caller's 10 second timeout.
-            if self.queued > QUEUE_BACKPRESSURE {
-                break;
-            }
-            let Ok((command, reply)) = self.incoming.try_recv() else {
-                break;
-            };
+            let request=self.urgent_incoming.try_recv().ok().or_else(|| {
+                (self.queued<=QUEUE_BACKPRESSURE).then(||self.incoming.try_recv().ok()).flatten()
+            });
+            let Some((command,reply))=request else {break;};
             if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
