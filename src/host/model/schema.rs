@@ -84,6 +84,8 @@ fn open_existing(path: &Path, file: &File) -> Result<Connection, String> {
         let mode: String = db.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !mode.eq_ignore_ascii_case("wal") { return Err(format!("SQLite journal mode is `{mode}`, but WAL is required")); }
         db.pragma_update(None, "locking_mode", "NORMAL").map_err(|e| e.to_string())?;
+        let locking: String = db.pragma_query_value(Some(rusqlite::DatabaseName::Main), "locking_mode", |r| r.get(0)).map_err(|e|e.to_string())?;
+        if !locking.eq_ignore_ascii_case("normal") { return Err("SQLite could not release exclusive registry admission".into()); }
         // End the exclusive-lock lifetime only after persistent configuration.
         let release = db.transaction().map_err(|e| e.to_string())?;
         require_current(&release)?;
