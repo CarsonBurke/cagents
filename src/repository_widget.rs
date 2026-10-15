@@ -3139,6 +3139,7 @@ impl RepositoryRuntime {
     }
 
     fn select_cached_match(&mut self, occurrence: usize) -> Option<usize> {
+        let origin = self.current_location();
         let DocumentState::Editable(document) = &mut self.document else {
             return None;
         };
@@ -3155,6 +3156,9 @@ impl RepositoryRuntime {
             position: end,
             selection: Some(start),
         });
+        if let Some(origin) = origin && let Some(target) = self.current_location() {
+            self.locations.jump(origin, target);
+        }
         Some(total)
     }
 
