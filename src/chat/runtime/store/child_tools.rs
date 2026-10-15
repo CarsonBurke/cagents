@@ -549,19 +549,28 @@ impl Store {
         Ok(None)
     }
 
-    pub(super) fn child_adapter_item(
+    /// Flush writes before the caller opens the shared canonical read snapshot.
+    /// An unrelated child's pending append remains bounded and need not be written.
+    pub(super) fn flush_child_adapter_read(
         &mut self,
         key: &CanonicalItemKey,
-    ) -> Result<Option<Item>, String> {
-        if let Some(reason) = self.child_tools_unavailable {
-            return Err(reason.into());
-        }
+    ) -> Result<(), String> {
+        self.validate_child_adapter_key(key)?;
         if self.pending_child_tool.as_ref().is_some_and(|pending| {
             Some(&pending.agent) == key.agent_id.as_ref() && pending.id == key.item_id
         }) && let Some(warning) = self.flush_child_tool()?
         {
             return Err(warning);
         }
+        self.validate_child_adapter_key(key)
+    }
+
+    /// Validate cache hits inside the same read snapshot as the raw Store guard.
+    /// Never load tool metadata or bodies just to establish availability.
+    pub(super) fn validate_child_adapter_key(
+        &self,
+        key: &CanonicalItemKey,
+    ) -> Result<(), String> {
         if let Some(reason) = self.child_tools_unavailable {
             return Err(reason.into());
         }
@@ -572,9 +581,43 @@ impl Store {
         if agent.len() > KEY_BYTES || key.item_id.len() > KEY_BYTES {
             return Err("Delegated tool identity exceeds its canonical limit".into());
         }
-        if self.child_tool_revoked(agent, &key.item_id)? {
+        // Read the persisted tombstone even when this process did not write it.
+        // The caller's snapshot also pins Store owner/schema/reset authority.
+        let revoked: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2)",
+            params![agent, key.item_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if revoked {
             return Err("Delegated tool source was explicitly removed".into());
         }
+        let (bytes, items, chunks): (i64, i64, i64) = self.db.query_row(
+            "SELECT bytes,items,chunks FROM child_tool_budget WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|e| e.to_string())?;
+        if bytes < 0 || bytes > STORE_BYTES as i64
+            || items < 0 || items > STORE_ITEMS as i64
+            || chunks < 0 || chunks > STORE_CHUNKS as i64
+        {
+            return Err(BUDGET_ERROR.into());
+        }
+        Ok(())
+    }
+
+    /// Pure hydration: the caller must first flush, then hold one read snapshot
+    /// across raw authority validation and this complete canonical read.
+    pub(super) fn child_adapter_item(
+        &self,
+        key: &CanonicalItemKey,
+    ) -> Result<Option<Item>, String> {
+        self.validate_child_adapter_key(key)?;
+        if self.pending_child_tool.as_ref().is_some_and(|pending| {
+            Some(&pending.agent) == key.agent_id.as_ref() && pending.id == key.item_id
+        }) {
+            return Err("Delegated tool pending bytes must be flushed before reading".into());
+        }
+        let agent = key.agent_id.as_ref().ok_or("A delegated tool requires its exact child identity")?;
         let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?3 THEN metadata ELSE NULL END,len0,len1,CASE WHEN length(spans)<=?3 THEN spans ELSE NULL END FROM child_tools WHERE agent=?1 AND id=?2",params![agent,key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,Option<Vec<u8>>>(3)?))).optional().map_err(|e|e.to_string())?;
         let Some((metadata, len0, len1, spans)) = record else {
             return Ok(None);
@@ -828,9 +871,61 @@ mod tests {
         );
     }
     fn read(store: &mut Store, agent: &str, id: &str) -> Option<Item> {
-        store
-            .child_adapter_item(&CanonicalItemKey::new(Some(agent), id))
-            .unwrap()
+        let key = CanonicalItemKey::new(Some(agent), id);
+        store.flush_child_adapter_read(&key).unwrap();
+        store.child_adapter_item(&key).unwrap()
+    }
+
+    #[test]
+    fn canonical_child_read_is_immutable_and_requires_an_explicit_matching_flush() {
+        let mut store = Store::new().unwrap();
+        put(&mut store, "one", tool("tool", "original", ""));
+        store.apply(Event::SubagentOutputDelta {
+            id: "one".into(), item_id: "tool".into(), offset: 0, delta: "exact suffix".into(),
+        }).unwrap();
+        let key = CanonicalItemKey::new(Some("one"), "tool");
+        let before = store.db.total_changes();
+        assert!(store.child_adapter_item(&key).unwrap_err().contains("must be flushed"));
+        assert_eq!(store.db.total_changes(), before);
+        let other = CanonicalItemKey::new(Some("two"), "missing");
+        store.flush_child_adapter_read(&other).unwrap();
+        assert!(store.pending_child_tool.is_some(), "unrelated hydration must not force append writes");
+        store.flush_child_adapter_read(&key).unwrap();
+        assert!(store.pending_child_tool.is_none());
+        // This is the same read-only access pattern used under the parent's
+        // Store authority transaction; hydration itself cannot begin writes.
+        store.db.execute_batch("BEGIN").unwrap();
+        let before = store.db.total_changes();
+        let exact = store.child_adapter_item(&key).unwrap().unwrap();
+        assert!(matches!(exact.content, ItemContent::Tool { output, .. } if output == "exact suffix"));
+        store.validate_child_adapter_key(&key).unwrap();
+        assert_eq!(store.db.total_changes(), before);
+        store.db.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn resident_child_key_validation_reads_tombstones_and_scalar_quota_without_body_reads() {
+        let mut store = Store::new().unwrap();
+        put(&mut store, "one", tool("tool", "exact", ""));
+        let key = CanonicalItemKey::new(Some("one"), "tool");
+        store.db.execute("UPDATE child_tools SET metadata=zeroblob(?1)", [METADATA_LIMIT + 1]).unwrap();
+        store.validate_child_adapter_key(&key).unwrap();
+        assert!(store.child_adapter_item(&key).is_err());
+        assert!(!store.child_tools_have_revocations);
+        store.db.execute("INSERT INTO child_tool_revoked VALUES('one','tool')", []).unwrap();
+        assert!(store.validate_child_adapter_key(&key).unwrap_err().contains("explicitly removed"));
+        store.db.execute("DELETE FROM child_tool_revoked", []).unwrap();
+        for column in ["bytes", "items", "chunks"] {
+            let original: i64 = store.db.query_row(&format!("SELECT {column} FROM child_tool_budget"), [], |row| row.get(0)).unwrap();
+            for invalid in [-1_i64, i64::MAX] {
+                store.db.execute(&format!("UPDATE child_tool_budget SET {column}=?1"), [invalid]).unwrap();
+                assert!(store.validate_child_adapter_key(&key).is_err());
+            }
+            store.db.execute(&format!("UPDATE child_tool_budget SET {column}=?1"), [original]).unwrap();
+        }
+        store.validate_child_adapter_key(&key).unwrap();
+        store.db.execute("DELETE FROM child_tool_budget", []).unwrap();
+        assert!(store.validate_child_adapter_key(&key).is_err());
     }
 
     #[test]
@@ -1433,11 +1528,9 @@ mod tests {
                 delta: "lost prefix".into(),
             })
             .unwrap();
-        assert!(
-            store
-                .child_adapter_item(&CanonicalItemKey::new(Some("child"), "tool"))
-                .is_err()
-        );
+        assert!(store.flush_child_adapter_read(
+            &CanonicalItemKey::new(Some("child"), "tool")
+        ).is_err());
         assert!(store.child_tools_unavailable.is_some());
     }
 
