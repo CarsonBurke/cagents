@@ -639,6 +639,11 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
+    #[cfg(test)]
+    pub(super) fn refuse_writes_for_test(&self) {
+        self.db.pragma_update(None, "query_only", true).unwrap();
+    }
+
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
         if let Some(seal) = &self.messages {
             match &mut event {

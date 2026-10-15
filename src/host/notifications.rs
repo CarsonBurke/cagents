@@ -934,6 +934,36 @@ mod tests {
     }
 
     #[test]
+    fn actual_scheduler_fifo_applies_preview_policy_before_both_commit_receipts() {
+        for previews in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut journal = Journal::open(&directory.path().join("scheduler.sqlite3")).unwrap();
+            let (shared, _) = shared();
+            let handle = Handle(shared.clone());
+            let mut event = Event::session(TerminalId::new(), crate::agent::Provider::Claude,
+                "/repo".into(), crate::notifications::Evidence {
+                    key: "scheduler-private-content".into(),
+                    kind: crate::notifications::Kind::AutomationSkipped,
+                });
+            event.target = Target::Automation { id: Uuid::new_v4(), name: "Fixture".into(), reason: "No capacity".into() };
+            event.content = Some(crate::notifications::Content {
+                conversation: "Private conversation".into(), preview: "Private response".into(), request: None,
+            });
+            handle.record(event.clone());
+            assert!(handle.take_automation_receipts().is_empty());
+            let queued = shared.pending.lock().unwrap().automation_events.pop_front().unwrap();
+            let (reply, result) = std::sync::mpsc::channel();
+            let policy = Preferences { message_previews: previews, ..Default::default() };
+            let notice = journal_event_with_actor_receipt(&mut journal, &Arc::downgrade(&shared),
+                queued, false, Some(reply), &policy).unwrap().unwrap();
+            assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+            assert_eq!(notice.event.content.is_some(), previews);
+            assert_eq!(handle.take_automation_receipts(), BTreeSet::from([event.evidence.key]));
+            assert_eq!(journal.list().unwrap()[0].event.content.is_some(), previews);
+        }
+    }
+
+    #[test]
     fn helper_attention_receipt_waits_for_the_actual_durable_journal_commit() {
         let (shared, _receiver) = shared();
         let handle = Handle(shared.clone());
