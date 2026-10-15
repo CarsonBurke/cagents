@@ -14761,6 +14761,11 @@ mod worktree_journal_tests {
 
     #[cfg(target_os = "linux")]
     fn isolated_creation_fixture(name: &str) -> bool {
+        // module_path! includes the crate root, whereas libtest names start
+        // at the first module. Strip exactly that compile-time crate prefix.
+        let name = name
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(name);
         const MARKER: &str = "CAGENTS_RETAINED_CREATION_FIXTURE";
         if std::env::var_os(MARKER).as_deref() == Some(OsStr::new(name)) {
             return false;
@@ -15156,11 +15161,17 @@ mod worktree_journal_tests {
             return;
         }
         let fixture = Fixture::new();
-        let refused = RetainedWorktreeCreation::not_started(&fixture.request, 19,
-            "Original creation source is unavailable".into());
+        let refused = RetainedWorktreeCreation::not_started(
+            &fixture.request,
+            19,
+            "Original creation source is unavailable".into(),
+        );
         assert_eq!(refused.report.operation_id, fixture.request.operation_id);
         assert_eq!(refused.report.generation, 19);
-        assert_eq!(refused.report.request.as_ref().unwrap().destination, fixture.request.destination);
+        assert_eq!(
+            refused.report.request.as_ref().unwrap().destination,
+            fixture.request.destination
+        );
         assert_eq!(refused.report.state, WorktreeOperationState::NotCreated);
         assert!(refused.report.outcome.is_none());
         assert!(refused.created.is_none());
