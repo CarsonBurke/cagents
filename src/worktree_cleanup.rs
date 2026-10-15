@@ -625,6 +625,9 @@ mod tests {
         std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\n").unwrap();
         std::fs::write(worktree.join(".env"), "preserve secret").unwrap();
         assert!(checked_record(&request).unwrap_err().contains("ignored files .env"));
+        // Exercise the production preparation entrypoint: ignored user data
+        // refuses before GitHub or removal can be reached, leaving it on disk.
+        assert!(matches!(PreparedRemoval::prepare(request.clone()), Err(reason) if reason.contains("ignored files .env")));
         assert_eq!(std::fs::read_to_string(worktree.join(".env")).unwrap(), "preserve secret");
         std::fs::remove_file(worktree.join(".env")).unwrap();
         std::fs::create_dir_all(worktree.join("target/nested")).unwrap();

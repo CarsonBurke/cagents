@@ -85,7 +85,7 @@ terminal_scrollback_lines = 10000
 link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
 pull_request_open_target = "review"
-managed_worktree_directory = "worktrees/"
+managed_worktree_directory = ".worktrees/"
 worktree_sort = "newest"
 editor_auto_save = true
 editor_wrap_lines = false
@@ -163,7 +163,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `link_open_destination` | string | `"integrated_browser"` | Where an ordinary link click opens: `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | The gesture that always opens the system browser: `"control_click"` or `"control_shift_click"`. The other gesture always opens the in-app browser |
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
-| `managed_worktree_directory` | string | `"worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
+| `managed_worktree_directory` | string | `".worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
@@ -403,3 +403,23 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+### Managed worktree safety
+
+New managed worktrees use `.worktrees/` by default. In-checkout managed directories
+are excluded through the clone's `info/exclude`; tracked `.gitignore` files are
+unchanged. Existing configured locations remain in use. Registered worktrees under
+the previous `worktrees/` directory stay in place and that directory is excluded
+on the next managed creation. Absolute and sibling locations are supported.
+
+Automatic merged-worktree cleanup checks uncommitted changes, untracked files and
+ignored user files. Ignored build directories are disposable by policy: defaults
+are `node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`,
+`.pytest_cache`, `.mypy_cache` and `.ruff_cache`. A directory name matches at any
+depth, including its nested contents; a regular file with the same name remains
+protected. All other ignored content, including `.env`, prevents cleanup.
+
+The per-project list is stored as a JSON array in the clone-local Git configuration
+key `cagents.cleanupDisposableDirectories`, shared by its linked worktrees. An
+empty array permits no ignored directories to be discarded. Values must be simple
+directory names, with no slashes, traversal components or control characters.

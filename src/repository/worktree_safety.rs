@@ -199,6 +199,12 @@ mod tests {
         assert_eq!(fresh.untracked, 1);
         assert_eq!(fresh.notable_ignored.len(), 1);
         assert_eq!(fresh.files_to_discard(), 2);
+        fs::remove_file(worktree.join("new file")).unwrap();
+        fs::write(worktree.join("replacement file"), "new").unwrap();
+        let replaced = service.worktree_safety(&worktree, &cancel).unwrap();
+        assert_eq!(fresh.files_to_discard(), replaced.files_to_discard());
+        assert_ne!(fresh.fingerprint, replaced.fingerprint);
+        fs::rename(worktree.join("replacement file"), worktree.join("new file")).unwrap();
         git(&worktree, &["add", "new file"]);
         git(&worktree, &["commit", "-m", "local work"]);
         assert_eq!(service.worktree_safety(&worktree, &cancel).unwrap().unpushed_commits, 1);
