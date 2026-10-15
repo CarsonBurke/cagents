@@ -403,6 +403,7 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
     let key=runtime.logical_changes.aliases.get(item)?;
     let entry=runtime.logical_changes.entries.get(key)?;
     let target=runtime.target;let mut rows:Vec<Element<'static,Message>>=Vec::new();
+    let painted=current_item(runtime,item).and_then(|item|runtime.find_paint_for(item));
     if let Some(reason)=&entry.part.metadata.unavailable {
         rows.push(design::caption(format!("Some original file metadata is unavailable: {reason:?}")).into());
     }
@@ -420,7 +421,6 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
             let index=file.file_index;let open=entry.opened.contains(&index) || runtime.find.as_ref().is_some_and(|query|!query.is_empty());
             let label=step::path_label(&file.path,&runtime.session.launch.recipe.working_directory);
             let Ok(logical_index)=u32::try_from(index) else {rows.push(design::caption("The file index exceeds the selectable document range.").into());continue;};
-            let painted=current_item(runtime,item).and_then(|item|runtime.find_paint_for(item));
             let logical=|path:&[u32]|selectable_prose::Logical {identity:selection::logical_identity(item,path),start:0,paint:painted.clone()};
             let title=widget::row::with_children(vec![
                 widget::button::custom(widget::icon(Icon::handle(if open {Icon::PanDown}else {Icon::PanEnd})).size(design::COMPACT_ICON_SIZE))
