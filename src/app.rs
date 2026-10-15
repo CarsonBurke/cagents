@@ -7302,6 +7302,18 @@ impl Cagents {
         }
     }
 
+    /// Ownership can change while the activity value stays identical: a project
+    /// loads, a worktree appears, or a pane moves into a channel. Rebind on the
+    /// structural path rather than looking up every output-producing agent on
+    /// each grid wake. This does not create or acknowledge unread attention.
+    fn reconcile_agent_attention_owners(&mut self) {
+        let cards = self.sidebar_state.attention_cards().collect::<HashSet<_>>();
+        for card in cards {
+            let owner = self.agent_worktree(card).map(|key| (key.project_id, key.worktree_id));
+            self.sidebar_state.reattribute_card_attention(card, owner);
+        }
+    }
+
     fn acknowledge_active_pane(&mut self) -> Task<Message> {
         let Some(card) = self
             .workspace
@@ -16502,6 +16514,7 @@ impl Application for Cagents {
         terminal_output_tests::record_projection();
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
+        self.reconcile_agent_attention_owners();
         self.refresh_sidebar_channels();
         if reconcile_row_selection {
             self.prune_sidebar_row_selection();

@@ -2916,6 +2916,26 @@ impl SidebarState {
         self.worktrees_with_panes.contains(&(project, worktree))
     }
 
+    /// Existing attention owners, for rebinding after workspace topology changes.
+    /// Ordinary grid output does not need to rediscover these owners.
+    pub fn attention_cards(&self) -> impl Iterator<Item = CardId> + '_ {
+        self.agent_activity.keys().chain(self.agent_updates.keys()).copied()
+    }
+
+    /// Move cached activity and unread attention without synthesizing a new turn.
+    pub fn reattribute_card_attention(
+        &mut self,
+        card: CardId,
+        owner: Option<(ProjectId, WorktreeId)>,
+    ) {
+        if let Some(activity) = self.agent_activity.get_mut(&card) {
+            activity.owner = owner;
+        }
+        if let Some(unread) = self.agent_updates.get_mut(&card) {
+            *unread = owner;
+        }
+    }
+
     pub fn card_activity(&self, card: CardId) -> Option<crate::agent::Activity> {
         self.agent_activity.get(&card).map(|entry| entry.activity)
     }
