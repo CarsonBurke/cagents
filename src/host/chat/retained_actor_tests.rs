@@ -1026,15 +1026,21 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
     const EXACT: &str = "host::chat::retained_actor_tests::failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup";
     const CHILD: &str = "CAGENTS_STARTUP_OWNER_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        use std::os::fd::FromRawFd;
+        use std::{io::Read, os::{fd::FromRawFd, unix::fs::OpenOptionsExt}};
+        const LOG_LIMIT: u64 = 4 * 1024 * 1024;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = directory.path();
         for path in ["home/.claude", "run", "data", "config", "cache", "bin", "project", "hold"] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
         fs::set_permissions(root.join("hold"),fs::Permissions::from_mode(0o700)).unwrap();
+        let private_log = |name| fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root.join(name)).unwrap();
+        let stdout = private_log("fixture.stdout");
+        let stderr = private_log("fixture.stderr");
         let reservation = crate::daemon::child_reaper::reserve().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", EXACT, "--nocapture"])
             .env_clear().env(CHILD,"1").env("CAGENTS_RETAINED_ACTOR_FIXTURE","1")
             .env("CAGENTS_HOLDER_ROOT",root).env("CAGENTS_STARTUP_OWNER_HOLD",root.join("hold"))
@@ -1042,7 +1048,19 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
             .env("XDG_RUNTIME_DIR",root.join("run")).env("XDG_DATA_HOME",root.join("data"))
             .env("XDG_CONFIG_HOME",root.join("config")).env("XDG_CACHE_HOME",root.join("cache"))
             .env("PATH",format!("{}:/usr/bin:/bin",root.join("bin").display()))
-            .spawn().unwrap();
+            .stdout(stdout).stderr(stderr);
+        // This tiny empty-start fixture has bounded regular output files.
+        // Apply the cap before exec so even a broken child cannot grow them
+        // between the parent's polling ticks; it is not a product setting.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                let cap = libc::rlimit {rlim_cur:LOG_LIMIT,rlim_max:LOG_LIMIT};
+                if libc::setrlimit(libc::RLIMIT_FSIZE,&cap)==-1 {return Err(std::io::Error::last_os_error());}
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
         reservation.quarantine();
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open,child.id(),0) };
         if raw < 0 {
@@ -1057,9 +1075,23 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    if !status.success() {
-                        let _ = directory.keep();
-                        panic!("isolated startup fixture failed: {status}");
+                    let read_log = |name| -> std::io::Result<String> {
+                        let mut text = String::new();
+                        fs::File::open(root.join(name))?.take(LOG_LIMIT+1).read_to_string(&mut text)?;
+                        if text.len() as u64>LOG_LIMIT {return Err(std::io::Error::other("fixture log exceeded cap"));}
+                        Ok(text)
+                    };
+                    let stdout = read_log("fixture.stdout");
+                    let stderr = read_log("fixture.stderr");
+                    let exactly_one = stdout.as_ref().is_ok_and(|text|
+                        text.lines().any(|line|line=="running 1 test")
+                        && text.lines().any(|line|line==format!("test {EXACT} ... ok"))
+                        && text.lines().any(|line|line.starts_with("test result: ok. 1 passed; 0 failed;")));
+                    if !status.success() || !exactly_one || stderr.is_err() {
+                        let stdout = stdout.map(|text|text.chars().take(4096).collect::<String>());
+                        let stderr = stderr.map(|text|text.chars().take(4096).collect::<String>());
+                        let retained = directory.keep();
+                        panic!("isolated startup fixture did not prove exactly one passing test: {status}; retained={retained:?}; stdout={stdout:?}; stderr={stderr:?}");
                     }
                     return;
                 }
