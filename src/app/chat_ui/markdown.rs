@@ -50,6 +50,9 @@ struct Section {
 }
 
 impl Content {
+    #[cfg(test)]
+    pub(super) fn parsed_work_bytes(&self) -> usize { self.parsed_bytes }
+
     /// Creates a new empty [`Content`].
     pub fn new() -> Self {
         Self::default()
