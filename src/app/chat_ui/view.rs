@@ -4854,6 +4854,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_outcome_with_unknown_activity_marks_background_pane_unread() {
+        use crate::agent::{ActivityOutcome, ActivityState};
+        for outcome in [ActivityOutcome::Cancelled, ActivityOutcome::Failed { reason: "exit 3".into() }, ActivityOutcome::Interrupted { reason: "missing final result".into() }] {
+            let (runtime, handle) = frame_cost::live_runtime(&[]);
+            let card = runtime.target.card;
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.context_inspector_open = false;
+            app.refresh_ui.focused = false;
+            let mut state = crate::app::tests::terminal_card_state();
+            state.id = card;
+            state.kind = CardKind::Chat(runtime.session.clone());
+            Arc::make_mut(&mut app.durable).cards.push(state);
+            app.cards.insert(card, CardRuntime::Chat(runtime));
+            assert!(handle.observe_outcome_for_test(ActivityState::Unknown, Some(outcome.clone())));
+            app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: ActivityState::Unknown }));
+            assert_eq!(app.sidebar_state.card_outcome(card), Some(&outcome));
+            assert!(app.sidebar_state.has_card_update(card));
+        }
+    }
+
+    #[test]
     fn terminal_run_outcomes_have_distinct_footer_status() {
         use crate::agent::ActivityOutcome;
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);

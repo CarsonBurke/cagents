@@ -7298,13 +7298,15 @@ impl Cagents {
             _ => self.sidebar_state.card_outcome(card).cloned(),
         };
         let activity = activity.or_else(|| outcome.as_ref().and_then(|_| self.sidebar_state.card_activity(card)).map(|mut last| { last.state = crate::agent::ActivityState::Idle; last }));
+        let completed_outcome = outcome.is_some() && self.sidebar_state.card_outcome(card) != outcome.as_ref();
         self.sidebar_state.set_card_outcome(card, outcome);
         let previous = self
             .sidebar_state
             .card_activity(card)
             .map(|activity| activity.state);
         let next = activity.map(|activity| activity.state);
-        if (next == Some(crate::agent::ActivityState::Waiting) && previous != next)
+        if completed_outcome
+            || (next == Some(crate::agent::ActivityState::Waiting) && previous != next)
             || (previous == Some(crate::agent::ActivityState::Working)
                 && next == Some(crate::agent::ActivityState::Idle))
         {
@@ -7344,6 +7346,9 @@ impl Cagents {
 
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
         let tasks: Vec<_> = cards.into_iter().map(|card| {
+            if let Some(channel) = self.durable.channels.iter().find(|channel| channel.cards.contains(&card)) {
+                self.sidebar_state.retain_attention_channel(channel.id);
+            }
             self.sidebar_state.acknowledge_agent_update(card);
             self.acknowledge_card_notices(card);
             if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
@@ -7368,7 +7373,7 @@ impl Cagents {
             directory.map_or_else(Task::none, |directory| self.select_worktree(directory, false))
         };
         let focus = self.focus_workspace_card(id);
-        let read = self.mark_cards_read(vec![id]);
+        let read = if self.workspace.focused() == Some(id) { self.mark_cards_read(vec![id]) } else { Task::none() };
         Task::batch([scope, focus, read])
     }
 
@@ -7704,7 +7709,7 @@ impl Cagents {
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
         let mut failure = self.terminal_failure_payload(card, message.clone());
-        self.sidebar_state.clear_agent_activity(card);
+        self.observe_agent_activity_for_card(card, None);
         self.retire_lsp_card(card);
         match self.cards.remove(&card) {
             Some(CardRuntime::Terminal(_handle)) => {
@@ -7765,7 +7770,7 @@ impl Cagents {
             transition_terminal_to_relaunchable(session, terminal_exit(exit_code, signal));
         }
         self.lifecycle.remove(card);
-        self.sidebar_state.clear_agent_activity(card);
+        self.observe_agent_activity_for_card(card, None);
         if let Some(state) = self.card_state_mut(card) {
             state.residency = Residency::Hibernated;
         }
@@ -16546,7 +16551,8 @@ impl Application for Cagents {
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
-        let task = Task::batch([task, self.flush_settings_on_blur()]);
+        let activation = self.retry_notification_activation();
+        let task = Task::batch([task, self.flush_settings_on_blur(), activation]);
         self.sync_notification_presence();
         self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();

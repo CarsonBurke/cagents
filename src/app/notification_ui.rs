@@ -44,6 +44,7 @@ pub(super) struct State {
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
+    session_activation: Option<TerminalId>,
 }
 
 impl Default for State {
@@ -59,6 +60,7 @@ impl Default for State {
             acknowledged: BTreeSet::new(),
             testing: false,
             inbox_activation: None,
+            session_activation: None,
         }
     }
 }
@@ -333,6 +335,9 @@ impl Cagents {
         {
             self.notification_ui.inbox_activation = None;
         }
+        if matches!(&action, Action::Activated(_)) {
+            self.notification_ui.session_activation = None;
+        }
         match action {
             Action::Snapshot(snapshot) => {
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
@@ -428,53 +433,11 @@ impl Cagents {
                 self.update_notifications(Action::Activated(Target::Session(session.id)))
             }
             Action::Activated(Target::Session(session)) => {
-                let Some(card) = self
-                    .durable
-                    .cards
-                    .iter()
-                    .find(|card| card.existence.is_open() && card_session(card) == Some(session))
-                    .cloned()
-                else {
-                    self.status = Some(TransientNotice::warning(
-                        "This agent's pane is no longer open. Its attention record remains available.",
-                    ));
-                    return self.activate_main_window(None);
-                };
-                if self.modal_is_open() {
-                    self.status = Some(TransientNotice::warning(
-                        "Finish the open dialog, then select the agent's highlighted pane.",
-                    ));
-                    return self.activate_main_window(None);
-                }
-                let channel = self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.cards.contains(&card.id))
-                    .map(|channel| channel.id);
-                let scope = if let Some(channel) = channel {
-                    self.select_channel(channel)
-                } else {
-                    let directory = self.durable.card_scopes.get(&card.id).cloned().or_else(|| {
-                        match &card.kind {
-                            CardKind::Terminal(session) => {
-                                Some(session.launch.working_directory.clone())
-                            }
-                            CardKind::Chat(session) => {
-                                Some(session.launch.recipe.working_directory.clone())
-                            }
-                            _ => None,
-                        }
-                    });
-                    directory.map_or_else(Task::none, |directory| {
-                        self.select_worktree(directory, false)
-                    })
-                };
-                let focus = self.workspace.focus(card.id).map_or_else(
-                    |_| Task::none(),
-                    |update| self.apply_viewport(update, true, false),
-                );
-                Task::batch([scope, focus, self.activate_main_window(None)])
+                // The notification watch may beat hosted inventory/model adoption.
+                // Keep only the newest target; adoption attaches its existing actor.
+                self.notification_ui.session_activation = Some(session);
+                let focus = self.retry_notification_activation();
+                Task::batch([focus, self.activate_main_window(None)])
             }
             Action::Activated(Target::AgentRun(run)) => {
                 if self.modal_is_open() || !self.automation_ui.can_open_run() {
@@ -516,6 +479,24 @@ impl Cagents {
                 Task::none()
             }
         }
+    }
+
+    /// Retry after lifecycle/model updates and dialog dismissal, never by spawning
+    /// a replacement provider. Explicitly closed cards remain closed.
+    pub(super) fn retry_notification_activation(&mut self) -> Task<Message> {
+        let Some(session) = self.notification_ui.session_activation else { return Task::none(); };
+        let card = self.durable.cards.iter().find(|card| card_session(card) == Some(session));
+        if card.is_some_and(|card| !card.existence.is_open()) {
+            self.notification_ui.session_activation = None;
+            return Task::none();
+        }
+        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() { return Task::none(); }
+        let Some(id) = card.map(|card| card.id) else { return Task::none(); };
+        let focus = self.focus_attention_card(id);
+        if self.workspace.focused() == Some(id) {
+            self.notification_ui.session_activation = None;
+        }
+        focus
     }
 
     pub(super) fn notification_subscription(&self) -> Subscription<Message> {
@@ -918,6 +899,46 @@ mod tests {
             app.notification_ui.pending.lock().unwrap().acknowledged,
             BTreeSet::from([id])
         );
+    }
+
+    #[test]
+    fn attention_activation_waits_for_dialog_and_latest_target_wins() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let previous = app.workspace.focused();
+        let card = super::super::tests::terminal_card_state();
+        let session = card_session(&card).unwrap();
+        let id = card.id;
+        Arc::make_mut(&mut app.durable).cards.push(card);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.settings_reset_confirm = true;
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert_eq!(app.workspace.focused(), previous);
+        assert_eq!(app.notification_ui.session_activation, Some(session));
+        app.settings_reset_confirm = false;
+        drop(app.retry_notification_activation());
+        assert_eq!(app.workspace.focused(), Some(id));
+        assert!(app.notification_ui.session_activation.is_none());
+        let missing = TerminalId::new();
+        drop(app.update_notifications(Action::Activated(Target::Session(missing))));
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.notification_ui.session_activation.is_none());
+        assert_eq!(app.workspace.focused(), Some(id));
+    }
+
+    #[test]
+    fn marking_all_read_retains_channel_until_attention_filter_reentry() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {
+            title_source: Default::default(), id: channel, project_id: ProjectId::new(), title: "Unread".into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
+        });
+        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        app.sidebar_state.observe_card_update(card);
+        drop(app.mark_cards_read(vec![card]));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(app.sidebar_state.attention_retained(sidebar::SelectionRow::Channel(channel)));
     }
 
     #[test]

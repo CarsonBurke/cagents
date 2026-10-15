@@ -481,15 +481,29 @@ impl SidebarChannel {
 
 /// Attribute a channel only when all of its launch directories resolve to one
 /// known root. Mixed-worktree channels deliberately keep their project scope.
-pub fn channel_worktree<'a>(worktrees: &[SidebarWorktree], directories: impl IntoIterator<Item = &'a Path>) -> Option<(WorktreeId, String)> {
-    let roots: std::collections::HashMap<_, _> = worktrees.iter().map(|worktree| (worktree.path.as_path(), worktree)).collect();
-    let mut owner = None;
-    for directory in directories {
-        let worktree = directory.ancestors().find_map(|ancestor| roots.get(ancestor).copied())?;
-        if owner.as_ref().is_some_and(|(id, _)| *id != worktree.id) { return None; }
-        owner = Some((worktree.id, worktree.branch.clone().unwrap_or_else(|| worktree.label().to_owned())));
+pub struct WorktreeIndex<'a> {
+    roots: std::collections::HashMap<&'a Path, &'a SidebarWorktree>,
+}
+
+impl<'a> WorktreeIndex<'a> {
+    pub fn new(worktrees: &'a [SidebarWorktree]) -> Self {
+        Self { roots: worktrees.iter().map(|worktree| (worktree.path.as_path(), worktree)).collect() }
     }
-    owner
+
+    pub fn channel<'b>(&self, directories: impl IntoIterator<Item = &'b Path>) -> Option<(WorktreeId, String)> {
+        let mut owner = None;
+        for directory in directories {
+            let worktree = directory.ancestors().find_map(|ancestor| self.roots.get(ancestor).copied())?;
+            if owner.as_ref().is_some_and(|(id, _)| *id != worktree.id) { return None; }
+            owner = Some((worktree.id, worktree.branch.clone().unwrap_or_else(|| worktree.label().to_owned())));
+        }
+        owner
+    }
+}
+
+#[cfg(test)]
+pub fn channel_worktree<'a>(worktrees: &[SidebarWorktree], directories: impl IntoIterator<Item = &'a Path>) -> Option<(WorktreeId, String)> {
+    WorktreeIndex::new(worktrees).channel(directories)
 }
 
 impl SidebarChannel {
@@ -11553,9 +11567,9 @@ pub(crate) mod tests {
 
     #[test]
     fn waiting_indicator_survives_read_acknowledgement_and_ci_does_not_recolor_pr_state() {
-        assert!(agent_indicator(Some(crate::agent::ActivityState::Waiting), false).is_some());
-        assert!(agent_indicator(None, true).is_some());
-        assert!(agent_indicator(None, false).is_none());
+        assert!(agent_indicator::<SidebarAction>(Some(crate::agent::ActivityState::Waiting), false).is_some());
+        assert!(agent_indicator::<SidebarAction>(None, true).is_some());
+        assert!(agent_indicator::<SidebarAction>(None, false).is_none());
         let mut pr = project().pull_requests[0].clone();
         pr.needs_review = false;
         pr.draft = false;

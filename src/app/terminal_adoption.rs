@@ -499,6 +499,23 @@ mod tests {
     }
 
     #[test]
+    fn attention_activation_before_inventory_focuses_the_exact_adopted_actor() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
+        drop(app.select_worktree("/repo".into(), false));
+        let session = hosted("/repo/worktree/src");
+        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(session.id)))));
+        assert!(cards_for(&app, session.id).is_empty());
+        drop(app.observe_hosted_terminals(vec![session.clone()]));
+        drop(app.retry_notification_activation());
+        let adopted = cards_for(&app, session.id);
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(app.workspace.focused(), Some(adopted[0].id));
+        assert!(matches!(terminal_start_mode(&session), Ok(TerminalStartMode::Attach(_))));
+    }
+
+    #[test]
     fn a_hosted_terminal_no_card_owns_becomes_one_card_in_its_own_worktree() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         register_worktrees(&mut app, &["/repo", "/repo/worktree"]);

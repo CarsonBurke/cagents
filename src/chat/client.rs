@@ -546,6 +546,14 @@ impl ClientHandle {
         activity.observe(generation, state)
     }
 
+    /// Records a typed terminal outcome using the same generation fence as IPC.
+    #[cfg(test)]
+    pub(crate) fn observe_outcome_for_test(&self, state: ActivityState, outcome: Option<crate::agent::ActivityOutcome>) -> bool {
+        let mut activity = self.inner.activity.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = activity.generation + 1;
+        activity.observe_outcome(generation, state, outcome)
+    }
+
     /// Whether the handle has asked its daemon to keep the snapshot current.
     #[cfg(test)]
     pub(crate) fn is_visible_for_test(&self) -> bool {

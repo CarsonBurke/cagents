@@ -868,6 +868,7 @@ impl Cagents {
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
+            let worktrees = sidebar::WorktreeIndex::new(&project.worktrees);
             let mut index = 0;
             // Built in the durable vector's own order, which is the registry's
             // ascending creation ranks. Display order is not decided here:
@@ -918,7 +919,7 @@ impl Cagents {
                         _ => {}
                     }
                 }
-                let worktree = sidebar::channel_worktree(&project.worktrees, directories);
+                let worktree = worktrees.channel(directories);
                 let acknowledged_attention = state.attention_retained(sidebar::SelectionRow::Channel(channel.id)) && !unread && !sidebar::attention_state(activity, unread, outcome.as_ref()).is_some_and(sidebar::AttentionState::needs_attention);
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
