@@ -478,7 +478,9 @@ pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveE
         let error = io::Error::last_os_error();
         return Err(ResolveError::message(
             directory.path(),
-            format!("Cannot create an anonymous copy file; this filesystem must support O_TMPFILE: {error}"),
+            format!(
+                "Cannot create an anonymous copy file; this filesystem must support O_TMPFILE: {error}"
+            ),
         ));
     }
     // SAFETY: this is the fresh descriptor returned by openat above.
