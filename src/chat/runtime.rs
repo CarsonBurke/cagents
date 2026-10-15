@@ -308,11 +308,17 @@ impl LocalHandle {
         // A live actor's close authority follows the physical directory it
         // entered, never a launch alias that can be retargeted afterwards.
         // Adopted legacy providers have no actor-owned admission observation.
-        let scope_observed = !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+        let scope_eligible = !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
             && !matches!(spec.transport, TransportSpec::History | TransportSpec::UnixWebSocket { .. });
-        let directory_identity = if scope_observed {
-            spec.working_directory = std::fs::canonicalize(&spec.working_directory)
-                .map_err(|error| format!("Cannot resolve provider execution directory: {error}"))?;
+        let physical_directory=if scope_eligible {Some(std::fs::canonicalize(&spec.working_directory)
+            .map_err(|error|format!("Cannot resolve provider execution directory: {error}"))?)} else {None};
+        // The adapter and initial Step were prepared before entering here. A
+        // process-only correction cannot prove their embedded provider cwd.
+        // Typed production preparation supplies a canonical private Launch
+        // before constructing either. Legacy aliases stay fail-closed.
+        let scope_observed=physical_directory.as_ref()==Some(&spec.working_directory);
+        let directory_identity = if let Some(physical_directory)=physical_directory {
+            spec.working_directory = physical_directory;
             if spec.execution.is_none() {
                 let directory = std::fs::File::open(&spec.working_directory)
                     .map_err(|error| format!("Cannot pin provider execution directory: {error}"))?;
@@ -320,9 +326,9 @@ impl LocalHandle {
             }
             let context = spec.execution.as_ref().unwrap();
             context.verify_directory(&spec.working_directory)?;
-            context.directory_descriptor().as_ref().map(|directory|directory.metadata()
+            if scope_observed {context.directory_descriptor().as_ref().map(|directory|directory.metadata()
                 .map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata)))
-                .transpose().map_err(|error|error.to_string())?
+                .transpose().map_err(|error|error.to_string())?} else {None}
         } else { None };
         // Keep the admitted inode alive even after the actor completes. Numeric
         // identities alone can be recycled after a directory is removed.
@@ -1859,7 +1865,7 @@ impl TurnAttention {
             }
             Event::Reset { .. } => *self = Self::default(),
             Event::TurnSettled => self.settled = true,
-            Event::TurnFinished { key, outcome } => {
+            Event::TurnFinished { key, outcome } | Event::PastTurnFinished {key,outcome} => {
                 return Some(crate::notifications::Evidence {
                     key: key.clone().unwrap_or_else(|| self.key.clone()),
                     kind: *outcome,
@@ -2730,6 +2736,10 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if matches!(&event,Event::PastTurnFinished {..}) {
+            if let Some(evidence)=self.attention.apply(&event) {(self.notify)(Update::Attention(evidence));}
+            return;
+        }
         if let Event::Compaction { active } = &event {
             let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
             if *active || close.compacting!=*active {close.revision=close.revision.saturating_add(1);}
@@ -3125,7 +3135,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } => {}
+        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished {..} => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -3983,7 +3993,7 @@ mod tests {
     }
 
     #[test]
-    fn close_scope_keeps_the_physical_admitted_directory_after_alias_retarget() {
+    fn generic_alias_launch_does_not_infer_provider_scope_from_process_canonicalization() {
         struct Idle;
         impl Adapter for Idle {
             fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
@@ -3996,7 +4006,6 @@ mod tests {
         let alias=root.path().join("alias");
         std::fs::create_dir(&original).unwrap(); std::fs::create_dir(&replacement).unwrap();
         std::os::unix::fs::symlink(&original,&alias).unwrap();
-        let expected=crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&original).unwrap());
         let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:alias.clone(),environment:BTreeMap::new()};
         let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};
         let store=preflight(&spec,&mut initial).unwrap();
@@ -4004,10 +4013,10 @@ mod tests {
         until(&handle,|state|state.ready);
         std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&replacement,&alias).unwrap();
         let observed=handle.close_observation();
-        assert_eq!(observed.working_directory,original);
-        assert_eq!(observed.directory_identity,Some(expected));
-        assert_ne!(observed.working_directory,std::fs::canonicalize(&alias).unwrap());
-        handle.close_if_revision(observed.close_revision).unwrap();
+        assert!(observed.working_directory.as_os_str().is_empty());
+        assert_eq!(observed.directory_identity,None);
+        assert!(handle.close_if_revision(observed.close_revision).is_err(),"a prebuilt adapter may still embed the old launch alias");
+        handle.close().unwrap();
     }
 
     #[test]
@@ -4064,6 +4073,41 @@ mod tests {
         assert!(!handle.close_observation().closing);
         handle.close_if_revision(autonomous.close_revision).unwrap();
         assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn delayed_old_turn_outcome_notifies_without_mutating_current_turn_metadata() {
+        struct LateResult;
+        impl Adapter for LateResult {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                let events=match command {
+                    Command::SetFastMode{..}=>vec![Event::TurnStarted,Event::Status {busy:true,detail:"Working".into()},Event::Request(super::super::Request {kind:super::super::RequestKind::Approval,id:"new-approval".into(),title:"New tool".into(),description:String::new(),fields:Vec::new(),actions:Vec::new()})],
+                    Command::Compact=>vec![Event::PastTurnFinished {key:Some("old-result".into()),outcome:crate::notifications::Kind::Cancelled}],
+                    _=>return Err("Unexpected late-result fixture command".into()),
+                };
+                Ok(Step {events,..Default::default()})
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let (send,receive)=crossbeam_channel::unbounded();
+        let handle=LocalHandle::start(spec,Box::new(LateResult),initial,store,None,move|update|{let _=send.send(update);}).unwrap();
+        until(&handle,|state|state.ready);
+        handle.command(Command::SetFastMode {enabled:true}).unwrap();
+        let before=handle.snapshot(None).unwrap();
+        handle.command(Command::Compact).unwrap();
+        let after=handle.snapshot(None).unwrap();
+        assert_eq!(after.turn_generation,before.turn_generation);
+        assert_eq!(after.requests,before.requests);
+        assert_eq!(after.outcome,before.outcome);
+        assert_eq!(after.finished_at,before.finished_at);
+        assert_eq!(after.activity(),ActivityState::Waiting);
+        assert!(receive.try_iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        handle.close().unwrap();
     }
 
     #[test]
