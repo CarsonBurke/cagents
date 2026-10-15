@@ -11,6 +11,7 @@ impl Directory {
         directory.require_current()?;Ok(directory)
     }
     pub(super) fn path(&self)->&Path { &self.path }
+    pub(super) fn sync(&self)->Result<(),String> { self.file.sync_all().map_err(|error|error.to_string()) }
     pub(super) fn anchor(&self)->PathBuf { PathBuf::from(format!("/proc/{}/fd/{}",std::process::id(),self.file.as_raw_fd())) }
     pub(super) fn require_current(&self)->Result<(),String> {
         let original=self.file.metadata().map_err(|error|error.to_string())?;
@@ -30,6 +31,17 @@ pub(super) struct Edit { directory:Directory,name:&'static str,before:Vec<u8>,af
 impl Edit {
     pub(super) fn new(directory:Directory,name:&'static str,before:Vec<u8>,after:Vec<u8>)->Self {Self{directory,name,before,after}}
     pub(super) fn apply(&self)->Result<(),String> { self.apply_with(||{}) }
+    pub(super) fn retained_bytes(&self)->usize {self.before.len().saturating_add(self.after.len())}
+    pub(super) fn require_current(&self)->Result<(),String> {self.directory.require_current()}
+    /// A prior attempt may have published the exact after-image before reporting
+    /// a sync/name-check failure. Finish its durability, never publish it twice.
+    pub(super) fn resume(&self)->Result<(),String> {
+        self.directory.require_current()?;
+        let current=self.directory.read(self.name,8*1024*1024)?;
+        if current==self.after {self.directory.sync()?;return Ok(());}
+        if current!=self.before {return Err("Git metadata changed while its original repair was pending. Its changes and the pending operation were retained.".into());}
+        self.apply()
+    }
     fn apply_with(&self,before_commit:impl FnOnce())->Result<(),String> {
         self.directory.require_current()?;
         if self.before==self.after {return Ok(());}
@@ -51,6 +63,7 @@ impl Edit {
         // of that parent cannot redirect this write into a replacement repo.
         before_commit();
         fs::rename(&lock.path,&target).map_err(|error|error.to_string())?;
+        self.directory.sync()?;
         self.directory.require_current()
     }
 }
