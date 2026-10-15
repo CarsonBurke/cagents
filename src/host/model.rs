@@ -191,6 +191,7 @@ impl Registry {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(WorkspaceModel {
+            agent_locations: Vec::new(),
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,

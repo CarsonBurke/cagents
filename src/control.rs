@@ -4013,6 +4013,7 @@ mod tests {
             assert_eq!(asked, server_repository);
             assert_eq!(title, "probe");
             let model = WorkspaceModel {
+                agent_locations: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 2,
@@ -4268,6 +4269,7 @@ mod tests {
                 "the CLI opens a project exactly as a window publishes one"
             );
             let model = WorkspaceModel {
+                agent_locations: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 4,
@@ -4336,6 +4338,7 @@ mod tests {
             let listed: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             assert_eq!(listed.request, ClientRequest::ReadWorkspaceModel);
             let model = WorkspaceModel {
+                agent_locations: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 7,
@@ -4460,6 +4463,7 @@ mod tests {
                     edit.request_id,
                     peer_proof,
                     WorkspaceModel {
+                        agent_locations: Vec::new(),
                         navigation_orders: Vec::new(),
                         identity: uuid::Uuid::new_v4(),
                         sequence: 9,
@@ -4507,6 +4511,7 @@ mod tests {
         channels: &[(ChannelId, &str, u32)],
     ) -> WorkspaceModel {
         WorkspaceModel {
+            agent_locations: Vec::new(),
             navigation_orders: Vec::new(),
             identity: uuid::Uuid::new_v4(),
             sequence: 8,

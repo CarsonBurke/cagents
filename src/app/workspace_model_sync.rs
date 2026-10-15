@@ -2065,6 +2065,7 @@ mod tests {
     /// has reconciled against it would have recorded.
     fn registry(channels: Vec<ModelChannel>) -> WorkspaceModel {
         WorkspaceModel {
+            agent_locations: Vec::new(),
             navigation_orders: Vec::new(),
             identity: uuid::Uuid::new_v4(),
             sequence: channels.len() as u64,
