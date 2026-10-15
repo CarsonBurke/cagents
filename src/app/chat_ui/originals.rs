@@ -151,6 +151,17 @@ impl Runtime {
         // The actual unsent composer and its chips remain user intent.
         self.recovery.attachment_labels.retain(|path,_|self.attachments.iter().any(|attachment|&attachment.path==path));
     }
+    pub(super) fn prompt_attachment_names(&self,command:Command)->Command {
+        match command {
+            Command::Prompt {text,attachments,mode}
+                if attachments.iter().any(|attachment|self.recovery.attachment_labels.contains_key(&attachment.path))=>{
+                Command::PromptNamed {text,mode,attachments:attachments.into_iter().map(|attachment| {
+                    chat::NamedAttachment {display_path:self.recovery.attachment_labels.get(&attachment.path).cloned(),path:attachment.path}
+                }).collect()}
+            }
+            command=>command,
+        }
+    }
     pub(super) fn sync_original(&mut self) {
         if !self.visible.load(Ordering::Relaxed) || self.disconnected || self.snapshot.exited {
             self.recovery.originals.clear();return;
@@ -430,6 +441,17 @@ mod tests {
         assert!(runtime.recovery.prepared_prompt.is_none());
         assert_eq!(runtime.composer.text(),"independently typed draft");
         assert_eq!(runtime.attachments,vec![Attachment {path:"/user/draft.png".into()}]);
+    }
+
+    #[test]
+    fn edited_send_keeps_private_dispatch_bytes_and_carries_only_display_hint() {
+        let mut runtime=runtime();
+        runtime.recovery.attachment_labels.insert("/private/capture.png".into(),"/other-account/original.png".into());
+        let command=Command::Prompt {text:"edited user intent".into(),attachments:vec![Attachment {path:"/private/capture.png".into()}],mode:PromptMode::Send};
+        assert_eq!(runtime.prompt_attachment_names(command),Command::PromptNamed {text:"edited user intent".into(),
+            attachments:vec![chat::NamedAttachment {path:"/private/capture.png".into(),display_path:Some("/other-account/original.png".into())}],mode:PromptMode::Send});
+        let ordinary=Command::Prompt {text:"new ordinary intent".into(),attachments:vec![Attachment {path:"/user/new.png".into()}],mode:PromptMode::Send};
+        assert_eq!(runtime.prompt_attachment_names(ordinary.clone()),ordinary);
     }
 
 }

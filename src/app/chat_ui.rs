@@ -5825,6 +5825,7 @@ impl Cagents {
             queued: step,
         });
         runtime.error = None;
+        let command=runtime.prompt_attachment_names(command);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.send(command))
                 .await

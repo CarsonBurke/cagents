@@ -269,6 +269,7 @@ fn queue_row<'a>(
     timing: QueueTiming,
     text: &'a str,
     attachments: &'a [Attachment],
+    attachment_labels: &'a HashMap<PathBuf,PathBuf>,
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let marker = match timing {
@@ -289,11 +290,8 @@ fn queue_row<'a>(
         attachments
             .iter()
             .map(|attachment| {
-                attachment
-                    .path
-                    .file_name()
-                    .unwrap_or(attachment.path.as_os_str())
-                    .to_string_lossy()
+                let path=attachment_labels.get(&attachment.path).unwrap_or(&attachment.path);
+                path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -3403,6 +3401,7 @@ impl Runtime {
                 },
                 &queued.text,
                 &queued.attachments,
+                &self.recovery.attachment_labels,
                 controls,
             ));
         }
@@ -3416,6 +3415,7 @@ impl Runtime {
                 },
                 &followup.text,
                 &followup.attachments,
+                &self.recovery.attachment_labels,
                 copy(&followup.text)
                     .into_iter()
                     .chain([

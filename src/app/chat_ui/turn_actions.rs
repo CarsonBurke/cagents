@@ -358,7 +358,8 @@ impl Runtime {
     }
 
     pub(super) fn edit_supported(&self,item:&chat::Item)->bool {
-        item.role == chat::Role::User && !self.recovery.originals.editing()
+        item.role == chat::Role::User && self.snapshot.session_id.is_some() && self.selected_subagent.is_none()
+            && self.snapshot.read_only_reason.is_none() && !self.recovery.originals.editing()
             && (self.session.launch.provider == Provider::Claude
                 || branch_point(self.session.launch.provider,&self.snapshot,item).is_some())
     }
