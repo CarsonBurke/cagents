@@ -83,6 +83,13 @@ fn guard(db: &Connection, proof: &SourceReadProofData) -> Result<()> {
     Ok(())
 }
 
+unsafe extern "C" fn sql_deadline(context: *mut libc::c_void) -> libc::c_int {
+    // ReadSnapshot owns the stable Box until this handler is explicitly
+    // removed before connection/box destruction. No concurrent connection use.
+    let expires = unsafe { &*context.cast::<Instant>() };
+    i32::from(Instant::now() >= *expires)
+}
+
 /// The owner MUST retain actual namespace/reader/attachment publication guards
 /// outside this snapshot until its private page is written or suppressed.
 /// No method here can issue a grant, send a public page or authorize disposal.
@@ -94,6 +101,7 @@ pub(super) struct ReadSnapshot<'a> {
     probe: &'a RevocationProbe,
     coverage: Coverage,
     deadline: Instant,
+    _progress_deadline: Box<Instant>,
 }
 impl<'a> ReadSnapshot<'a> {
     pub(super) fn begin(directory: &'a Directory, database: &'a File,
@@ -108,12 +116,16 @@ impl<'a> ReadSnapshot<'a> {
         // Use a REAL canonical locator, not /proc/self/fd with NOFOLLOW. Normal
         // sibling rollback-journal discovery remains enabled; no immutable=1,
         // recovery writes, Store creation or source initialization is allowed.
+        let mut progress_deadline = Box::new(expires);
         let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
         db.busy_timeout(Duration::ZERO)?;
+        unsafe { ffi::sqlite3_progress_handler(db.handle(), 1024, Some(sql_deadline),
+            (&mut *progress_deadline as *mut Instant).cast()); }
         let journal: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         if journal != "delete" { return Err(Error::Unsupported("Export requires the canonical DELETE journal profile")); }
         db.execute_batch("BEGIN DEFERRED")?;
-        let snapshot = Self { db, directory, database, proof, probe, coverage, deadline: expires };
+        let snapshot = Self { db, directory, database, proof, probe, coverage,
+            deadline: expires, _progress_deadline: progress_deadline };
         guard(&snapshot.db, proof)?; // First actual read establishes the SH lock.
         verify_open_connection(&snapshot.db, directory, database, true)?;
         probe.check()?; deadline(expires)?;
@@ -139,6 +151,7 @@ impl<'a> ReadSnapshot<'a> {
 }
 impl Drop for ReadSnapshot<'_> {
     fn drop(&mut self) {
+        unsafe { ffi::sqlite3_progress_handler(self.db.handle(), 0, None, std::ptr::null_mut()); }
         if !self.db.is_autocommit() { let _ = self.db.execute_batch("ROLLBACK"); }
     }
 }
@@ -242,4 +255,17 @@ mod tests {
         snapshot.context().unwrap().connection().execute_batch("ROLLBACK").unwrap();
         assert!(snapshot.finish().is_err(), "query code cannot claim release on the owner's behalf");
     }
+    #[test]
+    fn original_absolute_deadline_interrupts_query_work_without_renewal() {
+        let fixture = Fixture::new(false); let probe = fixture.epoch.probe().unwrap();
+        let expires = Instant::now() + Duration::from_millis(150);
+        let snapshot = ReadSnapshot::begin(&fixture.directory, &fixture.database, &fixture.proof, &probe, Coverage::Unknown, expires).unwrap();
+        let result = snapshot.context().unwrap().connection().query_row(
+            "WITH RECURSIVE growing(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM growing WHERE n<100000000) SELECT sum(n) FROM growing", [], |row| row.get::<_, i64>(0));
+        assert!(matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::OperationInterrupted));
+        assert!(snapshot.finish().is_err());
+        // A private query timeout must still release the actual SQLite lock.
+        fixture.writer().execute("UPDATE payload SET value='after timed-out read'", []).unwrap();
+    }
+
 }
