@@ -378,6 +378,14 @@ fn ensure_account_homes_unused(
                     paths.extend(selected_recipe(provider, &record.session.launch));
                     if let Some(environment) = &record.execution_environment {
                         paths.extend(selected_home(provider, &environment.0, &record.session.launch.working_directory));
+                    } else {
+                        // Ordinary PTYs inherit these nonsecret homes. A bare
+                        // recipe omits them, but that omission is not disuse.
+                        let mut environment:std::collections::BTreeMap<String,String>=["HOME","CLAUDE_CONFIG_DIR","CODEX_HOME"].into_iter()
+                            .filter_map(|name|std::env::var(name).ok().map(|value|(name.into(),value))).collect();
+                        environment.extend(record.session.launch.environment.iter().map(|(name,value)|(name.clone(),value.clone())));
+                        for name in crate::account::launch_credential_overrides(&record.session.launch) {environment.remove(&name);}
+                        paths.extend(selected_home(provider,&environment,&record.session.launch.working_directory));
                     }
                 }
             }

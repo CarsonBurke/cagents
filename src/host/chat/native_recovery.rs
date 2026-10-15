@@ -168,6 +168,8 @@ fn restore_authenticated(
     record: registry::Record,
     recovery: chat::native_holder::Recovery,
 ) -> Result<ServerResponse, String> {
+    super::super::account_lifecycle::ensure_captured_scope(host,recovery.launch_account_scope.as_ref())
+        .map_err(|error|error.message)?;
     let mut retained: Vec<_> = recovery
         .previous_sources
         .iter()

@@ -229,6 +229,7 @@ mod tests {
                 .env("XDG_CONFIG_HOME",root.path().join("config")).env("XDG_DATA_HOME",root.path().join("data"))
                 .env("XDG_CACHE_HOME",root.path().join("cache")).env("XDG_RUNTIME_DIR",root.path().join("runtime"))
                 .env("PATH","/usr/bin:/bin").env("SHELL","/bin/sh").env("TERM","xterm-256color")
+                .env("CODEX_HOME",root.path().join("inherited-home"))
                 .output().unwrap();
             assert!(output.status.success(), "isolated fixture failed:\n{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
             return;
@@ -245,6 +246,11 @@ mod tests {
         let store = Store::installation().unwrap();
         let source = registered(&homes,&store,Provider::Claude,"source");
         let other = registered(&homes,&store,Provider::Claude,"other");
+        let inherited_home=root.join("inherited-home");
+        std::fs::create_dir(&inherited_home).unwrap();
+        let inherited_key=uuid::Uuid::new_v4();
+        let inherited=Account::linked(Provider::Claude,inherited_key,inherited_home.clone());
+        store.update(|registry|registry.register(Registered{key:inherited_key,provider:Provider::Claude,linked_home:Some(inherited_home),label:None,email:Some("inherited@fixture.invalid".into()),organization:None,added_at:0},&[]).unwrap()).unwrap();
         let source_home = source.resolved_home().unwrap();
         let hold = source_home.join("logout-hold");
         std::fs::write(&hold,"").unwrap();
@@ -254,6 +260,7 @@ mod tests {
         let unrelated = terminal(&root, BTreeMap::from([("HOME".into(),root.join("home").display().to_string())]));
         let unrelated_id = unrelated.id;
         request(&host, ClientRequest::Spawn {session: unrelated, options: Default::default()}).unwrap();
+        assert!(lifecycle(&host,crate::account::remote::Operation::Remove{id:inherited.id()}).is_err(),"an ordinary terminal owns its inherited provider home even when its recipe omits it");
         let worker_host = host.clone();
         let source_id = source.id();
         let worker = std::thread::spawn(move || lifecycle(&worker_host, crate::account::remote::Operation::Remove {id:source_id}));
@@ -301,6 +308,10 @@ mod tests {
         // A path replacement never transfers the retained operation's authority.
         let gate = host.lock().unwrap().control_gate.clone();
         let reservation = { let _writer=gate.write().unwrap(); Reservation::install(&host,&[other.clone()]).unwrap() };
+        assert!(ensure_captured_scope(&host,None).is_err(),"legacy native adoption cannot enter an active account mutation");
+        let scope=crate::account::scope::LaunchAccountScope{provider:Provider::Claude,canonical_home:source_home.canonicalize().unwrap(),
+            device:std::fs::metadata(&source_home).unwrap().dev(),inode:std::fs::metadata(&source_home).unwrap().ino(),registered_id:None,purge_ids:Vec::new()};
+        assert!(ensure_captured_scope(&host,Some(&scope)).is_ok(),"a proved unrelated native home stays available");
         let other_home = other.resolved_home().unwrap();
         let retained = root.join("original-other");
         std::fs::rename(&other_home,&retained).unwrap();
@@ -372,4 +383,18 @@ pub(super) fn ensure_pane(host: &SharedHost, pane: &crate::workspace_model::view
         _ => return Ok(()),
     };
     ensure_launch(host,&recipe.working_directory,&recipe.environment,&recipe.unset_environment,false)
+}
+
+/// Retained native adoption must use captured provenance before any adapter or
+/// provider attachment. A legacy unknown owner cannot enter an active mutation.
+pub(super) fn ensure_captured_scope(host: &SharedHost, scope: Option<&crate::account::scope::LaunchAccountScope>) -> Result<(),ProtocolError> {
+    if let Some(scope)=scope {
+        scope.revalidate().map_err(refusal)?;
+        ensure_paths(host,[scope.canonical_home.clone()])
+    } else {
+        let map=host.lock().unwrap_or_else(|p|p.into_inner()).account_lifecycle.clone();
+        if map.lock().unwrap_or_else(|p|p.into_inner()).values().any(|homes|!homes.is_empty()) {
+            Err(refusal("This retained provider has no captured account ownership. Let the account operation finish before reattaching it."))
+        } else {Ok(())}
+    }
 }
