@@ -1482,24 +1482,35 @@ mod tests {
         assert!(matches!(&filled_include, Message::SourceControlLoaded { result: Ok(read), .. } if read.prepared.is_some()));
         drop(app.update(filled_include));
         assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        let mut config = fs::read(root.join(".git/config")).unwrap();
+        config.extend_from_slice(b"\n[includeIf \"gitdir:/inactive/non-utf8-\xff/.git/\"]\n path = inactive.inc\n");
+        fs::write(root.join(".git/config"), config).unwrap();
+        let non_utf8 = load(&mut app, &key);
+        assert!(matches!(&non_utf8, Message::SourceControlLoaded { result: Ok(_), .. }),
+            "a legal nonUTF8 include condition must not fail the whole snapshot");
+        drop(app.update(non_utf8));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
     }
 
     #[test]
     fn bound_worker_observes_new_and_changed_global_publication_config() {
+        use crate::process::ProcessExecutor;
         const CHILD: &str = "CAGENTS_PUBLICATION_GLOBAL_TEST_CHILD";
         const TEST: &str = "app::git_ui::tests::bound_worker_observes_new_and_changed_global_publication_config";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
             let global = directory.path().join("global-config");
-            let mut command = Command::new(std::env::current_exe().unwrap());
+            let mut command = crate::process::CommandSpec::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .timeout(Duration::from_secs(60)).output_limits(256 * 1024, 256 * 1024);
             for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
-                command.env_remove(name);
+                command = command.env_remove(name);
             }
-            let output = command.args(["--exact", TEST, "--nocapture"])
-                .env(CHILD, &global).env("GIT_CONFIG_GLOBAL", &global)
-                .env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
-                .output().unwrap();
-            assert!(output.status.success(), "global fixture failed: {}", String::from_utf8_lossy(&output.stderr));
+            command = command.env(CHILD, global.as_os_str()).env("GIT_CONFIG_GLOBAL", global.as_os_str())
+                .env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+            let output = crate::process::SystemProcessExecutor.execute(&command, &CancellationToken::default())
+                .expect("bounded global fixture child");
+            assert!(output.success, "global fixture failed: {}", String::from_utf8_lossy(&output.stderr));
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
                 "child must execute its exact contract: {}", String::from_utf8_lossy(&output.stdout));
             return;
@@ -1529,6 +1540,62 @@ mod tests {
             assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, owner);
             assert_eq!(fs::read(root.join(".git/config")).unwrap(), local_before);
         }
+    }
+
+    #[test]
+    fn publication_dependency_discovery_cannot_certify_values_from_before_a_replacement() {
+        use crate::process::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput, SystemProcessExecutor};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct SwapAfterRead { included: PathBuf, swapped: AtomicBool, config_reads: AtomicUsize }
+        impl ProcessExecutor for SwapAfterRead {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                let output = SystemProcessExecutor.execute(command, cancel)?;
+                if command.arguments.iter().any(|arg| arg == std::ffi::OsStr::new("--show-origin")) {
+                    self.config_reads.fetch_add(1, Ordering::Relaxed);
+                    if !self.swapped.swap(true, Ordering::Relaxed) {
+                        let replacement = self.included.with_extension("replacement");
+                        fs::write(&replacement, "[branch \"main\"]\n pushRemote = fork\n").unwrap();
+                        fs::rename(replacement, &self.included).unwrap();
+                    }
+                }
+                Ok(output)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let baseline = fixture(&root);
+        git(&root, &["remote", "add", "origin", "https://github.com/before/repo.git"]);
+        git(&root, &["remote", "add", "fork", "https://github.com/after/repo.git"]);
+        git(&root, &["config", "include.path", "publication.inc"]);
+        let included = root.join(".git/publication.inc");
+        fs::write(&included, "[branch \"main\"]\n pushRemote = origin\n").unwrap();
+        let executor = Arc::new(SwapAfterRead { included, swapped: AtomicBool::new(false), config_reads: AtomicUsize::new(0) });
+        let service = RepositoryService::new("git", executor.clone());
+        let mut cache = crate::repository::SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let options = crate::repository::SnapshotOptions::default();
+        let snapshot = service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().unwrap();
+        assert!(executor.swapped.load(Ordering::Relaxed));
+        assert!(executor.config_reads.load(Ordering::Relaxed) >= 2,
+            "a newly discovered post-read origin version requires a fenced reread");
+        let remote = cache.publication_remote().unwrap();
+        assert_eq!(remote.name, "fork", "old Git output must not acquire the new file's identity");
+        let head_repository = remote.push_url.as_deref().or(remote.fetch_url.as_deref())
+            .and_then(crate::github::remote_repository_key);
+        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let mut app = app_with_status_snapshot(baseline, &key);
+        let status = snapshot.status.display_summary();
+        let operation = snapshot.operation.as_ref().map(|operation| operation.kind);
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
+            result: Ok(SourceControlRead { prepared: Some(Box::new((snapshot, model))), status, operation,
+                head_repository, read: next_status_read() }) }));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, "after");
+        let reads = executor.config_reads.load(Ordering::Relaxed);
+        assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_none());
+        assert_eq!(cache.publication_remote().unwrap().name, "fork");
+        assert_eq!(executor.config_reads.load(Ordering::Relaxed), reads,
+            "a stable ordinary refresh must not rerun config discovery");
     }
 
     #[test]
