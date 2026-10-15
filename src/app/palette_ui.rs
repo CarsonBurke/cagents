@@ -75,7 +75,7 @@ fn entry_category(message: &Message) -> char {
 fn entry_key(message: &Message) -> String {
     match message {
         Message::RunCommand(command) => format!("command:{}", command.id()),
-        Message::Palette(Action::MovePaneToChannel(card, channel)) => format!("move:{card}:{channel}"),
+        Message::Palette(Action::MovePaneToChannel(_, _)) => format!("command:{}", Command::MovePaneToChannel.id()),
         Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) | Message::FocusAttention(id) => format!("pane:{id}"),
         Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => {
             format!("worktree:{worktree_id}")

@@ -1597,6 +1597,7 @@ mod tests {
         drop(app.update_palette(super::super::palette_ui::Action::Query("needle".into())));
         drop(app.update_palette(super::super::palette_ui::Action::Submit));
         assert!(!app.palette.is_open(), "dismiss before dispatch so the move passes the modal guard");
+        assert_eq!(app.settings.palette_recents.first().map(String::as_str), Some("command:move_pane_to_channel"), "parameterized destinations share the reachable command's recent identity");
         assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
             scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
         } if from == source && id == pane.id && to == destination));
