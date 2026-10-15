@@ -28,6 +28,7 @@ mod monospace;
 mod permissions;
 mod prose;
 mod retained;
+mod closed_draft;
 mod scroll;
 mod selectable_prose;
 mod selection;
@@ -168,6 +169,8 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    CopyClosedDraft(Target, u64),
+    DiscardClosedDraft(Target, u64),
     SignIn(Target, Account),
     ResumeAfterSignIn(Target),
     /// Starts a new conversation in the same session directory and working
@@ -1497,6 +1500,8 @@ pub(super) struct Runtime {
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
+    /// Set only by exact shared-view retirement, independently of transport failure.
+    closed_elsewhere: bool,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -2091,6 +2096,7 @@ impl Runtime {
             source_clock: None,
             finished_stamp: None,
             connection,
+            closed_elsewhere: false,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -4577,7 +4583,7 @@ impl Cagents {
             _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
         };
         runtime.is_some_and(|runtime| {
-            !runtime.unsent_text().is_empty() || runtime.transition_blocker().is_some()
+            runtime.closed_elsewhere || !runtime.unsent_text().is_empty() || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
             .drafts
@@ -5655,7 +5661,7 @@ impl Cagents {
         clear_draft: bool,
         step: Option<QueuedStep>,
     ) -> Task<Message> {
-        if self.chat_start_pending(target.card) {
+        if self.chat_start_pending(target.card) || self.chat_closed_elsewhere(target.card) {
             return Task::none();
         }
         let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -5763,6 +5769,10 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        let closed_refresh = match &action {
+            Action::Ready(target, _) => Some(target.card),
+            _ => None,
+        };
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
@@ -5784,6 +5794,9 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        if let Some(card) = closed_refresh {
+            self.sync_closed_chat_draft(card);
+        }
         if let Some(target) = restore
             && let Some(runtime) = self.chat_runtime_mut(target)
             && !runtime.account_picker
@@ -5828,11 +5841,16 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = action.starts_session()
-            && self.refuse_for_deleting_card(card)
+            && (self.chat_closed_elsewhere(card) || self.refuse_for_deleting_card(card))
         {
             return Task::none();
         }
+        if matches!(&action, Action::Submit(target, _) if self.chat_closed_elsewhere(target.card)) {
+            return Task::none();
+        }
         match action {
+            Action::CopyClosedDraft(target, revision) => return self.copy_closed_chat_draft(target, revision),
+            Action::DiscardClosedDraft(target, revision) => return self.discard_closed_chat_draft(target, revision),
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }

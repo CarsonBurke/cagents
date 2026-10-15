@@ -1064,9 +1064,11 @@ impl Runtime {
 
     /// Completion requires provider evidence; an idle, attached conversation
     /// without that evidence is ready, while an unattached one is connecting.
-    fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
+    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
-        if self.queued.is_some() {
+        if self.closed_elsewhere {
+            (Some(Icon::Close), if self.unsent_text().is_empty() && self.attachments.is_empty() { "Closed" } else { "Closed · draft retained" })
+        } else if self.queued.is_some() {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
@@ -1133,6 +1135,7 @@ impl Runtime {
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
         let available = !transitioning
+            && !self.closed_elsewhere
             && !self.disconnected
             && !self.snapshot.exited
             && self.pending.is_none()
@@ -1299,7 +1302,7 @@ impl Runtime {
                 );
             }
             for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                anchor.is_none() && !self.active_auth_notice(anchor, error)
+                anchor.is_none() && !self.expected_remote_close_error(error) && !self.active_auth_notice(anchor, error)
             }) {
                 transcript.push(notice_entry(error, target));
             }
@@ -1314,7 +1317,7 @@ impl Runtime {
                     self.turn_trailing_footer(turn),
                 );
                 for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                    anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
+                    anchor.as_ref() == Some(&turn.key) && !self.expected_remote_close_error(error) && !self.active_auth_notice(anchor, error)
                 }) {
                     transcript.push(notice_entry(error, target));
                 }
@@ -1375,6 +1378,7 @@ impl Runtime {
         // composer: it scrolls away with what it was about instead of
         // staying on screen until the next command happens to clear it.
         if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
+            && !self.expected_remote_close_error(error)
             && !chat::requires_sign_in(self.session.launch.provider, error)
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
@@ -1474,7 +1478,9 @@ impl Runtime {
                 "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             ));
         }
-        if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
+        if self.closed_elsewhere {
+            content.push(self.closed_draft_controls(transitioning));
+        } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
             let enabled =
                 !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
@@ -1536,7 +1542,7 @@ impl Runtime {
                 .into(),
             );
         }
-        if self.auth_error().is_some() {
+        if !self.closed_elsewhere && self.auth_error().is_some() {
             content.push(auth_recovery::view(self, recovery, !transitioning));
         }
         // A question stays on this surface until the reader resolves it: no
@@ -2218,7 +2224,9 @@ impl Runtime {
                 .into(),
             );
         }
-        status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+        if !self.closed_elsewhere {
+            status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+        }
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {

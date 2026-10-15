@@ -48,6 +48,8 @@ pub(super) struct State {
     requested_transfers: HashMap<uuid::Uuid, CardId>,
     pub attached: HashSet<CardId>,
     retained: HashSet<CardId>,
+    /// Exact chat identity retired by an authoritative view, never inferred from EOF.
+    pub closed_chats: HashMap<CardId, TerminalId>,
     applying: bool,
     pub creating_default: bool,
     pub deferred_default: Option<PathBuf>,
@@ -1356,6 +1358,12 @@ impl Cagents {
                 || self.shared_chat_has_local_work(id)
             {
                 self.retain_local_pane(id);
+                if view.retired.contains(&id)
+                    && let Some(CardKind::Chat(session)) = self.card_state(id).map(|card| &card.kind)
+                {
+                    self.shared_views.closed_chats.insert(id, session.id);
+                    self.sync_closed_chat_draft(id);
+                }
                 self.status = Some(TransientNotice::warning(
                     "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
                 ));
@@ -1364,6 +1372,8 @@ impl Cagents {
             self.detach_shared_pane(id);
         }
         for shared in &view.panes {
+            self.shared_views.closed_chats.remove(&shared.id);
+            self.sync_closed_chat_draft(shared.id);
             self.prepare_terminal_restoration(shared);
             let mut projected = shared.clone();
             if let Scope::Worktree { path, .. } = &view.scope {
