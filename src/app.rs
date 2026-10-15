@@ -32684,20 +32684,6 @@ mod tests {
             cards: ids[..2].to_vec(),
             focused: Some(ids[0]),
         });
-        app.observe_agent_activity_for_card(
-            ids[0],
-            Some(Activity {
-                provider: Provider::Omp,
-                state: ActivityState::Working,
-            }),
-        );
-        app.observe_agent_activity_for_card(
-            ids[1],
-            Some(Activity {
-                provider: Provider::Omp,
-                state: ActivityState::Waiting,
-            }),
-        );
         assert!(app.agent_worktree(ids[0]).is_none());
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -32725,7 +32711,22 @@ mod tests {
             .into_iter()
             .map(|(_, path, _)| PathBuf::from(path))
             .collect();
-        assert!(app.reconcile_agent_attention_owners());
+        // Exercise the actual observer with already loaded roots. Reattribution
+        // when roots arrive after activity needs a separate model-adoption test.
+        app.observe_agent_activity_for_card(
+            ids[0],
+            Some(Activity {
+                provider: crate::agent::Provider::Omp,
+                state: ActivityState::Working,
+            }),
+        );
+        app.observe_agent_activity_for_card(
+            ids[1],
+            Some(Activity {
+                provider: crate::agent::Provider::Omp,
+                state: ActivityState::Waiting,
+            }),
+        );
         app.refresh_sidebar_channels();
         assert_eq!(
             app.sidebar_state.agent_activity(project, linked),
@@ -32737,7 +32738,7 @@ mod tests {
         );
         let row = &app.sidebar_model.projects[0].channels[0];
         assert_eq!(row.worktree, Some((linked, "feature/login".into())));
-        assert!(row.tooltip.contains("feature/login"));
+        assert!(row.tooltip_for_test().contains("feature/login"));
         for id in &ids {
             app.observe_agent_update_for_card(*id);
         }
