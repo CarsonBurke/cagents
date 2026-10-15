@@ -354,6 +354,7 @@ fn create_inner(
             alias,
             cwd: launch.recipe.working_directory.clone(),
             expected_home,
+            annotation_scope: None,
             next_id: 0,
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
@@ -418,6 +419,8 @@ enum Pending {
     Skills,
     History {
         earlier: bool,
+        thread: String,
+        account: Option<crate::account::scope::LaunchAccountScope>,
     },
     Turn {
         revision: u64,
@@ -492,6 +495,7 @@ struct Codex {
     alias: Option<PathBuf>,
     cwd: PathBuf,
     expected_home: PathBuf,
+    annotation_scope: Option<crate::account::scope::LaunchAccountScope>,
     next_id: u64,
     pending: BTreeMap<String, Pending>,
     requests: BTreeMap<String, PendingRequest>,
@@ -1001,8 +1005,11 @@ impl Codex {
         if self.history_loading {
             return Err("Codex history is already loading".into());
         }
+        let thread = self.thread.as_deref().filter(|_| self.attached)
+            .ok_or("Codex history requires a provider-confirmed attached thread")?.to_owned();
+        let account = self.annotation_scope.as_ref().filter(|scope| scope.revalidate().is_ok()).cloned();
         let earlier = cursor.is_some();
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier })?;
+        self.call(step, "thread/turns/list", json!({"threadId":thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, thread, account })?;
         self.history_loading = true;
         step.events.push(if earlier {
             Event::HistoryLoading(true)
@@ -1674,7 +1681,13 @@ impl Codex {
     }
 }
 
+mod history_origins;
+
 impl Adapter for Codex {
+    fn annotation_scope(&mut self, scope: Option<crate::account::scope::LaunchAccountScope>) {
+        self.annotation_scope = scope.filter(|scope| scope.provider == crate::agent::Provider::Codex && scope.canonical_home == self.expected_home && scope.revalidate().is_ok());
+    }
+
     fn take_approval_updates(&mut self) -> Vec<chat::annotations::ApprovalUpdate> {
         std::mem::take(&mut self.annotation_updates)
     }
@@ -2356,9 +2369,20 @@ impl Adapter for Codex {
                         self.skills(&mut step)?;
                     }
                 }
-                Pending::History { earlier } => {
-                    self.page(result, &mut step, earlier)?;
-                    self.finish_history(&mut step)?;
+                Pending::History { earlier, thread, account } => {
+                    if !self.attached || self.thread.as_deref() != Some(thread.as_str()) {
+                        self.history_loading = false;
+                        step.events.push(Event::HistoryLoading(false));
+                        step.events.push(Event::HistoryError("Codex history response belongs to a previous attached thread".into()));
+                    } else {
+                        let begin = step.events.len();
+                        self.page(result, &mut step, earlier)?;
+                        if !self.is_child && let Some(account) = account
+                            && account.revalidate().is_ok() {
+                            self.history_annotation_origins(&account, &thread, begin, &mut step);
+                        }
+                        self.finish_history(&mut step)?;
+                    }
                 }
                 Pending::FastMode {
                     enabled,
@@ -4473,6 +4497,7 @@ mod tests {
             alias: None,
             cwd: PathBuf::from("/tmp"),
             expected_home: std::fs::canonicalize("/tmp").unwrap(),
+            annotation_scope: None,
             next_id: 0,
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),

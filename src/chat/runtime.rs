@@ -251,7 +251,7 @@ impl Handle {
 
     fn start_inner(
         mut spec: ProcessSpec,
-        adapter: Box<dyn Adapter>,
+        mut adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         session_id: Option<String>,
@@ -260,6 +260,7 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        adapter.annotation_scope(launch_account_scope.as_ref().ok().cloned());
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.

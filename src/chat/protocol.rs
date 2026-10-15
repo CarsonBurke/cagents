@@ -218,6 +218,9 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Inject only the actual immutable startup credential-directory capture.
+    /// Requested recipes and later account selections are not history proof.
+    fn annotation_scope(&mut self, _scope: Option<crate::account::scope::LaunchAccountScope>) {}
     /// The actor captures immutable operator input only for adapters that
     /// implement exact provider acceptance and settings evidence.
     fn supports_original_commands(&self, _command: &Command) -> bool {
