@@ -19,7 +19,7 @@ pub(super) struct WorktreeRoots<'a> {
 }
 
 impl<'a> WorktreeRoots<'a> {
-    fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
+    pub(super) fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
         Self {
             roots: roots.map(|root| (root, root)).collect(),
         }
@@ -395,7 +395,7 @@ impl Cagents {
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
-    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+    pub(super) fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.
         self.known_worktree_roots
@@ -551,6 +551,25 @@ impl Cagents {
             )
             .unwrap_or(directory),
         )
+    }
+
+    /// Current loaded ownership only; retained historical boundaries remain
+    /// separately in WorktreeRoots so a removed nested checkout cannot fall
+    /// through into its still-loaded parent.
+    pub(super) fn loaded_worktree_keys(&self) -> HashMap<PathBuf, ActiveWorktreeKey> {
+        let mut loaded = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            if let Some(key) = project.folder_key() {
+                loaded.entry(project.repository.clone()).or_insert(key);
+            }
+            for worktree in &project.worktrees {
+                loaded.entry(worktree.path.clone()).or_insert_with(|| ActiveWorktreeKey {
+                    project_id: project.id, worktree_id: worktree.id,
+                    canonical_path: worktree.path.clone(),
+                });
+            }
+        }
+        loaded
     }
 
     pub(super) fn indexed_worktree_roots(&self) -> WorktreeRoots<'_> {

@@ -537,83 +537,6 @@ impl Cagents {
 
     /// Removes a channel along with everything that existed only inside it.
     ///
-    #[test]
-    fn attention_verified_relocation_updates_channel_branch_and_rollup_without_rewriting_launch() {
-        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
-        use crate::workspace_model::{AgentLocation, views::{Pane, Scope, View}};
-        let (mut app, channel, _, card) = channel_with_a_conversation();
-        let project = app.sidebar_model.projects[0].id;
-        let worktree = crate::model::WorktreeId::new();
-        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
-            worktree, "/located/worktree".into(), Some("relocated-branch".into())));
-        let durable = Arc::make_mut(&mut app.durable);
-        let saved = durable.cards.iter_mut().find(|saved| saved.id == card).unwrap();
-        let CardKind::Chat(session) = &mut saved.kind else { unreachable!() };
-        session.launch.recipe.working_directory = "/old/worktree/src".into();
-        session.proof = Some(crate::model::HostSessionProof {
-            host_session_id: crate::model::HostSessionId::new("location-host"),
-            boot_id: crate::model::BootId::new("location-boot"),
-            host_incarnation: crate::model::HostIncarnation::new("location-incarnation"),
-        });
-        let accepted = session.clone();
-        let pane = Pane::from_card(saved, None).unwrap();
-        let placement = Scope::Channel(channel);
-        let agent = Agent {
-            id: crate::model::AgentId::from_uuid(card.as_uuid()), name: None,
-            origin: Origin::User,
-            spec: Spec { provider: crate::agent::Provider::Omp, account: None,
-                target: Target { repository: "/old/repository".into(),
-                    directory: accepted.launch.recipe.working_directory.clone(),
-                    placement: Some(placement.clone()) }, surface: Surface::Chat,
-                model: None, permission_mode: None, reasoning_effort: None },
-            placement: placement.clone(), session: Some(HostedSession::Chat(accepted.clone())),
-            console: None, created_ms: 0, closed: false,
-        };
-        app.workspace_model.agents = vec![agent.clone()];
-        app.workspace_model.agent_locations = vec![AgentLocation {
-            agent: agent.id, repository: "/located/repository".into(),
-            directory: "/located/worktree/src".into(), blocked_directory: None,
-        }];
-        app.workspace_model.views = vec![View { scope: placement, revision: 1, panes: vec![pane], retired: vec![] }];
-        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity {
-            provider: crate::agent::Provider::Omp, state: ActivityState::Waiting,
-        }));
-        app.refresh_sidebar_channels();
-        assert_eq!(app.sidebar_model.projects[0].channels[0].worktree,
-            Some((worktree, "relocated-branch".into())));
-        assert!(app.sidebar_model.projects[0].channels[0].tooltip_for_test().contains("relocated-branch"));
-        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
-        assert_eq!(app.agent_worktree(card).map(|key| key.worktree_id), Some(worktree));
-        assert_eq!(app.workspace_model.agents[0], agent);
-        assert_eq!(app.durable.cards.iter().find(|saved| saved.id == card).unwrap().kind,
-            CardKind::Chat(accepted.clone()));
-
-        // A separate valid card cannot hide another card's refused provenance.
-        let durable = Arc::make_mut(&mut app.durable);
-        let mut other = durable.cards.iter().find(|saved| saved.id == card).unwrap().clone();
-        other.id = CardId::new();
-        let CardKind::Chat(session) = &mut other.kind else { unreachable!() };
-        session.id = crate::model::TerminalId::new();
-        session.launch.recipe.working_directory = "/located/worktree/other".into();
-        durable.channels.iter_mut().find(|row| row.id == channel).unwrap().cards.push(other.id);
-        durable.cards.push(other);
-        app.workspace_model.agent_locations[0].blocked_directory = Some("/located/candidate".into());
-        app.reconcile_agent_attention_owners();
-        app.refresh_sidebar_channels();
-        assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none());
-        assert!(app.agent_worktree(card).is_none());
-        assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
-        app.workspace_model.agent_locations[0].blocked_directory = None;
-        app.sidebar_model.projects[0].worktrees.retain(|row| row.id != worktree);
-        app.reconcile_agent_attention_owners();
-        app.refresh_sidebar_channels();
-        assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none(),
-            "location metadata cannot invent a missing loaded checkout");
-        assert!(app.agent_worktree(card).is_none());
-        assert_eq!(app.durable.cards.iter().find(|saved| saved.id == card).unwrap().kind,
-            CardKind::Chat(accepted));
-    }
-
     /// A channel's conversations are reachable nowhere else, so they are
     /// retired with it rather than left behind as durable cards no scope can
     /// show - the same treatment worktree deletion gives the cards of the
@@ -945,6 +868,9 @@ impl Cagents {
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+        let loaded = self.loaded_worktree_keys();
+        let roots = super::worktree_ui::WorktreeRoots::new(self.known_worktree_roots.iter()
+            .map(PathBuf::as_path).chain(loaded.keys().map(PathBuf::as_path)));
         let cards: HashMap<_, _> = durable.cards.iter().map(|card| (card.id, card)).collect();
         let mut channels: HashMap<_, Vec<_>> = HashMap::new();
         for channel in &durable.channels {
@@ -1011,6 +937,10 @@ impl Cagents {
                         _ => {}
                     }
                 }
+                attribution_unavailable |= directories.iter().any(|directory| {
+                    let boundary = roots.resolve(directory).unwrap_or(directory);
+                    loaded.get(boundary).is_none_or(|key| key.project_id != project.id)
+                });
                 let worktree = if attribution_unavailable { None } else { worktrees.channel(directories) };
                 let acknowledged_attention = state
                     .attention_retained(sidebar::SelectionRow::Channel(channel.id))
@@ -1479,6 +1409,101 @@ mod tests {
         ));
         app.refresh_sidebar_channels();
         (app, doomed, survivor, conversation)
+    }
+
+    #[test]
+    fn attention_verified_relocation_updates_channel_branch_and_rollup_without_rewriting_launch() {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        use crate::workspace_model::{AgentLocation, views::{Pane, Scope, View}};
+        let (mut app, channel, _, card) = channel_with_a_conversation();
+        app.context_inspector_open = false;
+        let project = app.sidebar_model.projects[0].id;
+        let worktree = crate::model::WorktreeId::new();
+        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(), "/old/worktree".into(), Some("old-branch".into())));
+        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(), "/located".into(), Some("parent-control".into())));
+        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
+            worktree, "/located/worktree".into(), Some("relocated-branch".into())));
+        let durable = Arc::make_mut(&mut app.durable);
+        let saved = durable.cards.iter_mut().find(|saved| saved.id == card).unwrap();
+        let CardKind::Chat(session) = &mut saved.kind else { unreachable!() };
+        session.launch.recipe.working_directory = "/old/worktree/src".into();
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("location-host"),
+            boot_id: crate::model::BootId::new("location-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("location-incarnation"),
+        });
+        let accepted = session.clone();
+        let pane = Pane::from_card(saved, None).unwrap();
+        let placement = Scope::Channel(channel);
+        let agent = Agent {
+            id: crate::model::AgentId::from_uuid(card.as_uuid()), name: None,
+            origin: Origin::User,
+            spec: Spec { provider: crate::agent::Provider::Omp, account: None,
+                target: Target { repository: "/old/repository".into(),
+                    directory: accepted.launch.recipe.working_directory.clone(),
+                    placement: Some(placement.clone()) }, surface: Surface::Chat,
+                model: None, permission_mode: None, reasoning_effort: None },
+            placement: placement.clone(), session: Some(HostedSession::Chat(accepted.clone())),
+            console: None, created_ms: 0, closed: false,
+        };
+        // Populate the ordinary derived launch cache before relocation. It is
+        // not explicit filing authority and cannot override verified evidence.
+        app.refresh_worktree_owners(None);
+        assert_eq!(app.worktree_owners.get(&card).map(PathBuf::as_path), Some(Path::new("/old/worktree")));
+        app.workspace_model.agents = vec![agent.clone()];
+        app.workspace_model.agent_locations = vec![AgentLocation {
+            agent: agent.id, repository: "/located/repository".into(),
+            directory: "/located/worktree/src".into(), blocked_directory: None,
+        }];
+        app.workspace_model.views = vec![View { scope: placement, revision: 1, panes: vec![pane], retired: vec![] }];
+        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity {
+            provider: crate::agent::Provider::Omp, state: ActivityState::Waiting,
+        }));
+        app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_model.projects[0].channels[0].worktree,
+            Some((worktree, "relocated-branch".into())));
+        assert!(app.sidebar_model.projects[0].channels[0].tooltip_for_test().contains("relocated-branch"));
+        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
+        assert_eq!(app.agent_worktree(card).map(|key| key.worktree_id), Some(worktree));
+        app.sidebar_state.observe_agent_update(card, project, worktree);
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project, worktree))));
+        assert!(!app.sidebar_state.has_card_update(card), "bulk read uses verified current ownership");
+        assert_eq!(app.workspace_model.agents[0], agent);
+        assert_eq!(app.durable.cards.iter().find(|saved| saved.id == card).unwrap().kind,
+            CardKind::Chat(accepted.clone()));
+
+        // A separate valid card cannot hide another card's refused provenance.
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut other = durable.cards.iter().find(|saved| saved.id == card).unwrap().clone();
+        other.id = CardId::new();
+        let CardKind::Chat(session) = &mut other.kind else { unreachable!() };
+        session.id = crate::model::TerminalId::new();
+        session.launch.recipe.working_directory = "/located/worktree/other".into();
+        durable.channels.iter_mut().find(|row| row.id == channel).unwrap().cards.push(other.id);
+        durable.cards.push(other);
+        app.workspace_model.agent_locations[0].blocked_directory = Some("/located/candidate".into());
+        app.reconcile_agent_attention_owners();
+        app.refresh_sidebar_channels();
+        assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none());
+        assert!(app.agent_worktree(card).is_none());
+        assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
+        Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/located/worktree".into());
+        app.reconcile_agent_attention_owners();
+        assert_eq!(app.agent_worktree(card).map(|key| key.worktree_id), Some(worktree),
+            "explicit saved filing remains display authority even when process relocation refuses");
+        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
+        Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
+        app.workspace_model.agent_locations[0].blocked_directory = None;
+        app.sidebar_model.projects[0].worktrees.retain(|row| row.id != worktree);
+        app.reconcile_agent_attention_owners();
+        app.refresh_sidebar_channels();
+        assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none(),
+            "removed nested checkout cannot fall through to the loaded parent control");
+        assert!(app.agent_worktree(card).is_none());
+        assert_eq!(app.durable.cards.iter().find(|saved| saved.id == card).unwrap().kind,
+            CardKind::Chat(accepted));
     }
 
     /// A channel's conversations are reachable nowhere else, so deleting one

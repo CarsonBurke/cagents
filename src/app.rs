@@ -7253,7 +7253,8 @@ impl Cagents {
         let state = self.card_state(card)?;
         let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
         let roots = self.indexed_worktree_roots();
-        self.agent_worktree_indexed(state, &locations, &roots)
+        let loaded = self.loaded_worktree_keys();
+        self.agent_worktree_indexed(state, &locations, &roots, &loaded)
     }
 
     fn agent_worktree_indexed(
@@ -7261,46 +7262,34 @@ impl Cagents {
         state: &CardState,
         locations: &crate::workspace_model::views::AttentionDirectoryIndex<'_>,
         roots: &worktree_ui::WorktreeRoots<'_>,
+        loaded: &HashMap<PathBuf, ActiveWorktreeKey>,
     ) -> Option<ActiveWorktreeKey> {
         if !state.existence.is_open() || !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
             return None;
         }
         // Explicit filing remains display authority. Verified operational
         // location only replaces the historical launch-directory fallback.
-        if self.worktree_owners.contains_key(&state.id) || self.durable.card_scopes.contains_key(&state.id) {
-            return self.sidebar_model.worktree_at(self.unchanneled_card_worktree(state)?);
+        if let Some(scope) = self.durable.card_scopes.get(&state.id) {
+            return loaded.get(roots.resolve(scope).unwrap_or(scope)).cloned();
         }
         use crate::workspace_model::views::AttentionDirectory;
         let directory = match locations.directory(state) {
             AttentionDirectory::Verified(directory) => directory,
-            AttentionDirectory::Launch => card_directory(state)?,
+            AttentionDirectory::Launch => return loaded.get(self.unchanneled_card_worktree(state)?).cloned(),
             AttentionDirectory::Unavailable => return None,
         };
-        self.sidebar_model.worktree_at(roots.resolve(directory).unwrap_or(directory))
+        loaded.get(roots.resolve(directory).unwrap_or(directory)).cloned()
     }
 
     /// Reconcile only when repository roots change, not on runtime/frame wakes.
     /// Existing scalar activity and restored unread must acquire late roots too.
     fn reconcile_agent_attention_owners(&mut self) -> bool {
         self.notification_ui.scope_changed();
-        let mut roots = HashMap::new();
-        for project in &self.sidebar_model.projects {
-            if let Some(key) = project.folder_key() {
-                roots
-                    .entry(project.repository.as_path())
-                    .or_insert((key.project_id, key.worktree_id));
-            }
-            for worktree in &project.worktrees {
-                // Match SidebarModel::worktree_at's first-known exact owner.
-                roots
-                    .entry(worktree.path.as_path())
-                    .or_insert((project.id, worktree.id));
-            }
-        }
+        let loaded = self.loaded_worktree_keys();
+        let roots = self.indexed_worktree_roots();
         let resolve = |directory: &Path| {
-            directory
-                .ancestors()
-                .find_map(|ancestor| roots.get(ancestor).copied())
+            loaded.get(roots.resolve(directory).unwrap_or(directory))
+                .map(|key| (key.project_id, key.worktree_id))
         };
         let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
         let owners: Vec<_> = self
@@ -7317,13 +7306,13 @@ impl Cagents {
                     resolve(scope)
                 } else {
                     use crate::workspace_model::views::AttentionDirectory;
-                    let directory = match locations.directory(card) {
-                        AttentionDirectory::Verified(directory) => Some(directory),
-                        AttentionDirectory::Launch => card_directory(card),
+                    match locations.directory(card) {
+                        AttentionDirectory::Verified(directory) => resolve(directory),
+                        AttentionDirectory::Launch => card_directory(card).and_then(resolve).or_else(|| {
+                            self.worktree_owners.get(&card.id).and_then(|scope| resolve(scope))
+                        }),
                         AttentionDirectory::Unavailable => None,
-                    };
-                    self.worktree_owners.get(&card.id).and_then(|scope| resolve(scope))
-                        .or_else(|| directory.and_then(resolve))
+                    }
                 };
                 (card.id, owner)
             })
@@ -14470,8 +14459,9 @@ impl Application for Cagents {
                     SidebarAction::MarkWorktreeRead(project, worktree) => {
                         let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
                         let roots = self.indexed_worktree_roots();
+                        let loaded = self.loaded_worktree_keys();
                         let cards = self.durable.cards.iter().filter(|card| card.existence.is_open())
-                            .filter(|card| self.agent_worktree_indexed(card, &locations, &roots).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
+                            .filter(|card| self.agent_worktree_indexed(card, &locations, &roots, &loaded).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
                             .map(|card| card.id).collect();
                         self.mark_cards_read(cards)
                     }
