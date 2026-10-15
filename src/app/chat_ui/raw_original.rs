@@ -137,6 +137,13 @@ impl State {
     fn restore_notice(&mut self,error:Option<String>) {
         if self.restore_error!=error {self.restore_error=error;self.notice_revision=next_revision();}
     }
+    /// Geometry completions must match this selected displayed alias and the
+    /// current immutable call, not merely any tool cache with the same ID.
+    pub(super) fn item_matches(&self,item:&str,matches:impl Fn(&tool_text::ToolText)->bool)->bool {
+        self.aliases.get(item).into_iter().flatten().filter_map(|key|self.entries.get(key))
+            .filter(|entry|entry.opened).any(|entry|entry.loaded.as_ref()
+                .is_some_and(|loaded|loaded.record==record(&entry.part) && matches(&loaded.view)))
+    }
     pub(super) fn render_ready(&mut self,ready:impl Fn(&tool_text::ToolText)->bool)->bool {
         let mut changed=false;
         for entry in self.entries.values_mut() {
