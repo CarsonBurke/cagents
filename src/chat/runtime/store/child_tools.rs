@@ -218,15 +218,15 @@ impl Store {
     }
 
     pub(super) fn cache_child_tool(&mut self, event: &Event) -> Result<Option<String>, String> {
-        // Revocation discards uncommitted bytes before deleting the namespace;
-        // a pending batch must not re-create a removed item after this event.
+        // Destructive events never flush pending bytes into a removed source.
+        // A failed Reset keeps its pending lane until the transaction commits.
         match event {
             Event::Reset { .. } => {
-                self.pending_child_tool = None;
                 let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
                 guard(&tx, self.raw_sources.nonce)?;
                 tx.execute_batch("DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
+                self.pending_child_tool = None;
                 self.child_tools_unavailable = None;
                 self.child_tools_have_revocations = false;
                 return Ok(None);
@@ -1041,7 +1041,12 @@ mod tests {
                     1 => store.append_child_tool("child", "known", false, 6, "more").map(|_| ()),
                     2 => store.remove_child_tool("child", "known"),
                     3 => store.revoke_child_tool("child", "known"),
-                    4 => store.cache_child_tool(&Event::Reset { reason: "refused".into() }).map(|_| ()),
+                    4 => {
+                        store.pending_child_tool = Some(Pending {agent: "child".into(), id: "known".into(), input: false, offset: 6, delta: "pending".into()});
+                        let result = store.cache_child_tool(&Event::Reset { reason: "refused".into() }).map(|_| ());
+                        assert!(store.pending_child_tool.is_some(), "a refused Reset retains uncommitted bytes");
+                        result
+                    },
                     _ => {
                         store.pending_child_tool = Some(Pending {agent: "child".into(), id: "known".into(), input: false, offset: 6, delta: "pending".into()});
                         let result = store.flush_child_tool().map(|_| ());
