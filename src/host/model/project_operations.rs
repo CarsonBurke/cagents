@@ -15,7 +15,7 @@ const MAX_SCOPE_BYTES: usize = 1024 * 1024;
 
 /// Only negative scope metadata is durable. No descriptor, factory, environment,
 /// or process ownership is reconstructed from it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SavedScope {
     pub project: ProjectInstance,
@@ -35,7 +35,9 @@ impl SavedScope {
                 return Err("Project operation scope does not name its original project".into());
             }
         }
-        if self.roots.len() > 8192 || self.protected.len() > 8192
+        if self.project.repository.as_os_str().as_encoded_bytes().len()>16384
+            || self.roots.iter().chain(&self.protected).any(|path|path.as_os_str().as_encoded_bytes().len()>16384)
+            || self.roots.len() > 8192 || self.protected.len() > 8192
             || self.channels.len() > 8192 || self.panes.len() > 8192
             || self.sessions.len() > 8192
             || self.roots.iter().chain(&self.protected).any(|path| !path.is_absolute()
@@ -110,14 +112,31 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(CREATE_TABLE).map_err(|error| error.to_string())
 }
 
-pub(crate) fn digest(value: &impl Serialize) -> Result<String, String> {
-    use sha2::Digest;
-    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > 3 * 1024 * 1024 {
-        return Err("Project operation request exceeds its custody bound".into());
+struct BoundedWriter<W> {inner:W,remaining:usize}
+impl<W:io::Write> io::Write for BoundedWriter<W> {
+    fn write(&mut self,bytes:&[u8])->io::Result<usize> {
+        if bytes.len()>self.remaining {return Err(io::Error::other("Project operation serialization exceeds its custody bound"));}
+        self.inner.write_all(bytes)?;self.remaining-=bytes.len();Ok(bytes.len())
     }
-    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+    fn flush(&mut self)->io::Result<()> {self.inner.flush()}
 }
+fn bounded_scope(scope:&SavedScope)->Result<String,String> {
+    let mut writer=BoundedWriter{inner:Vec::new(),remaining:MAX_SCOPE_BYTES};
+    serde_json::to_writer(&mut writer,scope).map_err(|error|error.to_string())?;
+    String::from_utf8(writer.inner).map_err(|error|error.to_string())
+}
+pub(crate) fn digest(value:&impl Serialize)->Result<String,String> {
+    use sha2::Digest;
+    struct HashWriter(sha2::Sha256);
+    impl io::Write for HashWriter {
+        fn write(&mut self,bytes:&[u8])->io::Result<usize> {self.0.update(bytes);Ok(bytes.len())}
+        fn flush(&mut self)->io::Result<()> {Ok(())}
+    }
+    let mut writer=BoundedWriter{inner:HashWriter(sha2::Sha256::new()),remaining:3*1024*1024};
+    serde_json::to_writer(&mut writer,value).map_err(|error|error.to_string())?;
+    Ok(format!("{:x}",writer.inner.0.finalize()))
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
@@ -155,12 +174,12 @@ impl Registry {
         if operation.is_nil() || !valid_digest(request_digest) || !valid_digest(commit_digest) {
             return Err("Project operation identity or digest is invalid".into());
         }
-        let scope_json=serde_json::to_string(scope).map_err(|error|error.to_string())?;
-        if scope_json.len()>MAX_SCOPE_BYTES {return Err("Project operation scope exceeds its custody budget".into());}
+        let scope_json=bounded_scope(scope)?;
         let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
         if let Some(existing)=read(&tx,operation)? {
-            if existing.request_digest!=request_digest || existing.commit_digest!=commit_digest {
-                return Err("This project operation identity belongs to another original request".into());
+            if existing.request_digest!=request_digest || existing.commit_digest!=commit_digest
+                || existing.scope.as_ref().is_some_and(|original|original!=scope) {
+                return Err("This project operation identity belongs to another original request or retained scope".into());
             }
             return Ok(existing);
         }
@@ -249,6 +268,8 @@ mod tests {
         registry.begin_project_operation(operation,&request,&commit,&scope).unwrap();
         let other=digest(&"other").unwrap();
         assert!(registry.begin_project_operation(operation,&other,&commit,&scope).is_err());
+        let mut substituted=scope.clone();substituted.roots.push("/different".into());
+        assert!(registry.begin_project_operation(operation,&request,&commit,&substituted).is_err(),"a replay cannot substitute fresh negative scope after matching only its digests");
         assert!(registry.advance_project_operation(operation,&other,Phase::Admitted,Phase::Closing).is_err());
         assert!(registry.advance_project_operation(operation,&request,Phase::Admitted,Phase::Resolved).is_err());
         assert_eq!(registry.project_operation(operation).unwrap().unwrap().phase,Phase::Admitted);
@@ -286,5 +307,9 @@ mod tests {
         let mut large=scope;large.roots=vec![PathBuf::from(format!("/{}","x".repeat(MAX_SCOPE_BYTES)))];
         assert!(registry.begin_project_operation(Uuid::new_v4(),&request,&commit,&large).is_err());
         assert!(registry.project_operation(original).unwrap().is_some());
+        let mut aggregate=registry.project_operation(original).unwrap().unwrap().scope.unwrap();
+        aggregate.roots=vec![PathBuf::from(format!("/{}","x".repeat(255)));8192];
+        assert!(bounded_scope(&aggregate).is_err(),"combined serialization must stop at its bounded writer before allocating an oversized record");
+        assert!(digest(&"x".repeat(3*1024*1024+1)).is_err());
     }
 }
