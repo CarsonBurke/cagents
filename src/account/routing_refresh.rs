@@ -63,11 +63,15 @@ async fn refresh_with<F, Fut>(
                 Ok(probe::Outcome::Answered {
                     identity, snapshot, ..
                 }) => {
-                    let entry = Entry { identity, snapshot };
-                    if let Some(cache) = &cache {
-                        let _ = cache.store(&key, entry.clone());
-                    }
-                    entries.insert(key.clone(), entry);
+                    // Real probes commit before returning. Re-read the shared
+                    // verdict so a later login invalidation cannot be erased
+                    // by an unqualified duplicate write of this old answer.
+                    let entry = match &cache {
+                        Some(cache) => cache.load(crate::chat::now_ms().unwrap_or(now)).remove(&key),
+                        None => Some(Entry { identity, snapshot }),
+                    };
+                    if let Some(entry) = entry { entries.insert(key.clone(), entry); }
+                    else { entries.remove(&key); }
                     break;
                 }
                 Ok(probe::Outcome::Busy) => {

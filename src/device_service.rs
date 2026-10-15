@@ -227,13 +227,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
                 Vec<(crate::agent::Provider, Catalog)>,
             ) = serde_json::from_value(reports).map_err(|error| error.to_string())?;
             let cache = Cache::installation().ok_or("The device account cache is unavailable")?;
-            for (account, entry) in entries {
-                if let Some(key) = account.cache_key() {
-                    cache
-                        .store(&key, entry)
-                        .map_err(|error| error.to_string())?;
-                }
-            }
+            // Frontend entries carry issued recipes, not authenticated actor
+            // home identity. Only daemon-captured reports publish live usage.
+            drop(entries);
             for (provider, catalog) in catalogs {
                 cache
                     .store_catalog(provider, catalog)

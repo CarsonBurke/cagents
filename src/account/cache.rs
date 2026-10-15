@@ -31,6 +31,9 @@ use serde::{Deserialize, Serialize};
 use super::{Identity, UsageSnapshot, schedule::CLOCK_SLACK};
 use crate::{agent::Provider, chat::Model};
 
+mod verification;
+pub(super) use verification::Token as VerificationToken;
+
 const FILE_NAME: &str = "account-usage.json";
 const LOCK_NAME: &str = "account-usage.lock";
 const VERSION: u32 = 1;
@@ -113,7 +116,8 @@ impl Cache {
     /// stamped in the future is left out: the cache only ever saves a probe,
     /// so losing it costs one.
     pub fn load(&self, now: u64) -> BTreeMap<String, Entry> {
-        read_document(&self.path())
+        let Ok(_lock) = self.lock(libc::LOCK_SH) else { return BTreeMap::new() };
+        let mut entries = read_document(&self.path())
             .map(|document| {
                 document
                     .entries
@@ -123,19 +127,22 @@ impl Cache {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if self.overlay_verification(&mut entries).is_err() { entries.clear(); }
+        entries
     }
 
     /// Remembers `entry`, observed just now, for `key` - unless the cache
     /// already holds something newer for it that another window wrote
     /// meanwhile. An entry stamped further ahead than [`CLOCK_SLACK`] is from
     /// a clock that has since been set back, and is replaced.
-    pub fn store(&self, key: &str, entry: Entry) -> io::Result<()> {
+    pub fn store(&self, key: &str, mut entry: Entry) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
         let mut document = read_document(&path).unwrap_or_default();
         document.version = VERSION;
+        self.protect_verification(key, &mut entry, document.entries.get(key))?;
         if document.entries.get(key).is_some_and(|existing| {
             supersedes(existing.snapshot.observed_at, entry.snapshot.observed_at)
         }) {
@@ -247,7 +254,16 @@ impl Cache {
     }
 
     fn lock(&self, operation: i32) -> io::Result<crate::instance::OwnedLock> {
-        crate::instance::owned_lock(&self.directory.join(LOCK_NAME), operation)
+        let lock = crate::instance::owned_lock(&self.directory.join(LOCK_NAME), operation)?;
+        // A failed identity-invalidation commit poisons this existing inode
+        // without needing another directory entry or data block. No cache
+        // operation may repair that failure implicitly by rewriting figures.
+        if lock.metadata()?.len() != 0 {
+            return Err(io::Error::other(
+                "Account identity verification could not be saved; repair the private account cache before routing",
+            ));
+        }
+        Ok(lock)
     }
 }
 

@@ -1129,18 +1129,9 @@ fn now_ms() -> Millis {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-/// Writes figures and models running conversations reported to the cache
-/// other windows read. Blocking: finding an account's cache key resolves its
-/// home.
-fn store_live(cache: &Cache, entries: Vec<(Account, Entry)>, catalogs: Vec<(Provider, Catalog)>) {
-    for (account, entry) in entries {
-        let Some(key) = account.cache_key() else {
-            continue;
-        };
-        if let Err(error) = cache.store(&key, entry) {
-            tracing::debug!(%error, "live account usage could not be cached");
-        }
-    }
+/// Persist model catalogs only. Live account figures are persisted by the
+/// daemon against exact captured account scope, never a UI recipe guess.
+fn store_live(cache: &Cache, _entries: Vec<(Account, Entry)>, catalogs: Vec<(Provider, Catalog)>) {
     for (provider, catalog) in catalogs {
         if let Err(error) = cache.store_catalog(provider, catalog) {
             tracing::debug!(%error, ?provider, "listed models could not be cached");
@@ -7938,9 +7929,9 @@ mod app_tests {
     /// Figures a running conversation reports refine the reading of the
     /// account its launch points at, count as a probe - a focused window's
     /// tick asks every other account that is due, but not that one - and
-    /// reach other windows through the cache.
+    /// remain local display metadata; the daemon owns shared usage writes.
     #[test]
-    fn a_conversations_live_figures_refresh_its_account_and_reach_the_cache() {
+    fn a_conversations_live_figures_refresh_display_without_persisting_recipe_guesses() {
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
         let mut app = context_inspector_test_app(false);
@@ -8022,9 +8013,8 @@ mod app_tests {
             .account
             .cache_key()
             .unwrap();
-        let cached = cache.load(now_ms()).remove(&key).unwrap();
-        assert!((cached.snapshot.windows[0].used - 0.5).abs() < 1e-6);
-        assert_eq!(cached.snapshot.observed_at, now + 1);
+        assert!(cache.load(now_ms()).remove(&key).is_none(),
+            "only daemon-captured account scope may persist these live figures");
     }
 
     /// The startup load does not wait on the shell: an account whose CLI only

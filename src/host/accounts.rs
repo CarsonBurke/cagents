@@ -187,19 +187,16 @@ fn apply_reports(
             ),
         });
         if lost_login {
-            entry.snapshot = UsageSnapshot::state(
-                UsageStatus::NeedsLogin,
-                "Account updates exceeded the pending queue; verifying the current sign-in",
-                now,
-            );
-            let _ = cache.store(&key, entry.clone());
+            *entry = invalidate_identity(cache, &key, now,
+                "Account updates exceeded the pending queue; verifying the current sign-in");
             changed_logins.push(account);
             continue;
         }
         let mut updated = false;
         let mut login_changed = false;
         for (report, observed_at) in home_reports.into_iter().flat_map(|reports| &reports.events) {
-            if entry.snapshot.observed_at > *observed_at
+            if !matches!(report, LiveReport::CodexLogin(_))
+                && entry.snapshot.observed_at > *observed_at
                 && entry.snapshot.observed_at
                     <= now.saturating_add(crate::account::schedule::CLOCK_SLACK)
             {
@@ -207,11 +204,11 @@ fn apply_reports(
             }
             if let LiveReport::CodexLogin(login) = report {
                 if !login.describes(Some(&entry.snapshot), entry.identity.as_ref()) {
-                    entry.snapshot = UsageSnapshot::state(
-                        UsageStatus::NeedsLogin,
-                        "The provider reported an account change; verifying the current sign-in",
-                        *observed_at,
-                    );
+                    // Usage timestamps cannot prove when authentication was
+                    // checked. Persist every contradictory login before any
+                    // later quota report can reuse the cached identity.
+                    *entry = invalidate_identity(cache, &key, now.max(*observed_at),
+                        "The provider reported an account change; verifying the current sign-in");
                     if !login_changed {
                         changed_logins.push(account.clone());
                     }
@@ -219,7 +216,14 @@ fn apply_reports(
                     updated = true;
                 }
             } else if !login_changed {
-                updated |= report.clone().apply(&mut entry.snapshot, *observed_at, now);
+                if entry.snapshot.status == UsageStatus::NeedsLogin {
+                    // Quota is not identity verification. Keep the barrier
+                    // across drains, including failed/Busy identity probes.
+                    entry.snapshot.observed_at = entry.snapshot.observed_at.max(*observed_at);
+                    updated = true;
+                } else {
+                    updated |= report.clone().apply(&mut entry.snapshot, *observed_at, now);
+                }
             }
         }
         if updated {
@@ -230,6 +234,14 @@ fn apply_reports(
         }
     }
     (entries, exhausted, changed_logins)
+}
+
+fn invalidate_identity(cache: &Cache, key: &str, now: u64, detail: &str) -> crate::account::cache::Entry {
+    cache.invalidate_identity(key, now, detail).unwrap_or_else(|error| {
+        tracing::warn!(%error, "Cannot persist account identity invalidation");
+        crate::account::cache::Entry { identity: None,
+            snapshot: crate::account::UsageSnapshot::state(crate::account::UsageStatus::NeedsLogin, detail, now) }
+    })
 }
 
 /// Yield to newly reported usage before admitting another periodic probe.
@@ -334,18 +346,16 @@ impl Monitor {
                                         probe::run(account.clone(), Some(cache.clone()), true),
                                     )) {
                                         None => return Ok(()),
-                                        Some(probe::Outcome::Answered {
-                                            identity,
-                                            snapshot,
-                                            ..
-                                        }) => {
+                                        Some(probe::Outcome::Answered { .. }) => {
                                             if let Some(key) = account.cache_key() {
-                                                let entry = crate::account::cache::Entry {
-                                                    identity,
-                                                    snapshot,
-                                                };
-                                                let _ = cache.store(&key, entry.clone());
-                                                entries.insert(key, entry);
+                                                // The probe already committed its causal
+                                                // verdict. Never rewrite its returned old
+                                                // answer after another login invalidation.
+                                                if let Some(entry) = cache.load(crate::chat::now_ms().unwrap_or(now)).remove(&key) {
+                                                    entries.insert(key, entry);
+                                                } else {
+                                                    entries.remove(&key);
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -802,6 +812,61 @@ mod tests {
             UsageStatus::Limited
         );
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn changed_login_requires_verification_across_drains_overflow_and_newer_quota() {
+        use crate::account::{LiveReport, UsageSnapshot, UsageSource, UsageStatus, UsageWindow, WindowKind,
+            cache::Entry, registry::{Registered, Registry}, scope::LaunchAccountScope};
+        use std::os::unix::fs::MetadataExt;
+        for mode in ["login", "overflow", "older-than-quota"] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let homes = Homes::at(root.path().join("homes"));
+            let provider = crate::agent::Provider::Codex;
+            let key = uuid::Uuid::new_v4();
+            let account = Account::managed(provider, key, homes.path(provider, key));
+            std::fs::create_dir_all(account.resolved_home().unwrap()).unwrap();
+            let path = account.resolved_home().unwrap().canonicalize().unwrap();
+            let metadata = path.metadata().unwrap();
+            let scope = LaunchAccountScope { provider, canonical_home: path, device: metadata.dev(), inode: metadata.ino(),
+                registered_id: Some(account.id()), purge_ids: vec![account.id()] };
+            let mut registry = Registry::default();
+            registry.register(Registered { key, provider, linked_home: None, label: None,
+                email: Some("old@fixture.invalid".into()), organization: None, added_at: 0 }, &[]).unwrap();
+            let cache = Cache::at(root.path().join("cache"));
+            let cache_key = account.cache_key().unwrap();
+            let positive = |at, source| { let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", at);
+                snapshot.source = source;
+                Entry { identity: Some(crate::account::Identity { email: Some("old@fixture.invalid".into()), plan: Some("pro".into()), organization: None }), snapshot }
+            };
+            cache.store(&cache_key, positive(if mode == "older-than-quota" { 50 } else { 1 },
+                if mode == "older-than-quota" { UsageSource::Live } else { UsageSource::Probe })).unwrap();
+            let limits = || LiveReport::CodexLimits(crate::account::codex::LimitsUpdate {
+                windows: vec![UsageWindow { key: "codex:session".into(), kind: WindowKind::Session,
+                    label: "Session".into(), used: 0.2, resets_at: None, span_secs: None, binding: true }],
+                credits: None, plan: Some("pro".into()), limited: false,
+            });
+            let signal = Signal::new(Arc::new((Mutex::new(false), Condvar::new())));
+            signal.record(&scope, LiveReport::CodexLogin(crate::account::codex::LoginUpdate { chatgpt: false, plan: None }), 10);
+            if mode == "overflow" { for stamp in 11..44 { signal.record(&scope, limits(), stamp); } }
+            let (_, _, logins) = apply_reports(&registry, Some(&homes), &cache, signal.drain(), 100);
+            assert!(logins.contains(&account), "{mode}: contradiction cannot hide behind a newer quota timestamp");
+            // No successful identity probe follows: failed/Busy verification
+            // cannot clear a durable barrier. Simulate process/cache reopen.
+            let cache = Cache::at(root.path().join("cache"));
+            signal.record(&scope, limits(), 200);
+            let (entries, _, _) = apply_reports(&registry, Some(&homes), &cache, signal.drain(), 300);
+            assert_eq!(entries[&cache_key].snapshot.status, UsageStatus::NeedsLogin, "{mode}");
+            assert!(entries[&cache_key].identity.is_none());
+            cache.store(&cache_key, positive(400, UsageSource::Live)).unwrap();
+            assert_eq!(cache.load(400)[&cache_key].snapshot.status, UsageStatus::NeedsLogin);
+            // Only the provider-probe causal token path restores identity.
+            cache.fixture_verify_identity(&cache_key, positive(500, UsageSource::Probe)).unwrap();
+            signal.record(&scope, limits(), 600);
+            let (entries, _, _) = apply_reports(&registry, Some(&homes), &cache, signal.drain(), 700);
+            assert_eq!(entries[&cache_key].snapshot.status, UsageStatus::Ok, "{mode}");
+            assert!(entries[&cache_key].identity.is_some());
+        }
     }
 
     #[test]

@@ -214,9 +214,9 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         })
         .await
     };
-    let (cli, key, lock) = match setup {
+    let (cli, key, lock, verification) = match setup {
         Ok(Prepared::Done(outcome)) => return outcome,
-        Ok(Prepared::Probe { cli, key, lock }) => (cli, key, lock),
+        Ok(Prepared::Probe { cli, key, lock, verification }) => (cli, key, lock, verification),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
     let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &cli)).await;
@@ -240,36 +240,34 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
             TIMEOUT.as_secs()
         )),
     };
-    if let (
-        Outcome::Answered {
-            identity,
-            snapshot,
-            catalog,
-        },
-        Some(cache),
-        Some(key),
-    ) = (&outcome, cache, key)
-    {
-        let entry = Entry {
-            identity: identity.clone(),
-            snapshot: snapshot.clone(),
+    let (identity, snapshot, catalog) = match outcome {
+        Outcome::Answered { identity, snapshot, catalog } => (identity, snapshot, catalog),
+        other => { drop(lock); return other; }
+    };
+    let entry = Entry { identity, snapshot };
+    let saved_catalog = catalog.clone();
+    let provider = account.provider;
+    // Keep the provider lock until the causal identity verdict and durable
+    // commit finish. A detached write could return unverified success after a
+    // newer login invalidation, or allow another caller to see stale evidence.
+    let committed = tokio::task::spawn_blocking(move || {
+        let _probe_lock = lock;
+        let entry = if let Some((verification_cache, token)) = verification {
+            verification_cache.finish_verification(token, entry, cache.is_some())?
+        } else {
+            if let (Some(cache), Some(key)) = (&cache, &key) { cache.store(key, entry.clone())?; }
+            entry
         };
-        let catalog = catalog.clone();
-        let provider = account.provider;
-        // Written in the background so the answer reaches the reader at
-        // once, with the probe lock held until the answer is in the cache:
-        // a window that takes the lock next finds it there instead of
-        // probing again. A cache that cannot be written only costs other
-        // windows a probe.
-        tokio::task::spawn_blocking(move || {
-            let _ = cache.store(&key, entry);
-            if let Some(catalog) = catalog {
-                let _ = cache.store_catalog(provider, catalog);
-            }
-            drop(lock);
-        });
+        if let (Some(cache), Some(catalog)) = (&cache, saved_catalog) {
+            let _ = cache.store_catalog(provider, catalog);
+        }
+        Ok::<_, std::io::Error>(entry)
+    }).await;
+    match committed {
+        Ok(Ok(entry)) => Outcome::Answered { identity: entry.identity, snapshot: entry.snapshot, catalog },
+        Ok(Err(error)) => Outcome::Failed(format!("The account verification could not be committed: {error}")),
+        Err(_) => Outcome::Failed("The account verification could not be committed".into()),
     }
-    outcome
 }
 
 enum Prepared {
@@ -278,6 +276,7 @@ enum Prepared {
         cli: Cli,
         key: Option<String>,
         lock: Vec<crate::instance::OwnedLock>,
+        verification: Option<(Cache, super::cache::VerificationToken)>,
     },
 }
 
@@ -326,7 +325,15 @@ fn prepare(
                     .into(),
             )),
         };
-    if !force
+    let verification = match key.as_ref() {
+        Some(key) => match lock_cache.begin_verification(key) {
+            Ok(token) => Some((lock_cache.clone(), token)),
+            Err(error) => return Prepared::Done(Outcome::Failed(format!("Account identity verification is unavailable: {error}"))),
+        },
+        None => None,
+    };
+    let awaiting_identity = verification.as_ref().is_some_and(|(_,token)| token.pending());
+    if !force && !awaiting_identity
         && let Some(entry) = key
             .as_ref()
             .and_then(|key| cache.and_then(|cache| cache.load(now).remove(key)))
@@ -336,7 +343,7 @@ fn prepare(
         snapshot.source = UsageSource::Cache;
         return Prepared::Done(answered(entry.identity, snapshot));
     }
-    Prepared::Probe { cli, key, lock }
+    Prepared::Probe { cli, key, lock, verification }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
