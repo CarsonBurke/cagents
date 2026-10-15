@@ -8077,26 +8077,40 @@ impl widget::menu::Action for HistoryContextCommand<'_> {
     }
 }
 
-fn history_context_controls<'a>(content: Element<'a, SidebarAction>, source: &'a SourceControlModel, row: &'a CommitRow, blocked: bool, shortcuts: &crate::settings::KeyboardShortcuts, binding_key: Arc<[Option<widget::menu::KeyBind>; 6]>) -> Element<'a, SidebarAction> {
+fn history_context_controls<'a>(
+    content: Element<'a, SidebarAction>,
+    source: &'a SourceControlModel,
+    row: &'a CommitRow,
+    blocked: bool,
+    worktree: Arc<ActiveWorktreeKey>,
+    binding_key: Arc<[Option<widget::menu::KeyBind>; 6]>,
+) -> Element<'a, SidebarAction> {
     if blocked { return content; }
-    let entries = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
-        .into_iter().map(|command| {
-            let id = commands::history_command_id(command);
-            let label = if row.mainline.is_some() && matches!(command, HistoryCommand::Revert | HistoryCommand::CherryPick) {
-                format!("{} (first parent)", commands::label(id))
-            } else { commands::label(id).to_owned() };
-            let action = HistoryContextCommand { key: &source.key, row, command };
-            // Rows come directly from this source; only activation needs a commit lookup.
-            if source.history_command_policy_available(command) {
-                widget::menu::Item::Button(label, None, action)
-            } else { widget::menu::Item::ButtonDisabled(label, None, action) }
-        }).collect::<Vec<_>>();
-    let bindings = menu_bindings(entries.iter().filter_map(|item| match item {
-        widget::menu::Item::Button(_, _, action) => Some(*action), _ => None,
-    }), shortcuts, &[]);
-    crate::interaction::context_menu_keyed(content,
-        (row.chrome.focus_id.clone(), row.mainline, Arc::clone(&row.message), source.mutations_available(), source.busy(), source.history_command_policy_available(HistoryCommand::CopySha), binding_key),
-        widget::menu::items(&bindings, entries))
+    let identity = (worktree, row.chrome.focus_id.clone(), row.mainline, Arc::clone(&row.message), source.mutations_available(), source.busy(), source.history_command_policy_available(HistoryCommand::CopySha), Arc::clone(&binding_key));
+    crate::interaction::context_menu_lazy_keyed(content, identity, move || {
+        let entries = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
+            .into_iter().map(|command| {
+                let id = commands::history_command_id(command);
+                let label = if row.mainline.is_some() && matches!(command, HistoryCommand::Revert | HistoryCommand::CherryPick) {
+                    format!("{} (first parent)", commands::label(id))
+                } else { commands::label(id).to_owned() };
+                let action = HistoryContextCommand { key: &source.key, row, command };
+                // Rows come directly from this source; only activation needs a commit lookup.
+                if source.history_command_policy_available(command) {
+                    widget::menu::Item::Button(label, None, action)
+                } else { widget::menu::Item::ButtonDisabled(label, None, action) }
+            }).collect::<Vec<_>>();
+        // Parse the six bindings once per section, and materialize only an open
+        // menu. Building hints never calls Action::message or clones its payload.
+        let bindings = entries.iter().enumerate().filter_map(|(index, item)| {
+            let action = match item {
+                widget::menu::Item::Button(_, _, action) | widget::menu::Item::ButtonDisabled(_, _, action) => *action,
+                _ => return None,
+            };
+            binding_key[index].clone().map(|binding| (binding, action))
+        }).collect::<std::collections::HashMap<_, _>>();
+        widget::menu::items(&bindings, entries)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11457,6 +11471,7 @@ fn history_section_with_shortcuts<'a>(state: &'a SidebarState, source: &'a Sourc
     // popup keys. No row clones the full shortcut table or a path vector.
     let binding_key = Arc::new([HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
         .map(|command| crate::workspace_widget::menu_shortcut(commands::history_command_id(command), shortcuts)));
+    let worktree = Arc::new(source.key.clone());
     let key = &source.key;
     if let Some(changes) = &source.commit_changes {
         return commit_changes_section(state, source, changes, modal_open);
@@ -11541,7 +11556,7 @@ fn history_section_with_shortcuts<'a>(state: &'a SidebarState, source: &'a Sourc
                 modal_open,
             ))
             .width(Length::Fill),
-        ), source, row, modal_open, shortcuts, Arc::clone(&binding_key)));
+        ), source, row, modal_open, Arc::clone(&worktree), Arc::clone(&binding_key)));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -21358,6 +21373,44 @@ pub(crate) mod tests {
                         assert_eq!(after.get(label), Some(rect), "{panel:?}: {label} moved");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn history_popup_closes_when_an_identical_commit_moves_to_another_worktree() {
+        use cosmic::iced::{Event, Point, Rectangle, Vector, advanced::{Shell, clipboard}, mouse};
+        let renderer = headless_renderer();
+        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
+        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![], author: identity.clone(), committer: identity, subject: "Same commit".into(), body: "Same body".into() });
+        let original = source_control();
+        fn make<'a>(source: &'a SourceControlModel, row: &'a CommitRow) -> Element<'a, SidebarAction> {
+            history_context_controls(cosmic::iced::widget::Space::new().width(240).height(32).into(), source, row, false, Arc::new(source.key.clone()), Arc::new(std::array::from_fn(|_| None)))
+        }
+        let window = Size::new(600.0, 400.0);
+        let viewport = Rectangle::with_size(window);
+        let cursor = mouse::Cursor::Available(Point::new(20.0, 16.0));
+        for path_only in [false, true] {
+            let mut changed = original.clone();
+            changed.key = if path_only { ActiveWorktreeKey { canonical_path: "/replacement/main".into(), ..original.key.clone() } } else { fix_key() };
+            let mut element = make(&original, &row);
+            let widget = element.as_widget_mut();
+            let mut tree = Tree::new(&*widget);
+            widget.diff(&mut tree);
+            let node = widget.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+            let mut messages = Vec::new();
+            widget.update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            {
+                let mut popup = widget.overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).expect("original worktree popup");
+                let popup_node = popup.as_overlay_mut().layout(&renderer, window);
+                popup.as_overlay_mut().update(&Event::Window(cosmic::iced::window::Event::RedrawRequested(std::time::Instant::now())), Layout::new(&popup_node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+            }
+            for (source, expected_open) in [(&original, true), (&changed, false)] {
+                let mut next = make(source, &row);
+                let widget = next.as_widget_mut();
+                widget.diff(&mut tree);
+                let node = widget.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+                assert_eq!(widget.overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some(), expected_open, "same commit must retain only its original exact worktree");
             }
         }
     }
