@@ -808,12 +808,13 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
         if paths.contains_key(&path) {
             continue;
         }
-        paths.insert(
-            path.clone(),
-            fs::metadata(&path)
-                .ok()
-                .map(|metadata| file_identity(&metadata)),
-        );
+        // Child identities below detect real ref additions/removals. Ignore
+        // directory times, which also change for unpublished *.lock files.
+        let identity = fs::metadata(&path).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(path.clone(), identity);
         if let Ok(entries) = fs::read_dir(&path) {
             for entry in entries.flatten() {
                 if entry
@@ -7966,6 +7967,10 @@ mod tests {
         let first = snapshot_admin_fingerprint(directory.path());
         fs::write(gitdir.join("index.lock"), "temporary").unwrap();
         fs::remove_file(gitdir.join("index.lock")).unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
         assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
         fs::write(
             gitdir.join("config"),
