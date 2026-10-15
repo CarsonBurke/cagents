@@ -42,13 +42,14 @@ pub(super) struct ToolText {
 /// What a closed step's row says beyond its verb.
 ///
 /// `text` is what the step is: the command that ran, the target it was applied
-/// to, a tool's input. `tail` is the last line of what it has printed, which
+/// to, a tool's input. `tail` is a diagnostic or the latest output line, which
 /// is how a reader follows a build without opening it. The two are kept
 /// apart because the output used to take the command's place on the row, and
 /// a transcript of `Compiling…` lines no longer said what had been run.
 pub(super) struct Preview {
     pub(super) text: String,
     pub(super) tail: String,
+    pub(super) builtin: bool,
     language: Language,
     /// The text highlighted in both palettes, drawn from on every frame.
     block: prose::CodeBlock,
@@ -61,36 +62,40 @@ impl Preview {
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
+        let builtin=match content {
+            ItemContent::Tool {name,input,..} if input.len()<=64*1024=>builtin_target(name,input),
+            _=>None,
+        };
         let (source, language, output) = match content {
             // Only a shell command is shell: a read's or a search's command
             // is the path or the pattern it was given.
             ItemContent::Command {
                 command,
-                label,
                 action: chat::CommandAction::Run,
                 output,
                 ..
-            } if label.is_empty() || label == command => {
-                (turn::first_line(command), Language::Shell, output.as_str())
-            }
-            ItemContent::Command {
-                action: chat::CommandAction::Run,
-                output,
-                ..
-            } => (turn::step_label(content), Language::Plain, output.as_str()),
+            } => (turn::first_line(command), Language::Shell, output.as_str()),
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
-            ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
+            ItemContent::Command { output, status, .. } => (
+                turn::step_label(content),
+                Language::Plain,
+                if *status == ToolStatus::Failed { output.as_str() } else { "" },
+            ),
             // The row already names the tool, so its second line is what
             // the tool was called with. That stays once there is output: a
             // name alone does not tell one call of a tool from the next.
-            ItemContent::Tool { input, output, .. } => {
-                (input.as_str(), Language::structured(input), output.as_str())
+            ItemContent::Tool { name,input, output, .. } => {
+                let (source,language)=builtin.as_ref().map_or((input.as_str(),Language::structured(input)),
+                    |(text,language)|(text.as_str(),*language));
+                let output=if content.status() != Some(ToolStatus::Failed)
+                    && turn::builtin_action(name).is_some_and(|action|action!=chat::CommandAction::Run) {""} else {output.as_str()};
+                (source,language,output)
             }
             _ => (turn::step_label(content), Language::Plain, ""),
         };
         // Bound preview work independently of the complete source kept for
-        // expansion and copying. Layout also caps wrapped text at two rows.
+        // expansion and copying. Layout caps the primary label at one row.
         let bounded = |source: &str| {
             let mut chars = source.chars();
             let mut text: String = chars.by_ref().take(512).collect();
@@ -100,24 +105,19 @@ impl Preview {
             text
         };
         let text = bounded(source);
-        let tail = bounded(
-            output
-                .rsplit('\n')
-                .map(str::trim_end)
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or_default(),
-        );
+        let tail = bounded(output_summary(output, content.status() == Some(ToolStatus::Failed)));
         if let Some(previous) = previous
             && previous.text == text
             && previous.language == language
             && previous.theme == theme
         {
-            return Self { tail, ..previous };
+            return Self { tail, builtin:builtin.is_some(), ..previous };
         }
         let block = prose::CodeBlock::new(language.token(), &text, theme);
         Self {
             text,
             tail,
+            builtin:builtin.is_some(),
             language,
             block,
             theme,
@@ -137,14 +137,14 @@ impl Preview {
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .width(Length::Fill)
             .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(2),
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
         // Rich text keeps the full paragraph's intrinsic height even with a
-        // line-count ellipsis. Supply the matching layout limit as well;
+        // line-count ellipsis. Supply the matching one-row layout limit as well;
         // Shrink preserves a single row for short previews.
         widget::container(text)
             .width(Length::Fill)
-            .max_height(design::TEXT_BODY * 1.3 * 2.0)
+            .max_height(design::TEXT_BODY * 1.3)
             .clip(true)
             .into()
     }
@@ -162,6 +162,45 @@ impl Preview {
                 .into()
         })
     }
+}
+
+fn builtin_target(name:&str,input:&str)->Option<(String,Language)> {
+    let field=match turn::builtin_action(name)? {
+        chat::CommandAction::Run=>"command",
+        chat::CommandAction::Read=>"file_path",
+        chat::CommandAction::Search|chat::CommandAction::List=>"pattern",
+    };
+    let input:serde_json::Value=serde_json::from_str(input).ok()?;
+    let text=input[field].as_str()?.trim();
+    (!text.is_empty()).then(||(turn::first_line(text).to_owned(),if field=="command" {Language::Shell} else {Language::Plain}))
+}
+
+/// Scan only a bounded output tail. Failed commands often end in a wrapper's
+/// exit summary or whitespace; retain the last concrete diagnostic when one is
+/// present instead of replacing it with that wrapper line.
+fn output_summary(output: &str, failed: bool) -> &str {
+    let mut start=output.len().saturating_sub(32*1024);
+    while !output.is_char_boundary(start) {start+=1;}
+    let mut latest=None;
+    let mut diagnostic=None;let mut best=0;
+    for line in output[start..].lines().rev().take(128) {
+        let line=line.trim_end();
+        if line.trim().is_empty() {continue;}
+        latest.get_or_insert(line);
+        if !failed {break;}
+        let folded=line.to_ascii_lowercase();let folded=folded.trim_start();
+        let wrapper=folded.starts_with("command failed with exit") || folded.starts_with("process exited with")
+            || folded.starts_with("error: could not compile") || folded.starts_with("error: aborting due to");
+        let score=if wrapper {0}
+            else if folded.starts_with("error[") || folded.starts_with("fatal:") || folded.starts_with("assertion")
+                || folded.contains(": error") || folded.contains("permission denied")
+                || folded.contains("no such file or directory") || folded.contains("command not found") {3}
+            else if folded.starts_with("error") || folded.starts_with("caused by:") {2}
+            else if folded.contains("test result: failed") || folded.ends_with("... failed") {1}
+            else {0};
+        if score>best {best=score;diagnostic=Some(line);}
+    }
+    diagnostic.or(latest).unwrap_or_default()
 }
 
 impl ToolText {
@@ -527,8 +566,8 @@ mod tests {
             ),
             (
                 command("Run the tests", "cargo test", Run, "ok\n"),
-                "Run the tests",
-                Language::Plain,
+                "cargo test",
+                Language::Shell,
                 "ok",
             ),
             // A read's command is a path, its output is the file, and a
@@ -712,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_preview_is_limited_to_two_visual_lines() {
+    fn narrow_preview_is_limited_to_one_visual_line() {
         use iced::advanced::{layout, renderer::Headless, widget::Tree};
         let renderer = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -734,9 +773,8 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(110.0, 1000.0)),
             );
-            assert!(node.size().height > design::TEXT_BODY * 1.3);
             assert!(
-                node.size().height <= design::TEXT_BODY * 1.3 * 2.0 + 1.0,
+                node.size().height <= design::TEXT_BODY * 1.3 + 1.0,
                 "{:?}",
                 node.size()
             );
@@ -759,4 +797,46 @@ mod tests {
             node.size()
         );
     }
+    #[test]
+    fn failed_command_preview_keeps_a_diagnostic_instead_of_wrapper_tail() {
+        assert_eq!(output_summary("compiling\nerror[E0425]: cannot find value\n\nCommand failed with exit code 101\n",true),
+            "error[E0425]: cannot find value");
+        assert_eq!(output_summary("error[E0425]: cannot find value\nerror: could not compile `fixture` due to 1 previous error\n",true),
+            "error[E0425]: cannot find value");
+        assert_eq!(output_summary("fatal: unable to access repository\nProcess exited with code 128\n",true),
+            "fatal: unable to access repository");
+        assert_eq!(output_summary("error count: 0\nall done\n",false),"all done");
+        assert_eq!(output_summary("\n\n",true),"");
+        let huge=format!("error: old unrelated failure\n{}\nlatest progress", "🦀".repeat(100_000));
+        assert_eq!(output_summary(&huge,true),"latest progress");
+    }
+
+    #[test]
+    fn failed_read_and_search_keep_diagnostics_without_previewing_successful_contents() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for (name, input, action) in [
+            ("Read", r#"{"file_path":"missing.rs"}"#, chat::CommandAction::Read),
+            ("Grep", r#"{"pattern":"needle"}"#, chat::CommandAction::Search),
+            ("Glob", r#"{"pattern":"*.rs"}"#, chat::CommandAction::List),
+        ] {
+            for status in [ToolStatus::Failed, ToolStatus::Succeeded, ToolStatus::Running] {
+                let output = "No such file or directory\nProcess exited with code 1\n";
+                let tool = ItemContent::Tool {
+                    name: name.into(), input: input.into(), output: output.into(), status,
+                };
+                let command = ItemContent::Command {
+                    label: name.into(), command: "missing.rs".into(),
+                    working_directory: String::new(), action, status,
+                    exit_code: None, duration_ms: None, output: output.into(),
+                };
+                for content in [tool, command] {
+                    let preview = Preview::update(None, &content, theme);
+                    assert_eq!(preview.tail,
+                        if status == ToolStatus::Failed { "No such file or directory" } else { "" },
+                        "{name} {status:?}");
+                }
+            }
+        }
+    }
+
 }

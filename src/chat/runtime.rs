@@ -550,7 +550,7 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -723,6 +723,10 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
     }
+    /// Read only the ingestion cache, including after the actor exits.
+    pub(crate) fn source_query(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_page(query)
+    }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
         self.0
@@ -746,6 +750,8 @@ impl Handle {
         if store.dirty {
             match store.window_reusing(&mut state.items) {
                 Ok(window) => {
+                    state.source_parts.retain(|part|part.source.agent_id.is_some());
+                    state.source_parts.extend(window.source_parts);
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
@@ -755,6 +761,7 @@ impl Handle {
                 }
             }
         }
+        if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
         if refresh_publication {
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -792,6 +799,8 @@ impl Handle {
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
                     Ok(window) => {
+                        state.source_parts.retain(|part|part.source.agent_id.is_some());
+                        state.source_parts.extend(window.source_parts);
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
@@ -805,6 +814,7 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
@@ -2524,6 +2534,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::TurnStarted => {
             state.prompt_suggestion = None;
             state.turn_generation = state.turn_generation.wrapping_add(1);
+            state.turn_started_at = observed_at();
             state.finished_at = None;
         }
         Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
@@ -2557,6 +2568,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Forked(id) => state.forked = Some(id),
         Event::Reset { reason } => {
             state.finished_at = None;
+            state.turn_started_at = None;
             state.prompt_suggestion = None;
             state.branch_points.clear();
             state.forked = None;
@@ -3792,6 +3804,28 @@ mod tests {
         }
         apply_event(&mut state, &mut indices, Event::TurnStarted);
         assert_eq!(state.turn_generation, 3);
+        assert!(state.turn_started_at.is_some());
+        let started = state.turn_started_at;
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Status {
+                busy: true,
+                detail: "Working".into(),
+            },
+        );
+        apply_event(&mut state, &mut indices, Event::TurnSettled);
+        assert_eq!(
+            state.turn_started_at, started,
+            "status and completion do not restart the clock"
+        );
+        state.turn_started_at = Some(1);
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert_ne!(
+            state.turn_started_at,
+            Some(1),
+            "queued or autonomous turns get a new source timestamp"
+        );
         assert_eq!(state.generation, 0, "publication generation is independent");
     }
 

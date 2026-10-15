@@ -1,6 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+mod source;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -45,6 +46,7 @@ enum LatestBoundary {
 pub(super) struct Window {
     pub items: Vec<std::sync::Arc<Item>>,
     pub changes: Vec<crate::chat::presentation::ItemChange>,
+    pub source_parts: Vec<crate::chat::cache::SourcePart>,
     pub has_earlier: bool,
     pub has_later: bool,
 }
@@ -75,6 +77,9 @@ pub(crate) struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
+    pending_child_source: Option<source::PendingChildSource>,
+    pub(super) source_revision: u64,
+    pub(super) source_incarnation: uuid::Uuid,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -142,6 +147,7 @@ impl Store {
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
+            db.execute_batch(source::SCHEMA).map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
@@ -171,6 +177,9 @@ impl Store {
                 presentation: None,
                 presented_children: Default::default(),
                 pending_text: None,
+                pending_child_source: None,
+                source_revision: 0,
+                source_incarnation: uuid::Uuid::new_v4(),
             })
         })();
         if result.is_err() {
@@ -200,6 +209,7 @@ impl Store {
         older: bool,
         assigned: Option<i64>,
     ) -> Result<Option<String>, String> {
+        let is_text = matches!(&item.content, ItemContent::Text { .. });
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -357,6 +367,7 @@ impl Store {
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
+        source::rewrite_epoch(&transaction, &item.id)?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -370,6 +381,7 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if is_text || previous.as_ref().is_some_and(|(_,metadata,_)|postcard::from_bytes::<Item>(metadata).is_ok_and(|old|matches!(old.content,ItemContent::Text{..}))) {self.source_changed()?;}
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -650,6 +662,7 @@ impl Store {
             }
         }
         self.index_child_event(&event)?;
+        self.cache_child_source(&event)?;
         let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
@@ -761,6 +774,7 @@ impl Store {
                 thinking,
                 delta,
             } => {
+                if !delta.is_empty() {self.source_changed()?;}
                 if self.pending_text.as_ref().is_some_and(|pending| {
                     pending.0 != id
                         || pending.1 != role
@@ -783,6 +797,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                if self.removes_text_sources(&ids)? {self.source_changed()?;}
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
@@ -794,6 +809,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
+                self.source_changed()?;
                 self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
@@ -1031,9 +1047,9 @@ impl Store {
         let mut reused = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,(SELECT epoch FROM source_epochs WHERE source_epochs.id=items.id) FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
             } else {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,(SELECT epoch FROM source_epochs WHERE source_epochs.id=items.id) FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
             };
             let mut statement = self.db.prepare(query).map_err(|e| e.to_string())?;
             let rows = statement
@@ -1051,6 +1067,7 @@ impl Store {
                             row.get::<_, i64>(4)? as usize,
                             row.get::<_, i64>(5)? as usize,
                             row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, u64>(7)?,
                         ))
                     },
                 )
@@ -1059,10 +1076,11 @@ impl Store {
                 .map_err(|e| e.to_string())?
         };
         let mut items = Vec::new();
+        let mut source_parts = Vec::new();
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2, spans, source_epoch) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
@@ -1103,22 +1121,34 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    std::borrow::Cow::Owned(format!(
-                        "{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}"
-                    ))
+                    let base_id=format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
+                    let mut candidate=base_id.clone();
+                    let mut attempt=0_u64;
+                    // A provider's real ID may resemble any generated suffix.
+                    // Escape only synthetic aliases, preserving opaque root IDs.
+                    // The private cache nonce keeps aliases stable across pages.
+                    while self.exists(&candidate)? {
+                        candidate=format!("{base_id}:native-alias:{}:{attempt}",self.directory.file_name().unwrap().to_string_lossy());
+                        attempt=attempt.checked_add(1).ok_or("Native alias capacity exhausted")?;
+                    }
+                    std::borrow::Cow::Owned(candidate)
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
+                let source_bytes = if kind=="text" {item_id.len()+id.len()+64} else {0};
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
                         len2
                     } else {
                         0
                     };
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + end - start + 128 + attached + source_bytes;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
+                }
+                if kind=="text" {
+                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:crate::chat::cache::SourceEpoch{incarnation:self.source_incarnation,revision:source_epoch},metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
                 }
                 if self
                     .changed
@@ -1236,7 +1266,7 @@ impl Store {
                         }
                     }
                 }
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + end - start + 128 + attached + source_bytes;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
@@ -1330,6 +1360,7 @@ impl Store {
         Ok(Window {
             items,
             changes,
+            source_parts,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
         })
