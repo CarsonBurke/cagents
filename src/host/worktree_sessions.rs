@@ -33,9 +33,17 @@ struct Actor {
     native: Option<Native>,
     starting: bool,
 }
+type Directory = (PathBuf, crate::agent_execution::DirectoryIdentity);
+struct NativeCandidate {
+    execution_instance: uuid::Uuid,
+    session: chat::Session,
+    handle: chat::runtime::Handle,
+    pair_valid: bool,
+    paired_directory: Option<Option<Directory>>,
+}
 struct Candidates {
-    terminals: Vec<(uuid::Uuid, TerminalSession, TerminalHandle, Option<(PathBuf, crate::agent_execution::DirectoryIdentity)>)>,
-    natives: Vec<(uuid::Uuid, chat::Session, chat::runtime::Handle, bool)>,
+    terminals: Vec<(uuid::Uuid, TerminalSession, TerminalHandle, Option<Directory>)>,
+    natives: Vec<NativeCandidate>,
     starting: Vec<(TerminalId, uuid::Uuid, PathBuf)>,
 }
 
@@ -99,6 +107,15 @@ fn inside(directory: &Path, path: &Path) -> Result<bool, String> {
     Ok(scope_directory(directory)?.starts_with(path))
 }
 
+fn admitted_scope(directory: &Path, identity: crate::agent_execution::DirectoryIdentity, selected: &Path) -> Result<bool, String> {
+    if !directory.is_absolute() { return Err("An actor has no authoritative physical working directory".into()); }
+    let physical = directory.canonicalize().map_err(|error| format!("An actor's admitted directory moved or disappeared: {error}"))?;
+    let metadata = std::fs::symlink_metadata(&physical).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != identity {
+        return Err("An actor's admitted directory changed identity; its process was preserved".into());
+    }
+    Ok(physical.starts_with(selected))
+}
 fn candidates(host: &SharedHost) -> Result<Candidates, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down || state.has_unscoped_spawn() {
@@ -117,7 +134,10 @@ fn candidates(host: &SharedHost) -> Result<Candidates, String> {
             (None, Some(_)) => false,
             (None, None) => true,
         };
-        (record.execution_instance, record.session.clone(), record.handle.clone(), pair_valid)
+        NativeCandidate {
+            execution_instance: record.execution_instance, session: record.session.clone(), handle: record.handle.clone(), pair_valid,
+            paired_directory: record.paired_terminal.as_ref().map(|handle| handle.admitted_directory().map(|(path, identity)| (path.to_owned(), identity))),
+        }
     }).collect();
     let mut starting: Vec<_> = state.spawning_scopes.iter().map(|(id, (instance, path))| (*id, *instance, path.clone())).collect();
     starting.extend(state.chat_spawning.iter().map(|(id, session)| (*id, id.as_uuid(), session.launch.recipe.working_directory.clone())));
@@ -136,18 +156,23 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         let (directory, identity) = directory.ok_or_else(|| format!("Terminal {} has no authoritative admitted physical directory; close it explicitly before worktree removal", session.id))?;
         // Operational/launch aliases may expand removal protection, but cannot
         // newly authorize closing an actor admitted in another physical scope.
-        let metadata = std::fs::symlink_metadata(&directory).map_err(|error| format!("Terminal {} admitted directory moved or disappeared: {error}", session.id))?;
-        if !metadata.is_dir() || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != identity {
-            return Err(format!("Terminal {} admitted directory changed identity; its actor was preserved", session.id));
-        }
-        if !directory.starts_with(path) { continue; }
+        if !admitted_scope(&directory, identity, path)? { continue; }
         let (revision, busy) = handle.close_observation()?;
         let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
     }
-    for (execution_instance, session, handle, pair_valid) in candidates.natives {
+    for NativeCandidate { execution_instance, session, handle, pair_valid, paired_directory } in candidates.natives {
         let observation = handle.close_observation();
-        if !actors.contains_key(&session.id) && !inside(&session.launch.recipe.working_directory, path)? && !inside(&observation.working_directory, path)? { continue; }
+        let identity = observation.directory_identity.ok_or_else(|| format!("Native session {} has no authoritative physical scope; reconnect or explicitly close it before worktree removal", session.id))?;
+        let native_inside = admitted_scope(&observation.working_directory, identity, path)?;
+        if let Some(paired_directory) = paired_directory {
+            let (directory, identity) = paired_directory.ok_or("A paired terminal has no authoritative physical scope; its actors were preserved")?;
+            let terminal_inside = admitted_scope(&directory, identity, path)?;
+            if native_inside != terminal_inside {
+                return Err("A native actor and its console span different worktree scopes; close them explicitly before removing either scope".into());
+            }
+        }
+        if !native_inside { continue; }
         if !pair_valid { return Err("A native actor has an unverified paired terminal; settle its ownership before closing this worktree".into()); }
         let mut digest = Sha256::new();
         digest.update(observation.actor_id.as_bytes()); digest.update(execution_instance.as_bytes());
