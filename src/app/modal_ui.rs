@@ -38,6 +38,7 @@ pub(super) struct Stack {
 struct Frame {
     kind: Modal,
     generation: u64,
+    instance: Option<project_ui::ModalRequest>,
     restore: widget::Id,
     focus: crate::interaction::FocusSnapshot,
 }
@@ -58,17 +59,26 @@ impl Stack {
                     .map(|f| f.kind)
             })
     }
+    #[cfg(test)]
     pub(super) fn reconcile(
         &mut self,
         active: &[Modal],
         fallback: widget::Id,
+    ) -> Option<(Modal, u64, bool)> {
+        self.reconcile_instances(active, fallback, |_| None)
+    }
+    fn reconcile_instances(
+        &mut self,
+        active: &[Modal],
+        fallback: widget::Id,
+        instance: impl Fn(Modal) -> Option<project_ui::ModalRequest>,
     ) -> Option<(Modal, u64, bool)> {
         let previous = self.frames.last().map(|f| f.kind);
         // A removed lower dialog cannot remain the restore target of the
         // next surviving frame. Carry its parent link through any gap.
         let mut inherited_restore = None;
         for frame in &mut self.frames {
-            if active.contains(&frame.kind) {
+            if active.contains(&frame.kind) && frame.instance == instance(frame.kind) {
                 if let Some(restore) = inherited_restore.take() {
                     frame.restore = restore;
                 }
@@ -76,7 +86,7 @@ impl Stack {
                 inherited_restore = Some(frame.restore.clone());
             }
         }
-        self.frames.retain(|f| active.contains(&f.kind));
+        self.frames.retain(|f| active.contains(&f.kind) && f.instance == instance(f.kind));
         let mut pushed = false;
         for &kind in active {
             if !self.frames.iter().any(|f| f.kind == kind) {
@@ -89,6 +99,7 @@ impl Stack {
                     .unwrap_or_else(|| fallback.clone());
                 self.frames.push(Frame {
                     kind,
+                    instance: instance(kind),
                     generation: self.generation,
                     restore,
                     focus: Default::default(),
@@ -289,7 +300,13 @@ impl Cagents {
             .first()
             .map(|frame| frame.restore.clone());
         let fallback = self.modal_restore_fallback();
-        let changed = self.modal_stack.reconcile(&active, fallback.clone());
+        let project_ui = &self.project_ui;
+        let changed = self.modal_stack.reconcile_instances(&active, fallback.clone(), |kind| {
+            match kind {
+                Modal::Project(role) => project_ui.modal_target(role).map(|target| target.request),
+                _ => None,
+            }
+        });
         if let Some((kind, _, pushed)) = changed {
             let initial = self.modal_initial_focus(kind);
             let target = if pushed {

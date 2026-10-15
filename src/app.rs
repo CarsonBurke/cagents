@@ -2578,8 +2578,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::NativeWindowAction(_)
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
-                        | project_ui::Action::ConfirmDelete
-                        | project_ui::Action::ConfirmRemove
+                        | project_ui::Action::ConfirmDelete(_)
+                        | project_ui::Action::ConfirmRemove(_)
                         | project_ui::Action::DismissRole(_)
                         | project_ui::Action::Dismiss
                 )
@@ -16668,7 +16668,7 @@ impl Application for Cagents {
             && let Some(surface) = self.project_dialog_view_for(role) {
             return Some(dialog_ui::overlay(
                 surface,
-                Some(Message::ProjectUi(project_ui::Action::DismissRole(role))),
+                Some(Message::ProjectUi(project_ui::Action::DismissRole(self.project_ui.modal_target(role)?))),
                 1.0,
             ));
         }
@@ -26880,7 +26880,7 @@ mod tests {
             "with nothing blocking it, the confirming button is offered: {labels:?}"
         );
 
-        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete));
+        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete(match app.project_ui.modal_target(project_ui::ModalRole::WorktreeDelete).unwrap().request { project_ui::ModalRequest::Counter(request) => request, _ => unreachable!() })));
         assert!(
             app.project_ui
                 .deleting_directory(Path::new("/repo/feature")),

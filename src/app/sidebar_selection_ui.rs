@@ -646,7 +646,10 @@ impl Cagents {
                         worktree_id: None,
                         command: sidebar::ProjectCommand::Remove,
                     }));
-                    self.handle_project_action(project_ui::Action::ConfirmRemove)
+                    self.project_ui.modal_target(project_ui::ModalRole::ProjectRemove).map_or_else(Task::none, |target| {
+                        let project_ui::ModalRequest::Counter(request) = target.request else { return Task::none(); };
+                        self.handle_project_action(project_ui::Action::ConfirmRemove(request))
+                    })
                 }
             });
         }
