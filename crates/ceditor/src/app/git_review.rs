@@ -95,11 +95,22 @@ impl Editor {
             _ => return None,
         };
         let Some(card) = self.active else { return Some(Task::none()); };
+        if self.modal_open() { return Some(Task::none()); }
+        // Draft-only UI edits remain available when the directory disappears,
+        // and typing a filter never performs a filesystem metadata read.
+        if matches!(action, SidebarAction::HistoryQueryChanged { .. } | SidebarAction::HistoryBranchChanged { .. } | SidebarAction::CancelHistoryBranch | SidebarAction::AmendChanged { amend: false, .. }) {
+            if key.is_some_and(|key| !self.git_review_bound(card, key)) { return Some(Task::none()); }
+            let tab = self.tab_mut(card)?;
+            tab.navigation.apply(action);
+            if matches!(action, SidebarAction::AmendChanged { amend: false, .. }) {
+                if let Some((_, cancel)) = tab.git_review.amend_cancel.take() { cancel.cancel(); }
+            }
+            return Some(Task::none());
+        }
         let origin = match key {
             Some(key) => match self.git_review_origin(card, key) { Some(origin) => Some(origin), None => return Some(Task::none()) },
             None => None,
         };
-        if self.modal_open() { return Some(Task::none()); }
         if let SidebarAction::HistoryCommand { oid, mainline, message, .. } = action {
             let current = self.tab(card).and_then(|tab| tab.sidebar.source_control.as_ref()).is_some_and(|source|
                 source.history.iter().chain(source.commit_changes.iter().map(|changes| &changes.commit))
@@ -596,6 +607,12 @@ mod tests {
             assert!(app.tab(card).unwrap().git_review.amend_cancel.is_none());
             assert!(app.tab(card).unwrap().navigation.amend_request_revision().is_none());
             if commit { assert_eq!(app.tab(card).unwrap().navigation.commit_message(), "Keep this draft"); }
+            else {
+                let key = app.tab(card).unwrap().navigation.active_worktree().unwrap().clone();
+                sidebar_action(&mut app, SidebarAction::AmendChanged { key: key.clone(), amend: false });
+                assert!(app.tab(card).unwrap().navigation.amend_target().is_none());
+                sidebar_action(&mut app, SidebarAction::HistoryQueryChanged { key, query: "draft while missing".into() });
+            }
             assert_eq!(git(&destination, &["rev-list", "--count", "HEAD"]), "1");
         }
     }
