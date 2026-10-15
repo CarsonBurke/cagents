@@ -23,6 +23,7 @@ mod find;
 mod fold;
 mod hover;
 mod hydration;
+mod changes_sources;
 mod images;
 mod layout;
 mod markdown_source;
