@@ -2286,11 +2286,12 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     matches!(
         event,
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
+            key,
+            physical_key,
             modifiers,
             repeat: false,
             ..
-        } if key.eq_ignore_ascii_case("s")
+        } if key.to_latin(*physical_key).is_some_and(|key| key.eq_ignore_ascii_case(&'s'))
             && modifiers.control()
             && !modifiers.alt()
             && !modifiers.shift()
@@ -2366,6 +2367,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         action,
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::ConfiguredFileLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -2746,6 +2748,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    EditorTabWidth,
     DiffHideUnchanged,
     ChatEnterSends,
     ChatExpandToolGroups,
@@ -2875,6 +2878,7 @@ impl SettingsField {
             Self::LinkOpenDestination => "Open links in",
             Self::EditorAutoSave => "Auto-save",
             Self::EditorWrapLines => "Word wrap",
+            Self::EditorTabWidth => "Tab width",
             Self::DiffHideUnchanged => "Hide unchanged diff lines",
             Self::EditorFontFamily => "Editor font family",
             Self::EditorFontSize => "Editor font size",
@@ -2970,6 +2974,7 @@ impl SettingsField {
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
+            | Self::EditorTabWidth
             | Self::EditorSyntaxTheme
             | Self::EditorFontFamily
             | Self::EditorFontSize
@@ -3152,6 +3157,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
+    editor_tab_width: String,
     diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
@@ -3212,6 +3218,7 @@ impl SettingsDraft {
             default_channel_pane: settings.default_channel_pane,
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
+            editor_tab_width: settings.editor_tab_width.to_string(),
             diff_hide_unchanged: settings.diff_hide_unchanged,
             confirm_terminal_close: settings.confirm_terminal_close,
             confirm_multiline_paste: settings.confirm_multiline_paste,
@@ -3271,6 +3278,7 @@ impl SettingsDraft {
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
+            SettingsField::EditorTabWidth => self.editor_tab_width = value,
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
@@ -3572,6 +3580,7 @@ fn settings_update(
         SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
             .map(|theme| next.editor_syntax_theme = theme)
             .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
+        SettingsField::EditorTabWidth => value.parse::<u16>().ok().filter(|width| (1..=16).contains(width)).map(|width| next.editor_tab_width = width).ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
@@ -6045,6 +6054,7 @@ impl Cagents {
             self.settings.editor_font_size(),
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         PullRequestPane {
@@ -6769,6 +6779,7 @@ impl Cagents {
             self.settings.editor_font_size(),
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -12546,16 +12557,18 @@ impl Cagents {
             self.settings.editor_wrap_lines,
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        if previous.editor_tab_width != self.settings.editor_tab_width || previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
         {
             for runtime in self.cards.values_mut() {
                 match runtime {
                     CardRuntime::Repository(runtime) => {
                         runtime.set_wrap_lines(wrap_lines);
+                        runtime.set_editor_tab_width(self.settings.editor_tab_width);
                         runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::PullRequests(pane) => {
                         pane.runtime.set_wrap_lines(wrap_lines);
+                        pane.runtime.set_editor_tab_width(self.settings.editor_tab_width);
                         pane.runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
@@ -26448,6 +26461,16 @@ mod tests {
         app.settings_reset_confirm = true;
         drop(app.update(next()));
         assert_eq!(app.workspace.focused(), Some(ids[2]));
+    }
+
+    #[test]
+    fn save_matches_the_physical_key_on_non_latin_layouts() {
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("ы".into()), modified_key: keyboard::Key::Character("ы".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+        };
+        assert!(is_save_press(&event));
     }
 
     #[test]

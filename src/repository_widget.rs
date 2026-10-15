@@ -540,6 +540,7 @@ pub enum RepositoryAction {
     OpenSystem { card: CardId },
     RevealFile { card: CardId },
     BinaryPage { card: CardId, offset: u64 },
+    ConfiguredFileLoaded { identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides },
     BinaryPageLoaded { identity: AsyncIdentity, result: Result<crate::editor::BinaryPreview, FileIoError> },
     StageSelected {
         card: CardId,
@@ -739,6 +740,7 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::ConfiguredFileLoaded { identity, .. }
             | Self::BinaryPageLoaded { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
@@ -808,6 +810,7 @@ struct EditorDocument {
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
     history: History,
+    indentation: crate::editor_indent::Overrides,
     #[cfg(test)]
     history_time: Option<Instant>,
 }
@@ -862,6 +865,7 @@ impl EditorDocument {
             error: None,
             durability_warning: None,
             history: History::default(),
+            indentation: crate::editor_indent::Overrides::default(),
             #[cfg(test)]
             history_time: None,
         }
@@ -1851,6 +1855,7 @@ pub struct RepositoryRuntime {
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
+    editor_tab_width: u16,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -2072,6 +2077,7 @@ impl RepositoryRuntime {
             worktree_protection: None,
             standalone: false,
             external_editors: Vec::new(),
+            editor_tab_width: 4,
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -2162,6 +2168,13 @@ impl RepositoryRuntime {
 
     pub fn set_external_editors(&mut self, editors: Vec<crate::sidebar::SidebarEditor>) {
         self.external_editors = editors;
+    }
+
+    pub fn set_editor_tab_width(&mut self, width: u16) {
+        self.editor_tab_width = width.clamp(1, 16);
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, document.indentation));
+        }
     }
 
     /// Changes presentation without replacing the open buffer or its edit history.
@@ -4714,6 +4727,15 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::ConfiguredFileLoaded { identity, result, indentation } => {
+                let current = self.accepts_selected(&identity);
+                let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
+                if current && let DocumentState::Editable(document) = &mut self.document {
+                    document.indentation = indentation;
+                    document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, indentation));
+                }
+                task
+            }
             RepositoryAction::BinaryPage { card, offset } => {
                 let DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(_) } = &self.document else { return Task::none(); };
                 let identity = self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
@@ -6750,11 +6772,15 @@ fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<Repo
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path, tone))
+        let loaded = tokio::task::spawn_blocking(move || {
+            let indentation = crate::editor_indent::read(&worktree, &path);
+            (load_file(&worktree, &path, tone), indentation)
+        })
             .await
             .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
-            .and_then(|result| result);
-        RepositoryAction::FileLoaded { identity, result }
+            ;
+        let (result, indentation) = loaded.unwrap_or_else(|error| (Err(error), crate::editor_indent::Overrides::default()));
+        RepositoryAction::ConfiguredFileLoaded { identity, result, indentation }
     })
 }
 

@@ -563,6 +563,12 @@ fn settings_category_controls<'a>(
                     },
                 );
                 options.push(setting_field(
+                    "Tab width", "Display tab stops and default space indentation (1–16). File indentation and .editorconfig take precedence.",
+                    crate::ui_controls::field::text("4", &draft.editor_tab_width)
+                        .on_input(|value| Message::SettingsChanged { field: SettingsField::EditorTabWidth, value })
+                        .width(80).into(),
+                ));
+                options.push(setting_field(
                     "Hide unchanged diff lines",
                     "Fold unchanged context between hunks. Turn off to show the complete file.",
                     crate::settings_widgets::toggle(
