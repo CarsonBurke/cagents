@@ -48,8 +48,11 @@ fn read_creation_marker(admin: &crate::fs_safety::Root) -> io::Result<Option<Ope
     };
     if !file.metadata()?.is_file() { return Err(io::Error::other("Invalid worktree creation identity marker")); }
     let bytes = crate::fs_safety::read_bounded(&mut file, 64)?;
-    let value = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
-    value.trim_end_matches('\n').parse().map(Some).map_err(io::Error::other)
+    if bytes.len() != 37 || bytes.last() != Some(&b'\n') { return Err(io::Error::other("Invalid bounded canonical worktree creation marker")); }
+    let value = std::str::from_utf8(&bytes[..36]).map_err(io::Error::other)?;
+    let creation: OperationId = value.parse().map_err(io::Error::other)?;
+    if creation.to_string().as_bytes() != &bytes[..36] { return Err(io::Error::other("Noncanonical worktree creation marker")); }
+    Ok(Some(creation))
 }
 
 /// Verify a recorded generation without a database lookup, mutation or Git.
@@ -263,6 +266,8 @@ mod tests {
         assert!(worktree_setup_marker_matches(directory.path(), creation).unwrap());
         fs::write(directory.path().join(CREATION_MARKER), vec![b'a'; 65]).unwrap();
         assert!(worktree_setup_marker_matches(directory.path(), creation).is_err());
+        fs::write(directory.path().join(CREATION_MARKER), format!("{creation}{}invalid", "\n".repeat(100))).unwrap();
+        assert!(worktree_setup_marker_matches(directory.path(), creation).is_err(), "a truncated valid prefix is not a marker");
         fs::remove_file(directory.path().join(CREATION_MARKER)).unwrap();
         symlink("/dev/null", directory.path().join(CREATION_MARKER)).unwrap();
         assert!(worktree_setup_marker_matches(directory.path(), creation).is_err());
