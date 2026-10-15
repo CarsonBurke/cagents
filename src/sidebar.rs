@@ -16548,7 +16548,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn submitted_commit_clears_only_its_revision_even_while_parked() {
+    fn amend_submitted_commit_clears_only_its_revision_even_while_parked() {
         let model = panel_model();
         let mut state = panel_state(&model);
         let key = main_key();
