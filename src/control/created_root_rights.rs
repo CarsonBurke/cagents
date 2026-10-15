@@ -24,7 +24,7 @@ pub(crate) const MAX_DELIVERED_DESCRIPTORS: usize = std::mem::size_of::<[usize; 
 pub(crate) struct ReceivedRoots<const N: usize>(pub(crate) [File; N]);
 pub(crate) type Roots = ReceivedRoots<ROOT_COUNT>;
 
-fn wait(stream: &UnixStream, events: libc::c_short, deadline: Instant, cancellation: Option<&crate::process::CancellationToken>) -> io::Result<()> {
+fn wait(stream: &UnixStream, events: libc::c_short, deadline: Instant, cancellation: Option<&dyn Fn() -> bool>) -> io::Result<()> {
     loop {
         check_active(deadline, cancellation)?;
         let remaining = deadline
@@ -64,18 +64,19 @@ pub(crate) fn send(
 ) -> io::Result<()> {
     send_exact(stream, files, PHASE, deadline, None)
 }
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn send_cancellable(
     stream: &UnixStream, files: &[BorrowedFd<'_>; ROOT_COUNT], deadline: Instant,
     cancellation: &crate::process::CancellationToken,
 ) -> io::Result<()> {
-    send_exact(stream, files, PHASE, deadline, Some(cancellation))
+    send_exact(stream, files, PHASE, deadline, Some(&|| cancellation.is_cancelled()))
 }
 fn send_exact<const N: usize>(
     stream: &UnixStream,
     files: &[BorrowedFd<'_>; N],
     phase: u8,
     deadline: Instant,
-    cancellation: Option<&crate::process::CancellationToken>,
+    cancellation: Option<&dyn Fn() -> bool>,
 ) -> io::Result<()> {
     let mut byte = phase;
     let mut iov = libc::iovec {
@@ -141,12 +142,13 @@ fn send_exact<const N: usize>(
 pub(crate) fn receive(stream: &UnixStream, deadline: Instant) -> io::Result<Roots> {
     receive_exact(stream, PHASE, deadline, None)
 }
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn receive_cancellable(stream: &UnixStream, deadline: Instant,
     cancellation: &crate::process::CancellationToken) -> io::Result<Roots> {
-    receive_exact(stream, PHASE, deadline, Some(cancellation))
+    receive_exact(stream, PHASE, deadline, Some(&|| cancellation.is_cancelled()))
 }
 fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Instant,
-    cancellation: Option<&crate::process::CancellationToken>) -> io::Result<ReceivedRoots<N>> {
+    cancellation: Option<&dyn Fn() -> bool>) -> io::Result<ReceivedRoots<N>> {
     loop {
         check_active(deadline, cancellation)?;
         let mut byte = 0u8;
@@ -235,8 +237,8 @@ fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Insta
     }
 }
 
-fn check_active(deadline: Instant, cancellation: Option<&crate::process::CancellationToken>) -> io::Result<()> {
-    if cancellation.is_some_and(|token| token.is_cancelled()) {
+fn check_active(deadline: Instant, cancellation: Option<&dyn Fn() -> bool>) -> io::Result<()> {
+    if cancellation.is_some_and(|cancelled| cancelled()) {
         return Err(io::ErrorKind::Interrupted.into());
     }
     if Instant::now() >= deadline { return Err(io::ErrorKind::TimedOut.into()); }
