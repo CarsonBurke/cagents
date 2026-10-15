@@ -8,7 +8,7 @@ use super::source_binding::PendingClose;
 /// Constructed only after the exact claimed backend close AND its authenticated
 /// native cleanup receipt. A Remote additionally finishes semantic retirement.
 /// No wire serialization, public constructor or Clone can manufacture a seal.
-pub(super) struct ClosedPending {
+pub(in crate::host) struct ClosedPending {
     binding: crate::terminal_ipc::ChatSourceBinding,
     witness: chat::runtime::BackendIdentity,
     owner: Handle,
