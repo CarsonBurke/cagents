@@ -99,7 +99,7 @@ pub fn plan(target: &super::CheckoutTarget, head: &crate::github::checkout::Chec
     });
     let upstreams=remotes.iter().filter(|remote|matches_remote(remote)).map(|remote|format!("refs/remotes/{}/{}",remote.name,head.branch)).collect::<Vec<_>>();
     let existing_worktree = refs.iter().filter(|local| {
-        local.upstream.as_ref().is_some_and(|reference| upstreams.iter().any(|upstream|reference.as_str()==upstream))
+        local.upstream.as_ref().is_some_and(|reference| upstreams.iter().any(|upstream|reference.as_str()==upstream.as_str()))
             || (local.name.as_str() == format!("refs/heads/{}", head.branch)
                 && local.upstream.is_none() && local.oid.as_str() == head.oid)
     }).find_map(|local| worktrees.iter()

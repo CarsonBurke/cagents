@@ -706,6 +706,10 @@ impl State {
 
     pub fn selection_generation(&self) -> u64 { self.generation }
 
+    pub fn report_checkout_error(&mut self, error: String) {
+        self.notice=Some(format!("Could not prepare PR checkout. {error}"));
+    }
+
     pub fn target(&self) -> Option<&ReviewTarget> {
         self.target.as_ref()
     }

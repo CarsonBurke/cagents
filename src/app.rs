@@ -4316,6 +4316,7 @@ pub enum Message {
     PullRequestCheckoutReady {
         card: CardId,
         project: ProjectId,
+        generation: u64,
         target: pull_request_review::CheckoutTarget,
         result: Result<pull_request_review::checkout::PreparedCheckout, String>,
     },
@@ -6566,12 +6567,13 @@ impl Cagents {
         }
         if let Some((project, head)) = cleanup { tasks.push(self.open_merged_pull_request_cleanup(card,project,head)); }
         if let Some((project_id, target)) = checkout {
+            let generation=match self.cards.get(&card){Some(CardRuntime::PullRequests(pane))=>pane.review.selection_generation(),_=>return Task::batch(tasks)};
             self.status = Some(TransientNotice::success("Preparing PR checkout…"));
             tasks.push(cosmic::task::future(async move {
                 let work = target.clone();
                 let result = tokio::task::spawn_blocking(move || pull_request_review::checkout::prepare(&work, &CancellationToken::new()))
                     .await.map_err(|error| error.to_string()).and_then(|result| result);
-                Message::PullRequestCheckoutReady { card, project: project_id, target, result }
+                Message::PullRequestCheckoutReady { card, project: project_id, generation, target, result }
             }));
         }
         Task::batch(tasks)
@@ -16099,21 +16101,21 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
-            Message::PullRequestCheckoutReady { card, project, target, result } => {
+            Message::PullRequestCheckoutReady { card, project, generation, target, result } => {
                 if self.nested_modal_focus_target().is_some()
                     || !matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(pane))
-                        if pane.review.range().is_some_and(|range| range.head == target.head)
+                        if pane.review.selection_generation()==generation && pane.review.range().is_some_and(|range| range.head == target.head)
                         && pane.review.target().is_some_and(|review| review.worktree == target.repository && review.pull_request.number == target.number))
                 { return Task::none(); }
                 match result {
                     Ok(plan) => {
                         if let Some(path) = plan.existing_worktree { self.status = Some(TransientNotice::warning(plan.notice)); return self.select_worktree(path, false); }
                         let task = self.open_worktree_dialog(project, plan.repository,
-                            WorktreeDraft { branch: plan.branch_input, base: plan.base, destination: String::new() }, None);
+                            WorktreeDraft { branch: plan.branch_input, base: plan.base, destination: String::new(), ..Default::default() }, None);
                         if let Some(dialog) = &mut self.worktree_dialog { dialog.set_checkout_notice(plan.notice); }
                         task
                     }
-                    Err(error) => self.open_worktree_dialog(project, target.repository.clone(), WorktreeDraft::branch(target.suggested_branch()), Some(WorktreeInputError::general(error))),
+                    Err(error) => { if let Some(CardRuntime::PullRequests(pane))=self.cards.get_mut(&card){pane.review.report_checkout_error(error);}Task::none() },
                 }
             }
             Message::PullRequestReview { card, action } => {
