@@ -783,6 +783,7 @@ mod tests {
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
                 repository: "/fixture".into(),
                 name: "Fixture".into(),
                 kind: ProjectKind::Folder,
@@ -873,6 +874,7 @@ mod tests {
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
                 repository: "/fixture".into(),
                 name: "Fixture".into(),
                 kind: ProjectKind::Folder,

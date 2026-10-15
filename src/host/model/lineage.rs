@@ -307,6 +307,7 @@ mod tests {
         let repository = directory.path().to_owned();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
                 repository: repository.clone(),
                 name: "Fixture".into(),
                 kind: ProjectKind::Folder,
