@@ -146,6 +146,11 @@ impl Root {
     ///
     /// Returns the underlying [`io::Error`] when the descriptor cannot be
     /// stat'ed.
+    /// Duplicate this same retained directory for an inherited child operand.
+    pub(crate) fn retained_directory(&self) -> io::Result<File> {
+        self.directory.try_clone().map(File::from)
+    }
+
     pub fn metadata(&self) -> io::Result<Metadata> {
         metadata_of_descriptor(&self.directory)
     }

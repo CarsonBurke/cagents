@@ -677,6 +677,10 @@ pub enum ServerMessage {
     NotificationActivated {
         target: crate::notifications::Target,
     },
+    /// A successful daemon-owned worktree effect changed the repository inventory.
+    WorktreesChanged {
+        repository: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

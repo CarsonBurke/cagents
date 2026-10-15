@@ -348,6 +348,12 @@ pub(super) fn process_request(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::Worktree { operation },
+    } = &request
+    {
+        return super::worktree_requests::process(host, client_id, operation.clone());
+    }
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.

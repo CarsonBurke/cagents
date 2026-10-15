@@ -21,8 +21,14 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod native_reconcile;
 mod store;
 mod websocket;
+#[cfg(test)]
+mod whole_stop_fixture;
+mod worker_join;
+#[cfg(test)]
+mod worktree_stop_tests;
 use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
@@ -47,6 +53,12 @@ enum ActorCommand {
     },
     CloseIfIdle {
         generation: u64,
+    },
+    CloseIfRevision {
+        revision: u64,
+    },
+    StopSession {
+        actor_id: uuid::Uuid,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
@@ -111,6 +123,32 @@ pub(crate) enum Update {
 #[derive(Clone)]
 pub struct Handle(Arc<Inner>);
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CloseObservation {
+    pub actor_id: uuid::Uuid,
+    pub close_revision: u64,
+    pub turn_generation: u64,
+    pub activity: ActivityState,
+    pub ready: bool,
+    pub exited: bool,
+    pub completed: bool,
+    pub closing: bool,
+    pub owns_work: bool,
+    pub working_directory: std::path::PathBuf,
+    pub directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
+}
+
+struct CloseState {
+    actor_id: uuid::Uuid,
+    revision: u64,
+    admitted_work: bool,
+    compacting: bool,
+    unobserved_native: bool,
+    directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
+    _directory: Option<Arc<std::fs::File>>,
+    working_directory: std::path::PathBuf,
+}
+
 struct OwnedSocket(std::path::PathBuf);
 impl Drop for OwnedSocket {
     fn drop(&mut self) {
@@ -127,9 +165,12 @@ impl Handle {
     }
 }
 struct Inner {
+    native_holder_identity: Option<crate::daemon::holder_registry::Record>,
     commands: crossbeam_channel::Sender<CommandRequest>,
+    session_stop: Arc<Mutex<Option<CommandRequest>>>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
+    close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -138,15 +179,21 @@ struct Inner {
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    worker_joining: AtomicBool,
+    worker_join_failed: AtomicBool,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment: BTreeMap<String, String>,
+    ownership_admission: Arc<Mutex<()>>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
+    whole_session_stop: Arc<AtomicBool>,
     retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
+    native_reconciling: AtomicBool,
+    native_reconcile_error: Mutex<Option<String>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
 }
@@ -226,6 +273,69 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        // A live actor's close authority follows the physical directory it
+        // entered, never a launch alias that can be retargeted afterwards.
+        // Adopted legacy providers have no actor-owned admission observation.
+        let scope_eligible = !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+            && !matches!(
+                spec.transport,
+                TransportSpec::History | TransportSpec::UnixWebSocket { .. }
+            );
+        let physical_directory = if scope_eligible {
+            Some(
+                std::fs::canonicalize(&spec.working_directory).map_err(|error| {
+                    format!("Cannot resolve provider execution directory: {error}")
+                })?,
+            )
+        } else {
+            None
+        };
+        // The adapter and initial Step were prepared before entering here. A
+        // process-only correction cannot prove their embedded provider cwd.
+        // Typed production preparation supplies a canonical private Launch
+        // before constructing either. Legacy aliases stay fail-closed.
+        let scope_observed = physical_directory.as_ref() == Some(&spec.working_directory)
+            && spec
+                .execution
+                .as_ref()
+                .map(|context| context.provider_directory_observed(&spec.working_directory))
+                .transpose()?
+                .unwrap_or(false);
+        let directory_identity = if let Some(physical_directory) = physical_directory {
+            spec.working_directory = physical_directory;
+            if spec.execution.is_none() {
+                spec.execution = Some(Arc::new(super::protocol::ExecutionContext::capture(
+                    &spec.working_directory,
+                )?));
+            }
+            let context = spec.execution.as_ref().unwrap();
+            context.verify_directory(&spec.working_directory)?;
+            if scope_observed {
+                context
+                    .directory_descriptor()
+                    .as_ref()
+                    .map(|directory| {
+                        directory.metadata().map(|metadata| {
+                            crate::agent_execution::DirectoryIdentity::from_metadata(&metadata)
+                        })
+                    })
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Keep the admitted inode alive even after the actor completes. Numeric
+        // identities alone can be recycled after a directory is removed.
+        let close_directory = if scope_observed {
+            spec.execution
+                .as_ref()
+                .and_then(|context| context.directory_descriptor())
+        } else {
+            None
+        };
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -283,11 +393,26 @@ impl Handle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
+        let session_stop = Arc::new(Mutex::new(None));
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
+        let close_state = Arc::new(Mutex::new(CloseState {
+            actor_id: uuid::Uuid::new_v4(),
+            revision: 0,
+            admitted_work: false,
+            compacting: false,
+            unobserved_native: false,
+            directory_identity,
+            _directory: close_directory,
+            working_directory: if scope_observed {
+                spec.working_directory.clone()
+            } else {
+                Default::default()
+            },
+        }));
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -295,16 +420,21 @@ impl Handle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
+        let whole_session_stop = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
+            native_holder_identity: native_holder.as_ref().map(|holder| holder.record().clone()),
             commands,
+            session_stop: session_stop.clone(),
             wake: Mutex::new(wake),
             state: state.clone(),
+            close_state: close_state.clone(),
             confirmed_session: confirmed_session.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
@@ -313,17 +443,23 @@ impl Handle {
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
+            worker_joining: AtomicBool::new(false),
+            worker_join_failed: AtomicBool::new(false),
             store: store.clone(),
             notify: notify.clone(),
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
             ),
             recovery_environment,
+            ownership_admission: ownership_admission.clone(),
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
+            whole_session_stop: whole_session_stop.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
+            native_reconciling: AtomicBool::new(false),
+            native_reconcile_error: Mutex::new(None),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
         });
@@ -342,16 +478,23 @@ impl Handle {
                     reconnect_only_reported: false,
                     expected_native_peer,
                     native_peer: None,
+                    ownership_admission,
+                    release_native: release_native.clone(),
+                    whole_session_stop: whole_session_stop.clone(),
                     preserve_native: preserve_native.clone(),
                     native_installed: native_installed.clone(),
                     adapter,
                     state,
+                    close_state,
+                    close_input_fd: None,
+                    close_input_drained: true,
                     confirmed_session,
                     store,
                     visible,
                     observe_next,
                     stop,
                     incoming,
+                    session_stop,
                     wake: reader,
                     notify,
                     output: Vec::new(),
@@ -460,6 +603,11 @@ impl Handle {
                 });
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
+                        actor
+                            .close_state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .unobserved_native = true;
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
@@ -468,6 +616,11 @@ impl Handle {
                     {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
+                        actor
+                            .close_state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .unobserved_native = true;
                         false
                     } else {
                         true
@@ -620,8 +773,167 @@ impl Handle {
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
     }
 
+    /// Fence one actor lifetime after explicit consent to stop all its work.
+    /// This phase never joins cleanup and may run under control admission.
+    pub(crate) fn fence_session_stop_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("Session stop admission deadline elapsed".into());
+        }
+        let (observed_id, unobserved) = match self.0.close_state.try_lock() {
+            Ok(close) => (close.actor_id, close.unobserved_native),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let close = p.into_inner();
+                (close.actor_id, close.unobserved_native)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "Provider identity is updating; retain its owner and retry session stop".into(),
+                );
+            }
+        };
+        if observed_id != actor_id {
+            return Err("The provider actor was replaced; its replacement was preserved".into());
+        }
+        if self.0.preserve_native.load(Ordering::Acquire) {
+            return Err(
+                "Provider ownership is being preserved for a successor; refresh before stopping it"
+                    .into(),
+            );
+        }
+        if self.is_completed() || self.0.whole_session_stop.load(Ordering::Acquire) {
+            let _admission = match self.0.ownership_admission.try_lock() {
+                Ok(admission) => admission,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(
+                        "Provider ownership admission is busy; retain its owner and retry".into(),
+                    );
+                }
+            };
+            return if self.0.preserve_native.load(Ordering::Acquire) {
+                Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
+            } else if unobserved {
+                Err("Retained provider ownership must be reattached before session stop".into())
+            } else {
+                self.0.release_native.store(true, Ordering::Release);
+                Ok(())
+            };
+        }
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err("Provider ownership is changing; refresh before stopping it".into());
+        }
+        let (reply, response) = crossbeam_channel::bounded(1);
+        if Instant::now() >= deadline {
+            return Err("Session stop admission deadline elapsed".into());
+        }
+        {
+            let mut pending = match self.0.session_stop.try_lock() {
+                Ok(pending) => pending,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err("Session stop admission is busy; retain its owner and retry".into());
+                }
+            };
+            if pending.is_some() {
+                return Err(
+                    "A session stop is already pending; retain its owner and refresh".into(),
+                );
+            }
+            // Whole-session consent includes already queued work. This owner
+            // control must not be starved behind a saturated provider stdin.
+            *pending = Some((ActorCommand::StopSession { actor_id }, reply));
+        }
+        match self.0.wake.try_lock() {
+            Ok(mut wake) => {
+                let _ = wake.write(&[1]);
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let _ = p.into_inner().write(&[1]);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        response
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| {
+                "Session stop acknowledgement is unconfirmed; its exact owner is retained for retry"
+                    .to_string()
+            })?
+    }
+
+    /// Explicitly stop all ongoing work in this exact actor lifetime.
+    /// Cleanup uses one caller-owned budget and must run outside HostLock and
+    /// the global control gate. Timeout preserves the original cleanup owner.
+    pub(crate) fn stop_session_until(
+        &self,
+        actor_id: uuid::Uuid,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.fence_session_stop_until(actor_id, deadline)?;
+        self.close_until(deadline)
+    }
+
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        self.close()
+    }
+
+    /// Small resident census; never hydrates transcript windows or opens disk.
+    pub(crate) fn close_observation(&self) -> CloseObservation {
+        let owns_work = self.owns_work();
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let close = self.0.close_state.lock().unwrap_or_else(|p| p.into_inner());
+        let activity = if close.unobserved_native {
+            ActivityState::Unknown
+        } else if (close.admitted_work || close.compacting || !state.queued_messages.is_empty())
+            && !state.exited
+        {
+            ActivityState::Working
+        } else {
+            state.activity()
+        };
+        CloseObservation {
+            actor_id: close.actor_id,
+            close_revision: close.revision,
+            turn_generation: state.turn_generation,
+            activity,
+            ready: state.ready && !close.unobserved_native,
+            exited: state.exited && !close.unobserved_native,
+            completed: self.is_completed(),
+            closing: !close.unobserved_native
+                && (self.0.stop.load(Ordering::Acquire) || self.0.draining.load(Ordering::Acquire)),
+            owns_work: owns_work || close.unobserved_native,
+            working_directory: close.working_directory.clone(),
+            directory_identity: close.directory_identity,
+        }
+    }
+
+    /// Compare resident consent without treating it as a backend turn fence.
+    /// Live providers currently refuse; positively observed completed owners
+    /// can finish cleanup. Call outside HostLock because cleanup may join.
+    pub(crate) fn close_if_revision(&self, revision: u64) -> Result<(), String> {
+        if self.close_observation().directory_identity.is_none() {
+            return Err("The provider execution scope is not authoritatively observed; reattach before confirming close".into());
+        }
+        if self.is_completed() {
+            if self
+                .0
+                .close_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .unobserved_native
+            {
+                return Err("Retained provider work is not observed by this actor; reattach the session before confirming close".into());
+            }
+            if self.close_observation().close_revision != revision {
+                return Err("Provider work changed before conditional close".into());
+            }
+        } else {
+            self.ownership_command(ActorCommand::CloseIfRevision { revision })?;
+        }
         self.close()
     }
 
@@ -1043,6 +1355,11 @@ impl Handle {
             .clone()
     }
 
+    /// Exact process evidence captured before ownership moves to the actor.
+    pub(crate) fn native_holder_identity(&self) -> Option<&crate::daemon::holder_registry::Record> {
+        self.0.native_holder_identity.as_ref()
+    }
+
     pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
         if !matches!(
             self.native_continuity(),
@@ -1050,11 +1367,21 @@ impl Handle {
         ) {
             return Err("This native provider has no verified durable owner".into());
         }
+        self.claim_native_preservation()?;
+        self.close_inner(true, None)
+    }
+
+    fn claim_native_preservation(&self) -> Result<(), String> {
+        let _admission = self
+            .0
+            .ownership_admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if self.0.release_native.load(Ordering::Acquire) {
-            return Err("Native provider has already been explicitly closed".into());
+            return Err("Native provider session stop already owns cleanup".into());
         }
         self.0.preserve_native.store(true, Ordering::Release);
-        self.close_inner(true)
+        Ok(())
     }
 
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
@@ -1071,27 +1398,87 @@ impl Handle {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false)
+        self.close_inner(false, None)
     }
 
-    fn close_inner(&self, preserving: bool) -> Result<(), String> {
+    /// A caller-owned teardown budget. An unfinished worker or retained native
+    /// reconciliation remains owned and retryable; timeout is never cleanup.
+    pub(crate) fn close_until(&self, deadline: Instant) -> Result<(), String> {
+        if self.0.native_installed.load(Ordering::Acquire) {
+            self.0.release_native.store(true, Ordering::Release);
+        }
+        self.close_inner(false, Some(deadline))
+    }
+
+    fn join_worker_until(&self, deadline: Instant) -> Result<(), String> {
+        loop {
+            if !self.0.worker_joining.load(Ordering::Acquire) {
+                let ready = match self.0.worker.try_lock() {
+                    Ok(mut worker) => {
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
+                    }
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        let mut worker = poisoned.into_inner();
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => false,
+                };
+                if ready {
+                    return if self.0.worker_join_failed.load(Ordering::Acquire) {
+                        Err("Native chat worker did not shut down cleanly; provider state is unconfirmed".into())
+                    } else {
+                        Ok(())
+                    };
+                }
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
+            };
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn close_inner(&self, preserving: bool, deadline: Option<Instant>) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
-        self.wake();
-        // Serialize explicit closes through the join. A protocol failure is
-        // still useful diagnostic history, but it must not prevent retiring an
-        // actor whose process teardown has subsequently completed.
-        let mut worker = self.0.worker.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(worker) = worker.take()
-            && worker.join().is_err()
-        {
-            let error =
-                "Native chat worker did not shut down cleanly; provider state is unconfirmed"
-                    .to_owned();
-            // Even if the panic happened after the completion publication,
-            // repeated closes must preserve the uncertain teardown outcome.
-            self.0.completed.store(false, Ordering::Release);
-            *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
-            return Err(error);
+        // Close intent is atomic even when another caller owns wake metadata.
+        // A full/nonavailable wake stream already has a pending notification;
+        // periodic actor polls also observe stop without extending this budget.
+        match self.0.wake.try_lock() {
+            Ok(mut wake) => {
+                let _ = wake.write(&[1]);
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let _ = poisoned.into_inner().write(&[1]);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        // is_finished may precede blocking TLS destruction. Actual joins run
+        // in a bounded owner service, never on this deadline-bearing caller.
+        self.join_worker_until(
+            deadline.unwrap_or_else(|| Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE),
+        )?;
+        if let Some(deadline) = deadline {
+            return self.reconcile_native_until(deadline);
         }
         {
             let mut retained = self
@@ -1120,21 +1507,90 @@ impl Handle {
                 detached.take();
             }
         }
+        self.0
+            .close_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unobserved_native = false;
+        self.close_result()
+    }
+
+    fn reconcile_native_until(&self, deadline: Instant) -> Result<(), String> {
+        let mut attempted = false;
+        loop {
+            let retained = match self.0.retained_native.try_lock() {
+                Ok(owner) => Some(owner.is_some()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().is_some())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            let detached = if self.0.native_installed.load(Ordering::Acquire) {
+                match self.0.detached_native.try_lock() {
+                    Ok(owner) => Some(owner.is_some()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        Some(poisoned.into_inner().is_some())
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                }
+            } else {
+                Some(false)
+            };
+            if retained == Some(false)
+                && detached == Some(false)
+                && !self.0.native_reconciling.load(Ordering::Acquire)
+            {
+                let mut close=match self.0.close_state.try_lock() {
+                    Ok(close)=>close,
+                    Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock)=>return Err("Native cleanup is proved; resident metadata is busy, retry exact cleanup publication".into()),
+                };
+                close.unobserved_native = false;
+                drop(close);
+                return self.close_result();
+            }
+            if retained == Some(true) || detached == Some(true) {
+                if !attempted {
+                    native_reconcile::request(self)?;
+                    attempted = true;
+                } else if !self.0.native_reconciling.load(Ordering::Acquire) {
+                    let reason = self
+                        .0
+                        .native_reconcile_error
+                        .try_lock()
+                        .ok()
+                        .and_then(|error| error.clone());
+                    return Err(format!(
+                        "Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",
+                        reason
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err("Native cleanup is still pending; its exact owner and bounded reconciliation task are retained for retry".into());
+            };
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn close_result(&self) -> Result<(), String> {
         if self.is_completed() {
             return Ok(());
         }
-        match self
-            .0
-            .failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        {
-            Some(error) => Err(error),
-            None => {
-                Err("Native chat teardown did not complete; provider state is unconfirmed".into())
+        let failure = match self.0.failure.try_lock() {
+            Ok(failure) => failure.clone(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "Native teardown diagnostic is updating; cleanup remains unconfirmed".into(),
+                );
             }
-        }
+        };
+        Err(failure.unwrap_or_else(|| {
+            "Native chat teardown did not complete; provider state is unconfirmed".into()
+        }))
     }
 }
 
@@ -1244,6 +1700,16 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let retained = match self.retained_native.try_lock() {
+            Ok(mut owner) => owner.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            // The actor still owns this Arc/guard. Its existing owner remains
+            // responsible; final frontend destruction cannot wait for it.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(holder) = retained {
+            native_reconcile::retire_final(holder);
+        }
         let _ = self
             .wake
             .get_mut()
@@ -1255,7 +1721,12 @@ impl Drop for Inner {
             .unwrap_or_else(|p| p.into_inner())
             .take()
         {
-            let _ = worker.join();
+            // Dropping a JoinHandle detaches it. No last-handle destruction
+            // may join a TLS destructor, even if is_finished already says true.
+            drop(worker);
+            tracing::warn!(
+                "Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed"
+            );
         }
     }
 }
@@ -1309,7 +1780,7 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if let Some(directory) = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .and_then(|context| context.directory_descriptor())
     {
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
@@ -1333,6 +1804,8 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
     let child = ChildGuard::new(child)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
+    #[cfg(test)]
+    whole_stop_fixture::capture(&spec.working_directory, &child.identity);
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
@@ -1511,16 +1984,23 @@ struct Actor {
     reconnect_only_reported: bool,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
+    ownership_admission: Arc<Mutex<()>>,
+    release_native: Arc<AtomicBool>,
+    whole_session_stop: Arc<AtomicBool>,
     preserve_native: Arc<AtomicBool>,
     native_installed: Arc<AtomicBool>,
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
+    close_state: Arc<Mutex<CloseState>>,
+    close_input_fd: Option<std::os::fd::RawFd>,
+    close_input_drained: bool,
     confirmed_session: Arc<Mutex<Option<String>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
+    session_stop: Arc<Mutex<Option<CommandRequest>>>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
@@ -1607,6 +2087,52 @@ impl TurnAttention {
     }
 }
 impl Actor {
+    fn close_input_is_clear(&self) -> bool {
+        if !self.close_input_drained || !self.output.is_empty() {
+            return false;
+        }
+        let Some(fd) = self.close_input_fd else {
+            return true;
+        };
+        let mut input = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The transport owns this descriptor throughout command dispatch.
+        // No read is consumed here; the transport must observe it first.
+        (unsafe { libc::poll(&mut input, 1, 0) }) == 0
+    }
+    /// Called only after a validated actor relocation succeeds. The resident
+    /// census follows the operational directory and old consent becomes stale.
+    fn record_execution_directory(&mut self, directory: &std::path::Path) {
+        let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+        let pinned = self
+            .launch_context
+            .as_ref()
+            .filter(|context| {
+                context
+                    .provider_directory_observed(directory)
+                    .unwrap_or(false)
+            })
+            .and_then(|context| context.directory_descriptor());
+        let identity = pinned
+            .as_ref()
+            .and_then(|pinned| pinned.metadata().ok())
+            .map(|metadata| crate::agent_execution::DirectoryIdentity::from_metadata(&metadata));
+        let observed_directory = if identity.is_some() {
+            directory.to_path_buf()
+        } else {
+            Default::default()
+        };
+        if close.working_directory != observed_directory || close.directory_identity != identity {
+            close.working_directory = observed_directory;
+            close.directory_identity = identity;
+            close._directory = pinned;
+            close.revision = close.revision.saturating_add(1);
+        }
+    }
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -1616,6 +2142,9 @@ impl Actor {
         self.step(initial)?;
         while !self.stop.load(Ordering::Acquire) {
             self.drain_commands(false)?;
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if !self.pending.is_empty() {
                 return Err("History reader attempted a provider write".into());
             }
@@ -1672,6 +2201,8 @@ impl Actor {
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
+        self.close_input_fd = Some(stdout.as_raw_fd());
+        self.close_input_drained = false;
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
@@ -1680,6 +2211,13 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            self.drain_session_stop();
+            // Explicit lifetime consent stops delivery of queued bytes. It is
+            // not graceful interruption: the existing teardown below this run
+            // loop must still prove the original child/holder closed.
+            if self.whole_session_stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
                     closing = Some(Instant::now());
@@ -1707,7 +2245,6 @@ impl Actor {
                     ));
                 }
             }
-            self.drain_commands(closing.is_some())?;
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -1737,6 +2274,11 @@ impl Actor {
                 self.first_frame = true;
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
+            }
+            self.close_input_drained = self.output.is_empty();
+            self.drain_commands(closing.is_some())?;
+            if self.whole_session_stop.load(Ordering::Acquire) {
+                return Ok(());
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -1844,6 +2386,10 @@ impl Actor {
             if fds[0].revents != 0 {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
+            self.drain_session_stop();
+            if self.whole_session_stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if fds[3].revents != 0 {
                 if let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
@@ -1895,21 +2441,76 @@ impl Actor {
             }
         }
     }
+    // Owner-priority admission is independent of provider write/flush progress.
+    // It never consumes a normal provider command or reorders that queue.
+    fn drain_session_stop(&mut self) {
+        let request = self
+            .session_stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some((command, reply)) = request {
+            let result = match command {
+                ActorCommand::StopSession { actor_id } => self.admit_session_stop(actor_id),
+                _ => Err("Invalid session stop admission request".into()),
+            };
+            let _ = reply.send(result);
+        }
+    }
+
+    fn admit_session_stop(&mut self, actor_id: uuid::Uuid) -> Result<(), String> {
+        let _admission = self
+            .ownership_admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.preserve_native.load(Ordering::Acquire) {
+            Err(
+                "Provider ownership is being preserved for a successor; its owner was preserved"
+                    .into(),
+            )
+        } else if close.actor_id != actor_id {
+            Err("The provider actor was replaced; its replacement was preserved".into())
+        } else {
+            // Consent covers this actor's entire lifetime of work, including
+            // autonomous starts. Publish before ACK, retaining cleanup proof.
+            self.release_native.store(true, Ordering::Release);
+            self.whole_session_stop.store(true, Ordering::Release);
+            self.stop.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
-            // Backpressure applies to queued bytes, not to the mere existence of a
-            // queued write: a provider that reads stdin only between turns keeps
-            // `pending` non-empty for the whole turn, and refusing to drain there left
-            // UI commands unacknowledged until the caller's 10 second timeout.
+            self.drain_session_stop();
+            if self.whole_session_stop.load(Ordering::Acquire) {
+                break;
+            }
+            // Backpressure applies only to the normal provider command queue.
             if self.queued > QUEUE_BACKPRESSURE {
                 break;
             }
             let Ok((command, reply)) = self.incoming.try_recv() else {
                 break;
             };
-            if closing || self.stop.load(Ordering::Acquire) {
+            if (closing || self.stop.load(Ordering::Acquire))
+                && !matches!(&command, ActorCommand::StopSession { .. })
+            {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
+            }
+            if matches!(
+                &command,
+                ActorCommand::CloseIfRevision { .. } | ActorCommand::CloseIfIdle { .. }
+            ) && !self.close_input_is_clear()
+            {
+                let _=reply.send(Err("Provider input is still arriving; refresh close confirmation or stop the agent before closing".into()));
+                continue;
+            }
+            #[cfg(test)]
+            if matches!(&command, ActorCommand::CloseIfRevision { .. }) {
+                self.adapter.after_close_input_drained();
             }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
@@ -1975,6 +2576,31 @@ impl Actor {
                     });
                     continue;
                 }
+                ActorCommand::CloseIfRevision { revision } => {
+                    let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+                    let unchanged =
+                        close.revision == revision && close.directory_identity.is_some();
+                    // Empty input and the actor's FIFO cannot fence work that
+                    // the provider starts immediately after the final poll.
+                    // No supported adapter currently supplies an authoritative
+                    // backend conditional-close barrier, so preserve this live
+                    // owner instead of treating its observed revision as one.
+                    let _=reply.send(Err(if unchanged {
+                        "This agent cannot confirm that its work is unchanged. Stop the session explicitly, then refresh the worktree.".into()
+                    } else {
+                        "Provider work changed before conditional close".into()
+                    }));
+                    continue;
+                }
+                ActorCommand::StopSession { actor_id } => {
+                    let result = self.admit_session_stop(actor_id);
+                    let _ = reply.send(result);
+                    if self.whole_session_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let _ = readiness.send(self.update_readiness(&state));
@@ -2021,6 +2647,14 @@ impl Actor {
                 None
             };
             let starts_turn = matches!(&command, Command::Prompt { .. });
+            let compacts = matches!(&command, Command::Compact);
+            let starts_new_work = matches!(
+                &command,
+                Command::Prompt { .. }
+                    | Command::Slash { .. }
+                    | Command::StartQueued { .. }
+                    | Command::Branch { .. }
+            );
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2054,10 +2688,39 @@ impl Actor {
             };
             match prepared {
                 Ok(step) => {
+                    let compaction_tracked = step
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::Compaction { .. }));
+                    let compaction_finished = step
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::Compaction { active: false }));
+                    let observed_boundary = step.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            Event::TurnStarted
+                                | Event::TurnFinished { .. }
+                                | Event::Exited { .. }
+                                | Event::Error { fatal: true, .. }
+                        )
+                    });
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
                     }
                     let result = self.step(step);
+                    if result.is_ok() && authorizes_work {
+                        let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+                        close.revision = close.revision.saturating_add(1);
+                        // Claude submits /compact as a normal prompt. Only
+                        // adapters with explicit maintenance boundaries own a
+                        // separate compaction marker; other compacts follow
+                        // their ordinary turn admission/result lifecycle.
+                        close.admitted_work |= (starts_new_work || compacts && !compaction_tracked)
+                            && !observed_boundary;
+                        close.compacting |= compacts && compaction_tracked && !compaction_finished;
+                    }
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
                     let started = starts_turn && result.is_ok();
@@ -2085,9 +2748,17 @@ impl Actor {
         Ok(())
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
-        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
+        if !state.ready
+            || state.exited
+            || !self.pending.is_empty()
+            || !self.output.is_empty()
+            || !self.close_input_is_clear()
+        {
             UpdateReadiness::Unready
-        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
+        } else if state.is_working() || state.waiting || !state.requests.is_empty() || {
+            let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+            close.admitted_work || close.compacting
+        } {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
@@ -2293,6 +2964,37 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if let Event::Compaction { active } = &event {
+            let mut close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+            if *active || close.compacting != *active {
+                close.revision = close.revision.saturating_add(1);
+            }
+            close.compacting = *active;
+            return;
+        }
+        if matches!(
+            &event,
+            Event::Exited { .. } | Event::Error { fatal: true, .. } | Event::Reset { .. }
+        ) {
+            self.close_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .compacting = false;
+        }
+        // Clear terminal admission markers before attention reducers that may
+        // consume terminal events without retaining them in presentation.
+        if matches!(
+            &event,
+            Event::TurnFinished { .. }
+                | Event::Exited { .. }
+                | Event::Error { fatal: true, .. }
+                | Event::Reset { .. }
+        ) {
+            self.close_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .admitted_work = false;
+        }
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2312,6 +3014,29 @@ impl Actor {
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            &event,
+            Event::TurnStarted
+                | Event::TurnFinished { .. }
+                | Event::Exited { .. }
+                | Event::Error { fatal: true, .. }
+                | Event::Reset { .. }
+        ) {
+            let mut close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(&event, Event::TurnStarted) {
+                close.revision = close.revision.saturating_add(1);
+                close.admitted_work = false;
+            }
+            if matches!(
+                &event,
+                Event::TurnFinished { .. }
+                    | Event::Exited { .. }
+                    | Event::Error { fatal: true, .. }
+                    | Event::Reset { .. }
+            ) {
+                close.admitted_work = false;
+            }
+        }
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_event(&mut state, &mut self.indices, event);
@@ -2548,7 +3273,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::LatestHistoryStarted => state.history_loading = true,
         Event::HistoryError(message) => state.error = Some(message),
-        Event::HistoryRecovered => {}
+        Event::HistoryRecovered | Event::Compaction { .. } => {}
         Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),

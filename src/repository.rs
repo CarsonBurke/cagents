@@ -7,6 +7,9 @@
 
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+mod worktree_safety;
+mod worktree_unlock;
+pub use worktree_safety::{WorktreeSafetySnapshot, default_disposable_ignored_directories};
 
 use std::{
     borrow::Cow,
