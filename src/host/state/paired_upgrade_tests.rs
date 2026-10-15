@@ -246,7 +246,7 @@ fn run_pair(mode: &str) {
     let issued = match mode {
         "exact" => exact.clone(),
         "fresh" | "fresh-chat" => fresh.clone(),
-        "shell" => LaunchRecipe {
+        "shell" | "shell-hint" => LaunchRecipe {
             program: "/bin/bash".into(),
             arguments: vec![
                 "-c".into(),
@@ -407,12 +407,20 @@ fn run_pair(mode: &str) {
         assert_ne!(source.launch.recipe, checkpoint.chats[0].launch.recipe);
         store.save(&checkpoint).unwrap();
     }
-    if mode == "shell" {
-        // Older source daemons wrote the confirmed execution hint into the
-        // terminal checkpoint while the chat retained its issued shell tuple.
-        // Exercise that exact old encoding without changing the saved pane.
+    if mode == "shell-hint" {
+        // Explicit old-writer compatibility input: today's public conversion
+        // publishes the observed hint already. Older conversion copied the
+        // original shell descriptor with no hint into the chat, while terminal
+        // checkpointing learned the effective resume hint independently.
         let store = Store::open(&store_path).unwrap();
         let mut checkpoint = store.load().unwrap().unwrap();
+        checkpoint.chats[0]
+            .source
+            .terminal
+            .as_mut()
+            .unwrap()
+            .resume_hint = None;
+        source = checkpoint.chats[0].source.clone();
         checkpoint.terminals[0].source.resume_hint =
             crate::model::agent_recovery::hint_from_launch(&expected_execution);
         assert_ne!(
@@ -558,6 +566,7 @@ fn legacy_paired_fresh_and_shell_recipes_preserve_issued_identity_across_two_res
     }
     run_pair("fresh");
     run_pair("shell");
+    run_pair("shell-hint");
 }
 
 #[test]
