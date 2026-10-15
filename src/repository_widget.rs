@@ -5032,6 +5032,7 @@ impl RepositoryRuntime {
     /// Builds a language-feature action only for the mounted source buffer.
     /// Applications also check the corresponding live server capability.
     pub fn editor_language_feature_action(&self, card: CardId, feature: EditorLanguageFeature) -> Option<RepositoryAction> {
+        if self.standalone { return None; }
         self.editor_focus_target(card)?;
         self.lsp_document()?;
         self.cursor_position()?;
@@ -9777,8 +9778,8 @@ fn editable_document_view<'a>(
                     {
                         Some(EditorLspAction::Complete)
                     }
-                    Key::Named(Named::F2) if press.modifiers.is_empty() => Some(EditorLspAction::Rename),
-                    Key::Character(character) if character.as_str() == "." && press.modifiers.command() => Some(EditorLspAction::CodeActions),
+                    Key::Named(Named::F2) if !runtime.standalone && press.modifiers.is_empty() => Some(EditorLspAction::Rename),
+                    Key::Character(character) if !runtime.standalone && character.as_str() == "." && press.modifiers.command() => Some(EditorLspAction::CodeActions),
                     Key::Named(Named::F8) if !press.modifiers.control() && !press.modifiers.alt() && !press.modifiers.logo() => Some(EditorLspAction::Diagnostic(!press.modifiers.shift())),
                     Key::Named(Named::F12) => Some(if press.modifiers.shift() {
                         EditorLspAction::References

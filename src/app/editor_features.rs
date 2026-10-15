@@ -468,7 +468,7 @@ mod tests {
         let mut app = app();
         let card = CardId::new();
         let operation = operation(&app, card);
-        app.editor_features.publication = Some(Publication { ticket: 8, operation, cards: Vec::new() });
+        app.editor_features.publication = Some(Publication { ticket: 8, operation, cards: Vec::new(), server_lease: None });
         assert!(app.window_close_transient_blocker().is_some());
         let window = window::Id::unique();
         drop(app.update(Message::WindowCloseRequested(window)));
