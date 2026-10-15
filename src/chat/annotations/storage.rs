@@ -726,11 +726,9 @@ impl Store {
         {
             return Err(OriginalError::TooLarge);
         }
-        if !original.settings.is_exact() {
-            return Err(OriginalError::Unavailable(
-                "The accepted provider settings are unknown".into(),
-            ));
-        }
+        // Acceptance proves the original bytes independently of whether the
+        // provider can report restorable settings. Unknown remains explicit;
+        // only the Retry admission boundary requires exact settings.
         if original.text_bytes > ORIGINAL_TEXT_BYTES
             || original.attachments.len() > 32
             || original
@@ -1300,12 +1298,13 @@ mod tests {
         let mut store = Store::at(&annotations, &account, "session").unwrap();
         let mut original = prompt("user", "text");
         original.settings.fast = Setting::Unknown;
-        assert!(matches!(
-            store.accept(&original, "text", &[], &mut []),
-            Err(OriginalError::Unavailable(_))
-        ));
-        original.settings.fast = Setting::Unsupported;
         store.accept(&original, "text", &[], &mut []).unwrap();
+        let captured = store.original(Some("user"), 0, 4).unwrap();
+        assert!(!captured.original.settings.is_exact());
+        assert_eq!(captured.text, "text");
+        let mut changed = original.clone();
+        changed.settings.fast = Setting::Unsupported;
+        assert_eq!(store.accept(&changed, "text", &[], &mut []), Err(OriginalError::Changed));
         fs::rename(&account.canonical_home, root.path().join("old-home")).unwrap();
         fs::create_dir(&account.canonical_home).unwrap();
         assert!(matches!(

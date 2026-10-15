@@ -176,11 +176,7 @@ impl Store {
         // other unknown-session commands to this conversation.
         self.associate_command(id, &session)?;
         let command = self.prepared(id)?;
-        let settings = command.settings.ok_or_else(|| {
-            OriginalError::Unavailable(
-                "No fresh settings evidence is bound to this original dispatch".into(),
-            )
-        })?;
+        let settings = command.settings.unwrap_or_else(OriginalSettings::unknown);
         let mut text = PendingText(self.restore_capture(command.text)?);
         let mut captures = command
             .attachments
@@ -334,13 +330,6 @@ mod tests {
             accepted.original(Some("actual-user"), 0, 1024),
             Err(OriginalError::Unavailable(_))
         ));
-        assert!(
-            matches!(
-                accepted.accept_prepared("exact-command", "actual-user", "actual-turn", &[]),
-                Err(OriginalError::Unavailable(_))
-            ),
-            "No requested/default settings may masquerade as provider evidence"
-        );
         accepted
             .prepared_settings("exact-command", &settings())
             .unwrap();

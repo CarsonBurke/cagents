@@ -26,6 +26,12 @@ pub struct OriginalSettings {
     pub permission: Setting<String>,
 }
 impl OriginalSettings {
+    /// Exact input capture can support Edit even when a provider cannot prove
+    /// every setting. Such a record never authorizes exact-settings Retry.
+    pub fn unknown() -> Self {
+        Self { model: Setting::Unknown, reasoning: Setting::Unknown,
+            fast: Setting::Unknown, permission: Setting::Unknown }
+    }
     pub fn is_exact(&self) -> bool {
         !matches!(self.model, Setting::Unknown | Setting::Default)
             && !matches!(self.reasoning, Setting::Unknown | Setting::Default)

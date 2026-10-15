@@ -130,6 +130,9 @@ impl Authority {
         session: &str,
         original: &annotations::OriginalPrompt,
     ) -> Result<(String, crate::chat::Command), OriginalError> {
+        if !original.settings.is_exact() {
+            return Err(OriginalError::Unavailable("The accepted provider settings are unknown; only Edit as new intent is available".into()));
+        }
         if self.session.as_deref() != Some(session)
             || self.latest_proven.as_deref() != Some(original.user_id.as_str())
         {
@@ -1339,6 +1342,35 @@ mod tests {
             authority.prepare_retry("session", &original),
             Err(OriginalError::Changed)
         ));
+    }
+
+    #[test]
+    fn accepted_unknown_settings_capture_supports_edit_but_never_exact_retry() {
+        use crate::chat::annotations::{OriginalSettings, OriginalUpdate};
+        let root = annotations::storage::test_directory();
+        let home = root.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        let scope = LaunchAccountScope::resolve(crate::agent::Provider::Codex, root.path(), |key| (key == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+        let directory = root.path().join("annotations");
+        let mut authority = Authority::for_turn_outcomes_test(scope.clone(), directory.clone(), "session");
+        let image = root.path().join("original-image.png");
+        std::fs::write(&image, b"immutable image bytes").unwrap();
+        let mut command = Command::Prompt { text: "original /command with attachments".into(), attachments: vec![crate::chat::Attachment { path: image.clone() }], mode: crate::chat::PromptMode::Send };
+        let id = authority.prepare(&mut command, root.path()).unwrap().unwrap();
+        assert!(authority.original(Some("native-user"), 0, 1024).is_err(), "preparation is never acceptance");
+        std::fs::write(&image, b"changed picker bytes").unwrap();
+        assert!(authority.originals(vec![OriginalUpdate::Accepted { command_id: id, session_id: "session".into(), user_id: "native-user".into(), turn_id: "native-turn".into(), aliases: vec!["visible-alias".into()] }, OriginalUpdate::Latest { session_id: "session".into(), user_id: "native-user".into() }]).is_none());
+        let captured = authority.original(Some("visible-alias"), 0, 1024).unwrap();
+        assert_eq!(captured.text, "original /command with attachments");
+        assert_eq!(captured.original.settings, OriginalSettings::unknown());
+        assert_eq!(captured.original.attachments[0].original_path, image);
+        assert_eq!(std::fs::read(&captured.original.attachments[0].path).unwrap(), b"immutable image bytes");
+        assert!(matches!(authority.prepare_retry("session", &captured.original), Err(OriginalError::Unavailable(_))));
+        drop(authority);
+        let mut cold = Authority::for_turn_outcomes_test(scope, directory, "session");
+        cold.latest_user("native-user").unwrap();
+        assert_eq!(cold.original(None, 0, 1024).unwrap(), captured);
+        assert!(matches!(cold.prepare_retry("session", &captured.original), Err(OriginalError::Unavailable(_))));
     }
 
     #[test]

@@ -404,14 +404,17 @@ impl Claude {
                     command_id: proof.command_id.clone(),
                     settings,
                 });
-                self.originals.updates.push(OriginalUpdate::Accepted {
-                    command_id: proof.command_id,
-                    session_id: proof.session_id,
-                    user_id: proof.user_id,
-                    turn_id: proof.turn_id,
-                    aliases: proof.aliases,
-                });
             }
+            // The exact user/lifecycle join proves immutable input even when
+            // settings are unavailable. Retain it for Edit as new intent;
+            // absence of Settings is persisted as Unknown and refuses Retry.
+            self.originals.updates.push(OriginalUpdate::Accepted {
+                command_id: proof.command_id,
+                session_id: proof.session_id,
+                user_id: proof.user_id,
+                turn_id: proof.turn_id,
+                aliases: proof.aliases,
+            });
         }
     }
 }
@@ -477,6 +480,21 @@ mod tests {
         }
     }
     #[test]
+    fn accepted_input_without_settings_keeps_identity_for_edit_only() {
+        let mut adapter = adapter();
+        adapter.originals.policy = None;
+        adapter.original_command(Some("unknown-settings-command".into()));
+        let read = adapter.command(prompt("original", PromptMode::Send)).unwrap();
+        adapter.receive(settings_reply(&read.writes[0])).unwrap();
+        adapter.receive(init()).unwrap();
+        adapter.receive(started("unknown-settings-command")).unwrap();
+        adapter.receive(user("unknown-settings-command")).unwrap();
+        let updates = adapter.take_original_updates();
+        assert!(updates.iter().all(|update| !matches!(update, OriginalUpdate::Settings { .. })));
+        assert!(updates.iter().any(|update| matches!(update, OriginalUpdate::Accepted { command_id, aliases, .. } if command_id == "unknown-settings-command" && !aliases.is_empty())));
+    }
+
+    #[test]
     fn mutating_command_flushes_original_input_before_setting_change_and_invalidates_proof() {
         let mut adapter = adapter();
         adapter.original_command(Some("command".into()));
@@ -507,7 +525,7 @@ mod tests {
                 .iter()
                 .all(|update| !matches!(
                     update,
-                    OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. }
+                    OriginalUpdate::Settings { .. }
                 ))
         );
     }
@@ -537,7 +555,7 @@ mod tests {
                 .iter()
                 .all(|update| !matches!(
                     update,
-                    OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. }
+                    OriginalUpdate::Settings { .. }
                 ))
         );
     }
@@ -565,7 +583,7 @@ mod tests {
                     .iter()
                     .all(|update| !matches!(
                         update,
-                        OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. }
+                        OriginalUpdate::Settings { .. }
                     ))
             );
         }
@@ -610,7 +628,7 @@ mod tests {
                 .iter()
                 .all(|update| !matches!(
                     update,
-                    OriginalUpdate::Settings { .. } | OriginalUpdate::Accepted { .. }
+                    OriginalUpdate::Settings { .. }
                 ))
         );
     }
