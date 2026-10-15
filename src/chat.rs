@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub mod coordination;
 pub mod presentation;
 pub mod cache;
+#[cfg(feature = "ui")]
+pub(crate) mod source_owners;
 pub mod pricing;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
