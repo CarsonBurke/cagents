@@ -20790,6 +20790,7 @@ pub(crate) mod tests {
                 false,
                 None,
                 &shortcuts,
+                None,
             ),
             file_panel(&model, &state, width, false),
             git_panel(&model, &state, width, false),
