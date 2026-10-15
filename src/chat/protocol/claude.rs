@@ -1674,6 +1674,16 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn account_switch_ready(&self) -> bool {
+        !self.controls.values().any(|request| {
+            matches!(
+                request["subtype"].as_str(),
+                Some("set_model" | "apply_flag_settings" | "set_permission_mode")
+            )
+        })
+    }
+
+
     fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
         self.cwd = directory.to_path_buf();
         Ok(())

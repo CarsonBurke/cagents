@@ -1551,6 +1551,17 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn account_switch_ready(&self) -> bool {
+        self.permission_pending.is_none()
+            && !self.pending.values().any(|pending| {
+                matches!(
+                    pending,
+                    Pending::FastMode { .. } | Pending::Permission { .. }
+                )
+            })
+    }
+
+
     fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
         self.cwd = directory.to_path_buf();
         self.start["cwd"] = serde_json::Value::String(directory.to_string_lossy().into_owned());
