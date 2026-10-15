@@ -344,7 +344,7 @@ mod settings_typography_tests {
             .label(label).padding(4.0).on_input(|_| ()).into());
         let fixed_input = || lay_out(cosmic::widget::text_input("Query", "value")
             .font(Font::MONOSPACE).size(17.0).padding(4.0).on_input(|_| ()).into()).size();
-        let content = crate::ui_controls::editable::EditorContent::with_text("Form text\nsecond line");
+        let content = crate::ui_controls::field::EditorContent::with_text("Form text\nsecond line");
         let form_size = || lay_out(crate::ui_controls::field::editor("Instructions", &content)
             .height(Length::Shrink).padding(4.0).on_action(|_| ()).into()).size();
         configure_typography(first, 13.0, "", 14.0);
