@@ -35,6 +35,7 @@ struct PendingRemoval { target:RemovalTarget,batch:Option<uuid::Uuid>,kind:CardK
 pub(super) fn same_chat_removal_source(expected:&crate::chat::Session,current:&crate::chat::Session)->bool {
     expected.id==current.id && expected.launch==current.launch && expected.proof==current.proof
         && expected.owned_codex_listener==current.owned_codex_listener
+        && expected.terminal==current.terminal
 }
 fn same_removal_source(expected:&CardKind,current:&CardKind)->bool {
     match (expected,current) {
@@ -154,6 +155,19 @@ impl Cagents {
         let Some(proof) = surface.host_proof().filter(HostSessionProof::is_complete) else {
             return;
         };
+        self.record_terminal_close_binding(card, binding, proof, spawned);
+    }
+
+    /// Fixture entry point uses the same authentication and lineage checks as
+    /// actual spawn/adoption; it cannot set the private binding map directly.
+    #[cfg(test)]
+    pub(super) fn record_terminal_close_binding_for_test(
+        &mut self,
+        card: CardId,
+        binding: crate::terminal::HostedTerminalBinding,
+        proof: HostSessionProof,
+        spawned: bool,
+    ) {
         self.record_terminal_close_binding(card, binding, proof, spawned);
     }
 
