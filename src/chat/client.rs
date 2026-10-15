@@ -2462,7 +2462,7 @@ mod tests {
     fn handoff_reader_preserves_correlated_chat_close() { reader_case(ReaderCase::Close); }
 
     #[derive(Clone, Copy)]
-    enum ReplayCase { Exact, ForeignProof, WrongBackend, Refused }
+    enum ReplayCase { Exact, CanonicalPair, ForeignProof, WrongBackend, Refused }
     fn disconnected_return_replay(case: ReplayCase) {
         use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
@@ -2472,10 +2472,15 @@ mod tests {
         let proof = handoff_proof();
         let source = omp_card(Some("original"), Some(proof.clone()));
         let binding = ipc::ChatSourceBinding {source:source.clone(), execution_instance:uuid::Uuid::new_v4(), backend:uuid::Uuid::new_v4()};
-        let mut descriptor = ipc::TerminalDescriptor::relaunchable(TerminalId::new(), handoff_terminal().launch, None);
+        let mut descriptor = ipc::TerminalDescriptor::relaunchable(if matches!(case,ReplayCase::CanonicalPair) {source.id} else {TerminalId::new()}, handoff_terminal().launch, None);
         descriptor.execution_instance = uuid::Uuid::new_v4();
-        let receipt = ipc::TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(), source:source.clone(), source_execution_instance:binding.execution_instance,
+        let mut receipt = ipc::TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(), source:source.clone(), source_execution_instance:binding.execution_instance,
             source_binding:binding.clone(), retained_binding:None, terminal_native_epoch:uuid::Uuid::new_v4(), terminal:descriptor};
+        if matches!(case,ReplayCase::CanonicalPair) {
+            let mut canonical=binding.clone();canonical.backend=uuid::Uuid::new_v4();
+            canonical.source.terminal=Some(receipt.terminal.session.clone());
+            receipt.retained_binding=Some(canonical);
+        }
         let sockets = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
         let abort = Arc::new(AtomicBool::new(false));
         let (done, completed) = crossbeam_channel::bounded(1);
@@ -2525,6 +2530,12 @@ mod tests {
                 break frame;
             };
             assert!(matches!(submitted.request, ClientRequest::ChatReturnTerminal {expected, ..} if expected==original));
+            if let Some(canonical)=sent_receipt.retained_binding.as_ref() {
+                handoff_reply(&mut first,&mut codec,None,&sent_proof,ServerMessage::Response {response:ServerResponse::ChatSnapshot {
+                    chat_id:original.source.id,execution_instance:original.execution_instance,binding:Some(canonical.clone()),
+                    snapshot:Some(Snapshot {generation:2,session_id:Some("original".into()),..Default::default()}),
+                }});
+            }
             // Model the response-loss seam, not provider/family cleanup proof.
             // Shutdown all duplicate descriptors for this original connection.
             first.shutdown(Shutdown::Both).unwrap();
@@ -2563,7 +2574,7 @@ mod tests {
         while handle.inner.alive.load(Ordering::Acquire) {assert!(Instant::now()<deadline);thread::yield_now();}
         let result=handle.return_terminal(binding);
         match case {
-            ReplayCase::Exact => assert_eq!(result.unwrap(),receipt),
+            ReplayCase::Exact|ReplayCase::CanonicalPair => assert_eq!(result.unwrap(),receipt),
             ReplayCase::ForeignProof => assert!(result.unwrap_err().contains("proof")),
             ReplayCase::WrongBackend => assert!(result.unwrap_err().contains("exact captured receipt")),
             ReplayCase::Refused => assert_eq!(result.unwrap_err(),"exact original Return refused"),
@@ -2574,7 +2585,10 @@ mod tests {
         peer.settled=true;drop(worker);
     }
     #[test]
-    fn disconnected_return_replays_only_original_endpoint_proof_and_intent() {disconnected_return_replay(ReplayCase::Exact);}
+    fn disconnected_return_replays_only_original_endpoint_proof_and_intent() {
+        disconnected_return_replay(ReplayCase::Exact);
+        disconnected_return_replay(ReplayCase::CanonicalPair);
+    }
     #[test]
     fn disconnected_return_replay_refuses_changed_proof_backend_and_host_refusal() {
         disconnected_return_replay(ReplayCase::ForeignProof);
