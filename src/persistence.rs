@@ -9259,18 +9259,57 @@ mod tests {
             let store = StateStore::open(path, boot_id.clone()).unwrap();
             let mut state = WorkspaceState::default();
             state.cards = (0..if index == 1 { 2000 } else { 0 })
-                .map(|_| CardState {
-                    id: CardId::new(),
-                    generation: 0,
-                    title: "Closed pane".into(),
-                    width_fraction: 1.0,
-                    existence: closed_by_user(),
-                    exposure: Exposure::Offscreen,
-                    residency: Residency::Cold,
-                    kind: CardKind::Settings,
+                .map(|ordinal| {
+                    let kind = if ordinal % 2 == 0 {
+                        let mut template = workspace_with_terminal(&boot_id);
+                        let CardKind::Terminal(mut terminal) = template.cards.remove(0).kind else { unreachable!() };
+                        terminal.resume_hint = None;
+                        terminal.recovery_origin = Some(TerminalId::new());
+                        terminal.launch.program = "/bin/sh".into();
+                        terminal.launch.arguments = vec!["-c".into(), format!("printf 'retirement-{ordinal}'; exec sleep 3600")];
+                        terminal.launch.environment.insert("LANG".into(), "C.UTF-8".into());
+                        CardKind::Terminal(terminal)
+                    } else {
+                        let provider = if ordinal % 4 == 1 { crate::agent::Provider::Claude } else { crate::agent::Provider::Codex };
+                        let (_, mut chat) = agent_workspace(provider);
+                        let native_id = uuid::Uuid::new_v4().to_string();
+                        let terminal = chat.terminal.as_mut().unwrap();
+                        terminal.launch.arguments[1] = native_id.clone();
+                        terminal.resume_hint = crate::model::agent_recovery::hint_from_launch(&terminal.launch);
+                        terminal.continuity = TerminalContinuity::Live {
+                            host_session_id: HostSessionId::new("benchmark-host"),
+                            boot_id: boot_id.clone(),
+                            host_incarnation: HostIncarnation::new("benchmark-incarnation"),
+                        };
+                        terminal.recovery_origin = Some(TerminalId::new());
+                        chat.launch.recipe = terminal.launch.clone();
+                        chat.launch.session_id = Some(native_id);
+                        chat.proof = terminal.continuity.live_proof();
+                        CardKind::Chat(chat)
+                    };
+                    CardState {
+                        id: CardId::new(), generation: 0, title: format!("Closed pane {ordinal}"),
+                        width_fraction: 1.0, existence: closed_by_user(),
+                        exposure: Exposure::Offscreen, residency: Residency::Cold, kind,
+                    }
                 })
                 .collect();
             SaveLane::default().save(&store, &state).unwrap();
+            let inner = store.lock_inner().unwrap();
+            let rows: i64 = inner.connection.query_row("SELECT COUNT(*) FROM closed_terminal_claims WHERE unknown = 0", [], |row| row.get(0)).unwrap();
+            assert_eq!(rows, if index == 1 { 2000 } else { 0 }, "benchmark must include real terminal/chat claim decoding");
+            let mut claim_records = 0;
+            let mut proof_lineages = 0;
+            let mut statement = inner.connection.prepare("SELECT claims_json FROM closed_terminal_claims").unwrap();
+            for claims in statement.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+                let claims = serde_json::from_str::<Vec<serde_json::Value>>(&claims.unwrap()).unwrap();
+                proof_lineages += claims.iter().filter(|claim| claim["proof"].is_object() && claim["content"].is_object()).count();
+                claim_records += claims.len();
+            }
+            assert_eq!(claim_records, if index == 1 { 3000 } else { 0 });
+            assert_eq!(proof_lineages, if index == 1 { 2000 } else { 0 });
+            drop(statement);
+            drop(inner);
             store.shutdown().unwrap();
         }
         let mut startup = [Vec::new(), Vec::new()];
@@ -9317,7 +9356,7 @@ mod tests {
         let flush = [median(&mut flush[0]), median(&mut flush[1])];
         let startup_ratio = startup[1] as f64 / startup[0] as f64;
         let flush_ratio = flush[1] as f64 / flush[0] as f64;
-        let receipt = serde_json::json!({"closed_cards":2000,"samples":100,"startup_median_ns":startup,"noop_flush_median_ns":flush,"startup_ratio":startup_ratio,"noop_flush_ratio":flush_ratio,"budget_ratio":1.10});
+        let receipt = serde_json::json!({"closed_cards":2000,"plain_terminal_cards":1000,"native_chat_cards":1000,"native_providers":["Claude","Codex"],"claim_rows":2000,"claim_records":3000,"proof_and_content_lineages":2000,"samples":100,"startup_median_ns":startup,"noop_flush_median_ns":flush,"startup_ratio":startup_ratio,"noop_flush_ratio":flush_ratio,"budget_ratio":1.10});
         eprintln!("{receipt}");
         if let Some(path) = std::env::var_os("CAGENTS_RETIRE_BENCH_OUTPUT") {
             std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
