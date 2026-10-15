@@ -435,10 +435,14 @@ impl Claude {
                     }
                 }
                 let operation = super::preview(string(&request, "subtype").as_bytes(), 100);
+                let seconds=if string(&request,"subtype")=="initialize" {30} else {5};
+                if string(&request,"subtype")=="initialize" {
+                    step.events.push(Event::Error {message:"Claude did not confirm initialization within 30 seconds; restart the session".into(),fatal:true});
+                }
                 self.control_replies.push((
                     request["_cagents_ack"].as_str().unwrap_or(&id).to_owned(),
                     Err(format!(
-                        "Claude did not answer the {operation} request within 5 seconds; try again"
+                        "Claude did not answer the {operation} request within {seconds} seconds; try again"
                     )),
                 ));
             }
@@ -471,7 +475,7 @@ impl Claude {
         self.command_ack = Some(id.clone());
         self.control_deadlines.insert(
             id.clone(),
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            std::time::Instant::now() + std::time::Duration::from_secs(if string(&request,"subtype")=="initialize" {30} else {5}),
         );
         self.controls.insert(id.clone(), request.clone());
         let wire = request
@@ -5205,6 +5209,17 @@ mod tests {
             assert!(step.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Failed,.. })));
             assert!(!step.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Succeeded,.. })));
         }
+    }
+
+    #[test]
+    fn provider_startup_keeps_its_handshake_budget_before_expiring() {
+        let mut adapter=Claude::default();
+        adapter.initialize().unwrap();
+        let after_user_deadline=adapter.expire_controls(std::time::Instant::now()+std::time::Duration::from_secs(6));
+        assert!(after_user_deadline.events.is_empty());assert_eq!(adapter.controls.len(),1);
+        let expired=adapter.expire_controls(std::time::Instant::now()+std::time::Duration::from_secs(31));
+        assert!(expired.events.iter().any(|event|matches!(event,Event::Error {fatal:true,message} if message.contains("initialization") && message.contains("30 seconds"))));
+        assert!(adapter.controls.is_empty());
     }
 
     #[test]
