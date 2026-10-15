@@ -140,6 +140,7 @@ impl Cagents {
         // card from its channel's membership.
         let emptied = self.channels_emptied_by(&[card]);
         self.retire_lsp_card(card);
+        self.forget_repository_reader(card);
         self.sidebar_state.clear_agent_activity(card);
         self.sidebar_state.acknowledge_agent_update(card);
         self.cards.remove(&card);
@@ -378,6 +379,7 @@ impl Cagents {
             }
         }
         self.retire_lsp_card(id);
+        self.forget_repository_reader(id);
         self.sidebar_state.clear_agent_activity(id);
         self.sidebar_state.acknowledge_agent_update(id);
         self.chat_discard(id);

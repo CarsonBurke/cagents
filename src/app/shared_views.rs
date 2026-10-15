@@ -1313,6 +1313,7 @@ impl Cagents {
         self.shared_views.default_requests.remove(&id);
         self.shared_chat_detach(id);
         self.retire_lsp_card(id);
+        self.forget_repository_reader(id);
         if let Some(runtime) = self.cards.remove(&id) {
             #[cfg(feature = "integrated-browser")]
             if let CardRuntime::Browser(browser) = runtime {

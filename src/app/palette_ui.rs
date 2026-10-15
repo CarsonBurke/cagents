@@ -681,7 +681,7 @@ impl Cagents {
                         card,
                         kind,
                         request,
-                    } if self.diff_mutation_source(*card).is_some() => {
+                    } if self.diff_mutation_allowed(*card, *kind) => {
                         match self.registered_diff_mutation_action(*card, command) {
                             Some(RepositoryAction::ApplyDiffHunk {
                                 card: current_card,
@@ -2293,7 +2293,8 @@ impl Cagents {
             return None;
         };
         self.sidebar_model.source_control.as_ref().filter(|source| {
-            source.key.canonical_path == runtime.descriptor.worktree
+            self.runtime_git_source_is_current(card, runtime)
+                && source.key.canonical_path == runtime.descriptor.worktree
                 && self.sidebar_state.active_worktree() == Some(&source.key)
                 && self.sidebar_model.contains_worktree(&source.key)
                 && matches!(source.data_state, sidebar::SidebarDataState::Ready)
@@ -2302,10 +2303,12 @@ impl Cagents {
         })
     }
 
+    fn diff_mutation_allowed(&self, card: CardId, kind: crate::git_patch::Kind) -> bool {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return false; };
+        runtime.diff_mutation_applies_to_buffer(kind) || self.diff_mutation_source(card).is_some()
+    }
+
     fn diff_selection_command_capabilities(&self, card: CardId) -> u8 {
-        if self.diff_mutation_source(card).is_none() {
-            return 0;
-        }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
             return 0;
         };
@@ -2313,8 +2316,7 @@ impl Cagents {
             .into_iter()
             .filter_map(|command| {
                 let kind = workspace_widget::diff_selection_command_kind(command)?;
-                runtime
-                    .can_apply_diff_selection(kind)
+                (self.diff_mutation_allowed(card, kind) && runtime.can_apply_diff_selection(kind))
                     .then(|| workspace_widget::diff_selection_command_bit(command))
                     .flatten()
             })
@@ -2387,22 +2389,18 @@ impl Cagents {
         card: CardId,
         command: Command,
     ) -> Option<RepositoryAction> {
-        self.diff_mutation_source(card)?;
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
             return None;
         };
         if let Some(kind) = workspace_widget::diff_selection_command_kind(command) {
-            runtime.diff_selection_mutation_action(card, kind)
+            self.diff_mutation_allowed(card, kind).then(|| runtime.diff_selection_mutation_action(card, kind)).flatten()
         } else {
-            runtime
-                .diff_hunk_mutation_action(card, workspace_widget::diff_hunk_command_kind(command)?)
+            let kind = workspace_widget::diff_hunk_command_kind(command)?;
+            self.diff_mutation_allowed(card, kind).then(|| runtime.diff_hunk_mutation_action(card, kind)).flatten()
         }
     }
 
     fn diff_hunk_command_capabilities(&self, card: CardId) -> u8 {
-        if self.diff_mutation_source(card).is_none() {
-            return 0;
-        }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
             return 0;
         };
@@ -2410,8 +2408,7 @@ impl Cagents {
             .into_iter()
             .filter_map(|command| {
                 let kind = workspace_widget::diff_hunk_command_kind(command)?;
-                runtime
-                    .can_apply_diff_hunk(kind)
+                (self.diff_mutation_allowed(card, kind) && runtime.can_apply_diff_hunk(kind))
                     .then(|| workspace_widget::diff_hunk_command_bit(command))
                     .flatten()
             })
@@ -5347,24 +5344,31 @@ mod tests {
         }
     }
 
-    fn diff_command_fixture() -> (Cagents, CardId, ActiveWorktreeKey) {
+    #[cfg(target_os = "linux")]
+    fn diff_command_fixture() -> (tempfile::TempDir, Cagents, CardId, ActiveWorktreeKey) {
+        let temporary = tempfile::tempdir().unwrap();
+        super::super::git_binding::tests::init(temporary.path(), "original\nkeep\n");
+        std::fs::write(temporary.path().join("file.txt"), "changed\nkeep\n").unwrap();
+        let (source_app, key) = super::super::git_binding::tests::app_for(temporary.path());
         let mut app = settings_focus_fixture();
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.sidebar_model = source_app.sidebar_model;
+        app.sidebar_state = source_app.sidebar_state;
+        app.refresh_ui.source_binding = source_app.refresh_ui.source_binding;
         let card = app.workspace.focused().unwrap();
-        let mut runtime = RepositoryRuntime::selected_diff_fixture(card);
-        runtime.descriptor.project = key.project_id;
-        runtime.descriptor.worktree = key.canonical_path.clone();
+        let descriptor = RepositoryView { project: key.project_id, repository: temporary.path().to_owned(),
+            worktree: temporary.path().to_owned(), selected_file: Some("file.txt".into()) };
+        let runtime = RepositoryRuntime::selected_diff_fixture_from_source(card, descriptor,
+            app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone());
         app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
-        app.cards
-            .insert(card, CardRuntime::Repository(Box::new(runtime)));
-        (app, card, key)
+        app.refresh_ui.pane_reader_keys.insert(card, key.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        (temporary, app, card, key)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn diff_commands_require_the_bound_ready_source_and_keep_captured_selected_rows() {
-        let (mut app, card, _) = diff_command_fixture();
+        let (_temporary, mut app, card, _) = diff_command_fixture();
         assert!(app.command_available(Command::DiffStageSelection));
         assert!(!app.command_available(Command::DiffUnstageSelection));
         drop(app.update_palette(Action::Open));
@@ -5410,7 +5414,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|notice| notice.message.contains("selected diff changed"))
         );
-        let (mut app, _, _) = diff_command_fixture();
+        let (_temporary, mut app, _, _) = diff_command_fixture();
         app.sidebar_model
             .source_control
             .as_mut()
@@ -5421,7 +5425,6 @@ mod tests {
         for command in [
             Command::DiffStageSelection,
             Command::DiffUnstageSelection,
-            Command::DiffRevertSelection,
             Command::StageFile,
             Command::UnstageFile,
             Command::StageOrUnstageFile,
@@ -5431,6 +5434,8 @@ mod tests {
                 "{command:?} needs the actual current worktree source"
             );
         }
+        assert!(app.command_available(Command::DiffRevertSelection),
+            "native buffer Undo remains available without the Git strip");
         assert!(
             app.command_available(Command::DiffSplit),
             "presentation remains usable without mutation authority"
@@ -5525,9 +5530,10 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn hunk_palette_commands_capture_the_shown_source_and_refuse_later_row_selection() {
-        let (mut app, card, _) = diff_command_fixture();
+        let (_temporary, mut app, card, _) = diff_command_fixture();
         assert!(app.command_available(Command::DiffStageSelection));
         assert!(!app.command_available(Command::DiffStageHunk));
         let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
@@ -5585,6 +5591,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn file_stage_shortcut_rebinding_uses_actual_root_routing_and_never_background_fields() {
         let press = |app: &mut Cagents, card, pane, f9| {
@@ -5624,7 +5631,7 @@ mod tests {
             workspace_widget::FocusedPane::Editor,
             workspace_widget::FocusedPane::WorkingDiff,
         ] {
-            let (mut app, card, key) = diff_command_fixture();
+            let (_temporary, mut app, card, key) = diff_command_fixture();
             let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
                 unreachable!()
             };
@@ -5645,14 +5652,14 @@ mod tests {
             workspace_widget::FocusedPane::Chat,
             workspace_widget::FocusedPane::Terminal,
         ] {
-            let (mut app, card, _) = diff_command_fixture();
+            let (_temporary, mut app, card, _) = diff_command_fixture();
             press(&mut app, card, pane, false);
             assert!(
                 app.source_control_mutations.is_empty(),
                 "{pane:?} cannot stage a background file"
             );
         }
-        let (mut app, card, _) = diff_command_fixture();
+        let (_temporary, mut app, card, _) = diff_command_fixture();
         app.settings
             .keyboard_shortcuts
             .stage_or_unstage_file

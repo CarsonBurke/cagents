@@ -6945,6 +6945,11 @@ pub enum Message {
     /// key is no longer the bound one is a read of a tree nobody is looking at
     /// and is dropped rather than rendered.
     SourceControlReleased,
+    RepositoryReaderReady {
+        card: CardId,
+        request: OperationId,
+        result: Result<git_binding::Binding, String>,
+    },
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
@@ -10081,6 +10086,29 @@ impl Cagents {
             return Task::none();
         }
         let git_read_source = self.original_git_source_for_view(&view);
+        let directory = self.sidebar_model.project(view.project)
+            .is_some_and(|project| project.kind == ProjectKind::Folder);
+        if !directory && git_read_source.is_none()
+            && crate::repository::WorktreeAuthority::supported()
+            && self.repository_view_key(&view).is_some()
+        {
+            return self.start_repository_reader(card, view);
+        }
+        self.attach_repository_pane_with_source(card, view, git_read_source)
+    }
+
+    fn attach_repository_pane_with_source(
+        &mut self,
+        card: CardId,
+        view: RepositoryView,
+        git_read_source: Option<crate::repository::GitReadSource>,
+    ) -> Task<Message> {
+        self.refresh_ui.pane_reader_keys.remove(&card);
+        if git_read_source.is_some() {
+            if let Some(key) = self.repository_view_key(&view) {
+                self.refresh_ui.pane_reader_keys.insert(card, key);
+            }
+        }
         let mut runtime = if self
             .sidebar_model
             .project(view.project)
@@ -10090,6 +10118,13 @@ impl Cagents {
         } else {
             RepositoryRuntime::new_with_git_read_source(view, git_read_source)
         };
+        if runtime.git_read_source().is_none() {
+            runtime.set_git_mutation_unavailable_reason(Some(Arc::from(
+                crate::repository::WorktreeAuthority::unsupported_reason().unwrap_or(
+                    "Git changes are unavailable until this worktree has loaded. Reload the project and reopen this pane.",
+                ),
+            )));
+        }
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_editor_font(
             crate::terminal::monospace_font(self.settings.editor_font_family()),
@@ -11214,6 +11249,7 @@ impl Cagents {
         let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
         self.retire_lsp_card(card);
+        self.forget_repository_reader(card);
         match self.cards.remove(&card) {
             Some(CardRuntime::Terminal(_handle)) => {
                 // A failed or unreachable surface is not authority to terminate its PTY.
@@ -15169,7 +15205,8 @@ impl Cagents {
             .get(&key.canonical_path)
             .filter(|active| active.binding.key == key)
             .map(|active| active.binding.clone())
-            .or_else(|| self.retained_runtime_git_binding(&key));
+            .or_else(|| self.retained_runtime_git_binding(&key))
+            .or_else(|| self.pending_runtime_git_binding(&key));
         let binding = self
             .refresh_ui
             .source_binding
@@ -18968,7 +19005,7 @@ impl Application for Cagents {
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
                     return Task::none();
                 };
-                if !self.runtime_git_source_is_current(runtime) { return Task::none(); }
+                if !self.runtime_git_source_is_current(card, runtime) { return Task::none(); }
                 let binding = runtime.git_read_source().unwrap().id();
                 let Some(source) = self
                     .sidebar_model
@@ -18994,7 +19031,7 @@ impl Application for Cagents {
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
                     return Task::none();
                 };
-                if !self.runtime_git_source_is_current(runtime) { return Task::none(); }
+                if !self.runtime_git_source_is_current(card, runtime) { return Task::none(); }
                 let binding = runtime.git_read_source().unwrap().id();
                 let Some(source) = self
                     .sidebar_model
@@ -22016,6 +22053,9 @@ impl Application for Cagents {
                 result,
             } => self.finish_group_selection(key, operation, area, command, result),
             Message::SourceControlReleased => Task::none(),
+            Message::RepositoryReaderReady { card, request, result } => {
+                self.finish_repository_reader(card, request, result)
+            }
             Message::SourceControlLoaded {
                 key,
                 request,

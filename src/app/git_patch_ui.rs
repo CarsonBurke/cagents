@@ -11,6 +11,7 @@ pub(super) struct Pending {
     card: CardId,
     buffer_only: bool,
     read_receipt: Option<crate::repository::GitReadReceipt>,
+    read_key: Option<ActiveWorktreeKey>,
     result: Arc<
         std::sync::OnceLock<Result<Option<Arc<repository_widget::PreparedDiffMutation>>, String>>,
     >,
@@ -22,6 +23,7 @@ impl Pending {
             card,
             buffer_only,
             read_receipt: None,
+            read_key: None,
             result: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -34,7 +36,13 @@ impl Cagents {
     fn prepared_diff_binding_current(&self, pending: &Pending) -> bool {
         pending.buffer_only || pending.read_receipt.as_ref().is_some_and(|receipt| {
             self.refresh_ui.source_binding.as_ref().is_some_and(|binding| {
-                receipt.source().id() == binding.id
+                pending.read_key.as_ref() == Some(&binding.key)
+                    && self.sidebar_model.contains_worktree(&binding.key)
+                    && self.sidebar_model.source_control.as_ref().is_some_and(|model|
+                        model.key == binding.key && model.command_binding_id() == binding.id)
+                    && binding.authority.as_ref().is_some_and(|authority|
+                        authority.same_scope(receipt.source().authority()))
+                    && receipt.source().id() == binding.id
                     && binding.read_source.as_ref().is_some_and(|source| receipt.matches_source(source))
             })
         })
@@ -69,7 +77,7 @@ impl Cagents {
         else { return Task::none(); };
         let mut pending = Pending::new(card, buffer_only);
         if !buffer_only {
-            if !self.runtime_git_source_is_current(runtime) { return Task::none(); }
+            if !self.runtime_git_source_is_current(card, runtime) { return Task::none(); }
             let Some(receipt) = capture.git_read_receipt().filter(|receipt| {
                 self.refresh_ui.source_binding.as_ref()
                     .filter(|binding| binding.key == key)
@@ -77,6 +85,7 @@ impl Cagents {
                     .is_some_and(|source| receipt.matches_source(source))
             }) else { return Task::none(); };
             pending.read_receipt = Some(receipt.clone());
+            pending.read_key = Some(key.clone());
         }
         // A genuine native buffer Revert never writes Git or disk and remains
         // available on hosts without strong Git mutation authority.
@@ -262,11 +271,20 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, Cagents, CardId, ActiveWorktreeKey) {
         let temporary = tempfile::tempdir().unwrap();
-        super::super::git_binding::tests::init(temporary.path(), "changed\nkeep\n");
+        super::super::git_binding::tests::init(temporary.path(), "original\nkeep\n");
+        std::fs::write(temporary.path().join("file.txt"), "changed\nkeep\n").unwrap();
         let (mut app, key) = super::super::git_binding::tests::app_for(temporary.path());
         let card = CardId::new();
-        let runtime =
-            repository_widget::RepositoryRuntime::selected_diff_fixture_at(card, temporary.path());
+        #[cfg(target_os = "linux")]
+        let runtime = repository_widget::RepositoryRuntime::selected_diff_fixture_from_source(
+            card,
+            RepositoryView { project: key.project_id, repository: temporary.path().to_owned(),
+                worktree: temporary.path().to_owned(), selected_file: Some("file.txt".into()) },
+            app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let runtime = repository_widget::RepositoryRuntime::selected_diff_fixture_at(card, temporary.path());
+        app.refresh_ui.pane_reader_keys.insert(card, key.clone());
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         (temporary, app, card, key)
@@ -375,6 +393,115 @@ mod tests {
             }
         }
         panic!("expected worker receipt");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn held_original_reader_cannot_prepare_or_stage_through_a_same_path_replacement() {
+        use super::super::git_binding::tests::{git, init};
+        for metadata_only in [false, true] {
+            let (temporary, mut app, card, key) = fixture();
+            let root = temporary.path();
+            let original_source = app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone();
+            let task = app.start_diff_patch(card, git_patch::Kind::Stage, None);
+            let held = worker_message(task, |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+            let parked = tempfile::tempdir().unwrap();
+            let original = parked.path().join("original");
+            if metadata_only {
+                std::fs::rename(root.join(".git"), &original).unwrap();
+                init(root, "original\nkeep\n");
+            } else {
+                std::fs::rename(root, &original).unwrap();
+                init(root, "original\nkeep\n");
+            }
+            std::fs::write(root.join("file.txt"), "changed\nkeep\n").unwrap();
+            let mut replacement = git_binding::Binding::new(key.clone());
+            replacement.initialize().unwrap();
+            let new_source = replacement.read_source.as_ref().unwrap().clone();
+            let snapshot = replacement.mutation_service().unwrap().snapshot(root, &CancellationToken::default()).unwrap();
+            let mut current = SourceControlModel::ready_for_tab(key.clone(), &snapshot, false);
+            current.set_command_binding_id(replacement.id);
+            app.sidebar_model.source_control = Some(current);
+            app.refresh_ui.source_binding = Some(replacement);
+            assert!(!original_source.same_source(&new_source));
+            // The exact old CPU receipt settles its own reservation, and never
+            // lowers A's buffered patch into the currently bound B service.
+            drop(app.update(held));
+            assert!(app.source_control_mutations.is_empty());
+            drop(app.start_diff_patch(card, git_patch::Kind::Stage, None));
+            drop(app.update(Message::Repository(RepositoryAction::StageSelected { card, stage: true })));
+            drop(app.update(Message::Repository(RepositoryAction::RevertFile { card })));
+            assert!(app.source_control_mutations.is_empty());
+            assert!(app.sidebar_state.pending_discard().is_none());
+            assert_eq!(git(root, &["show", ":file.txt"]).stdout, b"original\nkeep\n");
+            // A genuine new B read, with the same text/index, is independently
+            // actionable. It is not an old A model with a new label.
+            let descriptor = RepositoryView { project: key.project_id, repository: root.to_owned(),
+                worktree: root.to_owned(), selected_file: Some("file.txt".into()) };
+            let fresh = RepositoryRuntime::selected_diff_fixture_from_source(card, descriptor, new_source);
+            app.cards.insert(card, CardRuntime::Repository(Box::new(fresh)));
+            app.refresh_ui.pane_reader_keys.insert(card, key.clone());
+            let prepare = app.start_diff_patch(card, git_patch::Kind::Stage, None);
+            let receipt = worker_message(prepare, |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+            let effect = app.update(receipt);
+            let completed = worker_message(effect, |message| matches!(message, Message::SourceControlMutated { .. })).await;
+            assert!(matches!(&completed, Message::SourceControlMutated { report: None, .. }));
+            drop(app.update(completed));
+            assert_eq!(git(root, &["show", ":file.txt"]).stdout, b"changed\nkeep\n");
+            let old_git = if metadata_only { original } else { original.join(".git") };
+            let old_index = std::process::Command::new("git").arg("--git-dir").arg(old_git)
+                .args(["show", ":file.txt"]).output().unwrap();
+            assert!(old_index.status.success());
+            assert_eq!(old_index.stdout, b"original\nkeep\n");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn returning_to_a_mounted_reader_reuses_its_original_actor_and_actual_worker() {
+        let (temporary, mut app, card, key) = fixture();
+        let original = app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone();
+        drop(app.release_source_control());
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+        let reload = app.reload_source_control(&key);
+        let binding = app.refresh_ui.source_binding.as_ref().unwrap();
+        assert_eq!(binding.id, original.id());
+        assert!(binding.read_source.as_ref().unwrap().same_source(&original));
+        let loaded = worker_message(reload, |message| matches!(message, Message::SourceControlLoaded { .. })).await;
+        drop(app.update(loaded));
+        let prepare = app.start_diff_patch(card, git_patch::Kind::Stage, None);
+        let receipt = worker_message(prepare, |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+        let effect = app.update(receipt);
+        let completed = worker_message(effect, |message| matches!(message, Message::SourceControlMutated { .. })).await;
+        assert!(matches!(&completed, Message::SourceControlMutated { report: None, .. }));
+        drop(app.update(completed));
+        assert_eq!(git_binding::tests::git(temporary.path(), &["show", ":file.txt"]).stdout, b"changed\nkeep\n");
+        assert_eq!(original.mutation_revision().load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn buffer_revert_uses_its_native_document_while_the_git_strip_is_elsewhere() {
+        let (_temporary, mut app, card, key) = fixture();
+        let original = app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone();
+        let other = tempfile::tempdir().unwrap();
+        git_binding::tests::init(other.path(), "other\n");
+        let mut sibling = key.clone();
+        sibling.worktree_id = crate::model::WorktreeId::new();
+        sibling.canonical_path = other.path().to_owned();
+        let mut binding = git_binding::Binding::new(sibling.clone());
+        binding.initialize().unwrap();
+        app.refresh_ui.source_binding = Some(binding);
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(sibling));
+        let prepare = app.start_diff_patch(card, git_patch::Kind::Revert, None);
+        let receipt = worker_message(prepare, |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+        drop(app.update(receipt));
+        assert!(app.source_control_mutations.is_empty());
+        let CardRuntime::Repository(runtime) = app.cards.get_mut(&card).unwrap() else { panic!() };
+        assert_eq!(runtime.editor_text().as_deref(), Some("original\nkeep\n"));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("changed\nkeep\n"));
+        assert!(runtime.git_read_source().unwrap().same_source(&original));
     }
 
     #[tokio::test]

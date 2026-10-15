@@ -12,6 +12,8 @@ pub(super) struct Binding {
     pub(super) authority: Option<WorktreeAuthority>,
     pub(super) initialized: bool,
     pub(super) read_source: Option<GitReadSource>,
+    initial_reader: Arc<std::sync::OnceLock<Result<GitReadSource, String>>>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
     pub(super) mutation_revision: Arc<std::sync::atomic::AtomicU64>,
 }
 impl Binding {
@@ -22,6 +24,8 @@ impl Binding {
             authority: None,
             initialized: false,
             read_source: None,
+            initial_reader: Arc::new(std::sync::OnceLock::new()),
+            retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mutation_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -30,31 +34,48 @@ impl Binding {
     pub(super) fn from_read_source(key: ActiveWorktreeKey, source: GitReadSource) -> Option<Self> {
         if !source.is_available() || source.authority().path() != key.canonical_path { return None; }
         Some(Self { id: source.id(), key, authority: Some(source.authority().clone()),
-            initialized: true, mutation_revision: source.mutation_revision(), read_source: Some(source) })
+            initialized: true, mutation_revision: source.mutation_revision(),
+            initial_reader: Arc::new(std::sync::OnceLock::new()),
+            retired: Arc::new(std::sync::atomic::AtomicBool::new(false)), read_source: Some(source) })
     }
 
     /// Blocking worker only. Once displayed, a refresh never recaptures a path.
     pub(super) fn initialize(&mut self) -> Result<(), String> {
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("The original Git reader was retired. Reopen the project before retrying.".into());
+        }
         if !self.initialized {
-            self.authority = if WorktreeAuthority::supported() {
-                Some(
-                    WorktreeAuthority::capture(&self.key.canonical_path)
-                        .map_err(|error| error.to_string())?,
-                )
-            } else {
-                None
-            };
-            self.read_source = self.authority.as_ref().map(|authority|
-                GitReadSource::new(self.id, authority.clone(), self.mutation_revision.clone()));
+            if WorktreeAuthority::supported() {
+                let source = self.initial_reader.get_or_init(|| {
+                    let authority = WorktreeAuthority::capture(&self.key.canonical_path)
+                        .map_err(|error| error.to_string())?;
+                    Ok(GitReadSource::new(self.id, authority, self.mutation_revision.clone()))
+                }).clone()?;
+                self.authority = Some(source.authority().clone());
+                self.read_source = Some(source);
+            }
             self.initialized = true;
         }
-        if self.read_source.as_ref().is_some_and(|source| !source.is_available()) {
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(source) = &self.read_source { source.invalidate(); }
+        }
+        if self.retired.load(std::sync::atomic::Ordering::Acquire)
+            || self.read_source.as_ref().is_some_and(|source| !source.is_available()) {
             return Err("The original Git reader was retired. Reopen the project before retrying.".into());
         }
         Ok(())
     }
+    /// Pure retirement, including a capture which has not completed yet.
+    pub(super) fn invalidate(&self) {
+        self.retired.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(source) = self.read_source.as_ref()
+            .or_else(|| self.initial_reader.get().and_then(|result| result.as_ref().ok())) {
+            source.invalidate();
+        }
+    }
     pub(super) fn validate(&self) -> Result<(), String> {
-        if self.read_source.as_ref().is_some_and(|source| !source.is_available()) {
+        if self.retired.load(std::sync::atomic::Ordering::Acquire)
+            || self.read_source.as_ref().is_some_and(|source| !source.is_available()) {
             return Err("The original Git reader was retired. Reopen the project before retrying.".into());
         }
         self.authority.as_ref().map_or(Ok(()), |authority| {
@@ -109,6 +130,9 @@ impl Binding {
             .authority
             .clone()
             .ok_or("Git mutation authority is unavailable for this displayed worktree.")?;
+        if !self.read_source.as_ref().is_some_and(|source| source.authority().same_scope(&authority)) {
+            return Err("The original Git reader and worktree scope no longer match.".into());
+        }
         RepositoryService::system("git")
             .with_worktree_authority(authority)
             .map_err(|error| error.to_string())

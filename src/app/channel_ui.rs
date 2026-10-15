@@ -717,6 +717,7 @@ impl Cagents {
                 continue;
             }
             self.retire_lsp_card(card);
+            self.forget_repository_reader(card);
             self.sidebar_state.clear_agent_activity(card);
             self.sidebar_state.acknowledge_agent_update(card);
             if passive {
