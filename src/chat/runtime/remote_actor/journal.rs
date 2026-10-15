@@ -7,7 +7,7 @@ use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
 
 const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
-const MAX_INPUTS: usize = 1024;
+pub(super) const MAX_INPUTS: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OutboxEntry {
@@ -424,6 +424,32 @@ impl Journal {
             .map_err(|error| error.to_string())?;
         Ok(())
     }
+    /// Retire exact terminal receipts independently: an earlier unknown or
+    /// partially written input must not block cleanup of unrelated outcomes.
+    /// The durable high-water sequence continues refusing all retired replay.
+    pub fn retire_acknowledged_inputs(&mut self, identities: &[InputIdentity]) -> Result<(), String> {
+        if identities.len()>64 {return Err("Input retirement batch exceeds capacity".into());}
+        for identity in identities {
+            let row:Option<(String,Vec<u8>,Vec<u8>)>=self.db.query_row(
+                "SELECT id,hash,state FROM inputs WHERE sequence=?1",[identity.sequence],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+                .optional().map_err(|error|error.to_string())?;
+            match row {
+                Some((id,hash,state))=> {
+                    if id!=identity.id.to_string() || hash.as_slice()!=identity.hash.as_slice() {return Err("Input retirement identity differs from its retained command".into());}
+                    if !matches!(serde_json::from_slice::<InputState>(&state).map_err(|error|error.to_string())?,InputState::Acknowledged(_)) {
+                        return Err("Accepted or unknown inputs must retain their receipt".into());
+                    }
+                }
+                None if identity.sequence>0 && identity.sequence<=self.input_sequence=> {},
+                None=>return Err("Input retirement exceeds the admitted sequence".into()),
+            }
+        }
+        let transaction=self.db.transaction().map_err(|error|error.to_string())?;
+        for identity in identities {transaction.execute("DELETE FROM inputs WHERE sequence=?1",[identity.sequence]).map_err(|error|error.to_string())?;}
+        transaction.commit().map_err(|error|error.to_string())
+    }
+
     pub fn retire_inputs(&mut self, through: u64) -> Result<(), String> {
         let mut query = self
             .db
@@ -598,6 +624,35 @@ mod tests {
         journal.ack(2).unwrap();
         assert!(journal.retained_runs().unwrap().is_empty());
     }
+    #[test]
+    fn exact_retirement_survives_more_than_capacity_and_preserves_uncertain_holes() {
+        let directory=tempfile::tempdir().unwrap();
+        let mut journal=Journal::open(directory.path()).unwrap();
+        let identity=|sequence|InputIdentity {sequence,id:uuid::Uuid::new_v4(),hash:[7;32]};
+        let accepted=identity(1);journal.admit(&accepted).unwrap();
+        let unknown=identity(2);journal.admit(&unknown).unwrap();journal.finish(&unknown,InputState::Unknown("write outcome is unknown".into())).unwrap();
+        let mut last=None;
+        for sequence in 3..(MAX_INPUTS as u64+35) {
+            let input=identity(sequence);journal.admit(&input).unwrap();journal.finish(&input,InputState::Acknowledged(Ok(()))).unwrap();
+            let mut changed=input.clone();changed.hash=[8;32];
+            assert!(journal.retire_acknowledged_inputs(&[changed]).is_err());
+            assert!(journal.input(&input).unwrap().is_some());
+            journal.retire_acknowledged_inputs(std::slice::from_ref(&input)).unwrap();
+            journal.retire_acknowledged_inputs(std::slice::from_ref(&input)).unwrap();
+            assert!(journal.admit(&input).is_err(),"a retired sequence must never invoke the command again");
+            last=Some(input);
+        }
+        assert!(journal.retire_acknowledged_inputs(std::slice::from_ref(&accepted)).is_err());
+        assert!(journal.retire_acknowledged_inputs(std::slice::from_ref(&unknown)).is_err());
+        assert_eq!(journal.input(&accepted).unwrap().unwrap().state,InputState::Accepted);
+        assert!(matches!(journal.input(&unknown).unwrap().unwrap().state,InputState::Unknown(_)));
+        let next=journal.next_input().unwrap();drop(journal);
+        let mut reopened=Journal::open(directory.path()).unwrap();
+        assert_eq!(reopened.next_input().unwrap(),next);
+        assert!(reopened.admit(&last.unwrap()).is_err());
+        assert_eq!(reopened.input(&accepted).unwrap().unwrap().state,InputState::Accepted);
+    }
+
     #[test]
     fn receipts_never_readmit_duplicate_or_retired_inputs() {
         let dir = tempfile::tempdir_in("/var/tmp").unwrap();

@@ -170,6 +170,7 @@ struct Remote {
     input_sequence: Mutex<u64>,
     uncertain_input: Mutex<Option<InputIdentity>>,
     pending: Mutex<Vec<Pending>>,
+    retiring_inputs: Mutex<Vec<InputIdentity>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     stop: AtomicBool,
     installed: AtomicBool,
@@ -317,6 +318,7 @@ impl RemoteActor {
             input_sequence: Mutex::new(1),
             uncertain_input: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
+            retiring_inputs: Mutex::new(Vec::new()),
             notify: Arc::new(|_| {}),
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(true),
@@ -660,6 +662,7 @@ impl RemoteActor {
             launch_account_scope: attached.launch_account_scope,
             recovery_environment: attached.recovery_environment,
             pending: Mutex::new(Vec::new()),
+            retiring_inputs: Mutex::new(Vec::new()),
             notify: Arc::new(notify),
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(false),
@@ -771,6 +774,7 @@ impl RemoteActor {
                     {
                         actor.apply_receipts(&receipts);
                     }
+                    let _=actor.flush_input_retirements();
                     drop(actor);
                     thread::sleep(Duration::from_millis(50));
                 }
@@ -904,6 +908,9 @@ impl RemoteActor {
             if pending.len() >= 65 {
                 return Err("Remote actor pending input capacity reached".into());
             }
+            if pending.len().saturating_add(self.0.retiring_inputs.lock().unwrap_or_else(|p|p.into_inner()).len())>=journal::MAX_INPUTS {
+                return Err("Input outcome retirement is pending; no new command was admitted".into());
+            }
             if let Some(identity) = &*self
                 .0
                 .uncertain_input
@@ -986,6 +993,7 @@ impl RemoteActor {
             .uncertain_input
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let mut completed=Vec::new();
         pending.retain_mut(|pending| {
             let Some(receipt) = receipts
                 .iter()
@@ -1001,6 +1009,7 @@ impl RemoteActor {
                     if let Some(reply) = pending.reply.take() {
                         let _ = reply.send(result.clone());
                     }
+                    completed.push(pending.identity.clone());
                     false
                 }
                 InputState::Unknown(error) => {
@@ -1012,6 +1021,18 @@ impl RemoteActor {
                 InputState::Accepted => true,
             }
         });
+        let mut retiring=self.0.retiring_inputs.lock().unwrap_or_else(|p|p.into_inner());
+        for identity in completed {if !retiring.contains(&identity) {retiring.push(identity);}}
+    }
+
+    fn flush_input_retirements(&self)->Result<(),String> {
+        let identities:Vec<_>=self.0.retiring_inputs.lock().unwrap_or_else(|p|p.into_inner()).iter().take(64).cloned().collect();
+        if identities.is_empty() {return Ok(());}
+        // No pending/receipt guard is held over the socket. On a lost reply,
+        // keep this bounded metadata and repeat only this idempotent ACK.
+        self.call::<()>("retire_acknowledged_inputs",json!([identities]))?;
+        self.0.retiring_inputs.lock().unwrap_or_else(|p|p.into_inner()).retain(|identity|!identities.contains(identity));
+        Ok(())
     }
 
     pub fn submit(
@@ -1741,6 +1762,11 @@ impl Server {
                     }
                 }
                 value!(receipts)
+            }
+            "retire_acknowledged_inputs" => {
+                let (identities,) = decode!((Vec<InputIdentity>,));
+                self.journal.lock().unwrap_or_else(|p|p.into_inner()).retire_acknowledged_inputs(&identities)?;
+                Ok(Value::Null)
             }
             "ack_inputs" => {
                 let (through,) = decode!((u64,));
@@ -2872,6 +2898,77 @@ done"#;
         assert!(actor.pending_inputs().is_empty());
         assert_eq!(*actor.0.input_sequence.lock().unwrap(), 2);
     }
+    #[test]
+    fn real_helper_accepts_more_than_its_receipt_capacity_without_replaying_commands() {
+        const CHILD:&str="CAGENTS_ACTOR_RECEIPT_RETIREMENT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root=tempfile::tempdir_in("/var/tmp").unwrap();
+            let test=thread::current().name().expect("test harness name").to_owned();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"])
+                .env(CHILD,"1").env("XDG_RUNTIME_DIR",root.path()).env("XDG_DATA_HOME",root.path().join("data"))
+                .env("XDG_CONFIG_HOME",root.path().join("config")).env("XDG_CACHE_HOME",root.path().join("cache"))
+                .env("HOME",root.path().join("home")).env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut source=chat::native_holder::fixture_source();
+        source.launch.provider=crate::agent::Provider::Claude;source.launch.session_id=None;
+        source.launch.recipe=crate::model::LaunchRecipe {program:"/bin/sh".into(),arguments:Vec::new(),working_directory:root.path().into(),
+            environment:BTreeMap::from([("HOME".into(),root.path().to_string_lossy().into_owned()),("CLAUDE_CONFIG_DIR".into(),root.path().join("claude").to_string_lossy().into_owned())]),unset_environment:Default::default()};
+        source.owned_codex_listener=None;source.terminal=None;source.native_continuity=chat::NativeContinuity::ReconnectOnly;
+        source.proof.as_mut().unwrap().boot_id=crate::daemon::read_boot_id().unwrap();
+        let paths=crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
+        let script=r#"while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      id=${frame#*'"request_id":"'}; id=${id%%'"'*}
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      ;;
+    *'"type":"user"'*) printf 'unexpected prompt\n' >> prompts ;;
+  esac
+done"#;
+        let mut spec=ProcessSpec::from(&source.launch.recipe);spec.arguments=vec!["-c".into(),script.into()];
+        let actor=RemoteActor::spawn(spec,source,BTreeMap::new(),|_|{}).unwrap();
+        struct Owner(RemoteActor);
+        impl Drop for Owner {fn drop(&mut self) {let _=self.0.close();let _=self.0.finish_close();}}
+        let owner=Owner(actor);let actor=&owner.0;actor.commit_installation().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(5);while !actor.state().ready {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
+        let mut total=0usize;
+        while total<journal::MAX_INPUTS+33 {
+            let count=32.min(journal::MAX_INPUTS+33-total);let mut replies=Vec::new();
+            for _ in 0..count {replies.push(actor.enqueue(None,Command::Refresh).unwrap());}
+            for reply in replies {reply.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();}
+            total+=count;
+        }
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while !actor.0.retiring_inputs.lock().unwrap().is_empty() {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
+        assert!(actor.pending_inputs().is_empty());
+        assert_eq!(*actor.0.input_sequence.lock().unwrap(),total as u64+1);
+        assert!(!root.path().join("prompts").exists(),"receipt retirement must never enqueue a provider prompt");
+        actor.close().unwrap();actor.finish_close().unwrap();
+    }
+
+    #[test]
+    fn lost_retirement_reply_keeps_bounded_ack_metadata_and_never_resends_input() {
+        let actor=RemoteActor::fixture();let response=actor.enqueue(None,Command::Refresh).unwrap();
+        let identity=actor.pending_inputs().pop().unwrap();
+        actor.apply_receipts(&[InputReceipt {identity:identity.clone(),state:InputState::Acknowledged(Ok(()))}]);
+        assert_eq!(response.try_recv(),Ok(Ok(())));assert!(actor.pending_inputs().is_empty());
+        assert_eq!(*actor.0.retiring_inputs.lock().unwrap(),vec![identity.clone()]);
+        assert!(actor.flush_input_retirements().is_err());
+        assert_eq!(*actor.0.retiring_inputs.lock().unwrap(),vec![identity.clone()]);
+        assert!(actor.pending_inputs().is_empty(),"a failed metadata ACK never restores a provider envelope");
+        // Accepted and Unknown receipts are not retirement candidates.
+        let response=actor.enqueue(None,Command::Refresh).unwrap();let other=actor.pending_inputs().pop().unwrap();
+        actor.apply_receipts(&[InputReceipt {identity:other.clone(),state:InputState::Accepted}]);
+        assert!(response.try_recv().is_err());
+        actor.apply_receipts(&[InputReceipt {identity:other,state:InputState::Unknown("uncertain".into())}]);
+        assert!(response.try_recv().unwrap().is_err());
+        assert_eq!(*actor.0.retiring_inputs.lock().unwrap(),vec![identity]);
+        assert_eq!(actor.pending_inputs().len(),1);
+    }
+
     #[test]
     fn unavailable_proxy_settles_pending_input_and_stops_reporting_healthy_metadata() {
         let actor = RemoteActor::fixture();
