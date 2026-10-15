@@ -2,6 +2,8 @@
 //! part IDs are aliases, never source IDs: callers retain the original key.
 use serde::{Deserialize, Serialize};
 
+pub mod changes;
+
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
