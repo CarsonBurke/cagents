@@ -4704,6 +4704,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(home).join(".config"));
             policy.attributes.push(xdg.join("git/config"));
         }
+        for dependency in &mut policy.attributes {
+            if dependency.is_relative() { *dependency = worktree.join(&*dependency); }
+        }
         Ok(policy)
     }
 
