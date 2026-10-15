@@ -10207,6 +10207,9 @@ mod account_continuation_capture_tests {
     }
 
     fn start(directory: &std::path::Path, label: &str, policy: Value, busy: bool) -> (chat::runtime::LocalHandle, PathBuf) {
+        start_with_speed(directory,label,policy,busy,Some(chat::FastMode::default()))
+    }
+    fn start_with_speed(directory: &std::path::Path, label: &str, policy: Value, busy: bool, speed:Option<chat::FastMode>) -> (chat::runtime::LocalHandle, PathBuf) {
         let log = directory.join(format!("{label}-wire.jsonl"));
         let recipe = crate::model::LaunchRecipe {
             program: "/usr/bin/python3".into(),
@@ -10227,7 +10230,7 @@ for line in sys.stdin:
             id:id.into(),label:id.into(),reasoning:vec!["low".into(),"high".into()],
         }).collect();
         let adapter = Claude {ready:true,busy,models:models.clone(),selected:Some("launch-model".into()),reasoning:Some("low".into()),
-            fast_mode:Some(chat::FastMode::default()),..Default::default()};
+            fast_mode:speed.clone(),..Default::default()};
         let capabilities = adapter.capabilities();
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step {events:vec![Event::Ready(true),Event::Status {busy,detail:String::new()},
@@ -10256,6 +10259,22 @@ for line in sys.stdin:
         assert_eq!(read[0]["request"]["subtype"],"get_settings");
         assert!(!handle.is_completed(),"metadata capture retains the original live actor");
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn live_continuation_distinguishes_unknown_speed_from_confirmed_nonchangeable_off() {
+        let directory=tempfile::tempdir().unwrap();
+        let (missing, _)=start_with_speed(directory.path(),"missing-speed",policy(),false,None);
+        assert!(!missing.snapshot(None).unwrap().capabilities.fast_mode);
+        assert!(missing.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err().contains("not confirmed all"));
+        assert!(!missing.is_completed()); missing.close().unwrap();
+        let (disabled, _)=start_with_speed(directory.path(),"disabled-speed",policy(),false,Some(chat::FastMode {
+            state:chat::FastModeState::Off,disabled_reason:Some("org_disabled".into()),
+        }));
+        assert!(!disabled.snapshot(None).unwrap().capabilities.fast_mode);
+        let captured=disabled.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(captured.controls().fast_mode,Some(false));
+        assert!(!disabled.is_completed()); disabled.close().unwrap();
     }
 
     #[test]

@@ -24,8 +24,9 @@ impl LocalHandle {
     /// prompt. An already-admitted getter may settle after the caller's budget.
     pub(crate) fn capture_continuation_options(&self, deadline: Instant) -> Result<Option<Options>, String> {
         if Instant::now() >= deadline { return Err("Automatic continuation capture budget expired".into()); }
-        if self.account_switch_generation()?.is_none() { return Ok(None); }
+        let readiness = self.account_switch_generation()?;
         if Instant::now() >= deadline { return Err("Automatic continuation capture budget expired before its settings read".into()); }
+        if readiness.is_none() { return Ok(None); }
         self.command(Command::RefreshPermissions)?;
         if Instant::now() >= deadline { return Err("Automatic continuation capture budget expired after its read-only settings acknowledgement".into()); }
         let (captured, response) = crossbeam_channel::bounded(1);
@@ -61,13 +62,13 @@ fn capture_known(snapshot: &Snapshot, policy: super::super::PermissionSettings) 
     }
     let mode = snapshot.permission_mode.as_ref().filter(|value| !value.is_empty()).ok_or_else(unknown)?;
     if !snapshot.capabilities.permission_modes.contains(mode)
-        || snapshot.capabilities.fast_mode && snapshot.fast_mode.is_none()
+        // The UI capability means changeable, not known: Claude can report a
+        // confirmed Off preference that this account is not allowed to edit.
+        || snapshot.fast_mode.is_none()
         || snapshot.permissions.as_ref() != Some(&policy) {
         return Err(unknown());
     }
-    let mut controls = AccountSwitchOptions::capture(snapshot);
-    // An unsupported speed control is absence, not a guessed Off preference.
-    if !snapshot.capabilities.fast_mode { controls.fast_mode = None; }
+    let controls = AccountSwitchOptions::capture(snapshot);
     Ok(Options { generation: snapshot.generation, controls })
 }
 
@@ -105,7 +106,40 @@ mod tests {
         }
         let mut unsupported = complete;
         unsupported.models[0].reasoning.clear(); unsupported.reasoning=None;
-        unsupported.capabilities.fast_mode=false; unsupported.fast_mode=None;
-        assert!(capture_known(&unsupported,policy).is_ok(),"explicitly unsupported effort/speed are absence, not guessed defaults");
+        unsupported.capabilities.fast_mode=false;
+        let controls = capture_known(&unsupported,policy).unwrap();
+        assert_eq!(controls.controls().fast_mode,Some(false),"confirmed nonchangeable speed is retained");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    struct IdleReader;
+    impl Adapter for IdleReader {
+        fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
+        fn command(&mut self, _:Command) -> Result<Step,String> { Err("the busy actor must never read settings".into()) }
+        fn receive(&mut self,_:serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
+    }
+    #[test]
+    fn continuation_busy_metadata_wait_cannot_succeed_after_original_deadline() {
+        let directory=tempfile::tempdir().unwrap();
+        let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().to_path_buf(),environment:Default::default(),unset_environment:Default::default()};
+        let spec=ProcessSpec::from(&recipe);
+        let mut initial=Step {events:vec![Event::Ready(true),Event::Status {busy:true,detail:String::new()}],..Step::default()};
+        let store=super::super::preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(IdleReader),initial,store,None,|_|{}).unwrap();
+        let state=handle.0.state.lock().unwrap();
+        let capture=handle.clone(); let (entered,started)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move|| {
+            let deadline=Instant::now()+Duration::from_millis(150);
+            entered.send(deadline).unwrap();
+            capture.capture_continuation_options(deadline)
+        });
+        let deadline=started.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(deadline.saturating_duration_since(Instant::now())+Duration::from_millis(10));
+        drop(state);
+        assert!(worker.join().unwrap().unwrap_err().contains("budget expired"));
+        assert!(!handle.is_completed()); handle.close().unwrap();
     }
 }
