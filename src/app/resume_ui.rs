@@ -613,7 +613,9 @@ impl Cagents {
                     return cosmic::task::future(async move {
                         let session = entry.session.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            configuration.validate(session.launch.provider).map(|_| session)
+                            configuration.validate(session.launch.provider)
+                                .map_err(|reason| format!("Repair the {} settings in Agents before resuming: {reason}", session.launch.provider.label()))
+                                .map(|_| session)
                         }).await.map_err(|error| error.to_string()).and_then(|result| result);
                         Message::ResumeConversation(Action::Prepared(generation, entry, result))
                     });
