@@ -2953,6 +2953,14 @@ fn parse_publication_config(
     Ok((parse_remote_config(&remote_records)?, values))
 }
 
+/// One immutable observation per path binds every occurrence in a config read.
+/// A later include candidate must not overwrite a consumed origin's version.
+fn observe_publication_path(files: &mut BTreeMap<PathBuf, Option<FileIdentity>>, path: PathBuf) -> bool {
+    files.entry(path.clone()).or_insert_with(|| {
+        fs::metadata(path).ok().map(|metadata| file_identity(&metadata))
+    }).is_some()
+}
+
 fn parse_observed_publication_config(
     worktree: &Path,
     output: &[u8],
@@ -2970,10 +2978,7 @@ fn parse_observed_publication_config(
     let mut observe = |path: PathBuf| {
         if path.as_os_str().is_empty() { return false; }
         let path = if path.is_absolute() { path } else { worktree.join(path) };
-        let identity = fs::metadata(&path).ok().map(|metadata| file_identity(&metadata));
-        let present = identity.is_some();
-        files.insert(path, identity);
-        present
+        observe_publication_path(&mut files, path)
     };
     // A previously absent root config has no --show-origin record. Observe
     // those defaults too, so adding the first relevant setting invalidates.
@@ -8477,6 +8482,26 @@ mod tests {
             dependencies.reconciliation_due(),
             "opaque targets receive bounded reconciliation"
         );
+    }
+
+    #[test]
+    fn repeated_origin_and_candidate_visits_keep_one_dependency_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("include.inc");
+        let mut first_absent = BTreeMap::new();
+        assert!(!observe_publication_path(&mut first_absent, path.clone()));
+        fs::write(&path, "[branch \"main\"]\n pushRemote = transient\n").unwrap();
+        assert!(!observe_publication_path(&mut first_absent, path.clone()),
+            "an absent candidate cannot acquire certification from a later consumed visit");
+        assert_eq!(first_absent.get(&path), Some(&None));
+        let mut consumed = BTreeMap::new();
+        assert!(observe_publication_path(&mut consumed, path.clone()));
+        let consumed_version = consumed[&path];
+        fs::remove_file(&path).unwrap();
+        assert!(observe_publication_path(&mut consumed, path.clone()),
+            "a later inactive include candidate must not overwrite the origin's Some version");
+        assert_eq!(consumed[&path], consumed_version);
+        assert_ne!(first_absent, consumed, "the complete before/after fence must reject transient origins");
     }
 
     #[test]
