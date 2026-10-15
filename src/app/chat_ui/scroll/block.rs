@@ -145,8 +145,7 @@ mod tests {
         let original = super::super::super::reader_source::Source::new("wide");
         let make = |source: super::super::super::reader_source::Source, width: f32| {
             let remembered = memory.reader_width_for(None, 7, &source);
-            block_source(widget::scrollable(widget::container(widget::Space::new().width(width).height(2000))
-                .min_width(remembered)).direction(iced::widget::scrollable::Direction::Both {
+            block_source(widget::scrollable(super::minimum_width(widget::container(widget::Space::new().width(width).height(2000)), remembered)).direction(iced::widget::scrollable::Direction::Both {
                     vertical: design::scrollbar(), horizontal: design::scrollbar(),
                 }).width(Length::Fill).height(Length::Fill), memory.clone(), None, 7, false, Some(source))
         };

@@ -3,7 +3,7 @@
 mod block;
 mod viewport;
 pub(super) use block::{block, block_source};
-pub(super) use viewport::viewport;
+pub(super) use viewport::{minimum_width, viewport};
 
 use super::view::Scroll;
 use super::*;
