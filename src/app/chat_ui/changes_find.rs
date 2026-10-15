@@ -78,8 +78,20 @@ impl State {
     }
     pub(super) fn metadata_ready(&self,item:&str,epoch:SourceEpoch)->bool {self.ready.get(item).is_some_and(|document|document.proof.epoch==epoch)}
     pub(super) fn selection(&self,item:&str,epoch:SourceEpoch,builder:&mut selection::DocumentBuilder) {
-        if let Some(document)=self.ready.get(item).filter(|document|document.proof.epoch==epoch) {
-            for leaf in &document.leaves {builder.indexed(item,&leaf.path,leaf.text.clone(),leaf.prefixes.clone());}
+        self.selection_with_pending(item,epoch,&[],builder);
+    }
+    pub(super) fn selection_with_pending(&self,item:&str,epoch:SourceEpoch,suspended:&[Vec<u32>],builder:&mut selection::DocumentBuilder) {
+        let document=self.ready.get(item).filter(|document|document.proof.epoch==epoch);
+        let leaves=document.map(|document|document.leaves.as_slice()).unwrap_or_default();
+        // Metadata then rename then patch for each original file index. Pending
+        // boundaries must interleave with real leaves, never append wholesale.
+        let order=|path:&[u32]|(path[1],if path[0]==6 {2}else {path[2]});
+        let mut positions:std::collections::BTreeMap<_,_>=suspended.iter().map(|path|(order(path),path.as_slice())).collect();
+        for leaf in leaves {positions.insert(order(&leaf.path),leaf.path.as_slice());}
+        for path in positions.values() {
+            if let Some(leaf)=leaves.iter().find(|leaf|leaf.path.as_slice()==*path) {
+                builder.indexed(item,path,leaf.text.clone(),leaf.prefixes.clone());
+            } else {builder.pending(item,path);}
         }
     }
     fn map(&self)->HashMap<String,Arc<find::External>> {

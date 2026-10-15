@@ -239,7 +239,18 @@ impl State {
         for index in &entry.suspended {
             if entry.current(*index).is_none() && let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}
         }
-        paths.sort();paths
+        paths.sort_by_key(|path|(path[1],if path[0]==6 {2}else {path[2]}));paths
+    }
+    /// Potential prior leaf positions in rendered file order. The selection
+    /// adapter substitutes a pending marker only when its real leaf is absent.
+    pub(super) fn suspended_paths(&self,item:&str)->Vec<Vec<u32>> {
+        let Some(entry)=self.aliases.get(item).and_then(|key|self.entries.get(key)) else {return Vec::new();};
+        let mut paths=Vec::new();
+        for (index,renamed) in &entry.suspended_paths {if let Ok(index)=u32::try_from(*index) {
+            paths.push(vec![7,index,0]);if *renamed {paths.push(vec![7,index,1]);}
+        }}
+        for index in &entry.suspended {if let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}}
+        paths.sort_by_key(|path|(path[1],if path[0]==6 {2}else {path[2]}));paths
     }
     pub(super) fn reconcile_demand(&mut self,expanded:&HashSet<String>,find:bool) {
         let mut changed=false;
@@ -907,7 +918,7 @@ mod tests {
         assert!(state.complete_patch(&page.source,0,request,Ok(pending)));
         state.evict(false);flush_retired();assert!(weak.upgrade().is_none());assert_eq!(state.retained_bytes(),0);
         assert!(state.entries[&page.source].opened.contains(&0));assert!(state.entries[&page.source].manual_pages.contains(&0));
-        assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![6,0],vec![7,0,0]]);
+        assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![7,0,0],vec![6,0]]);
         state.project(source.clone(),None,&expanded,false);let request=state.entries[&page.source].requested[&0];
         assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
         assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![6,0]]);
