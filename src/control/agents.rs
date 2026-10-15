@@ -1616,7 +1616,10 @@ mod tests {
             vec!["cagents", "agent", "close", "1234", "--interrupted"],
             vec!["cagents", "agent", "close", "1234", "--all"],
         ] {
-            assert!(Cli::try_parse_from(args.clone()).is_err(), "unexpectedly accepted {args:?}");
+            assert!(
+                Cli::try_parse_from(args.clone()).is_err(),
+                "unexpectedly accepted {args:?}"
+            );
         }
     }
     use super::*;
