@@ -1234,7 +1234,7 @@ where
         self.set_cursor(Cursor { position: Position { line: end.line, column: end.column.saturating_sub(closer.len_utf8()) }, selection: cursor.selection.map(|_| Position { line: start.line, column: start.column + character.len_utf8() }) });
         true
     }
-
+    pub fn indentation(&self) -> crate::editor_indent::Indentation { self.0.borrow().indentation }
     pub fn configure_indentation(&mut self, indentation: crate::editor_indent::Indentation) {
         let internal = self.0.get_mut();
         internal.indentation = indentation;
