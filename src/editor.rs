@@ -13,12 +13,27 @@ use crate::fs_safety::{self, ResolveError, Root};
 mod presence;
 mod save_publication;
 pub use crate::recovery_authority::RecoveryAuthority;
-pub(crate) use crate::recovery_authority::RecoverySlot;
+pub(crate) use crate::recovery_authority::{RecoverySlot, RecoveryContext};
 pub use presence::FileRestoration;
 pub(crate) use presence::{
     PresenceSave, capture_restoration_at, save_document_file, save_document_file_at,
 };
 use save_publication::{SaveBaseline, publish_replacement};
+
+/// Builds a worker-side recovery context from the EXACT pre-acquired physical
+/// cleanup lease. No named-path reacquisition occurs after a failure.
+pub(crate) fn recovery_context_at(root: &Root, protection: std::sync::Arc<Option<crate::worktree_cleanup::Protection>>) -> Result<RecoveryContext, FileIoError> {
+    let descriptors = match protection.as_ref() {
+        Some(protection) => {
+            if !protection.protects_root(root).map_err(io_error)? {
+                return Err(FileIoError::Io("The cleanup lease does not protect this exact opened root; no file was changed.".into()));
+            }
+            protection.retained_descriptor_count()
+        }
+        None => 0,
+    };
+    RecoveryContext::with_guard(protection, descriptors).map_err(FileIoError::Io)
+}
 
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
