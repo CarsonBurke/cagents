@@ -17,6 +17,7 @@ pub enum Action {
     ResolvedTargets { ticket: u64, result: Result<Arc<workspace::ResolvedTargets>, String> },
     Prepared { ticket: u64, result: Result<Arc<workspace::Plan>, String> },
     SelectPreviewFile(usize),
+    AnnotationsPage(usize),
     PreviewDiff { ticket: u64, index: usize, result: Result<Option<Arc<crate::diff_view::DiffModel>>, String> },
     PreviewRepository { ticket: u64, action: RepositoryAction },
     ApplyPreview,
@@ -47,7 +48,7 @@ mod tests {
     }
 
     fn operation(app: &Cagents, card: CardId) -> Operation {
-        Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, open_files: app.editor_open_files() }
+        Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: app.editor_open_files() }
     }
 
     fn plan(app: &Cagents, root: &Path, names: &[&str]) -> Arc<workspace::Plan> {
@@ -149,7 +150,7 @@ mod tests {
     fn retired_manager_response_cannot_consume_a_new_documents_reused_request_id() {
         let mut app = app();
         let request = LspRequestId(7);
-        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, open_files: Vec::new() };
+        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
         app.editor_features.requests.insert(request, current);
         drop(app.editor_feature_event(&LspEvent::WorkspaceEdit { request, doc: LspDocumentId(1), kind: LspEditKind::Rename, edit: LspWorkspaceEdit::default() }));
         assert_eq!(app.editor_features.requests.get(&request).unwrap().doc, LspDocumentId(2));
@@ -181,6 +182,7 @@ struct Operation {
     save_after: bool,
     command: Option<LspCommand>,
     server_request: Option<LspServerEditId>,
+    annotations: Vec<LspChangeAnnotation>,
     open_files: Vec<(CardId, PathBuf)>,
 }
 
@@ -197,6 +199,7 @@ struct Preview {
     operation: Operation,
     plan: Arc<workspace::Plan>,
     selected: usize,
+    annotation_page: usize,
     card: CardId,
     runtime: Option<RepositoryRuntime>,
     cancellation: crate::repository::CancellationToken,
@@ -391,7 +394,7 @@ impl Cagents {
     fn editor_operation(&self, card: CardId, kind: LspEditKind) -> Option<Operation> {
         if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source()) { return None; }
         let doc = self.lsp_document(card)?;
-        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, server_request: None, open_files: Vec::new() })
+        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }
 
     fn editor_operation_current(&self, operation: &Operation) -> bool {
@@ -518,7 +521,7 @@ impl Cagents {
             Action::Signature(card, trigger) => {
                 let Some(doc) = self.lsp_document(card) else { return Task::none(); };
                 let Some(version) = self.lsp.document_version(doc) else { return Task::none(); };
-                let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, server_request: None, open_files: Vec::new() };
+                let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
                 if let Some(previous) = self.editor_features.signature_requests.remove(&card) {
@@ -572,11 +575,17 @@ impl Cagents {
                         if preview {
                             if self.editor_features.modal_open() { self.reject_server_edit(&operation, "Another workspace edit is already open"); return Task::none(); }
                             let diff_ticket = self.editor_features.next();
-                            self.editor_features.preview = Some(Preview { ticket, diff_ticket, operation, plan, selected: 0, card: CardId::new(), runtime: None, cancellation: crate::repository::CancellationToken::new(), error: None });
+                            self.editor_features.preview = Some(Preview { ticket, diff_ticket, operation, plan, selected: 0, annotation_page: 0, card: CardId::new(), runtime: None, cancellation: crate::repository::CancellationToken::new(), error: None });
                             self.update_editor_features(Action::SelectPreviewFile(0))
                         } else { self.publish_editor_workspace_edit(ticket, operation, plan) }
                     }
                 }
+            }
+            Action::AnnotationsPage(page) => {
+                if let Some(preview) = self.editor_features.preview.as_mut() {
+                    preview.annotation_page = page.min(preview.operation.annotations.len().saturating_sub(1) / 8);
+                }
+                Task::none()
             }
             Action::SelectPreviewFile(index) => {
                 let diff_ticket = self.editor_features.next();
@@ -682,6 +691,7 @@ impl Cagents {
             return Task::none();
         }
         if edit.requires_confirmation { operation.kind = LspEditKind::Rename; }
+        operation.annotations = edit.annotations;
         let Some(CardRuntime::Repository(owner)) = self.cards.get(&operation.card) else { return Task::none(); };
         let worktree = owner.descriptor.worktree.clone();
         operation.open_files = self.editor_open_files();
@@ -776,15 +786,32 @@ impl Cagents {
             Some(runtime) => repository_widget::workspace_preview_view(preview.card, runtime).map(move |action| Message::EditorFeatures(Action::PreviewRepository { ticket: preview.diff_ticket, action })),
             None => design::body(preview.error.as_deref().unwrap_or("Preparing comparison…")).into(),
         };
-        let surface = widget::column::with_children(vec![
+        let mut rows = vec![
             design::title(format!("Preview changes · {} files", preview.plan.documents.len())).into(),
             design::caption("Open buffers retain one Undo step each. Unopened files are written after conflict checks.").into(),
-            widget::row::with_children(vec![widget::scrollable(files).width(260).height(Length::Fill).into(), widget::container(diff).width(Length::Fill).height(Length::Fill).into()]).spacing(space::M).height(480).into(),
-            dialog_ui::confirmation_actions(
-                crate::ui_controls::button::secondary("Cancel").on_press(Message::EditorFeatures(Action::CancelPreview)),
-                crate::ui_controls::button::primary("Apply changes").on_press(Message::EditorFeatures(Action::ApplyPreview)),
-            ),
-        ]).spacing(space::M);
+        ];
+        let annotations = &preview.operation.annotations;
+        if !annotations.is_empty() {
+            let start = preview.annotation_page * 8;
+            let end = (start + 8).min(annotations.len());
+            let metadata = widget::column::with_children(annotations[start..end].iter().map(|annotation| {
+                let mut fields = vec![design::body(format!("{}{}", if annotation.needs_confirmation { "Confirmation required · " } else { "" }, annotation.label)).into()];
+                if let Some(description) = &annotation.description { fields.push(design::caption(description).into()); }
+                widget::column::with_children(fields).spacing(space::XS).into()
+            }).collect::<Vec<_>>()).spacing(space::S);
+            rows.push(widget::row::with_children(vec![
+                design::caption(format!("Server annotations · {}–{} of {}", start + 1, end, annotations.len())).width(Length::Fill).into(),
+                crate::ui_controls::button::secondary("Previous annotations").on_press_maybe((start > 0).then_some(Message::EditorFeatures(Action::AnnotationsPage(preview.annotation_page.saturating_sub(1))))).into(),
+                crate::ui_controls::button::secondary("Next annotations").on_press_maybe((end < annotations.len()).then_some(Message::EditorFeatures(Action::AnnotationsPage(preview.annotation_page + 1)))).into(),
+            ]).spacing(space::S).into());
+            rows.push(widget::scrollable(metadata).height(120).into());
+        }
+        rows.push(widget::row::with_children(vec![widget::scrollable(files).width(260).height(Length::Fill).into(), widget::container(diff).width(Length::Fill).height(Length::Fill).into()]).spacing(space::M).height(if annotations.is_empty() { 480 } else { 360 }).into());
+        rows.push(dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel").on_press(Message::EditorFeatures(Action::CancelPreview)),
+            crate::ui_controls::button::primary("Apply changes").on_press(Message::EditorFeatures(Action::ApplyPreview)),
+        ));
+        let surface = widget::column::with_children(rows).spacing(space::M);
         Some(dialog_ui::overlay(dialog_ui::surface(surface, 1100.0), Some(Message::EditorFeatures(Action::CancelPreview)), 1.0))
     }
 }
