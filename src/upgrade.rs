@@ -745,7 +745,6 @@ pub(crate) mod handoff {
                             && chat.launch.terminal_recipe().as_ref() == Some(&terminal.recipe)
                     });
                 if paired_codex
-                    && !chat.source.owns_codex_listener()
                     && !matches!(chat.source.native_continuity, chat::NativeContinuity::Durable { .. })
                 {
                     let original = chat.source.terminal.as_ref().expect("checked pair");
@@ -881,7 +880,6 @@ pub(crate) mod handoff {
         // normalizing fresh/shell argv to resume argv would change it after
         // the source has stopped. Retained pairs keep their original worker.
         if source.launch.provider == crate::agent::Provider::Codex
-            && !source.owns_codex_listener()
             && !matches!(source.native_continuity, chat::NativeContinuity::Durable { .. })
             && let Some(terminal) = &source.terminal
             && Some(&terminal.launch) != launch.terminal_recipe().as_ref()

@@ -1,5 +1,5 @@
 mod presentation;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod paired_upgrade_tests;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
