@@ -105,7 +105,7 @@ impl State {
                     self.effects.push(Effect::CleanupMergedHead(CleanupHead{repository,branch:target.pull_request.head_ref_name.clone(),head}));
                 }
             }
-            Action::AutoMerge(enabled)=>{if enabled && (self.context.as_ref().is_none_or(|context|context.pending.is_some()||self.completion.data.as_ref().is_none_or(|data|data.head_oid!=context.head_oid))||self.discussion.composer.is_some()){return ActionTask::none();}let Some(method)=self.completion.method()else{return ActionTask::none();};return self.mutate_completion(ReviewControlMutation::AutoMerge{method,enabled});}
+            Action::AutoMerge(enabled)=>{if enabled && (self.context.as_ref().is_none_or(|context|context.pending.is_some()||self.completion.data.as_ref().is_none_or(|data|data.head_oid!=context.head_oid))||self.discussion.composer.is_some()){return ActionTask::none();}let method=if enabled{let Some(method)=self.completion.method()else{return ActionTask::none();};method}else{self.completion.method().unwrap_or(MergeMethod::Merge)};return self.mutate_completion(ReviewControlMutation::AutoMerge{method,enabled});}
             Action::Draft(draft)=>return self.mutate_completion(ReviewControlMutation::Draft(draft)),
             Action::Reviewers=>{self.completion.reviewers_open=!self.completion.reviewers_open;if self.completion.reviewers_open{return self.load_reviewer_candidates(false);}}
             Action::TeamTab(teams)=>{self.completion.teams=teams;self.completion.query.clear();self.completion.next=None;self.completion.cancellation.cancel();self.completion.candidates_loading=false;return self.load_reviewer_candidates(false);}
@@ -248,7 +248,7 @@ impl State {
             }
             let pending=self.context.as_ref().is_none_or(|context|context.pending.is_some()||context.head_oid!=data.head_oid)||self.discussion.composer.is_some();
             if pending{rows.push(design::caption("Submit or discard your pending review before merging.").into());}
-            rows.push(crate::ui_controls::button::secondary("Merge pull request").on_press_maybe((enabled&&!pending&&data.merge_blocked.is_none()&&state.method().is_some()&&!state.title.trim().is_empty()).then_some(Action::Merge)).into());
+            rows.push(crate::ui_controls::button::secondary("Merge pull request").on_press_maybe((enabled&&!pending&&data.merge_blocked.is_none()&&state.method().is_some()&&(state.method()==Some(MergeMethod::Rebase)||!state.title.trim().is_empty())).then_some(Action::Merge)).into());
             if data.auto_merge_enabled{rows.push(crate::ui_controls::button::secondary("Disable auto-merge").on_press_maybe((enabled&&data.can_disable_auto_merge).then_some(Action::AutoMerge(false))).into());}
             else if data.auto_merge_allowed{rows.push(crate::ui_controls::button::secondary("Enable auto-merge").on_press_maybe((enabled&&!pending&&data.can_enable_auto_merge&&state.method().is_some()).then_some(Action::AutoMerge(true))).into());}
             else{rows.push(design::caption("The repository does not allow auto-merge.").into());}

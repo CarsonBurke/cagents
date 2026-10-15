@@ -6,6 +6,9 @@ pub enum MergeMethod { Merge, Squash, Rebase }
 impl MergeMethod {
     pub fn api_name(self) -> &'static str { match self { Self::Merge => "MERGE", Self::Squash => "SQUASH", Self::Rebase => "REBASE" } }
 }
+impl AsRef<str> for MergeMethod {
+    fn as_ref(&self)->&str { match self { Self::Merge=>"Merge commit", Self::Squash=>"Squash", Self::Rebase=>"Rebase" } }
+}
 impl std::fmt::Display for MergeMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(match self { Self::Merge=>"Merge commit", Self::Squash=>"Squash", Self::Rebase=>"Rebase" }) }
 }
