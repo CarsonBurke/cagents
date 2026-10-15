@@ -3,7 +3,7 @@
 use crate::{chat, model::{CardId, ChannelId, ProjectId}, workspace_model::views::Scope};
 use std::{path::PathBuf, sync::Arc};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConversationEndTarget {
     pub(crate) card: CardId,
     pub(crate) registry: uuid::Uuid,
@@ -17,4 +17,17 @@ pub struct ConversationEndTarget {
 }
 impl ConversationEndTarget {
     pub fn card(&self) -> CardId { self.card }
+}
+
+impl std::fmt::Debug for ConversationEndTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Command diagnostics do not need argv/environment from either
+        // captured recipe. Those values remain private validation inputs.
+        formatter.debug_struct("ConversationEndTarget")
+            .field("card", &self.card)
+            .field("registry", &self.registry)
+            .field("channel", &self.channel)
+            .field("worktree", &self.worktree)
+            .finish_non_exhaustive()
+    }
 }
