@@ -19,7 +19,11 @@ pub(super) struct State {
 #[derive(Debug, Clone)]
 pub enum Action {
     /// Close the overlay without answering the pending request.
-    Dismiss,
+    Dismiss {
+        id: uuid::Uuid,
+        revision: u64,
+        generation: u64,
+    },
     Updated(Vec<ProposalSummary>),
     Loaded {
         id: uuid::Uuid,
@@ -33,6 +37,7 @@ pub enum Action {
     Decide {
         id: uuid::Uuid,
         revision: u64,
+        generation: u64,
         approved: bool,
     },
     Finished {
@@ -124,11 +129,64 @@ impl Cagents {
     }
 
     pub(super) fn cancel_automation_approval(&mut self) -> Task<Message> {
-        self.update_automation_approval(Action::Dismiss)
+        let Some(action) = self.automation_approval_dismiss_action() else {
+            return Task::none();
+        };
+        self.update_automation_approval(action)
+    }
+
+    pub(super) fn automation_approval_dismiss_action(&self) -> Option<Action> {
+        let proposal = self.automation_approval.proposal.as_ref()?;
+        Some(Action::Dismiss {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: self.automation_approval.generation,
+        })
+    }
+
+    pub(super) fn approval_user_action_matches(
+        &self,
+        id: uuid::Uuid,
+        revision: u64,
+        generation: u64,
+    ) -> bool {
+        self.automation_approval.generation == generation
+            && self
+                .automation_approval
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.id == id && proposal.revision == revision)
+    }
+
+    /// Model retirement is independent of user input and may remove hidden
+    /// backing state. User dismissal must first validate its captured review.
+    fn retire_automation_approval(&mut self) -> Task<Message> {
+        let state = &mut self.automation_approval;
+        if state.deciding || state.proposal.take().is_none() {
+            return Task::none();
+        }
+        state.error = None;
+        if let Some(restore) = state.restore_keyboard_nav.take() {
+            self.core.set_keyboard_nav(restore);
+        }
+        iced::widget::operation::focus(
+            self.workspace
+                .focused()
+                .map(|card| self.card_keyboard_focus(card))
+                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+        )
+        .map(cosmic::Action::App)
     }
 
     pub(super) fn automation_approval_open(&self) -> bool {
         self.automation_approval.proposal.is_some()
+    }
+
+    pub(super) fn approval_dialog_generation(&self) -> Option<u64> {
+        self.automation_approval
+            .proposal
+            .as_ref()
+            .map(|_| self.automation_approval.generation)
     }
 
     pub(super) fn update_automation_approval(&mut self, action: Action) -> Task<Message> {
@@ -158,7 +216,7 @@ impl Cagents {
                             })
                         })
                 {
-                    return self.update_automation_approval(Action::Dismiss);
+                    return self.retire_automation_approval();
                 }
                 Task::none()
             }
@@ -201,22 +259,15 @@ impl Cagents {
                 self.automation_approval.available = Some(proposal);
                 self.update_automation_approval(Action::Open { id, revision })
             }
-            Action::Dismiss => {
-                let state = &mut self.automation_approval;
-                if state.deciding || state.proposal.take().is_none() {
+            Action::Dismiss {
+                id,
+                revision,
+                generation,
+            } => {
+                if !self.approval_user_action_matches(id, revision, generation) {
                     return Task::none();
                 }
-                state.error = None;
-                if let Some(restore) = state.restore_keyboard_nav.take() {
-                    self.core.set_keyboard_nav(restore);
-                }
-                iced::widget::operation::focus(
-                    self.workspace
-                        .focused()
-                        .map(|card| self.card_keyboard_focus(card))
-                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-                )
-                .map(cosmic::Action::App)
+                self.retire_automation_approval()
             }
             Action::Open { id, revision } => {
                 if self.modal_is_open() || self.chrome_ui.workspace_preview_since.is_some() {
@@ -272,15 +323,14 @@ impl Cagents {
             Action::Decide {
                 id,
                 revision,
+                generation,
                 approved,
             } => {
+                if !self.approval_user_action_matches(id, revision, generation) {
+                    return Task::none();
+                }
                 let state = &mut self.automation_approval;
-                if state.deciding
-                    || state
-                        .proposal
-                        .as_ref()
-                        .is_none_or(|proposal| proposal.id != id || proposal.revision != revision)
-                {
+                if state.deciding {
                     return Task::none();
                 }
                 state.deciding = true;
@@ -406,11 +456,16 @@ impl Cagents {
                 && !modifiers.logo())
         {
             let action = if *key == Named::Escape || self.automation_approval.focus == 0 {
-                Action::Dismiss
+                Action::Dismiss {
+                    id: proposal.id,
+                    revision: proposal.revision,
+                    generation: self.automation_approval.generation,
+                }
             } else {
                 Action::Decide {
                     id: proposal.id,
                     revision: proposal.revision,
+                    generation: self.automation_approval.generation,
                     approved: self.automation_approval.focus == 2,
                 }
             };
@@ -476,10 +531,16 @@ impl Cagents {
         if let Some(error) = &state.error {
             content = content.push(notice_detail(error));
         }
+        let dismiss = Action::Dismiss {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: state.generation,
+        };
         let decision = |approved| {
             Message::AutomationApproval(Action::Decide {
                 id: proposal.id,
                 revision: proposal.revision,
+                generation: state.generation,
                 approved,
             })
         };
@@ -487,7 +548,7 @@ impl Cagents {
             crate::ui_controls::button::secondary("Not now")
                 .id(widget::Id::new("automation-approval.dismiss"))
                 .on_press_maybe(
-                    (!state.deciding).then_some(Message::AutomationApproval(Action::Dismiss)),
+                    (!state.deciding).then_some(Message::AutomationApproval(dismiss.clone())),
                 )
                 .into(),
             crate::ui_controls::button::secondary("Decline")
@@ -508,7 +569,7 @@ impl Cagents {
         .spacing(space::M);
         Some(dialog_ui::overlay(
             dialog_ui::surface(surface, 680.0),
-            (!state.deciding).then_some(Message::AutomationApproval(Action::Dismiss)),
+            (!state.deciding).then_some(Message::AutomationApproval(dismiss)),
             1.0,
         ))
     }
@@ -731,7 +792,7 @@ mod tests {
             vec![ProposalSummary::from(&proposal)]
         );
         assert!(!app.automation_approval.deciding);
-        drop(app.update_automation_approval(Action::Dismiss));
+        drop(app.cancel_automation_approval());
         assert!(!app.automation_approval_open());
         assert_eq!(app.automation_approval.pending.len(), 1);
         // An old/unsolicited load cannot reopen a dismissed dialog.
@@ -766,7 +827,7 @@ mod tests {
                 drop(app.automation_approval_key(&key(event), false));
             } else {
                 // The backdrop dispatches this same neutral action.
-                drop(app.update_automation_approval(Action::Dismiss));
+                drop(app.cancel_automation_approval());
             }
             assert!(!app.automation_approval_open());
             assert!(!app.automation_approval.deciding);
@@ -824,5 +885,57 @@ mod tests {
             app.automation_approval_open(),
             "another proposal's receipt cannot dismiss this review"
         );
+    }
+
+    #[test]
+    fn queued_user_actions_cannot_control_a_reopened_review_of_the_same_proposal() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        app.automation_approval.available = Some(proposal.clone());
+        app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
+        let old_dismiss = app.automation_approval_dismiss_action().unwrap();
+        let old_generation = app.approval_dialog_generation().unwrap();
+        drop(app.cancel_automation_approval());
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
+        let current_generation = app.approval_dialog_generation().unwrap();
+        assert_ne!(old_generation, current_generation);
+        drop(app.update_automation_approval(old_dismiss));
+        assert!(app.automation_approval_open());
+        drop(app.update_automation_approval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: old_generation,
+            approved: true,
+        }));
+        assert!(!app.automation_approval.deciding);
+        assert_eq!(app.automation_approval.pending.len(), 1);
+        drop(app.update_automation_approval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: current_generation,
+            approved: true,
+        }));
+        assert!(app.automation_approval.deciding);
+    }
+
+    #[test]
+    fn model_resolution_retires_backing_state_independently_of_user_actions() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        app.automation_approval.proposal = Some(proposal.clone());
+        app.automation_approval.available = Some(proposal.clone());
+        app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+        app.automation_approval.generation = 17;
+        drop(app.update_automation_approval(Action::Updated(Vec::new())));
+        assert!(!app.automation_approval_open());
+        assert!(app.automation_approval.available.is_none());
+        assert!(!app.automation_approval.deciding);
     }
 }
