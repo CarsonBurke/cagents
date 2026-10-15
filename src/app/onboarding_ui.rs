@@ -540,7 +540,9 @@ mod tests {
             &mut tree,
             Layout::new(&node),
             &renderer,
-            &mut iced::widget::operation::focusable::focus::<()>(widget::Id::new(id.to_owned())),
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(widget::Id::new(
+                id.to_owned(),
+            )),
         );
         let mut messages = Vec::new();
         element.as_widget_mut().update(

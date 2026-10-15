@@ -84,7 +84,7 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout, space},
+    design::{self, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
         ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
@@ -11279,8 +11279,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -19818,7 +19821,9 @@ mod tests {
                 "{} · {} · {}",
                 provider.label(),
                 app.account_ui.provider_status(provider),
-                app.account_ui.onboarding_action(provider).map_or("Checking…", |(label, _)| label)
+                app.account_ui
+                    .onboarding_action(provider)
+                    .map_or("Checking…", |(label, _)| label)
             );
             assert!(
                 nodes.root().iter().chain(nodes.children()).any(|node| {
