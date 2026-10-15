@@ -1327,7 +1327,8 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
         // No residual real PTY is allowed to mask the startup-only shutdown
         // assertions below, after exact startup cleanup finally succeeds.
         let done=super::super::client::process_request(&host,0,ClientRequest::CloseTerminalSourceChecked{source:match healthy.source{HostedSession::Terminal(source)=>source,_=>unreachable!()},execution_instance:healthy.execution_instance.unwrap(),allow_active:true});
-        assert!(done.is_ok());
+        assert!(matches!(done.unwrap().0,ServerResponse::TerminalCloseChecked{outcome:crate::terminal_ipc::TerminalCloseResult::Closed,..}));
+        assert!(terminals.0[0].is_completed());
     }
     // A deliberate start retry invokes exact cleanup and may wait for the
     // latch then legitimately launch a successor. It is not a nonblocking
