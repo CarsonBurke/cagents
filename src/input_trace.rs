@@ -33,6 +33,7 @@ pub struct InputTrace(
     Rc<Cell<Sample>>,
     Rc<Cell<Option<KeyboardRegion>>>,
     Rc<RefCell<Option<cosmic::iced::widget::Id>>>,
+    Rc<RefCell<Option<crate::terminal::ReviewInputBarrier>>>,
 );
 
 #[derive(Clone, Copy, Default)]
@@ -66,8 +67,24 @@ impl InputTrace {
         trace
     }
 
+    pub(crate) fn bind_terminal_keys(&self, barrier: crate::terminal::ReviewInputBarrier) {
+        *self.3.borrow_mut() = Some(barrier);
+    }
+    fn finish_event<Message>(&self, event: &Event, shell: &mut Shell<'_, Message>) {
+        if let Some(barrier) = self.3.borrow().as_ref() {
+            barrier.finish_key_event(event);
+            if barrier.flush_owned_keys() {
+                shell.request_redraw_at(Instant::now() + std::time::Duration::from_millis(16));
+            }
+        }
+    }
     /// Records one event the window delivered.
     pub(crate) fn record(&self, event: &Event) {
+        if let Event::Keyboard(event) = event
+            && let Some(barrier) = self.3.borrow().as_ref()
+        {
+            barrier.observe_key_event(event);
+        }
         let mut sample = self.0.get();
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -585,6 +602,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             let child_captured = shell.is_event_captured();
             shell.publish(callback(event.clone(), child_captured, region, widget));
         }
+        self.trace.finish_event(event, shell);
     }
 
     fn mouse_interaction(
@@ -803,6 +821,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
                 shell.publish(callback(event.clone(), child_captured, region, widget));
             }
         }
+        self.trace.finish_event(event, shell);
     }
 
     fn mouse_interaction(

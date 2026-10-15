@@ -4994,12 +4994,14 @@ pub struct Cagents {
 
 impl Cagents {
     fn set_terminal_review_owner(&mut self, owner: Option<CardId>) {
+        let previous = self.terminal_review_identity;
         self.terminal_review_card = owner;
         self.terminal_review_identity = owner.and_then(|card| match self.cards.get(&card) {
             Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
             _ => None,
         });
         self.terminal_review_revision = self.terminal_review_revision.wrapping_add(1);
+        self.terminal_review_input.confirm_review(previous, self.terminal_review_identity);
     }
 
     fn reconcile_terminal_review_owner(&mut self) {
@@ -9197,7 +9199,8 @@ impl Cagents {
                             self.window_scale_factor,
                             self.settings.ui_scale,
                         ))
-                        .model_focused(card_focused && !find.is_some_and(|find| find.focused))
+                        .model_focused(focused && !self.workspace_inputs_blocked() && !find.is_some_and(|find| find.focused))
+                        .window_focused(self.refresh_ui.focused)
                         .on_shortcut(move |event| {
                             let keyboard::Event::KeyPressed {
                                 key,
@@ -13201,6 +13204,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        for failure in self.terminal_review_input.take_key_cleanup_failures() {
+            self.notices.record(TransientNotice::warning(failure));
+        }
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -16701,6 +16707,8 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
+        let surface = (|| -> Option<Element<'_, Message>> {
         if let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
@@ -17061,6 +17069,8 @@ impl Application for Cagents {
             Some(Message::CancelDialog),
             1.0,
         ))
+        })();
+        surface.map(|surface| crate::input_trace::observe(surface, &self.input_trace))
     }
 
     /// The application opens no window but its main one, which stops being
@@ -17434,6 +17444,7 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
+        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
         let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
