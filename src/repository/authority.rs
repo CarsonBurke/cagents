@@ -13,6 +13,12 @@ use scope::{
 // Fresh capture belongs to the actual original-source producer, not the
 // minimal imported host receiver core, which accepts only its original roles.
 impl WorktreeAuthority {
+    pub(super) fn discard_index_lock(&self) -> Result<GitFileLock, RepositoryError> {
+        self.validate()?;
+        GitFileLock::acquire_beneath(&self.git_dir, OsStr::new("index"))
+            .map_err(|reason| ValidationError::Io(reason).into())
+    }
+
     pub fn capture(path: &Path) -> Result<Self, RepositoryError> {
         if let Some(reason) = Self::unsupported_reason() {
             return Err(ValidationError::Io(reason.into()).into());

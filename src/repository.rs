@@ -6,6 +6,9 @@
 //! straightforward to test with a fake executor.
 
 mod authority;
+#[path = "repository_recovery.rs"]
+mod recovery;
+pub use recovery::{DiscardRecovery, DiscardRecoveryResolution, RecoverableDiscard};
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
 
 mod worktree_setup_intent;
@@ -4686,6 +4689,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .collect())
     }
 
+    /// Low-level irreversible compatibility operation. Product discard uses
+    /// `discard_recoverable` and retains its typed receipt.
     /// Restores tracked paths from the index and deletes untracked files.
     ///
     /// This destroys work that exists nowhere else, so it refuses to run
@@ -4822,11 +4827,168 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(report_discard(applied, failures))
     }
 
+    fn discard_recovery_mutation(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
+        native_batch: &mut Option<recovery::native_trash::Batch>,
+        live: &recovery::LiveDiscardRecovery,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if !request.confirmed {
+            return Err(ValidationError::ConfirmationRequired.into());
+        }
+        if !request.worktree.is_absolute() {
+            return Err(
+                ValidationError::InvalidWorktree(request.worktree.display().to_string()).into(),
+            );
+        }
+        let tracked =
+            self.matchable_pathspecs(&request.worktree, &request.tracked, cancellation)?;
+        let mut untracked: Vec<RepoPath> = Vec::with_capacity(request.untracked.len());
+        let mut seen = HashSet::new();
+        for path in &request.untracked {
+            if seen.insert(path.clone()) {
+                untracked.push(path.clone());
+            }
+        }
+        if tracked.is_empty() && untracked.is_empty() {
+            return Err(ValidationError::EmptySelection.into());
+        }
+
+        if let Err(reason) =
+            recovery::verify_captured_versions(captured_root, captured_versions, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
+        let mut applied = Vec::new();
+        if !tracked.is_empty() {
+            let command =
+                self.git_pathspec_mutation(&request.worktree, ["restore", "--worktree"], &tracked);
+            // A `restore` that reports a refusal changed nothing, and one that
+            // failed inside its write loop changed an amount only the user can
+            // establish. Neither leaves a half of the request that this may
+            // finish on its own: unlinking the untracked half afterwards would
+            // destroy files as part of an operation the caller is being told
+            // did not happen, or is being told to go and check.
+            match self.run_mutation(
+                &command,
+                tracked,
+                MutationScope::AtomicRefusal,
+                cancellation,
+            ) {
+                MutationOutcome::Applied { mut paths } => applied.append(&mut paths),
+                outcome => return Ok(outcome),
+            }
+        }
+        if untracked.is_empty() {
+            return Ok(MutationOutcome::Applied { paths: applied });
+        }
+
+        // This is Git's actual worktree index, including linked worktrees.
+        // Hold its standard lock while classifying and unlinking: otherwise a
+        // terminal's `git add` can make a selected path tracked after the read.
+        let mut index_lock = match self.discard_index_lock(&request.worktree, cancellation) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Ok(report_discard(
+                    applied,
+                    discard_failures(&untracked, format!("cannot protect the index: {error}")),
+                ));
+            }
+        };
+        let mut failures = (|| {
+            // The confirmation may have outlived the snapshot. Re-establish
+            // tracking under the lock, before deleting any untracked file.
+            let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation)
+            {
+                Ok(paths) => paths.into_iter().collect::<HashSet<_>>(),
+                Err(error) => {
+                    return discard_failures(
+                        &untracked,
+                        format!("could not verify that the path is still untracked: {error}"),
+                    );
+                }
+            };
+            let root = match captured_root.try_clone() {
+                Ok(root) => root,
+                Err(error) => {
+                    return discard_failures(
+                        &untracked,
+                        format!("{}: {error}", request.worktree.display()),
+                    );
+                }
+            };
+            if let Err(reason) = recovery::verify_recovery_root(captured_root) {
+                return discard_failures(&untracked, reason);
+            }
+            // A refused directory does not prevent independent selected files
+            // being attempted. Cancellation or loss of the index lock ends the
+            // remaining batch, whose paths are still known untouched.
+            let mut failures = Vec::new();
+            for (position, path) in untracked.iter().enumerate() {
+                let protected = if cancellation.is_cancelled() {
+                    Err("discard cancelled before deletion".to_owned())
+                } else {
+                    index_lock.check()
+                };
+                if let Err(reason) = protected {
+                    failures.extend(discard_failures(&untracked[position..], reason));
+                    break;
+                }
+                if tracked_now.contains(path) {
+                    failures.push(MutationFailure::Path {
+                        path: path.clone(),
+                        reason: "the path is tracked now but was untracked when it was selected"
+                            .into(),
+                    });
+                    continue;
+                }
+                match native_batch.as_mut().ok_or_else(|| "No reserved native Trash batch".to_owned())
+                    .and_then(|batch|batch.discard(path,live,cancellation)) {
+                    Ok(receipt)=>{
+                        if let Some(reason)=&receipt.warning {failures.push(MutationFailure::Path{path:path.clone(),reason:reason.clone()});}
+                        trashed.push(receipt);
+                        applied.push(path.clone());
+                    }
+                    Err(reason)=>failures.push(MutationFailure::Path{path:path.clone(),reason}),
+                }
+            }
+            failures
+        })();
+        if let Err(reason) = index_lock.release() {
+            let cleanup = format!("could not release the discard index lock: {reason}");
+            if applied.is_empty()
+                && let Some(MutationFailure::Path { reason, .. }) = failures.first_mut()
+            {
+                // A wholly refused discard presents its first path failure.
+                // Keep lock cleanup diagnostics visible there as well.
+                reason.push_str("; ");
+                reason.push_str(&cleanup);
+            } else {
+                failures.push(MutationFailure::Rejected { reason: cleanup });
+            }
+        }
+        Ok(report_discard(applied, failures))
+    }
+
     fn discard_index_lock(
         &self,
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<GitFileLock, RepositoryError> {
+        if let Some(authority)=&self.authority {
+            authority.validate()?;
+            if authority.path()!=worktree {return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into());}
+            return authority.discard_index_lock();
+        }
         let output = self.run_checked(
             &self.git_read(
                 worktree,
