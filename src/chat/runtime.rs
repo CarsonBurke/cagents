@@ -15,7 +15,7 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -198,6 +198,21 @@ pub(crate) enum Update {
     SourceAuthorityUnavailable { cause: super::SourceAuthorityUnavailableCause },
 }
 
+fn source_unavailable_code(cause: super::SourceAuthorityUnavailableCause) -> u8 {
+    match cause {
+        super::SourceAuthorityUnavailableCause::ClockExhausted => 1,
+        super::SourceAuthorityUnavailableCause::RevocationFailed => 2,
+    }
+}
+fn source_unavailable_cause(code: u8) -> Option<super::SourceAuthorityUnavailableCause> {
+    match code {
+        0 => None,
+        1 => Some(super::SourceAuthorityUnavailableCause::ClockExhausted),
+        2 => Some(super::SourceAuthorityUnavailableCause::RevocationFailed),
+        _ => unreachable!("only typed source causes enter this atomic cache"),
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct LocalHandle(Arc<Inner>);
 
@@ -243,7 +258,7 @@ impl LocalHandle {
         *self.0.source_authority.lock().unwrap_or_else(|p| p.into_inner())
     }
     pub(crate) fn source_authority_unavailable(&self) -> Option<super::SourceAuthorityUnavailableCause> {
-        self.0.source_unavailable.load(Ordering::Acquire).then_some(super::SourceAuthorityUnavailableCause::ClockExhausted)
+        source_unavailable_cause(self.0.source_unavailable.load(Ordering::Acquire))
     }
     fn retained_store_for_replacement(&self) -> Result<Arc<Mutex<Store>>, String> {
         if !self.is_completed() {
@@ -288,7 +303,7 @@ impl SourceObserverBinding {
             store.register_source_authority_observer(bound.clone());
             store.publish_source_authority(&mut state);
             *inner.source_authority.lock().unwrap_or_else(|p| p.into_inner()) = store.source_authority();
-            inner.source_unavailable.store(store.source_authority_unavailable().is_some(), Ordering::Release);
+            inner.source_unavailable.store(store.source_authority_unavailable().map_or(0, source_unavailable_code), Ordering::Release);
             previous
         };
         Self { store: inner.store.clone(), previous, bound, committed: false }
@@ -322,7 +337,7 @@ struct SourceRefreshContext {
     state:Arc<Mutex<Snapshot>>,
     source_authority:Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty:Arc<AtomicBool>,
-    source_unavailable:Arc<AtomicBool>,
+    source_unavailable:Arc<AtomicU8>,
     wake:Arc<UnixStream>,
 }
 impl SourceRefreshContext {
@@ -344,8 +359,8 @@ impl SourceRefreshContext {
             store.publish_source_authority(&mut state);
             (store.source_authority(),store.source_authority_unavailable())
         };
-        if unavailable.is_some() {
-            if !self.source_unavailable.swap(true,Ordering::AcqRel) {
+        if let Some(cause) = unavailable {
+            if self.source_unavailable.compare_exchange(0, source_unavailable_code(cause), Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 self.source_dirty.store(true,Ordering::Release);
                 self.wake();
             }
@@ -410,7 +425,7 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
-    source_unavailable: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicU8>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -737,7 +752,7 @@ impl LocalHandle {
         };
         let source_authority = Arc::new(Mutex::new(initial_authority));
         let source_dirty = Arc::new(AtomicBool::new(false));
-        let source_unavailable = Arc::new(AtomicBool::new(initial_unavailable.is_some()));
+        let source_unavailable = Arc::new(AtomicU8::new(initial_unavailable.map_or(0, source_unavailable_code)));
         let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -2754,7 +2769,7 @@ struct Actor {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
-    source_unavailable: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicU8>,
     source_notified: Option<SourceAuthority>,
     source_unavailable_notified: bool,
     store: Arc<Mutex<Store>>,
@@ -3781,7 +3796,7 @@ impl Actor {
             (store.source_authority(), store.source_authority_unavailable())
         };
         if let Some(cause) = unavailable {
-            self.source_unavailable.store(true, Ordering::Release);
+            let _ = self.source_unavailable.compare_exchange(0, source_unavailable_code(cause), Ordering::AcqRel, Ordering::Acquire);
             if !self.source_unavailable_notified {
                 self.source_unavailable_notified = true;
                 (self.notify)(Update::SourceAuthorityUnavailable { cause });
@@ -5217,6 +5232,38 @@ mod tests {
         SourceObserverBinding::bind(&successor.0).commit();
         drop(failed);
         assert!(successor.0.store.lock().unwrap().source_authority_observer().ptr_eq(&Arc::downgrade(&successor.0)));
+    }
+
+    #[test]
+    fn actual_kernel_revocation_failure_preserves_its_cause_before_hidden_actor_eof() {
+        struct Reset;
+        impl Adapter for Reset {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step {events:vec![Event::Ready(true)],..Default::default()}) }
+            fn command(&mut self, _:Command) -> Result<Step, String> { Ok(Step {events:vec![Event::Reset {reason:"actual revocation failure".into()}],..Default::default()}) }
+            fn receive(&mut self, _:Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:vec![],working_directory:directory.path().into(),environment:Default::default(),unset_environment:Default::default()};
+        let spec=ProcessSpec::from(&recipe);
+        let mut adapter:Box<dyn Adapter>=Box::new(Reset);
+        let mut initial=adapter.initialize().unwrap();
+        let store=preflight(&spec,&mut initial).unwrap();
+        let (send,receive)=crossbeam_channel::bounded(32);
+        let handle=LocalHandle::start(spec,adapter,initial,store,None,move |update| {let _=send.try_send(update);}).unwrap();
+        until(&handle,|state|state.ready);
+        let before=handle.source_authority().unwrap();
+        handle.0.store.lock().unwrap().fail_source_revocation_for_test();
+        assert!(handle.command(Command::Refresh).is_err());
+        let deadline=Instant::now()+Duration::from_secs(3);
+        loop {
+            let update=receive.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("actual revocation cause was not published");
+            if matches!(update,Update::SourceAuthorityUnavailable {cause:super::super::SourceAuthorityUnavailableCause::RevocationFailed}) {break;}
+        }
+        assert_eq!(handle.source_authority_unavailable(),Some(super::super::SourceAuthorityUnavailableCause::RevocationFailed));
+        assert!(handle.source_authority().is_none(),"failure must not mint a new token or acknowledgement");
+        assert_eq!(handle.0.store.lock().unwrap().source_authority(),Some(before),"failed kernel revocation leaves Store token unchanged");
+        assert!(!handle.0.visible.load(Ordering::Acquire));
+        handle.close().unwrap();
     }
 
     #[test]

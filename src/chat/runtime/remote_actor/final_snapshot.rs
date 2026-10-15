@@ -210,10 +210,12 @@ mod tests {
         assert_eq!(reopened.source_authority_conflict, contradictory.source_authority_conflict);
         contradictory.source_authority = None;
         contradictory.source_authority_conflict = None;
-        contradictory.source_authority_unavailable = Some(chat::SourceAuthorityUnavailableCause::ClockExhausted);
-        let unavailable = decode_publication(&identity,&proof,&serde_json::to_vec(&contradictory).unwrap()).unwrap();
-        assert_eq!(unavailable.source_authority_unavailable,Some(chat::SourceAuthorityUnavailableCause::ClockExhausted));
-        assert!(unavailable.source_authority.is_none());
+        for cause in [chat::SourceAuthorityUnavailableCause::ClockExhausted, chat::SourceAuthorityUnavailableCause::RevocationFailed] {
+            contradictory.source_authority_unavailable = Some(cause);
+            let unavailable = decode_publication(&identity,&proof,&serde_json::to_vec(&contradictory).unwrap()).unwrap();
+            assert_eq!(unavailable.source_authority_unavailable,Some(cause));
+            assert!(unavailable.source_authority.is_none());
+        }
         let mut malformed = contradictory;
         malformed.source_authority_unavailable = None;
         malformed.source_authority_conflict = None;

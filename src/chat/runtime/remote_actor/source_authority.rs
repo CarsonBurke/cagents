@@ -172,15 +172,17 @@ mod tests {
     }
     #[test]
     fn explicit_clock_unavailability_revokes_body_without_minting_an_ordered_pair() {
-        let actor = RemoteActor::fixture();
-        let cause = chat::SourceAuthorityUnavailableCause::ClockExhausted;
-        actor.publish_source_authority(None, None, Some(cause));
-        actor.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}), None, None);
-        assert_eq!(actor.state().source_authority_unavailable, Some(cause));
-        assert!(!actor.accepts_body(&Snapshot::default()));
-        let fresh = RemoteActor::fixture();
-        fresh.replace_resident(actor.state().as_ref().clone(), false);
-        assert_eq!(fresh.state().source_authority_unavailable, Some(cause));
+        use chat::SourceAuthorityUnavailableCause::{ClockExhausted, RevocationFailed};
+        for cause in [ClockExhausted, RevocationFailed] {
+            let actor = RemoteActor::fixture();
+            actor.publish_source_authority(None, None, Some(cause));
+            actor.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}), None, Some(if cause == ClockExhausted { RevocationFailed } else { ClockExhausted }));
+            assert_eq!(actor.state().source_authority_unavailable, Some(cause), "first actual cause is sticky without invented source metadata");
+            assert!(!actor.accepts_body(&Snapshot::default()));
+            let fresh = RemoteActor::fixture();
+            fresh.replace_resident(actor.state().as_ref().clone(), false);
+            assert_eq!(fresh.state().source_authority_unavailable, Some(cause));
+        }
     }
     #[test]
     fn final_publication_and_explicit_refresh_can_publish_authority_after_proxy_stop() {

@@ -941,7 +941,11 @@ impl PromptSuggestion {
 /// Source ordering was lost; cached bodies are revoked without new authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SourceAuthorityUnavailableCause { ClockExhausted }
+pub enum SourceAuthorityUnavailableCause {
+    ClockExhausted,
+    /// Actual Store kernel revocation failed; no replacement source or Reset ACK.
+    RevocationFailed,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
