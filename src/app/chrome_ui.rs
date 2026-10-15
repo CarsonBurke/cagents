@@ -1,6 +1,16 @@
 use super::*;
 use crate::interaction::tooltip;
 
+/// These controls address the workspace, not a pane behind their native
+/// keyboard focus. Tab titles keep their existing explicit card ownership.
+pub(super) fn keyboard_focus_regions() -> Vec<(widget::Id, crate::input_trace::KeyboardRegion)> {
+    [TOOLBAR_FOCUS_ID, "workspace.pane-list", "command.previous-column",
+        "command.next-column", "chrome.notices"]
+        .into_iter()
+        .map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into()))
+        .collect()
+}
+
 /// Shape once when cached chrome changes, with the same font and size as the tab.
 pub(super) fn measure_tab_title(title: &str) -> f32 {
     use iced::{
@@ -77,6 +87,56 @@ mod tests {
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());
         app
+    }
+
+    #[test]
+    fn mounted_workspace_controls_keep_global_keys_without_borrowing_pane_focus() {
+        use iced::Size;
+        use iced::advanced::{clipboard, widget::operation::focusable};
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let mut renderer = super::super::tests::headless_renderer();
+        for control in 0..6 {
+            let mut app = tab_fixture(3, 1600.);
+            let selected = app.workspace.order().nth(1).unwrap();
+            app.workspace.focus(selected).unwrap();
+            drop(app.sync_chrome());
+            app.notices.record(TransientNotice::warning("Owned workspace focus fixture"));
+            let inactive = app.workspace.order().next().unwrap();
+            let (id, owner) = match control {
+                0 => (widget::Id::new(TOOLBAR_FOCUS_ID), None),
+                1 => (widget::Id::new("workspace.pane-list"), None),
+                2 => (widget::Id::new("command.previous-column"), None),
+                3 => (widget::Id::new("command.next-column"), None),
+                4 => (widget::Id::new("chrome.notices"), None),
+                _ => (app.card_header_widget_id(inactive), Some(inactive)),
+            };
+            let mut ui = UserInterface::build(cosmic::Application::view(&app),
+                Size::new(1600., 1000.), Cache::new(), &mut renderer);
+            ui.operate(&renderer, &mut focusable::focus::<()>(id.clone()));
+            let key = keyboard::Key::Character("t".into());
+            let event = keyboard::Event::KeyPressed {
+                key: key.clone(), modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
+                location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL,
+                text: None, repeat: false,
+            };
+            let mut messages = Vec::new();
+            let _ = ui.update(&[iced::Event::Keyboard(event.clone())], iced::mouse::Cursor::Unavailable,
+                &mut renderer, &mut clipboard::Null, &mut messages);
+            let routed: Vec<_> = messages.iter().filter_map(|message| match message {
+                Message::RoutedKeyEvent { region, widget, .. } => Some((*region, widget.clone())),
+                _ => None,
+            }).collect();
+            assert_eq!(routed, vec![(crate::input_trace::KeyboardRegion {
+                pane: workspace_widget::FocusedPane::Other, card: owner,
+            }, Some(id.clone()))], "exact native focus owner: {id:?}");
+            assert_eq!(workspace_widget::global_shortcut(&event, &app.settings.keyboard_shortcuts,
+                routed[0].0.pane), Some(workspace_widget::GlobalShortcut::NewThread));
+            // Toolbar controls address the selected workspace. An inactive
+            // tab title retains its explicit card for the router's existing
+            // focus-before-dispatch handoff; it is not reclassified as chrome.
+            assert_eq!(app.workspace.focused(), Some(selected));
+        }
     }
 
     #[test]

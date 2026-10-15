@@ -20808,6 +20808,7 @@ impl Application for Cagents {
             }
         }
         focus_regions.extend(onboarding_ui::keyboard_focus_regions());
+        focus_regions.extend(chrome_ui::keyboard_focus_regions());
         let surface = crate::input_trace::observe_keyboard_events(
             surface,
             &self.input_trace,
