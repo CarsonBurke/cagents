@@ -902,6 +902,29 @@ mod tests {
     }
 
     #[test]
+    fn a_global_command_targets_the_pane_with_native_keyboard_focus() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let first = app.workspace.focused().unwrap();
+        let mut second = app.card_state(first).unwrap().clone();
+        second.id = CardId::new();
+        let target = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.cards.insert(target, CardRuntime::Loading);
+        app.input_trace = crate::input_trace::InputTrace::with_keyboard_region(crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::Other, card: Some(target) });
+        app.sidebar_model.projects.push(SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Project".into(), std::env::temp_dir(), Vec::new(), Vec::new()));
+        assert_eq!(app.workspace.focused(), Some(first));
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("f".into()), modified_key: keyboard::Key::Character("f".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyF), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+            }, captured: true,
+        }));
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert!(app.sidebar_state.controls_expanded());
+    }
+
+    #[test]
     fn find_without_a_pane_target_focuses_project_search() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;

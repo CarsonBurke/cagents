@@ -121,7 +121,7 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
             Self::Review => focused == FocusedPane::Review,
-            Self::Chat => focused == FocusedPane::Chat,
+            Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
         }
     }
 }
@@ -133,8 +133,10 @@ pub enum FocusedPane {
     Terminal,
     /// A pull request review pane.
     Review,
-    /// A native chat composer and transcript.
+    /// The editable native chat composer.
     Chat,
+    /// Non-text controls or transcript content inside a native chat pane.
+    ChatPane,
     /// The native code editor.
     Editor,
     /// A text control outside the focused pane (sidebar, inspector, find bar).
@@ -3544,7 +3546,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
+    fn pane_close_and_width_defaults_apply_outside_a_terminal() {
         use keyboard::key::Code;
         let shortcuts = KeyboardShortcuts::default();
         for focused in [FocusedPane::Review, FocusedPane::Other] {
@@ -4440,8 +4442,8 @@ mod tests {
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
         assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
-        assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
-        assert!(!reserved("w".into(), Code::KeyW, ctrl_shift));
+        assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
+        assert!(reserved("w".into(), Code::KeyW, ctrl_shift));
         assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
         assert!(reserved("r".into(), Code::KeyR, keyboard::Modifiers::ALT));
         assert!(!reserved("r".into(), Code::KeyR, ctrl_shift));
@@ -4603,10 +4605,11 @@ mod tests {
                 FocusedPane::Review,
                 FocusedPane::Other,
                 FocusedPane::Chat,
+                FocusedPane::ChatPane,
             ] {
                 assert_eq!(
                     global_shortcut(&key_press(key, code, modifiers, false), &shortcuts, focused),
-                    (focused == FocusedPane::Chat).then_some(action),
+                    matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane).then_some(action),
                 );
                 assert_eq!(
                     is_global_shortcut_chord(
@@ -4616,7 +4619,7 @@ mod tests {
                         &shortcuts,
                         focused
                     ),
-                    focused == FocusedPane::Chat,
+                    matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
                 );
                 assert_eq!(
                     global_shortcut(&key_press(key, code, modifiers, true), &shortcuts, focused),

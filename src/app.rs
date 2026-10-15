@@ -4280,6 +4280,7 @@ pub enum Message {
         action: String,
         enabled: bool,
     },
+    RoutedKeyEvent { event: keyboard::Event, captured: bool, region: crate::input_trace::KeyboardRegion },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -6444,6 +6445,10 @@ impl Cagents {
         let Some(card) = self.workspace.focused() else {
             return workspace_widget::FocusedPane::Other;
         };
+        self.pane_kind(card)
+    }
+
+    fn pane_kind(&self, card: CardId) -> workspace_widget::FocusedPane {
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_))
                 if ended_terminal(self.card_state(card)).is_none()
@@ -6451,7 +6456,7 @@ impl Cagents {
             {
                 workspace_widget::FocusedPane::Terminal
             }
-            Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
+            Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::ChatPane,
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
@@ -13139,6 +13144,13 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let (message, _keyboard_region) = match message {
+            Message::RoutedKeyEvent { event, captured, region } => (
+                Message::KeyEvent { event, captured },
+                Some(self.input_trace.scoped_keyboard_region(region)),
+            ),
+            message => (message, None),
+        };
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -15702,7 +15714,22 @@ impl Application for Cagents {
                 }
                 self.save_settings_task(false)
             }
+            Message::RoutedKeyEvent { .. } => unreachable!("native keyboard events are normalized before dispatch"),
             Message::KeyEvent { event, captured } => {
+                if !self.workspace_inputs_blocked()
+                    && let Some(card) = self.input_trace.keyboard_card()
+                    && !self.workspace.order().any(|candidate| candidate == card)
+                { return Task::none(); }
+                let focus_task = if !self.workspace_inputs_blocked()
+                    && let Some(card) = self.input_trace.keyboard_card()
+                    && self.workspace.focused() != Some(card)
+                    && let Ok(update) = self.workspace.focus(card)
+                {
+                    // Synchronize the action target without moving native
+                    // focus or delivering the widget's input a second time.
+                    self.apply_viewport(update, false, false)
+                } else { Task::none() };
+                let route_task = (|| {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -16008,6 +16035,8 @@ impl Application for Cagents {
                     }
                     None => Task::none(),
                 }
+                })();
+                Task::batch([focus_task, route_task])
             }
             #[cfg(feature = "latency-harness")]
             Message::LatencyRedraw { generation, at } => {
@@ -16571,11 +16600,8 @@ impl Application for Cagents {
                     },
                 },
             }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
+            event::listen_with(|event, _status, event_window| match event {
+                iced::Event::Keyboard(_) => None,
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
@@ -17373,33 +17399,32 @@ impl Application for Cagents {
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
         let mut focus_regions = Vec::new();
-        if let Some(card) = self.workspace.focused() {
-            let kind = self.workspace_pane_kind();
-            let container_kind = if kind == workspace_widget::FocusedPane::Review {
-                kind
-            } else {
-                workspace_widget::FocusedPane::Other
-            };
-            focus_regions.push((workspace_widget::card_widget_id(card), container_kind));
+        let projection = self.workspace.projection(self.workspace.viewport_width());
+        for mounted in &projection.mounted {
+            let card = mounted.id;
+            let kind = self.pane_kind(card);
+            let container_kind = if matches!(kind, workspace_widget::FocusedPane::Review | workspace_widget::FocusedPane::ChatPane) { kind } else { workspace_widget::FocusedPane::Other };
+            let region = |pane| crate::input_trace::KeyboardRegion { pane, card: Some(card) };
+            focus_regions.push((workspace_widget::card_widget_id(card), region(container_kind)));
             if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
-                focus_regions.push((self.card_keyboard_focus(card), kind));
+                focus_regions.push((self.card_keyboard_focus(card), region(kind)));
             }
-            focus_regions.push((self.card_header_widget_id(card), container_kind));
+            focus_regions.push((self.card_header_widget_id(card), region(container_kind)));
+            if let Some(chrome) = self.card_chrome.get(&card) {
+                focus_regions.push((chrome.close_id.clone(), region(container_kind)));
+                focus_regions.push((chrome.resize_id.clone(), region(container_kind)));
+                focus_regions.push((chrome.browser_address_id.clone(), region(workspace_widget::FocusedPane::TextInput)));
+            }
             if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
-                focus_regions.push((
-                    repository_widget::editor_focus_id(card),
-                    workspace_widget::FocusedPane::Editor,
-                ));
+                focus_regions.push((repository_widget::editor_focus_id(card), region(workspace_widget::FocusedPane::Editor)));
             }
             if matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
-                focus_regions.push((
-                    card_control_id(card, "chat-composer"),
-                    workspace_widget::FocusedPane::Chat,
-                ));
+                focus_regions.push((card_control_id(card, "chat-composer"), region(workspace_widget::FocusedPane::Chat)));
             }
         }
         let surface =
-            crate::input_trace::observe_keyboard_focus(surface, &self.input_trace, focus_regions);
+            crate::input_trace::observe_keyboard_events(surface, &self.input_trace, focus_regions,
+                |event, captured, region| Message::RoutedKeyEvent { event, captured, region });
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
