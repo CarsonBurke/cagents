@@ -1494,19 +1494,19 @@ mod tests {
     }
     #[test]
     fn presentation_repair_confirms_only_exact_observation_and_outputs_compact_receipt() {
-        for present in [false, true] {
+        for (present, removed) in [(false, false), (true, true), (true, false)] {
             let target = presentation_target(); let agent = target.agent.id;
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
             let server = thread::spawn(move || {
                 answer(&mut server_stream, |_| true, connected());
                 answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::InspectPresentationRepair(id), .. } if *id == agent), ServerResponse::Agent(Reply::PresentationRepair(present.then(|| target.clone()))));
                 if present {
-                    answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::ConfirmPresentationRepair { observed }, .. } if *observed == target), ServerResponse::Agent(Reply::PresentationRemoved { agent, removed: true }));
+                    answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::ConfirmPresentationRepair { observed }, .. } if *observed == target), ServerResponse::Agent(Reply::PresentationRemoved { agent, removed }));
                 }
             });
             let mut session = Session { authority: Authority::default(), connection: Some((ControlClient::from_stream(client_stream).unwrap(), "/fixture".into())), summaries: None };
             let output = session.repair_stale_presentation(agent).unwrap(); server.join().unwrap();
-            assert_eq!(output.data, json!({"agent":agent,"presentation_repair":true,"removed":present,"historical_generation_verified":false}));
+            assert_eq!(output.data, json!({"agent":agent,"presentation_repair":true,"removed":removed,"historical_generation_verified":false}));
             let rendered = format!("{} {}", output.human, output.data);
             assert!(!rendered.contains("PRIVATE_") && !rendered.contains("SECRET_ENV"));
             assert!(output.human.contains("historical generation unverified"));
@@ -1534,6 +1534,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn stale_presentation_consent_is_not_reinspected_or_retried_after_refusal() {
+        let target = presentation_target(); let agent = target.agent.id;
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::InspectPresentationRepair(id), .. } if *id == agent), ServerResponse::Agent(Reply::PresentationRepair(Some(target.clone()))));
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Agent { operation: Operation::ConfirmPresentationRepair { observed }, .. } if observed == target));
+            write_frame(&mut server_stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof(), message: ServerMessage::Error(terminal::ipc::ProtocolError::new(terminal::ipc::ProtocolErrorCode::ViewConflict, "The observed presentation changed", true)) }).unwrap();
+            assert!(read_frame::<ClientEnvelope>(&mut server_stream).unwrap().is_none(), "stale consent must not inspect a replacement or replay any operation");
+        });
+        let mut session = Session { authority: Authority::default(), connection: Some((ControlClient::from_stream(client_stream).unwrap(), "/fixture".into())), summaries: None };
+        let error = session.repair_stale_presentation(agent).unwrap_err();
+        assert!(error.message.contains("The observed presentation changed"));
+        drop(session); server.join().unwrap();
+    }
 
     #[test]
     fn wait_contract_has_one_shape_and_outcome_exit_codes() {
