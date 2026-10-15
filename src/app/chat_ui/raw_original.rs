@@ -82,7 +82,10 @@ impl State {
         for key in removed {if let Some(entry)=self.entries.remove(&key) {retire(entry);self.revision=self.revision.wrapping_add(1);}}
         self.aliases=aliases;
     }
-    fn key(&self,item:&str,field:RawSourceField)->Option<Key> {self.aliases.get(item)?.iter().find(|key|key.field==field).cloned()}
+    fn key(&self,item:&str,field:RawSourceField)->Option<Key> {
+        let mut keys=self.aliases.get(item)?.iter().filter(|key|key.field==field);
+        let key=keys.next()?;keys.next().is_none().then(||key.clone())
+    }
     fn toggle(&mut self,item:&str,field:RawSourceField) {
         let Some(key)=self.key(item,field) else {return;};let Some(entry)=self.entries.get_mut(&key) else {return;};
         entry.opened=!entry.opened;entry.error=None;
@@ -282,6 +285,14 @@ mod tests {
         state.sync(&snapshot,Some("child"),None);assert!(state.context>context);assert_eq!(state.entries.len(),1);
         assert_eq!(state.key(&child.item_id,child.field).unwrap().source,child.source);
         assert!(!state.entries.values().next().unwrap().opened,"another transcript cannot inherit original disclosure/request state");
+    }
+    #[test]
+    fn ambiguous_explicit_alias_cannot_choose_another_original_call() {
+        let first=part("first");let mut second=part("other");second.source.source_id="other-real-root".into();second.item_id=first.source.source_id.clone();
+        let snapshot=Snapshot {raw_source_parts:vec![first.clone(),second.clone()],..Default::default()};let mut state=State::default();state.sync(&snapshot,None,None);
+        assert!(state.key(&first.source.source_id,first.field).is_none(),"an alias conflict is unavailable rather than first-match authority");
+        assert_eq!(state.key(&first.item_id,first.field).unwrap().source,first.source);
+        assert_eq!(state.key(&second.source.source_id,second.field).unwrap().source,second.source);
     }
     #[test]
     fn offline_original_restore_requires_exact_admitted_owner_and_complete_capture_proof() {
