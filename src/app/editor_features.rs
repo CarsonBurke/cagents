@@ -172,7 +172,14 @@ mod tests {
                 state.kind = CardKind::Repository(runtime.descriptor.clone());
                 Arc::make_mut(&mut app.durable).cards.push(state);
                 let index = app.workspace.cards().len();
-                app.workspace.add_card(WorkspaceCard::new(card, "editor".into(), CardWidth::Fraction(0.5)).unwrap(), index, card == focused).unwrap();
+                app.workspace
+                    .add_card(
+                        WorkspaceCard::new(card, "editor", CardWidth::Fraction(0.5))
+                            .unwrap(),
+                        index,
+                        card == focused,
+                    )
+                    .unwrap();
             }
             app.workspace.focus(focused).unwrap();
             Arc::make_mut(&mut app.durable).focused = Some(focused);

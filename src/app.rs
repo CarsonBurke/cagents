@@ -22323,7 +22323,7 @@ impl Application for Cagents {
                                 .id(widget::Id::new("dialog.reset-settings.confirm"))
                                 .on_press(Message::ConfirmResetSettings)
                                 .into(),
-                        ]),
+                        ]).into(),
                     ])
                     .spacing(space::M),
                     480.0,
