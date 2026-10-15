@@ -145,6 +145,12 @@ pub(crate) enum UpdateReadiness {
     Unready,
 }
 
+/// Actual Store-issued invalidation, never a semantic acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceAuthority {
+    pub(crate) incarnation: uuid::Uuid,
+    pub(crate) generation: u64,
+}
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Update {
     Execution {
@@ -187,6 +193,8 @@ pub(crate) enum Update {
     TurnOutcome {
         update: crate::chat::turn_outcomes::TurnUpdate,
     },
+    SourceAuthority { incarnation: uuid::Uuid, generation: u64 },
+    SourceAuthorityConflict { generation: u64, original: uuid::Uuid, conflicting: uuid::Uuid },
 }
 
 #[derive(Clone)]
@@ -229,6 +237,37 @@ impl Drop for OwnedSocket {
 }
 
 impl LocalHandle {
+    pub(crate) fn source_authority(&self) -> Option<SourceAuthority> {
+        *self.0.source_authority.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    fn retained_store_for_replacement(&self) -> Result<Arc<Mutex<Store>>, String> {
+        if !self.is_completed() {
+            return Err("The previous reducer is still active; its source Store cannot be rebound".into());
+        }
+        // Completion screens the candidate; the original worker's actual join
+        // receipt proves its reducer can no longer mutate this Store clock.
+        self.join_worker_until(Instant::now() + Duration::from_secs(32))?;
+        let generation = self.0.state.lock().unwrap_or_else(|p| p.into_inner()).generation;
+        self.0.store.lock().unwrap_or_else(|p| p.into_inner()).note_source_generation_floor(generation);
+        Ok(self.0.store.clone())
+    }
+    pub(super) fn refresh_source_authority(&self) {
+        let authority = {
+            let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.publish_source_authority(&mut state);
+            store.source_authority()
+        };
+        if let Some(authority) = authority {
+            let changed = {
+                let mut cached = self.0.source_authority.lock().unwrap_or_else(|p| p.into_inner());
+                if cached.is_some_and(|old| old.generation > authority.generation) || *cached == Some(authority) { false }
+                else { *cached = Some(authority); true }
+            };
+            if changed { self.0.source_dirty.store(true, Ordering::Release); self.wake(); }
+        }
+    }
+
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         self.0.native_holder_record.as_ref()
     }
@@ -248,6 +287,8 @@ struct Inner {
     state: Arc<Mutex<Snapshot>>,
     close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    source_authority: Arc<Mutex<Option<SourceAuthority>>>,
+    source_dirty: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -347,13 +388,14 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
+        let retained_store = previous.map(LocalHandle::retained_store_for_replacement).transpose()?;
         let launch_account_scope = capture_account_scope(&spec, source.launch.provider);
         Self::start_inner(
             spec,
             adapter,
             initial,
             store,
-            previous.map(|handle| handle.0.store.clone()),
+            retained_store,
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
             true,
@@ -375,6 +417,7 @@ impl LocalHandle {
         let server = recovery
             .server_process
             .ok_or("Missing retained app-server process identity")?;
+        let retained_store = previous.map(LocalHandle::retained_store_for_replacement).transpose()?;
         spec.environment = recovery.execution_environment.0;
         let launch_account_scope = recovery.launch_account_scope.ok_or_else(|| {
             "The retained provider has no captured credential-directory scope".to_owned()
@@ -384,7 +427,7 @@ impl LocalHandle {
             adapter,
             initial,
             store,
-            previous.map(|handle| handle.0.store.clone()),
+            retained_store,
             recovery.confirmed_thread,
             Some(NativeOwnership::Adopted(holder, server)),
             true,
@@ -561,6 +604,8 @@ impl LocalHandle {
         let store = retained_store.unwrap_or_else(|| Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let source_authority = Arc::new(Mutex::new(None));
+        let source_dirty = Arc::new(AtomicBool::new(false));
         let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -585,6 +630,8 @@ impl LocalHandle {
             state: state.clone(),
             close_state: close_state.clone(),
             confirmed_session: confirmed_session.clone(),
+            source_authority: source_authority.clone(),
+            source_dirty: source_dirty.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -639,6 +686,9 @@ impl LocalHandle {
                     close_input_fd:None,
                     close_input_drained:true,
                     confirmed_session,
+                    source_authority,
+                    source_dirty,
+                    source_notified: None,
                     store,
                     visible,
                     observe_next,
@@ -872,6 +922,11 @@ impl LocalHandle {
                     usage,
                 ) {
                     (actor.notify)(Update::Execution { run, update });
+                }
+                // Flush the actual cache token before final actor EOF. Read
+                // wrappers update its cache without synchronous Host callbacks.
+                if let Err(error) = actor.publish_source_authority() {
+                    tracing::warn!(reason=%super::protocol::preview(error.as_bytes(),1024), "Final source authority publication failed");
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
@@ -1509,11 +1564,11 @@ impl LocalHandle {
         &self,
         command: &Command,
     ) -> Result<Option<super::FileChangeReply>, String> {
-        self.0
-            .store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .file_query(command)
+        // Preserve RESET2: ordinary controls never touch a poisoned cache.
+        if !matches!(command, Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }) { return Ok(None); }
+        let result = self.0.store.lock().unwrap_or_else(|p| p.into_inner()).file_query(command);
+        self.refresh_source_authority();
+        result
     }
     pub(crate) fn provider_exit_output(
         &self,
@@ -1553,8 +1608,14 @@ impl LocalHandle {
             .clone()
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
+        let result = self.snapshot_inner(after);
+        self.refresh_source_authority();
+        result
+    }
+    fn snapshot_inner(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        store.publish_source_authority(&mut state);
         if after.is_some_and(|generation| generation >= state.generation) && !store.dirty {
             return None;
         }
@@ -1599,8 +1660,14 @@ impl LocalHandle {
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
     ) -> Option<crate::terminal_ipc::ServerResponse> {
+        let result = self.presentation_inner(chat_id, after);
+        self.refresh_source_authority();
+        result
+    }
+    fn presentation_inner(&self, chat_id: crate::model::TerminalId, after: Option<u64>) -> Option<crate::terminal_ipc::ServerResponse> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        store.publish_source_authority(&mut state);
         if after == Some(state.generation) && !store.dirty {
             return None;
         }
@@ -2541,6 +2608,9 @@ struct Actor {
     close_input_fd: Option<std::os::fd::RawFd>,
     close_input_drained: bool,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    source_authority: Arc<Mutex<Option<SourceAuthority>>>,
+    source_dirty: Arc<AtomicBool>,
+    source_notified: Option<SourceAuthority>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3055,6 +3125,7 @@ impl Actor {
         result
     }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
+        if self.source_dirty.swap(false, Ordering::AcqRel) { self.publish_source_authority()?; }
         for _ in 0..64 {
             // Backpressure applies to queued bytes, not to the mere existence of a
             // queued write: a provider that reads stdin only between turns keeps
@@ -3550,7 +3621,29 @@ impl Actor {
         Ok(())
     }
     fn step(&mut self, step: Step) -> Result<(), String> {
-        self.apply_step(step, None)
+        self.apply_step(step, None)?;
+        if self.source_dirty.swap(false, Ordering::AcqRel) || self.source_notified.is_none() {
+            self.publish_source_authority()?;
+        }
+        Ok(())
+    }
+    fn publish_source_authority(&mut self) -> Result<(), String> {
+        let authority = {
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.publish_source_authority(&mut state);
+            store.source_authority().ok_or("Source authority could not be ordered")?
+        };
+        let authority = {
+            let mut cached = self.source_authority.lock().unwrap_or_else(|p| p.into_inner());
+            if cached.is_none_or(|old| old.generation <= authority.generation) { *cached = Some(authority); }
+            cached.expect("actual Store authority was cached")
+        };
+        if self.source_notified != Some(authority) {
+            self.source_notified = Some(authority);
+            (self.notify)(Update::SourceAuthority {incarnation:authority.incarnation,generation:authority.generation});
+        }
+        Ok(())
     }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
@@ -3661,6 +3754,10 @@ impl Actor {
                     | Event::Session { .. }
             )
             .then(|| event.clone());
+            let is_reset = matches!(&event, Event::Reset { .. });
+            if is_reset && self.state.lock().unwrap_or_else(|p| p.into_inner()).generation > u64::MAX - 2 {
+                frame_error.get_or_insert_with(|| "Reset was refused before source mutation because its generation is exhausted".into());
+            }
             let events = if frame_error.is_some() {
                 None
             } else {
@@ -3677,6 +3774,15 @@ impl Actor {
                     }
                 }
             };
+            // A failed Reset can already have revoked the source. Publish its
+            // ACTUAL Store token now, while still draining this decoded frame's
+            // known semantic outcomes through the existing immutable contexts.
+            let reset_applied = is_reset && events.is_some();
+            if is_reset && !reset_applied {
+                if let Err(error) = self.publish_source_authority() {
+                    frame_error.get_or_insert(error);
+                }
+            }
             match events {
                 Some(events) if events.is_empty() => self.touch(),
                 Some(events) => {
@@ -3695,6 +3801,9 @@ impl Actor {
                         self.apply_with_attention(event, content);
                     }
                 }
+            }
+            if reset_applied {
+                if let Err(error) = self.publish_source_authority() { frame_error.get_or_insert(error); }
             }
             if let Some(message) = fatal {
                 frame_error.get_or_insert(message);
@@ -4872,8 +4981,16 @@ mod tests {
 
     #[test]
     fn final_provider_proof_survives_a_pending_transcript_flush_failure() {
+        assert_final_provider_proof_survives_cache_failure(false);
+    }
+    #[test]
+    fn failed_reset_revokes_source_before_exact_same_frame_semantic_settlement() {
+        assert_final_provider_proof_survives_cache_failure(true);
+    }
+    fn assert_final_provider_proof_survives_cache_failure(reset: bool) {
         struct FinalFrame {
             run: Option<crate::model::RunId>,
+            reset: bool,
         }
         impl Adapter for FinalFrame {
             fn initialize(&mut self) -> Result<Step, String> {
@@ -4907,7 +5024,7 @@ mod tests {
             fn receive(&mut self, frame: Value) -> Result<Step, String> {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
-                Ok(Step {
+                let mut step = Step {
                     writes: Vec::new(),
                     events: vec![
                         Event::Execution {
@@ -4950,7 +5067,9 @@ mod tests {
                             },
                         },
                     ],
-                })
+                };
+                if self.reset { step.events.insert(1, Event::Reset { reason:"same-frame source revocation".into() }); }
+                Ok(step)
             }
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -4964,7 +5083,7 @@ mod tests {
             working_directory: directory.path().into(),
             environment: BTreeMap::new(),
         };
-        let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None });
+        let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None, reset });
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
@@ -4973,6 +5092,7 @@ mod tests {
         })
         .unwrap();
         until(&handle, |state| state.ready);
+        let original_authority = handle.source_authority().unwrap();
         handle.0.store.lock().unwrap().refuse_writes_for_test();
         let run = crate::model::RunId::new();
         handle
@@ -4988,6 +5108,13 @@ mod tests {
         until(&handle, |state| state.exited);
         handle.close().unwrap();
         let updates = receiver.try_iter().collect::<Vec<_>>();
+        if reset {
+            let invalidation = updates.iter().position(|update| matches!(update,
+                Update::SourceAuthority {incarnation,..} if *incarnation != original_authority.incarnation)).expect("actual failed Reset token must publish");
+            let settlement = updates.iter().position(|update| matches!(update,
+                Update::AttentionContext {evidence,..} if evidence.kind == crate::notifications::Kind::Succeeded)).unwrap();
+            assert!(invalidation < settlement, "revocation precedes same-frame known semantic outcome");
+        }
         let finished = updates
             .iter()
             .filter_map(|update| match update {
@@ -9092,6 +9219,8 @@ mod tests {
                 | Update::AttentionContext { .. }
                 | Update::PastAttention(_)
                 | Update::RetainedOutcomes
+                | Update::SourceAuthority { .. }
+                | Update::SourceAuthorityConflict { .. }
                 | Update::Identity
                 | Update::TurnOutcome { .. }
                 | Update::Ready

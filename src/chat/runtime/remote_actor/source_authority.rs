@@ -94,6 +94,26 @@ impl RemoteActor {
     }
 }
 
+impl Server {
+    pub(super) fn refresh_source_authority_metadata(&self) {
+        // A cache-only read can rotate the source after Local actor EOF. Its
+        // cheap cache remains truthful, while no actor remains to emit notify.
+        // Try only resident metadata here: control admission never waits on
+        // a source worker's Store/state locks or Journal SQLite operation.
+        let Some(actual) = self.actor.source_authority() else { return; };
+        let mut journal = match self.journal.try_lock() {
+            Ok(journal) => journal,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        let before = (journal.source_authority(), journal.source_authority_conflict());
+        let _ = journal.append(&Update::SourceAuthority {incarnation:actual.incarnation,generation:actual.generation});
+        if before != (journal.source_authority(), journal.source_authority_conflict()) {
+            self.changed.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

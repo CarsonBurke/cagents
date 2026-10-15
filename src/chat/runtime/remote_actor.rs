@@ -1776,6 +1776,7 @@ impl Server {
         }
     }
     fn revision(&self) -> u64 {
+        self.refresh_source_authority_metadata();
         self.changed
             .load(Ordering::Acquire)
             .wrapping_add(self.actor.close_observation().close_revision)
@@ -2783,6 +2784,27 @@ mod tests {
             },
             _root: root,
         }
+    }
+    #[test]
+    fn completed_cache_read_revocation_reaches_resident_without_actor_or_host_callback() {
+        let fixture = resident_fixture();
+        let server = &fixture.server;
+        server.actor.close().unwrap();
+        server.actor.refresh_source_authority();
+        server.revision();
+        let old = server.journal.lock().unwrap().source_authority().unwrap();
+        server.actor.0.store.lock().unwrap().apply(chat::Event::Reset { reason:"completed cache reader revocation".into() }).unwrap();
+        server.actor.refresh_source_authority();
+        let actual = server.actor.source_authority().unwrap();
+        assert_ne!(actual.incarnation, old.incarnation);
+        assert_eq!(server.journal.lock().unwrap().source_authority(), Some(old), "no actor remains to emit callbacks");
+        let journal = server.journal.lock().unwrap();
+        let start = Instant::now();
+        server.revision();
+        assert!(start.elapsed() < Duration::from_millis(100), "busy journal defers metadata, never waits for SQL");
+        drop(journal);
+        server.revision();
+        assert_eq!(server.resident().unwrap().source_authority, Some(actual));
     }
     #[test]
     fn helper_restores_descriptor_seal_before_any_provider_exec() {
