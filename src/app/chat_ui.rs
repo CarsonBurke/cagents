@@ -1019,6 +1019,8 @@ impl CachedItem {
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
+        let find_paint = previous.as_ref().filter(|cached| cached.item.as_ref().is_some_and(|item| std::ptr::eq(&item.content,content)))
+            .and_then(|cached| cached.find_paint.clone());
         let (
             image,
             image_source,
@@ -1165,6 +1167,7 @@ impl CachedItem {
             }
             ItemContent::Image { .. } => {}
         }
+        cached.find_paint = find_paint;
         cached
     }
     /// The text of `content` that is drawn as Markdown.
@@ -1188,6 +1191,7 @@ impl CachedItem {
     /// exception is text that turned out to be something else than it was
     /// first handed over as, which is parsed again from the top.
     fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
+        self.find_paint = None;
         match self.source.advance(body, growing) {
             markdown_source::Step::Append(text) => self.markdown.push_str(&text),
             markdown_source::Step::Restart(text) => {
