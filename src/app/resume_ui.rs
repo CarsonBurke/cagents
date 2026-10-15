@@ -760,7 +760,8 @@ impl Cagents {
                     .and_then(|card| self.card_worktree(card))
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                self.select_worktree(owner, false)
+                return self.select_worktree_then(owner, false,
+                    worktree_ui::selection::Intent::Focus {card, activate: false});
             };
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
@@ -812,9 +813,14 @@ impl Cagents {
         }
         let replace = self.resume_ui.replace;
         self.close_resume();
-        self.recently_closed
-            .retain(|(card, _)| card.id != entry.card);
-        let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
+        let entry = SavedConversation { session, ..entry };
+        self.select_worktree_then(entry.session.launch.recipe.working_directory.clone(), false,
+            worktree_ui::selection::Intent::Resume {entry, replace})
+    }
+
+    pub(super) fn commit_resumed_conversation(&mut self, entry: SavedConversation, replace: Option<CardId>) -> Task<Message> {
+        self.recently_closed.retain(|(card, _)| card.id != entry.card);
+        let session = entry.session;
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
@@ -825,7 +831,7 @@ impl Cagents {
             self.apply_reported_title(card, entry.title);
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
-        Task::batch([scope, insert, discard])
+        Task::batch([insert, discard])
     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the

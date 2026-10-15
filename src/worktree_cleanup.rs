@@ -426,11 +426,11 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct WindowProtections {
-    directories: BTreeMap<PathBuf, Protection>,
+    directories: BTreeMap<PathBuf, std::sync::Arc<Protection>>,
     requested: std::collections::BTreeSet<PathBuf>,
-    ready: Option<crate::instance::OwnedLock>,
+    ready: Option<std::sync::Arc<crate::instance::OwnedLock>>,
 }
 
 impl WindowProtections {
@@ -439,10 +439,39 @@ impl WindowProtections {
         self.requested.clear();
     }
 
+    /// Install a lease acquired by a blocking navigation preparation before
+    /// its scope or dependent cards become visible. This performs no I/O.
+    pub(crate) fn install_prepared(&mut self, protection: Option<Protection>) {
+        if let Some(protection) = protection {
+            self.directories.insert(protection.directory.clone(), std::sync::Arc::new(protection));
+        }
+    }
+
+    /// Revoke readiness on the UI, while every old directory lease remains
+    /// held. The snapshot shares those leases with one background synchronizer.
+    pub(crate) fn synchronization_snapshot(&mut self) -> Self {
+        self.ready = None;
+        self.clone()
+    }
+
+    pub(crate) fn prepare_sync(mut self, paths: Vec<PathBuf>) -> io::Result<(Self, Option<crate::instance::PreparedLock>)> {
+        self.sync_inner(paths, false)?;
+        let ready = if crate::instance::window_is_initialized() && crate::device::selected().is_none() {
+            Some(crate::instance::prepare_window_protection_ready()?)
+        } else { None };
+        Ok((self, ready))
+    }
+
+    pub(crate) fn commit_readiness(&mut self, prepared: Option<crate::instance::PreparedLock>) -> io::Result<()> {
+        self.ready = prepared.map(|prepared| prepared.lock(libc::LOCK_EX | libc::LOCK_NB)
+            .map(std::sync::Arc::new)).transpose()?;
+        Ok(())
+    }
+
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
         if let Some(protection) = protect(directory)? {
             self.directories
-                .insert(protection.directory.clone(), protection);
+                .insert(protection.directory.clone(), std::sync::Arc::new(protection));
         }
         Ok(())
     }
@@ -450,6 +479,10 @@ impl WindowProtections {
         &mut self,
         directories: impl IntoIterator<Item = PathBuf>,
     ) -> io::Result<()> {
+        self.sync_inner(directories, true)
+    }
+
+    fn sync_inner(&mut self, directories: impl IntoIterator<Item=PathBuf>, publish: bool) -> io::Result<()> {
         if !crate::instance::window_is_initialized() {
             return Ok(());
         }
@@ -474,14 +507,14 @@ impl WindowProtections {
                 if !self.directories.contains_key(&directory) {
                     let guard = protect(&directory)?
                         .ok_or_else(|| io::Error::other("window protection unavailable"))?;
-                    self.directories.insert(directory.clone(), guard);
+                    self.directories.insert(directory.clone(), std::sync::Arc::new(guard));
                 }
                 needed.insert(directory);
             }
             self.directories
                 .retain(|directory, _| needed.contains(directory));
-            if self.ready.is_none() {
-                self.ready = Some(crate::instance::window_protection_ready()?);
+            if publish && self.ready.is_none() {
+                self.ready = Some(std::sync::Arc::new(crate::instance::window_protection_ready()?));
             }
             self.requested = requested;
             Ok(())
@@ -821,11 +854,11 @@ mod tests {
         let path = guard.directory.clone();
         let marker = runtime.path().join("ready");
         let mut window = WindowProtections {
-            directories: [(path.clone(), guard)].into(),
+            directories: [(path.clone(), std::sync::Arc::new(guard))].into(),
             requested: [path].into(),
-            ready: Some(
+            ready: Some(std::sync::Arc::new(
                 crate::instance::owned_lock(&marker, libc::LOCK_EX | libc::LOCK_NB).unwrap(),
-            ),
+            )),
         };
         window.suspend_readiness();
         assert!(window.ready.is_none());

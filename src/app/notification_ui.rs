@@ -457,9 +457,11 @@ impl Cagents {
                             _ => None,
                         }
                     });
-                    directory.map_or_else(Task::none, |directory| {
-                        self.select_worktree(directory, false)
-                    })
+                    if let Some(directory) = directory {
+                        return self.select_worktree_then(directory, false,
+                            worktree_ui::selection::Intent::Focus {card: card.id, activate: true});
+                    }
+                    Task::none()
                 };
                 let focus = self.workspace.focus(card.id).map_or_else(
                     |_| Task::none(),

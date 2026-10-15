@@ -4015,6 +4015,9 @@ pub enum Message {
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
     HostedTerminalsObserved(Vec<crate::terminal::ipc::TerminalDescriptor>),
+    WorktreeProtectionsPrepared { generation: u64, receipt: worktree_ui::protection_sync::Receipt },
+    RetryWorktreeProtections,
+    WorktreeSelectionPrepared { generation: u64, create: bool, receipt: worktree_ui::selection::Receipt },
     WorktreeOwnerPathsInvalidated,
     WorktreeOwnerPathsResolved { generation: u64, paths: Vec<(PathBuf, PathBuf)> },
     PersistStableTitles,
@@ -4904,6 +4907,8 @@ pub struct Cagents {
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
+    worktree_protection_sync: worktree_ui::protection_sync::State,
+    worktree_selection: worktree_ui::selection::State,
     worktree_owner_paths: worktree_ui::OwnerPaths,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
@@ -5786,17 +5791,14 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&launch.working_directory) {
             return Task::none();
         }
-        let scope = if self.durable.active_channel.is_none()
-            && self.active_workspace.as_deref() != Some(launch.working_directory.as_path())
+        let session = fresh_terminal_session(launch);
+        if self.durable.active_channel.is_none()
+            && self.active_workspace.as_deref() != Some(session.launch.working_directory.as_path())
         {
-            self.select_worktree(launch.working_directory.clone(), false)
-        } else {
-            Task::none()
-        };
-        Task::batch([
-            scope,
-            self.insert_terminal_card(fresh_terminal_session(launch), None),
-        ])
+            return self.select_worktree_then(session.launch.working_directory.clone(), false,
+                worktree_ui::selection::Intent::Terminal(session));
+        }
+        self.insert_terminal_card(session, None)
     }
 
     /// Opens the new terminal `session` in the current scope: at `slot`, as
@@ -13024,6 +13026,8 @@ impl Application for Cagents {
             worktree_offsets: HashMap::new(),
             channel_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            worktree_protection_sync: worktree_ui::protection_sync::State::default(),
+            worktree_selection: worktree_ui::selection::State::default(),
             worktree_owner_paths: worktree_ui::OwnerPaths::default(),
             known_worktree_roots: worktrees
                 .iter()
@@ -13114,7 +13118,7 @@ impl Application for Cagents {
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
             .set_worktree_sort(app.settings.worktree_sort);
-        app.sync_worktree_protections();
+        let protections = app.sync_worktree_protections();
         app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
@@ -13161,6 +13165,7 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
+        app.worktree_selection.initialize_runtimes = true;
         let scope = app.restore_worktree_scope();
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
@@ -13179,10 +13184,11 @@ impl Application for Cagents {
         app.start_notifications();
         let mut tasks = vec![
             scope,
+            protections,
             app.commit_terminal_handoffs(),
             Self::editor_discovery_task(),
             app.rehydrate_worktree_operations(),
-            app.initialize_runtimes(),
+            app.initialize_prepared_scope_runtimes(),
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
@@ -13191,7 +13197,9 @@ impl Application for Cagents {
         ];
         // Unused default chats are never saved. Recreate the active scope's
         // placeholder only after restored runtimes have been initialized.
-        tasks.push(app.ensure_default_pane());
+        if !app.worktree_selection.initialize_runtimes {
+            tasks.push(app.ensure_default_pane());
+        }
         app.refresh_draft_permission_previews();
         tasks.extend(
             projects
@@ -13412,7 +13420,11 @@ impl Application for Cagents {
                     }
                 }
             }
+            Message::WorktreeProtectionsPrepared {generation,receipt} => self.window_protections_prepared(generation,receipt),
+            Message::RetryWorktreeProtections => self.sync_worktree_protections(),
+            Message::WorktreeSelectionPrepared { generation, create, receipt } => self.worktree_selection_prepared(generation, create, receipt),
             Message::WorktreeOwnerPathsInvalidated => {
+                self.worktree_protection_sync.invalidate();
                 self.worktree_owner_paths.invalidate_watched();
                 self.resolve_worktree_owner_paths()
             }
@@ -16552,9 +16564,9 @@ impl Application for Cagents {
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
-        if self.update_tail.run(update_tail::Step::Protections) {
-            self.sync_worktree_protections();
-        }
+        let protections = if self.update_tail.run(update_tail::Step::Protections) {
+            self.sync_worktree_protections()
+        } else {Task::none()};
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
@@ -16622,6 +16634,7 @@ impl Application for Cagents {
             notices,
             terminal_probes,
             owner_paths,
+            protections,
         ])
     }
 
@@ -16633,6 +16646,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.worktree_owner_paths.subscription(self.refresh_ui.focused),
+            self.protection_retry_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             self.refresh_subscription(),
@@ -25357,6 +25371,8 @@ mod tests {
             channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            worktree_protection_sync: worktree_ui::protection_sync::State::default(),
+            worktree_selection: worktree_ui::selection::State::default(),
             worktree_owner_paths: worktree_ui::OwnerPaths::default(),
             known_worktree_roots: HashSet::new(),
             workspace_view_generation: 0,

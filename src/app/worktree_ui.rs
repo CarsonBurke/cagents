@@ -2,6 +2,8 @@ use super::*;
 use crate::model::ChannelId;
 
 mod owner_watch;
+pub(super) mod selection;
+pub(super) mod protection_sync;
 
 /// Canonical filesystem aliases are read on the blocking pool, once per path.
 /// Runtime selection uses lexical ownership until that immutable result arrives.
@@ -421,6 +423,8 @@ impl Cagents {
     }
 
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+        let preparation_was_pending = self.worktree_selection.pending;
+        self.worktree_selection.cancel();
         let Some(channel) = self
             .durable
             .channels
@@ -454,7 +458,7 @@ impl Cagents {
                 .filter(|card| card.existence.is_open() && channel.cards.contains(&card.id))
                 .map(|card| card.id))
         {
-            return Task::none();
+            return if preparation_was_pending { self.initialize_prepared_scope_runtimes() } else {Task::none()};
         }
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {
@@ -475,7 +479,8 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        scope
+        let initialize = if preparation_was_pending {self.initialize_prepared_scope_runtimes()} else {Task::none()};
+        Task::batch([scope,initialize])
     }
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
@@ -595,7 +600,7 @@ impl Cagents {
         // the job. Late I/O cannot navigate back to a previously selected scope.
         let selected = self.active_workspace.clone();
         self.refresh_worktree_owners(selected.as_deref());
-        if self.durable.active_channel.is_none() {
+        if self.durable.active_channel.is_none() && !self.worktree_selection.pending {
             selected.map_or_else(Task::none, |path| self.select_worktree(path, false))
         } else { Task::none() }
     }
@@ -741,9 +746,7 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
-        let selected = self.select_worktree_inner(path, create_if_empty);
-        let owners = self.resolve_worktree_owner_paths();
-        Task::batch([selected, owners])
+        self.select_worktree_then(path, create_if_empty, selection::Intent::Navigate)
     }
 
     fn select_worktree_inner(
@@ -754,12 +757,6 @@ impl Cagents {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
-        if let Err(error) = self.worktree_protections.protect_next(&path) {
-            self.status = Some(TransientNotice::warning(format!(
-                "Cannot open this worktree yet: {error}"
-            )));
-            return Task::none();
-        }
         let roots = self
             .known_worktree_roots
             .iter()

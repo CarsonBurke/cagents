@@ -186,7 +186,8 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        self.select_worktree(path.clone(), false)
+                        return self.select_worktree_then(path.clone(), false,
+                            worktree_ui::selection::Intent::Agent(agent));
                     }
                 };
                 let adopted = self

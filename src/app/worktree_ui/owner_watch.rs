@@ -2,7 +2,7 @@
 use super::*;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Default)]
 struct Registration {
@@ -14,6 +14,7 @@ pub(super) struct Monitor {
     registration: Mutex<Registration>,
     observed: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
+    epoch: Arc<AtomicU64>,
     broken: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     sender: async_channel::Sender<()>,
@@ -27,6 +28,7 @@ impl Default for Monitor {
             registration: Mutex::new(Registration::default()),
             observed: Arc::new(Mutex::new(HashMap::new())),
             dirty: Arc::new(Mutex::new(HashSet::new())),
+            epoch: Arc::new(AtomicU64::new(0)),
             broken: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
             sender, receiver,
@@ -35,6 +37,9 @@ impl Default for Monitor {
 }
 
 impl Monitor {
+    /// Updated by the notify callback before any queued UI invalidation.
+    pub(super) fn epoch(&self) -> u64 { self.epoch.load(Ordering::Acquire) }
+
     /// Called only inside the existing blocking canonicalization task.
     pub(super) fn register(&self, results: &[(PathBuf, PathBuf)]) {
         let mut registration = self.registration.lock().unwrap_or_else(|error| error.into_inner());
@@ -59,6 +64,7 @@ impl Monitor {
             let observed = self.observed.clone();
             let dirty = self.dirty.clone();
             let broken = self.broken.clone();
+            let epoch = self.epoch.clone();
             let sender = self.sender.clone();
             registration.watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
@@ -73,6 +79,7 @@ impl Monitor {
                     }
                 };
                 if !changed.is_empty() {
+                    epoch.fetch_add(1, Ordering::AcqRel);
                     dirty.lock().unwrap_or_else(|error| error.into_inner()).extend(changed);
                     let _ = sender.try_send(());
                 }
@@ -126,6 +133,7 @@ impl Monitor {
     pub(super) fn invalidate_failed(&self) {
         if !self.failed.load(Ordering::Acquire) { return; }
         self.broken.store(true, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let observed = self.observed.lock().unwrap_or_else(|error| error.into_inner());
         self.dirty.lock().unwrap_or_else(|error| error.into_inner()).extend(observed.keys().cloned());
     }
@@ -177,9 +185,12 @@ mod tests {
         std::os::unix::fs::symlink(&first, &alias).unwrap();
         let monitor = Monitor::default();
         monitor.register(&[(alias.clone(), alias.canonicalize().unwrap())]);
+        let epoch = monitor.epoch();
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&second, &alias).unwrap();
         next_change(&monitor);
+        // The worker callback fences receipts before UI invalidation is read.
+        assert_ne!(monitor.epoch(), epoch);
         assert!(monitor.take_invalidated().contains(&alias));
         assert_eq!(alias.canonicalize().unwrap(), second);
     }

@@ -4364,17 +4364,13 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let scope = if self.durable.active_channel.is_none()
+        if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
-            self.select_worktree(working_directory, false)
-        } else {
-            Task::none()
-        };
-        Task::batch([
-            scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
-        ])
+            return self.select_worktree_then(working_directory, false,
+                worktree_ui::selection::Intent::Chat { session, beside: None, ephemeral });
+        }
+        self.insert_chat_card_with_lifetime(session, None, ephemeral, None)
     }
 
     /// Opens a card for the new conversation `session`, as a draft whose first
@@ -4390,7 +4386,7 @@ impl Cagents {
         self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
     }
 
-    fn insert_chat_card_with_lifetime(
+    pub(super) fn insert_chat_card_with_lifetime(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
@@ -6693,23 +6689,16 @@ impl Cagents {
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
-                                let scope = if let Some(channel) = self
-                                    .durable
-                                    .channels
-                                    .iter()
-                                    .find(|channel| channel.cards.contains(&target.card))
-                                    .map(|channel| channel.id)
+                                if let Some(channel) = self.durable.channels.iter()
+                                    .find(|channel| channel.cards.contains(&target.card)).map(|channel| channel.id)
                                 {
-                                    self.select_channel(channel)
+                                    let scope = self.select_channel(channel);
+                                    let insert = self.insert_chat_card(session, Some(target.card), None);
+                                    Task::batch([scope, insert])
                                 } else {
-                                    self.select_worktree(
-                                        session.launch.recipe.working_directory.clone(),
-                                        false,
-                                    )
-                                };
-                                let insert =
-                                    self.insert_chat_card(session, Some(target.card), None);
-                                Task::batch([scope, insert])
+                                    self.select_worktree_then(session.launch.recipe.working_directory.clone(), false,
+                                        worktree_ui::selection::Intent::Chat { session, beside: Some(target.card), ephemeral: false })
+                                }
                             }),
                         ]);
                     }

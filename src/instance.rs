@@ -151,7 +151,20 @@ impl Drop for OwnedLock {
     }
 }
 
-pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+/// A verified lock file opened on a blocking worker, with no published lease.
+/// Installing it later uses only a nonblocking flock on this descriptor.
+pub(crate) struct PreparedLock(File);
+impl PreparedLock {
+    pub(crate) fn lock(self, operation: i32) -> io::Result<OwnedLock> {
+        // SAFETY: self owns the file descriptor throughout the syscall.
+        if unsafe { libc::flock(self.0.as_raw_fd(), operation) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedLock(self.0))
+    }
+}
+
+fn prepare_owned_lock(path: &Path) -> io::Result<PreparedLock> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -168,11 +181,11 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
         ));
     }
     lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    // SAFETY: the descriptor remains owned by the returned file.
-    if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(OwnedLock(lock))
+    Ok(PreparedLock(lock))
+}
+
+pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+    prepare_owned_lock(path)?.lock(operation)
 }
 
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
@@ -590,6 +603,10 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
 
 pub(crate) fn window_is_initialized() -> bool {
     WINDOW_SLOT.get().is_some()
+}
+
+pub(crate) fn prepare_window_protection_ready() -> io::Result<PreparedLock> {
+    prepare_owned_lock(&runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))))
 }
 
 pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
