@@ -5,6 +5,9 @@ use std::{
 };
 use unicode_casefold::UnicodeCaseFold;
 
+mod index;
+pub(super) use index::{Block, Document, Index, Match};
+
 pub(super) const HIGHLIGHT_LIMIT: usize = 4096;
 pub(super) struct Highlights {
     pub(super) ranges: Vec<Range<usize>>,
@@ -111,15 +114,24 @@ impl Matcher {
     }
 }
 fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
+    matched_ranges_cancellable(text, query, limit, || true).unwrap()
+}
+
+fn matched_ranges_cancellable(text: &str, query: &str, limit: usize, mut current: impl FnMut() -> bool) -> Option<Highlights> {
     if query.is_empty() {
-        return Highlights::empty();
+        return Some(Highlights::empty());
     }
     let needle: Vec<char> = query.case_fold().collect();
     if needle.is_empty() {
-        return Highlights::empty();
+        return Some(Highlights::empty());
     }
     let mut matcher = Matcher::new(needle, limit);
+    let mut next_cancel = 0;
     'source: for (offset, character) in text.char_indices() {
+        if offset >= next_cancel {
+            if !current() { return None; }
+            next_cancel = offset.saturating_add(4096);
+        }
         if character.is_ascii() {
             if matcher.push(
                 character.to_ascii_lowercase(),
@@ -148,7 +160,7 @@ fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
             }
         }
     }
-    matcher.result
+    current().then_some(matcher.result)
 }
 pub(super) fn contains(text: &str, query: &str) -> bool {
     matched_ranges(text, query, 0).truncated
