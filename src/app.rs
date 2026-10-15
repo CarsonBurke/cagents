@@ -22241,10 +22241,21 @@ impl Application for Cagents {
             };
             let target = self.modal_surface_target(top);
             let dialog = crate::interaction::owned_surface(dialog, target);
-            crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top)).map(
+            let dialog = crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top)).map(
                 move |message| Message::ModalSurface {
                     target,
                     message: Box::new(message),
+                },
+            );
+            // Global Popover captures bypass the background view observer.
+            // Preserve child transport isolation and bind held keys to the
+            // same visible instance as every other widget decision.
+            crate::input_trace::observe_dialog_keyboard_events(
+                dialog,
+                &self.input_trace,
+                move |event, captured, region, widget| Message::ModalSurface {
+                    target,
+                    message: Box::new(Message::RoutedKeyEvent { event, captured, region, widget }),
                 },
             )
         })

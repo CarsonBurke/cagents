@@ -577,7 +577,10 @@ impl Cagents {
             if top == Modal::DirtyClose {
                 return Some(self.cycle_dirty_close_focus(backwards));
             }
-            if !captured && !self.core.keyboard_nav() {
+            // The dialog observer isolates all keys from Cosmic's global
+            // ignored-key traversal. Native controls that ignored Tab still
+            // need exactly one traversal, independent of reader preference.
+            if !captured {
                 return Some(
                     if backwards {
                         iced::widget::operation::focus_previous()
@@ -826,6 +829,124 @@ mod tests {
         messages.into_iter().find(|message| matches!(message,
             Message::ModalSurface { message, .. } if expected(message)))
             .expect("actual widget publishes its surface-bound decision")
+    }
+
+    /// Drive the same global Popover that libcosmic mounts, through the
+    /// runtime which skips the base widget update when an overlay captures.
+    fn global_dialog_events(
+        app: &Cagents,
+        focus: widget::Id,
+        events: &[iced::Event],
+    ) -> (Vec<Message>, Vec<iced::event::Status>) {
+        use iced::advanced::{clipboard, widget::operation};
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = UserInterface::build(cosmic::ApplicationExt::view_main(app),
+            iced::Size::new(1280.0, 900.0), Cache::new(), &mut renderer);
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(focus));
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(events, iced::mouse::Cursor::Unavailable,
+            &mut renderer, &mut clipboard::Null, &mut messages);
+        (messages.into_iter().filter_map(|message| match message {
+            cosmic::Action::App(message) => Some(message),
+            _ => None,
+        }).collect(), statuses)
+    }
+    fn dialog_key(key: keyboard::Key, modifiers: keyboard::Modifiers) -> iced::Event {
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            modified_key: key.clone(), key,
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers, text: None, repeat: false,
+        })
+    }
+
+    #[test]
+    fn captured_tab_in_global_dialog_routes_once_and_cycles_once() {
+        let mut app = app();
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        // A hidden feature completion can restore this preference. Modal
+        // routing must remain exclusive even with Cosmic traversal enabled.
+        app.core.set_keyboard_nav(true);
+        for (modifiers, start, destination) in [
+            (keyboard::Modifiers::empty(), "dialog.reset-settings.cancel", "dialog.reset-settings.confirm"),
+            (keyboard::Modifiers::SHIFT, "dialog.reset-settings.confirm", "dialog.reset-settings.cancel"),
+        ] {
+            let (messages, statuses) = global_dialog_events(&app, widget::Id::new(start),
+                &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Tab), modifiers)]);
+            assert_eq!(statuses, vec![iced::event::Status::Captured]);
+            assert_eq!(messages.len(), 1, "no lost key, child wrapper, or duplicate base route");
+            assert!(matches!(&messages[0], Message::ModalSurface { message, .. }
+                if matches!(&**message, Message::RoutedKeyEvent { captured: true, .. })));
+            let task = app.update(messages.into_iter().next().unwrap());
+            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task),
+                Some(widget::Id::new(destination)));
+        }
+    }
+
+    #[test]
+    fn ignored_dialog_chord_is_one_owner_stamped_routed_event_with_native_field_owner() {
+        let mut app = app();
+        app.resume_ui.open = true;
+        drop(app.finish_modal_update(Task::none()));
+        let before = app.workspace.order().collect::<Vec<_>>();
+        let (messages, statuses) = global_dialog_events(&app, resume_ui::focus_id(),
+            &[dialog_key(keyboard::Key::Character("t".into()), keyboard::Modifiers::CTRL)]);
+        assert_eq!(statuses, vec![iced::event::Status::Captured]);
+        assert_eq!(messages.len(), 1, "ignored chord must not also update the base observer");
+        assert!(matches!(&messages[0], Message::ModalSurface { message, .. }
+            if matches!(&**message, Message::RoutedKeyEvent { region, widget: Some(id), .. }
+                if region.pane == workspace_widget::FocusedPane::TextInput && id == &resume_ui::focus_id())));
+        drop(app.update(messages.into_iter().next().unwrap()));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), before);
+        assert!(app.resume_ui.open);
+    }
+
+    #[test]
+    fn native_dialog_field_ime_and_escape_stay_in_the_global_overlay() {
+        let mut app = app();
+        app.resume_ui.open = true;
+        drop(app.finish_modal_update(Task::none()));
+        let (messages, statuses) = global_dialog_events(&app, resume_ui::focus_id(),
+            &[iced::Event::InputMethod(iced::advanced::input_method::Event::Commit("modal-ime".into()))]);
+        assert_eq!(statuses, vec![iced::event::Status::Captured]);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(&messages[0], Message::ModalSurface { message, .. }
+            if matches!(&**message, Message::ResumeConversation(resume_ui::Action::Query(query)) if query.contains("modal-ime"))));
+        drop(app.update(messages.into_iter().next().unwrap()));
+        assert!(app.resume_ui.query.contains("modal-ime"));
+        let (messages, statuses) = global_dialog_events(&app, resume_ui::focus_id(),
+            &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::empty())]);
+        assert_eq!(statuses, vec![iced::event::Status::Captured]);
+        assert_eq!(messages.iter().filter(|message| matches!(message, Message::ModalSurface { message, .. }
+            if matches!(&**message, Message::RoutedKeyEvent { .. }))).count(), 1);
+        for message in messages { drop(app.update(message)); }
+        assert!(!app.resume_ui.open);
+    }
+
+    #[test]
+    fn held_global_dialog_escape_cannot_close_a_replacement_instance() {
+        let mut app = app();
+        drop(app.update(Message::ResetSettings));
+        let (mut held, statuses) = global_dialog_events(&app,
+            widget::Id::new("dialog.reset-settings.cancel"),
+            &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::empty())]);
+        assert_eq!(statuses, vec![iced::event::Status::Captured]);
+        assert_eq!(held.len(), 1);
+        let old = app.modal_surface_target(Modal::SettingsReset);
+        drop(app.update(Message::CancelResetSettings));
+        drop(app.update(Message::ResetSettings));
+        assert_ne!(old, app.modal_surface_target(Modal::SettingsReset));
+        let revision = app.modal_stack.focus_revision.load(Ordering::Relaxed);
+        let task = app.update(held.pop().unwrap());
+        assert!(iced::runtime::task::into_stream(task).is_none(), "stale key has no focus/status effects");
+        assert!(app.settings_reset_confirm, "old Escape must not cancel replacement");
+        assert_eq!(revision, app.modal_stack.focus_revision.load(Ordering::Relaxed));
+        let (current, _) = global_dialog_events(&app, widget::Id::new("dialog.reset-settings.cancel"),
+            &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::empty())]);
+        for message in current { drop(app.update(message)); }
+        assert!(!app.settings_reset_confirm, "current Escape still works");
     }
 
     fn emitted_reset_cancel(app: &Cagents) -> Message {
