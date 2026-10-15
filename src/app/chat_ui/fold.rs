@@ -394,7 +394,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         // appending to the enclosing collection, which performs its own reversal.
         let mut rectangles = inner.into_rectangles();
         rectangles.reverse();
-        crate::workspace_widget::clip_drag_destinations(&mut rectangles, Self::shown(state, layout));
+        crate::workspace_widget::clip_drag_destinations(
+            &mut rectangles,
+            Self::shown(state, layout),
+        );
         destinations.append(&mut rectangles);
         if state.tall {
             self.toggle.as_widget().drag_destinations(
@@ -414,7 +417,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let content = layout.children().next()?.with_virtual_offset(layout.virtual_offset());
+        let content = layout
+            .children()
+            .next()?
+            .with_virtual_offset(layout.virtual_offset());
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             content,
@@ -428,7 +434,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_widget::forwarding_test::{leaf, renderer, Traverse};
+    use crate::workspace_widget::forwarding_test::{Traverse, leaf, renderer};
     use cosmic::iced::advanced::clipboard::DndDestinationRectangles;
 
     #[test]
@@ -436,31 +442,82 @@ mod tests {
         let renderer = renderer();
         let offset = Vector::new(7.0, -35.0);
         for (height, folded, expected) in [
-            (200.0, true, vec![(4, 130.0, 20.0), (2, 100.0, 20.0), (1, 40.0, 50.0)]),
-            (200.0, false, vec![(4, 250.0, 20.0), (3, 140.0, 20.0), (2, 100.0, 50.0), (1, 40.0, 50.0)]),
+            (
+                200.0,
+                true,
+                vec![(4, 130.0, 20.0), (2, 100.0, 20.0), (1, 40.0, 50.0)],
+            ),
+            (
+                200.0,
+                false,
+                vec![
+                    (4, 250.0, 20.0),
+                    (3, 140.0, 20.0),
+                    (2, 100.0, 50.0),
+                    (1, 40.0, 50.0),
+                ],
+            ),
             (60.0, true, vec![(1, 40.0, 50.0)]),
         ] {
             let mut targets = vec![(1, Rectangle::new(Point::ORIGIN, Size::new(60.0, 50.0)))];
             if height > 60.0 {
-                targets.extend([(2, Rectangle::new(Point::new(0.0, 60.0), Size::new(60.0, 50.0))), (3, Rectangle::new(Point::new(0.0, 100.0), Size::new(60.0, 20.0)))]);
+                targets.extend([
+                    (
+                        2,
+                        Rectangle::new(Point::new(0.0, 60.0), Size::new(60.0, 50.0)),
+                    ),
+                    (
+                        3,
+                        Rectangle::new(Point::new(0.0, 100.0), Size::new(60.0, 20.0)),
+                    ),
+                ]);
             }
             let (content, visits) = leaf::<()>(Size::new(100.0, height), targets);
-            let (toggle, toggle_visits) = leaf::<()>(Size::new(100.0, 20.0), vec![(4, Rectangle::new(Point::ORIGIN, Size::new(60.0, 20.0)))]);
+            let (toggle, toggle_visits) = leaf::<()>(
+                Size::new(100.0, 20.0),
+                vec![(4, Rectangle::new(Point::ORIGIN, Size::new(60.0, 20.0)))],
+            );
             let mut widget = fold(content, toggle, folded, 80.0, 10.0, |_| Color::BLACK);
             let mut tree = Tree::new(&widget);
-            let node = widget.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0))).move_to(Point::new(30.0, 40.0));
+            let node = widget
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
             let layout = Layout::new(&node).with_virtual_offset(offset);
-            widget.as_widget_mut().operate(&mut tree, layout, &renderer, &mut Traverse);
-            assert!(widget.as_widget_mut().overlay(&mut tree, layout, &renderer, &layout.bounds(), Vector::ZERO).is_none());
+            widget
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut Traverse);
+            assert!(
+                widget
+                    .as_widget_mut()
+                    .overlay(&mut tree, layout, &renderer, &layout.bounds(), Vector::ZERO)
+                    .is_none()
+            );
             let mut destinations = DndDestinationRectangles::new();
-            widget.as_widget().drag_destinations(&tree, layout, &renderer, &mut destinations);
-            let actual: Vec<_> = destinations.into_rectangles().into_iter().map(|target| (target.id, target.rectangle.y, target.rectangle.height)).collect();
+            widget
+                .as_widget()
+                .drag_destinations(&tree, layout, &renderer, &mut destinations);
+            let actual: Vec<_> = destinations
+                .into_rectangles()
+                .into_iter()
+                .map(|target| (target.id, target.rectangle.y, target.rectangle.height))
+                .collect();
             assert_eq!(actual, expected);
             assert_eq!(visits.offsets("operate"), vec![offset]);
             assert_eq!(visits.offsets("overlay"), vec![offset]);
             assert_eq!(visits.offsets("drag"), vec![offset]);
-            assert_eq!(toggle_visits.offsets("drag"), if height > 60.0 { vec![offset] } else { vec![] });
-            assert_eq!(toggle_visits.offsets("operate"), if height > 60.0 { vec![offset] } else { vec![] });
+            assert_eq!(
+                toggle_visits.offsets("drag"),
+                if height > 60.0 { vec![offset] } else { vec![] }
+            );
+            assert_eq!(
+                toggle_visits.offsets("operate"),
+                if height > 60.0 { vec![offset] } else { vec![] }
+            );
         }
     }
 }

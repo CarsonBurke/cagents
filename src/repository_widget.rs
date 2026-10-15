@@ -16911,21 +16911,66 @@ mod tests {
     #[test]
     fn horizontal_diff_forwards_translated_and_clipped_drop_targets() {
         use crate::workspace_widget::forwarding_test::{leaf, renderer};
-        use cosmic::iced::{Point, Rectangle, Size, Vector, advanced::clipboard::DndDestinationRectangles};
+        use cosmic::iced::{
+            Point, Rectangle, Size, Vector, advanced::clipboard::DndDestinationRectangles,
+        };
         let renderer = renderer();
-        let (content, visits) = leaf::<RepositoryAction>(Size::new(300.0, 60.0), vec![
-            (1, Rectangle::new(Point::ORIGIN, Size::new(50.0, 60.0))),
-            (2, Rectangle::new(Point::new(60.0, 0.0), Size::new(80.0, 60.0))),
-            (3, Rectangle::new(Point::new(150.0, 0.0), Size::new(80.0, 60.0))),
-        ]);
-        let mut widget = Element::new(DiffHorizontalContent { content, width: Length::Fixed(100.0), content_width: 300.0, offset: 80.0, accessible_text: None, viewport: None });
+        let (content, visits) = leaf::<RepositoryAction>(
+            Size::new(300.0, 60.0),
+            vec![
+                (1, Rectangle::new(Point::ORIGIN, Size::new(50.0, 60.0))),
+                (
+                    2,
+                    Rectangle::new(Point::new(60.0, 0.0), Size::new(80.0, 60.0)),
+                ),
+                (
+                    3,
+                    Rectangle::new(Point::new(150.0, 0.0), Size::new(80.0, 60.0)),
+                ),
+            ],
+        );
+        let mut widget = Element::new(DiffHorizontalContent {
+            content,
+            width: Length::Fixed(100.0),
+            content_width: 300.0,
+            offset: 80.0,
+            accessible_text: None,
+            viewport: None,
+        });
         let mut tree = Tree::new(&widget);
-        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0))).move_to(Point::new(30.0, 40.0));
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+            )
+            .move_to(Point::new(30.0, 40.0));
         let offset = Vector::new(4.0, -20.0);
         let mut destinations = DndDestinationRectangles::new();
-        widget.as_widget().drag_destinations(&tree, Layout::new(&node).with_virtual_offset(offset), &renderer, &mut destinations);
-        let actual: Vec<_> = destinations.into_rectangles().into_iter().map(|destination| (destination.id, destination.rectangle.x, destination.rectangle.y, destination.rectangle.width, destination.rectangle.height)).collect();
-        assert_eq!(actual, vec![(3, 100.0, 40.0, 30.0, 60.0), (2, 30.0, 40.0, 60.0, 60.0)]);
+        widget.as_widget().drag_destinations(
+            &tree,
+            Layout::new(&node).with_virtual_offset(offset),
+            &renderer,
+            &mut destinations,
+        );
+        let actual: Vec<_> = destinations
+            .into_rectangles()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.id,
+                    destination.rectangle.x,
+                    destination.rectangle.y,
+                    destination.rectangle.width,
+                    destination.rectangle.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![(3, 100.0, 40.0, 30.0, 60.0), (2, 30.0, 40.0, 60.0, 60.0)]
+        );
         assert_eq!(visits.offsets("drag"), vec![offset]);
     }
 

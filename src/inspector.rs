@@ -1951,14 +1951,37 @@ mod tests {
         let renderer = renderer();
         let target = Rectangle::new(Point::ORIGIN, Size::new(80.0, 40.0));
         let (background, background_visits) = leaf::<()>(Size::new(100.0, 60.0), vec![(1, target)]);
-        let (foreground, foreground_visits) = leaf::<()>(Size::new(100.0, 60.0), vec![(2, target), (3, target)]);
+        let (foreground, foreground_visits) =
+            leaf::<()>(Size::new(100.0, 60.0), vec![(2, target), (3, target)]);
         let mut widget = Element::new(ModalOverlay::new(background, foreground));
         let mut tree = Tree::new(&widget);
-        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0))).move_to(Point::new(20.0, 30.0));
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+            )
+            .move_to(Point::new(20.0, 30.0));
         let offset = Vector::new(4.0, -20.0);
         let mut destinations = DndDestinationRectangles::new();
-        widget.as_widget().drag_destinations(&tree, Layout::new(&node).with_virtual_offset(offset), &renderer, &mut destinations);
-        let actual: Vec<_> = destinations.into_rectangles().into_iter().map(|destination| (destination.id, destination.rectangle.x, destination.rectangle.y)).collect();
+        widget.as_widget().drag_destinations(
+            &tree,
+            Layout::new(&node).with_virtual_offset(offset),
+            &renderer,
+            &mut destinations,
+        );
+        let actual: Vec<_> = destinations
+            .into_rectangles()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.id,
+                    destination.rectangle.x,
+                    destination.rectangle.y,
+                )
+            })
+            .collect();
         assert_eq!(actual, vec![(3, 20.0, 30.0), (2, 20.0, 30.0)]);
         assert!(background_visits.offsets("drag").is_empty());
         assert_eq!(foreground_visits.offsets("drag"), vec![offset]);
