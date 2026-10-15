@@ -120,5 +120,4 @@ mod tests {
             assert!(help.contains(text), "missing {text}: {help}");
         }
     }
-
 }
