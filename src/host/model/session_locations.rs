@@ -201,3 +201,85 @@ impl Registry {
         Ok(Some(location))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{agent::Provider, chat::{Launch, Session}, model::{HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, ProjectKind}, project_recovery::Relocation};
+
+    fn source(directory: &Path) -> HostedSession {
+        HostedSession::Chat(Session {
+            id: TerminalId::new(), launch: Launch { provider: Provider::Omp, recipe: LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(), working_directory: directory.into(), environment: Default::default(), unset_environment: Default::default() }, session_id: None },
+            proof: Some(HostSessionProof { host_session_id: HostSessionId::new("source"), boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: HostIncarnation::new("original") }), terminal: None, native_continuity: Default::default(), owned_codex_listener: None,
+        })
+    }
+
+    #[test]
+    fn changed_session_incarnation_rolls_back_the_entire_project_location() {
+        let fixture = tempfile::tempdir().unwrap();
+        let old = fixture.path().join("old"); let moved = fixture.path().join("moved");
+        std::fs::create_dir(&old).unwrap(); std::fs::create_dir(&moved).unwrap();
+        let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        registry.apply(&ModelEdit::OpenProject { repository: old.clone(), name: "Original".into(), kind: ProjectKind::Folder }).unwrap();
+        let source = source(&old);
+        let identity = DirectoryIdentity::from_metadata(&std::fs::metadata(&old).unwrap());
+        registry.bind_session_location(&source, None, &old, identity).unwrap();
+        let before = registry.model().unwrap();
+        let mut changed = source.clone();
+        let HostedSession::Chat(session) = &mut changed else { unreachable!() };
+        session.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("unrelated");
+        let movement = SessionMove { source: changed, repository: moved.clone(), candidate: moved.clone(), proof: Err("Unproved provider".into()) };
+        let edit = ModelEdit::RelocateProject { relocation: Relocation { repository: old.clone(), destination: moved.clone(), old_root: old.clone(), new_root: moved } };
+        assert!(registry.apply_with_session_moves(&edit, &[movement]).unwrap_err().contains("session changed"));
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(registry.session_location(&source).unwrap().unwrap().directory, old);
+    }
+
+    #[test]
+    fn only_exact_authenticated_retained_sources_adopt_directory_bindings() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        let source = source(fixture.path());
+        let identity = DirectoryIdentity::from_metadata(&std::fs::metadata(fixture.path()).unwrap());
+        registry.bind_session_location(&source, None, fixture.path(), identity).unwrap();
+        let mut successor = source.clone();
+        let HostedSession::Chat(session) = &mut successor else { unreachable!() };
+        session.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("successor");
+        let mut forged = source.clone();
+        let HostedSession::Chat(session) = &mut forged else { unreachable!() };
+        session.launch.recipe.arguments.push("--different-source".into());
+        assert!(registry.retained_session_location(&[forged.clone()]).is_err());
+        assert!(registry.adopt_session_location(&[forged], &successor).is_err());
+        registry.adopt_session_location(&[source.clone()], &successor).unwrap();
+        let saved = registry.session_location(&successor).unwrap().unwrap();
+        assert_eq!(saved.approved, Some(identity));
+        assert_eq!(saved.directory, fixture.path());
+        assert!(registry.session_location(&source).is_err());
+        let mut replaced = identity; replaced.inode = replaced.inode.wrapping_add(1);
+        assert!(registry.bind_session_location(&successor, None, fixture.path(), replaced).unwrap_err().contains("replaced"));
+    }
+
+    #[test]
+    fn refusals_preserve_approved_authority_and_publish_bounded_private_free_status() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        let source = source(fixture.path());
+        let identity = DirectoryIdentity::from_metadata(&std::fs::metadata(fixture.path()).unwrap());
+        registry.bind_session_location(&source, None, fixture.path(), identity).unwrap();
+        let candidate = fixture.path().join("replacement");
+        registry.refuse_session_location(&source, &candidate, &format!("Close the original provider\n{}", "x".repeat(4000))).unwrap();
+        let saved = registry.session_location(&source).unwrap().unwrap();
+        assert_eq!(saved.directory, fixture.path());
+        assert_eq!(saved.approved, Some(identity));
+        let status = registry.model().unwrap().session_location_refusals;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].session, source.id());
+        assert_eq!(status[0].reason.chars().count(), 1024);
+        assert!(!status[0].reason.chars().any(char::is_control));
+        let public = serde_json::to_string(&status).unwrap();
+        for private in ["proof", "approved", "device", "inode", "source", "process", "environment"] { assert!(!public.contains(private)); }
+        assert!(registry.retained_session_location(&[source.clone()]).is_err());
+        registry.bind_session_location(&source, None, fixture.path(), identity).unwrap();
+        assert!(registry.model().unwrap().session_location_refusals.is_empty());
+    }
+}

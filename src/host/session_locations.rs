@@ -111,3 +111,100 @@ pub(super) fn relocate(host: &SharedHost, origin: ClientId, relocation: Relocati
     state.announce_model_edit(origin, model.sequence, &edit);
     Ok(model)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{agent::Provider, chat::{self, protocol::{Adapter, ProcessSpec, Step, TransportSpec}, runtime}, host::{chat::Record, model::Registry, state::{HostLock, HostState}}, model::{CardId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, ProjectKind}, terminal_ipc::{ClientRequest, ServerResponse}, workspace_model::views::Pane};
+    use std::{path::PathBuf, sync::{Arc, Mutex}};
+
+    struct PathAware { directory: PathBuf, calls: Arc<Mutex<Vec<PathBuf>>> }
+    impl Adapter for PathAware {
+        fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
+        fn command(&mut self, _: chat::Command) -> Result<Step,String> { self.calls.lock().unwrap().push(self.directory.clone()); Ok(Step::default()) }
+        fn command_for_run(&mut self, _: crate::model::RunId, command: chat::Command) -> Result<Step,String> { self.command(command) }
+        fn relocate_directory(&mut self, path: &Path) -> Result<(),String> { self.directory = path.into(); Ok(()) }
+    }
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        host: SharedHost,
+        handle: Handle,
+        source: chat::Session,
+        old: PathBuf,
+        moved: PathBuf,
+        calls: Arc<Mutex<Vec<PathBuf>>>,
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = self.handle.close(); } }
+    fn fixture(pinned: bool) -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("original"); std::fs::create_dir(&old).unwrap();
+        let moved = directory.path().join("located");
+        let proof = HostSessionProof { host_session_id: HostSessionId::new("session-location-test"), boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: HostIncarnation::new("original") };
+        let source = chat::Session { id: TerminalId::new(), launch: chat::Launch { provider: Provider::Omp, recipe: LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new(), unset_environment: Default::default() }, session_id: None }, proof: Some(proof.clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+        let context = pinned.then(|| Arc::new(chat::protocol::ExecutionContext::capture(&old).unwrap()));
+        let identity = context.as_ref().and_then(|context| context.directory_identity().unwrap());
+        let spec = ProcessSpec { execution: context, messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
+        let mut initial = Step { events: vec![chat::Event::Ready(true)], ..Default::default() };
+        let store = runtime::preflight(&spec, &mut initial).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handle = Handle::start(spec, Box::new(PathAware { directory: old.clone(), calls: calls.clone() }), initial, store, None, |_| {}).unwrap();
+        let mut registry = Registry::at(&directory.path().join("workspace.sqlite3")).unwrap();
+        registry.apply(&ModelEdit::OpenProject { repository: old.clone(), name: "Original".into(), kind: ProjectKind::Folder }).unwrap();
+        registry.apply(&ModelEdit::SeedView { scope: Scope::Worktree { repository: old.clone(), path: old.clone() }, panes: vec![Pane { id: CardId::new(), title: "Owned native fixture".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: CardKind::Chat(source.clone()), scope: Some(old.clone()) }], closed: Vec::new() }).unwrap();
+        if let Some(identity) = identity { registry.bind_session_location(&HostedSession::Chat(source.clone()), None, &old, identity).unwrap(); }
+        let mut state = HostState::new(proof);
+        state.install_model(registry);
+        state.chats.insert(source.id, Record { execution_instance: uuid::Uuid::new_v4(), console_recipe: None, paired_terminal: None, session: source.clone(), handle: handle.clone(), source_process: None, subscribers: BTreeMap::new(), observations: BTreeMap::new(), completion_observed: false, returning_terminal: false });
+        Fixture { _directory: directory, host: Arc::new(HostLock::new(state)), handle, source, old, moved, calls }
+    }
+    fn locate(fixture: &Fixture) -> WorkspaceModel {
+        let request = ClientRequest::EditWorkspaceModel { edit: ModelEdit::RelocateProject { relocation: Relocation { repository: fixture.old.clone(), destination: fixture.moved.clone(), old_root: fixture.old.clone(), new_root: fixture.moved.clone() } } };
+        let response = super::super::client::process_request(&fixture.host, 1, request).unwrap().0;
+        let ServerResponse::WorkspaceModel { model } = response else { panic!("expected verified model") }; model
+    }
+
+    #[test]
+    fn locate_keeps_fresh_and_legacy_owned_native_processes_and_immutable_recipes() {
+        for pinned in [true, false] {
+            let fixture = fixture(pinned);
+            let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&fixture.old).unwrap());
+            std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+            std::fs::create_dir(&fixture.old).unwrap();
+            let model = locate(&fixture);
+            assert!(model.session_location_refusals.is_empty());
+            assert_eq!(model.projects[0].repository, fixture.moved);
+            let state = fixture.host.lock().unwrap();
+            let record = &state.chats[&fixture.source.id];
+            assert!(record.handle.same_actor(&fixture.handle));
+            assert_eq!(record.session, fixture.source);
+            drop(state);
+            let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+            let saved = registry.lock().unwrap().session_location(&HostedSession::Chat(fixture.source.clone())).unwrap().unwrap();
+            assert_eq!(saved.directory, fixture.moved);
+            assert_eq!(saved.approved, Some(identity));
+            fixture.handle.command_for_run(crate::model::RunId::new(), chat::Command::Prompt { text: "follow-up after Locate".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
+            assert_eq!(*fixture.calls.lock().unwrap(), vec![fixture.moved.clone()]);
+            assert!(fixture.old.is_dir());
+        }
+    }
+
+    #[test]
+    fn locate_replacement_folder_retains_provider_and_returns_actionable_refusal() {
+        let fixture = fixture(true);
+        let retained = fixture._directory.path().join("actual-provider-folder");
+        std::fs::rename(&fixture.old, retained).unwrap();
+        std::fs::create_dir(&fixture.old).unwrap();
+        std::fs::create_dir(&fixture.moved).unwrap();
+        let model = locate(&fixture);
+        assert_eq!(model.projects[0].repository, fixture.moved);
+        assert_eq!(model.session_location_refusals.len(), 1);
+        assert_eq!(model.session_location_refusals[0].session, fixture.source.id);
+        assert!(model.session_location_refusals[0].reason.contains("different directory"));
+        assert!(!fixture.handle.is_completed(), "Locate never stops the original provider");
+        assert!(fixture.handle.command(chat::Command::Prompt { text: "must not enter replacement".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).is_err());
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
+        assert!(fixture.moved.is_dir());
+    }
+}
