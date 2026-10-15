@@ -146,8 +146,9 @@ use crate::{
 /// Version 78 carries terminal provider outcomes and readable exit diagnostics.
 /// Version 79 pages immutable retained provider output by opaque log identity.
 /// Version 80 composes explicit terminal history byte budgets with provider
-/// outcomes and retained diagnostic output. Use matched executables.
-pub const PROTOCOL_VERSION: u16 = 80;
+/// outcomes, retained diagnostic output and stable history anchors. Use matched
+/// executables.
+pub const PROTOCOL_VERSION: u16 = 81;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -577,6 +578,8 @@ pub enum TerminalScroll {
     Top,
     Bottom,
     Row(u64),
+    /// A search range is rebased against the terminal's current history origin.
+    Match(super::SearchMatch),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2056,6 +2059,7 @@ mod tests {
         let next = RenderSnapshot {
             generation: 2,
             scroll: ScrollSnapshot {
+                history: Default::default(),
                 total: 100,
                 offset: 40,
                 len: 1,

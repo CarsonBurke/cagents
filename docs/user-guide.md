@@ -540,7 +540,11 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
-Press Ctrl+F in a terminal to search its output, including scrollback. Completed
+Press Ctrl+F in a terminal to search its output, including scrollback. Selection and find ranges follow retained output when old history is pruned.
+If selected text has left history, a short notice clears the selection and copy
+asks you to select again. Resetting the terminal or resizing its grid also
+invalidates ranges whose coordinates can no longer be proved.
+ Completed
 terminals keep read-only search, scrolling, selection and copying without keeping
 their process alive. Completed history is bounded to 8 MiB per terminal, including
 text, cell coordinates, colors and links. If older rows exceed this limit, a

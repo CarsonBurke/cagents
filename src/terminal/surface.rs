@@ -135,6 +135,10 @@ impl TerminalSurface {
     pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
         self.handle.scroll_to_row(row)
     }
+    pub fn scroll_to_match(&self, range: super::SearchMatch) -> Result<(), TerminalSendError> {
+        self.handle.scroll_to_match(range)
+    }
+
     pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
         self.handle.clear_scrollback()
     }

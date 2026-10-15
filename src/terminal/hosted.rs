@@ -1057,6 +1057,10 @@ impl HostedTerminalHandle {
         self.try_command(ClientCommand::Scroll(TerminalScroll::Row(row)))
     }
 
+    pub fn scroll_to_match(&self, range: super::SearchMatch) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::Scroll(TerminalScroll::Match(range)))
+    }
+
     pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::SetTheme(theme))
     }

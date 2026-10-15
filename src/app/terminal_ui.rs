@@ -45,6 +45,7 @@ mod tests {
             7,
             "needle".into(),
             vec![crate::terminal::SearchMatch {
+                history: Default::default(),
                 start_row: 12,
                 start_column: 0,
                 end_row: 12,
@@ -141,6 +142,7 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
         let matched = |row| crate::terminal::SearchMatch {
+            history: Default::default(),
             start_row: row,
             start_column: 0,
             end_row: row,
@@ -333,6 +335,7 @@ struct SearchContent {
     columns: u16,
     rows: u16,
     total: u64,
+    history: crate::terminal::HistoryPosition,
     alternate_screen: bool,
 }
 
@@ -343,6 +346,7 @@ impl SearchContent {
             columns: snapshot.columns,
             rows: snapshot.rows,
             total: snapshot.scroll.total,
+            history: snapshot.scroll.history,
             alternate_screen: snapshot.scroll.alternate_screen,
         }
     }
@@ -553,13 +557,19 @@ impl Cagents {
             }
             Action::Next(_, backwards) => {
                 find.focused = true;
+                let origin = handle.snapshot().scroll.history;
+                let previous = find.matches.get(find.selected).and_then(|found| found.rebase(origin));
+                let matches: Vec<_> = find.matches.iter().filter_map(|found| found.rebase(origin)).collect();
+                find.selected = previous.and_then(|previous| matches.iter().position(|found| *found == previous))
+                    .unwrap_or(0);
+                find.matches = matches.into();
                 if !find.matches.is_empty() {
                     find.selected = if backwards {
                         (find.selected + find.matches.len() - 1) % find.matches.len()
                     } else {
                         (find.selected + 1) % find.matches.len()
                     };
-                    let _ = handle.scroll_to_row(find.matches[find.selected].start_row);
+                    let _ = handle.scroll_to_match(find.matches[find.selected]);
                 }
                 return iced::widget::operation::focus(input_id(card)).map(cosmic::Action::App);
             }
@@ -625,7 +635,9 @@ impl Cagents {
         if !find.open || find.request != request || find.query != query {
             return;
         }
-        let previous = find.matches.get(find.selected).copied();
+        let previous = find.matches.get(find.selected).copied().and_then(|previous| {
+            matches.first().and_then(|found| previous.rebase(found.history))
+        });
         let background = std::mem::take(&mut find.background_results);
         let selected = background
             .then(|| previous.and_then(|previous| matches.iter().position(|item| *item == previous)))
@@ -644,7 +656,9 @@ impl Cagents {
             && let Some(first) = find.matches.first()
             && let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
         {
-            let _ = handle.scroll_to_row(first.start_row);
+            if let Some(first) = first.rebase(handle.snapshot().scroll.history) {
+                let _ = handle.scroll_to_match(first);
+            }
         }
     }
 

@@ -221,6 +221,8 @@ pub enum TerminalSendError {
     Full,
     #[error("terminal worker has closed")]
     Closed,
+    #[error("Output moved; selection cleared. Select again to copy.")]
+    SelectionMoved,
     /// Text larger than the daemon takes as one paste, refused before it is
     /// sent: a request that large would not fit in a frame, and losing the
     /// connection over it would lose the paste without a word.

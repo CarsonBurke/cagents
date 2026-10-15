@@ -211,9 +211,33 @@ pub struct CursorSnapshot {
     pub blinking: bool,
 }
 
+/// Coordinate origin for history rows. Dropped counts advance while a tracked
+/// row survives; an epoch changes when the whole origin is replaced (reset,
+/// reflow, or a batch that prunes every previously existing row).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryPosition {
+    pub epoch: u64,
+    pub dropped: u64,
+}
+
+impl HistoryPosition {
+    pub fn rebase_row(self, row: u64, captured: Self) -> Option<u64> {
+        if self.epoch != captured.epoch { return None; }
+        row.checked_sub(self.dropped.checked_sub(captured.dropped)?)
+    }
+
+    #[cfg(feature = "host")]
+    pub(super) fn invalidate(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+        self.dropped = 0;
+    }
+}
+
 /// Ghostty's exact viewport position, captured only with visible snapshots.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScrollSnapshot {
+    #[serde(default)]
+    pub history: HistoryPosition,
     pub total: u64,
     pub offset: u64,
     pub len: u64,
@@ -308,6 +332,7 @@ impl VisualResources {
     ) -> Result<Option<Arc<RenderSnapshot>>, libghostty_vt::Error> {
         let scrollbar = terminal.scrollbar()?;
         let scroll = ScrollSnapshot {
+            history: HistoryPosition::default(),
             total: scrollbar.total,
             offset: scrollbar.offset,
             len: scrollbar.len,

@@ -201,6 +201,7 @@ pub(super) struct History {
 pub(super) struct Source {
     rows: Arc<[Row]>,
     columns: u16,
+    history: crate::terminal::HistoryPosition,
 }
 
 impl History {
@@ -208,7 +209,7 @@ impl History {
     /// The budget accounts for owned capacities, including indices and styles.
     pub(super) fn capture(
         terminal: &mut Terminal<'static, 'static>,
-        _base: &RenderSnapshot,
+        previous: &RenderSnapshot,
         budget: usize,
     ) -> Result<Self, String> {
         let scroll = terminal.scrollbar().map_err(|e| e.to_string())?;
@@ -257,6 +258,8 @@ impl History {
             base.lines = Arc::from([]);
             base.cursor = None;
             base.activity = None;
+            base.scroll.history = previous.scroll.history;
+            base.scroll.history.dropped = base.scroll.history.dropped.saturating_add(omitted);
             base.scroll.total = rows.len() as u64;
             base.scroll.len = u64::from(base.rows).min(base.scroll.total);
             base.scroll.offset = scroll
@@ -365,6 +368,7 @@ impl History {
         self.rows = self.rows[first..].to_vec().into();
         self.meaningful_end = self.meaningful_end.saturating_sub(first);
         self.active_start = self.active_start.saturating_sub(first as u64);
+        self.base.scroll.history.dropped = self.base.scroll.history.dropped.saturating_add(first as u64);
         self.base.scroll.total = self.rows.len() as u64;
         self.base.scroll.len = self.base.scroll.total;
         self.base.scroll.offset = 0;
@@ -392,10 +396,15 @@ impl History {
         self.base.background = background;
     }
 
+    pub(super) fn position(&self) -> crate::terminal::HistoryPosition {
+        self.base.scroll.history
+    }
+
     pub(super) fn source(&self) -> Source {
         Source {
             rows: self.rows.clone(),
             columns: self.base.columns,
+            history: self.base.scroll.history,
         }
     }
 }
@@ -420,10 +429,13 @@ impl Source {
                 break;
             }
         }
-        Some(matcher.results())
+        let (mut matches, truncated) = matcher.results();
+        for found in &mut matches { found.history = self.history; }
+        Some((matches, truncated))
     }
 
     pub(super) fn copy(&self, range: SearchMatch) -> Result<String, String> {
+        let range = range.rebase(self.history).ok_or_else(|| "Output moved; select again".to_owned())?;
         let unavailable = || "The selected terminal output is no longer available".to_owned();
         if range.start_row > range.end_row
             || range.end_row >= self.rows.len() as u64
@@ -564,6 +576,7 @@ mod tests {
         }
         let total = terminal.scrollbar().unwrap().total;
         let range = SearchMatch {
+            history: Default::default(),
             start_row: 0,
             start_column: 0,
             end_row: total - 1,
@@ -575,6 +588,7 @@ mod tests {
         );
         for row in 0..total {
             let range = SearchMatch {
+                history: Default::default(),
                 start_row: row,
                 start_column: 0,
                 end_row: row,

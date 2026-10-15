@@ -30,7 +30,7 @@ pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
 };
 pub use snapshot::{
-    CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
+    CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, HistoryPosition, RenderSnapshot, Rgb,
     RowSnapshot, ScrollSnapshot, Underline,
 };
 #[cfg(feature = "ui")]

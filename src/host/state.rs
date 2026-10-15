@@ -3711,6 +3711,11 @@ pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
             "the terminal worker has closed",
             true,
         ),
+        TerminalSendError::SelectionMoved => ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Output moved; select again",
+            false,
+        ),
         TerminalSendError::PasteTooLarge(bytes) => ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
             format!(

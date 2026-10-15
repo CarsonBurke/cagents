@@ -624,6 +624,12 @@ struct Selection {
 }
 
 impl Selection {
+    fn rebase(mut self, captured: super::HistoryPosition, current: super::HistoryPosition) -> Option<Self> {
+        self.anchor.row = current.rebase_row(self.anchor.row, captured)?;
+        self.head.row = current.rebase_row(self.head.row, captured)?;
+        Some(self)
+    }
+
     fn new(cell: SelectionCell, mode: SelectionMode) -> Self {
         Self {
             anchor: cell,
@@ -984,6 +990,20 @@ impl PtySize {
     }
 }
 
+impl WidgetState {
+    /// Returns true only when an existing selection lost its anchored text.
+    fn rebase_history(&mut self, current: super::HistoryPosition) -> bool {
+        let had_selection = self.selection.is_some();
+        if self.history_position != current {
+            self.selection = self.selection.and_then(|selection| selection.rebase(self.history_position, current));
+        }
+        self.history_position = current;
+        let cleared = had_selection && self.selection.is_none();
+        if cleared { self.selecting = false; self.selection_click = None; }
+        cleared
+    }
+}
+
 #[derive(Default)]
 struct WidgetState {
     a11y: RefCell<accessibility::State>,
@@ -994,6 +1014,7 @@ struct WidgetState {
     observed_review_revision: Option<u64>,
     observed_review_identity: Option<crate::model::TerminalId>,
     history_total: u64,
+    history_position: super::HistoryPosition,
     completed_read_only: bool,
     shortcut_keys: Vec<keyboard::key::Physical>,
     select_all_request: u64,
@@ -1914,6 +1935,7 @@ impl<Message> TerminalWidget<Message> {
     fn selected_range(&self, state: &WidgetState) -> Option<super::SearchMatch> {
         let (start, end) = state.selection?.span(self.selection_grid());
         Some(super::SearchMatch {
+            history: self.snapshot.scroll.history,
             start_row: start.row,
             start_column: start.column,
             end_row: end.row,
@@ -2362,7 +2384,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             shell.request_redraw();
             return;
         }
-        if self.snapshot.scroll.total < state.history_total
+        if state.rebase_history(self.snapshot.scroll.history) {
+            self.publish_error(TerminalSendError::SelectionMoved, shell);
+        }
+        if (self.snapshot.scroll.total < state.history_total && state.selection.is_none())
             || (self.read_only && !state.completed_read_only)
             || self.selection_reset != state.selection_reset
         {
@@ -3007,11 +3032,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // gains the accent behind it.
                 if let Some((matches, selected)) = &self.find_matches {
                     let offset = self.snapshot.scroll.offset;
-                    let first = matches.partition_point(|hit| hit.end_row < offset);
+                    let origin = self.snapshot.scroll.history;
+                    let first = matches.partition_point(|hit|
+                        hit.rebase(origin).is_none_or(|hit| hit.end_row < offset));
                     for (index, hit) in matches
                         .iter()
                         .enumerate()
                         .skip(first)
+                        .filter_map(|(index, hit)| hit.rebase(origin).map(|hit| (index, hit)))
                         .take_while(|(_, hit)| hit.start_row < offset + rows.len() as u64)
                     {
                         for absolute in hit.start_row.max(offset)
@@ -4019,6 +4047,7 @@ mod tests {
             height: 300.0,
         };
         let scroll = super::super::ScrollSnapshot {
+            history: Default::default(),
             total: 100,
             offset: 40,
             len: 20,
@@ -4030,6 +4059,7 @@ mod tests {
             TerminalScrollbar::new(
                 bounds,
                 super::super::ScrollSnapshot {
+                    history: Default::default(),
                     alternate_screen: true,
                     ..scroll
                 },
@@ -4040,6 +4070,7 @@ mod tests {
             TerminalScrollbar::new(
                 bounds,
                 super::super::ScrollSnapshot {
+                    history: Default::default(),
                     total: 20,
                     ..scroll
                 },
@@ -4049,6 +4080,7 @@ mod tests {
         // An unfocused terminal paints its rail only while scrolled back, so a
         // card left in history says so and a live one stays clean.
         let live = super::super::ScrollSnapshot {
+            history: Default::default(),
             offset: scroll.max_offset(),
             ..scroll
         };
@@ -4383,6 +4415,7 @@ mod tests {
                     padding,
                 );
                 let scroll = super::super::ScrollSnapshot {
+                    history: Default::default(),
                     total: 100,
                     offset: 80,
                     len: 20,
@@ -4427,6 +4460,7 @@ mod tests {
     #[test]
     fn scrollbar_tiny_viewport_keeps_thumb_and_drag_inside_track() {
         let scroll = super::super::ScrollSnapshot {
+            history: Default::default(),
             total: 100,
             offset: 80,
             len: 20,
@@ -5803,6 +5837,28 @@ mod tests {
     }
 
     #[test]
+    fn selection_stays_on_a_after_constant_total_pruning_and_notices_its_removal() {
+        let captured = super::super::HistoryPosition { epoch: 3, dropped: 100 };
+        let mut state = WidgetState {
+            history_total: 1000,
+            history_position: captured,
+            selection: Some(Selection::new(at(9, 0), SelectionMode::Character)),
+            ..WidgetState::default()
+        };
+        let current = super::super::HistoryPosition { epoch: 3, dropped: 102 };
+        assert!(!state.rebase_history(current));
+        assert_eq!(state.history_total, 1000, "total need not change when pruning");
+        let rows = vec![row("A"), row("B")];
+        let grid = selection_grid(&rows, 1);
+        assert_eq!(selection_text(grid, state.selection.unwrap().span(grid)), "A");
+        assert!(state.rebase_history(super::super::HistoryPosition { epoch: 3, dropped: 110 }),
+            "the update must publish the selection-moved notice");
+        assert!(state.selection.is_none());
+        assert!(!state.rebase_history(super::super::HistoryPosition { epoch: 3, dropped: 111 }),
+            "notice is emitted once");
+    }
+
+    #[test]
     fn a_selection_covers_the_same_span_whichever_way_it_was_dragged() {
         let rows = vec![row("first row"), row("second row"), row("third row")];
         let grid = selection_grid(&rows, 12);
@@ -6192,6 +6248,7 @@ mod tests {
     }
 
     const SCROLLBACK: ScrollSnapshot = ScrollSnapshot {
+        history: super::super::HistoryPosition { epoch: 0, dropped: 0 },
         total: 1000,
         offset: 500,
         len: 24,
@@ -6251,6 +6308,7 @@ mod tests {
         );
 
         let mut full_screen = ScrollPump::new(ScrollSnapshot {
+            history: Default::default(),
             alternate_screen: true,
             ..SCROLLBACK
         });
@@ -6262,6 +6320,7 @@ mod tests {
         );
 
         let mut tracked = ScrollPump::new(ScrollSnapshot {
+            history: Default::default(),
             mouse_tracking: true,
             bracketed_paste: false,
             ..SCROLLBACK
@@ -6274,6 +6333,7 @@ mod tests {
         // detents are three downward reports, in gesture order, none of it
         // deferred to a frame.
         let mut reporting = ScrollPump::new(ScrollSnapshot {
+            history: Default::default(),
             mouse_tracking: true,
             bracketed_paste: false,
             ..SCROLLBACK
@@ -6290,6 +6350,7 @@ mod tests {
         // Shift claims the gesture for the viewport even where the child is
         // reading the wheel, and then it coalesces like any other.
         let mut shifted = ScrollPump::new(ScrollSnapshot {
+            history: Default::default(),
             mouse_tracking: true,
             bracketed_paste: false,
             ..SCROLLBACK
@@ -6318,6 +6379,7 @@ mod tests {
         );
         for speed in [0.25, 4.0] {
             let mut reporting = ScrollPump::new(ScrollSnapshot {
+                history: Default::default(),
                 mouse_tracking: true,
                 bracketed_paste: false,
                 ..SCROLLBACK

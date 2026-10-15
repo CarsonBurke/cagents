@@ -103,6 +103,7 @@ enum Command {
     Mouse(MouseInput),
     ReadViewport {
         offset: Option<u64>,
+        history: super::HistoryPosition,
         rows: u16,
         reply: Sender<Result<Arc<RenderSnapshot>, String>>,
     },
@@ -559,9 +560,11 @@ impl PublishedState {
                     }
                     Command::ReadViewport {
                         offset,
+                        history: captured,
                         rows,
                         reply,
                     } => {
+                        let offset = offset.map(|row| history.position().rebase_row(row, captured).unwrap_or(0));
                         let _ = reply.send(Ok(history.snapshot_at(
                             offset,
                             rows,
@@ -835,6 +838,7 @@ impl TerminalHandle {
         &self,
         offset: Option<u64>,
         rows: u16,
+        history: super::HistoryPosition,
     ) -> Result<Arc<RenderSnapshot>, String> {
         let published = self.snapshot();
         if published.detached || published.rows == 0 {
@@ -849,6 +853,7 @@ impl TerminalHandle {
         let (reply, receive) = crossbeam_channel::bounded(1);
         self.try_command(Command::ReadViewport {
             offset,
+            history,
             rows,
             reply,
         })
@@ -1599,9 +1604,11 @@ struct Worker {
     visual: Option<VisualResources>,
     visibility: Visibility,
     generation: u64,
+    history_position: super::HistoryPosition,
     capture_dirty: bool,
     viewport_reads: Vec<(
         Option<u64>,
+        super::HistoryPosition,
         u16,
         Sender<Result<Arc<RenderSnapshot>, String>>,
     )>,
@@ -1970,6 +1977,7 @@ impl Worker {
             visual,
             visibility,
             generation: 0,
+            history_position: Default::default(),
             capture_dirty: false,
             viewport_reads: Vec::new(),
             force_capture: false,
@@ -2351,7 +2359,31 @@ impl Worker {
         let parse_started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
+        // A tracked reference follows the same existing row even when a full
+        // history prunes and appends while its total stays unchanged. Tracking
+        // the active bottom row avoids traversing the history to create a pin.
+        use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
+        let before_rows = self.terminal.total_rows().unwrap_or(0) as u64;
+        let marker = self.terminal.rows().ok().and_then(|rows| {
+            self.terminal.track_grid_ref(Point::Active(PointCoordinate {
+                x: 0, y: u32::from(rows.saturating_sub(1)),
+            })).ok()
+        });
+        let screen = self.terminal.active_screen().ok();
         self.terminal.vt_write(&bytes);
+        if screen != self.terminal.active_screen().ok() {
+            self.history_position.invalidate();
+        } else if let Some(point) = marker.as_ref()
+            .and_then(|pin| pin.point(PointSpace::Screen).ok().flatten())
+        {
+            self.history_position.dropped = self.history_position.dropped.saturating_add(
+                before_rows.saturating_sub(1).saturating_sub(u64::from(point.y)));
+        } else {
+            // No previous cell survives: an unknown number of newly-created
+            // rows may also have been pruned within this batch. A fresh epoch
+            // refuses all old anchors instead of inventing an exact offset.
+            self.history_position.invalidate();
+        }
         if let Some(started) = parse_started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "parse",
                 terminal_id = %self.terminal_id, bytes = bytes.len(),
@@ -2394,10 +2426,11 @@ impl Worker {
             }
             Command::ReadViewport {
                 offset,
+                history,
                 rows,
                 reply,
             } => {
-                self.viewport_reads.push((offset, rows, reply));
+                self.viewport_reads.push((offset, history, rows, reply));
                 if self.capture_dirty {
                     // This explicit next-frame request grants one capture
                     // credit. Waiting for its future ACK would deadlock.
@@ -2617,13 +2650,12 @@ impl Worker {
                 match super::search::search(&self.terminal, &query, case_sensitive, || {
                     latest.load(Ordering::Acquire) != request
                 }) {
-                    Ok(Some((matches, truncated))) => self.emit(TerminalEvent::SearchResults {
-                        owner,
-                        request,
-                        query,
-                        matches,
-                        truncated,
-                    }),
+                    Ok(Some((mut matches, truncated))) => {
+                        for found in &mut matches { found.history = self.history_position; }
+                        self.emit(TerminalEvent::SearchResults {
+                            owner, request, query, matches, truncated,
+                        });
+                    },
                     Ok(None) => {}
                     Err(error) => self.error("search terminal", error.to_string()),
                 }
@@ -2631,9 +2663,14 @@ impl Worker {
             Command::Hide => self.set_hidden(),
             Command::ClearScrollback => {
                 self.terminal.vt_write(b"\x1b[3J");
+                self.history_position.invalidate();
                 self.publish_snapshot(true);
             }
             Command::CopySelection { request, selection } => {
+                let Some(selection) = selection.rebase(self.history_position) else {
+                    self.error("copy terminal selection", "Output moved; select again".into());
+                    return false;
+                };
                 match super::search::selected_text(&self.terminal, selection) {
                     Ok(text) => self.emit(TerminalEvent::ClipboardText { request, text }),
                     Err(error) => self.error("copy terminal selection", error),
@@ -2745,6 +2782,7 @@ impl Worker {
             ) {
                 Ok(()) => {
                     self.applied_parser_size = size;
+                    self.history_position.invalidate();
                     // The parser ends an update when it resizes; the next one
                     // gets its own full hold.
                     self.synchronized_since = None;
@@ -2888,7 +2926,8 @@ impl Worker {
                 elapsed_ns = started.elapsed().as_nanos() as u64);
         }
         match captured {
-            Ok(Some(snapshot)) => {
+            Ok(Some(mut snapshot)) => {
+                Arc::make_mut(&mut snapshot).scroll.history = self.history_position;
                 self.capture_dirty = false;
                 self.force_capture = false;
                 self.generation = next_generation;
@@ -2908,7 +2947,8 @@ impl Worker {
             return;
         }
         let base = self.published.snapshot.load_full();
-        for (offset, rows, reply) in std::mem::take(&mut self.viewport_reads) {
+        for (offset, captured, rows, reply) in std::mem::take(&mut self.viewport_reads) {
+            let offset = offset.map(|row| self.history_position.rebase_row(row, captured).unwrap_or(0));
             let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -4540,6 +4580,7 @@ mod tests {
             .copy_selection(
                 request,
                 super::super::SearchMatch {
+                    history: Default::default(),
                     start_row: 0,
                     start_column: 0,
                     end_row: handle.snapshot().scroll.total - 1,
@@ -5487,6 +5528,7 @@ mod tests {
         assert!(worker.capture_dirty);
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
+            history: Default::default(),
             offset: Some(0),
             rows: 10,
             reply,
@@ -5514,6 +5556,7 @@ mod tests {
         worker.process_output(b"\x1b[?2026h\x1b[H\x1b[2Jpartial".to_vec());
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
+            history: Default::default(),
             offset: Some(0),
             rows: 10,
             reply,
@@ -6046,6 +6089,61 @@ mod tests {
         let started = std::time::Instant::now();
         handle.shutdown().unwrap();
         assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn history_origin_counts_rows_pruned_with_repeated_full_history() {
+        let (mut worker, _) = capture_worker_with(
+            shell_session("exit 0").launch,
+            TerminalConfig { max_scrollback_bytes: 100, ..TerminalConfig::default() },
+        );
+        for _ in 0..50 { worker.process_output(b"row\r\n".repeat(100)); }
+        let epoch = worker.history_position.epoch;
+        let initial = worker.history_position.dropped;
+        for _ in 0..50 {
+            let before_total = worker.terminal.scrollbar().unwrap().total;
+            let before_dropped = worker.history_position.dropped;
+            worker.process_output(b"row\r\n".repeat(100));
+            let after_total = worker.terminal.scrollbar().unwrap().total;
+            assert_eq!(worker.history_position.epoch, epoch);
+            assert_eq!(worker.history_position.dropped - before_dropped, before_total + 100 - after_total);
+        }
+        assert!(worker.history_position.dropped > initial);
+        present(&worker);
+        worker.publish_snapshot(true);
+        assert_eq!(worker.published.snapshot.load().scroll.history, worker.history_position);
+        worker.run();
+    }
+
+    #[test]
+    fn search_and_copy_rebase_surviving_text_and_refuse_pruned_text() {
+        let (mut worker, events) = capture_worker_with(
+            shell_session("exit 0").launch,
+            TerminalConfig { max_scrollback_bytes: 100, ..TerminalConfig::default() },
+        );
+        for _ in 0..50 { worker.process_output(b"row\r\n".repeat(100)); }
+        worker.process_output(b"ANCHOR\r\n".to_vec());
+        worker.handle_command(Command::Search {
+            owner: None, request: 1, query: "ANCHOR".into(), case_sensitive: true,
+            latest: Arc::new(AtomicU64::new(1)),
+        });
+        let matched = events.try_iter().find_map(|event| match event {
+            TerminalEvent::SearchResults { matches, .. } => matches.first().copied(),
+            _ => None,
+        }).unwrap();
+        for _ in 0..3 { worker.process_output(b"row\r\n".repeat(100)); }
+        let rebased = matched.rebase(worker.history_position).unwrap();
+        assert_eq!(super::super::search::selected_text(&worker.terminal, rebased).unwrap(), "ANCHOR");
+        let request = uuid::Uuid::new_v4();
+        worker.handle_command(Command::CopySelection { request, selection: matched });
+        assert!(events.try_iter().any(|event| matches!(event,
+            TerminalEvent::ClipboardText { text, .. } if text == "ANCHOR")));
+        for _ in 0..50 { worker.process_output(b"row\r\n".repeat(100)); }
+        assert!(matched.rebase(worker.history_position).is_none());
+        worker.handle_command(Command::CopySelection { request, selection: matched });
+        assert!(events.try_iter().any(|event| matches!(event,
+            TerminalEvent::Error { message, .. } if message == "Output moved; select again")));
+        worker.run();
     }
 
     #[test]
