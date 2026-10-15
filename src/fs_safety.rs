@@ -417,26 +417,12 @@ pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, Reso
     resolve_directory(root, relative)
 }
 
-/// Creates one directory while retaining whether this call created it. A
-/// recovery caller can preserve newer directories' permissions unchanged.
-pub fn create_directory_beneath(
-    root: &Root,
-    relative: &Path,
-    mode: u32,
-) -> Result<(Root, bool), ResolveError> {
-    let (parent, name) = open_parent_beneath(root, relative)?;
-    let leaf = c_component(&name, &parent.path)?;
-    // SAFETY: the held parent and C leaf remain live through mkdirat.
-    let result = unsafe { libc::mkdirat(parent.descriptor(), leaf.as_ptr(), mode) };
-    let created = result == 0;
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(ResolveError::io(&parent.path.join(&name), &error));
-        }
-    }
-    Ok((resolve_directory(&parent, Path::new(&name))?, created))
-}
+#[path = "fs_safety/directory_creation.rs"]
+mod directory_creation;
+pub use directory_creation::{
+    DirectoryCreation, DirectoryNamespace, DirectoryPublication, DirectoryRecovery, create_directory_beneath,
+    create_directory_in_namespace,
+};
 
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to
 /// fchmod; Linux's descriptor link pins the same inode without re-resolving
