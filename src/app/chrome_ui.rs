@@ -434,11 +434,20 @@ mod tests {
     fn notice_details_and_affected_conversations_are_keyboard_reachable() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        app.notices.record(TransientNotice::error("Conversation interrupted").targets([card]));
+        app.notices
+            .record(TransientNotice::error("Conversation interrupted").targets([card]));
         let id = app.notices.recent().next().unwrap().id;
-        assert!(app.popup_focus_ring(Popup::Notices).iter().any(|item| item.as_ref() == notice_details_id(id)));
+        assert!(
+            app.popup_focus_ring(Popup::Notices)
+                .iter()
+                .any(|item| item.as_ref() == notice_details_id(id))
+        );
         drop(app.update(Message::ToggleNoticeDetails(id)));
-        assert!(app.popup_focus_ring(Popup::Notices).iter().any(|item| item.as_ref() == notice_target_id(id, card)));
+        assert!(
+            app.popup_focus_ring(Popup::Notices)
+                .iter()
+                .any(|item| item.as_ref() == notice_target_id(id, card))
+        );
     }
 
     #[test]
@@ -764,8 +773,12 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
         })
     }
 }
@@ -863,8 +876,12 @@ mod tab_style_tests {
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
 
-fn notice_details_id(id: u64) -> String { format!("chrome.notices.details.{id}") }
-fn notice_target_id(id: u64, card: CardId) -> String { format!("chrome.notices.target.{id}.{card}") }
+fn notice_details_id(id: u64) -> String {
+    format!("chrome.notices.details.{id}")
+}
+fn notice_target_id(id: u64, card: CardId) -> String {
+    format!("chrome.notices.target.{id}.{card}")
+}
 
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
@@ -953,8 +970,17 @@ impl Cagents {
                     if entry.notice.details.is_some() || !entry.notice.targets.is_empty() {
                         ring.push(Cow::Owned(notice_details_id(entry.id)));
                         if entry.details_open {
-                            ring.extend(entry.notice.targets.iter().filter(|card| self.card_state(**card).is_some_and(|state| state.existence.is_open()))
-                                .map(|card| Cow::Owned(notice_target_id(entry.id, *card))));
+                            ring.extend(
+                                entry
+                                    .notice
+                                    .targets
+                                    .iter()
+                                    .filter(|card| {
+                                        self.card_state(**card)
+                                            .is_some_and(|state| state.existence.is_open())
+                                    })
+                                    .map(|card| Cow::Owned(notice_target_id(entry.id, *card))),
+                            );
                         }
                     }
                     ring.push(Cow::Owned(notice_dismiss_id(entry.id)));
@@ -1410,23 +1436,46 @@ impl Cagents {
                     } else {
                         super::notice_body(&entry.notice.message)
                     };
-                    let body = if entry.notice.details.is_some() || !entry.notice.targets.is_empty() {
-                        let mut children = vec![body,
-                            crate::ui_controls::button::secondary(if entry.details_open { "Hide details" } else { "Details" })
-                                .on_press(Message::ToggleNoticeDetails(entry.id))
-                                .id(widget::Id::new(notice_details_id(entry.id))).into()];
+                    let body = if entry.notice.details.is_some() || !entry.notice.targets.is_empty()
+                    {
+                        let mut children = vec![
+                            body,
+                            crate::ui_controls::button::secondary(if entry.details_open {
+                                "Hide details"
+                            } else {
+                                "Details"
+                            })
+                            .on_press(Message::ToggleNoticeDetails(entry.id))
+                            .id(widget::Id::new(notice_details_id(entry.id)))
+                            .into(),
+                        ];
                         if entry.details_open {
-                            if let Some(details) = &entry.notice.details { children.push(super::notice_body(details)); }
+                            if let Some(details) = &entry.notice.details {
+                                children.push(super::notice_body(details));
+                            }
                             for card in &entry.notice.targets {
-                                if let Some(state) = self.card_state(*card).filter(|state| state.existence.is_open()) {
-                                    children.push(crate::ui_controls::button::secondary(format!("Open {}", self.card_display_title(state)))
+                                if let Some(state) = self
+                                    .card_state(*card)
+                                    .filter(|state| state.existence.is_open())
+                                {
+                                    children.push(
+                                        crate::ui_controls::button::secondary(format!(
+                                            "Open {}",
+                                            self.card_display_title(state)
+                                        ))
                                         .on_press(Message::ChromeUi(Action::FocusNoticeCard(*card)))
-                                        .id(widget::Id::new(notice_target_id(entry.id, *card))).into());
+                                        .id(widget::Id::new(notice_target_id(entry.id, *card)))
+                                        .into(),
+                                    );
                                 }
                             }
                         }
-                        widget::column::with_children(children).spacing(space::XS).into()
-                    } else { body };
+                        widget::column::with_children(children)
+                            .spacing(space::XS)
+                            .into()
+                    } else {
+                        body
+                    };
                     notices.push(super::notice_surface(
                         entry.notice.severity,
                         body,
