@@ -20852,8 +20852,30 @@ mod tests {
             widget::Id::new("dialog.pull-request.head"),
             widget::Id::new("dialog.pull-request.base"),
         ] {
-            let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), id);
-            assert!(matches!(message, Message::SubmitPullRequest));
+            let (messages, _) = dialog_ui::tests::key_control(
+                app.dialog().unwrap(),
+                id,
+                dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::SubmitPullRequest))
+                    .count(),
+                1
+            );
+            // Native text_editor::unfocus queues ClearSelection. Focusing any
+            // single-line field flushes that pending edit on the next event.
+            assert!(
+                messages.iter().all(|message| matches!(
+                    message,
+                    Message::SubmitPullRequest
+                        | Message::PullRequestBodyChanged(
+                            widget::text_editor::Action::ClearSelection
+                        )
+                )),
+                "unexpected Enter callbacks: {messages:?}"
+            );
         }
     }
 
