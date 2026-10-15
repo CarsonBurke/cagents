@@ -2068,7 +2068,7 @@ fn close_sessions_in_scope(
                 })
         } else {
             client
-                .close_terminal_checked(id, true)
+                .close_terminal_source_checked(terminal.session, terminal.execution_instance, true)
                 .map_err(|error| error.to_string())
                 .and_then(|outcome| match outcome {
                     crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
