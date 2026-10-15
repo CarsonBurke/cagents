@@ -36,7 +36,7 @@ pub struct TerminalConfig {
     /// Private matched control-view executable; never an issued recipe field.
     #[cfg(feature = "host")]
     #[doc(hidden)]
-    pub execution_program: Option<std::sync::Arc<super::execution_program::MatchedCli>>,
+    pub execution_program: Option<std::sync::Arc<super::execution_program::AuthorizedCli>>,
     /// Private setup authority, retained by the holder until family cleanup.
     #[cfg(feature = "host")]
     pub setup_execution_lease: Option<std::sync::Arc<std::fs::File>>,

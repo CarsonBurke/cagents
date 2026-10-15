@@ -11,6 +11,8 @@ mod notifications;
 mod service;
 mod state;
 
+pub(crate) use agent_execution::console_mapping::ConsoleProgramAuthorization;
+
 use std::{
     fs, io,
     net::Shutdown,

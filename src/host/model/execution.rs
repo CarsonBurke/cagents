@@ -1586,6 +1586,49 @@ mod tests {
     }
 
     #[test]
+    fn private_console_mapping_requires_exact_accepted_binding_and_retained_capability() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let HostedSession::Chat(mut source) = source() else { unreachable!() };
+        let recipe = crate::model::LaunchRecipe {
+            program: "/versions/old/bin/cagents".into(),
+            arguments: vec!["agent".into(), "console".into(), accepted.agent.id.to_string()],
+            working_directory: source.launch.recipe.working_directory.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let console = crate::model::TerminalSession {
+            id: source.id,
+            launch: recipe.clone(),
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+        };
+        source.terminal = Some(console.clone());
+        let hosted = HostedSession::Chat(source.clone());
+        registry.bind_agent(accepted.agent.id, None, hosted.clone()).unwrap();
+        registry.bind_agent_console(accepted.agent.id, &hosted, console.clone()).unwrap();
+        let authority = registry.register_agent_authority(&hosted).unwrap();
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let authorization = crate::host::ConsoleProgramAuthorization::capture(registry.clone(), &source, &console).unwrap();
+        authorization.validate_spawn(console.id, &console.launch, &authority).unwrap();
+        let mut arbitrary = console.launch.clone();
+        arbitrary.program = "/bin/sleep".into();
+        assert!(authorization.validate_spawn(console.id, &arbitrary, &authority).is_err());
+        assert!(authorization.validate_spawn(crate::model::TerminalId::new(), &console.launch, &authority).is_err());
+        assert!(authorization.validate_spawn(console.id, &console.launch, &Authority::default()).is_err());
+        let mut unrelated = source.clone();
+        unrelated.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(crate::host::ConsoleProgramAuthorization::capture(registry.clone(), &unrelated, &console).is_err());
+        registry.lock().unwrap().retire_agent_authority(&hosted).unwrap();
+        assert!(authorization.revalidate().is_err(), "retired permission cannot be used after the executable probe");
+        assert_eq!(registry.lock().unwrap().agent(accepted.agent.id).unwrap().spec, accepted.agent.spec);
+    }
+
+    #[test]
     fn authority_retirement_and_proved_successor_are_exact_source_fenced() {
         let (mut registry, _directory, _) = fixture();
         let source = source();

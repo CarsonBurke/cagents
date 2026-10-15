@@ -1816,7 +1816,7 @@ impl Worker {
                 || config.agent_authority.token().is_none() {
                 return Err("A private matched executable is allowed only for a new authenticated provider-console view".into());
             }
-            program.validate()?;
+            program.validate_spawn(&session,&config.agent_authority)?;
         }
         for name in crate::account::launch_credential_overrides(&session.launch) {
             command.env_remove(name);
@@ -1903,7 +1903,7 @@ impl Worker {
                         config.holder_recovery.clone(),
                         config.execution_directory.clone(),
                         config.setup_execution_lease.clone(),
-                        config.execution_program.clone(),
+                        config.execution_program.as_ref().map(|program|program.pin()),
                     )?,
                     Vec::new(),
                 )

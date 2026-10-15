@@ -18,6 +18,7 @@ use std::{
 };
 
 mod account_info;
+pub(super) mod console_mapping;
 mod directory;
 pub(super) mod mailbox;
 mod ownership;

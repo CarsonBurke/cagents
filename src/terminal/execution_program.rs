@@ -27,12 +27,31 @@ pub(crate) struct Descriptor {file:FileIdentity,digest:[u8;32],build:crate::cons
 
 #[derive(Debug)]
 pub(crate) struct MatchedCli {file:Arc<File>,descriptor:Descriptor}
+
+#[derive(Debug)]
+pub(crate) struct AuthorizedCli {
+    pin:Arc<MatchedCli>,
+    authorization:crate::host::ConsoleProgramAuthorization,
+}
+impl AuthorizedCli {
+    pub(crate) fn capture(authorization:crate::host::ConsoleProgramAuthorization)->Result<Arc<Self>,String> {
+        authorization.revalidate()?;
+        let pin=MatchedCli::current()?;
+        authorization.revalidate()?;
+        Ok(Arc::new(Self {pin,authorization}))
+    }
+    pub(super) fn validate_spawn(&self,session:&crate::model::TerminalSession,authority:&crate::agent_execution::Authority)->Result<(),String> {
+        self.authorization.validate_spawn(session.id,&session.launch,authority)?;
+        self.pin.validate()
+    }
+    pub(super) fn pin(&self)->Arc<MatchedCli> {self.pin.clone()}
+}
 impl MatchedCli {
     #[cfg(test)]
     pub(crate) fn capture_for_test(path:&Path)->Result<Self,String> {Self::capture(path)}
     /// Call outside HostLock and before any predecessor teardown. One captured
     /// file/probe is shared across all consoles in this exact daemon image.
-    pub(crate) fn current()->Result<Arc<Self>,String> {
+    fn current()->Result<Arc<Self>,String> {
         static CURRENT:OnceLock<Mutex<Option<Arc<MatchedCli>>>>=OnceLock::new();
         let mut current=CURRENT.get_or_init(||Mutex::new(None)).lock().unwrap_or_else(|p|p.into_inner());
         if let Some(pin)=current.as_ref() {pin.validate()?;return Ok(pin.clone());}
