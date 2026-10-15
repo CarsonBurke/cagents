@@ -378,6 +378,12 @@ impl RemoteActor {
         if let Some(snapshot)=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {return (after!=Some(snapshot.generation)).then(||snapshot.as_ref().clone());}
         self.call("snapshot",json!([after])).ok().flatten()
     }
+    pub fn pinned_directory(&self,candidate:&std::path::Path)->Result<Arc<ExecutionContext>,String> {
+        let identity:crate::agent_execution::DirectoryIdentity=self.call("pinned_directory",Value::Null)?;
+        let context=Arc::new(ExecutionContext::capture(candidate)?);
+        if context.directory_identity()?!=Some(identity) {return Err("The retained actor's original directory was replaced; approval cannot transfer to this folder".into());}
+        Ok(context)
+    }
     pub fn capture_directory(&self,candidate:&std::path::Path)->Result<super::DirectoryProof,String> {
         let proof:DirectoryEvidence=self.call("capture_directory",json!([candidate]))?;
         if proof.process!=self.0.identity.record.root || proof.path!=candidate {return Err("Retained provider directory evidence changed process or candidate".into());}
@@ -585,6 +591,7 @@ impl Server {
             "exit_output"=>{let (id,offset)=decode!((String,u64));value!(self.actor.provider_exit_output(&id,offset)?)},
             "visible"=>{let (visible,)=decode!((bool,));self.actor.set_visible(visible);Ok(Value::Null)},
             "observe"=>{self.actor.observe_next_update();Ok(Value::Null)},
+            "pinned_directory"=>value!(self.actor.pinned_directory_identity()?),
             "capture_directory"=>{let (candidate,)=decode!((PathBuf,));let proof=self.actor.capture_execution_directory(&candidate)?;value!(DirectoryEvidence {process:proof.process,identity:proof.identity,path:proof.path})},
             "relocate_directory"=>{let (candidate,)=decode!((PathBuf,));self.actor.relocate_execution_directory(&candidate)?;self.changed.fetch_add(1,Ordering::Release);Ok(Value::Null)},
             "readiness"=>value!(self.actor.check_update_readiness()?),

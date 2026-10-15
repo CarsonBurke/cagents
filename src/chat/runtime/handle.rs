@@ -54,6 +54,7 @@ impl Handle {
     pub fn command(&self,command:Command)->Result<(),String> {self.try_command(command).map_err(String::from)}
     pub(crate) fn try_command(&self,command:Command)->Result<(),Rejection> {match &self.0 {Owner::Local(local)=>local.try_command(command),Owner::Remote(remote)=>remote.submit(None,command)}}
     pub(crate) fn command_for_run(&self,run:crate::model::RunId,command:Command)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.command_for_run(run,command),Owner::Remote(remote)=>remote.submit(Some(run),command).map_err(String::from)}}
+    pub(crate) fn pinned_execution_directory(&self,candidate:&std::path::Path)->Result<std::sync::Arc<super::super::protocol::ExecutionContext>,String> {match &self.0 {Owner::Local(local)=>local.pinned_execution_directory(candidate),Owner::Remote(remote)=>remote.pinned_directory(candidate)}}
     pub(crate) fn capture_execution_directory(&self,candidate:&std::path::Path)->Result<super::DirectoryProof,String> {match &self.0 {Owner::Local(local)=>local.capture_execution_directory(candidate),Owner::Remote(remote)=>remote.capture_directory(candidate)}}
     pub(crate) fn relocate_execution_directory(&self,candidate:&std::path::Path)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.relocate_execution_directory(candidate),Owner::Remote(remote)=>remote.relocate_directory(candidate)}}
     pub(crate) fn close_observation(&self)->super::CloseObservation {match &self.0 {Owner::Local(local)=>local.close_observation(),Owner::Remote(remote)=>remote.state().close.clone()}}

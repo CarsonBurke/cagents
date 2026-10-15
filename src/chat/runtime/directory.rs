@@ -21,6 +21,18 @@ impl DirectoryProof {
 }
 
 impl LocalHandle {
+    /// The retained descriptor authorizes an explicit completed-provider
+    /// replacement even when there is no live cwd left to inspect.
+    pub(crate) fn pinned_execution_directory(&self,candidate:&Path)->Result<Arc<super::super::protocol::ExecutionContext>,String> {
+        let identity=self.pinned_directory_identity()?;
+        let context=Arc::new(super::super::protocol::ExecutionContext::capture(candidate)?);
+        if context.directory_identity()?!=Some(identity) {return Err("The completed provider's original directory was replaced; its approval cannot transfer to this folder".into());}
+        Ok(context)
+    }
+    pub(super) fn pinned_directory_identity(&self)->Result<DirectoryIdentity,String> {
+        let directory=self.0.pinned_directory.lock().unwrap_or_else(|p|p.into_inner()).clone().ok_or("The provider has no retained approved directory descriptor")?;
+        Ok(DirectoryIdentity::from_metadata(&directory.metadata().map_err(|error|error.to_string())?))
+    }
     /// Call outside HostState: this is serialized with the owning actor and
     /// may wait behind provider work. An unavailable proof never authorizes a
     /// guessed relocation or a replacement provider.
@@ -100,6 +112,7 @@ pub(super) fn capture(actor: &mut Actor, candidate: &Path) -> Result<DirectoryPr
         // live cwd. This changes no issued recipe or operational path.
         actor.launch_context = Some(Arc::new(super::super::protocol::ExecutionContext::new(Some(proof.directory.clone()))));
     }
+    *actor.pinned_directory.lock().unwrap_or_else(|p|p.into_inner())=Some(proof.directory.clone());
     Ok(proof)
 }
 
