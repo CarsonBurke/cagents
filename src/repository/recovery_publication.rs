@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(fs::read(staging.join("directory")).unwrap(), b"retained fixture artifact");
         fs::remove_file(staging.join("directory")).unwrap();
         let result = service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
-        assert!(result.remaining_paths.is_empty());
+        assert_eq!(result.remaining_paths, 0);
         assert!(!recovery.live_recovery.needs_resolution());
         assert!(!staging.exists());
         drop(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).unwrap());
