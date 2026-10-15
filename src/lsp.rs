@@ -332,10 +332,11 @@ pub enum LocationKind {
 /// What a location points at, and therefore how it may be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspTarget {
-    /// A file inside the requesting worktree: open a normal editable tab.
+    /// An absolute file-URI path proved inside the requesting worktree when
+    /// converted. Revalidate its resolved target before opening it editable.
     Workspace { path: PathBuf },
-    /// A file outside the requesting worktree: open a read-only
-    /// external-source tab.
+    /// An absolute file-URI path not proved inside the requesting worktree:
+    /// open a read-only external-source tab.
     External { path: PathBuf },
     /// A non-`file:` URI. Listed for the user, never written.
     Uri { uri: String },
@@ -346,9 +347,9 @@ pub enum LspTarget {
 pub enum LspCoordinates {
     /// Converted against a known snapshot; editor-native scalar offsets.
     Scalar,
-    /// The target's text is not open at the LSP boundary, so the range is
-    /// still in protocol UTF-16 code units and must be converted by whoever
-    /// loads the file.
+    /// The target is not the requesting document, whose snapshot this result
+    /// was converted against. The range remains in protocol UTF-16 code units;
+    /// whoever loads or owns the target must convert it against that text.
     Utf16,
 }
 
