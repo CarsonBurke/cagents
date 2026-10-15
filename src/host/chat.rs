@@ -1969,6 +1969,30 @@ fn reserved_automation_descriptor_matches(
     crate::automations::archive::native_descriptor_matches(agent, &current)
 }
 
+/// Read-only archive projection may learn an issued console from None. A live
+/// actor record must instead retain every already-known pair; reconstructing
+/// that ownership from an archive alias would erase its current pair authority.
+fn reserved_automation_record_matches(
+    agent: &crate::agent_execution::Agent,
+    current: &Session,
+    actual: &chat::NativeContinuity,
+) -> bool {
+    let Some(crate::agent_execution::HostedSession::Chat(canonical)) = &agent.session else {
+        return false;
+    };
+    (canonical.terminal.is_none() || current.terminal.is_some())
+        && reserved_automation_descriptor_matches(agent, current, actual)
+}
+
+fn reserved_automation_request_matches(
+    agent: &crate::agent_execution::Agent,
+    requested: &Session,
+    issued: &Session,
+) -> bool {
+    requested.terminal.as_ref().is_none_or(|terminal| issued.terminal.as_ref() == Some(terminal))
+        && reserved_automation_descriptor_matches(agent, requested, &issued.native_continuity)
+}
+
 /// The caller holds this agent's owner gate and has proved an OPEN pending
 /// archive reservation. Resolve only its exact existing actor, never a launcher.
 pub(in crate::host) fn reserved_automation_actor(
@@ -1987,7 +2011,7 @@ pub(in crate::host) fn reserved_automation_actor(
     validate_proof(issued.proof.as_ref(), state.proof())?;
     let record = state.chats.get(&issued.id)
         .filter(|record| !record.handle.is_completed())
-        .filter(|record| reserved_automation_descriptor_matches(agent, &record.session, &record.handle.native_continuity()))
+        .filter(|record| reserved_automation_record_matches(agent, &record.session, &record.handle.native_continuity()))
         .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id)
         .filter(|record| !require_attached || record.subscribers.contains_key(&client))
         .ok_or_else(|| unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"))?;
@@ -2033,7 +2057,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     };
     issued.launch.session_id = handle.confirmed_session_id();
     issued.native_continuity = handle.native_continuity();
-    if !reserved_automation_descriptor_matches(agent, requested, &issued.native_continuity) {
+    if !reserved_automation_request_matches(agent, requested, &issued) {
         return Err(error("The pending archive attachment changed its exact native descriptor"));
     }
     let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The pending archive snapshot is unavailable"))?;
@@ -2044,7 +2068,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     validate_proof(requested.proof.as_ref(), state.proof())?;
     let record = state.chats.get_mut(&requested.id)
         .filter(|record| record.handle.same_actor(&handle) && !record.handle.is_completed())
-        .filter(|record| reserved_automation_descriptor_matches(agent, &record.session, &record.handle.native_continuity()))
+        .filter(|record| reserved_automation_record_matches(agent, &record.session, &record.handle.native_continuity()))
         .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id && record.handle.native_continuity() == issued.native_continuity)
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
     let advanced = subscribe_reserved_automation_reader(record, client, snapshot.generation);
@@ -3294,6 +3318,36 @@ mod tests {
         let mut unknown_thread = source.clone();
         unknown_thread.launch.session_id = None;
         assert!(reserved_automation_descriptor_matches(&agent, &unknown_thread, &actual), "only the canonical already-confirmed thread may be learned");
+        let terminal = crate::model::TerminalSession {
+            id: source.id,
+            launch: LaunchRecipe {
+                program: "/matched/cagents".into(),
+                arguments: vec!["agent".into(), "console".into(), agent.id.to_string()],
+                working_directory: source.launch.recipe.working_directory.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: source.proof.as_ref().unwrap().host_session_id.clone(),
+                boot_id: source.proof.as_ref().unwrap().boot_id.clone(),
+                host_incarnation: source.proof.as_ref().unwrap().host_incarnation.clone(),
+            },
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+        };
+        agent.console = Some(terminal.clone());
+        let mut paired = promoted.clone();
+        paired.terminal = Some(terminal.clone());
+        assert!(reserved_automation_record_matches(&agent, &paired, &actual));
+        assert!(reserved_automation_request_matches(&agent, &source, &paired), "stale None may learn the exact current actor pair");
+        assert!(!reserved_automation_request_matches(&agent, &paired, &promoted), "known pair must not disappear from the response");
+        let Some(HostedSession::Chat(canonical)) = &mut agent.session else { unreachable!() };
+        canonical.terminal = Some(terminal);
+        assert!(!reserved_automation_record_matches(&agent, &source, &actual), "a live record cannot reconstruct its missing known pair from readonly projection");
+        assert!(reserved_automation_record_matches(&agent, &paired, &actual));
         for field in 0..5 {
             let mut changed = source.clone();
             match field {
