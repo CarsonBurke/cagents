@@ -337,6 +337,13 @@ impl DirectoryPublication {
     pub fn publication_error(&self) -> Option<&str> {
         self.publication_error.as_deref()
     }
+    /// Worker-only retry of pending mode/private-staging steps. This does not
+    /// remove the public payload or resolve an acquired public recovery entry.
+    /// Callers retain any separate quarantine/durability obligations.
+    pub fn retry_publication_steps(&mut self) -> Result<(), ResolveError> {
+        self.restore_pending_mode()?;
+        self.cleanup_private_staging()
+    }
     /// Diagnostic opened spelling only; namespace moves can make it stale.
     /// The retained namespace and private leaf, not this path, are authority.
     pub fn pending_staging_path(&self) -> Option<PathBuf> {
