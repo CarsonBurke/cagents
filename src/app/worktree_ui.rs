@@ -175,6 +175,12 @@ fn scope_descriptor(
         // A global-only strip still needs an active pane, without making that
         // browser an ownership source or displacing a worktree's own panes.
         .or_else(|| cards.first().map(|card| card.id));
+    let automation_archives = state
+        .automation_archives
+        .iter()
+        .filter(|(id, _)| cards.iter().any(|card| card.id == **id))
+        .map(|(card, agent)| (*card, *agent))
+        .collect();
     WorkspaceState {
         schema_version: state.schema_version,
         id: state.id,
@@ -189,6 +195,7 @@ fn scope_descriptor(
         active_channel: None,
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
+        automation_archives,
         chat_drafts: HashMap::new(),
         agent_updates: Default::default(),
         conversation_drafts: HashMap::new(),
@@ -372,7 +379,7 @@ impl Cagents {
                 .filter(|card| card.existence.is_open() && channel.cards.contains(&card.id))
                 .map(|card| card.id))
         {
-            return Task::none();
+            return self.discover_scope_automation_archives();
         }
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {
@@ -393,7 +400,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        scope
+        Task::batch([scope, self.discover_scope_automation_archives()])
     }
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
@@ -661,13 +668,14 @@ impl Cagents {
                 .map(|card| card.id))
         {
             if !create_if_empty {
-                return Task::none();
+                return self.discover_scope_automation_archives();
             }
-            return if !has_terminal {
+            let terminal = if !has_terminal {
                 self.add_default_pane(path, self.settings.default_worktree_pane)
             } else {
                 Task::none()
             };
+            return Task::batch([terminal, self.discover_scope_automation_archives()]);
         }
         let promoted = !was_channel
             && self.active_workspace.as_ref().is_some_and(|previous| {
@@ -727,7 +735,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        Task::batch([scope, terminal])
+        Task::batch([scope, terminal, self.discover_scope_automation_archives()])
     }
 
     fn install_workspace_scope(
@@ -1461,6 +1469,7 @@ mod tests {
             unreachable!()
         };
         card.kind = CardKind::Chat(crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: source.id,

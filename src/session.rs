@@ -2884,6 +2884,7 @@ mod tests {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            automation_archives: HashMap::new(),
             chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),
             conversation_drafts: HashMap::new(),
@@ -3397,6 +3398,7 @@ mod tests {
         terminal.launch.arguments.clear();
         terminal.transcript_path = None;
         let mut chat = crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: terminal.id,
@@ -4242,6 +4244,7 @@ mod tests {
         for kind in [ChatRecoveryKind::Account, ChatRecoveryKind::Upgrade] {
             let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);
             let source = crate::chat::Session {
+                archive_report: None,
                 id: TerminalId::new(),
                 proof: None,
                 terminal: None,
@@ -4305,6 +4308,7 @@ mod tests {
             host_incarnation: crate::model::HostIncarnation::new(name),
         };
         let source = crate::chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             proof: Some(proof("old")),
             terminal: None,

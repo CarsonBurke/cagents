@@ -94,6 +94,7 @@ impl RestoreFixture {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            automation_archives: HashMap::new(),
             chat_drafts: HashMap::new(),
             agent_updates: Default::default(),
             conversation_drafts: HashMap::new(),

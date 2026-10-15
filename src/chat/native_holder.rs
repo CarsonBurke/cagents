@@ -236,15 +236,7 @@ impl Recovery {
     }
 }
 
-/// Versions verified with an isolated Responses API fixture while disconnecting
-/// during a long command, a yielded-command poll, and a pending approval.
-/// This is deliberately an allowlist: a 0.x version increment is not a promise
-/// that an app-server preserves all three boundaries without a client.
-///
-/// `tests/codex_continuity_qualification.rs` is that verification, run against
-/// the real executable through a killed daemon. A version belongs here only
-/// after it passes; a server of any other version ends with its daemon.
-pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1", "0.161.0", "0.162.0"];
+pub(crate) use super::VERIFIED_CODEX_VERSIONS;
 
 /// Codex's initialize response includes its own version in a user agent whose
 /// prefix is the client name supplied by this application. Use that response
@@ -286,6 +278,7 @@ mod tests {
         let socket = std::path::PathBuf::from(format!("/var/tmp/cagents-codex-{id}/control.sock"));
         Recovery {
             source: super::super::Session {
+                archive_report: None,
                 id,
                 launch: super::super::Launch {
                     provider: Provider::Codex,

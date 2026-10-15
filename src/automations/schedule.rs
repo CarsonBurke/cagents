@@ -82,6 +82,41 @@ impl Compiled {
     /// At most one catch-up firing: the latest due minute inside the grace
     /// window. Looking only inside that window bounds work after long downtime.
     pub fn due(&self, persisted: &Occurrence, now_ms: u64) -> Result<Due, String> {
+        self.due_with_policy(persisted, now_ms, &crate::automations::CatchUp::default())
+    }
+
+    #[cfg(feature = "host")]
+    pub fn due_with_policy(
+        &self,
+        persisted: &Occurrence,
+        now_ms: u64,
+        policy: &crate::automations::CatchUp,
+    ) -> Result<Due, String> {
+        use crate::automations::CatchUp;
+        if persisted.due_ms <= now_ms {
+            match policy {
+                CatchUp::OnceOnWake => {
+                    return Ok(Due {
+                        fire: Some(persisted.clone()),
+                        next: self.next_after(now_ms)?,
+                        missed: false,
+                    });
+                }
+                CatchUp::Skip if now_ms.saturating_sub(persisted.due_ms) >= 60_000 => {
+                    return Ok(Due {
+                        fire: None,
+                        next: self.next_after(now_ms)?,
+                        missed: true,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let grace_ms = match policy {
+            CatchUp::WithinMinutes(minutes) => u64::from(*minutes) * 60_000,
+            CatchUp::Skip => 60_000,
+            CatchUp::OnceOnWake => MISFIRE_GRACE_MS,
+        };
         if persisted.due_ms > now_ms {
             return Ok(Due {
                 fire: None,
@@ -89,13 +124,11 @@ impl Compiled {
                 missed: false,
             });
         }
-        let lower = now_ms
-            .saturating_sub(MISFIRE_GRACE_MS)
-            .max(persisted.due_ms);
+        let lower = now_ms.saturating_sub(grace_ms).max(persisted.due_ms);
         let mut cursor = lower.saturating_sub(1);
         let mut latest = None;
         let mut missed = persisted.due_ms < lower;
-        for _ in 0..=MISFIRE_GRACE_MS / 60_000 + 1 {
+        for _ in 0..=grace_ms / 60_000 + 1 {
             let next = self.next_after(cursor)?;
             if next.due_ms > now_ms {
                 return Ok(Due {
@@ -182,6 +215,38 @@ mod tests {
             timezone: timezone.into(),
         })
         .unwrap()
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn catch_up_policies_bound_or_resume_a_long_gap() {
+        use crate::automations::CatchUp;
+        let schedule = cron("0 9 * * *", "UTC");
+        let persisted = schedule.next_after(ms("2026-10-01T00:00:00Z")).unwrap();
+        let wake = ms("2026-10-04T09:20:00Z");
+        assert!(
+            schedule
+                .due_with_policy(&persisted, wake, &CatchUp::Skip)
+                .unwrap()
+                .fire
+                .is_none()
+        );
+        assert!(
+            schedule
+                .due_with_policy(&persisted, wake, &CatchUp::WithinMinutes(15))
+                .unwrap()
+                .fire
+                .is_none()
+        );
+        let within = schedule
+            .due_with_policy(&persisted, wake, &CatchUp::WithinMinutes(30))
+            .unwrap();
+        assert_eq!(within.fire.unwrap().due_ms, ms("2026-10-04T09:00:00Z"));
+        let once = schedule
+            .due_with_policy(&persisted, wake, &CatchUp::OnceOnWake)
+            .unwrap();
+        assert_eq!(once.fire, Some(persisted));
+        assert!(once.next.due_ms > wake);
     }
 
     #[test]

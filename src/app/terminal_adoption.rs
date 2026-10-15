@@ -694,6 +694,7 @@ mod tests {
         drop(app.observe_hosted_terminals(vec![saved.clone()]));
         let card = cards_for(&app, saved.id)[0].id;
         app.card_state_mut(card).unwrap().kind = CardKind::Chat(crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),

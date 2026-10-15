@@ -1769,6 +1769,7 @@ mod tests {
         let mut checkpoint = checkpoint(directory.path());
         checkpoint.terminals.clear();
         let mut source = crate::chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex,
@@ -1961,6 +1962,7 @@ mod tests {
         store.retire_unattached(TerminalId::new()).unwrap();
         let unattached = |reason: &str| {
             let source = crate::chat::Session {
+                archive_report: None,
                 id: TerminalId::new(),
                 launch: crate::chat::Launch {
                     provider: crate::agent::Provider::Codex,

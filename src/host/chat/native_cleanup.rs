@@ -21,6 +21,9 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
+    if source.archive_report.is_some() {
+        return Err("A saved automation report cannot authorize provider teardown".into());
+    }
     let (proof, pending, actor) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down

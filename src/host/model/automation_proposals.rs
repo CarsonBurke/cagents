@@ -56,7 +56,57 @@ fn read(db: &Connection, id: Uuid, owner: Option<&Origin>) -> Result<Option<Prop
         .transpose()
 }
 
+const PENDING_PAGE_SQL: &str =
+    "SELECT summary FROM automation_proposals WHERE pending=1 AND id>?1 ORDER BY id LIMIT ?2";
+
 impl Registry {
+    pub(crate) fn pending_automation_proposal_count(&self) -> Result<u64, String> {
+        self.db
+            .query_row(
+                "SELECT count(*) FROM automation_proposals WHERE pending=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn automation_proposal_sequence(&self) -> Result<u64, String> {
+        self.db
+            .query_row(
+                "SELECT automation_proposal_sequence FROM metadata WHERE key=0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn pending_automation_proposals_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ProposalSummary>, String> {
+        // Every stored ID is a nonempty canonical UUID. The empty lower bound
+        // starts page one; all pages retain a genuine indexed range seek.
+        let mut query = self
+            .db
+            .prepare(PENDING_PAGE_SQL)
+            .map_err(|error| error.to_string())?;
+        query
+            .query_map(
+                params![
+                    after.map(|id| id.to_string()).unwrap_or_default(),
+                    limit.clamp(1, crate::automations::PROPOSAL_PAGE_SIZE)
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     pub(crate) fn automation_proposal(
         &self,
         id: Uuid,
@@ -155,6 +205,60 @@ impl Registry {
             ],
         )
         .map_err(|_| "Could not save this request ID; use a new request ID".to_owned())?;
+        let project: String = proposal
+            .definition
+            .agent
+            .target
+            .repository
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect();
+        // Attribute the request to its actual issuing conversation, rather
+        // than the provider it proposes to schedule (which may differ).
+        let issuer = if let Origin::Child { parent } = &proposal.owner {
+            tx.query_row("SELECT record FROM agents WHERE session_id IN (SELECT session_id FROM session_lineages WHERE lineage=?1) ORDER BY rowid DESC LIMIT 1",
+                [parent.to_string()], |row|row.get::<_,String>(0)).optional().map_err(|error|error.to_string())?
+                .map(|record|serde_json::from_str::<crate::agent_execution::Agent>(&record).map_err(|error|error.to_string())).transpose()?
+        } else {
+            None
+        };
+        let mut requester = issuer
+            .as_ref()
+            .map(|agent| {
+                agent.name.clone().unwrap_or_else(|| {
+                    format!("{} agent {}", agent.spec.provider.label(), agent.id)
+                })
+            })
+            .unwrap_or_else(|| match &proposal.owner {
+                Origin::Child { parent } => format!("Hosted conversation {parent}"),
+                _ => "Hosted conversation".into(),
+            });
+        crate::agent_execution::truncate(&mut requester, 256);
+        super::automations::queue_automation_event(
+            &tx,
+            crate::notifications::Event {
+                target: crate::notifications::Target::AutomationProposal {
+                    id: proposal.id,
+                    name: proposal.definition.name.clone(),
+                    project,
+                    requester,
+                },
+                source_session: None,
+                provider: issuer.as_ref().map(|agent| agent.spec.provider),
+                directory: Some(proposal.definition.agent.target.repository.clone()),
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: format!("proposal:{}", proposal.id),
+                    kind: crate::notifications::Kind::AutomationProposed,
+                },
+            },
+        )?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1,automation_proposal_sequence=automation_proposal_sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
     }
@@ -204,6 +308,8 @@ impl Registry {
             params![current.id.to_string(), encode(&current)?],
         )
         .map_err(|error| error.to_string())?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1,automation_proposal_sequence=automation_proposal_sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(current)
     }
@@ -263,6 +369,8 @@ mod tests {
                 },
             },
             session_mode: SessionMode::Fresh,
+            visibility: crate::automations::Visibility::default(),
+            catch_up: crate::automations::CatchUp::default(),
             precheck: None,
         };
         let proposal = registry
@@ -289,6 +397,34 @@ mod tests {
             due_ms: 1000,
             local: "2026-10-12T09:30".into(),
         }
+    }
+
+    #[test]
+    fn proposal_creation_and_resolution_advance_watch_sequence_and_global_snapshot() {
+        let (_root, mut registry, proposal) = fixture();
+        let sequence = registry.execution_sequence().unwrap();
+        assert!(sequence > 1);
+        assert_eq!(
+            registry.model().unwrap().pending_automation_proposals,
+            vec![ProposalSummary::from(&proposal)]
+        );
+        let notices = registry.automation_notifications().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].evidence.kind,
+            crate::notifications::Kind::AutomationProposed
+        );
+        registry
+            .resolve_automation_proposal(&proposal, None, 300)
+            .unwrap();
+        assert_eq!(registry.execution_sequence().unwrap(), sequence + 1);
+        assert!(
+            registry
+                .model()
+                .unwrap()
+                .pending_automation_proposals
+                .is_empty()
+        );
     }
 
     #[test]
@@ -549,6 +685,356 @@ mod tests {
                 .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
             super::super::SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn ten_thousand_pending_requests_keep_push_bounded_and_every_page_reachable() {
+        let (_root, mut registry, original) = fixture();
+        let tx = registry.db.transaction().unwrap();
+        tx.execute("DELETE FROM automation_proposals", []).unwrap();
+        {
+            let mut insert = tx.prepare("INSERT INTO automation_proposals(id,owner,repository,pending,record,summary) VALUES(?1,?2,?3,1,?4,?5)").unwrap();
+            for index in 1..=10_000u128 {
+                let mut proposal = original.clone();
+                proposal.id = Uuid::from_u128(index);
+                proposal.owner = Origin::Child {
+                    parent: Lineage(TerminalId::new()),
+                };
+                insert
+                    .execute(params![
+                        proposal.id.to_string(),
+                        encode(&proposal.owner).unwrap(),
+                        proposal
+                            .definition
+                            .agent
+                            .target
+                            .repository
+                            .to_str()
+                            .unwrap(),
+                        encode(&proposal).unwrap(),
+                        encode(&ProposalSummary::from(&proposal)).unwrap()
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.execute("UPDATE metadata SET automation_proposal_sequence=automation_proposal_sequence+1,sequence=sequence+1 WHERE key=0", []).unwrap();
+        tx.commit().unwrap();
+        let model = registry.model().unwrap();
+        assert_eq!(model.pending_automation_proposal_count, 10_000);
+        assert_eq!(
+            model.pending_automation_proposals.len(),
+            crate::automations::PROPOSAL_PAGE_SIZE
+        );
+        let bytes = serde_json::to_vec(&model).unwrap();
+        assert!(
+            bytes.len() < 128 * 1024,
+            "summary payload is bounded: {} bytes",
+            bytes.len()
+        );
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains(&original.definition.prompt)
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = None;
+        loop {
+            let page = registry
+                .pending_automation_proposals_page(cursor, usize::MAX)
+                .unwrap();
+            assert!(page.len() <= crate::automations::PROPOSAL_PAGE_SIZE);
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.windows(2).all(|pair| pair[0].id < pair[1].id));
+            assert!(cursor.is_none_or(|cursor| page[0].id > cursor));
+            cursor = page.last().map(|proposal| proposal.id);
+            for proposal in page {
+                assert!(seen.insert(proposal.id));
+            }
+        }
+        assert_eq!(seen.len(), 10_000);
+        assert!(seen.contains(&Uuid::from_u128(10_000)));
+        // Assert the actual production SQL seeks both the first and late page,
+        // rather than scanning all earlier pending IDs on every request.
+        for after in [String::new(), Uuid::from_u128(9_984).to_string()] {
+            let mut explain = registry
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_PAGE_SQL}"))
+                .unwrap();
+            let plan = explain
+                .query_map(params![after, 64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains("SEARCH") && plan.contains("id>?"),
+                "page lookup must seek: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_clock_migrates_atomically_and_only_consent_edges_advance_it() {
+        let (root, registry, proposal) = fixture();
+        let definition = proposal.definition.clone();
+        let original_clock = registry.automation_proposal_sequence().unwrap();
+        assert_eq!(original_clock, 1);
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE IF EXISTS automation_report_sources; DROP TABLE IF EXISTS automation_report_descriptors; DROP TABLE IF EXISTS automation_report_usage; PRAGMA user_version=12;").unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
+        assert_eq!(registry.pending_automation_proposal_count().unwrap(), 1);
+        assert_eq!(
+            registry.automation_proposal(proposal.id, None).unwrap(),
+            Some(proposal.clone())
+        );
+        assert_eq!(
+            registry
+                .db
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            super::super::SCHEMA_VERSION
+        );
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: definition.agent.target.repository,
+                name: "Unrelated sidebar edit".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
+        registry
+            .resolve_automation_proposal(&proposal, None, 300)
+            .unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 1);
+        assert_eq!(registry.pending_automation_proposal_count().unwrap(), 0);
+        registry
+            .resolve_automation_proposal(&proposal, None, 301)
+            .unwrap();
+        assert_eq!(
+            registry.automation_proposal_sequence().unwrap(),
+            1,
+            "an immutable receipt retry is not a new proposal edge"
+        );
+        let future = super::super::SCHEMA_VERSION + 1;
+        registry
+            .db
+            .pragma_update(None, "user_version", future)
+            .unwrap();
+        drop(registry);
+        assert!(Registry::at(&root.path().join("registry.sqlite3")).is_err());
+        let db = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            future
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT pending FROM automation_proposals WHERE id=?1",
+                [proposal.id.to_string()],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn failed_automation_extension_upgrade_retains_clock_schema_and_durable_intent() {
+        let (root, mut registry, proposal) = fixture();
+        let automation = registry
+            .create_automation(
+                proposal.definition.clone(),
+                200,
+                proposal.target_identity.clone(),
+            )
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                automation.execution_revision,
+                None,
+                Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        let firing = registry
+            .db
+            .query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [claim.firing.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let notice = registry
+            .db
+            .query_row(
+                "SELECT event FROM automation_notifications WHERE key=?1",
+                [format!("proposal:{}", proposal.id)],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        // A malformed legacy definition fails after clock/table creation. The
+        // entire new checkpoint must roll back, including its schema number.
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; DROP TABLE IF EXISTS automation_report_descriptors; DROP TABLE IF EXISTS automation_report_usage; PRAGMA user_version=12;").unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE automation_revisions SET definition='{malformed' WHERE automation=?1",
+                [automation.id.to_string()],
+            )
+            .unwrap();
+        drop(registry);
+        assert!(Registry::at(&root.path().join("registry.sqlite3")).is_err());
+        let db = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            12
+        );
+        assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='automation_proposal_sequence')",[],|row|row.get::<_,bool>(0)).unwrap());
+        assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='automation_precheck_retirements')",[],|row|row.get::<_,bool>(0)).unwrap());
+        assert_eq!(
+            db.query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [claim.firing.id.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            firing
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT event FROM automation_notifications WHERE key=?1",
+                [format!("proposal:{}", proposal.id)],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            notice
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT pending FROM automation_proposals WHERE id=?1",
+                [proposal.id.to_string()],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap(),
+            true
+        );
+        // Repairing the unrelated malformed input permits the same upgrade;
+        // the accepted firing and pending request still have their identities.
+        db.execute(
+            "UPDATE automation_revisions SET definition=?2 WHERE automation=?1",
+            params![
+                automation.id.to_string(),
+                encode(&proposal.definition).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(db);
+        let registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(
+            registry.automation(automation.id).unwrap().active_firing,
+            Some(claim.firing.id)
+        );
+        assert_eq!(registry.pending_automation_proposal_count().unwrap(), 1);
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
+    }
+    #[test]
+    fn automation_checkpoint_refuses_a_future_schema_committed_after_the_outer_read() {
+        let (root, registry, proposal) = fixture();
+        let database = root.path().join("registry.sqlite3");
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; DROP TABLE IF EXISTS automation_report_descriptors; DROP TABLE IF EXISTS automation_report_usage; PRAGMA user_version=12;").unwrap();
+        // This is the opener's admitted version before its writer reservation.
+        let observed: u32 = registry
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(observed, 12);
+        let competing = Connection::open(&database).unwrap();
+        let future = super::super::SCHEMA_VERSION + 1;
+        competing.execute_batch(&format!("BEGIN IMMEDIATE; CREATE TABLE future_checkpoint_owned (value TEXT NOT NULL) STRICT; INSERT INTO future_checkpoint_owned VALUES ('preserve future intent'); PRAGMA user_version={future}; COMMIT;")).unwrap();
+        let before: Vec<(String, Option<String>)> = competing
+            .prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // The stale outer branch still tries its old checkpoint. Its real
+        // production helper must re-admit under BEGIN IMMEDIATE, not stamp13.
+        let error = super::super::migrate_automation_extensions(&registry.db).unwrap_err();
+        assert!(error.contains("newer than supported"), "{error}");
+        assert_eq!(
+            registry
+                .db
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            future
+        );
+        let after: Vec<(String, Option<String>)> = registry
+            .db
+            .prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(after, before, "no extension DDL may run on a future schema");
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT value FROM future_checkpoint_owned", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "preserve future intent"
+        );
+        assert_eq!(
+            registry.automation_proposal(proposal.id, None).unwrap(),
+            Some(proposal)
+        );
+        assert!(!registry.db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='automation_proposal_sequence')", [], |row| row.get::<_,bool>(0)).unwrap());
+    }
+
+    #[test]
+    fn automation_checkpoint_accepts_an_already_committed_compatible_upgrade() {
+        let (root, registry, proposal) = fixture();
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; DROP TABLE IF EXISTS automation_report_descriptors; DROP TABLE IF EXISTS automation_report_usage; PRAGMA user_version=12;").unwrap();
+        let observed: u32 = registry
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(observed, 12);
+        let competing = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        super::super::migrate_automation_extensions(&competing).unwrap();
+        competing
+            .execute(
+                "UPDATE metadata SET automation_proposal_sequence=41 WHERE key=0",
+                [],
+            )
+            .unwrap();
+        // The first opener's old12 branch resumes after the other writer has
+        // completed the atomic checkpoint and made a subsequent consent edit.
+        super::super::migrate_automation_extensions(&registry.db).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 41);
+        assert_eq!(
+            registry
+                .db
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(
+            registry.automation_proposal(proposal.id, None).unwrap(),
+            Some(proposal)
         );
     }
 }

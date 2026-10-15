@@ -4078,6 +4078,12 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
+                automation_archive_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4332,6 +4338,12 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
+                automation_archive_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4395,6 +4407,12 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
+                automation_archive_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4519,6 +4537,12 @@ mod tests {
                         closed_projects: Vec::new(),
                         views: Vec::new(),
                         agents: Vec::new(),
+                        headless_automation_agents: Vec::new(),
+                        archived_automation_agents: Vec::new(),
+                        pending_automation_proposals: Vec::new(),
+                        pending_automation_proposal_count: 0,
+                        automation_proposal_sequence: 0,
+                        automation_archive_sequence: 0,
                     },
                 ),
             )
@@ -4580,6 +4604,12 @@ mod tests {
             closed_projects: Vec::new(),
             views: Vec::new(),
             agents: Vec::new(),
+            headless_automation_agents: Vec::new(),
+            archived_automation_agents: Vec::new(),
+            pending_automation_proposals: Vec::new(),
+            pending_automation_proposal_count: 0,
+            automation_proposal_sequence: 0,
+            automation_archive_sequence: 0,
         }
     }
 
@@ -4947,6 +4977,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let session = |id| crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id,
@@ -5161,6 +5192,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let session = crate::chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex,

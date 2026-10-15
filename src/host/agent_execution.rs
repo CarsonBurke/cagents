@@ -25,11 +25,12 @@ pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
     reconcile_agent_run, reconcile_agent_run_under_control, try_interactive,
+    reconcile_archived_automation_run_under_control,
 };
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
-const EXECUTION_CLIENT: u64 = 0;
+pub(super) const EXECUTION_CLIENT: u64 = 0;
 pub(super) type SharedRegistry = Arc<Mutex<Registry>>;
 
 pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
@@ -642,7 +643,7 @@ fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
 
-fn announce(host: &SharedHost, registry: &SharedRegistry) {
+pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
     let sequence = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -685,6 +686,16 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
     let origin = origin(host, authority)?;
+    close_owned_agent_under_control(host, origin, id)
+}
+
+/// The user-only automation management RPC supplies the saved automation
+/// owner, so explicit close uses the same exact-process proof as normal close.
+pub(super) fn close_owned_agent_under_control(
+    host: &SharedHost,
+    origin: Origin,
+    id: AgentId,
+) -> Result<Agent, String> {
     let gate = agent_gate(host, id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;

@@ -92,6 +92,90 @@ impl State {
 }
 
 impl Cagents {
+    pub(super) fn insert_archive_report_card(
+        &mut self,
+        session: chat::Session,
+        report: &crate::automations::ArchiveReport,
+        title: String,
+    ) -> Option<(CardId, Task<Message>)> {
+        let previous = self.shared_views.applying;
+        self.shared_views.applying = true;
+        let created = self.new_archive_report_card(session);
+        self.shared_views.applying = previous;
+        let (card, task) = created?;
+        let durable = Arc::make_mut(&mut self.durable);
+        match &report.presentation_scope {
+            Some(scope) => {
+                durable.card_scopes.insert(card, scope.clone());
+            }
+            None => {
+                durable.card_scopes.remove(&card);
+            }
+        }
+        self.apply_reported_title(card, title);
+        if !self.publish_archive_report_presentation(card, report) {
+            self.status = Some(TransientNotice::warning(
+                "The saved report is read-only, but its original shared membership could not be published. Reconnect before trying again.",
+            ));
+        }
+        self.persist();
+        Some((card, task))
+    }
+
+    pub(super) fn publish_archive_report_presentation(
+        &mut self,
+        card: CardId,
+        report: &crate::automations::ArchiveReport,
+    ) -> bool {
+        if report.reference.registry != self.workspace_model.identity {
+            return false;
+        }
+        let Some(view) = self
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == report.scope)
+        else {
+            return false;
+        };
+        let revision = view.revision;
+        let Some(pane) = self
+            .card_state(card)
+            .and_then(|state| Pane::from_card(state, self.durable.card_scopes.get(&card).cloned()))
+        else {
+            return false;
+        };
+        let repository = match &report.scope {
+            Scope::Worktree { repository, .. } => repository.clone(),
+            Scope::Channel(channel) => match self.workspace_model.channel(*channel) {
+                Some(channel) => channel.repository.clone(),
+                None => return false,
+            },
+        };
+        let change = Change::InsertArchiveReport {
+            registry: report.reference.registry,
+            repository,
+            reference: report.reference.clone(),
+            pane: pane.clone(),
+        };
+        let operation = uuid::Uuid::new_v4();
+        self.shared_views
+            .pending
+            .push((operation, report.scope.clone(), change.clone()));
+        self.shared_views
+            .baseline
+            .entry(report.scope.clone())
+            .or_default()
+            .push(pane);
+        self.publish_model_edit(ModelEdit::ChangeView {
+            scope: report.scope.clone(),
+            expected_revision: revision,
+            operation,
+            change,
+        });
+        true
+    }
+
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
         Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
@@ -221,6 +305,9 @@ impl Cagents {
                     self.card_state(id)?,
                     self.durable.card_scopes.get(&id).cloned(),
                 )?;
+                if let Some(canonical) = self.canonical_automation_archive_pane(id) {
+                    pane.kind = canonical.kind;
+                }
                 pane.user_title = self.chrome_ui.user_titles.get(&id).cloned();
                 pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
                     && (self.durable.pending_terminal_creations.contains(&id)
@@ -363,6 +450,9 @@ impl Cagents {
                     }
                     let mut pane =
                         Pane::from_card(cards.get(id)?, self.durable.card_scopes.get(id).cloned())?;
+                    if let Some(canonical) = self.canonical_automation_archive_pane(*id) {
+                        pane.kind = canonical.kind;
+                    }
                     pane.user_title = self.chrome_ui.user_titles.get(id).cloned();
                     pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
                         && (self.durable.pending_terminal_creations.contains(id)
@@ -678,6 +768,30 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
+                let change = match change {
+                    Change::Insert { pane, .. } if matches!(&pane.kind,CardKind::Chat(session) if session.archive_report.is_some()) =>
+                    {
+                        let CardKind::Chat(session) = &pane.kind else {
+                            unreachable!()
+                        };
+                        let reference = session.archive_report.clone().unwrap();
+                        let repository = match &scope {
+                            Scope::Worktree { repository, .. } => repository.clone(),
+                            Scope::Channel(channel) => match self.workspace_model.channel(*channel)
+                            {
+                                Some(channel) => channel.repository.clone(),
+                                None => continue,
+                            },
+                        };
+                        Change::InsertArchiveReport {
+                            registry: reference.registry,
+                            repository,
+                            reference,
+                            pane,
+                        }
+                    }
+                    change => change,
+                };
                 let operation = match &change {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
@@ -862,6 +976,22 @@ impl Cagents {
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         self.shared_views.blocked.clear();
+        let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
+        let managed = self
+            .workspace_model
+            .agents
+            .iter()
+            .map(|agent| (CardId::from_uuid(agent.id.as_uuid()), agent))
+            .collect::<HashMap<_, _>>();
+        for view in views {
+            if view.panes.iter().any(|pane| {
+                managed
+                    .get(&pane.id)
+                    .is_some_and(|agent| !display_index.permits_projection(agent, pane))
+            }) {
+                self.shared_views.blocked.insert(view.scope.clone());
+            }
+        }
         // Decide which whole views can project before retiring any local alias.
         // Otherwise a later blocked pane could leave an earlier adoption without
         // the canonical descriptor required by its persistence checkpoint.
@@ -1060,8 +1190,14 @@ impl Cagents {
             self.detach_shared_pane(id);
         }
         for shared in &view.panes {
-            self.prepare_terminal_restoration(shared);
-            let mut projected = shared.clone();
+            let archived = self.project_automation_archive_pane(shared);
+            if archived.is_none() && self.durable.automation_archives.contains_key(&shared.id) {
+                self.cards.insert(shared.id,CardRuntime::Failed("The saved automation pane's descriptor changed. Open its run history to inspect the exact result.".into()));
+                self.lifecycle.remove(shared.id);
+                continue;
+            }
+            let mut projected = archived.unwrap_or_else(|| shared.clone());
+            self.prepare_terminal_restoration(&projected);
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
                 self.worktree_owners.insert(projected.id, path.clone());
@@ -1334,6 +1470,23 @@ impl Cagents {
         // viewport update to tell the saved state.
         self.settle_focus();
         self.sidebar_state.clear_agent_activity(id);
+    }
+
+    /// Refresh presentation after an exact managed owner changes on first model
+    /// sync. The existing runtime remains attached; no snapshot of the old strip
+    /// may publish the pane back into its stale original channel.
+    pub(super) fn refresh_managed_display_strip(&mut self) -> Task<Message> {
+        let scope = self.durable.active_channel.map(Scope::Channel).or_else(|| {
+            self.active_workspace
+                .as_deref()
+                .and_then(|path| self.worktree_view_scope(path))
+        });
+        let Some(scope) = scope else {
+            return Task::none();
+        };
+        let panes = self.local_view_panes(&scope);
+        let visible = self.local_view_cards(&scope);
+        self.project_shared_strip(&panes, &visible)
     }
 
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
@@ -3035,5 +3188,115 @@ mod tests {
         ));
         app.acknowledge_view_edit(Scope::Channel(a), None);
         assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
+    }
+    #[test]
+    fn closed_automation_console_remains_read_only_across_shared_reconciliation_and_publication() {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        use crate::model::{
+            AgentId, BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalContinuity,
+            TerminalExit,
+        };
+        let (mut app, channel, _, mut pane) = fixture();
+        let id = AgentId::new();
+        pane.id = CardId::from_uuid(id.as_uuid());
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("archive-host"),
+            boot_id: BootId::new("archive-boot"),
+            host_incarnation: HostIncarnation::new("archive-incarnation"),
+        };
+        let mut console =
+            fresh_terminal_session(LaunchRecipe::shell("/archive-project".into()).unwrap());
+        console.launch.program = "cagents".into();
+        console.launch.arguments = vec!["agent".into(), "console".into(), id.to_string()];
+        console.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let mut saved = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            console.id,
+            "/archive-project".into(),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        saved.proof = Some(proof);
+        saved.launch.session_id = Some("confirmed-shared-thread".into());
+        let mut agent = Agent {
+            name: None,
+            id,
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/archive-project".into(),
+                    directory: "/archive-project".into(),
+                    placement: None,
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Scope::Channel(channel),
+            session: Some(HostedSession::Chat(saved.clone())),
+            console: Some(console.clone()),
+            created_ms: 1,
+            closed: false,
+        };
+        pane.kind = CardKind::Terminal(console.clone());
+        app.workspace_model.views = vec![View {
+            scope: Scope::Channel(channel),
+            revision: 1,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        drop(app.reconcile_shared_views());
+        assert!(matches!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Terminal(_)
+        ));
+        agent.closed = true;
+        let CardKind::Terminal(current) = &mut pane.kind else {
+            unreachable!()
+        };
+        current.continuity = TerminalContinuity::Exited {
+            last_exit: TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 2,
+            },
+        };
+        app.workspace_model.views[0].panes[0] = pane.clone();
+        app.workspace_model.archived_automation_agents = vec![agent.clone()];
+        Arc::make_mut(&mut app.durable)
+            .automation_archives
+            .insert(pane.id, id);
+        assert!(app.prepare_automation_archive(pane.id, &agent));
+        saved.terminal = Some(console);
+        for _ in 0..8 {
+            drop(app.reconcile_shared_views());
+            assert_eq!(
+                app.card_state(pane.id).unwrap().kind,
+                CardKind::Chat(saved.clone())
+            );
+            assert_eq!(
+                app.local_views().panes[&Scope::Channel(channel)][0].kind,
+                pane.kind,
+                "shared publication retains the exact canonical source descriptor"
+            );
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+            assert_eq!(app.workspace_model.views[0].panes[0], pane);
+        }
+        assert_eq!(app.archived_pane_readiness(pane.id), Ok(Some(false)));
+        drop(app.qualify_startup_automation_archives());
+        assert!(
+            app.chat_start_pending(pane.id),
+            "a saved-view read is pending, never a provider launch"
+        );
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
     }
 }

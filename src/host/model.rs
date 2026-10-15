@@ -24,7 +24,10 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod automation_archive_clock;
+mod automation_membership;
 mod automation_proposals;
+mod automation_reports;
 mod automations;
 pub(super) use automations::Claimed;
 mod execution;
@@ -34,7 +37,22 @@ mod navigation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+pub(super) const SCHEMA_VERSION: u32 = 15;
+
+/// Read-only source inspection entry point. Does not open/migrate a Registry.
+pub(crate) fn inspect_archive_report_in(
+    db: &Connection,
+    reference: &crate::chat::ArchiveReportReference,
+    session: &crate::chat::Session,
+) -> Result<crate::automations::ArchiveReport, String> {
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| "The report registry version is unreadable")?;
+    if !(15..=SCHEMA_VERSION).contains(&version) {
+        return Err("The report registry has no supported presentation authority".into());
+    }
+    automation_reports::report_in(db, reference, session)
+}
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -192,6 +210,13 @@ impl Registry {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(WorkspaceModel {
             navigation_orders,
+            headless_automation_agents: self.headless_automation_agents()?,
+            archived_automation_agents: self.archived_automation_agents()?,
+            pending_automation_proposals: self
+                .pending_automation_proposals_page(None, crate::automations::PROPOSAL_PAGE_SIZE)?,
+            pending_automation_proposal_count: self.pending_automation_proposal_count()?,
+            automation_proposal_sequence: self.automation_proposal_sequence()?,
+            automation_archive_sequence: self.automation_archive_sequence()?,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
             identity,
@@ -623,6 +648,70 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 12 {
         mailbox::migrate_attention(db)?;
     }
+    if version < 13 {
+        migrate_automation_extensions(db)?;
+    }
+    if version < 14 {
+        automation_archive_clock::migrate(db)?;
+    }
+    if version < 15 {
+        automation_reports::migrate(db)?;
+    }
+    Ok(())
+}
+
+/// Version this complete automation extension atomically. Admission is checked
+/// under the writer reservation: the opener's earlier schema read can be stale
+/// after another connection wins the race to apply a migration.
+fn migrate_automation_extensions(db: &Connection) -> Result<(), String> {
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let current: u32 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if current > SCHEMA_VERSION {
+        return Err(format!(
+            "workspace registry schema {current} is newer than supported schema {SCHEMA_VERSION}"
+        ));
+    }
+    if current >= 13 {
+        // Another compatible opener committed the entire checkpoint already.
+        return tx.commit().map_err(|error| error.to_string());
+    }
+    if current != 12 {
+        return Err(format!(
+            "workspace registry schema {current} must complete its legacy migrations before the automation checkpoint"
+        ));
+    }
+    let clock_exists: bool = tx.query_row(
+    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='automation_proposal_sequence')",
+    [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    if !clock_exists {
+        tx.execute_batch("ALTER TABLE metadata ADD COLUMN automation_proposal_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_proposal_sequence>=0);")
+        .map_err(|error| error.to_string())?;
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS automation_notifications (key TEXT PRIMARY KEY, event TEXT NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS automation_retired_manual_requests (
+        automation TEXT NOT NULL, request TEXT NOT NULL, revision INTEGER NOT NULL,
+        PRIMARY KEY(automation,request)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS automation_snapshots (
+        firing TEXT PRIMARY KEY REFERENCES automation_firings(id) ON DELETE CASCADE,
+        agent TEXT NOT NULL UNIQUE, snapshot TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS automation_precheck_retirements (
+        firing TEXT PRIMARY KEY REFERENCES automation_firings(id) ON DELETE RESTRICT,
+        revision INTEGER NOT NULL, retired INTEGER NOT NULL CHECK(retired IN (0,1)),
+        notify INTEGER NOT NULL CHECK(notify IN (0,1))
+    ) STRICT;
+    INSERT OR IGNORE INTO automation_precheck_retirements(firing,revision,retired,notify)
+        SELECT f.id,f.revision,0,json_extract(f.record,'$.state')='prechecking' FROM automation_firings f
+        JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
+        WHERE json_type(r.definition,'$.precheck')='object';")
+    .map_err(|error| error.to_string())?;
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS global_pending_automation_proposals ON automation_proposals(id) WHERE pending=1; PRAGMA user_version=13;")
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
     Ok(())
 }
 

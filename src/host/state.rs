@@ -530,8 +530,12 @@ impl HostState {
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
-                    || (matches!(target, crate::notifications::Target::AgentRun(_))
-                        && presence.application == Application::Cagents)
+                    || (matches!(
+                        target,
+                        crate::notifications::Target::AgentRun(_)
+                            | crate::notifications::Target::Automation { .. }
+                            | crate::notifications::Target::AutomationProposal { .. }
+                    ) && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {
@@ -629,6 +633,64 @@ impl HostState {
                         true,
                     ));
                 }
+            }
+        }
+        if let ModelEdit::ChangeView {
+            operation,
+            change:
+                crate::workspace_model::views::Change::RemoveArchivedAutomationSource { before, .. }
+                | crate::workspace_model::views::Change::InsertArchiveReport { pane: before, .. },
+            ..
+        } = &edit
+        {
+            if !self
+                .registry()?
+                .view_operation_seen(*operation)
+                .map_err(model_unavailable)?
+            {
+                let owner = self
+                    .registry()?
+                    .archived_automation_pane_owner(before)
+                    .map_err(model_unavailable)?
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "The original closed automation archive is unavailable",
+                            false,
+                        )
+                    })?;
+                let mut ids = owner
+                    .session
+                    .iter()
+                    .map(crate::agent_execution::HostedSession::id)
+                    .collect::<Vec<_>>();
+                ids.extend(owner.console.iter().map(|console| console.id));
+                if self.execution_startups.contains_key(&owner.id)
+                    || ids.iter().any(|id| {
+                        self.terminals.contains_key(id)
+                            || self.chats.contains_key(id)
+                            || self.native_adoption_failures.contains_id(*id)
+                            || self.spawning.contains(id)
+                            || self.browser_logins_spawning.contains(id)
+                            || self.chat_spawning.contains_key(id)
+                            || self.chat_bindings.contains_key(id)
+                            || self.native_closing.contains_key(id)
+                            || self.upgrade_chats.contains_key(id)
+                            || self.chat_handoffs.contains_key(id)
+                            || self
+                                .chat_handoffs
+                                .values()
+                                .any(|handoff| handoff.replacement().id == *id)
+                    })
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "An actor or handoff still owns this archive identity; its shared pane was preserved",
+                        false,
+                    ));
+                }
+                // This mutex spans the no-actor fence and final SQLite source
+                // transaction. This operation never closes or starts anything.
             }
         }
         let registry = self.registry()?;
@@ -1552,6 +1614,11 @@ impl HostState {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn execution_inventory_count_for_test(&mut self) -> u64 {
+        self.inventory_count()
     }
 
     fn inventory_count(&mut self) -> u64 {
@@ -5066,6 +5133,7 @@ for line in sys.stdin:
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let start = |id: &str| {
             let session = Session {
+                archive_report: None,
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id: TerminalId::new(),
@@ -5221,6 +5289,7 @@ for line in sys.stdin:
         }
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let source = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
@@ -5509,6 +5578,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let source = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
@@ -6253,6 +6323,7 @@ for line in sys.stdin:
             state.chat_spawning.insert(
                 id,
                 crate::chat::Session {
+                    archive_report: None,
                     id,
                     launch: crate::chat::Launch {
                         provider: crate::agent::Provider::Claude,
@@ -6856,6 +6927,7 @@ for line in sys.stdin:
         );
         let mut state = test_host();
         let session = chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             native_continuity: Default::default(),
             owned_codex_listener: None,

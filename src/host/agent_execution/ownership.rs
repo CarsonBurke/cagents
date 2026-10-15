@@ -63,6 +63,11 @@ fn interactive_inner(
             *chat_id,
             !matches!(command, Command::Refresh | Command::LoadEarlier),
         ),
+        ClientRequest::ChatStart { session, .. }
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session } => (session.id, false),
+        ClientRequest::ChatPrepareResume { source }
+        | ClientRequest::ChatRecoverAccount { source, .. } => (source.id, false),
         ClientRequest::ChatReturnTerminal { chat_id } => (*chat_id, true),
         ClientRequest::ChatCommitTerminal { terminal_id } => (*terminal_id, false),
         ClientRequest::ChatClose { chat_id } => (*chat_id, false),
@@ -81,12 +86,81 @@ fn interactive_inner(
     let agent = admission_lock(&registry, nonblocking)?
         .agent_for_session(id)
         .map_err(unavailable)?;
-    let Some(agent) = agent else {
-        return apply(request);
+    let executable = super::super::chat::executable_automation_sessions(&request);
+    let mut owners = agent.iter().map(|agent| agent.id).collect::<Vec<_>>();
+    {
+        let registry = admission_lock(&registry, nonblocking)?;
+        for session in &executable {
+            if let Some(owner) = registry.agent_for_session(*session).map_err(unavailable)? {
+                owners.push(owner.id);
+            }
+        }
+    }
+    // Account recovery acts on both its source and replacement identities.
+    // Lock every registered owner in stable order so a concurrent scheduler
+    // close of the replacement cannot race a source-only preflight check.
+    owners.sort_unstable();
+    owners.dedup();
+    let gates = owners
+        .into_iter()
+        .map(|owner| agent_gate(host, owner))
+        .collect::<Vec<_>>();
+    let _dispatch = gates
+        .iter()
+        .map(|gate| admission_lock(gate, nonblocking))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reserved = {
+        let registry = admission_lock(&registry, nonblocking)?;
+        let mut reserved = Vec::new();
+        for session in executable {
+            if let Some(owner) = registry
+                .archived_automation_owner(session)
+                .map_err(unavailable)?
+            {
+                reserved.push(owner);
+            }
+        }
+        reserved
     };
-    let gate = agent_gate(host, agent.id);
-    let _dispatch = admission_lock(&gate, nonblocking)?;
+    for owner in reserved {
+        if !owner.closed {
+            match &request {
+                ClientRequest::ChatAttach { session }
+                    if owner
+                        .session
+                        .as_ref()
+                        .is_some_and(|issued| issued.id() == session.id) =>
+                {
+                    return super::super::chat::attach_reserved_automation_actor(
+                        host, client, &owner, session,
+                    );
+                }
+                ClientRequest::ChatCommand { chat_id, .. }
+                    if owner
+                        .session
+                        .as_ref()
+                        .is_some_and(|issued| issued.id() == *chat_id) =>
+                {
+                    super::super::chat::reserved_automation_actor(host, client, &owner, true)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation.",
+            false,
+        ));
+    }
+    // The pre-gate lookup selected locks, not mutable control authority.
+    let agent = admission_lock(&registry, nonblocking)?
+        .agent_for_session(id)
+        .map_err(unavailable)?;
     if claims {
+        let Some(agent) = agent else {
+            return apply(request);
+        };
         let authorized = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -133,6 +207,25 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
     expected: &Run,
     retire: bool,
 ) -> Result<Reconciliation, String> {
+    reconcile_agent_run_with_archive(host, expected, retire, None)
+}
+
+/// Capture the completed Fresh report under the same owner gate that fences
+/// conditional teardown and every executable attachment/recovery admission.
+pub(in crate::host) fn reconcile_archived_automation_run_under_control(
+    host: &SharedHost,
+    expected: &Run,
+    firing: uuid::Uuid,
+) -> Result<Reconciliation, String> {
+    reconcile_agent_run_with_archive(host, expected, true, Some(firing))
+}
+
+fn reconcile_agent_run_with_archive(
+    host: &SharedHost,
+    expected: &Run,
+    retire: bool,
+    archive: Option<uuid::Uuid>,
+) -> Result<Reconciliation, String> {
     if !expected.state.is_terminal() || expected.state == State::Interrupted {
         return Err("An unfinished or uncertain run cannot be automatically reconciled".into());
     }
@@ -176,12 +269,27 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
                 .ok_or("The exact provider ownership is unavailable for reconciliation")?;
             record.handle.clone()
         };
-        let idle_generation = if !handle.is_completed() {
-            let snapshot = handle
-                .snapshot(None)
-                .ok_or("Provider state is unavailable")?;
-            if !snapshot.ready || snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty()
-            {
+        let completed = handle.is_completed();
+        let snapshot = (!completed || retire)
+            .then(|| handle.snapshot(None).ok_or("Provider state is unavailable"))
+            .transpose()?;
+        // Process exit does not settle provider-reported delegated work. Its
+        // canonical ownership evidence must survive until explicitly resolved.
+        if retire
+            && snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.is_working() || snapshot.waiting || !snapshot.requests.is_empty()
+            })
+        {
+            return Err("The provider is not idle; automatic cleanup did not stop it".into());
+        }
+        let idle_generation = if !completed {
+            let snapshot = snapshot.as_ref().expect("live provider snapshot");
+            let working = if retire {
+                snapshot.is_working()
+            } else {
+                snapshot.busy
+            };
+            if !snapshot.ready || working || snapshot.waiting || !snapshot.requests.is_empty() {
                 return Err("The provider is not idle; automatic cleanup did not stop it".into());
             }
             Some(snapshot.generation)
@@ -192,6 +300,11 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         };
         if !retire {
             return Ok(Reconciliation::Idle);
+        }
+        if let Some(firing) = archive {
+            registry.lock().unwrap_or_else(|p| p.into_inner())
+                .archive_automation_conversation(firing, &agent, snapshot.expect("archive snapshot"))
+                .map_err(|error| format!("The completed conversation could not be saved: {error}. Open the blocking run, then close it explicitly to unblock."))?;
         }
         if let Some(generation) = idle_generation {
             handle.close_if_idle(generation)?;

@@ -384,7 +384,23 @@ fn attached_mut(
     }
     Ok(record)
 }
+pub(super) fn changed_owned(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: uuid::Uuid,
+    update: Update,
+) {
+    changed_from(host, id, Some(instance), update);
+}
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    changed_from(host, id, None, update);
+}
+fn changed_from(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: Option<uuid::Uuid>,
+    update: Update,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -416,6 +432,14 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if instance.is_some_and(|instance| {
+        !state
+            .chats
+            .get(&id)
+            .is_some_and(|record| record.execution_instance == instance)
+    }) {
+        return;
+    }
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for it.
     if matches!(
@@ -1975,11 +1999,269 @@ pub(super) fn enqueue_deferred(
     pending.ok_or_else(|| error("Provider control was not admitted"))
 }
 
+/// A cached descriptor may predate the exact live actor's verified native
+/// promotion. Only that same Handle can supply the new typed continuity; a
+/// caller-provided Durable/actor version never authorizes learning it.
+fn reserved_automation_descriptor_matches(
+    agent: &crate::agent_execution::Agent,
+    current: &Session,
+    actual: &chat::NativeContinuity,
+) -> bool {
+    let Some(crate::agent_execution::HostedSession::Chat(canonical)) = &agent.session else {
+        return false;
+    };
+    let issued = |value: &chat::NativeContinuity| {
+        matches!(value, chat::NativeContinuity::ReconnectOnly) || value == actual
+    };
+    if !issued(&canonical.native_continuity) || !issued(&current.native_continuity) {
+        return false;
+    }
+    let mut current = current.clone();
+    current.native_continuity = canonical.native_continuity.clone();
+    crate::automations::archive::native_descriptor_matches(agent, &current)
+}
+
+/// Read-only archive projection may learn an issued console from None. A live
+/// actor record must instead retain every already-known pair; reconstructing
+/// that ownership from an archive alias would erase its current pair authority.
+fn reserved_automation_record_matches(
+    agent: &crate::agent_execution::Agent,
+    current: &Session,
+    actual: &chat::NativeContinuity,
+) -> bool {
+    let Some(crate::agent_execution::HostedSession::Chat(canonical)) = &agent.session else {
+        return false;
+    };
+    (canonical.terminal.is_none() || current.terminal.is_some())
+        && reserved_automation_descriptor_matches(agent, current, actual)
+}
+
+fn reserved_automation_request_matches(
+    agent: &crate::agent_execution::Agent,
+    requested: &Session,
+    issued: &Session,
+) -> bool {
+    requested
+        .terminal
+        .as_ref()
+        .is_none_or(|terminal| issued.terminal.as_ref() == Some(terminal))
+        && reserved_automation_descriptor_matches(agent, requested, &issued.native_continuity)
+}
+
+/// The caller holds this agent's owner gate and has proved an OPEN pending
+/// archive reservation. Resolve only its exact existing actor, never a launcher.
+pub(in crate::host) fn reserved_automation_actor(
+    host: &SharedHost,
+    client: ClientId,
+    agent: &crate::agent_execution::Agent,
+    require_attached: bool,
+) -> Result<chat::runtime::Handle, ProtocolError> {
+    if agent.closed
+        || !matches!(
+            agent.origin,
+            crate::agent_execution::Origin::Automation { .. }
+        )
+    {
+        return Err(error(
+            "Completed scheduled conversations are saved read-only",
+        ));
+    }
+    let Some(crate::agent_execution::HostedSession::Chat(issued)) = &agent.session else {
+        return Err(unavailable(
+            "The exact pending archive provider is unavailable",
+        ));
+    };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(issued.proof.as_ref(), state.proof())?;
+    let record = state.chats.get(&issued.id)
+        .filter(|record| !record.handle.is_completed())
+        .filter(|record| reserved_automation_record_matches(agent, &record.session, &record.handle.native_continuity()))
+        .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id)
+        .filter(|record| !require_attached || record.subscribers.contains_key(&client))
+        .ok_or_else(|| unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"))?;
+    Ok(record.handle.clone())
+}
+
+/// Hydration happened without HostState. An already-consumed update after its
+/// snapshot still belongs to the new reader; arming at the newer current clock
+/// would silently hide that only observation until another provider event.
+fn subscribe_reserved_automation_reader(
+    record: &mut Record,
+    client: ClientId,
+    snapshot_generation: u64,
+) -> Option<u64> {
+    if let std::collections::btree_map::Entry::Vacant(entry) = record.subscribers.entry(client) {
+        entry.insert(false);
+        let current = record.handle.observe_next_update();
+        record.observations.insert(
+            client,
+            Observation {
+                after_generation: snapshot_generation,
+                ..Default::default()
+            },
+        );
+        (current > snapshot_generation).then_some(current)
+    } else {
+        None
+    }
+}
+
+/// Attach an OPEN reserved conversation directly to its issued live actor.
+/// Snapshot hydration runs outside HostState, including retained native RPCs.
+pub(in crate::host) fn attach_reserved_automation_actor(
+    host: &SharedHost,
+    client: ClientId,
+    agent: &crate::agent_execution::Agent,
+    requested: &chat::Session,
+) -> Result<ServerResponse, ProtocolError> {
+    let handle = reserved_automation_actor(host, client, agent, false)?;
+    let (mut issued, instance) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&requested.id)
+            .filter(|record| record.handle.same_actor(&handle))
+            .ok_or_else(|| unavailable("The pending archive actor changed before attachment"))?;
+        (record.session.clone(), record.execution_instance)
+    };
+    issued.launch.session_id = handle.confirmed_session_id();
+    issued.native_continuity = handle.native_continuity();
+    if !reserved_automation_request_matches(agent, requested, &issued) {
+        return Err(error(
+            "The pending archive attachment changed its exact native descriptor",
+        ));
+    }
+    let snapshot = handle
+        .snapshot(None)
+        .ok_or_else(|| unavailable("The pending archive snapshot is unavailable"))?;
+    if snapshot.session_id != issued.launch.session_id
+        || snapshot.native_continuity != issued.native_continuity
+    {
+        return Err(unavailable(
+            "The pending archive conversation changed during hydration",
+        ));
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(requested.proof.as_ref(), state.proof())?;
+    let record = state
+        .chats
+        .get_mut(&requested.id)
+        .filter(|record| {
+            record.execution_instance == instance
+                && record.handle.same_actor(&handle)
+                && !record.handle.is_completed()
+        })
+        .filter(|record| {
+            reserved_automation_record_matches(
+                agent,
+                &record.session,
+                &record.handle.native_continuity(),
+            )
+        })
+        .filter(|record| {
+            record.handle.confirmed_session_id() == issued.launch.session_id
+                && record.handle.native_continuity() == issued.native_continuity
+        })
+        .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
+    let advanced = subscribe_reserved_automation_reader(record, client, snapshot.generation);
+    drop(state);
+    if let Some(generation) = advanced {
+        // The client retains ChatObserved edges received before ChatAttached.
+        // Use the ordinary coalescer, including its successful-delivery receipt.
+        changed_owned(
+            &Arc::downgrade(host),
+            requested.id,
+            instance,
+            Update::Observed { generation },
+        );
+    }
+    Ok(ServerResponse::ChatAttached {
+        session: issued,
+        snapshot,
+    })
+}
+
+pub(in crate::host) fn executable_automation_sessions(
+    request: &ClientRequest,
+) -> Vec<crate::model::TerminalId> {
+    match request {
+        ClientRequest::ChatStart { session, .. }
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session } => vec![session.id],
+        ClientRequest::ChatPrepareResume { source } => vec![source.id],
+        ClientRequest::ChatRecoverAccount {
+            source,
+            replacement,
+            ..
+        } => vec![source.id, replacement.id],
+        ClientRequest::ChatReturnTerminal { chat_id } => vec![*chat_id],
+        ClientRequest::ChatCommand { chat_id, command }
+            if !matches!(command, chat::Command::Refresh | chat::Command::LoadEarlier) =>
+        {
+            vec![*chat_id]
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
+    let report_source = match &request {
+        ClientRequest::ChatStart { session, .. }
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session }
+        | ClientRequest::ChatPreview { session, .. }
+        | ClientRequest::ChatCandidates { session, .. } => session.archive_report.is_some(),
+        ClientRequest::ChatPrepareResume { source } => source.archive_report.is_some(),
+        ClientRequest::ChatRecoverAccount {
+            source,
+            replacement,
+            ..
+        } => source.archive_report.is_some() || replacement.archive_report.is_some(),
+        _ => false,
+    };
+    if report_source {
+        return Err(error(
+            "Saved automation reports are read-only and cannot start, attach, or resume a provider",
+        ));
+    }
+    // Window watches are asynchronous. The persisted archive reservation is
+    // authoritative even if a stale client still presents live controls.
+    let sessions = executable_automation_sessions(&request);
+    if !sessions.is_empty() {
+        let registry = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execution_registry
+            .clone();
+        if let Some(registry) = registry {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            for id in sessions {
+                if registry
+                    .is_archived_automation_session(id)
+                    .map_err(unavailable)?
+                {
+                    // An external exact attach or command is re-admitted under
+                    // the owner gate below. Its reserved live path cannot enter
+                    // a start/restart fallback; completed archives still refuse.
+                    if client != super::agent_execution::EXECUTION_CLIENT
+                        && matches!(
+                            &request,
+                            ClientRequest::ChatAttach { .. } | ClientRequest::ChatCommand { .. }
+                        )
+                    {
+                        continue;
+                    }
+                    return Err(error(
+                        "Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation.",
+                    ));
+                }
+            }
+        }
+    }
     super::agent_execution::interactive(host, client, request, |request| {
         process_inner(host, client, request)
     })
@@ -2644,6 +2926,11 @@ pub(super) fn resolve_upgrade(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Session, ProtocolError> {
+    if source.archive_report.is_some() {
+        return Err(error(
+            "A saved automation report has no executable upgrade owner",
+        ));
+    }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let sources = state.upgrade_chats.get(&source.id).ok_or_else(|| {
         unavailable(
@@ -3055,6 +3342,372 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    fn saved_report_markers_refuse_every_session_based_provider_admission_before_process_creation()
+    {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("report-no-start"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("instance"),
+        };
+        let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+        let session = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "/must-never-be-spawned-report".into(),
+                    arguments: vec![],
+                    working_directory: "/".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("report-thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            archive_report: Some(chat::ArchiveReportReference {
+                format: 999,
+                registry: uuid::Uuid::new_v4(),
+                agent: crate::model::AgentId::new(),
+                source_operation: uuid::Uuid::new_v4(),
+            }),
+        };
+        let mut replacement = session.clone();
+        replacement.archive_report = None;
+        replacement.id = TerminalId::new();
+        for request in [
+            ClientRequest::ChatStart {
+                session: session.clone(),
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+            ClientRequest::ChatStartSelected {
+                session: session.clone(),
+                source: proof.clone(),
+                token: "never-issued".into(),
+            },
+            ClientRequest::ChatAttach {
+                session: session.clone(),
+            },
+            ClientRequest::ChatPrepareResume {
+                source: session.clone(),
+            },
+            ClientRequest::ChatPreview {
+                session: session.clone(),
+                source: proof.clone(),
+            },
+            ClientRequest::ChatCandidates {
+                session: session.clone(),
+                source: proof.clone(),
+            },
+            ClientRequest::ChatRecoverAccount {
+                source: session.clone(),
+                replacement,
+                idle_generation: None,
+                execution_environment: Default::default(),
+            },
+        ] {
+            let refused = process(&host, 1, request).unwrap_err();
+            assert!(!refused.retryable);
+            assert!(refused.message.contains("read-only"), "{refused:?}");
+        }
+        assert!(
+            resolve_upgrade(&host, &session)
+                .unwrap_err()
+                .message
+                .contains("report")
+        );
+        assert!(
+            close_retained_native(&host, &session)
+                .unwrap_err()
+                .contains("report")
+        );
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            state.chats.is_empty()
+                && state.chat_spawning.is_empty()
+                && state.execution_inventory_count_for_test() == 0
+                && state.terminals.is_empty()
+        );
+    }
+
+    #[test]
+    fn pending_automation_archive_attachment_observes_changes_after_its_hydrated_snapshot() {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("pending-archive-observation"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+        let chat_id = TerminalId::new();
+        let instance = uuid::Uuid::new_v4();
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let weak = Arc::downgrade(&host);
+        let (completed, seen) = crossbeam_channel::bounded(8);
+        let handle = Handle::start(
+            spec,
+            Box::new(Echo(false)),
+            initial,
+            store,
+            None,
+            move |update| {
+                let generation = match &update {
+                    Update::Activity { generation, .. } => Some(*generation),
+                    _ => None,
+                };
+                // Finish the real producer callback while no reader is subscribed.
+                changed(&weak, chat_id, update);
+                if let Some(generation) = generation {
+                    let _ = completed.try_send(generation);
+                }
+            },
+        )
+        .unwrap();
+        let hydrated = handle.snapshot(None).unwrap();
+        handle.command(Command::Interrupt).unwrap();
+        let generation = loop {
+            let generation = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("provider update after snapshot");
+            if generation > hydrated.generation {
+                break generation;
+            }
+        };
+        let (queue, advanced) = {
+            let mut state = host.lock().unwrap();
+            let queue = state.register_client(17);
+            let mut record = Record {
+                execution_instance: instance,
+                console_recipe: None,
+                paired_terminal: None,
+                session: Session {
+                    archive_report: None,
+                    id: chat_id,
+                    launch: chat::Launch {
+                        provider: Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: Some(proof),
+                    terminal: None,
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                },
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            };
+            let advanced =
+                subscribe_reserved_automation_reader(&mut record, 17, hydrated.generation);
+            assert_eq!(
+                record.observations[&17].after_generation,
+                hydrated.generation
+            );
+            state.chats.insert(chat_id, record);
+            (queue, advanced)
+        };
+        assert!(advanced.is_some_and(|current| current >= generation));
+        changed_owned(
+            &Arc::downgrade(&host),
+            chat_id,
+            uuid::Uuid::new_v4(),
+            Update::Observed {
+                generation: advanced.unwrap(),
+            },
+        );
+        assert!(
+            !host.lock().unwrap().chats[&chat_id].observations[&17].notified,
+            "an older actor instance must not notify the replacement reader"
+        );
+        for _ in 0..2 {
+            changed_owned(
+                &Arc::downgrade(&host),
+                chat_id,
+                instance,
+                Update::Observed {
+                    generation: advanced.unwrap(),
+                },
+            );
+        }
+        queue.close_after_drain();
+        let mut observations = Vec::new();
+        while let Some(envelope) = queue.pop() {
+            match envelope.message {
+                ServerMessage::ChatObserved {
+                    chat_id: observed,
+                    epoch,
+                } => {
+                    assert_eq!(observed, chat_id);
+                    observations.push(epoch);
+                }
+                other => panic!("attachment requested unsolicited presentation: {other:?}"),
+            }
+        }
+        assert_eq!(
+            observations,
+            vec![0],
+            "the consumed update must be observed once without another provider event"
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn pending_automation_archive_attachment_learns_only_the_exact_actors_native_promotion() {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        let (_directory, _host, saved) = upgrade_fixture();
+        let source = saved.source;
+        let placement = Placement::Channel(crate::model::ChannelId::new());
+        let mut agent = Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+            spec: Spec {
+                provider: source.launch.provider,
+                account: None,
+                target: Target {
+                    repository: source.launch.recipe.working_directory.clone(),
+                    directory: source.launch.recipe.working_directory.clone(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: Some(HostedSession::Chat(source.clone())),
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let actual = chat::NativeContinuity::Durable {
+            provider_version: "verified-1".into(),
+        };
+        assert!(reserved_automation_descriptor_matches(
+            &agent, &source, &actual
+        ));
+        let mut promoted = source.clone();
+        promoted.native_continuity = actual.clone();
+        assert!(reserved_automation_descriptor_matches(
+            &agent, &promoted, &actual
+        ));
+        let Some(HostedSession::Chat(canonical)) = &mut agent.session else {
+            unreachable!()
+        };
+        canonical.native_continuity = actual.clone();
+        assert!(reserved_automation_descriptor_matches(
+            &agent, &source, &actual
+        ));
+        assert!(
+            !crate::automations::archive::native_descriptor_matches(&agent, &source),
+            "closed archive readiness remains strict"
+        );
+        let mut unrelated = promoted.clone();
+        unrelated.native_continuity = chat::NativeContinuity::Durable {
+            provider_version: "unrelated-version".into(),
+        };
+        assert!(!reserved_automation_descriptor_matches(
+            &agent, &unrelated, &actual
+        ));
+        assert!(!reserved_automation_descriptor_matches(
+            &agent,
+            &promoted,
+            &chat::NativeContinuity::ReconnectOnly
+        ));
+        let mut unknown_thread = source.clone();
+        unknown_thread.launch.session_id = None;
+        assert!(
+            reserved_automation_descriptor_matches(&agent, &unknown_thread, &actual),
+            "only the canonical already-confirmed thread may be learned"
+        );
+        let terminal = crate::model::TerminalSession {
+            id: source.id,
+            launch: LaunchRecipe {
+                program: "/matched/cagents".into(),
+                arguments: vec!["agent".into(), "console".into(), agent.id.to_string()],
+                working_directory: source.launch.recipe.working_directory.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: source.proof.as_ref().unwrap().host_session_id.clone(),
+                boot_id: source.proof.as_ref().unwrap().boot_id.clone(),
+                host_incarnation: source.proof.as_ref().unwrap().host_incarnation.clone(),
+            },
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+        };
+        agent.console = Some(terminal.clone());
+        let mut paired = promoted.clone();
+        paired.terminal = Some(terminal.clone());
+        assert!(reserved_automation_record_matches(&agent, &paired, &actual));
+        assert!(
+            reserved_automation_request_matches(&agent, &source, &paired),
+            "stale None may learn the exact current actor pair"
+        );
+        assert!(
+            !reserved_automation_request_matches(&agent, &paired, &promoted),
+            "known pair must not disappear from the response"
+        );
+        let Some(HostedSession::Chat(canonical)) = &mut agent.session else {
+            unreachable!()
+        };
+        canonical.terminal = Some(terminal);
+        assert!(
+            !reserved_automation_record_matches(&agent, &source, &actual),
+            "a live record cannot reconstruct its missing known pair from readonly projection"
+        );
+        assert!(reserved_automation_record_matches(&agent, &paired, &actual));
+        for field in 0..5 {
+            let mut changed = source.clone();
+            match field {
+                0 => changed.launch.session_id = Some("unrelated-native-thread".into()),
+                1 => changed.id = TerminalId::new(),
+                2 => changed.proof = None,
+                3 => {
+                    changed.owned_codex_listener = Some(chat::OwnedCodexListener {
+                        socket: "/unrelated/control.sock".into(),
+                        allocator: source.proof.clone().unwrap(),
+                    })
+                }
+                _ => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("DIFFERENT_ACCOUNT".into(), "other-home".into());
+                }
+            }
+            assert!(
+                !reserved_automation_descriptor_matches(&agent, &changed, &actual),
+                "different authority field {field}"
+            );
+        }
+    }
+
+    #[test]
     fn removed_claude_account_is_reported_before_missing_resume_history() {
         const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_HISTORY_TEST";
         if std::env::var_os(CHILD).is_none() {
@@ -3076,6 +3729,7 @@ mod tests {
             })
             .unwrap();
         let session = Session {
+            archive_report: None,
             id: TerminalId::new(),
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -3326,6 +3980,7 @@ mod tests {
             .proof()
             .clone();
         let session = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
@@ -3419,6 +4074,7 @@ for line in sys.stdin:
             session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
         };
         let source = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
@@ -4128,6 +4784,7 @@ done
             proof.clone(),
         )));
         let source = Session {
+            archive_report: None,
             id: TerminalId::new(),
             owned_codex_listener: None,
             native_continuity: Default::default(),
@@ -4384,6 +5041,7 @@ done
             current.clone(),
         )));
         let mut session = Session {
+            archive_report: None,
             id: TerminalId::new(),
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -4477,6 +5135,7 @@ done
         )
         .unwrap();
         let mut session = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: chat_id,
@@ -4778,6 +5437,7 @@ done
         let session = Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
+            archive_report: None,
             id: chat_id,
             launch: chat::Launch {
                 provider: if return_terminal {
@@ -4943,6 +5603,7 @@ done
                     console_recipe: None,
                     paired_terminal: None,
                     session: Session {
+                        archive_report: None,
                         native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,

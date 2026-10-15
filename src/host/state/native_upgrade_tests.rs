@@ -975,6 +975,7 @@ fn provider_session(
     proof: &HostSessionProof,
 ) -> Session {
     let mut source = Session {
+        archive_report: None,
         id: TerminalId::new(),
         launch: Launch {
             provider: Provider::Codex,

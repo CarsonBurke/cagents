@@ -2166,6 +2166,7 @@ mod tests {
                         .then(|| session.launch.clone()),
                     paired_terminal: Some(terminal),
                     session: chat::Session {
+                        archive_report: None,
                         id: session.id,
                         native_continuity: Default::default(),
                         owned_codex_listener: None,
@@ -2324,6 +2325,7 @@ mod tests {
                     console_recipe: None,
                     paired_terminal: None,
                     session: chat::Session {
+                        archive_report: None,
                         native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,

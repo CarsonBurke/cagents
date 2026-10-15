@@ -10,11 +10,15 @@ use crate::{
 };
 
 #[cfg(any(feature = "host", feature = "ui"))]
+pub mod archive;
+#[cfg(any(feature = "host", feature = "ui"))]
 pub mod schedule;
 
 pub const MAX_NAME_BYTES: usize = 160;
 pub const MAX_PRECHECK_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_PAGE: usize = 100;
+/// Maximum summary rows in a model push or explicit global request page.
+pub const PROPOSAL_PAGE_SIZE: usize = 64;
 pub const MAX_CONCURRENT_PRECHECKS: usize = 4;
 pub const DEFAULT_PRECHECK_SECONDS: u32 = 30;
 pub const MAX_PRECHECK_SECONDS: u32 = 300;
@@ -91,6 +95,35 @@ pub enum Request {
         revision: u64,
         approved: bool,
     },
+    Unblock {
+        id: Uuid,
+        firing: Uuid,
+        revision: u64,
+    },
+    AllPendingProposals {
+        after: Option<Uuid>,
+        limit: usize,
+    },
+    ArchivedConversation {
+        agent: AgentId,
+    },
+    /// Look up report provenance before any provider-resume identity reset.
+    ArchiveReportSource {
+        identity: Uuid,
+        card: crate::model::CardId,
+        descriptor: ArchiveReportDescriptor,
+    },
+    ReadArchiveReport {
+        reference: crate::chat::ArchiveReportReference,
+        descriptor: ArchiveReportDescriptor,
+    },
+    ArchivedAgents {
+        scope: agent_execution::Placement,
+        identity: Uuid,
+        archive_sequence: u64,
+        after: Option<AgentId>,
+        limit: usize,
+    },
 }
 
 impl Request {
@@ -119,6 +152,69 @@ pub enum Response {
     CancellationRequested,
     Proposal(Box<Proposal>),
     Proposals(Vec<ProposalSummary>),
+    ArchivedConversation(Box<ArchivedConversation>),
+    ArchiveReportSource(Option<Box<ArchiveReport>>),
+    ArchiveReport(Box<ArchiveReport>),
+    ArchivedAgents(ArchiveAgentPage),
+}
+
+/// The request binds an exact saved descriptor without copying its recipe
+/// into the smaller client frame. The server must find and privately qualify
+/// that exact digest from its closed source; this is never execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReportDescriptor {
+    pub id: crate::model::TerminalId,
+    pub digest: [u8; 32],
+    pub reference: Option<crate::chat::ArchiveReportReference>,
+}
+impl ArchiveReportDescriptor {
+    pub fn from_session(session: &crate::chat::Session) -> Result<Self, String> {
+        Ok(Self {
+            id: session.id,
+            digest: ArchiveReport::session_digest(session)?,
+            reference: session.archive_report.clone(),
+        })
+    }
+}
+
+/// Private bounded history plus the immutable registry-issued removal reference.
+/// This describes a read-only presentation, not a new provider conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReport {
+    pub reference: crate::chat::ArchiveReportReference,
+    pub scope: crate::agent_execution::Placement,
+    pub repository: std::path::PathBuf,
+    pub source_revision: u64,
+    pub presentation_scope: Option<std::path::PathBuf>,
+    /// Binds the exact requested presentation without duplicating a potentially
+    /// large native recipe beside the original Agent in every response.
+    pub session_digest: [u8; 32],
+    pub archive: ArchivedConversation,
+}
+impl ArchiveReport {
+    pub fn session_digest(session: &crate::chat::Session) -> Result<[u8; 32], String> {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_vec(session).map_err(|error| error.to_string())?;
+        Ok(Sha256::digest(encoded).into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveAgentPage {
+    pub scope: agent_execution::Placement,
+    pub identity: Uuid,
+    pub archive_sequence: u64,
+    pub proof: crate::model::HostSessionProof,
+    pub agents: Vec<agent_execution::Agent>,
+    pub next: Option<AgentId>,
+}
+
+/// Bounded final presentation of an exact retired provider conversation.
+/// This payload is fetched only when its pane is visible; never in model watch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedConversation {
+    pub agent: agent_execution::Agent,
+    pub snapshot: crate::chat::Snapshot,
 }
 
 /// A saved execution configuration, separate from active scheduler records.
@@ -261,6 +357,29 @@ pub struct Precheck {
     pub timeout_seconds: u32,
 }
 
+/// Whether a scheduled session is automatically attached to its destination.
+/// Definitions saved before this setting existed use the normal visible mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    #[default]
+    Headfull,
+    Headless,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchUp {
+    Skip,
+    WithinMinutes(u32),
+    OnceOnWake,
+}
+impl Default for CatchUp {
+    fn default() -> Self {
+        Self::WithinMinutes(15)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
     pub name: String,
@@ -268,6 +387,10 @@ pub struct Definition {
     pub agent: agent_execution::Spec,
     pub schedule: Schedule,
     pub session_mode: SessionMode,
+    #[serde(default)]
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub catch_up: CatchUp,
     pub precheck: Option<Precheck>,
 }
 
@@ -297,6 +420,10 @@ impl Definition {
             || self.schedule.timezone.chars().any(char::is_control)
         {
             return Err("Choose an explicit IANA timezone, such as America/Vancouver".into());
+        }
+        if matches!(self.catch_up, CatchUp::WithinMinutes(minutes) if minutes == 0 || minutes > 10_080)
+        {
+            return Err("Catch-up must be between 1 and 10080 minutes".into());
         }
         if let Some(precheck) = &self.precheck {
             if precheck.command.trim().is_empty()
@@ -399,6 +526,22 @@ pub enum SkipReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedOccurrences {
+    pub count: u64,
+    pub first_occurrence_ms: u64,
+    pub last_occurrence_ms: u64,
+}
+
+/// A bounded missed-time interval; no occurrence count is inferred across downtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissedInterval {
+    pub first_due_ms: u64,
+    /// The next eligible occurrence is excluded from this missed interval.
+    pub until_exclusive_ms: u64,
+    pub intervals: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Firing {
     pub id: Uuid,
     pub automation: Uuid,
@@ -420,6 +563,10 @@ pub struct Firing {
     pub agent: Option<AgentId>,
     pub run: Option<RunId>,
     pub skip: Option<SkipReason>,
+    #[serde(default)]
+    pub skipped_occurrences: Option<SkippedOccurrences>,
+    #[serde(default)]
+    pub missed_interval: Option<MissedInterval>,
     /// Bounded process/validation diagnostic, never a duplicate transcript.
     pub diagnostic: Option<String>,
 }

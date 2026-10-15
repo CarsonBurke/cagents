@@ -1442,6 +1442,7 @@ mod tests {
 
     fn source() -> HostedSession {
         HostedSession::Chat(crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {

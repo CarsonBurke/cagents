@@ -1219,6 +1219,10 @@ pub struct WorkspaceState {
     /// them in the workspace where they were opened.
     #[serde(default)]
     pub card_scopes: HashMap<CardId, PathBuf>,
+    /// Exact retired automation conversations. Only IDs persist here; their
+    /// bounded read-only presentation is loaded from the daemon on visibility.
+    #[serde(default)]
+    pub automation_archives: HashMap<CardId, AgentId>,
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
@@ -1273,6 +1277,7 @@ impl Default for WorkspaceState {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            automation_archives: HashMap::new(),
             chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),
             conversation_drafts: HashMap::new(),
@@ -1394,6 +1399,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Chat(crate::chat::Session {
+                    archive_report: None,
                     native_continuity: Default::default(),
                     owned_codex_listener: None,
                     id: TerminalId::new(),

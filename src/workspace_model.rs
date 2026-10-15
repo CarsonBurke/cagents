@@ -185,6 +185,23 @@ pub struct WorkspaceModel {
     /// Durable execution sessions, adopted into their explicitly owned channel.
     #[serde(default)]
     pub agents: Vec<crate::agent_execution::Agent>,
+    #[serde(default)]
+    pub headless_automation_agents: Vec<crate::model::AgentId>,
+    #[serde(default)]
+    pub archived_automation_agents: Vec<crate::agent_execution::Agent>,
+    /// Archive availability and canonical display changes only. Live run state
+    /// transitions never invalidate a destination's bounded discovery cursor.
+    #[serde(default)]
+    pub automation_archive_sequence: u64,
+    /// Exact global count and proposal-only change clock. Unrelated execution
+    /// edits do not reset explicit paging or refetch a consent dialog.
+    #[serde(default)]
+    pub pending_automation_proposal_count: u64,
+    #[serde(default)]
+    pub automation_proposal_sequence: u64,
+    /// First bounded page of pending consent summaries from every project.
+    #[serde(default)]
+    pub pending_automation_proposals: Vec<crate::automations::ProposalSummary>,
 }
 
 impl WorkspaceModel {
@@ -196,6 +213,20 @@ impl WorkspaceModel {
 
     pub fn channel(&self, id: ChannelId) -> Option<&ModelChannel> {
         self.channels.iter().find(|channel| channel.id == id)
+    }
+
+    /// The view currently displaying this exact agent, independent of its
+    /// execution repository and original placement. Old daemons transferred
+    /// panes without updating managed placement records.
+    ///
+    /// Saved pane membership wins, including a move across project displays.
+    /// Ambiguous, removed, or replaced panes must not be recreated at the old
+    /// placement. An agent not yet published as a pane retains its launch target.
+    pub fn agent_view_scope<'a>(
+        &'a self,
+        agent: &'a crate::agent_execution::Agent,
+    ) -> Option<&'a views::Scope> {
+        views::ManagedDisplayIndex::new(self).scope(agent)
     }
 
     /// Folds an observed edge into this cached copy.
@@ -524,6 +555,171 @@ pub fn repository_display_name(repository: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn agent_display_membership_survives_stale_records_without_changing_execution() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target},
+            model::{AgentId, CardId, CardKind, LaunchRecipe, TerminalId},
+            workspace_model::views::{Pane, Scope, View},
+        };
+        let original = Scope::Channel(ChannelId::new());
+        let moved = Scope::Channel(ChannelId::new());
+        let session = crate::chat::Session {
+            archive_report: None,
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: Provider::Codex,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec![],
+                    working_directory: "/execution-repo".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("host"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let agent = Agent {
+            id: AgentId::new(),
+            name: Some("live lead".into()),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Codex,
+                account: None,
+                target: Target {
+                    repository: "/execution-repo".into(),
+                    directory: "/execution-repo".into(),
+                    placement: Some(original.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: original.clone(),
+            session: Some(HostedSession::Chat(session.clone())),
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let pane = Pane {
+            id,
+            title: "Mailbox lead".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: CardKind::Chat(session),
+            scope: Some("/execution-repo".into()),
+        };
+        let mut model = WorkspaceModel::default();
+        assert_eq!(model.agent_view_scope(&agent), Some(&original));
+        let mut source = View::empty(original.clone());
+        source.retired.push(id);
+        model.views.push(source);
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "closed panes stay closed"
+        );
+        let mut destination = View::empty(moved.clone());
+        destination.panes.push(pane.clone());
+        model.views.push(destination);
+        assert_eq!(model.agent_view_scope(&agent), Some(&moved));
+        let restored: WorkspaceModel =
+            serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
+        assert_eq!(
+            restored.agent_view_scope(&agent),
+            Some(&moved),
+            "reconnect follows durable pane membership"
+        );
+        let CardKind::Chat(promoted) = &mut model.views[1].panes[0].kind else {
+            unreachable!()
+        };
+        promoted.launch.session_id = Some("confirmed-provider-thread".into());
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            Some(&moved),
+            "thread promotion does not replace the actor"
+        );
+        assert_eq!(agent.placement, original);
+        assert_eq!(
+            agent.spec.target.repository,
+            std::path::Path::new("/execution-repo")
+        );
+        // A legacy inventory alias can own the exact same actor.
+        model.views[1].panes[0].id = CardId::new();
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "an inventory alias must not create a second canonical pane"
+        );
+        model.views[1].panes[0].id = id;
+        let mut conflicting = View::empty(Scope::Worktree {
+            repository: "/execution-repo".into(),
+            path: "/execution-repo/tree".into(),
+        });
+        conflicting.panes.push(pane);
+        model.views.push(conflicting);
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "ambiguous legacy membership chooses no view"
+        );
+        model.views.pop();
+        let CardKind::Chat(session) = &mut model.views[1].panes[0].kind else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("replacement");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "same session id cannot substitute a different host"
+        );
+        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {
+            unreachable!()
+        };
+        let proof = source.proof.clone().unwrap();
+        let terminal = crate::model::TerminalSession {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: source.launch.recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            },
+        };
+        let mut terminal_agent = agent.clone();
+        terminal_agent.spec.surface = Surface::Terminal;
+        terminal_agent.console = Some(terminal.clone());
+        model.views[1].panes[0].kind = CardKind::Terminal(terminal);
+        let worktree = Scope::Worktree {
+            repository: "/execution-repo".into(),
+            path: "/execution-repo/tree".into(),
+        };
+        model.views[1].scope = worktree.clone();
+        assert_eq!(
+            model.agent_view_scope(&terminal_agent),
+            Some(&worktree),
+            "terminal presentation follows its console pane, not its native chat source"
+        );
+    }
 
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {
