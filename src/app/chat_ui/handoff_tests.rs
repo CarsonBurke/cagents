@@ -112,7 +112,7 @@ fn queued(task: Task<Message>) -> Message {
 pub(super) fn end_waits_for_original_attachment_then_closes_only_its_worker() {
     let (mut app, card, target, receipt) = returning();
     super::tests::request_end_chat(&mut app, card);
-    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Ok(receipt.clone())))));
     assert!(app.terminal_start_in_flight(card));
     assert!(app.chat_ui.phases.is_empty(), "actor cleanup cannot race the outstanding attachment");
     assert!(!app.chat_ui.handoff_closes[&card].attached);
@@ -149,7 +149,7 @@ fn post_retirement_unknown_binding_keeps_the_exact_completed_return() {
                 last_exit: crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 },
             };
         }
-        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Ok(receipt.clone())))));
         assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Terminal(source) if source == &receipt.terminal.session));
         let saved = &app.durable.terminal_handoff_receipts[&receipt.operation];
         assert!(saved.converted);
@@ -169,7 +169,7 @@ fn a_new_handle_with_unknown_binding_does_not_receive_the_earlier_return() {
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("chat"); };
     let current = runtime.session.clone();
     runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(current.clone(), Snapshot { ready: true, session_id: current.launch.session_id.clone(), ..Snapshot::default() })));
-    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Ok(receipt.clone())))));
     assert!(matches!(app.card_state(card).unwrap().kind, CardKind::Chat(_)));
     assert!(!app.terminal_start_in_flight(card));
     assert!(!app.durable.terminal_handoff_receipts[&receipt.operation].converted);
@@ -180,7 +180,7 @@ fn a_new_handle_with_unknown_binding_does_not_receive_the_earlier_return() {
 #[test]
 fn exact_receipt_ack_cannot_remove_a_new_operation_or_replacement_payload() {
     let (mut app, card, target, receipt) = returning();
-    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Ok(receipt.clone())))));
     let mut next = receipt.clone();
     next.operation = uuid::Uuid::new_v4();
     next.terminal.execution_instance = uuid::Uuid::new_v4();
@@ -242,7 +242,7 @@ fn receipt_owned_issued_thread_learning_keeps_the_original_end_and_pins_known_th
             // while the exact typed Return answer is still in flight.
             app.card_state_mut(card).unwrap().kind = CardKind::Chat(receipt.source.clone());
         }
-        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Ok(receipt.clone())))));
         assert_eq!(app.durable.terminal_handoff_receipts[&receipt.operation].converted, !known_other);
         assert_eq!(app.chat_ui.handoff_closes.contains_key(&card), !known_other);
         assert!(app.chat_ui.phases.is_empty(), "accepted End still waits for its actual attachment");
@@ -254,7 +254,7 @@ fn receipt_owned_issued_thread_learning_keeps_the_original_end_and_pins_known_th
 fn held_old_attachment_cannot_retire_a_new_attachment_of_the_same_receipt() {
     let (mut app, card, target, receipt) = returning();
     super::tests::request_end_chat(&mut app, card);
-    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Ok(receipt.clone())))));
     let first = app.terminal_start_operation(card).unwrap();
     app.begin_terminal_start(card);
     let second = app.terminal_start_operation(card).unwrap();
