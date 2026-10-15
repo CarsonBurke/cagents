@@ -35,6 +35,21 @@ pub(crate) fn reserve() -> io::Result<Reservation> {
     service.reserve()
 }
 
+/// Explicit recovery uses only already retained original ownership; it never
+/// opens a new pidfd by a remembered numeric PID.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RetryReport {
+    pub(crate) rearmed: usize,
+    pub(crate) retained: usize,
+}
+pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
+    match SERVICE.get() {
+        None => Ok(RetryReport { rearmed: 0, retained: 0 }),
+        Some(Ok(service)) => service.retry_preserved(),
+        Some(Err(error)) => Err(io::Error::other(error.clone())),
+    }
+}
+
 pub(crate) type RetainError = (io::Error, Child, File, Reservation);
 impl Reservation {
     /// Failure returns every ownership object intact. Insertion and wakeup are
@@ -98,6 +113,8 @@ struct State {
     free: Vec<usize>,
     next_ticket: u64,
     failure: Option<String>,
+    fatal: bool,
+    worker_alive: bool,
     stopping: bool,
 }
 struct Service {
@@ -121,7 +138,7 @@ impl Service {
         if fd < 0 { return Err(io::Error::last_os_error()); }
         let service = Arc::new(Self {
             event: unsafe { File::from_raw_fd(fd) },
-            state: Mutex::new(State { entries, free, next_ticket: 1, failure: None, stopping: false }),
+            state: Mutex::new(State { entries, free, next_ticket: 1, failure: None, fatal: false, worker_alive: true, stopping: false }),
             #[cfg(test)] fail_wake: std::sync::atomic::AtomicBool::new(false),
         });
         let owner = service.clone();
@@ -140,6 +157,36 @@ impl Service {
         state.next_ticket = next;
         Ok(Reservation { service: self.clone(), slot: Some(slot), ticket })
     }
+    fn retry_preserved(&self) -> io::Result<RetryReport> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopping || state.fatal || !state.worker_alive {
+            return Err(io::Error::other(state.failure.clone()
+                .unwrap_or_else(|| "Exact-child reaper worker is unavailable".into())));
+        }
+        let mut rearmed = Vec::new();
+        for (slot, entry) in state.entries.iter_mut().enumerate() {
+            let Some(entry) = entry.as_mut().filter(|entry| entry.suspended) else { continue; };
+            if entry.pidfd.as_ref().is_some_and(|pidfd| validate_pidfd(&entry.child, pidfd).is_ok()) {
+                entry.suspended = false;
+                rearmed.push(slot);
+            }
+        }
+        // As with retain, the worker cannot see a rearm that failed its wake.
+        if !rearmed.is_empty() {
+            if let Err(error) = self.wake() {
+                for slot in rearmed {
+                    state.entries[slot].as_mut().expect("retained under the state lock").suspended = true;
+                }
+                state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
+                return Err(error);
+            }
+        }
+        let retained = state.entries.iter().flatten().filter(|entry| entry.suspended).count();
+        if retained == 0 { state.failure = None; }
+        else { state.failure = Some(format!("{retained} original helper child owner(s) remain suspended without validated reaping authority")); }
+        Ok(RetryReport { rearmed: rearmed.len(), retained })
+    }
+
     fn wake(&self) -> io::Result<()> {
         #[cfg(test)]
         if self.fail_wake.load(std::sync::atomic::Ordering::Acquire) {
@@ -176,9 +223,26 @@ impl Service {
     fn fail(&self, error: impl ToString) {
         let error = error.to_string();
         tracing::error!(%error, "Exact-child reaping became unavailable; original children and admission credits remain owned");
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).failure = Some(error);
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.failure = Some(error);
+        state.fatal = true;
+        state.worker_alive = false;
     }
     fn run(&self) {
+        // Includes an unexpected worker panic: retained originals remain in
+        // State, and explicit recovery cannot report a dead worker as armed.
+        struct WorkerLifetime<'a>(&'a Service);
+        impl Drop for WorkerLifetime<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.worker_alive = false;
+                if !state.stopping {
+                    state.fatal = true;
+                    state.failure.get_or_insert_with(|| "Exact-child reaper worker stopped".into());
+                }
+            }
+        }
+        let _lifetime = WorkerLifetime(self);
         loop {
             let snapshot = {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -433,6 +497,57 @@ mod tests {
         drop(state);
         assert!(reaper.service.reserve().is_err());
         assert!(owned.pidfd.metadata().is_ok(), "the fixture retains its own independent cleanup authority");
+    }
+
+    #[test]
+    fn explicit_retry_rearms_only_retained_valid_pidfds_and_reaps_after_exit() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let child = owned.child.take().unwrap();
+        reservation.preserve_suspended(child, Some(owned.pidfd.try_clone().unwrap()), "fixture transfer failure");
+        reaper.service.fail_wake.store(true, Ordering::Release);
+        assert!(reaper.service.retry_preserved().is_err());
+        assert!(reaper.service.state.lock().unwrap().entries[0].as_ref().unwrap().suspended);
+        assert_eq!(reaper.free(), 0);
+        reaper.service.fail_wake.store(false, Ordering::Release);
+        assert_eq!(reaper.service.retry_preserved().unwrap(), RetryReport { rearmed: 1, retained: 0 });
+        assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        owned.signal(libc::SIGKILL);
+        reaper.await_free(1);
+        assert!(reaper.service.reserve().is_ok());
+    }
+
+    #[test]
+    fn explicit_retry_keeps_missing_and_wrong_pidfds_suspended_without_new_admission() {
+        let reaper = TestService::new(2);
+        let mut unrelated = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let mut missing = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let mut wrong = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let missing_reservation = reaper.service.reserve().unwrap();
+        let reservation = reaper.service.reserve().unwrap();
+        missing_reservation.preserve_suspended(missing.child.take().unwrap(), None, "missing fd");
+        reaper.service.reserve().unwrap_err();
+        reservation.preserve_suspended(wrong.child.take().unwrap(), Some(unrelated.pidfd.try_clone().unwrap()), "wrong fd");
+        assert_eq!(reaper.service.retry_preserved().unwrap(), RetryReport { rearmed: 0, retained: 2 });
+        assert!(reaper.service.reserve().is_err());
+        assert!(reaper.service.state.lock().unwrap().entries.iter().flatten().all(|entry| entry.suspended));
+        assert!(unrelated.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_retry_refuses_a_stopped_worker_even_with_a_valid_retained_pidfd() {
+        let mut reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        reservation.preserve_suspended(owned.child.take().unwrap(), Some(owned.pidfd.try_clone().unwrap()), "fixture failure");
+        reaper.service.state.lock().unwrap().stopping = true;
+        reaper.service.wake().unwrap();
+        reaper.worker.take().unwrap().join().unwrap();
+        reaper.service.state.lock().unwrap().stopping = false;
+        assert!(reaper.service.retry_preserved().is_err());
+        assert_eq!(reaper.free(), 0);
+        assert!(reaper.service.state.lock().unwrap().entries[0].as_ref().unwrap().suspended);
     }
 
     #[test]
