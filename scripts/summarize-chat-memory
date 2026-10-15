@@ -18,13 +18,22 @@ HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+)\s")
 METRICS = ("Rss", "Pss", "Anonymous", "Swap")
 
 
-def trace_owners(log):
+def trace_owners(log, pid=None):
     owners = {"chat_runtime": {}, "chat_client": {}, "ipc": {}}
     stacks = {}
+    matched_lines = 0
+    missing_process_id = 0
     for line in log.open(errors="replace"):
         if "cagents::memory" not in line:
             continue
         fields = {key: value.strip('"') for key, value in FIELD.findall(ANSI.sub("", line))}
+        if pid is not None:
+            if "process_id" not in fields:
+                missing_process_id += 1
+                continue
+            if fields["process_id"] != str(pid):
+                continue
+        matched_lines += 1
         owner = fields.get("owner")
         if owner == "thread_stack":
             try:
@@ -43,10 +52,12 @@ def trace_owners(log):
             if identity is None:
                 continue
             if fields.get("released") == "true":
-                owners[owner].pop(identity, None)
+                owners[owner].pop((fields.get("process_id"), identity), None)
             else:
                 # All current owner events contain complete exposed counters.
-                owners[owner][identity] = fields
+                owners[owner][(fields.get("process_id"), identity)] = fields
+    if pid is not None and matched_lines == 0:
+        raise SystemExit("no memory traces for the requested UI PID; missing process_id lines=" + str(missing_process_id))
     return owners, stacks
 
 
@@ -143,7 +154,7 @@ def main():
     parser.add_argument("--pid", type=int)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    owners, stacks = trace_owners(args.log)
+    owners, stacks = trace_owners(args.log, args.pid)
     report = {"schema_version": 1, "owner_totals": owner_totals(owners),
               "body_bytes_are_arc_references_not_unique_heap": True,
               "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True}
