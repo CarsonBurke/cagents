@@ -565,11 +565,22 @@ impl Cagents {
                 // Absence grants only an explicit, revision-bound local
                 // presentation option. Shared membership/history remain intact.
                 let offered=self.offer_local_terminal_dismissal(presentation);
-                self.status = Some(TransientNotice::warning(if offered {
+                // This pane was retained, so the batch has not completed.
+                // Discard its remaining intents instead of letting a later,
+                // unrelated successful close silently resume the old batch.
+                let remaining=self.project_recovery_ui.closing_panes && !self.queued_card_closes.is_empty();
+                if self.project_recovery_ui.closing_panes {
+                    self.queued_card_closes.clear();
+                    self.project_recovery_ui.closing_panes=false;
+                }
+                let message=if offered {
                     "The saved pane is unavailable. Use Dismiss locally to hide it in this window, or refresh its connection. Shared sessions and history are preserved."
                 } else {
                     "The saved pane is unavailable and was kept because its current local identity could not be verified. Reconnect or refresh this pane before trying again."
-                }));
+                };
+                self.status = Some(TransientNotice::warning(if remaining {
+                    format!("{message} Other selected panes were kept; choose Close panes again to inspect them.")
+                }else{message.to_owned()}));
                 Task::none()
             }
             Ok(CompletedCloseOutcome::Closed) => {

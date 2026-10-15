@@ -2582,6 +2582,23 @@ mod tests {
         }
     }
     #[test]
+    fn unavailable_completed_pane_stops_its_batch_before_local_dismissal() {
+        let (mut app,card,target)=local_dismissal_fixture();
+        let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
+        let model=app.workspace_model.clone();
+        let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+        drop(app.close_cards_in_order(vec![card,other]));
+        assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.queued_card_closes.len(),1);
+        drop(app.completed_terminal_closed(card,source,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
+        assert!(app.status.as_ref().unwrap().message.contains("Other selected panes were kept"));
+        assert!(app.local_terminal_unavailable_notice(card).is_some());
+        drop(app.dismiss_terminal_locally(target));
+        assert!(app.workspace.card(other).is_some());assert!(app.card_state(other).unwrap().existence.is_open());
+        assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
+    }
+
+    #[test]
     fn old_absence_cannot_offer_or_hide_a_fresh_start_without_confirmed_worker_metadata() {
         let (mut app,card,target)=local_dismissal_fixture();
         let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
