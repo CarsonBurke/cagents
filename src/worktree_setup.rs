@@ -452,6 +452,10 @@ pub fn prepare(
                     metadata.permissions().mode() & 0o777,
                 ))
                 .map_err(error)?;
+            // Numeric group mode bits can describe the ACL mask rather than
+            // actual group access. Preserve the source ACL and remove any
+            // default ACL inherited by a new copy when the source has none.
+            fs_safety::copy_access_acl(&input, &output).map_err(error)?;
             output.sync_all().map_err(error)?;
             check_cancel(cancel)?;
             index_lock.check().map_err(error)?;
@@ -654,6 +658,67 @@ mod tests {
         fs::set_permissions(&fixture.primary, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().copied, [PathBuf::from(".env")]);
         assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn copy_preserves_restrictive_access_acl_and_removes_inherited_acl() {
+        use std::os::fd::AsRawFd;
+        fn write_acl(file: &fs::File, name: &std::ffi::CStr, value: &[u8]) -> bool {
+            // SAFETY: file and both borrowed buffers outlive this call.
+            let result = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            if result == 0 { return true; }
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
+                eprintln!("SETUP_ACL_FIXTURE_UNSUPPORTED: {error}");
+                return false;
+            }
+            panic!("could not set fixture ACL: {error}");
+        }
+        fn read_acl(file: &fs::File) -> Option<Vec<u8>> {
+            let name = c"system.posix_acl_access";
+            // SAFETY: file/name remain live; null with zero size queries length.
+            let size = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            if size < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.raw_os_error(), Some(libc::ENODATA), "{error}");
+                return None;
+            }
+            let mut value = vec![0u8; size as usize];
+            // SAFETY: value is writable for its entire passed length.
+            let read = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            assert_eq!(read, size);
+            Some(value)
+        }
+        let fixture = Fixture::new();
+        fs::write(fixture.primary.join(".env.restricted"), "restricted").unwrap();
+        fs::write(fixture.primary.join(".env.plain"), "plain").unwrap();
+        let source = fs::File::open(fixture.primary.join(".env.restricted")).unwrap();
+        // Linux POSIX ACL v2: group mode0640 is the readable mask; the owning
+        // group itself has no access. A mode-only copy would broaden access.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX), (0x02, 4, 12_345),
+            (0x04, 0, u32::MAX), (0x10, 4, u32::MAX), (0x20, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        if !write_acl(&source, c"system.posix_acl_access", &acl) { return; }
+        assert_eq!(source.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        let parent = fs::File::open(&fixture.destination).unwrap();
+        assert!(write_acl(&parent, c"system.posix_acl_default", &acl));
+        fs::set_permissions(fixture.primary.join(".env.plain"), fs::Permissions::from_mode(0o640)).unwrap();
+        let plan = fixture.config("copy = ['.env*']");
+        assert_eq!(fixture.prepare(&plan).unwrap().copied.len(), 2);
+        let restricted = fs::File::open(fixture.destination.join(".env.restricted")).unwrap();
+        let plain = fs::File::open(fixture.destination.join(".env.plain")).unwrap();
+        assert_eq!(read_acl(&restricted), Some(acl));
+        assert_eq!(read_acl(&plain), None);
+        assert_eq!(plain.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read(fixture.destination.join(".env.restricted")).unwrap(), b"restricted");
+        assert_eq!(fs::read(fixture.destination.join(".env.plain")).unwrap(), b"plain");
+        println!("SETUP_ACL_COPY_VERIFIED");
     }
 
     #[test]
