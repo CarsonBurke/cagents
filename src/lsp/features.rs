@@ -531,13 +531,13 @@ pub(super) async fn perform_feature(
             .await
             .map(R::PrepareRename),
         (RequestKind::Rename, RequestArgs::Rename(new_name)) => server
-            .request::<request::Rename>(lsp_types::RenameParams {
+            .request::<workspace_wire::Rename>(lsp_types::RenameParams {
                 text_document_position: position,
                 new_name,
                 work_done_progress_params: progress,
             })
             .await
-            .map(R::Rename),
+            .map(|edit| R::Rename(edit.map(|edit| edit.0))),
         (RequestKind::Formatting, RequestArgs::Formatting(options)) => server
             .request::<request::Formatting>(lsp_types::DocumentFormattingParams {
                 text_document: position.text_document,
@@ -556,7 +556,7 @@ pub(super) async fn perform_feature(
             .await
             .map(R::Formatting),
         (RequestKind::CodeActions, RequestArgs::CodeActions { range, diagnostics }) => server
-            .request::<request::CodeActionRequest>(lsp_types::CodeActionParams {
+            .request::<workspace_wire::CodeActions>(lsp_types::CodeActionParams {
                 text_document: position.text_document,
                 range,
                 context: lsp_types::CodeActionContext {
@@ -568,11 +568,11 @@ pub(super) async fn perform_feature(
                 partial_result_params: Default::default(),
             })
             .await
-            .map(R::CodeActions),
+            .map(|items| R::CodeActions(items.map(|items| items.into_iter().map(|item| item.0).collect()))),
         (RequestKind::ResolveCodeAction, RequestArgs::Resolve(item)) => server
-            .request::<request::CodeActionResolveRequest>(item)
+            .request::<workspace_wire::ResolveCodeAction>(item)
             .await
-            .map(R::CodeActionResolved),
+            .map(|item| R::CodeActionResolved(item.0)),
         (RequestKind::ExecuteCommand, RequestArgs::Execute(command)) => server
             .request::<request::ExecuteCommand>(lsp_types::ExecuteCommandParams {
                 command: command.command,
@@ -1381,6 +1381,19 @@ impl Drop for ServerEditGuard {
     }
 }
 
+/// The router decodes annotations before handing the existing publication
+/// state machine its normal typed request. Direct typed fixtures use the same
+/// conversion and lease checks below.
+pub(super) fn apply_workspace_edit_wire(
+    state: &mut RouterState,
+    params: workspace_wire::ApplyWorkspaceEditParams,
+) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>>
++ Send
++ 'static
++ use<> {
+    apply_workspace_edit(state, params.into())
+}
+
 pub(super) fn apply_workspace_edit(
     state: &mut RouterState,
     params: lsp_types::ApplyWorkspaceEditParams,
@@ -1731,6 +1744,9 @@ mod tests {
 
     #[test]
     fn workspace_annotations_require_confirmation_and_bad_ranges_refuse_the_whole_batch() {
+        // Exercise the wire decoder rather than constructing OneOf::Right:
+        // lsp-types' plain-first JSON union otherwise discards annotationId.
+        let decode = |value| serde_json::from_value::<workspace_wire::WorkspaceEdit>(value).unwrap().0;
         let store = SnapshotStore::default();
         let uri = Arc::new(Url::parse("file:///repo/a.rs").unwrap());
         let key = SessionKey {
@@ -1740,7 +1756,7 @@ mod tests {
         store.register(LspDocumentId(1), &uri, &key, 4, Arc::from("a𝄞b"));
         let value = json!({"changeAnnotations":{"confirm":{"label":"Rename export","needsConfirmation":true}},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[{"annotationId":"confirm","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"x"}]}]});
         let converted =
-            convert_workspace_edit(&store, serde_json::from_value(value.clone()).unwrap(), None)
+            convert_workspace_edit(&store, decode(value.clone()), None)
                 .unwrap();
         assert!(converted.requires_confirmation);
         assert_eq!(converted.annotations[0].label, "Rename export");
@@ -1752,25 +1768,25 @@ mod tests {
         let mut oversized = value.clone();
         oversized["changeAnnotations"]["confirm"]["label"] = json!("x".repeat(1025));
         assert!(matches!(
-            convert_workspace_edit(&store, serde_json::from_value(oversized).unwrap(), None),
+            convert_workspace_edit(&store, decode(oversized), None),
             Err(LspError::Unsupported(_))
         ));
         let mut oversized = value.clone();
         oversized["changeAnnotations"]["confirm"]["description"] = json!("x".repeat(4097));
         assert!(matches!(
-            convert_workspace_edit(&store, serde_json::from_value(oversized).unwrap(), None),
+            convert_workspace_edit(&store, decode(oversized), None),
             Err(LspError::Unsupported(_))
         ));
         let mut missing = value.clone();
         missing["changeAnnotations"] = json!({});
         assert!(matches!(
-            convert_workspace_edit(&store, serde_json::from_value(missing).unwrap(), None),
+            convert_workspace_edit(&store, decode(missing), None),
             Err(LspError::Unsupported(_))
         ));
         let mut split = value;
         split["documentChanges"][0]["edits"][0]["range"]["start"]["character"] = json!(2);
         assert!(matches!(
-            convert_workspace_edit(&store, serde_json::from_value(split).unwrap(), None),
+            convert_workspace_edit(&store, decode(split), None),
             Err(LspError::SplitSurrogate { .. })
         ));
         let duplicate: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]},{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]}]})).unwrap();
