@@ -3062,14 +3062,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         if current < 12 {
             transaction.execute_batch(
                 "ALTER TABLE cards ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0, 1));
-                 UPDATE cards SET retired = 1 WHERE json_type(existence_json, '$.closed') IS NOT NULL;
+                 UPDATE cards SET retired = 1 WHERE CASE WHEN json_valid(existence_json) THEN json_type(existence_json, '$.closed') IS NOT NULL ELSE 1 END;
                  CREATE TABLE closed_cards (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     card_id TEXT UNIQUE NOT NULL,
                     workspace_id TEXT NOT NULL,
                     closed_at_unix_ms INTEGER NOT NULL
                  ) STRICT;
-                 INSERT INTO closed_cards(card_id, workspace_id, closed_at_unix_ms) SELECT card_id, workspace_id, COALESCE(json_extract(existence_json, '$.closed.tombstone.closed_at_unix_ms'), updated_at_unix_ms) FROM cards WHERE retired = 1;
+                 INSERT INTO closed_cards(card_id, workspace_id, closed_at_unix_ms) SELECT card_id, workspace_id, COALESCE(CASE WHEN json_valid(existence_json) THEN CASE WHEN typeof(json_extract(existence_json, '$.closed.tombstone.closed_at_unix_ms')) = 'integer' THEN json_extract(existence_json, '$.closed.tombstone.closed_at_unix_ms') END END, updated_at_unix_ms) FROM cards WHERE retired = 1;
                  CREATE TABLE closed_terminal_claims (
                     card_id TEXT PRIMARY KEY NOT NULL REFERENCES closed_cards(card_id),
                     claims_json TEXT NOT NULL,
@@ -3092,6 +3092,18 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             )?;
         }
         if current < 12 {
+            // Legacy existence is arbitrary TEXT. Quarantine unreadable rows
+            // without parsing them, preserve forensic bytes and narrow IDs,
+            // and pause automatic resource adoption when attribution is lost.
+            let damaged = transaction.prepare("SELECT card_id, kind_tag FROM cards WHERE NOT json_valid(existence_json)")?
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (id, kind) in damaged {
+                tracing::warn!(card = %id, %kind, "quarantined unreadable legacy card existence; original bytes retained");
+                if matches!(kind.as_str(), "terminal" | "chat") {
+                    closed_claims::preserve_unknown_claim(&transaction, parse_id("closed card", &id)?)?;
+                }
+            }
             let ids = transaction.prepare("SELECT card_id FROM cards WHERE retired = 1 AND kind_tag IN ('terminal', 'chat')")?
                 .query_map([], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
             for id in ids {
@@ -8288,6 +8300,41 @@ mod tests {
             StateStore::open(linked.join("state.sqlite3"), boot("boot-directory-link")),
             Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
+    }
+
+    #[test]
+    fn v11_corrupt_cold_workspace_existence_is_quarantined_without_blocking_healthy_restore() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("legacy-corrupt-existence");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let damaged = workspace_with_terminal(&boot_id);
+        let healthy = workspace_with_terminal(&boot_id);
+        SaveLane::default().save(&store, &damaged).unwrap();
+        SaveLane::default().save(&store, &healthy).unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx;
+            DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claims;
+            DROP TABLE closed_cards;
+            ALTER TABLE cards DROP COLUMN retired;
+            PRAGMA user_version = 11;").unwrap();
+        connection.execute("UPDATE cards SET existence_json = '{malformed' WHERE card_id = ?1", [damaged.cards[0].id.to_string()]).unwrap();
+        drop(connection);
+        let migrated = StateStore::open(&path, boot_id).unwrap();
+        assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let restored = migrated.load_workspace(healthy.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards.len(), 1);
+        assert_eq!(restored.cards[0].id, healthy.cards[0].id);
+        assert!(migrated.card_was_closed(damaged.cards[0].id));
+        assert!(migrated.has_unknown_closed_claims());
+        assert!(migrated.load_workspace(damaged.id, None).unwrap().unwrap().cards.is_empty());
+        let raw: String = migrated.lock_inner().unwrap().connection.query_row("SELECT existence_json FROM cards WHERE card_id = ?1", [damaged.cards[0].id.to_string()], |row| row.get(0)).unwrap();
+        assert_eq!(raw, "{malformed", "migration must preserve forensic bytes");
+        SaveLane::default().save(&migrated, &restored).unwrap();
     }
 
     #[test]
