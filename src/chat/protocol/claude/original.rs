@@ -20,6 +20,7 @@ pub(super) struct Waiting {
 #[derive(Default)]
 pub(super) struct Originals {
     pub staged: Option<String>,
+    pub(super) verified_retry: Option<(String, chat::annotations::OriginalSettings)>,
     pub revision: u64,
     provider_revision: u64,
     #[cfg(test)]
@@ -36,6 +37,9 @@ pub(super) struct Originals {
     latest_started: Option<String>,
 }
 impl Claude {
+    pub(super) fn original_retry_session(&self) -> Option<&str> {
+        self.originals.confirmed_session.as_deref()
+    }
     pub(super) fn original_settings_changed(&mut self) {
         self.originals.revision = self.originals.revision.wrapping_add(1);
         // A setter ACK may only acknowledge the requested overlay. Until
@@ -76,6 +80,10 @@ impl Claude {
             self.originals.started.remove(&oldest);
             self.originals.owned.remove(&oldest);
         }
+        let verified_retry = self.originals.verified_retry.take();
+        if verified_retry.as_ref().is_some_and(|(id, _)| id != &command) {
+            return Err("The verified Retry input changed before dispatch".into());
+        }
         if self
             .originals
             .proofs
@@ -86,9 +94,15 @@ impl Claude {
             )
             .is_err()
         {
-            return Ok(vec![frame]);
+            return if verified_retry.is_some() {
+                Err("The exact Retry acceptance identity could not be registered".into())
+            } else { Ok(vec![frame]) };
         }
         self.originals.owned.insert(command.clone());
+        if let Some((_, settings)) = verified_retry {
+            self.originals.applied.insert(command, (settings, self.originals.revision));
+            return Ok(vec![frame]);
+        }
         // Read optional metadata first. Failure to allocate this optional RPC
         // cannot prevent dispatch of the user's already validated prompt.
         let read = match self.control(json!({"subtype":"get_settings"})) {

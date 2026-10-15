@@ -21,6 +21,7 @@ use std::{
 };
 
 mod original;
+mod retry;
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
 const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Claude);
@@ -301,6 +302,7 @@ enum ReportTask {
 struct Claude {
     attachment_names: Vec<Option<PathBuf>>,
     originals: original::Originals,
+    retry: retry::RetryState,
     annotation_updates: Vec<chat::annotations::ApprovalUpdate>,
     session_id: Option<String>,
     /// Whether this process was launched to resume `session_id`, as opposed
@@ -1642,6 +1644,9 @@ impl Adapter for Claude {
                 }
             )
     }
+    fn retry_original(&mut self, settings: &chat::annotations::OriginalSettings, command: Command) -> Result<Step, String> {
+        self.begin_original_retry(settings, command)
+    }
     fn prompt_attachment_names(&mut self,names:Vec<Option<PathBuf>>) { self.attachment_names=names; }
     fn original_command(&mut self, id: Option<String>) {
         self.originals.staged = id;
@@ -1650,16 +1655,24 @@ impl Adapter for Claude {
         std::mem::take(&mut self.originals.updates)
     }
     fn discard_undispatched(&mut self) -> Result<Option<Step>, String> {
-        self.original_abort(true)
+        let mut step = self.cancel_original_retry("The conversation closed before Retry dispatch");
+        if let Some(original) = self.original_abort(true)? {
+            let merged = step.get_or_insert_with(Step::default);
+            merged.writes.extend(original.writes);
+            merged.events.extend(original.events);
+        }
+        Ok(step)
     }
     fn maintenance(&mut self) -> Result<Step, String> {
-        Ok(self.original_maintenance())
+        let mut step = self.original_maintenance();
+        let retry = self.retry_maintenance();
+        step.writes.extend(retry.writes);
+        step.events.extend(retry.events);
+        Ok(step)
     }
     fn maintenance_deadline(&self) -> Option<std::time::Instant> {
-        self.originals
-            .waiting
-            .as_ref()
-            .map(|pending| pending.deadline)
+        self.originals.waiting.as_ref().map(|pending| pending.deadline)
+            .into_iter().chain(self.retry_deadline()).min()
     }
     fn take_approval_updates(&mut self) -> Vec<chat::annotations::ApprovalUpdate> {
         std::mem::take(&mut self.annotation_updates)
@@ -1811,6 +1824,10 @@ impl Adapter for Claude {
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
+        let retry_aborted = self.cancel_original_retry("Retry was cancelled by a newer operator action");
+        if matches!(&command, Command::Interrupt) && retry_aborted.is_some() && !self.busy {
+            return Ok(retry_aborted.unwrap());
+        }
         if matches!(
             &command,
             Command::SetModel { .. }
@@ -2049,16 +2066,17 @@ impl Adapter for Claude {
                 }
             }
         })();
-        result.map(|mut step: Step| {
+        let result = result.map(|mut step: Step| {
             if flush_before_control {
                 let held = self.original_flush();
                 step.writes.splice(0..0, held);
             }
             step
-        })
+        });
+        self.merge_retry_abort(result, retry_aborted)
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
-        let mut step = Step::default();
+        let mut step = self.retry_observe_frame(&frame);
         if frame["parent_tool_use_id"].is_null() {
             self.fast_mode_metadata(&frame, &mut step);
         }
@@ -2094,6 +2112,11 @@ impl Adapter for Claude {
                 id: id.into(),
                 title: None,
             });
+        }
+        if let Some(retry) = self.retry_control_response(&frame)? {
+            step.writes.extend(retry.writes);
+            step.events.extend(retry.events);
+            return Ok(step);
         }
         if let Some(original) = self.original_control_response(&frame) {
             step.writes.extend(original.writes);
