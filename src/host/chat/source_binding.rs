@@ -877,6 +877,7 @@ impl PendingClose {
     pub(in crate::host) fn binding(&self) -> &ChatSourceBinding { &self.admitted }
     pub(in crate::host) fn owner(&self) -> &Handle { &self.continuation.handle }
     pub(in crate::host) fn witness(&self) -> &chat::runtime::BackendIdentity { &self.continuation.witness }
+    pub(in crate::host) fn claim_token(&self) -> Option<uuid::Uuid> { self.continuation.claim }
     pub(in crate::host) fn close_original(&mut self, host: &SharedHost) -> Result<(), ProtocolError> {
         claim_continuation(host, &self.intent, &self.admitted, &mut self.continuation)?;
         close_continuation(host, self.admitted.source.id, &self.continuation)?;
@@ -902,6 +903,42 @@ pub(in crate::host) fn capture_pending_close(host: &SharedHost, source: &Session
     };
     let continuation = continuation(host, &captured.1)?;
     Ok(Some(PendingClose { intent: captured.0, admitted: captured.1, continuation, closed: false }))
+}
+
+/// Requires the companion bound-close producer's sealed positive actual owner
+/// receipt. Generic Accepted/completion/absence cannot call this CAS.
+pub(in crate::host) fn release_pending_close(
+    host: &SharedHost, pending: &PendingClose, proof: &super::bound_close::ClosedPending,
+) -> Result<(), ProtocolError> {
+    if !pending.closed || pending.claim_token().is_none() || !proof.authenticates(pending) {
+        return Err(unavailable("The exact pending close has no authenticated positive owner disposition"));
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let id = pending.admitted.source.id;
+    if !state.native_sources.matches_reservation(&pending.continuation.publication)
+        || state.chats.get(&id).is_some_and(|record| record.execution_instance != pending.admitted.execution_instance || !record.handle.same_actor(pending.owner())) {
+        return Err(unavailable("The source changed before exact pending close retirement"));
+    }
+    let entry = state.native_sources.entries.get_mut(&id).expect("reserved exact slot");
+    let current = entry.pending_handoff.as_ref().filter(|current| {
+        entry.instance == pending.admitted.execution_instance
+            && current.intent == pending.intent && current.admitted == pending.admitted
+            && current.witness == *pending.witness() && current.owner.same_actor(pending.owner())
+            && current.token == pending.claim_token() && current.backend_closed
+            && current.original_pair.is_none() && current.created_pair.is_none()
+            && current.returned.as_ref().is_none_or(|target| !target.attempted && target.published.is_none())
+    }).ok_or_else(|| unavailable("The exact pending phase changed; cleanup authority was retained"))?;
+    let _ = current;
+    entry.pending_handoff = None;
+    entry.known = None;
+    entry.learned_from = None;
+    entry.unresolved = true;
+    entry.resource_epoch = uuid::Uuid::new_v4();
+    if let Some(record) = state.chats.get_mut(&id) {
+        record.source_binding = None;
+        record.returning_terminal = false;
+    }
+    Ok(())
 }
 
 /// The operation's own paired source may change, but its actual backend and
