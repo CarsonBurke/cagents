@@ -6645,7 +6645,6 @@ impl RepositoryRuntime {
         self.retain_action_recovery(&action);
         if self.has_editor_recovery() && matches!(&action,
             RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }
-            | RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. }
             | RepositoryAction::DiscardEdits { .. } | RepositoryAction::StageSelected { .. }) {
             return Task::none();
         }
@@ -10197,13 +10196,18 @@ pub fn view_with_review<'a>(
             ),
         }
     };
-    // Ordinary columns reconcile children through Tree::diff, including tag
-    // changes. The pinned keyed column directly diffs equal-length children
-    // even when keys change, which reuses incompatible placeholder state.
-    widget::column::with_children([body])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    // Recovery belongs to the runtime, including a late receipt delivered
+    // while another file is loading or shown as a noneditable viewer.
+    let mut rows = Vec::new();
+    if let Some(recovery) = &runtime.recovery {
+        rows.push(widget::container(widget::row::with_children(vec![
+            crate::design::body(&recovery.message).width(Length::Fill).into(),
+            crate::ui_controls::button::secondary("Retry file recovery")
+                .on_press_maybe(recovery.pending.is_none().then(|| RepositoryAction::ResolveEditorRecovery { card, authority: recovery.authority.clone() })).into(),
+        ]).spacing(space::S)).padding(space::M).into());
+    }
+    rows.push(body);
+    widget::column::with_children(rows).width(Length::Fill).height(Length::Fill).into()
 }
 
 /// The focus target of the card's editable buffer.
@@ -11237,13 +11241,6 @@ fn editable_document_view<'a>(
     document: &'a EditorDocument,
 ) -> Element<'a, RepositoryAction> {
     let mut error_rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
-    if let Some(recovery) = &runtime.recovery {
-        error_rows.push(widget::container(widget::row::with_children(vec![
-            crate::design::body(&recovery.message).width(Length::Fill).into(),
-            crate::ui_controls::button::secondary("Retry file recovery")
-                .on_press_maybe(recovery.pending.is_none().then(|| RepositoryAction::ResolveEditorRecovery { card, authority: recovery.authority.clone() })).into(),
-        ]).spacing(space::S)).padding(space::M).into());
-    }
     let (line, column, selected) = document.content.cursor_metrics();
     error_rows.push(widget::button::custom(crate::design::caption(if selected == 0 { format!("Ln {line}, Col {column}") } else { format!("Ln {line}, Col {column} ({selected} selected)") })).class(crate::ui_controls::control_style(false, None)).on_press(RepositoryAction::OpenGoToLine { card }).into());
     if let Some(value) = &runtime.go_to_line {
@@ -14005,6 +14002,30 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn late_recovery_has_a_real_retry_control_while_loading_and_in_a_viewer() {
+        for loading in [true, false] {
+            let card = CardId::new(); let (mut runtime, completion) = RepositoryRuntime::post_persist_failure_fixture(card);
+            let RepositoryAction::SaveFinished { mut identity, .. } = completion else { unreachable!() };
+            identity.generation += 10;
+            runtime.document = if loading { DocumentState::Loading } else { DocumentState::ReadOnly { path: "notes.txt".into(), reason: ReadOnlyReason::Binary } };
+            let directory = tempfile::tempdir().unwrap(); std::fs::write(directory.path().join("file"), "text").unwrap();
+            let stamp = crate::editor_reload::stamp(directory.path(), Path::new("file"), Path::new("file")).unwrap().unwrap();
+            let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("late source".into(), || Ok(()));
+            drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 999, stamp, baseline: blake3::hash(b""), result: Err(FileIoError::Recovery { message: "late read cleanup".into(), authority: authority.clone() }) }));
+            let action = click_native_repository_control(view(card, &runtime), "Retry file recovery");
+            let task = runtime.update(action);
+            if loading {
+                let loaded = runtime.current_identity(card, PathBuf::from("notes.txt"));
+                drop(runtime.update(RepositoryAction::FileLoaded { identity: loaded, result: Ok(LoadedFile { source: "notes.txt".into(), content: FileContent::ReadOnly(ReadOnlyReason::Binary) }) }));
+                assert!(matches!(runtime.document, DocumentState::ReadOnly { .. }), "already admitted pure load completes while recovery remains retained");
+                assert!(runtime.has_editor_recovery());
+            }
+            finish_navigation_task(&mut runtime, task).await;
+            assert!(!runtime.has_editor_recovery()); assert!(authority.is_resolved());
+        }
+    }
+
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
         use cosmic::iced::futures::StreamExt;
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
