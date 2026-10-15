@@ -503,7 +503,11 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
             crate::repository::RepositoryService::system("git")
-                .ensure_managed_directory_ignored(root, &root.join(".worktrees"), &CancellationToken::new())
+                .ensure_managed_directory_ignored(
+                    root,
+                    &root.join(".worktrees"),
+                    &CancellationToken::new(),
+                )
                 .map_err(|error| error.to_string())?;
             let directory = root.join(".worktrees");
             crate::secure_file::reject_symlink_components(&directory)
