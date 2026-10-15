@@ -1970,6 +1970,7 @@ pub struct RepositoryRuntime {
     locations: crate::editor_navigation::Locations,
     navigating_history: bool,
     pending_jump_origin: Option<crate::editor_navigation::Location>,
+    window_jump_origin: Option<(PathBuf, crate::model::EditorNavigation)>,
     go_to_line: Option<String>,
     pending_scalar_location: Option<(PathBuf, usize, usize)>,
     pending_source_location: Option<(PathBuf, usize)>,
@@ -2217,6 +2218,7 @@ impl RepositoryRuntime {
             locations: crate::editor_navigation::Locations::default(),
             navigating_history: false,
             pending_jump_origin: None,
+            window_jump_origin: None,
             go_to_line: None,
             pending_scalar_location: None,
             pending_source_location: None,
@@ -7010,7 +7012,22 @@ impl RepositoryRuntime {
 
     fn record_location_jump(&mut self, target: crate::editor_navigation::Location) {
         if self.navigating_history { return; }
-        if let Some(origin) = self.pending_jump_origin.take().or_else(|| self.current_location()) { self.locations.jump(origin, target); }
+        if let Some(origin) = self.pending_jump_origin.take().or_else(|| self.current_location()) {
+            if self.window_jump_origin.is_none() && let Some(source) = self.source_tab_path() {
+                self.window_jump_origin = Some((source, crate::model::EditorNavigation {
+                    caret: crate::model::EditorPosition { line: origin.cursor.position.line, column: origin.cursor.position.column },
+                    selection: origin.cursor.selection.map(|at| crate::model::EditorPosition { line: at.line, column: at.column }),
+                    scroll_line: origin.scroll.line, scroll_vertical: origin.scroll.vertical, scroll_horizontal: origin.scroll.horizontal,
+                }));
+            }
+            self.locations.jump(origin, target);
+        }
+    }
+
+    /// Frontends fold ordinary jumps into the same window history as language
+    /// source tabs. The target is captured only after its actual buffer loads.
+    pub fn take_location_jump_origin(&mut self, card: CardId) -> Option<crate::editor_locations::Location> {
+        self.window_jump_origin.take().map(|(source, anchor)| crate::editor_locations::Location { card, source, anchor })
     }
 
     fn navigate_location(&mut self, card: CardId, forward: bool) -> Task<RepositoryAction> {

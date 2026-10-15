@@ -10289,6 +10289,11 @@ impl Cagents {
             }
             _ => return Task::none(),
         };
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+            && let Some(origin) = runtime.take_location_jump_origin(card) {
+            self.editor_features.jump_origins.entry(card).or_insert(origin);
+        }
+        self.complete_cross_card_jump(card);
         if intents.is_empty() {
             return auto_save;
         }
@@ -10747,11 +10752,11 @@ impl Cagents {
     }
 
     fn complete_cross_card_jump(&mut self, card: CardId) {
+        if self.workspace.focused() != Some(card) || self.lsp_pending_jumps.contains_key(&card) { return; }
+        let Some(target) = self.capture_editor_location(card) else { return; };
         let Some(origin) = self.editor_features.jump_origins.remove(&card) else { return; };
-        if self.workspace.focused() != Some(card) { return; }
-        if let Some(target) = self.capture_editor_location(card) {
-            if origin.card != target.card { self.editor_features.location_history.record_jump(origin, target); }
-        }
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.take_location_jump_origin(card); }
+        self.editor_features.location_history.record_jump(origin, target);
     }
 
     fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
@@ -24107,6 +24112,15 @@ mod tests {
         app.workspace.add_card(WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(), 1, true).unwrap();
         app.editor_features.jump_origins.insert(target, from);
         app.complete_cross_card_jump(target);
+        // A more recent ordinary jump is in the same window sequence: Back
+        // restores its local origin before crossing back to the dirty card.
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card: target })));
+        drop(app.update(Message::Repository(RepositoryAction::GoToLineChanged { card: target, value: "1:1".into() })));
+        drop(app.update(Message::Repository(RepositoryAction::SubmitGoToLine { card: target })));
+        assert_eq!(app.capture_editor_location(target).unwrap().anchor.caret.column, 0);
+        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
         // A pending transaction makes the target unavailable, without
         // consuming the history position. Cancelling it permits the same Back.
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {

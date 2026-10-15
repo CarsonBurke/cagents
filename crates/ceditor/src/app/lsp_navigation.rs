@@ -54,11 +54,12 @@ pub(super) struct State {
     pub(super) resolving: HashMap<CardId, (LspRequestId, u64)>,
     next_resolution: u64,
     history: cagents::editor_locations::History,
+    history_origins: HashMap<CardId, cagents::editor_locations::Location>,
 }
 
 impl State {
     pub(super) fn remove_tab(&mut self, card: CardId) {
-        self.requests.remove(&card); self.results.remove(&card); self.jumps.remove(&card); self.resolving.remove(&card);
+        self.requests.remove(&card); self.results.remove(&card); self.jumps.remove(&card); self.resolving.remove(&card); self.history_origins.remove(&card);
     }
 }
 
@@ -199,9 +200,22 @@ impl Editor {
         }
         let focus = if may_focus { tab.runtime.focus_editor(card).map(cosmic::Action::App) } else { Task::none() };
         if let Some(origin) = jump.origin && let Some(target) = self.capture_editor_location(card) {
-            if origin.card != target.card { self.lsp_navigation.history.record_jump(origin, target); }
+            self.lsp_navigation.history.record_jump(origin, target);
+            self.lsp_navigation.history_origins.remove(&card);
+            if let Some(tab) = self.tab_mut(card) { tab.runtime.take_location_jump_origin(card); }
         }
         focus
+    }
+
+    pub(super) fn collect_location_jump(&mut self, card: CardId) {
+        if let Some(tab) = self.tab_mut(card) && let Some(origin) = tab.runtime.take_location_jump_origin(card) {
+            self.lsp_navigation.history_origins.entry(card).or_insert(origin);
+        }
+        if self.active != Some(card) || self.lsp_navigation.jumps.contains_key(&card) { return; }
+        if let Some(target) = self.capture_editor_location(card)
+            && let Some(origin) = self.lsp_navigation.history_origins.remove(&card) {
+            self.lsp_navigation.history.record_jump(origin, target);
+        }
     }
 
     fn capture_editor_location(&self, card: CardId) -> Option<cagents::editor_locations::Location> {
@@ -370,6 +384,14 @@ mod tests {
         run_tasks(&mut app, task);
         let target = app.active.unwrap();
         let target_anchor = app.capture_editor_location(target).unwrap().anchor;
+        for action in [RepositoryAction::OpenGoToLine { card: target }, RepositoryAction::GoToLineChanged { card: target, value: "1:1".into() }, RepositoryAction::SubmitGoToLine { card: target }] {
+            let task = app.update(Message::Repository(action)); run_tasks(&mut app, task);
+        }
+        assert_eq!(app.capture_editor_location(target).unwrap().anchor.caret.column, 0);
+        let local_back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false }));
+        run_tasks(&mut app, local_back);
+        assert_eq!(app.active, Some(target));
+        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
         let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false }));
         run_tasks(&mut app, back);
         assert_eq!(app.active, Some(origin));

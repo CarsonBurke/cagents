@@ -2033,6 +2033,7 @@ impl Editor {
             }
         }
         let navigation = self.finish_navigation_jump(id);
+        self.collect_location_jump(id);
         Task::batch([autosave, working_diff, navigation])
     }
 
