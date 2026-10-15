@@ -157,7 +157,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "An inherited agent capability cannot alter unattended schedules; use automation propose for user approval",
         ));
     }
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     let mut reply = client
