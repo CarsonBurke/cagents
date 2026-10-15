@@ -266,6 +266,7 @@ pub struct WorkspaceManifest {
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
     pub pending_terminal_creations: HashSet<CardId>,
+    pub created_start_requirements: HashMap<CardId, (uuid::Uuid, crate::model::CreatedStartRequirement)>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -1748,6 +1749,7 @@ impl StateStore {
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
             pending_terminal_creations: manifest.pending_terminal_creations,
+            created_start_requirements: manifest.created_start_requirements,
         };
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -3314,6 +3316,11 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:pending_terminal_creations"),
         &to_json(&state.pending_terminal_creations)?,
     )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:created_start_requirements"),
+        &to_json(&state.created_start_requirements)?,
+    )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -4657,6 +4664,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("pending terminal creation identities", &value))
         .transpose()?
         .unwrap_or_default(),
+        created_start_requirements: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:created_start_requirements"),
+        )?
+        .map(|value| from_json("directory-start obligations", &value))
+        .transpose()?
+        .unwrap_or_default(),
         workspace_model_identity: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_model_identity"),
@@ -5269,6 +5283,7 @@ mod tests {
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
+            created_start_requirements: HashMap::new(),
         }
     }
 
@@ -5281,11 +5296,18 @@ mod tests {
         let mut state = workspace_with_terminal(&boot_id);
         let id = state.cards[0].id;
         state.pending_terminal_creations.insert(id);
+        let CardKind::Terminal(session) = &state.cards[0].kind else { panic!("terminal fixture") };
+        let requirement = crate::model::CreatedStartRequirement {
+            card: id, session: session.id, operation: crate::model::OperationId::new(),
+            generation: 3, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::Terminal,
+        };
+        state.created_start_requirements.insert(id, (uuid::Uuid::new_v4(), requirement));
         state.card_scopes.insert(id, PathBuf::from("/repo"));
         let mut lane = SaveLane::default();
         lane.save(&store, &state).unwrap();
         let restored = store.load_workspace(state.id, None).unwrap().unwrap();
         assert_eq!(restored.pending_terminal_creations, HashSet::from([id]));
+        assert_eq!(restored.created_start_requirements, state.created_start_requirements);
         let (CardKind::Terminal(before), CardKind::Terminal(after)) =
             (&state.cards[0].kind, &restored.cards[0].kind)
         else {

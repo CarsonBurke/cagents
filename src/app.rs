@@ -1494,7 +1494,10 @@ static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
 
 /// A terminal that has never run, under a new identity, waiting to launch `launch`.
 pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
-    let id = TerminalId::new();
+    fresh_terminal_session_with_id(launch, TerminalId::new())
+}
+
+pub(super) fn fresh_terminal_session_with_id(launch: LaunchRecipe, id: TerminalId) -> TerminalSession {
     TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
@@ -5747,15 +5750,17 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
-            Ok(launch) => launch,
+        match self.terminal_launch_recipe(working_directory) {
+            Ok(launch) => self.add_terminal_recipe(launch),
             Err(error) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "could not create terminal: {error}"
-                )));
-                return Task::none();
+                self.status = Some(TransientNotice::error(format!("could not create terminal: {error}")));
+                Task::none()
             }
-        };
+        }
+    }
+
+    fn terminal_launch_recipe(&self, working_directory: PathBuf) -> Result<LaunchRecipe, String> {
+        let mut launch = LaunchRecipe::shell(working_directory.clone()).map_err(|error| error.to_string())?;
         if let Some(shell) = crate::device::shell() {
             launch.program = shell.to_owned();
         }
@@ -5786,7 +5791,7 @@ impl Cagents {
                     .insert(variable.to_owned(), home.display().to_string());
             }
         }
-        self.add_terminal_recipe(launch)
+        Ok(launch)
     }
 
     fn add_terminal_recipe(&mut self, launch: LaunchRecipe) -> Task<Message> {
@@ -5813,11 +5818,19 @@ impl Cagents {
         session: TerminalSession,
         slot: Option<(usize, usize)>,
     ) -> Task<Message> {
+        self.insert_terminal_card_with_id(CardId::new(), session, slot)
+    }
+
+    fn insert_terminal_card_with_id(
+        &mut self,
+        card_id: CardId,
+        session: TerminalSession,
+        slot: Option<(usize, usize)>,
+    ) -> Task<Message> {
         if self.refuse_in_deleting_worktree(&session.launch.working_directory) {
             return Task::none();
         }
         let working_directory = session.launch.working_directory.clone();
-        let card_id = CardId::new();
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "terminal");
         let card = CardState {
             id: card_id,

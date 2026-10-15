@@ -24,6 +24,9 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod created_start;
+pub(crate) use created_start::{CreatedStartRecord, CreatedStartState};
+
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -194,6 +197,7 @@ impl Registry {
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
+            created_start_requirements: created_start::active(&self.db)?,
             identity,
             sequence: sequence as u64,
             projects,

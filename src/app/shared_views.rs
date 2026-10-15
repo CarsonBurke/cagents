@@ -121,6 +121,90 @@ impl State {
 }
 
 impl Cagents {
+    /// Insert the PREALLOCATED recipient after authenticated grant registration.
+    /// Callers retain the original carrier across registry/default deferral;
+    /// this helper never converts it into the ordinary path-only default flow.
+    /// Actual startup still goes through the host's independent obligation and
+    /// retained-FD gate; neither these arguments nor a model row are authority.
+    pub(super) fn insert_registered_directory_pane(
+        &mut self, registry: uuid::Uuid,
+        requirement: crate::model::CreatedStartRequirement,
+        kind: CardKind, automatic_terminal: bool,
+    ) -> Result<Task<Message>, String> {
+        if self.card_state(requirement.card).is_some() || self.workspace.card(requirement.card).is_some() {
+            return Err("The original-directory recipient was already inserted".into());
+        }
+        let directory = match (&kind, requirement.kind) {
+            (CardKind::Terminal(session), crate::model::CreatedStartKind::Terminal)
+                if session.id == requirement.session && session.continuity.live_proof().is_none() =>
+                &session.launch.working_directory,
+            (CardKind::Chat(session), crate::model::CreatedStartKind::NativeChat)
+                if session.id == requirement.session && session.is_unstarted() =>
+                &session.launch.recipe.working_directory,
+            _ => return Err("The draft does not match its registered directory-start target".into()),
+        };
+        if self.refuse_in_deleting_worktree(directory) {
+            return Err("The worktree is being removed; its original-directory draft was preserved".into());
+        }
+        self.retain_created_start_requirement(registry, requirement.clone())?;
+        Ok(match kind {
+            CardKind::Terminal(session) => {
+                let previous = self.shared_views.creating_default;
+                self.shared_views.creating_default = automatic_terminal;
+                let task = self.insert_terminal_card_with_id(requirement.card, session, None);
+                self.shared_views.creating_default = previous;
+                task
+            }
+            CardKind::Chat(session) => {
+                // Unlike an ordinary blank default, this recipient owns a
+                // durable obligation and must survive close/reopen/restart.
+                self.insert_chat_card_with_id(requirement.card, session, None, false, None)
+            }
+            _ => unreachable!("validated directory-start target"),
+        })
+    }
+
+    /// Invoked after the authenticated FD-registration ACK and its model have
+    /// been reconciled, BEFORE persisting/inserting the recipient draft. The
+    /// marker grants no startup authority; the host must retain the exact FD.
+    pub(super) fn retain_created_start_requirement(
+        &mut self, registry: uuid::Uuid, requirement: crate::model::CreatedStartRequirement,
+    ) -> Result<(), String> {
+        requirement.validate().map_err(str::to_owned)?;
+        if registry.is_nil() || registry != self.workspace_model.identity
+            || !self.workspace_model.created_start_requirements.contains(&requirement)
+        {
+            return Err("Wait for the original directory grant registration before publishing this pane".into());
+        }
+        if let Some(existing) = self.durable.created_start_requirements.get(&requirement.card) {
+            if existing != &(registry, requirement.clone()) {
+                return Err("The pane already retains a different original-directory obligation".into());
+            }
+            return Ok(());
+        }
+        Arc::make_mut(&mut self.durable).created_start_requirements
+            .insert(requirement.card, (registry, requirement));
+        Ok(())
+    }
+
+    fn created_start_is_publishable(&self, card: &CardState) -> bool {
+        let Some((registry, requirement)) = self.durable.created_start_requirements.get(&card.id) else {
+            return true;
+        };
+        let target_matches = match (&card.kind, requirement.kind) {
+            (CardKind::Terminal(session), crate::model::CreatedStartKind::Terminal) => session.id == requirement.session,
+            (CardKind::Chat(session), crate::model::CreatedStartKind::NativeChat) => session.id == requirement.session,
+            _ => false,
+        };
+        if !target_matches || *registry != self.workspace_model.identity { return false; }
+        self.workspace_model.created_start_requirements.contains(requirement)
+            // Absence from a newer active-only list is not a startup receipt.
+            // Keep normal metadata publication for an already accepted actor;
+            // its original marker survives until the owning receipt consumer.
+            || self.workspace_model.views.iter().flat_map(|view| &view.panes)
+                .any(|pane| pane.id == card.id && views::same_resource(&pane.kind, &card.kind))
+    }
+
     pub(super) fn capture_view_update_source(&mut self, edit: &ModelEdit) {
         let ModelEdit::ChangeView {
             scope,
@@ -399,6 +483,10 @@ impl Cagents {
                     self.card_state(id)?,
                     self.durable.card_scopes.get(&id).cloned(),
                 )?;
+                if !self.created_start_is_publishable(self.card_state(id)?) {
+                    return self.workspace_model.views.iter().flat_map(|view| &view.panes)
+                        .find(|pane| pane.id == id).cloned();
+                }
                 pane.user_title = self.chrome_ui.user_titles.get(&id).cloned();
                 pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
                     && (self.durable.pending_terminal_creations.contains(&id)
@@ -538,6 +626,10 @@ impl Cagents {
                         || self.shared_views.defaults.contains_key(id)
                     {
                         return None;
+                    }
+                    if !self.created_start_is_publishable(cards.get(id)?) {
+                        return self.workspace_model.views.iter().flat_map(|view| &view.panes)
+                            .find(|pane| pane.id == *id).cloned();
                     }
                     let mut pane =
                         Pane::from_card(cards.get(id)?, self.durable.card_scopes.get(id).cloned())?;
@@ -878,7 +970,8 @@ impl Cagents {
             let defaults = cards[&scope]
                 .iter()
                 .copied()
-                .filter(|id| self.shared_views.defaults.contains_key(id))
+                .filter(|id| self.shared_views.defaults.contains_key(id)
+                    && self.card_state(*id).is_some_and(|card| self.created_start_is_publishable(card)))
                 .collect::<Vec<_>>();
             for id in defaults {
                 if self.shared_views.default_requests.insert(id) {
@@ -1024,6 +1117,16 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        // A peer learns obligations before projecting a pending actor. A
+        // different registry or tuple cannot overwrite a saved source fence.
+        let registry = self.workspace_model.identity;
+        if !registry.is_nil() {
+            for requirement in &self.workspace_model.created_start_requirements {
+                if requirement.validate().is_err() { continue; }
+                Arc::make_mut(&mut self.durable).created_start_requirements
+                    .entry(requirement.card).or_insert_with(|| (registry, requirement.clone()));
+            }
+        }
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
@@ -1795,6 +1898,83 @@ mod tests {
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         channel_move_fixture_with_kind(None)
+    }
+
+    #[test]
+    fn registered_directory_default_retains_preallocated_identity_before_persist_and_publication() {
+        let (mut app, source, _, _) = fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(source);
+        let registry = app.workspace_model.identity;
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        let requirement = crate::model::CreatedStartRequirement {
+            card: CardId::new(), session: session.id, operation: crate::model::OperationId::new(),
+            generation: 9, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::Terminal,
+        };
+        let before = app.durable.clone();
+        assert!(app.insert_registered_directory_pane(registry, requirement.clone(), CardKind::Terminal(session.clone()), true).is_err());
+        assert_eq!(app.durable, before, "missing registration cannot persist or allocate the recipient");
+        app.workspace_model.created_start_requirements.push(requirement.clone());
+        drop(app.insert_registered_directory_pane(registry, requirement.clone(), CardKind::Terminal(session.clone()), true).unwrap());
+        let card = app.card_state(requirement.card).unwrap().clone();
+        assert_eq!(card.kind, CardKind::Terminal(session));
+        assert_eq!(app.durable.created_start_requirements.get(&requirement.card), Some(&(registry, requirement.clone())));
+        let saved = app.persistent_workspace();
+        assert!(saved.cards.iter().any(|card| card.id == requirement.card), "required defaults are durable even when untouched");
+        assert!(saved.created_start_requirements.contains_key(&requirement.card));
+        assert!(app.shared_views.defaults.contains_key(&requirement.card));
+        assert!(app.insert_registered_directory_pane(registry, requirement.clone(), card.kind.clone(), true).is_err(), "late ACK cannot allocate a replacement recipient");
+    }
+
+    #[test]
+    fn registered_directory_native_draft_is_durable_under_its_preallocated_session() {
+        let (mut app, source, _, _) = fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(source);
+        let registry = app.workspace_model.identity;
+        let id = TerminalId::new();
+        let before_cards = app.durable.cards.len();
+        let kind = app.prepare_directory_start_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat, id).unwrap();
+        assert_eq!(app.durable.cards.len(), before_cards, "descriptor preparation never inserts a draft");
+        let CardKind::Chat(session) = &kind else { panic!("native draft") };
+        assert_eq!(session.id, id);
+        assert!(session.is_unstarted());
+        let requirement = crate::model::CreatedStartRequirement {
+            card: CardId::new(), session: id, operation: crate::model::OperationId::new(),
+            generation: 4, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::NativeChat,
+        };
+        app.workspace_model.created_start_requirements.push(requirement.clone());
+        drop(app.insert_registered_directory_pane(registry, requirement.clone(), kind, false).unwrap());
+        let saved = app.persistent_workspace();
+        assert!(saved.cards.iter().any(|card| card.id == requirement.card
+            && matches!(&card.kind, CardKind::Chat(session) if session.id == id && session.is_unstarted())));
+        assert_eq!(saved.created_start_requirements.get(&requirement.card), Some(&(registry, requirement)));
+    }
+
+    #[test]
+    fn directory_start_source_markers_cannot_be_rebound_by_registry_or_actor_projection() {
+        let (mut app, source, _, _) = fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(source);
+        let registry = app.workspace_model.identity;
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        let requirement = crate::model::CreatedStartRequirement {
+            card: CardId::new(), session: session.id, operation: crate::model::OperationId::new(),
+            generation: 1, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::Terminal,
+        };
+        app.workspace_model.created_start_requirements.push(requirement.clone());
+        drop(app.insert_registered_directory_pane(registry, requirement.clone(), CardKind::Terminal(session), false).unwrap());
+        let card = app.card_state(requirement.card).unwrap().clone();
+        assert!(app.created_start_is_publishable(&card));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        assert!(!app.created_start_is_publishable(&card));
+        assert!(app.local_view_panes(&Scope::Channel(source)).iter().all(|pane| pane.id != requirement.card));
+        app.workspace_model.identity = registry;
+        let mut replacement = card;
+        let CardKind::Terminal(session) = &mut replacement.kind else { panic!() };
+        session.id = TerminalId::new();
+        assert!(!app.created_start_is_publishable(&replacement));
+        let mut fork = requirement.clone(); fork.attempt = uuid::Uuid::new_v4();
+        app.workspace_model.created_start_requirements.push(fork.clone());
+        assert!(app.retain_created_start_requirement(registry, fork).is_err());
+        assert_eq!(app.durable.created_start_requirements[&requirement.card].1, requirement);
     }
 
     fn channel_move_fixture_with_kind(

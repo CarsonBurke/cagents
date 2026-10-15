@@ -185,6 +185,9 @@ pub struct WorkspaceModel {
     /// Durable execution sessions, adopted into their explicitly owned channel.
     #[serde(default)]
     pub agents: Vec<crate::agent_execution::Agent>,
+    /// Active obligations are independent of pane JSON and never authorize a start.
+    #[serde(default)]
+    pub created_start_requirements: Vec<crate::model::CreatedStartRequirement>,
 }
 
 impl WorkspaceModel {

@@ -4110,6 +4110,26 @@ impl Cagents {
         }
     }
 
+    /// Prepare display/launch metadata for an already allocated recipient.
+    /// This opens no directory, selects no path, persists nothing and starts
+    /// no actor. Original-directory authority is registered separately.
+    pub(super) fn prepare_directory_start_pane(
+        &self, directory: PathBuf, pane: settings::DefaultPane, session: TerminalId,
+    ) -> Result<CardKind, String> {
+        if session.as_uuid().is_nil() { return Err("Directory-start session identity is missing".into()); }
+        match pane {
+            settings::DefaultPane::Terminal => Ok(CardKind::Terminal(
+                fresh_terminal_session_with_id(self.terminal_launch_recipe(directory)?, session),
+            )),
+            settings::DefaultPane::NativeChat => {
+                let provider = self.preferred_chat_provider();
+                let account = self.default_account_for_directory(provider, &directory);
+                let automatic = self.automatic_accounts_for_directory(provider, &directory);
+                fresh_chat_session(provider, session, directory, &account, automatic).map(CardKind::Chat)
+            }
+        }
+    }
+
     pub(super) fn ensure_default_pane(&mut self) -> Task<Message> {
         let Some(directory) = self.active_workspace.clone() else {
             return Task::none();
@@ -4169,6 +4189,9 @@ impl Cagents {
             .iter()
             .copied()
             .chain(self.shared_views.defaults.keys().copied())
+            // Original-directory obligations keep their recipient even when
+            // its untouched content would normally be an ephemeral default.
+            .filter(|card| !self.durable.created_start_requirements.contains_key(card))
             .collect::<HashSet<_>>();
         let open_cards = self
             .durable
@@ -4391,6 +4414,17 @@ impl Cagents {
         ephemeral: bool,
         draft_from: Option<CardId>,
     ) -> Task<Message> {
+        self.insert_chat_card_with_id(CardId::new(), session, beside, ephemeral, draft_from)
+    }
+
+    pub(super) fn insert_chat_card_with_id(
+        &mut self,
+        card_id: CardId,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
+        draft_from: Option<CardId>,
+    ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
             let durable = self
@@ -4400,7 +4434,6 @@ impl Cagents {
                 .position(|state| state.id == source)?;
             Some((source, (index + 1, durable + 1)))
         });
-        let card_id = CardId::new();
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.

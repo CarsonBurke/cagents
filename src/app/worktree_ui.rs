@@ -197,6 +197,7 @@ fn scope_descriptor(
         workspace_model_identity: None,
         local_only_cards: HashSet::new(),
         pending_terminal_creations: HashSet::new(),
+        created_start_requirements: state.created_start_requirements.clone(),
     }
 }
 

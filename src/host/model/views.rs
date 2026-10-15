@@ -294,6 +294,7 @@ pub(super) fn apply(
                     .map_err(|error| error.to_string())?;
             }
             for pane in panes {
+                super::created_start::validate_pane(transaction, pane)?;
                 if view.panes.iter().any(|existing| {
                     existing.id != pane.id
                         && crate::workspace_model::views::same_resource(&existing.kind, &pane.kind)
@@ -319,6 +320,11 @@ pub(super) fn apply(
             }
             if view.revision != *expected_revision {
                 return Err("workspace view revision conflict".into());
+            }
+            match change {
+                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
+                    | Change::Update { pane, .. } => super::created_start::validate_pane(transaction, pane)?,
+                _ => {}
             }
             changed = match change {
                 Change::Transfer {

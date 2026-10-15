@@ -1239,6 +1239,10 @@ pub struct WorkspaceState {
     /// exact recipe, scope and insertion order are stored with the pane.
     #[serde(default)]
     pub pending_terminal_creations: HashSet<CardId>,
+    /// Negative first-start obligations, bound to the registry that retained the grant.
+    /// Neither this cache nor its presence authorizes a process or directory.
+    #[serde(default)]
+    pub created_start_requirements: HashMap<CardId, (uuid::Uuid, CreatedStartRequirement)>,
 }
 
 impl Default for WorkspaceState {
@@ -1262,6 +1266,7 @@ impl Default for WorkspaceState {
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
+            created_start_requirements: HashMap::new(),
         }
     }
 }

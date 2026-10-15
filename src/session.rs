@@ -2890,6 +2890,7 @@ mod tests {
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
+            created_start_requirements: HashMap::new(),
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,
