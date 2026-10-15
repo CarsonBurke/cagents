@@ -172,7 +172,12 @@ mod tests {
     impl Adapter for PathAware {
         fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
-        fn command(&mut self, _: chat::Command) -> Result<Step,String> { self.calls.lock().unwrap().push(self.directory.clone()); Ok(Step::default()) }
+        fn command(&mut self, command: chat::Command) -> Result<Step,String> {
+            if matches!(&command, chat::Command::Prompt { text, .. } if text == "__fixture_new_thread") {
+                return Ok(Step { events: vec![chat::Event::Session { id: "44444444-0000-4000-8000-000000000004".into(), title: None }], ..Default::default() });
+            }
+            self.calls.lock().unwrap().push(self.directory.clone()); Ok(Step::default())
+        }
         fn command_for_run(&mut self, _: crate::model::RunId, command: chat::Command) -> Result<Step,String> { self.command(command) }
         fn relocate_directory(&mut self, path: &Path) -> Result<(),String> { self.directory = path.into(); Ok(()) }
     }
@@ -282,6 +287,38 @@ mod tests {
             assert_eq!(fixture.host.lock().unwrap().read_model().unwrap(), before);
             assert!(!fixture.handle.is_completed());
         }
+    }
+
+    #[test]
+    fn owned_actor_thread_change_keeps_directory_authority_but_stale_panes_and_callbacks_do_not() {
+        let fixture = fixture(0);
+        let instance = fixture.host.lock().unwrap().chats[&fixture.source.id].execution_instance;
+        fixture.handle.command(chat::Command::Prompt { text: "__fixture_new_thread".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
+        let new_thread = "44444444-0000-4000-8000-000000000004";
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fixture.handle.confirmed_session_id().as_deref() != Some(new_thread) {
+            assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10));
+        }
+        let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host), fixture.source.id, uuid::Uuid::new_v4(), runtime::Update::Presentation);
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
+        assert!(registry.lock().unwrap().session_location(&HostedSession::Chat(fixture.source.clone())).unwrap().is_some());
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host), fixture.source.id, instance, runtime::Update::Presentation);
+        let current = fixture.host.lock().unwrap().chats[&fixture.source.id].session.clone();
+        assert_eq!(current.launch.session_id.as_deref(), Some(new_thread));
+        assert_eq!(current.launch.recipe, fixture.source.launch.recipe);
+        let saved = registry.lock().unwrap().session_location(&HostedSession::Chat(current.clone())).unwrap().unwrap();
+        assert_eq!(saved.approved, fixture.original_context.as_ref().unwrap().directory_identity().unwrap());
+        std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+        let request = || ClientRequest::EditWorkspaceModel { edit: ModelEdit::RelocateProject { relocation: Relocation { repository: fixture.old.clone(), destination: fixture.moved.clone(), old_root: fixture.old.clone(), new_root: fixture.moved.clone() } } };
+        assert!(super::super::client::process_request(&fixture.host, 1, request()).unwrap_err().message.contains("different provider incarnation"));
+        {
+            let mut state = fixture.host.lock().unwrap(); let view = state.read_model().unwrap().views[0].clone();
+            let before = view.panes[0].clone(); let mut pane = before.clone(); pane.kind = CardKind::Chat(current);
+            state.edit_model(1, ModelEdit::ChangeView { scope: view.scope, expected_revision: view.revision, operation: uuid::Uuid::new_v4(), change: crate::workspace_model::views::Change::Update { before, pane } }).unwrap();
+        }
+        assert!(locate(&fixture).session_location_refusals.is_empty());
+        assert!(!fixture.handle.is_completed());
     }
 
     #[test]

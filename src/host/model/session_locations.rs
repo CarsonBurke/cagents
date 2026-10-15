@@ -186,6 +186,22 @@ pub(super) fn pin_owned_agents(db: &Connection, moves: &[SessionMove]) -> Result
 }
 
 impl Registry {
+    /// Only an exact hosted actor callback may advance its confirmed thread.
+    /// This changes presentation metadata, never source proof, recipe or pin.
+    pub(crate) fn observe_owned_session_thread(&mut self, source: &HostedSession) -> Result<(), String> {
+        let HostedSession::Chat(current) = source else { return Ok(()); };
+        if current.launch.session_id.is_none() { return Ok(()); }
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let Some(mut location) = read(&tx, source.id())? else { return Ok(()); };
+        let mut comparison = location.source.clone();
+        let HostedSession::Chat(previous) = &mut comparison else { return Err("A terminal binding cannot become a native conversation".into()); };
+        previous.launch.session_id = current.launch.session_id.clone();
+        if !same_source(&comparison, source) { return Err("The confirmed thread update belongs to a different hosted source".into()); }
+        location.source = source.clone();
+        write(&tx, &location)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     pub(crate) fn authenticated_session_alias(&self, cached: &HostedSession, current: &HostedSession) -> Result<bool, String> {
         if !compatible_chat_metadata(cached,current) { return Ok(false); }
         if same_source(cached,current) { return Ok(true); }

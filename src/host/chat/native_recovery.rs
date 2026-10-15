@@ -229,7 +229,7 @@ fn restore_authenticated(
                     );
                 }
             } else {
-                changed(&weak, id, update);
+                changed_owned(&weak, id, execution_instance, update);
             }
         },
     )?;
