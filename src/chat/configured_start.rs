@@ -39,19 +39,33 @@ impl ConfiguredChatStart {
             || directory.len() > 16 * 1024
             || directory.contains(&0)
             || self.working_directory.components().any(|part| {
-                matches!(part, std::path::Component::ParentDir | std::path::Component::CurDir)
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
             })
         {
-            return Err("A fresh conversation needs a new identifier and an absolute directory".into());
+            return Err(
+                "A fresh conversation needs a new identifier and an absolute directory".into(),
+            );
         }
         if self.account.as_str().len() > 256
-            || !self.account.as_str().starts_with(&format!("{}/", self.provider.executable()))
+            || !self
+                .account
+                .as_str()
+                .starts_with(&format!("{}/", self.provider.executable()))
         {
             return Err("Choose an account for this provider on the selected device".into());
         }
-        for value in [&self.model, &self.effort, &self.permission_mode].into_iter().flatten() {
-            if value.len() > 1024 || value.trim().is_empty() || value.chars().any(char::is_control) {
-                return Err("Conversation choices must be bounded names without control characters".into());
+        for value in [&self.model, &self.effort, &self.permission_mode]
+            .into_iter()
+            .flatten()
+        {
+            if value.len() > 1024 || value.trim().is_empty() || value.chars().any(char::is_control)
+            {
+                return Err(
+                    "Conversation choices must be bounded names without control characters".into(),
+                );
             }
         }
         if let Some(mode) = self.permission_mode.as_deref() {
@@ -67,11 +81,14 @@ mod tests {
 
     fn intent() -> ConfiguredChatStart {
         ConfiguredChatStart {
-            id: TerminalId::new(), provider: Provider::Codex,
+            id: TerminalId::new(),
+            provider: Provider::Codex,
             working_directory: "/work".into(),
             account: "codex/system".parse().unwrap(),
-            model: Some("chosen-model".into()), effort: None,
-            permission_mode: Some("readOnly".into()), automatic: false,
+            model: Some("chosen-model".into()),
+            effort: None,
+            permission_mode: Some("readOnly".into()),
+            automatic: false,
         }
     }
 
@@ -79,7 +96,14 @@ mod tests {
     fn fresh_intent_round_trips_without_recipe_environment_or_source_authority() {
         let request = crate::terminal_ipc::ClientRequest::ChatStartConfigured { start: intent() };
         let bytes = postcard::to_allocvec(&request).unwrap();
-        assert_eq!(postcard::from_bytes::<crate::terminal_ipc::ClientRequest>(&bytes).unwrap(), request);
+        assert_eq!(
+            bytes[0], 66,
+            "the current-main request is appended after CompletePendingTerminal"
+        );
+        assert_eq!(
+            postcard::from_bytes::<crate::terminal_ipc::ClientRequest>(&bytes).unwrap(),
+            request
+        );
         let mut json = serde_json::to_value(intent()).unwrap();
         assert!(json.get("environment").is_none());
         assert!(json.get("recipe").is_none());

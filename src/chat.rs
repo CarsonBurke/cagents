@@ -16,11 +16,11 @@ pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(feature = "ui")]
 pub mod client;
+mod configured_start;
 #[cfg(feature = "host")]
 pub(crate) mod native_holder;
 #[cfg(feature = "host")]
 pub mod protocol;
-mod configured_start;
 pub use configured_start::ConfiguredChatStart;
 #[cfg(feature = "host")]
 pub mod runtime;

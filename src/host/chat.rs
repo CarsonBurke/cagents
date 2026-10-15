@@ -1,10 +1,10 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+mod configured_start;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
-mod configured_start;
 #[cfg(test)]
 mod startup_tests;
 use crate::{
@@ -808,10 +808,13 @@ fn start_with_execution(
     ) || has_native_owner(&session)?
     {
         if fresh_only {
-            return Err(error("This conversation identifier has a native owner; explicitly recover it"));
+            return Err(error(
+                "This conversation identifier has a native owner; explicitly recover it",
+            ));
         }
         return native_recovery::restore(host, client, &session).map_err(unavailable);
     }
+    let mut preparation = configured_start::StartPreparation::reserve(host, &session, fresh_only)?;
     let reservation_id = session.id;
     let mut source_process = None;
     let mut source_fresh = None;
@@ -1056,6 +1059,7 @@ fn start_with_execution(
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
         }
+        preparation.release_for_install(&mut state)?;
         if fresh_only {
             configured_start::require_fresh_in(&state, session.id)?;
         }
