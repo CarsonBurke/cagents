@@ -452,3 +452,33 @@ fn removed_source_checkout_continues_on_original_common_without_deleted_head() {
     ));
     assert!(primary.exists());
 }
+
+#[test]
+fn target_and_source_locators_cannot_borrow_a_sibling_registration() {
+    const TEST: &str = "host::worktree_inspections::tests::continuation_tests::target_and_source_locators_cannot_borrow_a_sibling_registration";
+    let Some(root) = super::private_runtime::enter(TEST) else { return; };
+    let (repository, target) = setup(&root, false);
+    let sibling = root.join("sibling");
+    git(&repository, &["worktree", "add", "--quiet", "-b", "sibling", sibling.to_str().unwrap()]);
+    let third = root.join("third");
+    git(&repository, &["worktree", "add", "--quiet", "-b", "third", third.to_str().unwrap()]);
+    let host = host_with_registry(&root);
+    let original = std::fs::read(target.join(".git")).unwrap();
+    let sibling_locator = std::fs::read(sibling.join(".git")).unwrap();
+    std::fs::write(target.join(".git"), &sibling_locator).unwrap();
+    let refusal = request(&host, 1, Operation::InspectForSessionStop {
+        repository: repository.clone(), path: target.clone(),
+    }).unwrap_err();
+    assert!(refusal.contains("backlink disagree"), "{refusal}");
+    assert!(target.exists() && sibling.exists());
+    assert!(host.lock().unwrap().stop_inspections.is_empty());
+    std::fs::write(target.join(".git"), &original).unwrap();
+    inspected(&host, &repository, &target);
+    std::fs::write(target.join(".git"), &sibling_locator).unwrap();
+    let refusal = request(&host, 1, Operation::InspectForSessionStop {
+        repository: target.clone(), path: third.clone(),
+    }).unwrap_err();
+    assert!(refusal.contains("backlink disagree"), "{refusal}");
+    std::fs::write(target.join(".git"), &original).unwrap();
+    inspected(&host, &target, &third);
+}
