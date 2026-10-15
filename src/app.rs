@@ -7413,7 +7413,9 @@ impl Cagents {
         let tasks: Vec<_> = cards
             .into_iter()
             .map(|card| {
-                if let Some(channel) = self
+                if (self.sidebar_state.has_card_update(card)
+                    || self.sidebar_state.card_attention(card).is_some_and(sidebar::AttentionState::needs_attention))
+                    && let Some(channel) = self
                     .durable
                     .channels
                     .iter()
@@ -7439,7 +7441,7 @@ impl Cagents {
     }
 
     fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
-        if self.workspace_inputs_blocked() {
+        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() || self.update_prepared {
             return Task::none();
         }
         let Some(card) = self
@@ -14377,7 +14379,6 @@ impl Application for Cagents {
                     SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
-                        self.sidebar_state.retain_attention_channel(id);
                         let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
                         self.mark_cards_read(cards)
                     }
@@ -25699,6 +25700,33 @@ mod tests {
         drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(ids[2]));
         assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+    }
+
+    #[test]
+    fn attention_shortcut_does_not_leave_a_repository_with_an_active_save_or_acknowledge_target() {
+        use crate::model::{ChannelId, ProjectChannel};
+        let (mut app, first) = editing_repository_app();
+        app.context_inspector_open = false;
+        let other = terminal_card_state();
+        let target = other.id;
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Attention".into(), "/tmp".into(), Vec::new(), Vec::new()));
+        let channels = [ChannelId::new(), ChannelId::new()];
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(other);
+        for (index, card) in [first, target].into_iter().enumerate() {
+            durable.channels.push(ProjectChannel { title_source: Default::default(), id: channels[index], project_id: project, title: format!("Channel{index}"), ordinal: index as u32, shared: false, cards: vec![card], focused: Some(card) });
+        }
+        drop(app.select_channel(channels[0]));
+        app.sidebar_state.observe_card_update(target);
+        drop(app.update(Message::Repository(RepositoryAction::Save { card: first, overwrite: false })));
+        assert!(app.focused_repository_is_saving());
+        for command in [workspace_widget::GlobalShortcut::NextAttention, workspace_widget::GlobalShortcut::PreviousAttention] {
+            drop(app.update(Message::RunCommand(command)));
+            assert_eq!(app.workspace.focused(), Some(first));
+            assert_eq!(app.durable.active_channel, Some(channels[0]));
+            assert!(app.sidebar_state.has_card_update(target));
+        }
     }
 
     #[test]
