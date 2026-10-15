@@ -3261,6 +3261,10 @@ impl Runtime {
                 Icon::Warning,
                 design::destructive_text as fn(&cosmic::Theme) -> iced::widget::text::Style,
             ),
+            outcomes::Tone::ObservationEnded => (
+                Icon::Warning,
+                design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style,
+            ),
         };
         Some(
             widget::tooltip(
@@ -5214,6 +5218,7 @@ mod tests {
             .collect::<Vec<_>>();
         snapshot.generation += 1;
         snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            losses: Vec::new(),
             revision: 1,
             complete: true,
             records: vec![VisibleTurnOutcome {
@@ -5296,6 +5301,76 @@ mod tests {
     }
 
     #[test]
+    fn attention_historical_observation_loss_reprojects_and_survives_ui_reattach_without_settling_b() {
+        use chat::turn_outcomes::TurnOutcomeProjection;
+        let item = |id: &str, role| chat::Item { id: id.into(), role, started_at: None, at: Some(1000),
+            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final } };
+        let items = [item("input-A1", chat::Role::User), item("answer-A", chat::Role::Assistant),
+            item("input-B", chat::Role::User), item("answer-B", chat::Role::Assistant)];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.session_id = Some("native-session".into());
+        snapshot.busy = true;
+        snapshot.turn_generation = 2;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turns.len(), 2);
+        let before = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        snapshot.generation += 1;
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![],
+            losses: vec![outcomes::loss_for_test("native-session", &["input-A1", "input-A2"])] });
+        let source = snapshot.turn_outcomes.clone();
+        let original_items = snapshot.items.clone();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_outcome_markers["input-A1"].tone, outcomes::Tone::ObservationEnded);
+        assert!(!runtime.turn_outcome_markers.contains_key("input-B"));
+        assert!(runtime.snapshot.busy);
+        assert_eq!(runtime.snapshot.turn_generation, 2);
+        assert!(runtime.snapshot.outcome.is_none());
+        assert_eq!(runtime.conversation_status(false).1, "Responding");
+        assert!(runtime.snapshot.items.iter().zip(&original_items).all(|(shown, original)| Arc::ptr_eq(shown, original)),
+            "historical observation evidence does not rewrite any native item/body/status");
+        let after = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        assert_ne!(before[0], after[0]);
+        assert_eq!(before[1], after[1], "current B retains its existing row");
+
+        // Loss-only projections also need exact window/role invalidation while
+        // the projection Arc stays identical. No terminal records are present.
+        snapshot.generation += 1;
+        snapshot.items[0] = Arc::new(item("input-A2", chat::Role::User));
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert!(Arc::ptr_eq(&source, &runtime.snapshot.turn_outcomes));
+        assert!(!runtime.turn_outcome_markers.contains_key("input-A1"));
+        assert_eq!(runtime.turn_outcome_markers["input-A2"].tone, outcomes::Tone::ObservationEnded);
+        snapshot.generation += 1;
+        snapshot.items[0] = Arc::new(item("input-A2", chat::Role::Assistant));
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert!(runtime.turn_outcome_markers.is_empty(), "user-input proof never follows a corrected assistant role or nearest B");
+        snapshot.generation += 1;
+        snapshot.items[0] = Arc::new(item("input-A2", chat::Role::User));
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        let expected = runtime.turn_outcome_markers.clone();
+        let same_snapshot = runtime.snapshot.clone();
+        runtime.release_turn_outcome_presentation();
+        assert!(runtime.turn_outcome_markers.is_empty());
+        runtime.refresh();
+        assert!(Arc::ptr_eq(&same_snapshot, &runtime.snapshot));
+        assert_eq!(runtime.turn_outcome_markers, expected);
+        let replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        let (mut reattached, fresh_handle) = frame_cost::live_runtime(&items);
+        fresh_handle.replace_snapshot_for_test(replay);
+        reattached.refresh();
+        assert_eq!(reattached.turn_outcome_markers, expected,
+            "a fresh UI renders supplied durable proof, not local completion memory");
+        assert!(reattached.snapshot.busy && reattached.snapshot.outcome.is_none());
+    }
+
+    #[test]
     fn attention_turn_markers_reproject_middle_bindings_and_role_changes_with_unchanged_edges() {
         use chat::turn_outcomes::{
             TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome,
@@ -5321,6 +5396,7 @@ mod tests {
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.session_id = Some("proved-session".into());
         snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            losses: Vec::new(),
             revision: 1,
             complete: true,
             records: vec![VisibleTurnOutcome {
@@ -5424,6 +5500,7 @@ mod tests {
             *status = chat::ToolStatus::Stopped;
         }
         snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            losses: Vec::new(),
             revision: 1,
             complete: true,
             records: vec![VisibleTurnOutcome {
