@@ -4811,6 +4811,7 @@ for line in sys.stdin:
         rusqlite::Connection::open(directory.path().join("binding.sqlite3")).unwrap().execute_batch("CREATE TRIGGER reject_fixture_binding BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'fixture binding write refused'); END;").unwrap();
         let (failed_tx, failed_rx) = std::sync::mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
         let closing_host = host.clone();
         let captured_source = source.clone();
         let captured_actor = previous.clone();
@@ -4819,7 +4820,7 @@ for line in sys.stdin:
             assert!(binding.unwrap_err().contains("fixture binding write refused"));
             failed_tx.send(()).unwrap();
             resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            close_captured(&closing_host, 0, &captured_source, &captured_actor, instance)
+            closed_tx.send(close_captured(&closing_host, 0, &captured_source, &captured_actor, instance)).unwrap();
         });
         failed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         previous.close().unwrap();
@@ -4837,7 +4838,8 @@ for line in sys.stdin:
         assert_eq!(restarted.id, source.id);
         assert!(!replacement.same_actor(&previous));
         resume_tx.send(()).unwrap();
-        let refusal = cleanup.join().unwrap().unwrap_err();
+        let refusal = closed_rx.recv_timeout(Duration::from_secs(10)).expect("captured cleanup did not return before its fixture deadline").unwrap_err();
+        cleanup.join().unwrap();
         assert!(refusal.message.contains("no replacement was stopped"), "{refusal:?}");
         assert!(!replacement.is_completed());
         assert!(host.lock().unwrap().chats[&source.id].handle.same_actor(&replacement));

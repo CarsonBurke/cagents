@@ -130,7 +130,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         let HostedSession::Chat(source) = source else {
             return Err("This agent has no native cleanup contract".into());
         };
-        let handle = {
+        let (handle, execution_instance) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let record = state
                 .chats
@@ -140,7 +140,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
                         .same_process(&HostedSession::Chat(record.session.clone()))
                 })
                 .ok_or("The exact provider ownership is unavailable for reconciliation")?;
-            record.handle.clone()
+            (record.handle.clone(), record.execution_instance)
         };
         let idle_generation = if !handle.is_completed() {
             let snapshot = handle
@@ -162,10 +162,12 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         if let Some(generation) = idle_generation {
             handle.close_if_idle(generation)?;
         }
-        super::super::chat::process(
+        super::super::chat::close_captured(
             host,
             EXECUTION_CLIENT,
-            ClientRequest::ChatClose { chat_id: source.id },
+            source,
+            &handle,
+            execution_instance,
         )
         .map_err(|error| error.message)?;
     } else if !retire {
