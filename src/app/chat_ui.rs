@@ -35,6 +35,8 @@ mod retained;
 mod scroll;
 mod selectable_prose;
 mod selection;
+mod clipboard_intent;
+mod clipboard_surface;
 mod step;
 mod thumbnails;
 mod tool_text;
@@ -465,6 +467,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    copy_intents: clipboard_intent::Intents,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -507,6 +510,7 @@ impl Default for State {
         let (sender, receiver) = async_channel::unbounded();
         Self {
             image_viewer: None,
+            copy_intents: clipboard_intent::Intents::default(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -524,6 +528,11 @@ impl Default for State {
     }
 }
 impl State {
+    /// Scope every native widget clipboard write to the same hub as async chat
+    /// copies. Keep the hub private; the app root only wraps its final surface.
+    pub(super) fn clipboard_surface<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message> {
+        clipboard_surface::surface(content, self.copy_intents.clone())
+    }
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
