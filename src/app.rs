@@ -3535,15 +3535,22 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.always_show_terminal_review_bar = enabled)
             .map_err(|_| "Choose whether the review bar is always visible.".into()),
-        SettingsField::TerminalClipboardWrite => {
-            next.terminal_clipboard_write = match value {
-                "allow" => crate::settings::TerminalClipboardWritePolicy::Allow,
-                "ask" => crate::settings::TerminalClipboardWritePolicy::Ask,
-                "deny" => crate::settings::TerminalClipboardWritePolicy::Deny,
-                _ => return Err("Choose allow, ask or deny for terminal clipboard writes.".into()),
-            };
-            Ok(())
-        }
+        SettingsField::TerminalClipboardWrite => match value {
+            "allow" => {
+                next.terminal_clipboard_write =
+                    crate::settings::TerminalClipboardWritePolicy::Allow;
+                Ok(())
+            }
+            "ask" => {
+                next.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Ask;
+                Ok(())
+            }
+            "deny" => {
+                next.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Deny;
+                Ok(())
+            }
+            _ => Err("Choose allow, ask or deny for terminal clipboard writes.".into()),
+        },
         SettingsField::TerminalScrollToBottomOnInput => value
             .parse::<bool>()
             .map(|value| next.terminal_scroll_to_bottom_on_input = value)
@@ -15915,9 +15922,9 @@ impl Application for Cagents {
                     if let Some(action) = self.automation_ui.keep_draft_action() {
                         return self.update_automation_ui(action);
                     }
-                    if let Some((card, ..)) = &self.terminal_clipboard {
+                    if let Some((card, terminal, ..)) = &self.terminal_clipboard {
                         return self.handle_terminal_find(terminal_ui::Action::ConfirmClipboard(
-                            *card, false,
+                            *card, *terminal, false,
                         ));
                     }
                     if let Some((card, _)) = &self.terminal_paste {
