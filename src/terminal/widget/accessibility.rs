@@ -589,6 +589,25 @@ impl State {
             )));
         }
     }
+    /// Normal focus handoffs address the stable widget ID; the native tree
+    /// addresses this attachment's root. Iced custom IDs match by either
+    /// numeric identity or name, so an operation-only alias can name both.
+    /// This alias is never emitted as a semantic node or accepted as a native
+    /// action target; queued old native actions still require the scoped root.
+    pub fn focus_id(&mut self, parent: &Id) -> Id {
+        self.ensure_ids(parent);
+        let root = self.root_id.as_ref().unwrap();
+        use cosmic::iced::id::Internal;
+        match (&parent.0, &root.0) {
+            (Internal::Custom(_, name), Internal::Custom(number, _)) => {
+                Id(Internal::Custom(*number, name.clone()))
+            }
+            (Internal::Unique(number), Internal::Custom(_, name)) => {
+                Id(Internal::Custom(*number, name.clone()))
+            }
+            _ => parent.clone(),
+        }
+    }
     pub fn refresh(
         &mut self,
         snapshot: &Arc<RenderSnapshot>,
