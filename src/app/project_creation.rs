@@ -11,6 +11,23 @@ pub(super) struct PublishedSource {
 }
 
 impl Cagents {
+    /// Consume the original displayed project token; never upgrade an old row
+    /// action to the source that happens to occupy the same project today.
+    pub(super) fn run_project_creation_target(&mut self, target: sidebar::commands::ProjectCreationTarget) -> Task<Message> {
+        if crate::device::is_remote() || self.modal_is_open() || self.focused_repository_is_saving()
+            || self.workspace_inputs_blocked() || !target.current_in(&self.sidebar_model) {
+            return Task::none();
+        }
+        let Some(source) = self.project_creation_source(target.project_id).filter(|source| source.id() == target.binding) else {
+            self.status = Some(TransientNotice::warning("Reload the project before creating a worktree"));
+            return Task::none();
+        };
+        self.open_worktree_dialog_project_bound(target.project_id, source, WorktreeDraft {
+            base: target.branch.as_deref().unwrap_or("").trim_start_matches("refs/heads/").to_owned(),
+            ..Default::default()
+        }, None)
+    }
+
     /// Internal refreshes retain their already-published physical actor even
     /// while a replacement read is in flight. They never mint click authority.
     pub(super) fn retained_project_creation_source(&self, project: ProjectId) -> Option<WorktreeCreationSource> {

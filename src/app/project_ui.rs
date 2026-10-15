@@ -1074,7 +1074,7 @@ impl Cagents {
                 worktree_id,
                 command,
             } => {
-                if self.modal_is_open() {
+                if self.modal_is_open() || matches!(command, ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch) {
                     return Task::none();
                 }
                 let Some(target) = self.project_target(project_id, worktree_id) else {

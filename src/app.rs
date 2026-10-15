@@ -2796,6 +2796,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::OpenPullRequest { .. }
                     | SidebarAction::BrowsePullRequests { .. }
                     | SidebarAction::NewWorktree { .. }
+                    | SidebarAction::CreateProjectWorktree(_)
                     | SidebarAction::NewChannel { .. }
                     | SidebarAction::OpenChannel { .. }
                     | SidebarAction::CreatePullRequest { .. }
@@ -19077,20 +19078,11 @@ impl Application for Cagents {
                             self.open_clicked_link(url)
                         }
                     },
-                    SidebarAction::NewWorktree {
-                        project_id,
-                        repository,
-                    } => {
-                        if self.sidebar_model.project(project_id).is_some_and(|project| project.kind == ProjectKind::Folder) {
-                            return Task::none();
-                        }
-                        self.open_worktree_dialog(
-                            project_id,
-                            repository,
-                            WorktreeDraft::default(),
-                            None,
-                        )
-                    }
+                    SidebarAction::CreateProjectWorktree(target) => self.run_project_creation_target(target),
+                    // Actual rendered/registered entrypoints carry the token
+                    // captured before activation. Legacy raw messages cannot
+                    // acquire a replacement project's authority here.
+                    SidebarAction::NewWorktree { .. } => Task::none(),
                     SidebarAction::Refresh => {
                         let targets = repository_refresh_targets(&self.sidebar_model.projects);
                         if targets.is_empty() {

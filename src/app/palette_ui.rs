@@ -18,6 +18,8 @@ pub(super) struct State {
     git_target: Option<sidebar::git_commands::GitTarget>,
     group_target: Option<sidebar::commands::GroupTarget>,
     git_captured: bool,
+    project_creation_captured: bool,
+    project_creation_targets: [Option<sidebar::commands::ProjectCreationTarget>; 2],
     stash_picker: Option<Command>,
     stash_entries: Vec<crate::repository::StashEntry>,
 }
@@ -39,6 +41,7 @@ pub enum Action {
     RunChatUser(chat_ui::RegisteredChatCommand),
     RunOriginCommand(Command, Arc<PaletteOrigin>),
     RunGitGroup(Command, sidebar::commands::GroupTarget),
+    RunProjectCreation(sidebar::commands::ProjectCreationTarget),
     RunGitStash(
         sidebar::git_commands::GitTarget,
         Command,
@@ -107,6 +110,7 @@ fn entry_category(message: &Message) -> char {
 fn entry_command(message: &Message) -> Option<Command> {
     match message {
         Message::Palette(Action::RunGitGroup(command, _)) => Some(*command),
+        Message::Palette(Action::RunProjectCreation(target)) => Some(target.command()),
         Message::RunCommand(command)
         | Message::Palette(
             Action::RunOriginCommand(command, _)
@@ -121,6 +125,7 @@ fn entry_command(message: &Message) -> Option<Command> {
 fn entry_key(message: &Message) -> String {
     match message {
         Message::Palette(Action::RunGitGroup(command, _)) => format!("command:{}", command.id()),
+        Message::Palette(Action::RunProjectCreation(target)) => format!("command:{}", target.command().id()),
         Message::Palette(Action::RunOriginCommand(command, _)) => {
             format!("command:{}", command.id())
         }
@@ -154,6 +159,7 @@ fn entry_key(message: &Message) -> String {
 /// Compare captured intent without formatting IDs or cloning target snapshots.
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
+        (Message::Palette(Action::RunProjectCreation(left)), Message::Palette(Action::RunProjectCreation(right))) => left == right,
         (
             Message::Palette(Action::RunGitGroup(lc, lt)),
             Message::Palette(Action::RunGitGroup(rc, rt)),
@@ -464,6 +470,8 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.group_target = None;
                 self.palette.git_captured = false;
+            self.palette.project_creation_captured = false;
+            self.palette.project_creation_targets = [None, None];
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
                 self.palette.recording = Some(field);
@@ -587,6 +595,12 @@ impl Cagents {
                 }
                 self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.sidebar_target = self.capture_sidebar_command_target();
+                self.palette.project_creation_captured = false;
+                self.palette.project_creation_targets = [
+                    self.project_creation_command_target(Command::NewWorktree),
+                    self.project_creation_command_target(Command::NewWorktreeFromBranch),
+                ];
+                self.palette.project_creation_captured = true;
                 self.palette.git_target = sidebar::git_commands::GitTarget::capture(
                     &self.sidebar_model,
                     &self.sidebar_state,
@@ -609,6 +623,7 @@ impl Cagents {
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
             }
+            Action::RunProjectCreation(target) => self.run_project_creation_target(target),
             Action::RunGitGroup(command, target) => {
                 if self.focused_repository_is_saving()
                     || self.workspace_inputs_blocked()
@@ -1101,7 +1116,8 @@ impl Cagents {
                         Action::RunDiffMutation(_, _)
                         | Action::RunChatUser(_)
                         | Action::RunOriginCommand(_, _)
-                        | Action::RunGitGroup(_, _),
+                        | Action::RunGitGroup(_, _)
+                        | Action::RunProjectCreation(_),
                     ) => "Commands",
                     Message::Palette(Action::FocusPane(_)) => "Panes",
                     _ => "Workspaces",
@@ -1302,7 +1318,9 @@ impl Cagents {
                 .filter(|descriptor| descriptor.action != Command::CommandPalette)
                 .filter(|descriptor| descriptor.available(&context))
                 .filter_map(|descriptor| {
-                    let message = if workspace_widget::git_group_command_bit(descriptor.action)
+                    let message = if matches!(descriptor.action, Command::NewWorktree | Command::NewWorktreeFromBranch) {
+                        Message::Palette(Action::RunProjectCreation(self.project_creation_command_target(descriptor.action)?))
+                    } else if workspace_widget::git_group_command_bit(descriptor.action)
                         .is_some()
                     {
                         Message::Palette(Action::RunGitGroup(
@@ -1461,7 +1479,8 @@ impl Cagents {
                                     Action::RunDiffMutation(_, _)
                                     | Action::RunChatUser(_)
                                     | Action::RunOriginCommand(_, _)
-                                    | Action::RunGitGroup(_, _),
+                                    | Action::RunGitGroup(_, _)
+                        | Action::RunProjectCreation(_),
                                 ) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
@@ -1683,6 +1702,27 @@ impl Cagents {
         )
     }
 
+    fn project_creation_command_target(&self, command: Command) -> Option<sidebar::commands::ProjectCreationTarget> {
+        let from_branch = command == Command::NewWorktreeFromBranch;
+        if !matches!(command, Command::NewWorktree | Command::NewWorktreeFromBranch) { return None; }
+        if self.palette.project_creation_captured {
+            return self.palette.project_creation_targets[usize::from(from_branch)].as_ref()
+                .filter(|target| target.current_in(&self.sidebar_model)
+                    && self.project_creation_source(target.project_id).is_some_and(|source| source.id() == target.binding)).cloned();
+        }
+        let captured = if let Some(target) = self.sidebar_command_target() {
+            match target {
+                sidebar::commands::CommandTarget::Rows(rows) => sidebar::commands::ProjectCreationTarget::capture_rows(&self.sidebar_model, &rows, from_branch),
+                sidebar::commands::CommandTarget::ProjectCreation(target) if target.command() == command && target.current_in(&self.sidebar_model) => Some(target),
+                _ => None,
+            }
+        } else if !from_branch {
+            sidebar::commands::ProjectCreationTarget::capture(&self.sidebar_model, self.command_project()?.id, None, false)
+        } else { None }?;
+        self.project_creation_source(captured.project_id).filter(|source| source.id() == captured.binding)?;
+        Some(captured)
+    }
+
     fn command_project(&self) -> Option<&SidebarProject> {
         if let Some(channel) = self.durable.active_channel.and_then(|id| {
             self.durable
@@ -1852,6 +1892,9 @@ impl Cagents {
             .iter()
             .filter_map(|descriptor| {
                 let bit = descriptor.action.sidebar_command_bit()?;
+                if matches!(descriptor.action, Command::NewWorktree | Command::NewWorktreeFromBranch) {
+                    return (!crate::device::is_remote() && self.project_creation_command_target(descriptor.action).is_some()).then_some(bit);
+                }
                 let action = target.resolve_in(
                     &self.sidebar_model,
                     &self.sidebar_state,
@@ -2107,7 +2150,7 @@ impl Cagents {
             .is_empty(),
             active_git_project: self
                 .command_project()
-                .is_some_and(|project| project.kind != ProjectKind::Folder),
+                .is_some_and(|project| self.project_creation_source(project.id).is_some()),
             pane_has_path: card
                 .is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(_))))
                 || state.and_then(super::worktree_ui::card_directory).is_some(),
@@ -2404,6 +2447,9 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if matches!(command, Command::NewWorktree | Command::NewWorktreeFromBranch) {
+            return self.project_creation_command_target(command).map_or_else(Task::none, |target| self.run_project_creation_target(target));
+        }
         if command == Command::OpenAutomations { return self.open_automations(); }
         if command == Command::OpenAgentAccounts { return self.open_agent_accounts(); }
         if matches!(
@@ -2660,13 +2706,7 @@ impl Cagents {
             }
             Command::OpenFolder => self.update(Message::OpenRepository),
             Command::NewWorktree => {
-                let Some(project) = self.command_project() else {
-                    return Task::none();
-                };
-                self.update(Message::Sidebar(SidebarAction::NewWorktree {
-                    project_id: project.id,
-                    repository: project.repository.clone(),
-                }))
+                self.project_creation_command_target(command).map_or_else(Task::none, |target| self.run_project_creation_target(target))
             }
             Command::ResumeConversation => {
                 self.update(Message::ResumeConversation(resume_ui::Action::Open))
