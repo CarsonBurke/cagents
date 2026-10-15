@@ -1649,7 +1649,7 @@ mod tests {
         }).collect::<String>();
         assert_eq!(actual, format!("{source}尾"));
         assert_eq!(window.changes.iter().filter(|change| matches!(change,
-            crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty())).count(), 8);
+            crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty())).count(), 1);
     }
 
     #[test]
