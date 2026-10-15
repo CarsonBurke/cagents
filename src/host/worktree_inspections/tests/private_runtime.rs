@@ -102,7 +102,7 @@ struct FixtureDirectory(Option<tempfile::TempDir>);
 impl Drop for FixtureDirectory {
     fn drop(&mut self) {
         if let Some(directory) = self.0.take() {
-            directory.keep();
+            let _ = directory.keep();
         }
     }
 }
