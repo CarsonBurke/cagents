@@ -9426,6 +9426,7 @@ impl Cagents {
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
         }
+        if let Some(notice) = self.project_location_notice(id) { rows.push(notice); }
         rows.push(content);
         if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
             // Under the final screen, where the reader's eye already is when

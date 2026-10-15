@@ -4,12 +4,14 @@ use super::*;
 use crate::{project_recovery::{self, Relocation}, sidebar::ProjectRecoveryAction};
 
 #[derive(Default)]
-pub(super) struct State { checking: bool, locating: HashSet<ProjectId>, pub(super) closing_panes: bool }
+pub(super) struct State { checking: bool, locating: HashSet<ProjectId>, pub(super) closing_panes: bool, details: HashSet<CardId> }
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
     Checked(Vec<(ProjectId, PathBuf, Option<String>)>),
     Command(ProjectId, ProjectRecoveryAction),
+    VerifyProject(ProjectId),
+    SessionDetails(CardId),
     Located(ProjectId, Result<PathBuf, String>),
     Prepared(ProjectId, Result<Relocation, String>),
     Applied(ProjectId, Relocation, Result<crate::workspace_model::WorkspaceModel, String>),
@@ -111,6 +113,17 @@ impl Cagents {
                 }
                 Task::batch(tasks)
             }
+            Action::VerifyProject(id) => {
+                if self.modal_is_open() || !self.project_recovery_ui.locating.insert(id) { return Task::none(); }
+                let Some(project) = self.sidebar_model.project(id) else { self.finish_project_location(id); return Task::none(); };
+                let root = root(project);
+                let relocation = Relocation { repository: project.repository.clone(), destination: project.repository.clone(), old_root: root.clone(), new_root: root };
+                self.update_project_recovery(Action::Prepared(id, Ok(relocation)))
+            }
+            Action::SessionDetails(card) => {
+                if !self.project_recovery_ui.details.insert(card) { self.project_recovery_ui.details.remove(&card); }
+                Task::none()
+            }
             Action::Command(id, ProjectRecoveryAction::Details) => {
                 if let Some(project) = self.sidebar_model.projects.iter_mut().find(|project| project.id == id) { project.missing_details = !project.missing_details; }
                 Task::none()
@@ -205,9 +218,15 @@ impl Cagents {
                         return self.apply_project_relocation(&relocation);
                     }
                     self.workspace_model = model;
-                    let relocated = self.apply_project_relocation(&relocation);
-                    self.status = Some(TransientNotice::success("Project located. Existing schedules are paused until their target is updated."));
-                    let _ = id;
+                    let relocated = if relocation.repository == relocation.destination { Task::none() } else { self.apply_project_relocation(&relocation) };
+                    let refused = self.project_cards(id).into_iter().filter(|card| self.card_location_refusal(*card).is_some()).count();
+                    self.status = Some(if refused > 0 {
+                        TransientNotice::warning(format!("Project located. {refused} panes still need directory verification; use Verify again or Close pane in each warning."))
+                    } else if relocation.repository == relocation.destination {
+                        TransientNotice::success("Session locations verified.")
+                    } else {
+                        TransientNotice::success("Project located. Existing schedules are paused until their target is updated.")
+                    });
                     relocated
                 }
                 Err(error) => { self.status = Some(TransientNotice::error(format!("Could not locate project: {error}"))); Task::none() }
@@ -219,6 +238,39 @@ impl Cagents {
     fn finish_project_location(&mut self, id: ProjectId) {
         self.project_recovery_ui.locating.remove(&id);
         if let Some(project) = self.sidebar_model.projects.iter_mut().find(|project| project.id == id) { project.reloading = false; }
+    }
+
+    pub(super) fn card_location_refusal(&self, card: CardId) -> Option<&crate::workspace_model::SessionLocationRefusal> {
+        let session = match &self.card_state(card)?.kind {
+            CardKind::Chat(session) => session.id,
+            CardKind::Terminal(session) => session.id,
+            _ => return None,
+        };
+        self.workspace_model.session_location_refusals.iter().find(|refusal| refusal.session == session)
+    }
+
+    pub(super) fn project_location_notice(&self, card: CardId) -> Option<Element<'_, Message>> {
+        let refusal = self.card_location_refusal(card)?;
+        let expanded = self.project_recovery_ui.details.contains(&card);
+        let project = self.durable.channels.iter().find(|channel| channel.cards.contains(&card)).map(|channel| channel.project_id)
+            .or_else(|| self.durable.card_scopes.get(&card).and_then(|path| self.sidebar_model.worktree_at(path)).map(|key| key.project_id));
+        let enabled = !self.modal_is_open();
+        let mut actions = Vec::new();
+        if let Some(project) = project {
+            actions.push(crate::ui_controls::button::quiet("Verify again").id(card_control_id(card,"project.location.retry")).on_press_maybe((enabled && !self.project_recovery_ui.locating.contains(&project)).then_some(Message::ProjectRecovery(Action::VerifyProject(project)))).into());
+        }
+        actions.push(crate::ui_controls::button::quiet("Close pane").on_press_maybe(enabled.then_some(Message::CloseCard(card))).into());
+        actions.push(crate::ui_controls::button::quiet(if expanded { "Hide details" } else { "Details" }).on_press_maybe(enabled.then_some(Message::ProjectRecovery(Action::SessionDetails(card)))).into());
+        let mut body = widget::column::with_children(vec![
+            notice_body("This session still needs a verified directory."),
+            notice_surface_detail(NoticeSeverity::Warning, if expanded { format!("{}\n{}", refusal.directory.display(), refusal.reason) } else {
+                let mut reason = refusal.reason.chars().take(160).collect::<String>();
+                if refusal.reason.chars().count() > 160 { reason.push('…'); }
+                reason
+            }),
+        ]).spacing(space::XS).width(Length::Fill);
+        body = body.push(widget::row::with_children(actions).spacing(space::XS));
+        Some(notice_surface(NoticeSeverity::Warning, body.into(), None, false))
     }
 
     /// A reconnect can miss Locate's watch edge. Recover logical ownership
@@ -396,6 +448,23 @@ mod tests {
         drop(app.update_project_recovery(Action::Checked(vec![(id,root.clone(),project_recovery::missing_reason(&root))])));
         assert!(!app.project_missing(id));
     }
+    #[test]
+    fn session_location_warning_stays_with_exact_pane_and_clears_after_verified_model() {
+        let (mut app, _) = app(Path::new("/old/project"));
+        drop(app.add_terminal("/old/project".into()));
+        let card = app.durable.cards.last().unwrap().id;
+        let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else { panic!() };
+        let session = session.id;
+        app.workspace_model.session_location_refusals.push(crate::workspace_model::SessionLocationRefusal { session, directory: "/new/project".into(), reason: "The owned provider has not confirmed this directory; retry when ready.".into() });
+        assert_eq!(app.card_location_refusal(card).unwrap().session, session);
+        assert!(app.project_location_notice(card).is_some());
+        drop(app.update_project_recovery(Action::SessionDetails(card)));
+        assert!(app.project_recovery_ui.details.contains(&card));
+        app.workspace_model.session_location_refusals.clear();
+        assert!(app.card_location_refusal(card).is_none());
+        assert!(app.project_location_notice(card).is_none());
+    }
+
     #[test]
     fn locate_preserves_live_terminal_launch_provenance_and_observed_directory() {
         let old = Path::new("/old/project");
