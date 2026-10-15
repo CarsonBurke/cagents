@@ -89,10 +89,12 @@ pub(super) fn append_menu(
 ) {
     if rows.0.is_empty() { return; }
     use cosmic::widget::menu::{Item, items};
-    // One registered template serves every captured parameter. Each action's
-    // hint is derived from current settings; no per-conversation registry IDs.
-    let bindings = super::menu_bindings(rows.0.iter().map(|row| EndCommand(&row.target)), shortcuts, &[]);
-    menu.extend(items(&bindings, vec![Item::Divider, Item::Folder(
+    // One registered template serves every captured parameter, but its
+    // generic keyboard binding addresses the focused conversation. Assigning
+    // that one chord to all parameterized entries would misleadingly choose
+    // an arbitrary last row. These captured targets have no implicit chord.
+    let _ = shortcuts;
+    menu.extend(items(&std::collections::HashMap::new(), vec![Item::Divider, Item::Folder(
         super::commands::label(crate::workspace_widget::GlobalShortcut::EndConversation).to_owned(),
         entries(&rows.0, 0),
     )]));
