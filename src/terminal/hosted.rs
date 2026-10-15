@@ -3133,6 +3133,7 @@ mod tests {
             assert_eq!(handle.proof(), None);
             assert!(handle.wait_until_attached(Duration::ZERO).is_err());
             let terminal = TerminalDescriptor {
+                execution_instance: uuid::Uuid::nil(),
                 screen_lost_after_crash: false,
                 session,
                 generation: 0,
@@ -3206,6 +3207,7 @@ mod tests {
         stream.write_all(&frame[2..]).unwrap();
         let spawn: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
         let terminal = TerminalDescriptor {
+            execution_instance: uuid::Uuid::nil(),
             screen_lost_after_crash: false,
             session,
             generation: 0,
@@ -3443,6 +3445,7 @@ mod tests {
                     ServerMessage::Response {
                         response: ServerResponse::Attached {
                             terminal: TerminalDescriptor {
+                                execution_instance: uuid::Uuid::nil(),
                                 screen_lost_after_crash: false,
                                 session,
                                 generation: 0,
@@ -4018,6 +4021,7 @@ mod tests {
                 response: ServerResponse::Connected {
                     proof: pinned.clone(),
                     resumed: vec![TerminalDescriptor {
+                        execution_instance: uuid::Uuid::nil(),
                         screen_lost_after_crash: false,
                         session,
                         generation: 0,
