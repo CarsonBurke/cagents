@@ -1071,15 +1071,18 @@ struct HeldKeyPeer {
     _directory: tempfile::TempDir,
     keys: crossbeam_channel::Receiver<KeyInput>,
     acknowledge: crossbeam_channel::Sender<bool>,
+    resume: crossbeam_channel::Sender<()>,
     closed: crossbeam_channel::Receiver<()>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl HeldKeyPeer {
-    fn connect() -> (TerminalSurface, Self) {
+    fn connect() -> (TerminalSurface, Self) { Self::connect_mode(false) }
+    fn connect_mode(reconnect: bool) -> (TerminalSurface, Self) {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = directory.path().join("held-key.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let id = TerminalId::new();
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new("held-key-session"),
@@ -1089,27 +1092,48 @@ impl HeldKeyPeer {
         let handle = HostedTerminalHandle::connect_at(socket, id, Some(proof.clone()), |_| {}).unwrap();
         let (keys_tx, keys) = crossbeam_channel::unbounded();
         let (acknowledge, acks) = crossbeam_channel::bounded(8);
+        let (resume, resume_rx) = crossbeam_channel::bounded(1);
         let (closed_tx, closed) = crossbeam_channel::bounded(1);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let instance = uuid::Uuid::new_v4();
+            let mut reconnecting = false;
+            'connections: loop {
+            let mut stream = loop {
+                if stopping.load(Ordering::Relaxed) { return; }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
+                    Err(error) => panic!("held-key accept: {error}"),
+                }
+            };
             stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
             let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
             while !stopping.load(Ordering::Relaxed) {
                 let envelope: ClientEnvelope = match codec.read(&mut stream) {
                     Ok(Some(value)) => value,
-                    Ok(None) => { let _ = closed_tx.send(()); break; }
+                    Ok(None) => { let _ = closed_tx.send(()); return; }
                     Err(FrameError::Io(error)) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
                     Err(error) => panic!("held-key frame: {error}"),
                 };
+                let disconnect_after_ack = reconnect && !reconnecting && matches!(&envelope.request, ClientRequest::Key { input, .. } if input.action == KeyAction::Press);
                 let message = match envelope.request {
                     ClientRequest::Connect { .. } => {
+                        if reconnecting {
+                            loop {
+                                match resume_rx.recv_timeout(Duration::from_millis(50)) {
+                                    Ok(()) => break,
+                                    Err(_) if stopping.load(Ordering::Relaxed) => return,
+                                    Err(_) => continue,
+                                }
+                            }
+                        }
                         let mut descriptor = TerminalDescriptor::relaunchable(id, LaunchRecipe {
                             program: "/bin/sh".into(), arguments: Vec::new(), working_directory: "/".into(),
                             environment: Default::default(), unset_environment: Default::default(),
                         }, None);
-                        descriptor.execution_instance = uuid::Uuid::new_v4();
+                        descriptor.execution_instance = instance;
                         descriptor.attached = true;
                         descriptor.session.continuity = crate::model::TerminalContinuity::Live {
                             host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone(),
@@ -1130,11 +1154,14 @@ impl HeldKeyPeer {
                     }
                     _ => ServerMessage::Response { response: ServerResponse::Accepted },
                 };
-                if write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(envelope.request_id), proof: proof.clone(), message }).is_err() { break; }
+                if write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(envelope.request_id), proof: proof.clone(), message }).is_err() { return; }
+                if disconnect_after_ack { reconnecting = true; continue 'connections; }
+            }
+            return;
             }
         });
         handle.wait_until_attached(Duration::from_secs(3)).unwrap();
-        (handle.into(), Self { _directory: directory, keys, acknowledge, closed, stop, worker: Some(worker) })
+        (handle.into(), Self { _directory: directory, keys, acknowledge, resume, closed, stop, worker: Some(worker) })
     }
     fn next(&self, action: KeyAction) {
         assert_eq!(self.keys.recv_timeout(Duration::from_secs(3)).unwrap().action, action);
@@ -1228,4 +1255,28 @@ fn refused_press_skips_its_release_and_reports_failure() {
     barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
     peer.next(KeyAction::Release); peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
+}
+
+#[test]
+fn acknowledged_press_retains_historical_authority_across_detach_before_reap() {
+    let (surface, peer) = HeldKeyPeer::connect_mode(true);
+    let barrier = ReviewInputBarrier::default();
+    let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyA);
+    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
+    peer.next(KeyAction::Press); peer.ack(true);
+    // The peer closes immediately after its ACK and withholds the reconnect
+    // descriptor. No UI ownership reap occurs before transient proof is gone.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while surface.host_proof().is_some() {
+        assert!(Instant::now() < deadline, "fixture did not detach after the acknowledged press");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(barrier.pending_counts(), (1, 0), "a live getter becoming unknown must not erase historical admission");
+    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
+    assert_eq!(barrier.pending_counts(), (0, 1));
+    assert!(peer.keys.try_recv().is_err(), "release waits for reattachment to the original worker");
+    peer.resume.send(()).unwrap();
+    peer.next(KeyAction::Release); peer.ack(true);
+    wait_key_counts(&barrier, (0, 0));
+    assert!(barrier.take_failures().is_empty());
 }
