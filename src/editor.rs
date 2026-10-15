@@ -97,6 +97,7 @@ pub struct BinaryPreview {
     pub error: Option<String>,
     pub offset: u64,
     pub data: std::sync::Arc<[u8]>,
+    pub hex: std::sync::Arc<str>,
 }
 
 pub const BINARY_PREVIEW_BYTES: u64 = 64 * 1024;
@@ -119,9 +120,40 @@ fn binary_preview(mut file: File, offset: u64) -> Result<BinaryPreview, FileIoEr
     let read = file.read(&mut header).map_err(io_error)?;
     file.seek(io::SeekFrom::Start(offset)).map_err(io_error)?;
     let mut data = Vec::new();
-    file.take(BINARY_PREVIEW_BYTES).read_to_end(&mut data).map_err(io_error)?;
-    Ok(BinaryPreview { bytes: metadata.len(), modified: metadata.modified().ok(),
-        mime: binary_mime(&header[..read]), error: None, offset, data: data.into() })
+    file.take(BINARY_PREVIEW_BYTES)
+        .read_to_end(&mut data)
+        .map_err(io_error)?;
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(data.len() * 5);
+    for (row, bytes) in data.chunks(16).enumerate() {
+        let _ = write!(hex, "{:08x}  ", offset + (row * 16) as u64);
+        for index in 0..16 {
+            match bytes.get(index) {
+                Some(byte) => {
+                    let _ = write!(hex, "{byte:02x} ");
+                }
+                None => hex.push_str("   "),
+            }
+        }
+        hex.push_str(" | ");
+        for byte in bytes {
+            hex.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            });
+        }
+        hex.push('\n');
+    }
+    Ok(BinaryPreview {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        mime: binary_mime(&header[..read]),
+        error: None,
+        offset,
+        data: data.into(),
+        hex: hex.into(),
+    })
 }
 
 pub fn load_binary_page(worktree: &Path, path: &Path, offset: u64) -> Result<BinaryPreview, FileIoError> {
