@@ -200,10 +200,10 @@ impl Cagents {
                     .map(|project| project.kind)
             })
             .unwrap_or_default();
-        let directory = self.project_ui.checkout_roots.get(&repository).cloned().unwrap_or(repository.clone());
+        let checkout = self.project_ui.checkout_roots.get(&repository).cloned();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                crate::device_service::request(Operation::ProjectNavigation { repository: directory, kind })
+                crate::device_service::request(Operation::ProjectNavigation { repository, kind, checkout })
             })
             .await
             .map_err(|error| error.to_string())

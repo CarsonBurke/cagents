@@ -103,6 +103,28 @@ fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
     fs::canonicalize(root).map(Some).map_err(|error| error.to_string())
 }
 
+/// Filesystem identity for a verified checkout marker, including linked and
+/// separate Git directories. No Git subprocess is needed during navigation.
+#[cfg(feature = "host")]
+pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    fn reference(bytes: &[u8]) -> &Path {
+        Path::new(std::ffi::OsStr::from_bytes(bytes.strip_suffix(b"\n").unwrap_or(bytes)))
+    }
+    let marker = directory.join(".git");
+    let admin = if marker.is_dir() { fs::canonicalize(marker).ok()? } else {
+        let content = fs::read(marker).ok()?;
+        let path = reference(content.strip_prefix(b"gitdir: ")?);
+        fs::canonicalize(directory.join(path)).ok()?
+    };
+    let common = match fs::read(admin.join("commondir")) {
+        Ok(content) => fs::canonicalize(admin.join(reference(&content))).ok()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => admin.clone(),
+        Err(_) => return None,
+    };
+    Some((admin, common))
+}
+
 fn exists(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -243,6 +265,29 @@ mod tests {
         assert_eq!(location.key, metadata.canonicalize().unwrap());
         assert_eq!(location.checkout, Some(checkout.canonicalize().unwrap()));
         assert_eq!(discover(&metadata).unwrap().checkout, None);
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn separate_primary_is_normalized_without_substituting_a_linked_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let metadata = root.path().join("metadata");
+        assert!(Command::new("git").args(["init", "--separate-git-dir"]).arg(&metadata).arg(&checkout).output().unwrap().status.success());
+        assert!(Command::new("git").arg("-C").arg(&checkout).args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"]).output().unwrap().status.success());
+        let service = crate::repository::RepositoryService::system("git");
+        let cancellation = crate::repository::CancellationToken::new();
+        let info = service.discover(&checkout, &cancellation).unwrap();
+        let records = service.list_worktrees_for_repository(&info, &cancellation).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path, checkout.canonicalize().unwrap());
+        assert_eq!(records[0].id, crate::repository::stable_worktree_id(&records[0].path));
+        let linked = root.path().join("linked");
+        assert!(Command::new("git").arg("-C").arg(&checkout).args(["worktree", "add", "-b", "linked"]).arg(&linked).output().unwrap().status.success());
+        let info = service.discover(&linked, &cancellation).unwrap();
+        let records = service.list_worktrees_for_repository(&info, &cancellation).unwrap();
+        assert!(records.iter().any(|record| record.path == linked.canonicalize().unwrap()));
+        assert!(!records.iter().any(|record| record.path == metadata.canonicalize().unwrap() && !record.bare));
     }
 
     #[test]
