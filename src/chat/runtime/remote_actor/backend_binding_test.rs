@@ -95,7 +95,7 @@ pub(super) fn isolated(exact: &str) -> bool {
     if std::env::var(CHILD).as_deref() == Ok(exact) {
         return false;
     }
-    let mut evidence = Evidence(Some(
+    let evidence = Evidence(Some(
         tempfile::Builder::new()
             .prefix("cagents-backend-binding-")
             .tempdir_in("/var/tmp")
@@ -196,7 +196,9 @@ pub(super) fn isolated(exact: &str) -> bool {
         stdout.chars().take(4096).collect::<String>(),
         stderr.chars().take(4096).collect::<String>()
     );
-    drop(evidence.0.take());
+    // A named child pass is not whole-family settlement. Preserve the private
+    // recovery root and receipts on success too; only the strict outer family
+    // owner may establish cleanup before any later evidence retirement.
     true
 }
 pub(super) struct Completed(pub std::sync::mpsc::Sender<()>);
