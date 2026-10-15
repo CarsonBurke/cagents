@@ -97,6 +97,11 @@ impl State {
         self.target = target;
         if same_identity {
             self.loading = false;
+            if self.target.as_ref().is_some_and(|target| {
+                !crate::github::polling::ready(&target.repository.host, false)
+            }) {
+                return ActionTask::none();
+            }
             return self.refresh();
         }
         self.inspection = None;
@@ -322,11 +327,19 @@ fn verify_local_head_with<E: crate::repository::ProcessExecutor>(
     let head = git
         .resolve_head(&target.worktree, cancellation)
         .map_err(|error| error.to_string())?;
-    if head.as_ref().map(|oid| oid.as_str()) == target.head_oid.as_deref() {
+    let branch = git
+        .symbolic_head(&target.worktree, cancellation)
+        .map_err(|error| error.to_string())?;
+    if head.as_ref().map(|oid| oid.as_str()) == target.head_oid.as_deref()
+        && branch
+            .as_ref()
+            .and_then(|reference| reference.as_str().strip_prefix("refs/heads/"))
+            == Some(target.branch.as_str())
+    {
         Ok(())
     } else {
         Err(
-            "The worktree HEAD changed. Refresh the repository before inspecting its pull request."
+            "The worktree branch or HEAD changed. Refresh the repository before inspecting its pull request."
                 .into(),
         )
     }
@@ -1334,6 +1347,14 @@ mod tests {
         state.loaded = true;
         state.filter = "keep this filter".into();
         state.description = markdown::parse("loaded description").collect();
+        let pr = crate::pull_request_review::tests::pull_request(7);
+        let inspection = Arc::new(PullRequestInspection {
+            pull_request: pr.clone(),
+            checks: Ok(Vec::new()),
+            conversation: Ok(Default::default()),
+        });
+        state.pull_request = Some(Arc::new(pr));
+        state.inspection = Some(Arc::clone(&inspection));
         let mut next = target();
         next.head_oid = Some("bbb".into());
         drop(state.synchronize(Some(next), None));
@@ -1341,38 +1362,124 @@ mod tests {
         assert!(state.loading);
         assert_eq!(state.filter, "keep this filter");
         assert!(!state.description.is_empty());
+        assert!(state.pull_request.is_some());
+        assert!(Arc::ptr_eq(state.inspection.as_ref().unwrap(), &inspection));
     }
 
     #[test]
-    fn inspector_head_verification_reads_one_ref_without_status() {
+    fn local_head_changes_observe_automatic_host_backoff_without_blank_content() {
+        let host = "inspector-commit-backoff.invalid";
+        let mut original = target();
+        original.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        let mut state = State::default();
+        state.target = Some(original.clone());
+        state.loaded = true;
+        state.filter = "keep".into();
+        state.description = markdown::parse("Loaded content").collect();
+        crate::github::polling::failed(
+            host,
+            &crate::github::GitHubError::Inspection("offline".into()),
+        );
+        original.head_oid = Some("b".repeat(40));
+        drop(state.synchronize(Some(original), None));
+        assert!(!state.loading);
+        assert!(state.loaded);
+        assert_eq!(state.filter, "keep");
+        assert!(!state.description.is_empty());
+        crate::github::polling::succeeded(host);
+    }
+
+    #[test]
+    fn inspector_head_verification_reads_one_oid_and_checks_symbolic_branch_without_status() {
         use crate::repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
-        #[derive(Default)]
-        struct CountingGit(std::sync::Mutex<Vec<CommandSpec>>);
+        struct CountingGit {
+            calls: std::sync::Mutex<Vec<CommandSpec>>,
+            branch: Option<&'static str>,
+            unborn: bool,
+        }
         impl ProcessExecutor for CountingGit {
             fn execute(
                 &self,
                 command: &CommandSpec,
                 _: &CancellationToken,
             ) -> Result<ProcessOutput, ProcessFailure> {
-                self.0.lock().unwrap().push(command.clone());
+                self.calls.lock().unwrap().push(command.clone());
+                let symbolic = command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "symbolic-ref");
+                let (success, stdout) = if symbolic {
+                    (
+                        self.branch.is_some(),
+                        self.branch.unwrap_or_default().to_owned(),
+                    )
+                } else {
+                    (
+                        !self.unborn,
+                        if self.unborn {
+                            String::new()
+                        } else {
+                            "a".repeat(40)
+                        },
+                    )
+                };
                 Ok(ProcessOutput {
-                    success: true,
-                    exit_code: Some(0),
+                    success,
+                    exit_code: Some(if success { 0 } else { 1 }),
                     signal: None,
-                    stdout: format!("{}\n", "a".repeat(40)).into_bytes(),
+                    stdout: format!("{stdout}\n").into_bytes(),
                     stderr: Vec::new(),
                 })
             }
         }
-        let executor = Arc::new(CountingGit::default());
-        let git = RepositoryService::new("git", executor.clone());
-        let mut target = target();
-        target.head_oid = Some("a".repeat(40));
-        verify_local_head_with(&git, &target, &CancellationToken::new()).unwrap();
-        let calls = executor.0.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].arguments.iter().any(|arg| arg == "rev-parse"));
-        assert!(!calls[0].arguments.iter().any(|arg| arg == "status"));
+        for (branch, unborn, expected) in [
+            (Some("refs/heads/feature"), false, true),
+            (Some("refs/heads/other"), false, false),
+            (None, false, false),
+            (Some("refs/heads/feature"), true, true),
+            (Some("refs/heads/other"), true, false),
+        ] {
+            let executor = Arc::new(CountingGit {
+                calls: Default::default(),
+                branch,
+                unborn,
+            });
+            let git = RepositoryService::new("git", executor.clone());
+            let mut target = target();
+            target.head_oid = (!unborn).then(|| "a".repeat(40));
+            assert_eq!(
+                verify_local_head_with(&git, &target, &CancellationToken::new()).is_ok(),
+                expected
+            );
+            let calls = executor.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "rev-parse"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "symbolic-ref"))
+                    .count(),
+                1
+            );
+            assert!(calls.iter().all(|command| {
+                !command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "status")
+            }));
+        }
     }
 
     #[test]

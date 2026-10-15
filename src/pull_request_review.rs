@@ -402,6 +402,7 @@ pub struct State {
     list_appending: bool,
     list_error: Option<String>,
     list_last_refresh: Option<Instant>,
+    list_loaded_query: Option<String>,
     browser_query: String,
     browser_keys: BTreeMap<u64, (String, String)>,
     browser_viewport: (f32, f32),
@@ -602,6 +603,7 @@ impl State {
             list_appending: false,
             list_error: None,
             list_last_refresh: None,
+            list_loaded_query: None,
             browser_query: String::new(),
             browser_keys: BTreeMap::new(),
             browser_viewport: (0.0, 480.0),
@@ -650,6 +652,7 @@ impl State {
         self.list_loading = false;
         self.list_error = None;
         self.list_last_refresh = None;
+        self.list_loaded_query = None;
         self.browser_query.clear();
         self.browser_keys.clear();
         self.browser_viewport.0 = 0.0;
@@ -663,6 +666,11 @@ impl State {
 
     pub fn source(&self) -> Option<&ReviewSource> {
         self.source.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browser_is_refreshing(&self) -> bool {
+        self.list_loading
     }
 
     pub fn list(&self) -> &ListState {
@@ -858,6 +866,7 @@ impl State {
                 self.list_loading = false;
                 match result {
                     Ok(page) => {
+                        self.list_loaded_query = Some(self.browser_query.trim().to_owned());
                         if let Some(source) = &self.source {
                             crate::github::polling::succeeded(&source.repository.host);
                         }
@@ -1187,7 +1196,7 @@ impl State {
         }
         let api = Arc::clone(&self.api);
         let query = self.browser_query.trim().to_owned();
-        let page_limit = if append || !query.is_empty() {
+        let page_limit = if append || self.list_loaded_query.as_deref() != Some(query.as_str()) {
             1
         } else {
             match &self.list {
@@ -2960,6 +2969,8 @@ pub(crate) struct ScriptedApi {
     pub viewed_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
     pub conversation: std::sync::Mutex<crate::github::PullRequestConversation>,
     pub submitted: std::sync::Mutex<Vec<crate::github::SubmitReviewRequest>>,
+    pub search_pages: std::sync::Mutex<std::collections::VecDeque<PullRequestPage>>,
+    pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
 }
 
 #[cfg(test)]
@@ -2970,12 +2981,33 @@ impl ScriptedApi {
             viewed_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
             conversation: std::sync::Mutex::new(Default::default()),
             submitted: std::sync::Mutex::new(Vec::new()),
+            search_pages: Default::default(),
+            searches: Default::default(),
         }
     }
 }
 
 #[cfg(test)]
 impl GitHubReviewApi for ScriptedApi {
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        _: &CancellationToken,
+    ) -> Result<PullRequestPage, crate::github::GitHubError> {
+        self.searches
+            .lock()
+            .unwrap()
+            .push((query.to_owned(), cursor.map(str::to_owned)));
+        Ok(self
+            .search_pages
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted search page"))
+    }
+
     fn pull_request(
         &self,
         _key: &PullRequestKey,
@@ -3358,6 +3390,78 @@ pub(crate) mod tests {
             load: state.load_generation,
             result: Ok(Arc::new(loaded)),
         }));
+    }
+
+    pub(crate) fn ready_due_browser(state: &mut State) {
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
+        }));
+        state.list_last_refresh = Some(Instant::now() - Duration::from_secs(31));
+    }
+
+    #[test]
+    fn multi_page_search_refresh_retains_loaded_depth_query_and_viewport() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut state, api) = state();
+        state.source = Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        });
+        state.browser_query = "needle".into();
+        state.list_loaded_query = Some("needle".into());
+        state.list = ListState::Ready(
+            (1..=100)
+                .map(|number| Arc::new(pull_request(number)))
+                .collect(),
+        );
+        state.list_last_refresh = Some(Instant::now() - Duration::from_secs(31));
+        state.browser_viewport.0 = 800.0;
+        api.search_pages.lock().unwrap().extend([
+            PullRequestPage {
+                pull_requests: (2..=51).map(pull_request).collect(),
+                next_cursor: Some("page-2".into()),
+            },
+            PullRequestPage {
+                pull_requests: (52..=101).map(pull_request).collect(),
+                next_cursor: Some("page-3".into()),
+            },
+        ]);
+        let task = state.update(Action::RefreshIfDue(Instant::now()));
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action @ Action::ListLoaded { .. }) =
+                        action
+                    {
+                        return action;
+                    }
+                }
+                panic!("list request produced no result");
+            });
+        drop(state.update(reply));
+        assert_eq!(
+            *api.searches.lock().unwrap(),
+            vec![
+                ("needle".into(), None),
+                ("needle".into(), Some("page-2".into()))
+            ]
+        );
+        let ListState::Ready(rows) = &state.list else {
+            panic!("loaded search")
+        };
+        assert_eq!(rows.len(), 100);
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(101).is_some());
+        assert_eq!(state.browser_query, "needle");
+        assert_eq!(state.browser_viewport.0, 800.0);
     }
 
     #[test]

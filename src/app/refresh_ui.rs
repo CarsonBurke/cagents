@@ -248,9 +248,16 @@ impl Cagents {
             tasks.push(self.reload_source_control(&key));
         }
         let now = Instant::now();
-        if let Some(card) = self.workspace.focused()
-            && matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_)))
-        {
+        let browsers = self
+            .cards
+            .iter()
+            .filter_map(|(&card, runtime)| {
+                (self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+                    && matches!(runtime, CardRuntime::PullRequests(_)))
+                .then_some(card)
+            })
+            .collect::<Vec<_>>();
+        for card in browsers {
             tasks.push(self.apply_pull_request_review(
                 card,
                 if regained_focus {
