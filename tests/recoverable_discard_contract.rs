@@ -371,3 +371,50 @@ fn local_discard_refuses_native_trash_inside_checkout_before_any_effect() {
     );
     assert!(!root.join("inside-data").exists());
 }
+
+#[test]
+fn local_discard_undo_preserves_replaced_desktop_trash_directory() {
+    const NAME: &str = "local_discard_undo_preserves_replaced_desktop_trash_directory";
+    if isolated(NAME, false) {
+        return;
+    }
+    let root = setup();
+    fs::write(root.join("new"), b"original untracked").unwrap();
+    let service = service(&root);
+    let result = service
+        .discard_recoverable(
+            &request(&root, &[], &["new"]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&result.outcome);
+    let files = trash().join("files");
+    let old = trash().join("retired-files");
+    fs::rename(&files, &old).unwrap();
+    fs::create_dir(&files).unwrap();
+    fs::set_permissions(&files, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(files.join("foreign"), b"foreign native entry").unwrap();
+    let undo = service
+        .undo_discard(&result.recovery, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        matches!(undo, MutationOutcome::NotApplied { .. }),
+        "{undo:?}"
+    );
+    assert!(!root.join("new").exists());
+    assert_eq!(
+        fs::read(files.join("foreign")).unwrap(),
+        b"foreign native entry"
+    );
+    assert_eq!(fs::read_dir(&old).unwrap().count(), 1);
+    fs::remove_file(files.join("foreign")).unwrap();
+    fs::remove_dir(&files).unwrap();
+    fs::rename(&old, &files).unwrap();
+    applied(
+        &service
+            .undo_discard(&result.recovery, &CancellationToken::new())
+            .unwrap(),
+    );
+    assert_eq!(fs::read(root.join("new")).unwrap(), b"original untracked");
+}
