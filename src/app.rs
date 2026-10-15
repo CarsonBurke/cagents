@@ -13490,7 +13490,6 @@ impl Application for Cagents {
                 Message::ResumeConversation(_)
                 | Message::Repository(_)
                 | Message::ProjectUi(_)
-                | Message::GitUi(_)
                 | Message::SubmitWorktree => {
                     self.status = Some(TransientNotice::warning(
                         "Use Device files for remote files and Git operations",
