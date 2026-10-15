@@ -2431,7 +2431,7 @@ impl Adapter for Claude {
                         {
                             self.queued.push(message.preview.clone());
                         }
-                    } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
+                    } else if matches!(state, "started" | "completed" | "cancelled" | "discarded" | "refused") {
                         if state == "started" && self.submissions.contains_key(id) {
                             self.start_turn(&mut step);
                             self.status(true, "Claude is working", &mut step);
@@ -6137,7 +6137,7 @@ mod tests {
 
     #[test]
     fn cancelled_queued_input_never_enters_the_transcript() {
-        for state in ["cancelled", "discarded"] {
+        for state in ["cancelled", "discarded", "refused"] {
             let mut adapter = Claude {
                 ready: true,
                 busy: true,
