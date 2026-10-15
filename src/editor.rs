@@ -413,6 +413,18 @@ impl FileRootIdentity {
         if &named != self { return Err(FileIoError::Io("The editor worktree was moved or replaced. Reopen the file before saving.".into())); }
         Ok(&self._root)
     }
+    /// Worker-only proof for an explicit Locate/relocation. A replacement
+    /// clone is not the original editor root, even when its bytes match.
+    /// The caller must fence the result against the original document/context
+    /// and invalidate path-keyed caches before installing the new pathname.
+    pub(crate) fn rebind_same_directory(&self, worktree: &Path) -> Result<Self, FileIoError> {
+        let relocated = Self::of(std::sync::Arc::new(worktree_root(worktree)?))?;
+        if self.device != relocated.device || self.inode != relocated.inode {
+            return Err(FileIoError::Io("The located checkout is a different directory. The original buffer was kept; reopen a file in the new checkout before saving there.".into()));
+        }
+        Ok(relocated)
+    }
+
     pub(crate) fn of(root: std::sync::Arc<Root>) -> Result<Self, FileIoError> {
         use std::os::unix::fs::MetadataExt;
         let metadata = root.metadata().map_err(io_error)?;
@@ -1384,6 +1396,20 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn editor_root_relocation_requires_the_original_physical_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original"); let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let retained = FileRootIdentity::of(std::sync::Arc::new(worktree_root(&original).unwrap())).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        let rebound = retained.rebind_same_directory(&moved).unwrap();
+        assert!(rebound.validate_named(&moved).is_ok());
+        assert!(retained.validate_named(&moved).is_err(), "ordinary Save cannot perform an implicit relocation");
+        std::fs::create_dir(&original).unwrap();
+        assert!(retained.rebind_same_directory(&original).is_err(), "a replacement clone cannot acquire the old Undo root");
+    }
 
     #[test]
     fn saved_absence_loader_distinguishes_empty_recreated_files_and_retargeted_aliases() {
