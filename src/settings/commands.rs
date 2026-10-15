@@ -14,7 +14,15 @@ pub enum Operation {
 pub fn execute(path: &Path, operation: Operation) -> Result<Value, String> {
     if let Operation::Path { create } = operation {
         if create {
-            let settings=load_detailed(path).map_err(|e|e.to_string())?.settings;
+            let settings=if path.exists() {AppSettings::default()} else {
+                match load_detailed(path) {
+                    Ok(loaded)=>loaded.settings,
+                    // Another writer may create a file requiring repair after
+                    // our absence probe. Opening that file must remain possible.
+                    Err(_) if path.exists()=>AppSettings::default(),
+                    Err(error)=>return Err(error.to_string()),
+                }
+            };
             ensure_file(path, &settings).map_err(|e| e.to_string())?;
         }
         return Ok(json!({"path": path}));
@@ -125,6 +133,16 @@ mod tests {
         assert_eq!(settings.terminal_font_size,18.0);
         assert_eq!(settings.default_column_fraction,0.65);
         assert!(path.is_file());assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn settings_open_preserves_existing_files_that_need_manual_repair() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("settings.toml");
+        for bytes in [b"[unterminated".as_slice(),b"schema_version = 999999\nterminal_font_size = 18.0\n".as_slice()] {
+            std::fs::write(&path,bytes).unwrap();
+            execute(&path,Operation::Path{create:true}).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(),bytes);
+        }
     }
 
     #[test]
