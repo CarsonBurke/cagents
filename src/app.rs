@@ -10715,7 +10715,7 @@ impl Cagents {
         coordinates: LspCoordinates,
     ) -> Task<Message> {
         let open_path = match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.workspace_edit_source(),
+            Some(CardRuntime::Repository(runtime)) if runtime.workspace_edit_source().is_some() => runtime.source_tab_path(),
             _ => None,
         };
         if open_path.as_ref() == Some(&path) {
