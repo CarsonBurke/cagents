@@ -4269,7 +4269,8 @@ mod tests {
         let mut activated = Vec::new();
         let opened = project_output_with_activation(&mut client, resolved, |repository| {
             activated.push(repository.to_path_buf());
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(activated, vec![metadata.clone()]);
         let listed = project_output(&mut client, ResolvedProject::List).unwrap();
         server.join().unwrap();
@@ -4497,18 +4498,31 @@ mod tests {
         .unwrap();
         let mut activated = Vec::new();
         let output = if real_private_activation {
-            let runtime = PathBuf::from(std::env::var_os("CAGENTS_TEST_PROJECT_ACTIVATION_CHILD").unwrap());
-            assert_eq!(std::env::var_os("XDG_RUNTIME_DIR"), Some(runtime.clone().into_os_string()));
-            std::fs::write(runtime.join("expected.json"), serde_json::to_vec(&expected).unwrap()).unwrap();
+            let runtime =
+                PathBuf::from(std::env::var_os("CAGENTS_TEST_PROJECT_ACTIVATION_CHILD").unwrap());
+            assert_eq!(
+                std::env::var_os("XDG_RUNTIME_DIR"),
+                Some(runtime.clone().into_os_string())
+            );
+            std::fs::write(
+                runtime.join("expected.json"),
+                serde_json::to_vec(&expected).unwrap(),
+            )
+            .unwrap();
             project_output(&mut client, resolved).unwrap()
         } else {
             project_output_with_activation(&mut client, resolved, |repository| {
                 activated.push(repository.to_path_buf());
-            }).unwrap()
+            })
+            .unwrap()
         };
         server.join().unwrap();
         if !real_private_activation {
-            assert_eq!(activated, vec![expected.clone()], "the fixture records selection without notifying any real window");
+            assert_eq!(
+                activated,
+                vec![expected.clone()],
+                "the fixture records selection without notifying any real window"
+            );
         }
         assert_eq!(output.command, "project.open");
         assert_eq!(output.data["project"]["ordinal"], json!(2));
@@ -4544,7 +4558,9 @@ mod tests {
         struct ChildGuard(std::process::Child);
         impl Drop for ChildGuard {
             fn drop(&mut self) {
-                if self.0.try_wait().ok().flatten().is_none() { let _ = self.0.kill(); }
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
                 let _ = self.0.wait();
             }
         }
@@ -4558,21 +4574,34 @@ mod tests {
             for listener in &listeners {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                        stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
                         let mut line = String::new();
-                        std::io::BufReader::new(&mut stream).take(4096).read_line(&mut line).unwrap();
-                        let encoded = line.strip_prefix("project ").expect("actual project activation frame").trim_end();
+                        std::io::BufReader::new(&mut stream)
+                            .take(4096)
+                            .read_line(&mut line)
+                            .unwrap();
+                        let encoded = line
+                            .strip_prefix("project ")
+                            .expect("actual project activation frame")
+                            .trim_end();
                         observed = Some(serde_json::from_str::<PathBuf>(encoded).unwrap());
                         writeln!(stream, "ok").unwrap();
-                    },
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {},
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(error) => panic!("private activation listener: {error}"),
                 }
             }
             if let Some(status) = child.0.try_wait().unwrap() {
                 assert!(status.success());
-                let expected: PathBuf = serde_json::from_slice(&std::fs::read(runtime.path().join("expected.json")).unwrap()).unwrap();
+                let expected: PathBuf = serde_json::from_slice(
+                    &std::fs::read(runtime.path().join("expected.json")).unwrap(),
+                )
+                .unwrap();
                 assert_eq!(observed, Some(expected));
                 return;
             }
