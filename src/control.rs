@@ -258,6 +258,9 @@ pub enum DaemonCommand {
     },
     /// Print this executable's wire protocol version without contacting a daemon.
     ProtocolVersion,
+    /// Retire a stale development executable only after the daemon proves idle.
+    #[command(hide = true)]
+    CleanupStaleDevelopment,
     /// Stop any development daemon without relying on its wire protocol.
     #[command(hide = true)]
     StopForRebuild {
@@ -2062,7 +2065,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::UpdateWorker { .. }
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
-                command: DaemonCommand::ProtocolVersion | DaemonCommand::StopForRebuild { .. }
+                command: DaemonCommand::ProtocolVersion | DaemonCommand::StopForRebuild { .. } | DaemonCommand::CleanupStaleDevelopment
             }
     )
 }
@@ -2678,6 +2681,15 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
                     archive.display()
                 ),
+            })
+        }
+        DaemonCommand::CleanupStaleDevelopment => {
+            let stopped = crate::daemon::cleanup_stale_development_daemon()
+                .map_err(|error| AppError::new("daemon_process", error))?;
+            Ok(CommandOutput {
+                command: "daemon.cleanup_stale_development",
+                data: json!({ "stopped": stopped }),
+                human: if stopped { "Stopped an unused development daemon whose executable was removed".into() } else { String::new() },
             })
         }
         DaemonCommand::StopForRebuild {

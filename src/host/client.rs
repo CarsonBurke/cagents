@@ -1071,11 +1071,13 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             handle.shutdown().map_err(send_error)?;
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .close_terminal_attention(terminal_id, Some(&handle));
+            super::chat::close_for_terminal(host, terminal_id)?;
+            let retired = host.lock().unwrap_or_else(|p| p.into_inner())
+                .retire_terminal_if_current(terminal_id, &handle);
+            drop(retired);
+            crate::daemon::wake();
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ReleaseCompletedTerminal {
@@ -1146,9 +1148,12 @@ pub(super) fn process_request(
             if let Some(handle) = &handle {
                 handle.shutdown().map_err(send_error)?;
             }
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .close_terminal_attention(session.id, handle.as_ref());
+            let retired = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                handle.as_ref().and_then(|handle| state.retire_terminal_if_current(session.id, handle))
+            };
+            drop(retired); // Drop holder ownership outside the global host lock.
+            crate::daemon::wake();
             Ok((
                 ServerResponse::TerminalCloseChecked {
                     terminal_id: session.id,
@@ -1165,13 +1170,14 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
-                host.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .close_terminal_attention(terminal_id, Some(&handle));
                 super::chat::close_for_terminal(host, terminal_id)?;
+                let retired = host.lock().unwrap_or_else(|p| p.into_inner())
+                    .retire_terminal_if_current(terminal_id, &handle);
+                drop(retired);
+                crate::daemon::wake();
             }
             Ok((
                 ServerResponse::TerminalCloseChecked {

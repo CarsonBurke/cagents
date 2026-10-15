@@ -129,6 +129,14 @@ else
         --features development,integrated-browser --bin cagents-ui
 fi
 
+# The daemon itself proves emptiness before honoring this pidfd-bound request.
+# Unsupported older daemons and daemons hosting work are left running.
+if stale_cleanup=$(run_cli daemon cleanup-stale-development); then
+    [ -z "$stale_cleanup" ] || printf '%s\n' "$stale_cleanup" >&2
+else
+    printf '%s\n' 'Could not inspect stale development daemon; preserving it.' >&2
+fi
+
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
 if [ "$fresh_daemon" = true ]; then

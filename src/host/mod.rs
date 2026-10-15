@@ -6,6 +6,7 @@ mod client;
 mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;
+mod lifecycle;
 mod model;
 mod notifications;
 mod service;
@@ -292,6 +293,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
     let mut clients = Vec::new();
     let mut runtime_error = None;
+    let mut lifecycle = lifecycle::Lifecycle::new();
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
@@ -313,6 +315,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             break;
         }
 
+        let deadline = lifecycle.maintain(&host, client_capacity.active.load(Ordering::Acquire) != 0);
         let fatal = match listener.accept() {
             Ok((stream, _address)) => {
                 match daemon::peer_uid(&stream) {
@@ -350,10 +353,10 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 None
             }
             // Nothing is pending. Park until a peer connects, a client thread
-            // exits, or a signal arrives; an idle daemon blocks here indefinitely
-            // instead of waking on a timer.
+            // exits, a signal arrives, or the one pending lifecycle deadline
+            // becomes due. Active/production daemons have no idle timer.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                daemon::wait_for_activity(&listener).err()
+                daemon::wait_for_activity_until(&listener, deadline).err()
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => None,
             Err(error) => Some(error),
