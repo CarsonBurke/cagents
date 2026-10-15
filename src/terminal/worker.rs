@@ -3087,29 +3087,53 @@ impl Worker {
     }
 
     fn interrupt_input(&mut self) {
-        let mut readiness = libc::pollfd { fd: self.writer.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
-        let writable = unsafe { libc::poll(&mut readiness, 1, 0) } > 0
-            && readiness.revents & libc::POLLOUT != 0;
-        let pending = !self.pending_input.is_empty() || !writable;
+        let key = self.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let encoded = match key {
+            Some(key) => match encode_key_input(&self.terminal, &mut self.key_encoder, key) {
+                Ok(encoded) => encoded,
+                Err(error) => { self.error("encode interrupt", error.to_string()); return; }
+            },
+            None => vec![3],
+        };
         self.pending_input.clear();
         while let Ok(command) = self.commands.try_recv() {
             if !is_pty_input(&command) { self.retained_commands.push_back(command); }
         }
-        if pending {
-            // Cancel bytes already accepted by the master as well as those
-            // still queued here. Otherwise the next shell prompt inherits
-            // the beginning of the canceled paste after the busy job exits.
-            let _ = unsafe { libc::tcflush(self.writer.as_raw_fd(), libc::TCOFLUSH) };
-            // TIOCSIG is authorized by this exact PTY master, targets its
-            // foreground group and bypasses a full slave input buffer.
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        // The master exposes its exact slave's line discipline. POLLOUT only
+        // describes the flip queue: even a writable master can have a full
+        // slave input buffer that strands a conventional interrupt byte.
+        let conventional_interrupt = unsafe { libc::tcgetattr(self.writer.as_raw_fd(), &mut attributes) } == 0
+            && attributes.c_lflag & libc::ISIG != 0
+            && encoded.len() == 1
+            && encoded[0] != 0
+            && encoded[0] == attributes.c_cc[libc::VINTR];
+        self.cancel_kernel_input();
+        if conventional_interrupt {
+            // TIOCSIG targets the foreground group bound to this exact PTY.
+            // Raw applications and extended key encodings retain their bytes.
             let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
             if result < 0 { self.error("interrupt terminal", std::io::Error::last_os_error().to_string()); }
         } else {
-            let key = self.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if let Some(key) = key { self.encode_key(key); }
-            else { self.write_pty(&[3], "interrupt terminal"); }
+            self.write_pty(&encoded, "interrupt terminal");
         }
-        self.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+
+    fn cancel_kernel_input(&self) {
+        // The peer ioctl opens this exact slave without a reusable path or a
+        // controlling-terminal change. Flushing TCIFLUSH on the master would
+        // discard child output; flushing the peer discards canceled input.
+        let peer = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCGPTPEER,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if peer < 0 {
+            self.error("cancel terminal input", std::io::Error::last_os_error().to_string());
+            return;
+        }
+        // SAFETY: the successful ioctl returned a fresh owned descriptor.
+        let peer = unsafe { OwnedFd::from_raw_fd(peer) };
+        if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
+            self.error("cancel terminal input", std::io::Error::last_os_error().to_string());
+        }
     }
 
     fn emit(&self, event: TerminalEvent) {
@@ -5680,35 +5704,55 @@ mod tests {
 
     #[test]
     fn interrupt_bypasses_kernel_only_input_backpressure() {
-        let (mut worker, _) = capture_worker_for(shell_session(
-            "stty -echo -icanon; trap 'exit 0' INT; echo ready; while :; do echo tick; sleep 0.05; done"
-        ).launch);
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
-            if let PtyMessage::Bytes(bytes) = &message && bytes.windows(5).any(|word| word == b"ready") {
+        for requested in [4096, 1024 * 1024] {
+            let (mut worker, _) = capture_worker_for(shell_session(
+                "stty -echo -icanon; trap 'exit 0' INT; echo ready; while :; do echo tick; sleep 0.05; done"
+            ).launch);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                if let PtyMessage::Bytes(bytes) = &message && bytes.windows(5).any(|word| word == b"ready") {
+                    worker.handle_pty_message(Some(message));
+                    break;
+                }
                 worker.handle_pty_message(Some(message));
-                break;
             }
-            worker.handle_pty_message(Some(message));
-        }
-        let mut accepted = 0;
-        while accepted < 1024 * 1024 {
-            match worker.writer.write(&[b'x'; 1024]) {
-                Ok(0) => break,
-                Ok(count) => accepted += count,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
-                Err(error) => panic!("fill PTY: {error}"),
+            let mut accepted = 0;
+            while accepted < requested {
+                match worker.writer.write(&[b'x'; 1024]) {
+                    Ok(0) => break,
+                    Ok(count) => accepted += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+                    Err(error) => panic!("fill PTY: {error}"),
+                }
             }
+            assert!(accepted > 0);
+            assert!(worker.pending_input.is_empty(), "all accepted bytes are already inside the kernel");
+            if requested == 4096 {
+                assert_eq!(accepted, requested);
+            } else {
+                assert!(accepted < requested);
+            }
+            worker.interrupt_input();
+            assert!(worker.child.exited_within(Duration::from_secs(3)).unwrap(), "Ctrl+C was trapped behind {accepted} kernel bytes");
+            worker.run();
         }
-        assert!(accepted > 0 && accepted < 1024 * 1024);
-        assert!(worker.pending_input.is_empty(), "all accepted bytes are already inside the kernel");
-        let mut ready = libc::pollfd { fd: worker.writer.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
-        assert_eq!(unsafe { libc::poll(&mut ready, 1, 0) }, 0);
-        worker.interrupt_input();
-        assert!(worker.child.exited_within(Duration::from_secs(3)).unwrap(), "Ctrl+C was trapped behind kernel-only input");
-        worker.run();
+    }
+
+    #[test]
+    fn raw_interrupt_flushes_canceled_paste_and_preserves_its_control_byte() {
+        let handle = TerminalHandle::spawn(shell_session(
+            "stty raw -echo; echo ready; sleep 0.2; od -An -tu1 -N1"
+        ), TerminalConfig::default(), |_| {}).unwrap();
+        wait_for_text(&handle, "ready");
+        handle.input(vec![b'x'; 4096]).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        handle.input(vec![3]).unwrap();
+        wait_for_text(&handle, "3");
+        assert!(!handle.snapshot().lines.iter().any(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect::<String>().contains("120")),
+            "the raw child consumed canceled paste data");
+        handle.shutdown().unwrap();
     }
 
     #[test]
