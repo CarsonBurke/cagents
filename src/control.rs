@@ -755,13 +755,7 @@ impl ControlClient {
             let envelope = self.read_envelope()?;
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
-                ServerMessage::WorktreesChanged { repository } => {
-                if !self.observed_model.iter().any(|update| matches!(update,
-                    WorkspaceUpdate::WorktreesChanged { repository: existing } if *existing == repository)) {
-                    self.observed_model.push_back(WorkspaceUpdate::WorktreesChanged { repository });
-                }
-            }
-            ServerMessage::NotificationsChanged => {
+                ServerMessage::NotificationsChanged => {
                     return Ok(crate::notifications::Update::Changed);
                 }
                 ServerMessage::NotificationActivated { target } => {
@@ -1563,6 +1557,12 @@ impl ControlClient {
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited { sequence, edit } => {
                 self.observed_model.push_back(WorkspaceUpdate::Edited { sequence, edit });
+            }
+            ServerMessage::WorktreesChanged { repository } => {
+                if !self.observed_model.iter().any(|update| matches!(update,
+                    WorkspaceUpdate::WorktreesChanged { repository: existing } if *existing == repository)) {
+                    self.observed_model.push_back(WorkspaceUpdate::WorktreesChanged { repository });
+                }
             }
             ServerMessage::NotificationsChanged => {
                 if !self

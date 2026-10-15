@@ -376,9 +376,8 @@ pub(super) fn process_request(
                             .unwrap_or_else(|p| p.into_inner())
                             .allow_automatic_worktree_cleanup(client_id, windows)
                     })
-                    .ok()
             }
-            Err(_) => None,
+            Err(error) => Err(error),
         };
         return Ok((
             ServerResponse::DeviceOperation {

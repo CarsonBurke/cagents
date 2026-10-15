@@ -281,7 +281,7 @@ mod branch_delete_tests {
         git(path, &["checkout", "-q", "main"]);
         let error =
             delete_branch_checked_at(path, "unmerged", true, Some(&first), &cancel).unwrap_err();
-        assert_eq!(error.kind, BranchDeleteFailureKind::Other);
+        assert_eq!(error.kind, BranchDeleteFailureKind::AuthorityChanged);
         assert_eq!(git(path, &["rev-parse", "refs/heads/unmerged"]), latest);
         git(
             path,
