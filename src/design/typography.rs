@@ -299,6 +299,7 @@ mod settings_typography_tests {
                 widget::context_menu(widget::Space::new().width(300.0).height(100.0), Some(items))
                     .into();
             let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().diff(&mut tree);
             let node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
