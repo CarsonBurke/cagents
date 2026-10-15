@@ -1,5 +1,5 @@
 //! Admission for the published registry format. This module owns no runtime
-//! authority and does not extend the schema: the supported format remains 12.
+//! authority. Each published format is admitted before its migrations run.
 //!
 //! Admission serializes cooperating SQLite connections to the existing file.
 //! The read transaction is not a physical identity proof for a separately
@@ -236,7 +236,9 @@ fn published_layouts() -> Result<&'static (Layout, Layout), String> {
 }
 fn require_layout(db: &Connection) -> Result<(), String> {
     if inspect(db)?.objects != published_layouts()?.0 {
-        return Err("workspace registry layout does not match published schema 12".into());
+        return Err(format!(
+            "workspace registry layout does not match published schema {SCHEMA_VERSION}"
+        ));
     }
     Ok(())
 }
@@ -244,7 +246,9 @@ fn require_open_layout(db: &Connection) -> Result<(), String> {
     let actual = inspect(db)?.objects;
     let (complete, legacy_kind) = published_layouts()?;
     if &actual != complete && &actual != legacy_kind {
-        return Err("workspace registry layout does not match published schema 12".into());
+        return Err(format!(
+            "workspace registry layout does not match published schema {SCHEMA_VERSION}"
+        ));
     }
     Ok(())
 }
@@ -455,7 +459,7 @@ mod tests {
 
     #[test]
     fn every_published_version_preserves_nonempty_model_identity_and_ordinals() {
-        for version in 0..=12 {
+        for version in 0..=SCHEMA_VERSION {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite3");
             let (identity, channel) = legacy(&path, version);
@@ -604,7 +608,7 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12] {
+        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
@@ -634,7 +638,8 @@ mod tests {
         let delete = dir.path().join("future-delete.sqlite3");
         legacy(&delete, 12);
         let db = Connection::open(&delete).unwrap();
-        db.pragma_update(None, "user_version", 13).unwrap();
+        db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         drop(db);
         std::fs::set_permissions(&delete, std::fs::Permissions::from_mode(0o640)).unwrap();
         let before = bytes(&delete);
@@ -649,7 +654,7 @@ mod tests {
         let writer = connect(&path, false).unwrap();
         writer
             .execute_batch(
-                "PRAGMA user_version=13; INSERT INTO projects VALUES('/future','Future',1,'git');",
+                "PRAGMA user_version=14; INSERT INTO projects VALUES('/future','Future',1,'git');",
             )
             .unwrap();
         drop(registry);
@@ -666,7 +671,7 @@ mod tests {
     fn authoritative_writer_rejects_concurrent_header_and_layout_changes() {
         let _clear = Clear;
         for change in [
-            "PRAGMA user_version=13;",
+            "PRAGMA user_version=14;",
             "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;",
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -714,7 +719,7 @@ mod tests {
                     .busy_timeout(Duration::ZERO)
                     .map_err(|e| e.to_string())?;
                 let error = writer
-                    .execute_batch("PRAGMA user_version=13;")
+                    .execute_batch("PRAGMA user_version=14;")
                     .expect_err("future writer must remain excluded after COMMIT");
                 assert!(
                     matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),
@@ -741,7 +746,9 @@ mod tests {
         );
         // Exclusive mode was released after configuration, not held forever.
         let writer = connect(&path, false).unwrap();
-        writer.pragma_update(None, "user_version", 13).unwrap();
+        writer
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         assert!(
             registry
                 .apply(&ModelEdit::OpenProject {
@@ -765,7 +772,7 @@ mod tests {
         hook(move |stage| {
             if stage == "committed" {
                 let writer = connect(&target, false)?;
-                writer.execute_batch("PRAGMA user_version=13; INSERT INTO projects VALUES('/future','Future',1,'git');").map_err(|e|e.to_string())?;
+                writer.execute_batch("PRAGMA user_version=14; INSERT INTO projects VALUES('/future','Future',1,'git');").map_err(|e|e.to_string())?;
                 drop(writer);
                 *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
             }
@@ -793,7 +800,7 @@ mod tests {
     #[test]
     fn retained_outer_edits_refuse_future_or_unknown_layout_before_dml() {
         for change in [
-            "PRAGMA user_version=13;",
+            "PRAGMA user_version=14;",
             "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;",
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -1099,7 +1106,7 @@ mod tests {
             0o700
         );
         let db = Connection::open(root.join("hot.sqlite3")).unwrap();
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(zeroblob(1048576)); PRAGMA user_version=13; PRAGMA cache_size=4; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE future_payload SET value=randomblob(1048576);").unwrap();
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(zeroblob(1048576)); PRAGMA user_version=14; PRAGMA cache_size=4; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE future_payload SET value=randomblob(1048576);").unwrap();
         assert!(root.join("hot.sqlite3-journal").is_file());
         // The bounded original-child executor owns this exact process and its
         // wait/cleanup. No numeric PID lookup or fixture killing Drop exists.
