@@ -766,6 +766,15 @@ impl Drop for HandleInner {
     }
 }
 
+/// Queue expiry has not attempted teardown and can be readmitted after a
+/// fresh host ownership/pin census. Unconfirmed teardown requires explicit retry.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompletedRelease {
+    Released,
+    Deferred,
+    Retained(String),
+}
+
 #[derive(Clone)]
 pub struct TerminalHandle {
     inner: Arc<HandleInner>,
@@ -1463,9 +1472,7 @@ impl TerminalHandle {
 
     /// The daemon keeps the exact listed record pending until this result
     /// proves cleanup. Queue refusal and failure leave its holder retryable.
-    pub(crate) fn release_completed_holder_async(
-        &self,
-    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+    pub(crate) fn release_completed_holder_async(&self) -> Result<std::sync::mpsc::Receiver<CompletedRelease>, String> {
         holder::release::completed(self)
     }
 
@@ -7247,28 +7254,12 @@ mod tests {
         let retained = handle.inner.published.retained_holder.lock().unwrap();
         assert!(retained.is_some());
         let result = handle.release_completed_holder_async().unwrap();
-        assert!(
-            result
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .is_err()
-        );
-        assert!(
-            retained.is_some(),
-            "contention cannot discard exact cleanup ownership"
-        );
+        assert!(matches!(result.recv_timeout(Duration::from_secs(5)).unwrap(), CompletedRelease::Retained(_)));
+        assert!(retained.is_some(), "contention cannot discard exact cleanup ownership");
         drop(retained);
         let result = handle.release_completed_holder_async().unwrap();
-        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
-        assert!(
-            handle
-                .inner
-                .published
-                .retained_holder
-                .lock()
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), CompletedRelease::Released);
+        assert!(handle.inner.published.retained_holder.lock().unwrap().is_none());
     }
 
     #[test]

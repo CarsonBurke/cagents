@@ -68,6 +68,8 @@ pub(crate) use widget::accessibility_tests::Peer as TerminalTestPeer;
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]
+pub(crate) use worker::CompletedRelease;
+#[cfg(feature = "host")]
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]
 pub(crate) use worker::UpgradeSnapshot;
