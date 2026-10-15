@@ -2223,7 +2223,7 @@ fn unix_millis() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WriterExit {
     Shutdown(crate::diagnostics::Event),
     Unavailable,
@@ -2507,7 +2507,7 @@ fn persistence_loop(
                     )
                 },
             };
-            crate::diagnostics::record(final_flush);
+            crate::diagnostics::record(final_flush.clone());
             return WriterExit::Shutdown(final_flush);
         }
     }

@@ -308,11 +308,15 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         let Some(recovered) = crate::runtime_state::begin_panic_report() else {
             return;
         };
-        crate::diagnostics::record_panic(recovered);
+        let subsystem = std::thread::current().name() == Some("accesskit-unix");
+        crate::diagnostics::record_panic(recovered || subsystem, panic.location());
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {
             previous(panic);
+            // Local capture is explicit opt-in. Force a backtrace even when
+            // RUST_BACKTRACE was absent before this thread's first panic.
+            eprintln!("cagents panic backtrace:\n{}", std::backtrace::Backtrace::force_capture());
         }
         crate::runtime_state::finish_panic_report();
     }));

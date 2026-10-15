@@ -23,7 +23,7 @@ use iced::advanced::{
     Clipboard, Layout, Shell, Widget,
     clipboard::DndDestinationRectangles,
     layout, mouse, overlay, renderer,
-    widget::{Id, Operation, Tree, tree},
+    widget::{Operation, Tree, tree},
 };
 use iced::{Event, Rectangle, Size, Vector};
 use std::cell::RefCell;
@@ -297,18 +297,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
         element.a11y_nodes(layout, child, cursor)
     }
 
-    fn id(&self) -> Option<Id> {
-        match &self.source {
-            Source::Fresh(element) => element.as_widget().id(),
-            Source::Kept { .. } => None,
-        }
-    }
-
-    fn set_id(&mut self, id: Id) {
-        if let Source::Fresh(element) = &mut self.source {
-            element.as_widget_mut().set_id(id);
-        }
-    }
+    // The child owns its named identity. Forwarding it here gives the Memo
+    // wrapper and its child the same name; named-state extraction then replaces
+    // Memo with a stateless container's State::None on the next frame.
 
     fn drag_destinations(
         &self,
@@ -439,6 +430,27 @@ mod tests {
             }
             self.cache = ui.into_cache();
             self.layouts.get() - before
+        }
+    }
+
+    #[test]
+    fn named_fresh_turn_can_mount_and_diff_repeatedly() {
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = Cache::new();
+        for fresh_frame in [true, true, false, true, false, false, true] {
+            let build = || -> Element<'static, Message> {
+                widget::container(widget::text("New worktree exchange"))
+                    .id(iced::widget::Id::new("chat-turn-regression"))
+                    .into()
+            };
+            let element = if fresh_frame { fresh(build()) } else { kept(1, build) };
+            // This follows the native runtime's take_all_named -> diff ->
+            // restore -> layout sequence. The old forwarded ID panicked on
+            // frame two when a stateless child displaced the wrapper's Memo.
+            let ui = UserInterface::build(
+                element, Size::new(400.0, 100.0), cache, &mut renderer,
+            );
+            cache = ui.into_cache();
         }
     }
 

@@ -69,7 +69,7 @@ pub enum Failure {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Startup,
@@ -80,6 +80,12 @@ pub enum Event {
     },
     Panic {
         recovered: bool,
+    },
+    /// Compiler-provided source location, without the panic payload.
+    PanicLocation {
+        file: String,
+        line: u32,
+        column: u32,
     },
     PersistenceStarted,
     PersistenceFailed {
@@ -207,7 +213,7 @@ pub fn record(event: Event) {
 
 /// A panic may interrupt a thread holding the ordinary writer mutex. Never
 /// block that thread on its own lock or recursively format its payload.
-pub fn record_panic(recovered: bool) {
+pub fn record_panic(recovered: bool, location: Option<&std::panic::Location<'_>>) {
     let Some(sink) = SINK.get() else {
         return;
     };
@@ -215,7 +221,29 @@ pub fn record_panic(recovered: bool) {
         return;
     }
     match sink.try_lock() {
-        Ok(mut sink) => append_global(&mut sink, Event::Panic { recovered }),
+        Ok(mut sink) => {
+            append_global(&mut sink, Event::Panic { recovered });
+            if let Some(location) = location {
+                // Source names originate in compiler metadata. Drop absolute
+                // build directories: diagnostics need a source location, never
+                // the builder's home or checkout path.
+                let path = Path::new(location.file());
+                let file = if path.is_absolute() {
+                    let components = path.components().collect::<Vec<_>>();
+                    let relative = components.iter().position(|part| part.as_os_str() == "vendor")
+                        .or_else(|| components.iter().position(|part| part.as_os_str() == "src"));
+                    relative.map(|index| components[index..].iter().collect::<PathBuf>())
+                        .unwrap_or_else(|| path.file_name().unwrap_or_default().into())
+                } else {
+                    path.to_owned()
+                };
+                append_global(&mut sink, Event::PanicLocation {
+                    file: file.to_string_lossy().into_owned(),
+                    line: location.line(),
+                    column: location.column(),
+                });
+            }
+        },
         Err(std::sync::TryLockError::WouldBlock) => skipped(1),
         Err(std::sync::TryLockError::Poisoned(_)) => fail_sink(),
     }
@@ -545,7 +573,7 @@ impl ProductReport {
             let mut settings_failed = false;
             let mut unrecovered_failure = false;
             for record in records.iter().filter(|record| record.run == last.run) {
-                match record.event {
+                match record.event.clone() {
                     Event::Startup => {
                         started = true;
                         observed.lifecycle = Lifecycle::Started;
@@ -1151,6 +1179,11 @@ mod process_tests {
         };
         // The child has a private XDG state root; HOME/authority are untouched.
         crate::instance::install_panic_hook("cagents-ui");
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("thread-panic")) {
+            let child = std::thread::spawn(|| panic!("LOCAL_THREAD_PANIC"));
+            assert!(child.join().is_err());
+            return;
+        }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("panic")) {
             panic!(
                 "TOKEN=secret prompt --api-key private https://user:password@example.test/?token=value#fragment \x1b[31m"
@@ -1322,6 +1355,21 @@ mod process_tests {
         );
     }
     #[test]
+    fn local_debug_forces_backtraces_on_main_and_worker_threads() {
+        for mode in ["panic", "thread-panic"] {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "diagnostics::process_tests::subprocess_fixture", "--nocapture"])
+                .env(TEST_STATE, root.path()).env(TEST_MODE, mode)
+                .env("XDG_STATE_HOME", root.path()).env("CAGENTS_LOCAL_DEBUG", "1")
+                .env_remove("RUST_BACKTRACE").output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("cagents panic backtrace:"), "{mode}: {stderr}");
+            assert!(stderr.contains("subprocess_fixture"), "{mode}: {stderr}");
+        }
+    }
+
+    #[test]
     fn real_panic_hook_retains_only_typed_evidence_after_exit() {
         let root = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1347,6 +1395,10 @@ mod process_tests {
         let last = report.products[0].last_observed.as_ref().unwrap();
         assert_eq!(last.lifecycle, Lifecycle::Panicked);
         assert_eq!(last.clean_shutdown, Some(false));
+        assert!(report.products[0].records.iter().any(|record| matches!(
+            &record.event, Event::PanicLocation { file, line, .. }
+                if file.ends_with("src/diagnostics.rs") && *line > 0
+        )));
         let evidence = serde_json::to_string(&report).unwrap();
         for forbidden in [
             "TOKEN",
