@@ -259,6 +259,14 @@ impl State {
             Some(Arc::new(chat::Item {id:key.source_id.clone(),role:metadata.role,at:metadata.at,started_at:metadata.started_at,
                 content:ItemContent::Changes {status:metadata.status,changes:Vec::new()}}))
         }).collect();
+        // Offline rehydration sees the logical empty root, not the original
+        // transport row. Give that displayed root its own explicit metadata
+        // alias without claiming its empty body contains complete file patches.
+        for (key,entry) in &self.entries {
+            projected.changes_parts.retain(|part|part.source!=*key || part.item_id!=key.source_id);
+            projected.changes_parts.push(chat::cache::changes::Part {item_id:key.source_id.clone(),source:key.clone(),
+                epoch:entry.part.epoch,metadata:entry.part.metadata.clone(),files:Vec::new(),replacement:true});
+        }
         let projected=Arc::new(projected);self.projected=Some(projected.clone());projected
     }
     pub(super) fn toggle_file(&mut self,item:&str,index:usize) {
@@ -314,6 +322,7 @@ impl State {
     }
     pub(super) fn request_copy_all(&mut self,item:&str)->bool {
         let Some(key)=self.aliases.get(item) else {return false;};let Some(entry)=self.entries.get_mut(key) else {return false;};
+        if entry.part.metadata.unavailable.is_some() || entry.pages.values().any(|page|page.omitted_files>0) {return false;}
         entry.copy_all=true;entry.demand(true,false);entry.revision=attempt();true
     }
     pub(super) fn take_copy_all(&mut self)->Option<(String,Vec<Arc<str>>)> {
@@ -352,7 +361,7 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
         rows.push(design::caption(format!("Some original file metadata is unavailable: {reason:?}")).into());
     }
     rows.push(widget::button::text(if entry.copy_all {"Loading all patches for copy…"} else {"Copy all patches"})
-        .on_press_maybe((!entry.copy_all).then(||action(Action::CopyAllChangePatches(target,item.into())))).into());
+        .on_press_maybe((!entry.copy_all && entry.part.metadata.unavailable.is_none() && entry.pages.values().all(|page|page.omitted_files==0)).then(||action(Action::CopyAllChangePatches(target,item.into())))).into());
     if entry.pages.is_empty() && entry.page_errors.is_empty() {rows.push(design::caption("Loading original file list…").into());}
     for error in entry.page_errors.values() {
         rows.push(widget::row::with_children(vec![design::caption(error.clone()).width(Length::Fill).into(),
@@ -428,6 +437,10 @@ pub(super) fn complete_copy(runtime:&mut Runtime,item:&str,epoch:chat::cache::So
     match result {
         Ok(ready)=>if let Some(output)=ready.0.lock().unwrap_or_else(|error|error.into_inner()).take() {
             runtime.copied=Some((item.into(),Instant::now()));
+            let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
+            for (key,entry) in &mut runtime.logical_changes.entries {
+                entry.demand(runtime.expanded.contains(&key.source_id),find);
+            }
             return iced::clipboard::write(output.text).map(cosmic::Action::App);
         },
         Err(error)=>if let Some(key)=runtime.logical_changes.aliases.get(item)
@@ -597,4 +610,97 @@ mod tests {
         let manifest=fixture("patch");let file=manifest.files[0].clone();
         future_send(read_patch(manifest,file,|_|async {Err(chat::cache::SourceError::Changed)}));
     }
+    fn raw(page:&Manifest,visible_id:&str)->Arc<Snapshot> {
+        let fragment="@@";
+        let item=Arc::new(chat::Item {id:visible_id.into(),role:page.metadata.role,at:page.metadata.at,started_at:page.metadata.started_at,
+            content:ItemContent::Changes {status:page.metadata.status,changes:vec![FileChange {path:"bounded-path".into(),kind:ChangeKind::Updated,diff:fragment.into()}]}});
+        let part=chat::cache::changes::Part {item_id:visible_id.into(),source:page.source.clone(),epoch:page.epoch,
+            metadata:page.metadata.clone(),files:vec![chat::cache::changes::FilePart {display_slot:0,file_index:0,start:0,end:fragment.len(),source_len:page.files[0].source_len}],replacement:false};
+        Arc::new(Snapshot {generation:1,changes_revision:1,items:vec![item],changes_parts:vec![part],..Snapshot::default()})
+    }
+    fn open(page:&Arc<Manifest>,visible:&str)->(State,Arc<Snapshot>,HashSet<String>) {
+        let raw=raw(page,visible);let expanded=HashSet::from([page.source.source_id.clone()]);let mut state=State::default();
+        state.project(raw.clone(),None,&expanded,false);let request=state.entries[&page.source].requested[&0];
+        assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
+        state.project(raw.clone(),None,&expanded,false);(state,raw,expanded)
+    }
+    async fn ready(page:&Arc<Manifest>,text:&str)->PatchReady {
+        let file=page.files[0].clone();let returned=file.clone();let text=text.to_owned();
+        let pending=read_patch(page.clone(),file,move |query|std::future::ready(Ok(self::page(query,&text,returned.clone())))).await.unwrap();
+        let record=chat::source_owners::ResidentPatch {source:page.source.clone(),epoch:page.epoch,file:page.files[0].clone()};
+        assert_eq!(chat::source_owners::admit_patch(&pending.text,&record,None),chat::source_owners::Admission::Ready);
+        PatchReady(Arc::new(Mutex::new(Some(pending))))
+    }
+    #[test]
+    fn projected_changes_are_metadata_only_and_collapsed_sources_make_no_reads() {
+        let page=fixture("original whole patch");let raw=raw(&page,"opaque-other-native-part-suffix");let mut state=State::default();
+        let projected=state.project(raw.clone(),None,&HashSet::new(),false);
+        assert_eq!(projected.items.len(),1);assert_eq!(projected.items[0].id,page.source.source_id);
+        assert!(matches!(&projected.items[0].content,ItemContent::Changes {changes,..} if changes.is_empty()));
+        assert!(state.entries[&page.source].requested.is_empty());assert!(state.entries[&page.source].patch_requests.is_empty());
+        assert_eq!(state.root("opaque-other-native-part-suffix"),Some(page.source.source_id.as_str()));
+        assert_eq!(state.metadata(&page.source.source_id).unwrap().total_bytes,"original whole patch".len());
+        assert!(!state.complete_for_find());
+    }
+    #[tokio::test]
+    async fn complete_patch_installs_exact_source_then_collapse_releases_actual_weak_owner() {
+        let text="@@ -1 +1 @@\n-before\n+after\nLAST_PATCH_ANCHOR";let page=fixture(text);
+        let (mut state,raw,expanded)=open(&page,"only-late-part-visible");let request=state.entries[&page.source].patch_requests[&0];
+        let prepared=ready(&page,text).await;let weak=Arc::downgrade(&prepared.0.lock().unwrap().as_ref().unwrap().text);
+        assert!(state.complete_patch(&page.source,0,request,Ok(prepared)));
+        let loaded=state.copy_patch(&page.source.source_id,0).unwrap();assert_eq!(loaded.as_ref(),text);
+        assert!(Arc::ptr_eq(&loaded,&state.entries[&page.source].current(0).unwrap().view.text));
+        assert!(state.complete_for_find());assert_eq!(state.find_patches().len(),1);drop(loaded);
+        state.toggle_file(&page.source.source_id,0);state.project(raw,None,&expanded,false);
+        assert!(state.copy_patch(&page.source.source_id,0).is_none());assert!(weak.upgrade().is_none());
+    }
+    #[tokio::test]
+    async fn stale_store_nonce_and_cleared_context_cannot_install_pending_patch_or_retain_it() {
+        let text="exact original patch";let page=fixture(text);let (mut state,_,expanded)=open(&page,"part");
+        let request=state.entries[&page.source].patch_requests[&0];let pending=ready(&page,text).await;
+        let weak=Arc::downgrade(&pending.0.lock().unwrap().as_ref().unwrap().text);
+        let mut replacement=(*page).clone();replacement.epoch.incarnation=uuid::Uuid::from_u128(999);
+        state.project(raw(&replacement,"part"),None,&expanded,false);
+        assert!(!state.complete_patch(&page.source,0,request,Ok(pending)));assert!(weak.upgrade().is_none());
+        let new_request=state.entries[&page.source].requested[&0];state.clear();
+        assert!(!state.complete_manifest(&page.source,0,new_request,Ok(page)));
+        assert!(state.entries.is_empty());assert!(state.capture().patches.is_empty());
+    }
+    #[test]
+    fn unselected_children_never_demand_patch_bodies_and_selection_retires_parent_owners() {
+        let page=fixture("original parent patch");let parent=raw(&page,"parent-part");let mut all=(*parent).clone();
+        for index in 0..30 {
+            let id=format!("child-{index}");let mut child_page=(*page).clone();child_page.source.agent_id=Some(id.clone());
+            let child=raw(&child_page,&format!("child-part-{index}"));all.changes_parts.extend(child.changes_parts.clone());
+            all.subagents.push(chat::Subagent {id,kind:String::new(),description:String::new(),status:ToolStatus::Succeeded,
+                model:None,waiting:false,detail:String::new(),background:true,items:child.items.clone()});
+        }
+        let all=Arc::new(all);let expanded=HashSet::from([page.source.source_id.clone()]);let mut state=State::default();
+        state.project(all.clone(),None,&expanded,true);assert_eq!(state.entries.len(),1);assert!(state.entries.keys().all(|key|key.agent_id.is_none()));
+        state.project(all,Some("child-17"),&expanded,true);assert_eq!(state.entries.len(),1);
+        assert!(state.entries.keys().all(|key|key.agent_id.as_deref()==Some("child-17")));
+    }
+    #[test]
+    fn manifest_omission_stays_explicit_and_never_claims_complete_find() {
+        let page=fixture("original patch");let raw=raw(&page,"part");let mut state=State::default();let expanded=HashSet::from([page.source.source_id.clone()]);
+        state.project(raw,None,&expanded,true);let request=state.entries[&page.source].requested[&0];
+        let mut omitted=(*page).clone();omitted.files.clear();omitted.omitted_files=1;omitted.metadata.unavailable=Some(chat::cache::changes::Unavailable::IncompleteIndex);
+        assert!(state.complete_manifest(&page.source,0,request,Ok(Arc::new(omitted))));
+        assert!(!state.complete_for_find());assert!(state.find_patches().is_empty());assert_eq!(state.entries[&page.source].pages[&0].omitted_files,1);
+    }
+    #[tokio::test]
+    async fn offline_capture_keeps_exact_patch_provenance_and_restores_only_admitted_decoded_owners() {
+        let text="@@ -1 +1 @@\n-before\n+after\nEND";let page=fixture(text);let (mut state,raw,expanded)=open(&page,"part");
+        let request=state.entries[&page.source].patch_requests[&0];assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let captured=state.capture();assert_eq!(captured.manifests.len(),1);assert_eq!(captured.patches.len(),1);
+        let weak=Arc::downgrade(&captured.patches[0].0);let mut restored=State::default();restored.project(raw.clone(),None,&expanded,false);
+        assert!(restored.restore(captured.clone()).is_ok());assert_eq!(restored.retained_bytes(),text.len());
+        let mut forged=captured.clone();forged.patches[0].1.epoch.incarnation=uuid::Uuid::from_u128(888);
+        assert!(restored.restore(forged).is_err());
+        let mut uncharged=captured.clone();uncharged.patches[0].0=Arc::from(text);
+        assert!(restored.restore(uncharged).is_err(),"equal bytes do not prove a decoded lease");
+        drop(captured);state.clear();assert!(weak.upgrade().is_some(),"actual restored owner remains charged");
+        restored.clear();assert!(weak.upgrade().is_none());
+    }
+
 }
