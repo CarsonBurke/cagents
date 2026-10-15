@@ -61,14 +61,27 @@ impl RecoveryContext {
 
 /// Reserve one bounded recovery payload before touching the filesystem.
 /// Producers must retain no more than MAX_RECOVERY_DESCRIPTORS descriptors.
-pub(crate) struct RecoverySlot { budget: Arc<Budget>, context: Option<RecoveryContext> }
+pub(crate) struct RecoverySlot {
+    budget: Arc<Budget>,
+    context: Option<RecoveryContext>,
+    // NO-FD, no-I/O Drop bookkeeping for the exact domain creation admission.
+    // Native endpoint/root/lease ownership remains in the charged context.
+    creation_guard: Option<Arc<dyn Send + Sync>>,
+}
 impl RecoverySlot {
     pub(crate) fn reserve() -> Result<Self, String> { Self::from_budget(budget()) }
     fn from_budget(budget: Arc<Budget>) -> Result<Self, String> {
         budget.used.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |used| (used < budget.limit).then_some(used + 1))
             .map_err(|_| "Recovery capacity is exhausted. Resolve an earlier recovery before changing files.".to_owned())?;
-        Ok(Self { budget, context: None })
+        Ok(Self { budget, context: None, creation_guard: None })
+    }
+    pub(crate) fn with_creation_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
+        // Only fresh pre-effect slots enter this constructor. The same guard
+        // then travels through the factory, producer and recovery authority.
+        debug_assert!(self.creation_guard.is_none());
+        self.creation_guard = Some(guard);
+        self
     }
     pub(crate) fn retain(self, description: String, retry: impl FnMut() -> Result<(), String> + Send + 'static) -> RecoveryAuthority {
         RecoveryAuthority(Arc::new(RecoveryInner {
@@ -77,7 +90,15 @@ impl RecoverySlot {
         }))
     }
 }
-impl Drop for RecoverySlot { fn drop(&mut self) { self.budget.used.fetch_sub(1, Ordering::AcqRel); } }
+impl Drop for RecoverySlot {
+    fn drop(&mut self) {
+        // Close this slot's charged context before releasing its creation turn;
+        // the guard itself performs only local counter bookkeeping, never IO.
+        drop(self.context.take());
+        drop(self.creation_guard.take());
+        self.budget.used.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 struct RecoveryWork {
     retry: Option<Box<dyn FnMut() -> Result<(), String> + Send>>,
@@ -158,6 +179,26 @@ mod tests {
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
         authority.retry().unwrap(); assert_eq!(attempts.load(Ordering::Acquire), 2);
     }
+    #[test]
+    fn same_slot_creation_guard_survives_failed_retry_until_producer_resolution() {
+        let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 });
+        let guard = Arc::new(()); let weak = Arc::downgrade(&guard);
+        let attempts = Arc::new(AtomicUsize::new(0)); let captured = attempts.clone();
+        let authority = RecoverySlot::from_budget(budget.clone()).unwrap()
+            .with_creation_guard(guard)
+            .retain("original admitted creation".into(), move || {
+                if captured.fetch_add(1, Ordering::AcqRel) == 0 { Err("retained operation is still unresolved".into()) }
+                else { Ok(()) }
+            });
+        assert!(weak.upgrade().is_some());
+        assert!(authority.retry().is_err());
+        assert!(weak.upgrade().is_some());
+        assert!(RecoverySlot::from_budget(budget.clone()).is_err());
+        authority.retry().unwrap();
+        assert!(authority.is_resolved()); assert!(weak.upgrade().is_none());
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn recovery_combine_flattens_and_deduplicates_repeated_overlapping_groups() {
         let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 2 });
