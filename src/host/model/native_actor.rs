@@ -116,6 +116,49 @@ mod tests {
     use crate::{agent::Provider, agent_execution::{Destination, Origin, ResultSummary, Spec, State, Submit, Surface, Target}, model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, ProjectKind, TerminalId}, workspace_model::ModelEdit};
 
     #[test]
+    fn native_actor_loss_is_atomic_exact_and_preserves_a_committed_terminal_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
+        registry.apply(&ModelEdit::OpenProject { repository: directory.path().into(), name: "Retained loss fixture".into(), kind: ProjectKind::Folder }).unwrap();
+        let accepted = registry.submit_agent(&Origin::User, &Submit {
+            name: None, destination: Destination::New(Spec {
+                provider: Provider::Claude, account: None, target: Target { repository: directory.path().into(), directory: directory.path().into(), placement: None },
+                surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None,
+            }), prompt: "One accepted prompt".into(), idempotency_key: "retained-loss".into(),
+        }, 1).unwrap();
+        let proof = HostSessionProof { host_session_id: HostSessionId::new("host"), boot_id: BootId::new("boot"), host_incarnation: HostIncarnation::new("daemon") };
+        let source = chat::Session { id: TerminalId::new(), launch: chat::Launch { provider: Provider::Claude,
+            recipe: LaunchRecipe { program: "claude".into(), arguments: Vec::new(), working_directory: directory.path().into(), environment: Default::default(), unset_environment: Default::default() },
+            session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+        }, proof: Some(proof.clone()), terminal: None, owned_codex_listener: None, native_continuity: Default::default() };
+        registry.bind_agent(accepted.agent.id, None, HostedSession::Chat(source.clone())).unwrap();
+        let owner = Record { version: 4, build: None, kind: Kind::Native, application: crate::instance::APPLICATION_ID.into(), boot: proof.boot_id,
+            terminal: source.id, holder: crate::daemon::holder_registry::Process { pid: 42, start: 7 }, root: crate::daemon::holder_registry::Process { pid: 43, start: 8 } };
+        let actor = Uuid::new_v4();
+        // The first run update must roll back if a later affected identity is
+        // absent. A partial loss commit must never authorize the helper ACK.
+        let unknown = RunId::new();
+        assert!(registry.commit_native_actor_loss(actor, &owner, &source, &[accepted.run.id, unknown], "Retained storage failed", 2).is_err());
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+        let mut different_account = source.clone();
+        different_account.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+        assert!(registry.commit_native_actor_loss(actor, &owner, &different_account, &[accepted.run.id], "Retained storage failed", 2).is_err());
+        let mut different_proof = source.clone();
+        different_proof.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("unrelated");
+        assert!(registry.commit_native_actor_loss(actor, &owner, &different_proof, &[accepted.run.id], "Retained storage failed", 2).is_err());
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+        assert!(registry.commit_native_actor_loss(actor, &owner, &source, &[accepted.run.id], "Retained storage failed", 3).unwrap());
+        let interrupted = registry.agent_run(accepted.run.id).unwrap();
+        assert_eq!(interrupted.state, State::Interrupted);
+        assert_eq!(interrupted.result.diagnostic.as_deref(), Some("Retained storage failed"));
+        assert!(!registry.commit_native_actor_loss(actor, &owner, &source, &[accepted.run.id], "Retried loss receipt", 4).unwrap());
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), interrupted);
+        let late_success = NativeActorEvent::Execution { run: accepted.run.id, update: Update::Finished { state: State::Succeeded, result: ResultSummary { text: "Unproven final result".into(), ..Default::default() } } };
+        assert!(!registry.commit_native_actor_event(actor, &owner, &source, 1, &late_success, 5).unwrap());
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), interrupted, "late success cannot overwrite the durable Interrupted decision");
+    }
+
+    #[test]
     fn native_actor_outcomes_commit_with_cursor_and_replay_never_changes_the_run_twice() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("registry.sqlite3");
