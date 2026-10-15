@@ -287,7 +287,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::repository::{ExistingPrCheckoutRequest, PrCheckoutTracking, ValidatedRefName};
-    use futures_util::StreamExt as _;
+    use cosmic::iced::futures::StreamExt as _;
 
     fn git(directory: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
