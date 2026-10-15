@@ -532,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn partial_change_multiple_presence_undos_restore_their_own_access_metadata() {
         use std::os::unix::fs::PermissionsExt;
-        for save_between_undos in [true, false] {
+        for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
             std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
@@ -550,13 +550,25 @@ mod tests {
             std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
             let task = runtime.request_save_inner(card, false, false);
-            finish_presence_save(&mut runtime, task).await;
-            drop(runtime.update(RepositoryAction::Undo { card }));
-            let task = runtime.request_save_inner(card, false, false);
-            finish_presence_save(&mut runtime, task).await;
-            assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic beta\n");
-            assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o644);
-            drop(runtime.update(RepositoryAction::Undo { card }));
+            if late_completion {
+                // The captured deletion belongs to B even after Undo has
+                // moved the current history back to A's absence identity.
+                drop(runtime.update(RepositoryAction::Undo { card }));
+                drop(runtime.update(RepositoryAction::Undo { card }));
+                finish_presence_save(&mut runtime, task).await;
+                let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+                assert_eq!(document.restorations.len(), 2);
+                assert_ne!(document.presence_id, document.saved_presence_id);
+                assert!(runtime.is_dirty());
+            } else {
+                finish_presence_save(&mut runtime, task).await;
+                drop(runtime.update(RepositoryAction::Undo { card }));
+                let task = runtime.request_save_inner(card, false, false);
+                finish_presence_save(&mut runtime, task).await;
+                assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic beta\n");
+                assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o644);
+                drop(runtime.update(RepositoryAction::Undo { card }));
+            }
             assert!(!runtime.desired_file_present());
             if save_between_undos {
                 let task = runtime.request_save_inner(card, false, false);
