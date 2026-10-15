@@ -182,7 +182,7 @@ pub enum SidebarDataState {
 pub struct SidebarModel {
     pub mode: SidebarMode,
     pub data_state: SidebarDataState,
-    pub external_editors: Vec<SidebarEditor>,
+    pub external_editors: SidebarEditors,
     /// Enables standalone editor file actions; other hosts keep editor-only menus.
     pub file_management: bool,
     pub projects: Vec<SidebarProject>,
@@ -253,7 +253,7 @@ impl SidebarModel {
             data_state: SidebarDataState::Ready,
             projects,
             source_control: None,
-            external_editors: Vec::new(),
+            external_editors: SidebarEditors::default(),
             file_management: false,
         }
     }
@@ -271,7 +271,7 @@ impl SidebarModel {
             data_state: SidebarDataState::Error(message.into()),
             projects: Vec::new(),
             source_control: None,
-            external_editors: Vec::new(),
+            external_editors: SidebarEditors::default(),
             file_management: false,
         }
     }
@@ -786,6 +786,57 @@ pub struct SidebarEditor {
     pub name: String,
     pub icon: String,
 }
+
+/// Immutable external-editor definitions shared by models, menus and panes.
+/// The scalar identity changes only when a new definition snapshot is created.
+#[derive(Debug, Clone)]
+pub struct SidebarEditors(Arc<SidebarEditorSnapshot>);
+#[derive(Debug, Clone)]
+struct SidebarEditorSnapshot {
+    generation: u64,
+    choices: Vec<SidebarEditor>,
+}
+impl SidebarEditors {
+    pub fn generation(&self) -> u64 { self.0.generation }
+    pub fn push(&mut self, editor: SidebarEditor) {
+        let snapshot = Arc::make_mut(&mut self.0);
+        snapshot.generation = next_editor_menu_generation();
+        snapshot.choices.push(editor);
+    }
+}
+fn next_editor_menu_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+impl From<Vec<SidebarEditor>> for SidebarEditors {
+    fn from(choices: Vec<SidebarEditor>) -> Self {
+        Self(Arc::new(SidebarEditorSnapshot { generation: next_editor_menu_generation(), choices }))
+    }
+}
+impl Default for SidebarEditors {
+    fn default() -> Self {
+        static EMPTY: LazyLock<SidebarEditors> = LazyLock::new(|| Vec::new().into());
+        EMPTY.clone()
+    }
+}
+fn default_sidebar_editors() -> &'static SidebarEditors {
+    static EMPTY: LazyLock<SidebarEditors> = LazyLock::new(Default::default);
+    &EMPTY
+}
+impl AsRef<[SidebarEditor]> for SidebarEditors {
+    fn as_ref(&self) -> &[SidebarEditor] { self }
+}
+impl FromIterator<SidebarEditor> for SidebarEditors {
+    fn from_iter<T: IntoIterator<Item = SidebarEditor>>(iter: T) -> Self { iter.into_iter().collect::<Vec<_>>().into() }
+}
+impl std::ops::Deref for SidebarEditors {
+    type Target = [SidebarEditor];
+    fn deref(&self) -> &Self::Target { &self.0.choices }
+}
+impl PartialEq for SidebarEditors {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) || self.0.choices == other.0.choices }
+}
+impl Eq for SidebarEditors {}
 
 /// Worktree presentation data derived from a worktree record and its optional
 /// status snapshot. A missing status is represented rather than guessed.
@@ -4644,7 +4695,7 @@ pub struct NavigationCache(
 /// number of navigation entities, even in a very large repository.
 struct NavigationSnapshot {
     projects: Vec<SidebarProject>,
-    editors: Vec<SidebarEditor>,
+    editors: SidebarEditors,
     rows: selection::Selection,
     query: String,
     filter: SidebarFilter,
@@ -6917,7 +6968,7 @@ fn worktree_view<'a>(
     selection: Option<SidebarSelection>,
     modal_open: bool,
     github_ready: bool,
-    editors: &'a [SidebarEditor],
+    editors: &'a SidebarEditors,
     agent_update: bool,
     activity: Option<crate::agent::ActivityState>,
     outcome: Option<&crate::agent::ActivityOutcome>,
@@ -7236,14 +7287,14 @@ fn context_controls<'a>(
     git: bool,
     has_branch: bool,
     github_ready: bool,
-    editors: &[SidebarEditor],
+    editors: &SidebarEditors,
     selection_rows: Option<Arc<[SelectionRow]>>,
     shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
-    let editors: Arc<[SidebarEditor]> = Arc::from(editors);
-    let identity = (project_id, worktree_id, MenuSelectionIdentity(selection_rows.clone()), Arc::clone(&editors));
+    let editors = editors.clone();
+    let identity = (project_id, worktree_id, MenuSelectionIdentity(selection_rows.clone()), editors.generation());
     let shortcuts = Arc::clone(shortcuts);
     if modal_open || selection_count.is_none() {
         return content.into();
@@ -7509,7 +7560,7 @@ fn file_context_controls<'a>(
     content: Element<'a, SidebarAction>,
     key: &ActiveWorktreeKey,
     row: &FileRow,
-    editors: &'a [SidebarEditor],
+    editors: &'a SidebarEditors,
     file_management: bool,
     blocked: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
@@ -7547,7 +7598,7 @@ fn file_context_controls<'a>(
         widget::menu::Item::Button(_, _, action) => Some(*action),
         _ => None,
     }), shortcuts, editors);
-    crate::interaction::context_menu_keyed(content, (row.chrome.menu_identity, editors.iter().map(|editor| editor.id.clone()).collect::<Vec<_>>()), widget::menu::items(&bindings, entries))
+    crate::interaction::context_menu_keyed(content, (row.chrome.menu_identity, editors.generation()), widget::menu::items(&bindings, entries))
 }
 
 fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
@@ -8335,7 +8386,7 @@ fn source_control_panel<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     worktree: Option<&'a SidebarWorktree>,
-    editors: &'a [SidebarEditor],
+    editors: &'a SidebarEditors,
     file_management: bool,
     modal_open: bool,
     panel: WorktreePanel,
@@ -8695,7 +8746,7 @@ fn files_section<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     modal_open: bool,
-    editors: &'a [SidebarEditor],
+    editors: &'a SidebarEditors,
     file_management: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
@@ -10946,7 +10997,7 @@ struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
     channels: Vec<&'a SidebarChannel>,
-    editors: &'a [SidebarEditor],
+    editors: &'a SidebarEditors,
     state: &'a SidebarState,
 }
 
@@ -12853,6 +12904,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn external_editor_snapshots_share_cached_identity_and_preserve_value_equality() {
+        let first: SidebarEditors = vec![SidebarEditor { id: "editor".into(), name: "Editor".into(), icon: "editor".into() }].into();
+        let mut changed = first.clone();
+        assert!(Arc::ptr_eq(&first.0, &changed.0));
+        assert_eq!(first.generation(), changed.generation());
+        changed.push(SidebarEditor { id: "other".into(), name: "Other".into(), icon: "editor".into() });
+        assert_ne!(first.generation(), changed.generation());
+        assert_eq!(first.len(), 1, "existing menu snapshots retain their definitions");
+        let same: SidebarEditors = first.to_vec().into();
+        assert_eq!(same, first, "model equality compares definitions, not menu cache identity");
+        assert_ne!(same.generation(), first.generation());
+    }
+
+    #[test]
     fn channel_menu_closes_when_equal_count_captured_selection_changes() {
         use cosmic::iced::{Event, Point, Rectangle, Vector, mouse,
             advanced::{Shell, clipboard}};
@@ -13422,7 +13487,7 @@ pub(crate) mod tests {
                     None,
                     false,
                     false,
-                    &[],
+                    default_sidebar_editors(),
                     false,
                     None,
                     None,
@@ -13485,7 +13550,7 @@ pub(crate) mod tests {
                 None,
                 false,
                 true,
-                &[],
+                default_sidebar_editors(),
                 false,
                 None,
                 None,
@@ -13963,7 +14028,7 @@ pub(crate) mod tests {
                 None,
                 false,
                 false,
-                &[],
+                default_sidebar_editors(),
                 false,
                 None,
                 None,
@@ -14811,7 +14876,8 @@ pub(crate) mod tests {
         }];
         for file_management in [false, true] {
             for blocked in [false, true] {
-                for editors in [&[][..], &configured_editors[..]] {
+                for choices in [&[][..], &configured_editors[..]] {
+                    let editors: SidebarEditors = choices.to_vec().into();
                     for row in &rows {
                         let content = cosmic::iced::widget::Space::new()
                             .width(240)
@@ -14821,7 +14887,7 @@ pub(crate) mod tests {
                             content,
                             &key,
                             row,
-                            editors,
+                            &editors,
                             file_management,
                             blocked,
                             default_menu_shortcuts(),
@@ -14942,7 +15008,7 @@ pub(crate) mod tests {
             true,
             true,
             false,
-            &[],
+            default_sidebar_editors(),
             Some(Arc::from([SelectionRow::Project(project_id(1))])),
             &Arc::new(crate::settings::KeyboardShortcuts::default()),
         );
@@ -16105,7 +16171,7 @@ pub(crate) mod tests {
                 true,
                 true,
                 true,
-                &[],
+                default_sidebar_editors(),
                 Some(Arc::from([SelectionRow::Worktree(project_id(1), WorktreeId::from_uuid(Uuid::from_u128(2)))])),
             &Arc::new(crate::settings::KeyboardShortcuts::default()),
         )
@@ -16223,7 +16289,7 @@ pub(crate) mod tests {
                         data_state: data_state.clone(),
                         projects,
                         source_control: None,
-                        external_editors: Vec::new(),
+                        external_editors: SidebarEditors::default(),
                         file_management: false,
                     };
                     for selection in &selections {
@@ -17082,7 +17148,7 @@ pub(crate) mod tests {
                 None,
                 false,
                 true,
-                &[],
+                default_sidebar_editors(),
                 false,
                 None,
                 None,

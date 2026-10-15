@@ -951,10 +951,12 @@ impl Cagents {
                 Ok(editors) => {
                     let choices: Vec<_> =
                         editors.iter().map(|editor| editor.choice.clone()).collect();
-                    self.sidebar_model.external_editors = choices.clone();
+                    if self.sidebar_model.external_editors.as_ref() != choices.as_slice() {
+                        self.sidebar_model.external_editors = choices.into();
+                    }
                     for runtime in self.cards.values_mut() {
                         if let CardRuntime::Repository(runtime) = runtime {
-                            runtime.set_external_editors(choices.clone());
+                            runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                         }
                     }
                     self.project_ui.editors = editors;

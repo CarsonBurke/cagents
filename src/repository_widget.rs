@@ -2108,7 +2108,7 @@ pub struct RepositoryRuntime {
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
     directory_only: bool,
     standalone: bool,
-    external_editors: Vec<crate::sidebar::SidebarEditor>,
+    external_editors: crate::sidebar::SidebarEditors,
     keyboard_shortcuts: Arc<crate::settings::KeyboardShortcuts>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
@@ -2340,7 +2340,7 @@ impl RepositoryRuntime {
             descriptor,
             worktree_protection: None,
             standalone: false,
-            external_editors: Vec::new(),
+            external_editors: crate::sidebar::SidebarEditors::default(),
             keyboard_shortcuts: Arc::new(crate::settings::KeyboardShortcuts::default()),
             generation: 0,
             file_list_generation: 0,
@@ -2440,8 +2440,9 @@ impl RepositoryRuntime {
         self.standalone = standalone;
     }
 
-    pub fn set_external_editors(&mut self, editors: Vec<crate::sidebar::SidebarEditor>) {
-        self.external_editors = editors;
+    pub fn set_external_editors(&mut self, editors: impl Into<crate::sidebar::SidebarEditors>) {
+        let editors = editors.into();
+        if self.external_editors != editors { self.external_editors = editors; }
     }
 
     pub fn set_keyboard_shortcuts(&mut self, shortcuts: Arc<crate::settings::KeyboardShortcuts>) {
@@ -8833,7 +8834,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             }).into_iter().collect();
             secondary.push(crate::interaction::context_menu_keyed(
                 button,
-                (card, runtime.generation, runtime.external_editors.iter().map(|editor| editor.id.clone()).collect::<Vec<_>>()),
+                (card, runtime.generation, runtime.external_editors.generation()),
                 widget::menu::items(&bindings, entries),
             ));
         }
@@ -17832,7 +17833,7 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
         assert!(!runtime.external_editor_command_available());
-        runtime.set_external_editors(["first", "chosen"].into_iter().map(|id| crate::sidebar::SidebarEditor { id: id.into(), name: id.into(), icon: "editor".into() }).collect());
+        runtime.set_external_editors(["first", "chosen"].into_iter().map(|id| crate::sidebar::SidebarEditor { id: id.into(), name: id.into(), icon: "editor".into() }).collect::<Vec<_>>());
         let command = ExternalEditorCommand(card, "chosen");
         assert_eq!(crate::workspace_widget::shortcut_descriptor(command.command()).id(), "open_in_external_editor");
         assert!(matches!(runtime.external_editor_command(card, Some("chosen")), Some(RepositoryAction::OpenExternal { card: id, editor_id }) if id == card && editor_id == "chosen"));
