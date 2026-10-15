@@ -1227,6 +1227,7 @@ mod tests {
         // Exercise committed scheduler rows, the actual transfer, pending queue,
         // journal and receipt ACK. The newer reason sorts before the old reason.
         let commit = |event: &Event| {
+            let _writer = registry.lock().unwrap();
             let mut connection = rusqlite::Connection::open(&path).unwrap();
             let tx = connection.transaction().unwrap();
             tx.execute("DELETE FROM automation_notifications", []).unwrap();
@@ -1264,6 +1265,33 @@ mod tests {
         assert_eq!(journal.list().unwrap()[0].event, newer);
         super::super::automations::transfer_notifications(&registry, &handle).unwrap();
         assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+
+        // Competing service/scheduler flushes must not publish an older row
+        // after its replacement committed. Either the first transfer wins the
+        // writer lock and journals old→new, or both read the new committed row.
+        for round in 0..16 {
+            let old=event("Z concurrent earlier",&format!("concurrent-old-{round}"));
+            let newest=event("A concurrent newest",&format!("concurrent-new-{round}"));
+            commit(&old);
+            let barrier=Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                let worker_barrier=barrier.clone();let worker_registry=registry.clone();let worker_handle=handle.clone();
+                scope.spawn(move || {
+                    worker_barrier.wait();
+                    super::super::automations::transfer_notifications(&worker_registry,&worker_handle).unwrap();
+                });
+                barrier.wait();
+                commit(&newest);
+                super::super::automations::transfer_notifications(&registry,&handle).unwrap();
+            });
+            let pending=std::mem::take(&mut *shared.pending.lock().unwrap());
+            for event in pending.automation_events {
+                journal_event(&mut journal,&Arc::downgrade(&shared),event,false).unwrap();
+            }
+            assert_eq!(journal.list().unwrap()[0].event,newest);
+            super::super::automations::transfer_notifications(&registry,&handle).unwrap();
+            assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+        }
 
         // Identical presentation targets still journal and ACK both distinct
         // evidence keys rather than silently losing the older pending key.
