@@ -74,31 +74,33 @@ struct Registration {
     client_id: ClientId,
     delivery: Arc<DeliveryQueue>,
     retired: Option<Box<dyn FnOnce() + Send>>,
+    proof: HostSessionProof,
 }
 
 impl Registration {
     fn new(host: SharedHost, client_id: ClientId, retired: Option<Box<dyn FnOnce() + Send>>) -> Self {
-        let delivery = host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .register_client(client_id);
+        let (delivery, proof) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            (state.register_client(client_id), state.proof().clone())
+        };
         Self {
             host,
             client_id,
             delivery,
             retired,
+            proof,
         }
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        super::deferred::disconnected_proof(&self.proof, self.client_id);
         self.delivery.close_after_drain();
         let host = Arc::clone(&self.host);
         let client_id = self.client_id;
         let retired = self.retired.take();
         crate::terminal::transport::retire(move || {
-            super::deferred::disconnected(&host, client_id);
             disconnect_client(&host, client_id);
             if let Some(retired) = retired { retired(); }
         });
