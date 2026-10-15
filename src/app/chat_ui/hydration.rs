@@ -72,6 +72,12 @@ impl State {
         self.entries.values().any(|entry|entry.append.as_ref().is_some_and(|(old,new)|
             old.as_ptr()==Arc::as_ptr(previous) && new.as_ptr()==Arc::as_ptr(current)))
     }
+    /// Resolve only Store-authored aliases currently represented by this view.
+    /// Outcome/search bindings may name a transport part while the view exposes
+    /// one complete logical root. Unknown IDs must retain their own identity.
+    pub(super) fn logical_item_id(&self,agent_id:Option<&str>,item_id:&str)->Option<&str> {
+        self.aliases.get(&(agent_id.map(str::to_owned),item_id.to_owned())).map(|source|source.source_id.as_str())
+    }
     pub(super) fn aliases(&self,agent_id:Option<&str>,root:&str)->Vec<(String,Range<usize>)> {
         self.entries.get(&Key {agent_id:agent_id.map(str::to_owned),source_id:root.into()})
             .map(|entry|entry.parts.iter().map(|part|(part.item.id.clone(),part.range.clone())).collect())
@@ -405,6 +411,9 @@ mod tests {
         let mut state=State::default();let loading=state.project(raw.clone(),None);
         assert_eq!(loading.items.len(),1);assert_eq!(loading.items[0].id,"root");
         assert_eq!(body(&loading.items[0]),"");
+        assert_eq!(state.logical_item_id(None,&suffix.id),Some("root"));
+        assert_eq!(state.logical_item_id(Some("other-child"),&suffix.id),None);
+        assert_eq!(state.logical_item_id(None,"unproven:native-part:1:2"),None);
         let key=Key {agent_id:None,source_id:"root".into()};let attempt=state.entries[&key].attempt;
         assert!(state.complete(&key,attempt,Ok(Loaded {item:text("root",&full),epoch:7})));
         let ready=state.project(raw.clone(),None);
