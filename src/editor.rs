@@ -11,6 +11,8 @@ use thiserror::Error;
 use crate::fs_safety::{self, ResolveError, Root};
 
 mod presence;
+mod save_publication;
+use save_publication::{SaveBaseline, publish_replacement};
 pub use presence::FileRestoration;
 pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, capture_restoration_at};
 
@@ -301,9 +303,9 @@ pub enum SaveOutcome {
 pub enum SaveDurability {
     /// The replacement and its parent-directory entry were synced.
     Durable,
-    /// The destination was replaced, but syncing its parent directory failed.
-    /// The new bytes are the live disk baseline even though crash durability is
-    /// not guaranteed.
+    /// The destination was replaced, but durability or recovery-artifact
+    /// cleanup could not be confirmed. The new bytes are the live disk
+    /// baseline; the diagnostic describes any retained artifact.
     Unconfirmed { error: String },
 }
 
@@ -1016,7 +1018,7 @@ fn save_file_with_hooks(
     save_file_at_with_hooks(&root, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent)
 }
 
-fn save_file_at_with_hooks(
+pub(crate) fn save_file_at_with_hooks(
     root: &Root,
     relative_path: &Path,
     text: &str,
@@ -1032,8 +1034,8 @@ fn save_file_at_with_hooks(
     // The destination is classified by name once, only to refuse a symlink
     // without opening it, and then opened; every decision that follows — its
     // mode, its ACL, its attributes and the bytes the conflict check hashes —
-    // is taken from that one descriptor, so nothing can be swapped in behind
-    // the name between the check and the save.
+    // is taken from that descriptor. Publication separately acquires the
+    // current named entry and verifies it against this same baseline.
     let listed = fs_safety::metadata_beneath(&parent, name).map_err(resolve_error)?;
     if listed.file_type().is_symlink() {
         return Err(FileIoError::Io(
@@ -1048,7 +1050,12 @@ fn save_file_at_with_hooks(
         ));
     }
 
-    // A forced save compares nothing, so it reads nothing. An ordinary save
+    let baseline = SaveBaseline::capture(&destination, (!overwrite).then_some(expected_disk_hash))?;
+    baseline.ensure_initial(&metadata)?;
+    if !save_publication::same_file(&listed, &metadata) {
+        return Err(FileIoError::Io("The destination changed while opening the save target.".into()));
+    }
+    // A forced save skips the content baseline. An ordinary save
     // bounds the read the way `load_file` does rather than reading whatever is
     // there now: this worktree is shared with coding agents, so the
     // destination can have been replaced by a file far larger than the editor
@@ -1070,6 +1077,7 @@ fn save_file_at_with_hooks(
         &destination,
         text.as_bytes(),
         metadata.permissions(),
+        &baseline,
         before_publish,
         sync_parent,
     )?;
@@ -1106,75 +1114,6 @@ pub(crate) fn save_missing_file_at(root: &Root, path: &Path, text: &str) -> Resu
         Err(error) => SaveDurability::Unconfirmed { error: error.to_string() },
     };
     Ok(SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability })
-}
-
-/// Writes `bytes` into a temporary sibling that carries the destination's
-/// ownership, permissions, access ACL and content attributes, then renames it over the
-/// destination.
-///
-/// The replacement is a new inode, so every piece of metadata the old one
-/// carried has to be reproduced deliberately — `st_mode` alone leaves an
-/// ACL-bearing file readable by the wrong people and silently drops the user's
-/// extended attributes.
-fn publish_replacement(
-    parent: &Root,
-    name: &Path,
-    destination: &File,
-    bytes: &[u8],
-    permissions: Permissions,
-    before_publish: impl FnOnce() -> io::Result<()>,
-    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
-) -> Result<SaveDurability, FileIoError> {
-    let (mut temporary, temporary_name) =
-        fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
-    let result = (|| {
-        // Establish access rules before any sensitive bytes exist: otherwise
-        // the final chmod could briefly expose a mode-only view of an ACL.
-        fs_safety::copy_ownership(destination, &temporary).map_err(io_error)?;
-        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
-        temporary.write_all(bytes).map_err(io_error)?;
-        // Set the mode after writing: writing can clear set-ID permission bits.
-        temporary.set_permissions(permissions).map_err(io_error)?;
-        // ...and reinstate the ACL after it, because the kernel rewrites the
-        // ACL's mask from the mode.
-        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
-        let lost = fs_safety::copy_extended_attributes(destination, &temporary);
-        temporary.sync_all().map_err(io_error)?;
-        before_publish().map_err(io_error)?;
-        fs_safety::rename_within(parent, &temporary_name, name.as_os_str())
-            .map_err(resolve_error)?;
-        Ok(lost)
-    })();
-    let lost = match result {
-        Ok(lost) => lost,
-        Err(error) => {
-            if let Err(cleanup_error) = fs_safety::unlink_within(parent, &temporary_name) {
-                return Err(FileIoError::Io(format!(
-                    "{error}; could not remove partial save: {cleanup_error}"
-                )));
-            }
-            return Err(error);
-        }
-    };
-    // The bytes are published. Losing an optional attribute is not worth
-    // failing a save that already succeeded, but it must not be silent either.
-    for attribute in lost {
-        tracing::warn!(
-            path = %parent.path().join(name).display(),
-            %attribute,
-            "saved file did not receive one of its extended attributes"
-        );
-    }
-    // The rename has replaced the destination. From this point onward, an I/O
-    // failure must be reported as a successful replacement with unconfirmed
-    // durability; returning `Err` would falsely tell callers the old baseline
-    // is still on disk.
-    Ok(match sync_parent(parent) {
-        Ok(()) => SaveDurability::Durable,
-        Err(error) => SaveDurability::Unconfirmed {
-            error: error.to_string(),
-        },
-    })
 }
 
 /// Moves a regular file to a new repository-relative name without replacing
@@ -1831,12 +1770,13 @@ mod tests {
             &foreign,
             b"after",
             source.permissions(),
+            &SaveBaseline::capture(&foreign, None).unwrap(),
             || Ok(()),
             fs_safety::sync_directory,
         );
         match result {
             Err(error) => {
-                assert!(error.to_string().contains("file ownership"), "{error}");
+                assert!(error.to_string().contains("file ownership") || error.to_string().contains("identity"), "{error}");
                 assert_eq!(fs::read(&path).unwrap(), b"before");
                 let after = fs::metadata(&path).unwrap();
                 assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
