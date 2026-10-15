@@ -664,11 +664,21 @@ impl Runtime {
             }
             _ => "Image".into(),
         };
-        let caption = |suffix:&str| -> Element<'static,Message> {
+        let caption = |suffix: &str| -> Element<'static, Message> {
             widget::row::with_children(vec![
-                find::text(self.target,&item.id,&[9,0],label.clone(),design::TEXT_CAPTION,iced::Font::default(),self.find_paint.clone()),
+                find::text(
+                    self.target,
+                    &item.id,
+                    &[9, 0],
+                    label.clone(),
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.find_paint.clone(),
+                ),
                 design::caption(suffix.to_owned()).into(),
-            ]).spacing(step::GAP_XS).into()
+            ])
+            .spacing(step::GAP_XS)
+            .into()
         };
         let Some(handle) = &cached.image else {
             return if cached.image_unavailable {

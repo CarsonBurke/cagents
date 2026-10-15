@@ -198,7 +198,13 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, limit.map(|height| (height, true)), target, find, None)
+        self.surface(
+            theme,
+            limit.map(|height| (height, true)),
+            target,
+            find,
+            None,
+        )
     }
 
     /// Patches and read results open at their first line.
@@ -213,8 +219,12 @@ impl ToolText {
     }
 
     pub(super) fn view_logical(
-        &self, theme: crate::settings::EditorSyntaxTheme, limit: Option<(f32, bool)>,
-        target: Target, find: Option<&str>, logical: selectable_prose::Logical,
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
+        target: Target,
+        find: Option<&str>,
+        logical: selectable_prose::Logical,
     ) -> Element<'static, Message> {
         self.surface(theme, limit, target, find, Some(logical))
     }
@@ -230,8 +240,9 @@ impl ToolText {
         logical: Option<selectable_prose::Logical>,
     ) -> Element<'static, Message> {
         let mut syntax = self.syntax.borrow_mut();
-        if self.text.len() > CachedItem::HIGHLIGHT_LIMIT { *syntax = None; }
-        else if syntax
+        if self.text.len() > CachedItem::HIGHLIGHT_LIMIT {
+            *syntax = None;
+        } else if syntax
             .as_ref()
             .is_none_or(|(previous, _)| *previous != theme)
         {
@@ -240,15 +251,28 @@ impl ToolText {
                 prose::CodeBlock::new(self.language.token(), &self.text, theme),
             ));
         }
-        let spans = syntax.as_ref().map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
+        let spans = syntax
+            .as_ref()
+            .map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
             .unwrap_or_else(|| Arc::from([]));
-        let matching = logical.as_ref().is_some_and(|logical| logical.paint.as_ref().is_some_and(|paint| paint.blocks.contains_key(&logical.identity)));
+        let matching = logical.as_ref().is_some_and(|logical| {
+            logical
+                .paint
+                .as_ref()
+                .is_some_and(|paint| paint.blocks.contains_key(&logical.identity))
+        });
         let body: Element<'static, Message> = widget::container(prose::code_text(
-            self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
-            target, find, logical,
+            self.text.clone(),
+            spans,
+            design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE,
+            target,
+            find,
+            logical,
         ))
         .padding(design::with_vertical_rail(iced::Padding::from([
-            step::GAP_S, step::GAP_M,
+            step::GAP_S,
+            step::GAP_M,
         ])))
         .width(Length::Fill)
         .into();

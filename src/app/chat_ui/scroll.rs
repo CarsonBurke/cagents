@@ -19,7 +19,17 @@ pub(super) fn transcript<'a>(
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
 ) -> Element<'a, Message> {
-    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, None, Memory::default(), false)
+    transcript_impl(
+        content.into(),
+        target,
+        subagent,
+        anchors,
+        follow_end,
+        items,
+        None,
+        Memory::default(),
+        false,
+    )
 }
 
 pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scroll>>>;
@@ -28,22 +38,59 @@ pub(super) type Observations = Rc<std::cell::RefCell<HashMap<Option<String>, Scr
 /// No source text, widgets, fonts or shaped paragraphs are retained here.
 #[derive(Clone, Default)]
 pub(super) struct Memory(Rc<std::cell::RefCell<Anchor>>);
-struct ReaderState { memory: Memory, restore: bool }
+struct ReaderState {
+    memory: Memory,
+    restore: bool,
+}
 
 impl Memory {
-    pub fn clear(&self) { *self.0.borrow_mut() = Anchor::default(); }
-    pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }
+    pub fn clear(&self) {
+        *self.0.borrow_mut() = Anchor::default();
+    }
+    pub fn retained_rows(&self) -> usize {
+        self.0
+            .borrow()
+            .contexts
+            .iter()
+            .map(|context| context.rows.len())
+            .sum()
+    }
 }
 
 pub(super) fn transcript_observed<'a>(
-    content: impl Into<Element<'a, Message>>, target: Target, subagent: Option<&'a str>,
-    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Observations, memory: Memory, find_open: bool,
+    content: impl Into<Element<'a, Message>>,
+    target: Target,
+    subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Vec<(Id, &'a str)>,
+    observations: Observations,
+    memory: Memory,
+    find_open: bool,
 ) -> Element<'a, Message> {
-    transcript_impl(content.into(), target, subagent, anchors, follow_end, items, Some(observations), memory, find_open)
+    transcript_impl(
+        content.into(),
+        target,
+        subagent,
+        anchors,
+        follow_end,
+        items,
+        Some(observations),
+        memory,
+        find_open,
+    )
 }
 
-fn transcript_impl<'a>(content: Element<'a, Message>, target: Target, subagent: Option<&'a str>,
-    anchors: Vec<(usize, &'a str)>, follow_end: bool, items: Vec<(Id, &'a str)>, observations: Option<Observations>, memory: Memory, find_open: bool,
+fn transcript_impl<'a>(
+    content: Element<'a, Message>,
+    target: Target,
+    subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Vec<(Id, &'a str)>,
+    observations: Option<Observations>,
+    memory: Memory,
+    find_open: bool,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -113,87 +160,179 @@ pub(super) struct LogicalLocation {
 }
 
 struct LocateLogical {
-    scroll: Id, item: Id, identity: u64, byte: usize,
-    content: Option<Rectangle>, viewport: Option<Rectangle>,
+    scroll: Id,
+    item: Id,
+    identity: u64,
+    byte: usize,
+    content: Option<Rectangle>,
+    viewport: Option<Rectangle>,
     found: Option<(Rectangle, u8)>,
 }
 impl LocateLogical {
     fn candidate(&mut self, bounds: Rectangle, stage: u8) {
-        if self.found.as_ref().is_none_or(|(_, previous)| stage >= *previous) {
+        if self
+            .found
+            .as_ref()
+            .is_none_or(|(_, previous)| stage >= *previous)
+        {
             self.found = Some((bounds, stage));
         }
     }
 }
 impl Operation<Option<LogicalLocation>> for LocateLogical {
-    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) { visit(self); }
-    fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, content: Rectangle,
-        _: Vector, _: &mut dyn operation::Scrollable) {
-        if id == Some(&self.scroll) { self.content = Some(content); self.viewport = Some(viewport); }
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) {
+        visit(self);
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        viewport: Rectangle,
+        content: Rectangle,
+        _: Vector,
+        _: &mut dyn operation::Scrollable,
+    ) {
+        if id == Some(&self.scroll) {
+            self.content = Some(content);
+            self.viewport = Some(viewport);
+        }
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if id == Some(&self.item) { self.candidate(bounds, 0); }
+        if id == Some(&self.item) {
+            self.candidate(bounds, 0);
+        }
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if let Some((bounds, stage)) = virtualized::logical_bounds(state, bounds, self.identity, self.byte) {
+        if let Some((bounds, stage)) =
+            virtualized::logical_bounds(state, bounds, self.identity, self.byte)
+        {
             self.candidate(bounds, stage);
         }
         if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
-            && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte) {
-            self.candidate(Rectangle { x: bounds.x + local.x, y: bounds.y + local.y, ..local }, 3);
+            && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+        {
+            self.candidate(
+                Rectangle {
+                    x: bounds.x + local.x,
+                    y: bounds.y + local.y,
+                    ..local
+                },
+                3,
+            );
         }
     }
     fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
-        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found).map(|((content, viewport), (found, stage))| {
-            let travel = (content.height - viewport.height).max(0.0);
-            let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0).clamp(0.0, travel);
-            LogicalLocation { offset: travel - from_top, exact: stage == 3, stage }
-        }))
+        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found).map(
+            |((content, viewport), (found, stage))| {
+                let travel = (content.height - viewport.height).max(0.0);
+                let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0)
+                    .clamp(0.0, travel);
+                LogicalLocation {
+                    offset: travel - from_top,
+                    exact: stage == 3,
+                    stage,
+                }
+            },
+        ))
     }
 }
 
-pub(super) fn locate_logical(target: Target, item: String, identity: u64, byte: usize)
-    -> iced::Task<Option<LogicalLocation>> {
-    iced::advanced::widget::operate(LocateLogical { scroll: card_control_id(target.card, "chat-transcript"),
-        item: item_id(&item), identity, byte, content: None, viewport: None, found: None })
+pub(super) fn locate_logical(
+    target: Target,
+    item: String,
+    identity: u64,
+    byte: usize,
+) -> iced::Task<Option<LogicalLocation>> {
+    iced::advanced::widget::operate(LocateLogical {
+        scroll: card_control_id(target.card, "chat-transcript"),
+        item: item_id(&item),
+        identity,
+        byte,
+        content: None,
+        viewport: None,
+        found: None,
+    })
 }
 
 struct FindScrollMarker(bool);
 
 /// Find corrections position an existing result; they must not become user
 /// edge navigation that asks the provider to replace the history window.
-pub(super) fn find_scroll_to<T: Send + 'static>(target:Target,offset:f32) -> iced::Task<T> {
-    struct Scroll {id:Id,offset:f32}
-    impl<T:'static> Operation<T> for Scroll {
-        fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation<T>)) {visit(self);}
-        fn custom(&mut self,id:Option<&Id>,_:Rectangle,state:&mut dyn std::any::Any) {
-            if id==Some(&self.id) && let Some(marker)=state.downcast_mut::<FindScrollMarker>() {marker.0=true;}
+pub(super) fn find_scroll_to<T: Send + 'static>(target: Target, offset: f32) -> iced::Task<T> {
+    struct Scroll {
+        id: Id,
+        offset: f32,
+    }
+    impl<T: 'static> Operation<T> for Scroll {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
         }
-        fn scrollable(&mut self,id:Option<&Id>,_:Rectangle,_:Rectangle,_:Vector,state:&mut dyn operation::Scrollable) {
-            if id==Some(&self.id) {state.scroll_to(operation::scrollable::AbsoluteOffset{x:None,y:Some(self.offset)});}
+        fn custom(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if id == Some(&self.id)
+                && let Some(marker) = state.downcast_mut::<FindScrollMarker>()
+            {
+                marker.0 = true;
+            }
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            _: Rectangle,
+            _: Rectangle,
+            _: Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.id) {
+                state.scroll_to(operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(self.offset),
+                });
+            }
         }
     }
-    iced::advanced::widget::operate(Scroll{id:card_control_id(target.card,"chat-transcript"),offset})
+    iced::advanced::widget::operate(Scroll {
+        id: card_control_id(target.card, "chat-transcript"),
+        offset,
+    })
 }
 
 /// Restore a source offset after the Find bar and temporary disclosures
 /// change the viewport height. Native chat offsets are bottom anchored.
 pub(super) fn restore_top<T: Send + 'static>(target: Target, top: f32) -> iced::Task<T> {
-    struct Restore { scroll: Id, top: f32 }
+    struct Restore {
+        scroll: Id,
+        top: f32,
+    }
     impl<T: 'static> Operation<T> for Restore {
-        fn custom(&mut self,id:Option<&Id>,_:Rectangle,state:&mut dyn std::any::Any) {
-            if id==Some(&self.scroll) && let Some(marker)=state.downcast_mut::<FindScrollMarker>() {marker.0=true;}
+        fn custom(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if id == Some(&self.scroll)
+                && let Some(marker) = state.downcast_mut::<FindScrollMarker>()
+            {
+                marker.0 = true;
+            }
         }
-        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) { visit(self); }
-        fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, content: Rectangle,
-            _: Vector, state: &mut dyn operation::Scrollable) {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            viewport: Rectangle,
+            content: Rectangle,
+            _: Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
             if id == Some(&self.scroll) {
                 state.scroll_to(operation::scrollable::AbsoluteOffset {
-                    x:None,y:Some(((content.height-viewport.height).max(0.0)-self.top).max(0.0)),
+                    x: None,
+                    y: Some(((content.height - viewport.height).max(0.0) - self.top).max(0.0)),
                 });
             }
         }
     }
-    iced::advanced::widget::operate(Restore {scroll:card_control_id(target.card,"chat-transcript"),top})
+    iced::advanced::widget::operate(Restore {
+        scroll: card_control_id(target.card, "chat-transcript"),
+        top,
+    })
 }
 
 struct ItemBounds<'a> {
@@ -207,8 +346,11 @@ impl Operation for ItemBounds<'_> {
         visit(self);
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        self.virtual_rows.extend(virtualized::anchor_points(state, bounds, &self.wanted).into_iter()
-            .map(|(key, bounds)| (format!("virtual-chunk-{key:016x}"), bounds)));
+        self.virtual_rows.extend(
+            virtualized::anchor_points(state, bounds, &self.wanted)
+                .into_iter()
+                .map(|(key, bounds)| (format!("virtual-chunk-{key:016x}"), bounds)),
+        );
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         if let Some(id) = id.and_then(|id| self.ids.get(id)) {
@@ -289,7 +431,9 @@ impl Context {
         }
         // A recreated widget can restore authoritative native geometry from
         // the Runtime before it has any measured row anchors.
-        if self.rows.is_empty() { return top.clamp(0.0, next.travel()); }
+        if self.rows.is_empty() {
+            return top.clamp(0.0, next.travel());
+        }
         // Most relayouts only refresh a timer or hover state. Avoid building
         // a lookup table when every measured row is unchanged.
         if self.rows.len() == rows.len()
@@ -304,12 +448,21 @@ impl Context {
         let next_rows: std::collections::HashMap<_, _> = rows.iter().copied().collect();
         // Preserve the first visible surviving exchange, not the transcript's
         // total height: a page may arrive while the live answer also grows.
-        let visible = || self.rows.iter().filter(|row| {
-            row.bounds.y + row.bounds.height > top && row.bounds.y < top + previous.viewport.height
-        });
-        let overlap = visible().filter(|row| row.id.starts_with("virtual-chunk-"))
-            .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds))).next()
-            .or_else(|| visible().filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds))).next())
+        let visible = || {
+            self.rows.iter().filter(|row| {
+                row.bounds.y + row.bounds.height > top
+                    && row.bounds.y < top + previous.viewport.height
+            })
+        };
+        let overlap = visible()
+            .filter(|row| row.id.starts_with("virtual-chunk-"))
+            .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
+            .next()
+            .or_else(|| {
+                visible()
+                    .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
+                    .next()
+            })
             .or_else(|| {
                 // Front eviction can remove every visible exchange. Keep the
                 // nearest surviving boundary instead of jumping to live output.
@@ -441,9 +594,13 @@ impl Anchor {
         self.clock += 1;
         let seed = self.seed.take();
         let context = &mut self.contexts[index];
-        if context.geometry.is_none() && let Some(seed) = seed {
-            context.geometry = Some(Geometry { viewport: Size::new(next.viewport.width, seed.window_height()),
-                content: Size::new(next.content.width, seed.content()) });
+        if context.geometry.is_none()
+            && let Some(seed) = seed
+        {
+            context.geometry = Some(Geometry {
+                viewport: Size::new(next.viewport.width, seed.window_height()),
+                content: Size::new(next.content.width, seed.content()),
+            });
             context.top = Some(seed.from_top());
             context.follow_end = seed.at_bottom() && follow_end;
         }
@@ -657,7 +814,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(ReaderState { memory: self.memory.clone(), restore: true })
+        tree::State::new(ReaderState {
+            memory: self.memory.clone(),
+            restore: true,
+        })
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -685,10 +845,20 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         let state = tree.state.downcast_mut::<ReaderState>();
         let mut restore = std::mem::take(&mut state.restore);
         let mut anchor = state.memory.0.borrow_mut();
-        if restore { anchor.pending_input = false; }
-        if !anchor.contexts.iter().any(|context| context.subagent.as_deref() == self.subagent) {
-            anchor.seed = self.observations.as_ref().and_then(|observations|
-                observations.borrow().get(&self.subagent.map(str::to_owned)).copied());
+        if restore {
+            anchor.pending_input = false;
+        }
+        if !anchor
+            .contexts
+            .iter()
+            .any(|context| context.subagent.as_deref() == self.subagent)
+        {
+            anchor.seed = self.observations.as_ref().and_then(|observations| {
+                observations
+                    .borrow()
+                    .get(&self.subagent.map(str::to_owned))
+                    .copied()
+            });
         }
         let child = &mut tree.children[0];
         let mut top = ReadTop::default();
@@ -702,45 +872,86 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         }
         let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
         for _ in 0..4 {
-        let next = Geometry {
-            viewport: node.size(),
-            content: node.children()[0].size(),
-        };
-        let mut rows: Vec<_> = self
-            .anchors
-            .iter()
-            .filter_map(|(index, id)| {
-                node.children()[0]
-                    .children()
-                    .get(*index)
-                    .map(|child| (*id, child.bounds()))
-            })
-            .collect();
-        let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
-        for (id, item) in &self.items { ids.entry(id.clone()).or_default().push(item); }
-        let wanted = anchor.active.into_iter().flat_map(|index| anchor.contexts[index].rows.iter())
-            .filter_map(|row| row.id.strip_prefix("virtual-chunk-").and_then(|key| u64::from_str_radix(key, 16).ok())).collect();
-        let mut measured = ItemBounds { ids, rows: Default::default(), wanted, virtual_rows: vec![] };
-        self.content.as_widget_mut().operate(child, Layout::new(&node), renderer, &mut measured);
-        rows.extend(measured.rows);
-        rows.extend(measured.virtual_rows.iter().map(|(key, bounds)| (key.as_str(), *bounds)));
-        rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
-        let offset = anchor.layout_following(self.subagent, &rows, next, top.0, self.follow_end)
-            .or_else(|| restore.then(|| next.travel() - anchor.active.and_then(|index| anchor.contexts[index].top).unwrap_or_default()));
-        if let Some(offset) = offset {
+            let next = Geometry {
+                viewport: node.size(),
+                content: node.children()[0].size(),
+            };
+            let mut rows: Vec<_> = self
+                .anchors
+                .iter()
+                .filter_map(|(index, id)| {
+                    node.children()[0]
+                        .children()
+                        .get(*index)
+                        .map(|child| (*id, child.bounds()))
+                })
+                .collect();
+            let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
+            for (id, item) in &self.items {
+                ids.entry(id.clone()).or_default().push(item);
+            }
+            let wanted = anchor
+                .active
+                .into_iter()
+                .flat_map(|index| anchor.contexts[index].rows.iter())
+                .filter_map(|row| {
+                    row.id
+                        .strip_prefix("virtual-chunk-")
+                        .and_then(|key| u64::from_str_radix(key, 16).ok())
+                })
+                .collect();
+            let mut measured = ItemBounds {
+                ids,
+                rows: Default::default(),
+                wanted,
+                virtual_rows: vec![],
+            };
             self.content.as_widget_mut().operate(
                 child,
                 Layout::new(&node),
                 renderer,
                 &mut SetBottom(offset),
             );
-            top.0 = Some((next.travel() - offset).max(0.0));
-        }
-        restore = false;
-        let mut virtual_viewport = virtualized::UpdateViewport::default();
-        self.content.as_widget_mut().operate(child, Layout::new(&node), renderer, &mut virtual_viewport);
-        if !virtual_viewport.changed { break; }
-        node = self.content.as_widget_mut().layout(child, renderer, limits);
+            rows.extend(measured.rows);
+            rows.extend(
+                measured
+                    .virtual_rows
+                    .iter()
+                    .map(|(key, bounds)| (key.as_str(), *bounds)),
+            );
+            rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+            let offset = anchor
+                .layout_following(self.subagent, &rows, next, top.0, self.follow_end)
+                .or_else(|| {
+                    restore.then(|| {
+                        next.travel()
+                            - anchor
+                                .active
+                                .and_then(|index| anchor.contexts[index].top)
+                                .unwrap_or_default()
+                    })
+                });
+            if let Some(offset) = offset {
+                self.content.as_widget_mut().operate(
+                    child,
+                    Layout::new(&node),
+                    renderer,
+                    &mut SetBottom(offset),
+                );
+                top.0 = Some((next.travel() - offset).max(0.0));
+            }
+            restore = false;
+            let mut virtual_viewport = virtualized::UpdateViewport::default();
+            self.content.as_widget_mut().operate(
+                child,
+                Layout::new(&node),
+                renderer,
+                &mut virtual_viewport,
+            );
+            if !virtual_viewport.changed {
+                break;
+            }
+            node = self.content.as_widget_mut().layout(child, renderer, limits);
         }
         node
     }
@@ -752,9 +963,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
-        let mut find_scroll=FindScrollMarker(false);
-        if let Some(target)=self.target {
-            operation.custom(Some(&card_control_id(target.card,"chat-transcript")),layout.bounds(),&mut find_scroll);
+        let mut find_scroll = FindScrollMarker(false);
+        if let Some(target) = self.target {
+            operation.custom(
+                Some(&card_control_id(target.card, "chat-transcript")),
+                layout.bounds(),
+                &mut find_scroll,
+            );
         }
         let mut before = ReadTop::default();
         if self.target.is_some() {
@@ -776,15 +991,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut after,
             );
-            let mut anchor = tree.state.downcast_ref::<ReaderState>().memory.0.borrow_mut();
+            let mut anchor = tree
+                .state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow_mut();
             if let Some((top, geometry)) = after.0.zip(anchor.geometry()) {
-                anchor.pending_input |= !find_scroll.0 && navigation_input(
-                    before.0,
-                    top,
-                    Scroll::new(top, geometry.content.height, geometry.viewport.height),
-                    None,
-                    false,
-                );
+                anchor.pending_input |= !find_scroll.0
+                    && navigation_input(
+                        before.0,
+                        top,
+                        Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                        None,
+                        false,
+                    );
             }
         }
     }
@@ -823,8 +1044,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             viewport,
         );
         let mut virtual_viewport = virtualized::UpdateViewport::default();
-        self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer, &mut virtual_viewport);
-        if virtual_viewport.changed { shell.invalidate_layout(); }
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            &mut virtual_viewport,
+        );
+        if virtual_viewport.changed {
+            shell.invalidate_layout();
+        }
         if self.target.is_none() {
             return;
         }
@@ -842,7 +1070,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .bounds()
                     .size(),
             };
-            let mut anchor = tree.state.downcast_ref::<ReaderState>().memory.0.borrow_mut();
+            let mut anchor = tree
+                .state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow_mut();
             let changed = anchor.reported.as_ref().is_none_or(|previous| {
                 previous.subagent.as_deref() != self.subagent
                     || previous.top != top
@@ -876,7 +1109,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .as_ref()
                 .is_some_and(|captured| captured.get());
             let gesture = navigation_input(before.0, top, scroll, wheel, child_captured);
-            if self.find_open && gesture && let Some(target) = self.target {
+            if self.find_open
+                && gesture
+                && let Some(target) = self.target
+            {
                 shell.publish(action(Action::FindNavigationInput(target)));
             }
             let user_input = gesture || anchor.pending_input;
@@ -888,12 +1124,17 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     geometry,
                 });
                 if let Some(observations) = &self.observations {
-                    observations.borrow_mut().insert(self.subagent.map(str::to_owned), scroll);
+                    observations
+                        .borrow_mut()
+                        .insert(self.subagent.map(str::to_owned), scroll);
                 }
                 // Native geometry is shared directly with the Runtime. Only
                 // navigation needs a model message; a streamed height change
                 // must not cause another complete update/view/layout cycle.
-                if let Some(target) = self.target.filter(|_| self.observations.is_none() || user_input) {
+                if let Some(target) = self
+                    .target
+                    .filter(|_| self.observations.is_none() || user_input)
+                {
                     shell.publish(action(Action::Scrolled(
                         target,
                         self.subagent.map(str::to_owned),
@@ -1026,118 +1267,301 @@ mod tests {
     #[test]
     fn dropping_and_recreating_native_trees_preserves_only_the_reader_anchor_memory() {
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let memory = Memory::default();
         let observations = Observations::default();
-        let make = || transcript_observed(widget::column::with_children(
-            ["first", "middle", "last"].into_iter().map(|id|
-                item(id, widget::Space::new().height(500).width(Length::Fill))).collect::<Vec<_>>()),
-            target, None, vec![], true,
-            ["first", "middle", "last"].into_iter().map(|id| (item_id(id), id)).collect(), observations.clone(), memory.clone(), false);
+        let make = || {
+            transcript_observed(
+                widget::column::with_children(
+                    ["first", "middle", "last"]
+                        .into_iter()
+                        .map(|id| item(id, widget::Space::new().height(500).width(Length::Fill)))
+                        .collect::<Vec<_>>(),
+                ),
+                target,
+                None,
+                vec![],
+                true,
+                ["first", "middle", "last"]
+                    .into_iter()
+                    .map(|id| (item_id(id), id))
+                    .collect(),
+                observations.clone(),
+                memory.clone(),
+                false,
+            )
+        };
         let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
         {
             let mut element = make();
             let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut SetBottom(500.0));
-            element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(500.0),
+            );
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
         }
-        assert!(memory.retained_rows() >0, "only stable row IDs and geometry survive tree drop");
+        assert!(
+            memory.retained_rows() > 0,
+            "only stable row IDs and geometry survive tree drop"
+        );
         let mut recreated = make();
         let mut tree = Tree::new(&recreated);
-        let node = recreated.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let node = recreated
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
         let mut actual = ReadTop::default();
-        recreated.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
-        assert_eq!(actual.0, Some(600.0), "revealing a hidden transcript does not jump to its end");
+        recreated
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(
+            actual.0,
+            Some(600.0),
+            "revealing a hidden transcript does not jump to its end"
+        );
     }
 
     #[test]
     fn find_scroll_corrections_do_not_arm_provider_history_navigation() {
         use iced::futures::StreamExt;
-        let renderer=crate::app::tests::headless_renderer();
-        let target=Target{card:CardId::new(),generation:0};
-        let mut element=transcript(widget::Space::new().height(1600).width(Length::Fill),target,None,vec![],true,vec![]);
-        let mut tree=Tree::new(&element);
-        let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(Size::ZERO,Size::new(720.0,400.0)));
-        let mut actions=iced::runtime::task::into_stream(find_scroll_to::<()>(target,1200.0)).unwrap();
-        let executor=tokio::runtime::Builder::new_current_thread().build().unwrap();
-        while let Some(action)=executor.block_on(actions.next()) {
-            if let iced::runtime::Action::Widget(mut operation)=action {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = transcript(
+            widget::Space::new().height(1600).width(Length::Fill),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0)),
+        );
+        let mut actions =
+            iced::runtime::task::into_stream(find_scroll_to::<()>(target, 1200.0)).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        while let Some(action) = executor.block_on(actions.next()) {
+            if let iced::runtime::Action::Widget(mut operation) = action {
                 loop {
-                    element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut operation);
-                    match operation.finish() {operation::Outcome::Chain(next)=>operation=next,_=>break}
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation,
+                    );
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
                 }
             }
         }
-        assert!(!tree.state.downcast_ref::<ReaderState>().memory.0.borrow().pending_input,
-            "centering a search result must not request another history page");
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut SetBottom(0.0));
-        assert!(tree.state.downcast_ref::<ReaderState>().memory.0.borrow().pending_input,
-            "ordinary keyboard/edge operations retain their paging intent");
+        assert!(
+            !tree
+                .state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow()
+                .pending_input,
+            "centering a search result must not request another history page"
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(0.0),
+        );
+        assert!(
+            tree.state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow()
+                .pending_input,
+            "ordinary keyboard/edge operations retain their paging intent"
+        );
     }
 
     #[test]
     fn logical_find_realizes_a_distant_chunk_and_centers_its_mounted_glyph() {
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let identity = 9876;
         let line = "measured source line αβ\n";
         let source: Arc<str> = line.repeat(5000).into();
         let byte = line.len() * 1500;
-        let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(), iced::Font::MONOSPACE,
-            target, None, Some(selectable_prose::Logical { identity, start: 0, paint: None }));
-        let mut element = transcript(widget::column::with_children(vec![
-            widget::Space::new().height(10000).into(), item("answer", text)]), target, None, vec![], true, vec![]);
+        let text = prose::code_text(
+            source,
+            Arc::from([]),
+            design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE,
+            target,
+            None,
+            Some(selectable_prose::Logical {
+                identity,
+                start: 0,
+                paint: None,
+            }),
+        );
+        let mut element = transcript(
+            widget::column::with_children(vec![
+                widget::Space::new().height(10000).into(),
+                item("answer", text),
+            ]),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+        );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
         let limits = layout::Limits::new(Size::ZERO, viewport.size());
-        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
         let mut exact = false;
         for _ in 0..6 {
             let found = Arc::new(std::sync::Mutex::new(None));
             let sink = found.clone();
-            let mut locate = operation::map(LocateLogical { scroll: card_control_id(target.card, "chat-transcript"),
-                item: item_id("answer"), identity, byte, content: None, viewport: None, found: None },
-                move |location| { *sink.lock().unwrap() = location; });
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+            let mut locate = operation::map(
+                LocateLogical {
+                    scroll: card_control_id(target.card, "chat-transcript"),
+                    item: item_id("answer"),
+                    identity,
+                    byte,
+                    content: None,
+                    viewport: None,
+                    found: None,
+                },
+                move |location| {
+                    *sink.lock().unwrap() = location;
+                },
+            );
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
             let _ = locate.finish();
-            let location = found.lock().unwrap().take().expect("offscreen descriptors remain navigable");
+            let location = found
+                .lock()
+                .unwrap()
+                .take()
+                .expect("offscreen descriptors remain navigable");
             exact = location.exact;
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut SetBottom(location.offset));
-            node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            if exact { break; }
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(location.offset),
+            );
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            if exact {
+                break;
+            }
         }
-        assert!(exact, "estimate navigation converges to actual mounted glyph geometry");
-        struct Visible { identity: u64, byte: usize, translation: Vector, viewport: Option<Rectangle>, glyph: Option<Rectangle> }
+        assert!(
+            exact,
+            "estimate navigation converges to actual mounted glyph geometry"
+        );
+        struct Visible {
+            identity: u64,
+            byte: usize,
+            translation: Vector,
+            viewport: Option<Rectangle>,
+            glyph: Option<Rectangle>,
+        }
         impl Operation for Visible {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-            fn scrollable(&mut self, _: Option<&Id>, viewport: Rectangle, _: Rectangle, translation: Vector, _: &mut dyn operation::Scrollable) {
-                self.translation = translation; self.viewport = Some(viewport);
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&Id>,
+                viewport: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.translation = translation;
+                self.viewport = Some(viewport);
             }
             fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
                 if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
-                    && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte) {
-                    self.glyph = Some(Rectangle { x: bounds.x +local.x -self.translation.x,
-                        y: bounds.y +local.y -self.translation.y, ..local });
+                    && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                {
+                    self.glyph = Some(Rectangle {
+                        x: bounds.x + local.x - self.translation.x,
+                        y: bounds.y + local.y - self.translation.y,
+                        ..local
+                    });
                 }
             }
         }
-        let mut visible = Visible { identity, byte, translation: Vector::ZERO, viewport: None, glyph: None };
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+        let mut visible = Visible {
+            identity,
+            byte,
+            translation: Vector::ZERO,
+            viewport: None,
+            glyph: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
         let glyph = visible.glyph.expect("the requested chunk is mounted");
         let viewport = visible.viewport.unwrap();
-        assert!(glyph.y >= viewport.y && glyph.y +glyph.height <= viewport.y +viewport.height);
-        assert!((glyph.y +glyph.height /2.0 -viewport.y -viewport.height /2.0).abs() <= glyph.height +1.0,
-            "mounted match glyph is centered: {glyph:?}, {viewport:?}");
+        assert!(glyph.y >= viewport.y && glyph.y + glyph.height <= viewport.y + viewport.height);
+        assert!(
+            (glyph.y + glyph.height / 2.0 - viewport.y - viewport.height / 2.0).abs()
+                <= glyph.height + 1.0,
+            "mounted match glyph is centered: {glyph:?}, {viewport:?}"
+        );
     }
 
     #[test]
     fn native_geometry_updates_the_reader_without_echoing_a_model_message() {
         let renderer = crate::app::tests::headless_renderer();
         let observations: Observations = Default::default();
-        let target = Target { card: CardId::new(), generation: 0 };
-        let make = |height| transcript_observed(widget::Space::new().height(height).width(Length::Fill),
-            target, None, vec![], true, vec![], observations.clone(), Memory::default(), false);
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let make = |height| {
+            transcript_observed(
+                widget::Space::new().height(height).width(Length::Fill),
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
+                observations.clone(),
+                Memory::default(),
+                false,
+            )
+        };
         let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
         let limits = layout::Limits::new(Size::ZERO, bounds.size());
         let mut element = make(100.0);
@@ -1146,23 +1570,52 @@ mod tests {
         for height in [100.0, 2000.0, 4000.0] {
             element = make(height);
             tree.diff(element.as_widget_mut());
-            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            element.as_widget_mut().update(&mut tree,
-                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), Layout::new(&node),
-                mouse::Cursor::Unavailable, &renderer, &mut iced::advanced::clipboard::Null,
-                &mut Shell::new(&mut messages), &bounds);
-            assert!(messages.is_empty(), "streamed geometry does not enqueue another model/view cycle");
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(
+                messages.is_empty(),
+                "streamed geometry does not enqueue another model/view cycle"
+            );
             let scroll = observations.borrow()[&None];
             assert_eq!(scroll.content(), height);
-            assert!(scroll.at_bottom(), "the direct observation keeps authoritative native geometry");
+            assert!(
+                scroll.at_bottom(),
+                "the direct observation keeps authoritative native geometry"
+            );
         }
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::WheelScrolled {
-            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } }), Layout::new(&node),
-            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)), &renderer,
-            &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &bounds);
-        assert!(messages.iter().any(|message| matches!(message,
-            Message::ChatUi(Action::Scrolled(_, None, _, true)))), "user navigation still drives paging");
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::Scrolled(_, None, _, true))
+            )),
+            "user navigation still drives paging"
+        );
     }
 
     #[test]

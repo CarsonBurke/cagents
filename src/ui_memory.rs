@@ -59,36 +59,124 @@ impl<Message> Widget<Message, Theme, Renderer> for Gate<'_, Message> {
         self.0.as_widget().size_hint()
     }
 
-    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
-        self.0.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.0
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
     }
 
-    fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
-        self.0.as_widget_mut().operate(&mut tree.children[0], layout, renderer, operation);
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.0
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
-    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
-        self.0.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.0.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
     }
 
-    fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
-        self.0.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.0.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
     }
 
-    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle, renderer: &Renderer) -> mouse::Interaction {
-        self.0.as_widget().mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.0
+            .as_widget()
+            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
     }
 
-    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.0.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.0.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 
-    fn a11y_nodes(&self, layout: Layout<'_>, tree: &Tree, cursor: mouse::Cursor) -> iced_accessibility::A11yTree {
-        self.0.as_widget().a11y_nodes(layout, &tree.children[0], cursor)
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.0
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
     }
 
-    fn drag_destinations(&self, tree: &Tree, layout: Layout<'_>, renderer: &Renderer, rectangles: &mut DndDestinationRectangles) {
-        self.0.as_widget().drag_destinations(&tree.children[0], layout, renderer, rectangles);
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        rectangles: &mut DndDestinationRectangles,
+    ) {
+        self.0
+            .as_widget()
+            .drag_destinations(&tree.children[0], layout, renderer, rectangles);
     }
 }
 
@@ -120,7 +208,17 @@ mod tests {
             layout::Node::new(Size::ZERO)
         }
 
-        fn draw(&self, _: &Tree, _: &mut Renderer, _: &Theme, _: &renderer::Style, _: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {}
+        fn draw(
+            &self,
+            _: &Tree,
+            _: &mut Renderer,
+            _: &Theme,
+            _: &renderer::Style,
+            _: Layout<'_>,
+            _: mouse::Cursor,
+            _: &Rectangle,
+        ) {
+        }
     }
 
     #[test]
@@ -134,7 +232,10 @@ mod tests {
         let old_presentation = presentation.borrow().clone();
         let old_composer = composer.borrow().clone();
         assert!(old_presentation.upgrade().is_some());
-        assert!(root.children[0].id.is_none(), "the gate never aliases its child's widget ID");
+        assert!(
+            root.children[0].id.is_none(),
+            "the gate never aliases its child's widget ID"
+        );
         release_parked(&mut root);
         assert!(old_presentation.upgrade().is_none());
         assert!(old_composer.upgrade().is_some());

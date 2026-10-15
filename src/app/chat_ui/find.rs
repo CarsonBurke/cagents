@@ -117,7 +117,12 @@ fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
     matched_ranges_cancellable(text, query, limit, || true).unwrap()
 }
 
-fn matched_ranges_cancellable(text: &str, query: &str, limit: usize, mut current: impl FnMut() -> bool) -> Option<Highlights> {
+fn matched_ranges_cancellable(
+    text: &str,
+    query: &str,
+    limit: usize,
+    mut current: impl FnMut() -> bool,
+) -> Option<Highlights> {
     if query.is_empty() {
         return Some(Highlights::empty());
     }
@@ -129,7 +134,9 @@ fn matched_ranges_cancellable(text: &str, query: &str, limit: usize, mut current
     let mut next_cancel = 0;
     'source: for (offset, character) in text.char_indices() {
         if offset >= next_cancel {
-            if !current() { return None; }
+            if !current() {
+                return None;
+            }
             next_cancel = offset.saturating_add(4096);
         }
         if character.is_ascii() {
@@ -388,12 +395,24 @@ mod tests {
 /// A named rendered field uses the same logical coordinates as prose/code.
 /// Preview echoes are not a second search occurrence of their source field.
 pub(super) fn text(
-    target: super::Target, item: &str, path: &[u32], text: impl Into<String>,
-    size: f32, font: cosmic::iced::Font, paint: Option<std::sync::Arc<Paint>>,
+    target: super::Target,
+    item: &str,
+    path: &[u32],
+    text: impl Into<String>,
+    size: f32,
+    font: cosmic::iced::Font,
+    paint: Option<std::sync::Arc<Paint>>,
 ) -> super::Element<'static, super::Message> {
     super::selectable_prose::logical_text(
         vec![cosmic::iced::widget::text::Span::new(text.into())].into(),
-        size.into(), font, target, None,
-        super::selectable_prose::Logical {identity:super::selection::logical_identity(item,path),start:0,paint},
+        size.into(),
+        font,
+        target,
+        None,
+        super::selectable_prose::Logical {
+            identity: super::selection::logical_identity(item, path),
+            start: 0,
+            paint,
+        },
     )
 }
