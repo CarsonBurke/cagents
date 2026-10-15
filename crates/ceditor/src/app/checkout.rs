@@ -35,18 +35,14 @@ pub(crate) enum Action {
 #[derive(Clone)]
 enum Base {
     PullRequest(CheckoutTarget),
-    Commit { repository: PathBuf, head: cagents::repository::Oid, root_identity: (u64, u64) },
+    Commit { authority: WorktreeAuthority, head: cagents::repository::Oid },
 }
 impl Base {
     fn validate(&self) -> Result<(), String> {
-        if let Self::Commit { repository, root_identity, .. } = self {
-            if git_review::root_identity(repository) != Some(*root_identity) {
-                return Err("The original worktree directory was replaced; reopen it before creating a worktree.".into());
-            }
-        }
-        Ok(())
+        match self { Self::Commit { authority, .. } => authority.validate().map_err(|error| error.to_string()), Self::PullRequest(_) => Ok(()) }
     }
-    fn repository(&self) -> &Path { match self { Self::PullRequest(target) => &target.repository, Self::Commit { repository, .. } => repository } }
+    fn authority(&self) -> Option<WorktreeAuthority> { match self { Self::Commit { authority, .. } => Some(authority.clone()), Self::PullRequest(_) => None } }
+    fn repository(&self) -> &Path { match self { Self::PullRequest(target) => &target.repository, Self::Commit { authority, .. } => authority.path() } }
     fn head(&self) -> &cagents::repository::Oid { match self { Self::PullRequest(target) => &target.head, Self::Commit { head, .. } => head } }
     fn branch(&self) -> String { match self { Self::PullRequest(target) => target.suggested_branch(), Self::Commit { head, .. } => format!("review/{}", &head.as_str()[..8]) } }
 }
@@ -93,11 +89,8 @@ impl Editor {
         self.begin_checkout_base(Base::PullRequest(target));
     }
 
-    pub(super) fn begin_commit_checkout(&mut self, repository: PathBuf, head: cagents::repository::Oid) {
-        let Some(root_identity) = git_review::root_identity(&repository) else {
-            self.notice = Some("The original worktree is unavailable.".into()); return;
-        };
-        self.begin_checkout_base(Base::Commit { repository, head, root_identity });
+    pub(super) fn begin_commit_checkout(&mut self, authority: WorktreeAuthority, head: cagents::repository::Oid) {
+        self.begin_checkout_base(Base::Commit { authority, head });
     }
 
     fn begin_checkout_base(&mut self, target: Base) {
@@ -223,9 +216,10 @@ impl Editor {
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         authority.validate()?;
-                        RepositoryService::system("git")
-                            .resolve_worktree_request(&input, &cancellation)
-                            .map_err(|e| e.to_string())
+                        if let Some(authority) = authority.authority() {
+                            RepositoryService::system("git").with_worktree_authority(authority)
+                                .and_then(|service| service.resolve_worktree_request(&input, &cancellation)).map_err(|error| error.to_string())
+                        } else { RepositoryService::system("git").resolve_worktree_request(&input, &cancellation).map_err(|error| error.to_string()) }
                     })
                     .await
                     .map_err(|e| e.to_string())
@@ -274,11 +268,10 @@ impl Editor {
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         authority.validate()?;
-                        Ok(cagents::pull_request_review::checkout::create(
-                            &journal.0,
-                            &request,
-                            &cancellation,
-                        ))
+                        if let Some(authority) = authority.authority() {
+                            let service = RepositoryService::system("git").with_worktree_authority(authority).map_err(|error| error.to_string())?;
+                            Ok(cagents::pull_request_review::checkout::create_with_service(&service, &journal.0, &request, &cancellation))
+                        } else { Ok(cagents::pull_request_review::checkout::create(&journal.0, &request, &cancellation)) }
                     })
                     .await
                     .map_err(|e| e.to_string()).and_then(|result| result);

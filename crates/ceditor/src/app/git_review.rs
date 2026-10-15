@@ -1,13 +1,12 @@
 //! Standalone callers for the shared Git history and commit composer contracts.
 use super::*;
 use cagents::repository::{CommitSummary, DiffEntry, HistoryRequest, HistoryRevision, Oid};
-use std::os::unix::fs::MetadataExt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct Origin {
     card: CardId,
     key: ActiveWorktreeKey,
-    root_identity: (u64, u64),
+    authority: WorktreeAuthority,
 }
 
 #[derive(Default)]
@@ -50,14 +49,6 @@ pub(super) enum Action {
     Committed { origin: Origin, revision: u64, result: Result<CommitOutcome, String> },
 }
 
-pub(super) fn root_identity(path: &Path) -> Option<(u64, u64)> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
-}
-fn check_root(origin: &Origin) -> Result<(), String> {
-    (root_identity(&origin.key.canonical_path) == Some(origin.root_identity))
-        .then_some(()).ok_or_else(|| "The original worktree directory was replaced; reopen it before retrying.".into())
-}
 
 impl Editor {
     fn git_review_bound(&self, card: CardId, key: &ActiveWorktreeKey) -> bool {
@@ -69,7 +60,7 @@ impl Editor {
 
     fn git_review_origin(&self, card: CardId, key: &ActiveWorktreeKey) -> Option<Origin> {
         self.git_review_bound(card, key).then_some(())?;
-        Some(Origin { card, key: key.clone(), root_identity: root_identity(&key.canonical_path)? })
+        Some(Origin { card, key: key.clone(), authority: self.tab(card)?.worktree_authority.clone()? })
     }
 
     /// Returns Some only for actions owned by this adapter. Operations still
@@ -136,7 +127,7 @@ impl Editor {
                 match command {
                     HistoryCommand::CopySha => iced::clipboard::write(oid.to_string()).map(cosmic::Action::App),
                     HistoryCommand::CopyMessage => iced::clipboard::write(message.to_string()).map(cosmic::Action::App),
-                    HistoryCommand::NewWorktree => { self.begin_commit_checkout(origin.key.canonical_path, oid.clone()); Task::none() },
+                    HistoryCommand::NewWorktree => { self.begin_commit_checkout(origin.authority, oid.clone()); Task::none() },
                     HistoryCommand::CreateBranch => Task::none(),
                     HistoryCommand::Revert | HistoryCommand::CherryPick => {
                         let operation = if *command == HistoryCommand::Revert {
@@ -189,7 +180,7 @@ impl Editor {
         cosmic::task::future(async move {
             let root = origin.key.canonical_path.clone(); let target = head.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { check_root(&authority)?; RepositoryService::system("git").commit_message(&root, &target, &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.commit_message(&root, &target, &cancel).map_err(|error| error.to_string()) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::AmendLoaded { origin, revision, head, result })
         })
@@ -218,7 +209,7 @@ impl Editor {
             let request = HistoryRequest { worktree: origin.key.canonical_path.clone(), revision: HistoryRevision::Object { oid: head.clone() }, page, path: None };
             let filter = query.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { check_root(&authority)?; RepositoryService::system("git").filtered_history(&request, &filter, &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.filtered_history(&request, &filter, &cancel).map_err(|error| error.to_string()) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::HistoryLoaded { origin, generation, head, page, query, result })
         })
@@ -234,7 +225,7 @@ impl Editor {
         cosmic::task::future(async move {
             let root = origin.key.canonical_path.clone(); let target = oid.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { check_root(&authority)?; RepositoryService::system("git").commit_diff_entries(&root, &target, parent.as_ref(), &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.commit_diff_entries(&root, &target, parent.as_ref(), &cancel).map_err(|error| error.to_string()) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::CommitLoaded { origin, generation, oid, result })
         })
@@ -269,8 +260,7 @@ impl Editor {
             let request = CommitRequest { worktree, message };
             let authority = origin.clone();
             let result = tokio::task::spawn_blocking(move || {
-                check_root(&authority)?;
-                let service = RepositoryService::system("git"); let cancel = CancellationToken::new();
+                let service = RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?; let cancel = CancellationToken::new();
                 match expected { Some(head) if amend => service.commit_amend_at(&request, &head, &cancel), _ => service.commit_with_amend(&request, amend, &cancel) }.map_err(|error| error.to_string())
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::Committed { origin, revision, result })
@@ -282,9 +272,9 @@ impl Editor {
         // Physical disappearance refuses effects, but must still settle the
         // exact logical request that reserved this tab's mutation/read slot.
         if !self.git_review_bound(origin.card, &origin.key) { return Task::none(); }
-        let root_unavailable = root_identity(&origin.key.canonical_path) != Some(origin.root_identity);
+        let root_unavailable = origin.authority.validate().is_err();
         if root_unavailable {
-            let error = "The original worktree directory was replaced; reopen it before retrying.".to_owned();
+            let error = "The original worktree directory is unavailable or was replaced; reopen it before retrying.".to_owned();
             match &mut action {
                 Action::AmendLoaded { result, .. } => *result = Err(error),
                 Action::HistoryLoaded { result, .. } => *result = Err(error),

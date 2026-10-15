@@ -15,8 +15,19 @@ pub fn create(
     request: &CreateWorktreeRequest,
     cancellation: &CancellationToken,
 ) -> WorktreeOperationReport {
+    create_with_service(&RepositoryService::system("git"), store, request, cancellation)
+}
+
+/// Reuses the durable journal with a caller's retained repository authority.
+/// The service retains responsibility for validating every Git scope.
+pub fn create_with_service<E: crate::process::ProcessExecutor>(
+    service: &RepositoryService<E>,
+    store: &StateStore,
+    request: &CreateWorktreeRequest,
+    cancellation: &CancellationToken,
+) -> WorktreeOperationReport {
     let (progress, _receiver) = async_channel::bounded(8);
-    RepositoryService::system("git").create_worktree_journaled(
+    service.create_worktree_journaled(
         store,
         request,
         1,
