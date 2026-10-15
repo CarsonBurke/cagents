@@ -2692,7 +2692,12 @@ impl SessionState {
     ) {
         // The server must see the text the position refers to before it is
         // asked about it.
-        self.flush_changes(&request.uri);
+        if matches!(request.kind,RequestKind::Rename|RequestKind::CodeActions|RequestKind::ResolveCodeAction|RequestKind::ExecuteCommand) {
+            // Cross-file results must see every already-queued buffer edit,
+            // including another URI still inside its debounce window.
+            let uris:Vec<_>=self.pending.keys().cloned().collect();
+            for uri in uris {self.flush_changes(&uri);}
+        } else {self.flush_changes(&request.uri);}
         // Supersession is per document and kind, as two tabs on one file each
         // get their own answers.
         let slot = (request.doc, request.kind);
@@ -4435,7 +4440,7 @@ impl LspManager {
                 kind,
                 position,
                 version: snapshot.version,
-                args, timeout, observed_versions: if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ResolveCodeAction|RequestKind::ExecuteCommand) {self.snapshots.lock().uris.iter().map(|(uri,state)| ((**uri).clone(),state.latest().version)).collect()} else {HashMap::new()},
+                args, timeout, observed_versions: if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ResolveCodeAction|RequestKind::ExecuteCommand) {self.snapshots.lock().uris.iter().filter(|(_,state)|state.session==reference.session).map(|(uri,state)| ((**uri).clone(),state.latest().version)).collect()} else {HashMap::new()},
             }))
         {
             return fail(&self.events, LspError::Protocol(reason.to_owned()));
