@@ -1728,9 +1728,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn running_generic_creation_keeps_its_source_through_unchanged_refresh() {
-        use std::os::unix::fs::PermissionsExt;
         const TEST: &str = "app::worktree_dialog::tests::running_generic_creation_keeps_its_source_through_unchanged_refresh";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        paused_creation_with_refresh(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn running_generic_creation_keeps_its_source_through_duplicate_open_verification() {
+        const TEST: &str = "app::worktree_dialog::tests::running_generic_creation_keeps_its_source_through_duplicate_open_verification";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        paused_creation_with_refresh(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn paused_creation_with_refresh(duplicate_open: bool) {
+        use std::os::unix::fs::PermissionsExt;
         let (mut fixture, _files, root, oid) = real_history_source();
         let source = open_generic_fixture(&mut fixture, &oid);
         let original_generation = fixture.app.project_creation_generation(fixture.project).unwrap();
@@ -1779,12 +1792,30 @@ exit 0
         }
         assert!(source.lifetime.lock().unwrap().readers.iter().any(|reader| reader.strong_count() != 0),
             "the running blocking worker retains its cancellation lease");
-        let refresh = fixture.app.repository_load_task(root.clone(), Some(project), false);
-        assert!(fixture.app.project_creation_source(project).is_none());
-        assert!(fixture.app.current_project_creation_source(project, source.id()));
-        let loaded = first_creation_message(refresh).await;
-        assert!(matches!(loaded, Message::RepositoryLoaded { .. }));
-        drop(fixture.app.update(loaded));
+        if duplicate_open {
+            let provisional = ProjectId::new();
+            let refresh = fixture.app.repository_load_task(root.clone(), Some(provisional), false);
+            let loaded = first_creation_message(refresh).await;
+            assert!(matches!(&loaded, Message::RepositoryLoaded { project_id, .. } if *project_id == provisional));
+            let canonical = fixture.app.update(loaded);
+            assert!(source.is_available(), "duplicate read completion cannot revoke the canonical actor");
+            assert!(fixture.app.current_project_creation_source(project, source.id()));
+            let verified = first_creation_message(canonical).await;
+            assert!(matches!(&verified, Message::RepositoryLoaded { project_id, .. } if *project_id == project),
+                "drive the actual canonical verification task emitted by duplicate-open reconciliation");
+            drop(fixture.app.update(verified));
+            assert!(fixture.app.sidebar_model.project(provisional).is_none());
+            assert!(!fixture.app.repository_generations.contains_key(&provisional));
+        } else {
+            let refresh = fixture.app.repository_load_task(root.clone(), Some(project), false);
+            assert!(fixture.app.project_creation_source(project).is_none());
+            assert!(fixture.app.current_project_creation_source(project, source.id()));
+            let loaded = first_creation_message(refresh).await;
+            assert!(matches!(loaded, Message::RepositoryLoaded { .. }));
+            drop(fixture.app.update(loaded));
+        }
+        assert!(source.lifetime.lock().unwrap().readers.iter().filter_map(std::sync::Weak::upgrade)
+            .all(|token| !token.is_cancelled()), "verification must not cancel the accepted creation worker");
         assert_eq!(fixture.app.project_creation_generation(project), Some(original_generation));
         assert_eq!(fixture.app.project_creation_source(project).unwrap().id(), source.id());
         assert!(source.is_available());
