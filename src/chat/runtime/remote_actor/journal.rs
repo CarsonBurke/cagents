@@ -44,6 +44,10 @@ pub(super) struct Journal {
     budget: usize,
     last_loss:Option<ContinuityLoss>,
     run_ids:std::collections::BTreeSet<crate::model::RunId>,
+    finished_runs:std::collections::BTreeMap<crate::model::RunId,u64>,
+    input_sequence:u64,
+    outcome_ack:u64,
+    outcome_latest:u64,
 }
 impl Journal {
     pub fn open(directory: &Path) -> Result<Self, String> {
@@ -63,16 +67,11 @@ impl Journal {
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
             INSERT INTO metadata VALUES('input_sequence','0'),('outcome_ack','0');")
             .map_err(|error| error.to_string())?;
-        Ok(Self { db, budget,last_loss:None,run_ids:Default::default() })
+        Ok(Self { db, budget,last_loss:None,run_ids:Default::default(),finished_runs:Default::default(),input_sequence:0,outcome_ack:0,outcome_latest:0 })
     }
-    pub fn continuity_loss(&self)->Result<Option<ContinuityLoss>,String> {
-        if let Some(loss)=&self.last_loss {return Ok(Some(loss.clone()));}
-        let value:Option<Vec<u8>>=self.db.query_row("SELECT value FROM metadata WHERE key='continuity_loss'",[],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
-        value.map(|bytes|serde_json::from_slice(&bytes).map_err(|error|error.to_string())).transpose()
-    }
+    pub fn continuity_loss(&self)->Result<Option<ContinuityLoss>,String> {Ok(self.last_loss.clone())}
     pub fn loss(&self)->Result<Option<String>,String> {Ok(self.continuity_loss()?.map(|loss|loss.reason))}
     pub fn record_loss(&mut self,reason:&str)->Result<(),String> {
-        if self.last_loss.is_none() {self.last_loss=self.continuity_loss()?;}
         if self.last_loss.is_none() {self.last_loss=Some(ContinuityLoss {id:uuid::Uuid::new_v4(),affected_runs:self.run_ids.iter().copied().collect(),reason:reason.chars().take(4096).collect(),acknowledged:false});}
         let loss=self.last_loss.as_ref().unwrap();
         self.db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('continuity_loss',?1)",[serde_json::to_vec(loss).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;Ok(())
@@ -91,14 +90,20 @@ impl Journal {
         let tx=self.db.transaction().map_err(|error|error.to_string())?;
         for run in &loss.affected_runs {tx.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;}
         tx.execute("DELETE FROM metadata WHERE key='continuity_loss'",[]).map_err(|error|error.to_string())?;tx.commit().map_err(|error|error.to_string())?;
-        for run in loss.affected_runs {self.run_ids.remove(&run);}self.last_loss=None;Ok(())
+        for run in loss.affected_runs {self.run_ids.remove(&run);self.finished_runs.remove(&run);}self.last_loss=None;Ok(())
     }
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(update,Update::Execution {..}|Update::Attention(_)) { return Ok(()); }
-        if let Update::Execution {run,..}=update {self.run_ids.insert(*run);}
         if self.loss()?.is_some() { return Err("Actor outcome journal already has a recorded loss".into()); }
+        if let Update::Execution {run,..}=update {
+            if self.run_ids.len()>=MAX_ENTRIES && !self.run_ids.contains(run) {
+                self.run_ids.insert(*run);self.record_loss("Retained actor run identity capacity reached; outcome continuity is unconfirmed")?;
+                return Err("Retained actor run identity capacity reached".into());
+            }
+            self.run_ids.insert(*run);
+        }
         let bytes = serde_json::to_vec(update).map_err(|error|error.to_string())?;
         let (count, retained):(usize,usize)=self.db.query_row(
             "SELECT COUNT(*),COALESCE(SUM(LENGTH(payload)),0) FROM outcomes",[],|row|Ok((row.get(0)?,row.get(1)?)))
@@ -111,11 +116,15 @@ impl Journal {
         if let Update::Execution {run,..}=update {self.check_run_capacity(*run)?;}
         let tx=self.db.transaction().map_err(|error|error.to_string())?;
         tx.execute("INSERT INTO outcomes(payload) VALUES(?1)",[bytes]).map_err(|error|error.to_string())?;
+        let sequence=tx.last_insert_rowid() as u64;
         if let Update::Execution {run,update}=update {
             let finished=matches!(update,crate::agent_execution::Update::Finished{..}).then(||tx.last_insert_rowid());
             tx.execute("INSERT INTO retained_runs(run,finished) VALUES(?1,?2) ON CONFLICT(run) DO UPDATE SET finished=COALESCE(excluded.finished,retained_runs.finished)",params![run.to_string(),finished]).map_err(|error|error.to_string())?;
         }
-        tx.commit().map_err(|error|error.to_string())
+        tx.commit().map_err(|error|error.to_string())?;
+        self.outcome_latest=sequence;
+        if let Update::Execution {run,update:crate::agent_execution::Update::Finished{..}}=update {self.finished_runs.insert(*run,sequence);}
+        Ok(())
     }
     pub fn page(&self, after:u64) -> Result<Vec<OutboxEntry>,String> {
         let ack=self.number("outcome_ack")?;
@@ -148,7 +157,8 @@ impl Journal {
         tx.execute("DELETE FROM outcomes WHERE sequence<=?1",[through]).map_err(|error|error.to_string())?;
         tx.execute("UPDATE metadata SET value=?1 WHERE key='outcome_ack'",[through.to_string()]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error|error.to_string())?;
-        self.run_ids=self.retained_runs()?.into_iter().collect();Ok(())
+        self.outcome_ack=through;
+        self.finished_runs.retain(|run,sequence| {if *sequence<=through {self.run_ids.remove(run);false}else {true}});Ok(())
     }
     pub fn input(&self, identity:&InputIdentity) -> Result<Option<InputReceipt>,String> {
         let stored:Option<(String,Vec<u8>,Vec<u8>)>=self.db.query_row("SELECT id,hash,state FROM inputs WHERE sequence=?1",[identity.sequence],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
@@ -161,16 +171,11 @@ impl Journal {
         Ok(None)
     }
     fn check_run_capacity(&self,run:crate::model::RunId)->Result<(),String> {
-        let (count,exists):(usize,bool)=self.db.query_row("SELECT COUNT(*),EXISTS(SELECT 1 FROM retained_runs WHERE run=?1) FROM retained_runs",[run.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|error|error.to_string())?;
-        if count>=MAX_ENTRIES && !exists {return Err("Retained actor run identity capacity reached; outcome continuity is unconfirmed".into());}Ok(())
+        if self.run_ids.len()>=MAX_ENTRIES && !self.run_ids.contains(&run) {return Err("Retained actor run identity capacity reached; outcome continuity is unconfirmed".into());}Ok(())
     }
-    pub fn retained_runs(&self)->Result<Vec<crate::model::RunId>,String> {
-        let mut query=self.db.prepare("SELECT run FROM retained_runs ORDER BY run").map_err(|error|error.to_string())?;
-        let rows=query.query_map([],|row|row.get::<_,String>(0)).map_err(|error|error.to_string())?;
-        rows.map(|row|row.map_err(|error|error.to_string())?.parse().map_err(|_|"Invalid retained run identity".to_owned())).collect()
-    }
+    pub fn retained_runs(&self)->Result<Vec<crate::model::RunId>,String> {Ok(self.run_ids.iter().copied().collect())}
     pub fn refuse_unexecuted_run(&mut self,run:crate::model::RunId)->Result<(),String> {
-        self.db.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;self.run_ids.remove(&run);Ok(())
+        self.db.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;self.run_ids.remove(&run);self.finished_runs.remove(&run);Ok(())
     }
     pub fn admit(&mut self,identity:&InputIdentity) -> Result<InputReceipt,String> {self.admit_with_run(identity,None)}
     pub fn admit_with_run(&mut self,identity:&InputIdentity,run:Option<crate::model::RunId>) -> Result<InputReceipt,String> {
@@ -188,6 +193,7 @@ impl Journal {
         if let Some(run)=run {tx.execute("INSERT OR IGNORE INTO retained_runs(run,finished) VALUES(?1,NULL)",[run.to_string()]).map_err(|error|error.to_string())?;}
         tx.execute("UPDATE metadata SET value=?1 WHERE key='input_sequence'",[identity.sequence.to_string()]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error|error.to_string())?;
+        self.input_sequence=identity.sequence;
         if let Some(run)=run {self.run_ids.insert(run);}
         Ok(InputReceipt {identity:identity.clone(),state})
     }
@@ -212,7 +218,7 @@ impl Journal {
     }
     pub fn next_input(&self)->Result<u64,String> {self.number("input_sequence")?.checked_add(1).ok_or("Input sequence exhausted".into())}
     pub fn acknowledged(&self)->Result<u64,String> {self.number("outcome_ack")}
-    pub fn latest(&self)->Result<u64,String> {let ack=self.acknowledged()?;self.db.query_row("SELECT COALESCE(MAX(sequence),?1) FROM outcomes",[ack],|row|row.get(0)).map_err(|error|error.to_string())}
+    pub fn latest(&self)->Result<u64,String> {Ok(self.outcome_latest)}
     pub fn restart(&self,id:uuid::Uuid,hash:&[u8;32])->Result<Option<super::restart::RestartState>,String> {
         let row:Option<(Vec<u8>,Vec<u8>)>=self.db.query_row("SELECT hash,state FROM restarts WHERE id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error|error.to_string())?;
         row.map(|(stored,state)| {if stored.as_slice()!=hash {return Err("Restart identity was already used for a different launch".into());}serde_json::from_slice(&state).map_err(|error|error.to_string())}).transpose()
@@ -227,8 +233,7 @@ impl Journal {
         self.db.execute("UPDATE restarts SET state=?1 WHERE id=?2",params![serde_json::to_vec(&state).map_err(|error|error.to_string())?,id.to_string()]).map_err(|error|error.to_string())?;Ok(state)
     }
     fn number(&self,key:&str)->Result<u64,String> {
-        let value:String=self.db.query_row("SELECT value FROM metadata WHERE key=?1",[key],|row|row.get(0)).map_err(|error|error.to_string())?;
-        value.parse().map_err(|_|"Invalid actor journal sequence".into())
+        match key {"input_sequence"=>Ok(self.input_sequence),"outcome_ack"=>Ok(self.outcome_ack),_=>Err("Invalid actor journal sequence".into())}
     }
 }
 
@@ -273,6 +278,16 @@ mod tests {
         assert!(journal.admit(&identity).is_err());
         let mut next=identity.clone();next.sequence=3;next.id=uuid::Uuid::new_v4();assert!(journal.admit(&next).is_err());
         next.sequence=2;assert!(journal.admit(&next).is_ok());
+    }
+    #[test]
+    fn resident_loss_metadata_remains_available_when_the_journal_storage_is_unavailable() {
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),4096).unwrap();
+        let run=crate::model::RunId::new();journal.admit_with_run(&InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:[7;32]},Some(run)).unwrap();
+        journal.db.execute_batch("DROP TABLE metadata; DROP TABLE retained_runs;").unwrap();
+        assert!(journal.record_loss("storage failed").is_err(),"disk persistence failure is reported honestly");
+        let loss=journal.continuity_loss().unwrap().unwrap();assert_eq!(loss.affected_runs,vec![run]);
+        assert_eq!(journal.next_input().unwrap(),2);assert_eq!(journal.latest().unwrap(),0);assert_eq!(journal.acknowledged().unwrap(),0);assert_eq!(journal.retained_runs().unwrap(),vec![run]);
+        assert!(journal.ack_loss(loss.id).is_err());assert!(!journal.continuity_loss().unwrap().unwrap().acknowledged);
     }
     #[test]
     fn typed_loss_requires_exact_durable_ack_and_explicit_restart_reset() {
