@@ -4,11 +4,12 @@
 //!
 //! Every assertion here is made against a temporary worktree and a local bare
 //! remote created by this test, and is cross-checked with plain `git` where the
-//! service claims a repository-visible effect. Nothing reads the developer's
-//! configuration: raw setup commands and every command the service runs are
-//! given `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointing at `/dev/null` plus
-//! an explicit identity, so a local `diff.renames`, `commit.gpgsign`, or
-//! `core.hooksPath` cannot change the outcome.
+//! service claims a repository-visible effect. Setup commands and every
+//! command the service runs use `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointing
+//! at `/dev/null` plus a fixed identity. Raw fixture commands also scrub
+//! inherited Git overrides and disable templates, hooks and fsmonitor. Service
+//! commands keep the intentional local hooks and inherited-config contracts
+//! exercised below.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -143,9 +144,39 @@ impl Fixture {
     /// arbitrary byte string and one of these tests has to hand `git` a branch
     /// name that no encoding decodes.
     fn run<S: AsRef<OsStr> + fmt::Debug>(&self, cwd: &Path, arguments: &[S]) -> Vec<u8> {
+        let output = self
+            .command(cwd)
+            .args(arguments)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// Raw setup and observation commands own their environment. Service
+    /// commands retain their separate policy, including intentional hook and
+    /// inherited-config contracts tested below.
+    fn command(&self, cwd: &Path) -> Command {
         let mut command = Command::new(&self.git);
-        command.current_dir(cwd).args(arguments);
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
         command
+            .current_dir(cwd)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
+            ])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -155,17 +186,8 @@ impl Fixture {
             .env("GIT_COMMITTER_NAME", "Cagents Contract")
             .env("GIT_COMMITTER_EMAIL", "contract@example.invalid")
             .env("GIT_AUTHOR_DATE", "1700000000 +0000")
-            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
-        let output = command.output().expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {arguments:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output.stdout
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000");
+        command
     }
 
     fn git_in_work<S: AsRef<OsStr> + fmt::Debug>(&self, arguments: &[S]) -> Vec<u8> {
@@ -183,17 +205,11 @@ impl Fixture {
     /// failure raised inside a write loop, which reaches `exit` as 255. A test
     /// that pins only the wording cannot tell those apart.
     fn run_failing_status(&self, cwd: &Path, arguments: &[&str]) -> (Option<i32>, String) {
-        let mut command = Command::new(&self.git);
-        command.current_dir(cwd).args(arguments);
-        command
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
-        let output = command.output().expect("git runs");
+        let output = self
+            .command(cwd)
+            .args(arguments)
+            .output()
+            .expect("git runs");
         assert!(
             !output.status.success(),
             "git {arguments:?} was expected to fail"
@@ -368,11 +384,9 @@ fn merge_conflicts_expose_index_stages_and_conflict_kinds() {
     fixture.git_in_work(&["add", "-A"]);
     fixture.commit("ours");
 
-    let merge = Command::new(&fixture.git)
-        .current_dir(fixture.work())
+    let merge = fixture
+        .command(&fixture.work())
         .args(["merge", "--no-edit", "theirs"])
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("git merge runs");
     assert!(!merge.status.success(), "the merge must conflict");
@@ -1715,12 +1729,9 @@ fn git_answers_missing_for_an_object_this_repository_does_not_have() {
     let absent = Oid::parse("f".repeat(40)).expect("object id");
     let present = fixture.text(&["rev-parse", "HEAD:a.txt"]);
 
-    let mut child = Command::new("git")
-        .current_dir(fixture.work())
+    let mut child = fixture
+        .command(&fixture.work())
         .args(["cat-file", "--batch"])
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
