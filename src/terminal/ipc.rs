@@ -967,16 +967,28 @@ pub fn terminal_handoff_json_bytes(receipt: &TerminalHandoffReceipt) -> io::Resu
 }
 
 pub(crate) fn bounded_json_bytes(value: &impl Serialize, maximum: usize) -> io::Result<usize> {
-    struct Counter { bytes: usize, maximum: usize }
+    struct Counter {
+        bytes: usize,
+        maximum: usize,
+    }
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let required = self.bytes.checked_add(bytes.len())
+            let required = self
+                .bytes
+                .checked_add(bytes.len())
                 .filter(|required| *required <= self.maximum)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "terminal handoff JSON exceeds its reserved byte limit"))?;
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "terminal handoff JSON exceeds its reserved byte limit",
+                    )
+                })?;
             self.bytes = required;
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     let mut counter = Counter { bytes: 0, maximum };
     serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;

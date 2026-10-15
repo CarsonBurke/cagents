@@ -57,30 +57,80 @@ mod tests {
     use super::*;
     #[test]
     fn escaped_source_and_paired_recipe_fit_the_independent_json_reservation() {
-        let proof = HostSessionProof { host_session_id: "escaped-json".into(), boot_id: "boot".into(), host_incarnation: "incarnation".into() };
-        let recipe = crate::model::LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(), working_directory: "/fixture".into(),
-            environment: BTreeMap::from([("ESCAPED".into(), "\u{1}".repeat(60 * 1024))]), unset_environment: Default::default() };
-        let source = Session { id: TerminalId::new(), proof: Some(proof), launch: chat::Launch { provider: Provider::Omp, recipe: recipe.clone(), session_id: Some("original".into()) },
-            terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
-        let original = ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
-        let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(source.id, recipe.clone(), None);
+        let proof = HostSessionProof {
+            host_session_id: "escaped-json".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "incarnation".into(),
+        };
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/fixture".into(),
+            environment: BTreeMap::from([("ESCAPED".into(), "\u{1}".repeat(60 * 1024))]),
+            unset_environment: Default::default(),
+        };
+        let source = Session {
+            id: TerminalId::new(),
+            proof: Some(proof),
+            launch: chat::Launch {
+                provider: Provider::Omp,
+                recipe: recipe.clone(),
+                session_id: Some("original".into()),
+            },
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+        };
+        let original = ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
+        };
+        let mut terminal =
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(source.id, recipe.clone(), None);
         terminal.execution_instance = uuid::Uuid::new_v4();
-        let mut post = original.clone(); post.backend = uuid::Uuid::new_v4(); post.source.terminal = Some(terminal.session.clone());
+        let mut post = original.clone();
+        post.backend = uuid::Uuid::new_v4();
+        post.source.terminal = Some(terminal.session.clone());
         // Every admitted variable component has both wire AND JSON bounds
         // BEFORE any provider/terminal operation. The fixture invokes no IO.
-        bindings(&original, &original).unwrap(); super::recipe(&recipe).unwrap();
-        let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
-            source_execution_instance: original.execution_instance, source_binding: original, retained_binding: Some(post),
-            terminal_native_epoch: uuid::Uuid::new_v4(), terminal };
+        bindings(&original, &original).unwrap();
+        super::recipe(&recipe).unwrap();
+        let receipt = TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(),
+            source,
+            source_execution_instance: original.execution_instance,
+            source_binding: original,
+            retained_binding: Some(post),
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal,
+        };
         super::receipt(&receipt).unwrap();
         let json = crate::terminal_ipc::terminal_handoff_json_bytes(&receipt).unwrap();
         assert_eq!(json, serde_json::to_vec(&receipt).unwrap().len());
-        let mut wire = Vec::new(); FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(&mut wire, &receipt).unwrap();
-        assert!(json > wire.len() * 4, "actual control escaping must make the old wire-only inference invalid");
+        let mut wire = Vec::new();
+        FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+            .write(&mut wire, &receipt)
+            .unwrap();
+        assert!(
+            json > wire.len() * 4,
+            "actual control escaping must make the old wire-only inference invalid"
+        );
         assert!(json <= crate::terminal_ipc::MAX_HANDOFF_RECEIPT_JSON_BYTES);
         let mut oversized = receipt;
-        oversized.source.launch.recipe.environment.insert("ESCAPED".into(), "\u{1}".repeat(2 * 1024 * 1024));
-        assert!(crate::terminal_ipc::terminal_handoff_json_bytes(&oversized).is_err(), "exact issuer never exceeds the shared persisted promise");
-        assert!(component(&oversized.source).is_err(), "oversize input is refused at preflight before effects");
+        oversized
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("ESCAPED".into(), "\u{1}".repeat(2 * 1024 * 1024));
+        assert!(
+            crate::terminal_ipc::terminal_handoff_json_bytes(&oversized).is_err(),
+            "exact issuer never exceeds the shared persisted promise"
+        );
+        assert!(
+            component(&oversized.source).is_err(),
+            "oversize input is refused at preflight before effects"
+        );
     }
 }

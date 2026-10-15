@@ -352,7 +352,11 @@ impl HostState {
         !self.spawning.is_empty()
     }
     #[cfg(test)]
-    pub(super) fn observe_terminal_worker_for_test(&mut self, id: TerminalId, instance: uuid::Uuid) {
+    pub(super) fn observe_terminal_worker_for_test(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+    ) {
         self.published_terminal_workers.observe(id, instance);
     }
     #[cfg(test)]

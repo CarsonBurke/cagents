@@ -790,7 +790,12 @@ mod tests {
             move |update| {
                 let host = notified.lock().unwrap().clone();
                 if let Some(host) = host {
-                    super::super::chat::changed_owned(&host, notified_id, execution_instance, update);
+                    super::super::chat::changed_owned(
+                        &host,
+                        notified_id,
+                        execution_instance,
+                        update,
+                    );
                 }
             },
         )
@@ -1398,8 +1403,13 @@ mod tests {
 
     #[test]
     fn console_pair_claim_preserves_the_exact_operation_across_lost_disposition_reply() {
-        let exact = std::thread::current().name().expect("named contract").to_owned();
-        if runtime::isolated_backend_contract(&exact) { return; }
+        let exact = std::thread::current()
+            .name()
+            .expect("named contract")
+            .to_owned();
+        if runtime::isolated_backend_contract(&exact) {
+            return;
+        }
         // Actual owning Codex view caller + private framed process/PTY. This
         // proves lifecycle authority, not installed Codex protocol acceptance.
         let fixture = fixture_provider(0, Provider::Codex);
@@ -1416,36 +1426,85 @@ mod tests {
         struct TerminalCleanup(std::sync::Mutex<Option<TerminalHandle>>);
         impl Drop for TerminalCleanup {
             fn drop(&mut self) {
-                if let Some(handle) = self.0.get_mut().unwrap_or_else(|p| p.into_inner()).take() { let _ = handle.shutdown(); }
+                if let Some(handle) = self.0.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
+                    let _ = handle.shutdown();
+                }
             }
         }
         let cleanup = TerminalCleanup(std::sync::Mutex::new(None));
         let failure = super::super::chat::codex_terminal_view_with(
-            &fixture.host, 1, id, &fixture.handle, before.clone(), before.launch.recipe.clone(), || {
-                *cleanup.0.lock().unwrap() = Some(fixture.host.lock().unwrap().chats[&id].paired_terminal.as_ref().unwrap().clone());
-                let refused = fixture.handle.command(chat::Command::Prompt { text: "__fixture_next_thread".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap_err();
+            &fixture.host,
+            1,
+            id,
+            &fixture.handle,
+            before.clone(),
+            before.launch.recipe.clone(),
+            || {
+                *cleanup.0.lock().unwrap() = Some(
+                    fixture.host.lock().unwrap().chats[&id]
+                        .paired_terminal
+                        .as_ref()
+                        .unwrap()
+                        .clone(),
+                );
+                let refused = fixture
+                    .handle
+                    .command(chat::Command::Prompt {
+                        text: "__fixture_next_thread".into(),
+                        attachments: Vec::new(),
+                        mode: chat::PromptMode::Send,
+                    })
+                    .unwrap_err();
                 assert!(refused.contains("pending terminal handoff"));
-                assert_eq!(fixture.handle.confirmed_session_id().as_deref(), Some(first));
+                assert_eq!(
+                    fixture.handle.confirmed_session_id().as_deref(),
+                    Some(first)
+                );
                 // The actual actor will apply release; only its returned reply
                 // is lost at the Local boundary. The host must retain/replay
                 // its already-issued operation instead of creating another PTY.
                 fixture.handle.lose_next_source_release_reply_for_test();
             },
-        ).unwrap_err();
-        assert!(failure.message.contains("lost the applied source-claim disposition reply"), "{failure:?}");
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .message
+                .contains("lost the applied source-claim disposition reply"),
+            "{failure:?}"
+        );
         let (issued, worker) = {
             let state = fixture.host.lock().unwrap();
             let record = &state.chats[&id];
-            let receipt = record.handoff_receipt.clone().expect("full operation must precede final release");
+            let receipt = record
+                .handoff_receipt
+                .clone()
+                .expect("full operation must precede final release");
             assert_eq!(receipt.source_binding, expected);
-            assert!(state.validate_terminal_handoff_receipt(&receipt).is_err(), "unconfirmed disposition is not execution authority");
+            assert!(
+                state.validate_terminal_handoff_receipt(&receipt).is_err(),
+                "unconfirmed disposition is not execution authority"
+            );
             (receipt, record.paired_terminal.as_ref().unwrap().clone())
         };
         assert!(!fixture.handle.is_completed());
         assert!(!worker.is_completed());
-        let response = super::super::chat::process(&fixture.host, 1, ClientRequest::ChatReturnTerminal { chat_id: id, expected: expected.clone() }).unwrap();
-        let ServerResponse::ChatTerminal { receipt, .. } = response else { panic!("missing exact returned-terminal receipt"); };
-        assert_eq!(receipt, issued, "retry cannot mint another operation or refresh source authority");
+        let response = super::super::chat::process(
+            &fixture.host,
+            1,
+            ClientRequest::ChatReturnTerminal {
+                chat_id: id,
+                expected: expected.clone(),
+            },
+        )
+        .unwrap();
+        let ServerResponse::ChatTerminal { receipt, .. } = response else {
+            panic!("missing exact returned-terminal receipt");
+        };
+        assert_eq!(
+            receipt, issued,
+            "retry cannot mint another operation or refresh source authority"
+        );
         {
             let state = fixture.host.lock().unwrap();
             assert!(state.terminals[&id].handle.same_worker(&worker));
@@ -1457,8 +1516,17 @@ mod tests {
         // Its producer callback revokes the old receipt without a fresh Read.
         confirm_fixture_thread(&fixture, "__fixture_next_thread", second);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while fixture.host.lock().unwrap().validate_terminal_handoff_receipt(&receipt).is_ok() {
-            assert!(Instant::now() < deadline, "actual provider identity failed to revoke the old operation");
+        while fixture
+            .host
+            .lock()
+            .unwrap()
+            .validate_terminal_handoff_receipt(&receipt)
+            .is_ok()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "actual provider identity failed to revoke the old operation"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
         observe_chat_directory_thread(&fixture.host, id, instance, true).unwrap();

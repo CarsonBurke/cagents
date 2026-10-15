@@ -27,14 +27,31 @@ impl BackendIdentity {
             && self.valid()
     }
     pub(super) fn matches_actor(&self, actor: &super::Actor) -> bool {
-        let current = actor.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
-        let process = actor.native_peer.clone().or_else(|| actor.provider_process.lock().unwrap_or_else(|p| p.into_inner()).clone());
-        !actor.close_state.lock().unwrap_or_else(|p| p.into_inner()).unobserved_native
+        let current = actor
+            .backend_conversation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let process = actor.native_peer.clone().or_else(|| {
+            actor
+                .provider_process
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        !actor
+            .close_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unobserved_native
             && self.actor == actor.backend_instance
             && process.as_ref() == Some(&self.process)
             && self.conversation == current.thread
             && self.conversation_revision == current.revision
-            && *actor.confirmed_session.lock().unwrap_or_else(|p| p.into_inner()) == current.thread
+            && *actor
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                == current.thread
             && self.valid()
     }
     pub(super) fn belongs_to_helper(&self, helper: uuid::Uuid) -> bool {
@@ -71,7 +88,10 @@ pub(crate) enum BackendSourceClaim {
 impl BackendSourceClaim {
     #[cfg(test)]
     pub(crate) fn into_result(self) -> Result<uuid::Uuid, String> {
-        match self { Self::Granted(token) => Ok(token), Self::Refused(reason) => Err(reason) }
+        match self {
+            Self::Granted(token) => Ok(token),
+            Self::Refused(reason) => Err(reason),
+        }
     }
 }
 
@@ -389,48 +409,89 @@ impl Handle {
             }
         }
     }
-    pub(crate) fn claim_backend_source(&self, expected: &BackendIdentity) -> Result<BackendSourceClaim, String> {
+    pub(crate) fn claim_backend_source(
+        &self,
+        expected: &BackendIdentity,
+    ) -> Result<BackendSourceClaim, String> {
         match &self.0 {
-            Owner::Local(local) if expected.helper.is_none() => local.claim_backend_source(expected),
-            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) =>
-                remote.call("claim_backend_source", serde_json::json!([expected])),
+            Owner::Local(local) if expected.helper.is_none() => {
+                local.claim_backend_source(expected)
+            }
+            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) => {
+                remote.call("claim_backend_source", serde_json::json!([expected]))
+            }
             _ => Err("The actual backend owner changed before handoff admission".into()),
         }
     }
     #[cfg(test)]
-    pub(crate) fn claim_backend_source_losing_reply_for_test(&self, expected: &BackendIdentity) -> Result<(), String> {
-        self.local_actor()?.claim_backend_source_losing_reply_for_test(expected)
+    pub(crate) fn claim_backend_source_losing_reply_for_test(
+        &self,
+        expected: &BackendIdentity,
+    ) -> Result<(), String> {
+        self.local_actor()?
+            .claim_backend_source_losing_reply_for_test(expected)
     }
     #[cfg(test)]
     pub(crate) fn withdraw_backend_observation_for_test(&self) {
-        self.local_actor().expect("fixture requires actual Local actor").withdraw_backend_observation_for_test();
+        self.local_actor()
+            .expect("fixture requires actual Local actor")
+            .withdraw_backend_observation_for_test();
     }
     #[cfg(test)]
     pub(crate) fn lose_next_source_release_reply_for_test(&self) {
-        self.local_actor().expect("fixture requires actual Local actor").lose_next_source_release_reply_for_test();
+        self.local_actor()
+            .expect("fixture requires actual Local actor")
+            .lose_next_source_release_reply_for_test();
     }
-    pub(crate) fn release_backend_source(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> Result<(), String> {
+    pub(crate) fn release_backend_source(
+        &self,
+        expected: &BackendIdentity,
+        claim: uuid::Uuid,
+    ) -> Result<(), String> {
         match &self.0 {
-            Owner::Local(local) if expected.helper.is_none() => local.release_backend_source(expected, claim),
-            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) =>
-                remote.call("release_backend_source", serde_json::json!([expected, claim])),
+            Owner::Local(local) if expected.helper.is_none() => {
+                local.release_backend_source(expected, claim)
+            }
+            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) => remote
+                .call(
+                    "release_backend_source",
+                    serde_json::json!([expected, claim]),
+                ),
             _ => Err("The actual backend owner changed before handoff disposition".into()),
         }
     }
-    pub(crate) fn close_backend_source(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> Result<(), String> {
+    pub(crate) fn close_backend_source(
+        &self,
+        expected: &BackendIdentity,
+        claim: uuid::Uuid,
+    ) -> Result<(), String> {
         match &self.0 {
-            Owner::Local(local) if expected.helper.is_none() => local.close_backend_source(expected, claim),
-            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) =>
-                remote.close_method("close_backend_source", serde_json::json!([expected, claim])),
+            Owner::Local(local) if expected.helper.is_none() => {
+                local.close_backend_source(expected, claim)
+            }
+            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) => {
+                remote.close_method("close_backend_source", serde_json::json!([expected, claim]))
+            }
             _ => Err("The actual backend owner changed; no provider was stopped".into()),
         }
     }
-    pub(crate) fn update_claimed_native_source(&self, expected: &BackendIdentity, claim: uuid::Uuid,
-        source: chat::Session, console: Option<crate::model::LaunchRecipe>, pair: Option<crate::terminal::holder::Record>) -> Result<(), String> {
+    pub(crate) fn update_claimed_native_source(
+        &self,
+        expected: &BackendIdentity,
+        claim: uuid::Uuid,
+        source: chat::Session,
+        console: Option<crate::model::LaunchRecipe>,
+        pair: Option<crate::terminal::holder::Record>,
+    ) -> Result<(), String> {
         match &self.0 {
-            Owner::Local(local) if expected.helper.is_none() => local.update_claimed_native_source(expected, claim, source, console, pair),
-            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) =>
-                remote.call("update_claimed_source", serde_json::json!([expected, claim, source, console, pair])),
+            Owner::Local(local) if expected.helper.is_none() => {
+                local.update_claimed_native_source(expected, claim, source, console, pair)
+            }
+            Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) => remote
+                .call(
+                    "update_claimed_source",
+                    serde_json::json!([expected, claim, source, console, pair]),
+                ),
             _ => Err("The actual backend owner changed; no source was updated".into()),
         }
     }

@@ -1437,7 +1437,11 @@ impl ClientHandle {
     /// This withdraws authority and never constructs a replacement binding.
     #[cfg(test)]
     pub(crate) fn clear_source_binding_for_test(&self) {
-        *self.inner.source_binding.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .inner
+            .source_binding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Latest authenticated live source metadata; absence grants no new authority.
