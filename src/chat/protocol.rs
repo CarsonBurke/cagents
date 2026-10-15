@@ -197,6 +197,10 @@ pub struct Step {
     /// cannot replace the current conversation's notification context/error.
     /// This transport-local flag never enters the shared wire codec.
     pub suppress_current_notification: bool,
+    /// Bounded pre-acknowledgement context selected by the exact accepted
+    /// provider turn. Restores only notification metadata, never transcript
+    /// deltas that would otherwise be appended a second time.
+    pub notification_preview: Option<super::notification::Preview>,
     /// Written in order before the next incoming frame is processed.
     pub writes: Vec<Value>,
     pub events: Vec<Event>,

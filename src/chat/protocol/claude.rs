@@ -416,6 +416,7 @@ impl Claude {
         wire.remove("_cagents_permission_update");
         Ok(Step {
             suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
             events: vec![],
         })
@@ -752,6 +753,7 @@ impl Claude {
         }
         let mut step = Step {
             suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],
@@ -820,6 +822,7 @@ impl Claude {
             );
             return Ok(Step {
                 suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![
                     json!({"type":"control_response", "response":{"subtype":"error", "request_id":id, "error":error}}),
                 ],
@@ -4879,6 +4882,7 @@ impl Claude {
         }
         let mut step = Step {
             suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],

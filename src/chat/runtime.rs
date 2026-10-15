@@ -2198,6 +2198,11 @@ impl Actor {
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         let suppress_current_notification = step.suppress_current_notification;
+        if !suppress_current_notification {
+            if let Some(preview) = &step.notification_preview {
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).notification_preview = Arc::new(preview.clone());
+            }
+        }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -2312,13 +2317,17 @@ impl Actor {
                 }
             };
             if let Some(events) = events {
-                if events.is_empty() {
+                if events.is_empty() || suppress_current_notification {
                     self.touch();
                 }
                 for event in events {
-                    if suppress_current_notification && matches!(event,
-                        Event::Error { .. } | Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. })
-                    {
+                    // Preserve history and independently identified children
+                    // and requests. Old parent-turn scalar metadata cannot
+                    // replace the current turn's state or notification input.
+                    if suppress_current_notification && matches!(&event,
+                        Event::Error { .. } | Event::Usage(_) | Event::Plan { .. }
+                        | Event::Status { .. } | Event::Waiting(_)
+                        | Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }) {
                         continue;
                     }
                     let content = matches!(&event, Event::TurnFinished { .. })
@@ -3269,6 +3278,7 @@ mod tests {
                 self.run = Some(run);
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![serde_json::json!({"final":true})],
                     events: vec![
                         Event::Execution {
@@ -3286,6 +3296,7 @@ mod tests {
                 let run = self.run.take().unwrap();
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![
                         Event::Execution {
@@ -4780,6 +4791,7 @@ mod tests {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
                 suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![json!({"text": "hello"})],
                 events: Vec::new(),
             })
@@ -4790,6 +4802,7 @@ mod tests {
             }
             Ok(Step {
                 suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![json!({"text": " world"})],
                 events: Vec::new(),
             })
@@ -4797,6 +4810,7 @@ mod tests {
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
                 suppress_current_notification: false,
+                notification_preview: None,
                 writes: Vec::new(),
                 events: vec![Event::TextDelta {
                     id: "echo".into(),
@@ -5421,6 +5435,7 @@ mod tests {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({})],
                     events: Vec::new(),
                 })
@@ -5431,6 +5446,7 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![Event::AccountUsage(report())],
                 })
@@ -5495,6 +5511,7 @@ mod tests {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({})],
                     events: Vec::new(),
                 })
@@ -5506,6 +5523,7 @@ mod tests {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![
                         Event::Session {
@@ -5666,6 +5684,7 @@ mod tests {
             if command == Command::Interrupt {
                 Ok(Step {
                     suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
                     events: Vec::new(),
                 })
