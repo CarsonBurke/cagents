@@ -1390,6 +1390,31 @@ mod tests {
         (app, doomed, survivor, conversation)
     }
 
+    #[test]
+    fn mark_channel_read_keeps_attention_row_until_real_sidebar_navigation() {
+        let (mut app, channel, other, card) = channel_with_a_conversation();
+        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        app.sidebar_state.observe_card_update(card);
+        app.refresh_sidebar_channels();
+        let row = sidebar::SelectionRow::Channel(channel);
+        let before = sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(before.contains(&row));
+        drop(<Cagents as cosmic::Application>::update(&mut app, Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false), before);
+        assert!(app.sidebar_state.attention_retained(row));
+        assert!(sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, true).contains(&row));
+        // The target's next real update is unread; retention never ACKs it.
+        app.sidebar_state.observe_card_update(card);
+        app.refresh_sidebar_channels();
+        assert!(app.sidebar_model.projects.iter().flat_map(|project| &project.channels)
+            .find(|entry| entry.id == channel).unwrap().unread);
+        drop(<Cagents as cosmic::Application>::update(&mut app, Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        drop(<Cagents as cosmic::Application>::update(&mut app, Message::Sidebar(SidebarAction::OpenChannel { channel_id: other })));
+        assert!(!app.sidebar_state.attention_retained(row));
+        assert!(!sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false).contains(&row));
+    }
+
     /// A channel's conversations are reachable nowhere else, so deleting one
     /// has to take them with it, say so first, and leave the workspace on a
     /// scope that still exists.

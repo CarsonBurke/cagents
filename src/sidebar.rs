@@ -2759,6 +2759,7 @@ pub struct SidebarState {
     worktree_sort: crate::settings::WorktreeSort,
     hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    retained_attention: BTreeSet<SelectionRow>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     /// Worktrees holding at least one open pane. Derived by the application
     /// after its updates, never while drawing, so each row's read is one
@@ -2906,6 +2907,52 @@ impl SidebarState {
 
     pub fn acknowledge_agent_update(&mut self, card: CardId) {
         self.agent_updates.remove(&card);
+    }
+
+    /// Capture the row before a user read removes its unread owner. Closing
+    /// or retiring a card deliberately does not call this method.
+    pub fn retain_card_attention(&mut self, card: CardId) {
+        let owner = self.agent_updates.get(&card).copied().flatten().or_else(|| {
+            self.agent_activity.get(&card).and_then(|entry| {
+                (entry.activity.state == crate::agent::ActivityState::Waiting)
+                    .then_some(entry.owner)
+                    .flatten()
+            })
+        });
+        if self.filter == SidebarFilter::Attention
+            && let Some((project, worktree)) = owner
+        {
+            self.retained_attention
+                .insert(SelectionRow::Worktree(project, worktree));
+        }
+    }
+
+    /// Acknowledged rows stay in this visit to Attention, without remaining unread.
+    pub fn attention_retained(&self, row: SelectionRow) -> bool {
+        self.filter == SidebarFilter::Attention && self.retained_attention.contains(&row)
+    }
+
+    pub fn retain_attention_channel(&mut self, channel: ChannelId) {
+        if self.filter == SidebarFilter::Attention {
+            self.retained_attention.insert(SelectionRow::Channel(channel));
+        }
+    }
+
+    fn attention_read(
+        &self,
+        row: SelectionRow,
+        unread: bool,
+        activity: Option<crate::agent::ActivityState>,
+    ) -> bool {
+        self.attention_retained(row)
+            && !unread
+            && activity != Some(crate::agent::ActivityState::Waiting)
+    }
+
+    /// A deliberate scope change ends retention of rows left behind. Reopening
+    /// the same row does not move it away from the pointer.
+    pub fn navigate_attention(&mut self, row: SelectionRow) {
+        self.retained_attention.retain(|retained| *retained == row);
     }
 
     pub fn has_card_update(&self, card: CardId) -> bool {
@@ -3182,7 +3229,10 @@ impl SidebarState {
     pub fn apply(&mut self, action: &SidebarAction) {
         match action {
             SidebarAction::SearchChanged(query) => self.query.clone_from(query),
-            SidebarAction::SetFilter(filter) => self.filter = *filter,
+            SidebarAction::SetFilter(filter) => {
+                self.retained_attention.clear();
+                self.filter = *filter;
+            }
             SidebarAction::ToggleControls => {
                 self.controls_expanded = !self.controls_expanded;
                 if !self.controls_expanded {
@@ -3814,6 +3864,7 @@ struct NavigationSnapshot {
     worktree_sort: crate::settings::WorktreeSort,
     hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    retained_attention: BTreeSet<SelectionRow>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
 }
@@ -3832,6 +3883,7 @@ impl NavigationSnapshot {
             && self.worktree_sort == state.worktree_sort
             && self.hide_worktree_changes_icons == state.hide_worktree_changes_icons
             && self.agent_updates == state.agent_updates
+            && self.retained_attention == state.retained_attention
             && self.agent_activity == state.agent_activity
             && self.worktrees_with_panes == state.worktrees_with_panes
     }
@@ -3850,6 +3902,7 @@ impl NavigationSnapshot {
             worktree_sort: state.worktree_sort,
             hide_worktree_changes_icons: state.hide_worktree_changes_icons,
             agent_updates: state.agent_updates.clone(),
+            retained_attention: state.retained_attention.clone(),
             agent_activity: state.agent_activity.clone(),
             worktrees_with_panes: state.worktrees_with_panes.clone(),
         }
@@ -5202,6 +5255,9 @@ fn project_view<'a>(
                             .rows
                             .group_size(SelectionRow::Channel(channel.id)),
                         &project.state.query,
+                        project.state.attention_read(
+                            SelectionRow::Channel(channel.id), channel.unread, channel.activity,
+                        ),
                     ),
                     SelectionRow::Channel(channel.id),
                     project.state,
@@ -5233,6 +5289,11 @@ fn project_view<'a>(
                             .group_size(SelectionRow::Worktree(project_id, worktree.id)),
                         &project.state.query,
                         !project.state.hide_worktree_changes_icons,
+                        project.state.attention_read(
+                            SelectionRow::Worktree(project_id, worktree.id),
+                            project.state.has_agent_update(project_id, worktree.id),
+                            project.state.agent_activity(project_id, worktree.id),
+                        ),
                     ),
                     SelectionRow::Worktree(project_id, worktree.id),
                     project.state,
@@ -5337,6 +5398,7 @@ fn compact_project<'a>(
     for channel in project.channels.iter().filter(|channel| {
         expanded
             && ((!project.state.query.trim().is_empty() && project.state.controls_expanded)
+                || project.state.attention_retained(SelectionRow::Channel(channel.id))
                 || channel.selected
                 || channel.unread
                 || channel.activity.is_some()
@@ -5352,6 +5414,9 @@ fn compact_project<'a>(
                     .rows
                     .group_size(SelectionRow::Channel(channel.id)),
                 &project.state.query,
+                project.state.attention_read(
+                    SelectionRow::Channel(channel.id), channel.unread, channel.activity,
+                ),
             ),
             SelectionRow::Channel(channel.id),
             project.state,
@@ -5366,6 +5431,7 @@ fn compact_project<'a>(
                         project_id: entity.id,
                         worktree_id: worktree.id,
                     })
+                || project.state.attention_retained(SelectionRow::Worktree(entity.id, worktree.id))
                 || project.state.has_agent_update(entity.id, worktree.id)
                 || project.state.worktree_has_panes(entity.id, worktree.id)
                 || worktree.deletion.is_some()
@@ -5394,6 +5460,11 @@ fn compact_project<'a>(
                     .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
                 &project.state.query,
                 !project.state.hide_worktree_changes_icons,
+                project.state.attention_read(
+                    SelectionRow::Worktree(entity.id, worktree.id),
+                    project.state.has_agent_update(entity.id, worktree.id),
+                    project.state.agent_activity(entity.id, worktree.id),
+                ),
             ),
             SelectionRow::Worktree(entity.id, worktree.id),
             project.state,
@@ -5471,6 +5542,14 @@ impl GlyphTone {
             Self::Draft(RowInk::Muted) => PullRequestTone::Draft.color(theme),
             Self::PullRequest(tone) => tone.color(theme),
         }
+    }
+}
+
+fn read_row_ink(ink: RowInk, retained_read: bool) -> RowInk {
+    if retained_read {
+        RowInk::Muted
+    } else {
+        ink
     }
 }
 
@@ -5612,11 +5691,20 @@ fn channel_view(
     compact: bool,
     selection_count: Option<usize>,
     query: &str,
+    retained_read: bool,
 ) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
-    let tone = channel_glyph_tone(channel);
+    let ink = deletion_ink(
+        read_row_ink(RowInk::of(channel.has_panes, channel.unread), retained_read),
+        deletion,
+    );
+    let tone = if retained_read {
+        GlyphTone::Ink(ink)
+    } else {
+        channel_glyph_tone(channel)
+    };
     let glyph = widget::container(widget::icon(Icon::Channel.handle()).size(CHILD_ROW_ICON_SIZE))
         .class(theme::Container::custom(move |theme| {
             cosmic::iced::widget::container::Style {
@@ -5629,7 +5717,7 @@ fn channel_view(
             &channel.title,
             query,
             CHILD_ROW_TEXT_SIZE,
-            channel_ink(channel).text_class(),
+            ink.text_class(),
             false,
         )
     });
@@ -5900,6 +5988,7 @@ fn worktree_view<'a>(
     selection_count: Option<usize>,
     query: &str,
     show_changes_icons: bool,
+    retained_read: bool,
 ) -> Element<'static, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
@@ -5910,7 +5999,7 @@ fn worktree_view<'a>(
             &chrome.label,
             query,
             CHILD_ROW_TEXT_SIZE,
-            deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class(),
+            deletion_ink(read_row_ink(RowInk::of(has_panes, agent_update), retained_read), deletion).text_class(),
             false,
         )
     });
@@ -5935,7 +6024,7 @@ fn worktree_view<'a>(
             }))
             .into()
     } else {
-        worktree_status_icon(worktree, false, has_panes || agent_update)
+        worktree_status_icon(worktree, false, !retained_read && (has_panes || agent_update))
     };
     let mut content = grid.content(glyph, label, indicator);
     if !compact {
@@ -9474,6 +9563,7 @@ pub fn visible_selection_rows(
                     .filter(|channel| {
                         !compact
                             || searching
+                            || state.attention_retained(SelectionRow::Channel(channel.id))
                             || channel.selected
                             || channel.unread
                             || channel.activity.is_some()
@@ -9494,6 +9584,7 @@ pub fn visible_selection_rows(
                                     project_id: project.project.id,
                                     worktree_id: worktree.id,
                                 })
+                            || state.attention_retained(SelectionRow::Worktree(project.project.id, worktree.id))
                             || state.has_agent_update(project.project.id, worktree.id)
                             || state.worktree_has_panes(project.project.id, worktree.id)
                             || state
@@ -9556,7 +9647,8 @@ fn filtered_projects<'a>(
                         && match state.filter {
                             SidebarFilter::All => true,
                             SidebarFilter::Attention => {
-                                channel.unread
+                                state.attention_retained(SelectionRow::Channel(channel.id))
+                                    || channel.unread
                                     || channel.activity
                                         == Some(crate::agent::ActivityState::Waiting)
                             }
@@ -9573,7 +9665,8 @@ fn filtered_projects<'a>(
                         SidebarFilter::All => true,
                         SidebarFilter::PullRequests => worktree.pull_request().is_some(),
                         SidebarFilter::Attention => {
-                            state.has_agent_update(project.id, worktree.id)
+                            state.attention_retained(SelectionRow::Worktree(project.id, worktree.id))
+                                || state.has_agent_update(project.id, worktree.id)
                                 || state.agent_activity(project.id, worktree.id)
                                     == Some(crate::agent::ActivityState::Waiting)
                         }
@@ -11483,7 +11576,7 @@ pub(crate) mod tests {
         );
         for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
             let renderer = headless_renderer();
-            let mut element = channel_view(&channel, modal, compact, Some(1), "");
+            let mut element = channel_view(&channel, modal, compact, Some(1), "", false);
             let mut tree = Tree::new(&element);
             let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -11567,6 +11660,7 @@ pub(crate) mod tests {
                     None,
                     "",
                     show,
+                    false,
                 )
             };
             let counts = [true, false].map(|show| {
@@ -11628,6 +11722,7 @@ pub(crate) mod tests {
                 Some(1),
                 "",
                 true,
+                false,
             );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -11996,6 +12091,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn acknowledged_attention_worktree_stays_until_navigation_or_filter_reentry() {
+        let entry = project();
+        let project = entry.id;
+        let worktree = entry.worktrees[0].id;
+        let row = SelectionRow::Worktree(project, worktree);
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        let card = CardId::new();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.observe_agent_update(card, project, worktree);
+        let before = visible_selection_rows(&model, &state, false);
+        assert!(before.contains(&row));
+        state.retain_card_attention(card);
+        state.acknowledge_agent_update(card);
+        assert!(!state.has_agent_update(project, worktree));
+        assert!(state.attention_retained(row));
+        assert_eq!(visible_selection_rows(&model, &state, false), before);
+        assert!(visible_selection_rows(&model, &state, true).contains(&row));
+        assert_eq!(read_row_ink(RowInk::Full, state.attention_retained(row)), RowInk::Muted);
+        state.navigate_attention(row);
+        assert!(visible_selection_rows(&model, &state, false).contains(&row));
+        state.navigate_attention(SelectionRow::Project(project));
+        assert!(visible_selection_rows(&model, &state, false).is_empty());
+
+        state.observe_agent_update(card, project, worktree);
+        state.retain_card_attention(card);
+        state.acknowledge_agent_update(card);
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        assert!(visible_selection_rows(&model, &state, false).is_empty());
+        assert!(!state.has_card_update(card));
+    }
+
+    #[test]
+    fn waiting_attention_visit_keeps_resolved_row_but_removal_does_not_retain() {
+        let entry = project();
+        let project = entry.id;
+        let worktree = entry.worktrees[0].id;
+        let row = SelectionRow::Worktree(project, worktree);
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        let card = CardId::new();
+        let activity = |state| crate::agent::Activity { provider: crate::agent::Provider::Claude, state };
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.set_agent_activity(card, project, worktree, activity(crate::agent::ActivityState::Waiting));
+        state.retain_card_attention(card);
+        state.acknowledge_agent_update(card);
+        state.set_agent_activity(card, project, worktree, activity(crate::agent::ActivityState::Idle));
+        assert!(visible_selection_rows(&model, &state, false).contains(&row));
+        assert!(!state.has_card_update(card));
+
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.observe_agent_update(card, project, worktree);
+        // Closing/removing a card uses the same unread removal API, without
+        // the user-read retention step.
+        state.acknowledge_agent_update(card);
+        state.clear_agent_activity(card);
+        assert!(visible_selection_rows(&model, &state, false).is_empty());
+    }
+
+    #[test]
     fn channel_attention_keeps_its_project_visible_without_unread_worktrees() {
         let mut entry = project();
         let channel_id = ChannelId::from_uuid(Uuid::from_u128(20));
@@ -12104,6 +12259,7 @@ pub(crate) mod tests {
                 None,
                 query,
                 true,
+                false,
             );
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -12483,7 +12639,7 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, false, false, Some(1), "");
+            let mut element = channel_view(channel, false, false, Some(1), "", false);
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -15068,6 +15224,7 @@ pub(crate) mod tests {
                 None,
                 "",
                 true,
+                false,
             );
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(460.0, WORKTREE_ROW_HEIGHT));
