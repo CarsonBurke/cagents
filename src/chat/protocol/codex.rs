@@ -1561,13 +1561,9 @@ impl Codex {
 
 impl Adapter for Codex {
     fn account_switch_ready(&self) -> bool {
-        self.permission_pending.is_none()
-            && !self.pending.values().any(|pending| {
-                matches!(
-                    pending,
-                    Pending::FastMode { .. } | Pending::Permission { .. }
-                )
-            })
+        // This adapter represents permission updates as Pending::Other.
+        // No outstanding setting/control or unanswered request proves ready.
+        self.pending.is_empty() && self.requests.is_empty()
     }
 
     fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {

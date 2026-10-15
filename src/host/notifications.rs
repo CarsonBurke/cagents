@@ -2,6 +2,7 @@
 //! The broker alone touches SQLite and the desktop portal, outside HostState.
 mod batching;
 mod journal;
+use journal::Journal;
 mod withdrawals;
 use withdrawals::Withdrawals;
 
