@@ -9071,7 +9071,8 @@ fn changes_footer<'a>(
             (!modal_open
                 && !source.busy()
                 && (state.commit_draft.amend
-                    || (source.head_oid.is_some() && source.operation.is_none()))).then(|| {
+                    || (source.head_oid.is_some() && source.operation.is_none())))
+            .then(|| {
                 let key = key.clone();
                 move |amend| SidebarAction::AmendChanged {
                     key: key.clone(),
