@@ -31,6 +31,17 @@ pub(crate) struct Reservation {
     token: uuid::Uuid,
 }
 impl Reservation {
+    /// Caller owns exclusive control admission through the guarded model commit.
+    /// Release only this exact lease so normal final edit admission remains on.
+    pub(super) fn release_for_commit(&self, project: &ProjectInstance) -> Result<(), ProtocolError> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.get(&self.token).is_none_or(|scope| scope.project != *project) {
+            return Err(error("The exact project-removal reservation changed; the project was kept"));
+        }
+        entries.remove(&self.token);
+        Ok(())
+    }
+
     pub(super) fn proves_foreign_orphan(&self, sources: &[HostedSession], repository: Option<&Path>) -> bool {
         self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(&self.token).is_some_and(|scope| {
             if sources.is_empty() { return false; }
@@ -416,6 +427,15 @@ pub(crate) fn ensure_agent_available(
         )
     };
     ensure_available(host, Some(&repository), None, session)
+}
+
+/// Checks the exact prepared values that Registry::apply will persist. No path
+/// resolution or SharedHost lock occurs here; HostState already owns admission.
+pub(crate) fn ensure_prepared_edit_available(entries: &Reservations, edit: &ModelEdit) -> Result<(), ProtocolError> {
+    if entries.lock().unwrap_or_else(|p| p.into_inner()).values().any(|scope| scope.edit(edit)) {
+        return Err(busy());
+    }
+    Ok(())
 }
 
 /// Called after ordinary control admission and before any public request effect.

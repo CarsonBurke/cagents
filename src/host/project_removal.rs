@@ -19,7 +19,7 @@ mod reservation;
 mod census;
 use reservation::Reservation;
 pub(super) use reservation::{
-    Reservations, admit, ensure_agent_available, ensure_available, reserve, reserve_relocation,
+    Reservations, admit, ensure_agent_available, ensure_available, ensure_prepared_edit_available, reserve, reserve_relocation,
 };
 
 const MAX_SESSIONS: usize = 4096;
@@ -277,6 +277,9 @@ pub(super) fn remove(
     }
     let _commit = gate.write().unwrap_or_else(|p| p.into_inner());
     super::client::ensure_control_open(host)?;
+    // No related work can pass admission until this guarded atomic edit ends.
+    // Remove only our exact lease; all other active reservations still apply.
+    reservation.release_for_commit(&project)?;
     super::client::process_admitted(
         host,
         client,
@@ -410,6 +413,78 @@ mod tests {
             )
         }
     }
+    #[test]
+    fn final_prepared_model_edit_refuses_an_alias_retarget_after_admission() {
+        use std::os::unix::fs::symlink;
+        for repository_alias in [false, true] {
+            let fixture = Fixture::new();
+            let replay = {
+                let mut state = fixture.host.lock().unwrap();
+                let scope = Scope::Worktree { repository:fixture.root.clone(),path:fixture.root.clone() };
+                let model = state.edit_model(1, ModelEdit::SeedView { scope:scope.clone(),panes:vec![],closed:vec![] }).unwrap();
+                let revision = model.views.iter().find(|view|view.scope==scope).unwrap().revision;
+                let edit = ModelEdit::ChangeView { scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Remove {id:crate::model::CardId::new()} };
+                state.edit_model(1, edit.clone()).unwrap();
+                edit
+            };
+            let foreign = fixture._directory.path().join("foreign");
+            std::fs::create_dir(&foreign).unwrap();
+            let alias = fixture._directory.path().join("candidate");
+            symlink(&foreign, &alias).unwrap();
+            let gate = fixture.host.lock().unwrap().control_gate.clone();
+            let reservation = {
+                let _writer = gate.write().unwrap();
+                reserve(&fixture.host, &fixture.expected, &[]).unwrap()
+            };
+            let request = ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::OpenProject {
+                    repository: if repository_alias { alias.clone() } else { foreign.clone() },
+                    checkout: (!repository_alias).then(|| alias.clone()), primary_checkout: None,
+                    name: "Replacement".into(), kind: ProjectKind::Folder,
+                },
+            };
+            let before = fixture.host.lock().unwrap().read_model().unwrap();
+            let replayed = super::super::client::process_request(&fixture.host, 1, ClientRequest::EditWorkspaceModel {edit:replay}).unwrap();
+            let ServerResponse::WorkspaceModel {model:replayed} = replayed.0 else {panic!()};
+            assert_eq!(replayed.sequence, before.sequence, "seen operations remain idempotent while reserved");
+            {
+                let _shared = gate.read().unwrap();
+                // These are the actual dispatcher admission and effect halves.
+                // External filesystem changes are not fenced by control admission.
+                admit(&fixture.host, &request).unwrap();
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&fixture.root, &alias).unwrap();
+                let failure = super::super::client::process_admitted(&fixture.host, 1, request.clone()).unwrap_err();
+                assert!(failure.message.contains("being removed"), "{failure:?}");
+            }
+            let after = fixture.host.lock().unwrap().read_model().unwrap();
+            assert_eq!(after.sequence, before.sequence);
+            assert_eq!(after.project(&fixture.root), before.project(&fixture.root));
+            assert!(after.project(&foreign).is_none());
+            // A genuinely foreign edit still passes with the same reservation.
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&foreign, &alias).unwrap();
+            let result = super::super::client::process_request(&fixture.host, 1, request).unwrap();
+            let ServerResponse::WorkspaceModel { model } = result.0 else { panic!() };
+            assert!(model.project(&foreign).is_some());
+            assert_eq!(model.project(&fixture.root), before.project(&fixture.root));
+            {
+                let _writer = gate.write().unwrap();
+                let mut wrong = fixture.expected.clone(); wrong.ordinal += 1;
+                assert!(reservation.release_for_commit(&wrong).is_err());
+                assert!(ensure_available(&fixture.host, Some(&fixture.root), None, None).is_err());
+                reservation.release_for_commit(&fixture.expected).unwrap();
+                let result = super::super::client::process_admitted(&fixture.host, 1, ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::CloseProjectInstance { project:fixture.expected.clone() },
+                }).unwrap();
+                let ServerResponse::WorkspaceModel { model } = result.0 else { panic!() };
+                assert!(model.project(&fixture.root).is_none());
+                assert!(model.project(&foreign).is_some());
+            }
+            drop(reservation);
+        }
+    }
+
     #[test]
     fn slow_project_teardown_keeps_unrelated_input_responsive_and_releases_reservation() {
         use crate::{

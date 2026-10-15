@@ -649,6 +649,7 @@ impl HostState {
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
+        let mut seen_operation = false;
         if let ModelEdit::ChangeView {
             scope,
             expected_revision,
@@ -657,9 +658,8 @@ impl HostState {
         } = &edit
         {
             let registry = self.registry()?;
-            if !registry
-                .view_operation_seen(*operation)
-                .map_err(model_unavailable)?
+            seen_operation = registry.view_operation_seen(*operation).map_err(model_unavailable)?;
+            if !seen_operation
                 && registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision
             {
                 return Err(ProtocolError::new(
@@ -668,6 +668,11 @@ impl HostState {
                     true,
                 ));
             }
+        }
+        if !seen_operation {
+            // Admission checked a separately resolved clone. Persist only final
+            // prepared values that still satisfy the active scoped reservation.
+            super::project_removal::ensure_prepared_edit_available(&self.project_removals, &edit)?;
         }
         let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
         if applied.changed {
