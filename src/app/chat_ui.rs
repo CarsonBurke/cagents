@@ -2498,7 +2498,7 @@ impl Runtime {
         self.refresh();
         let Some(prepared)=self.preparation.accept(target,id,run,ready) else { return; };
         let managed=self.preparation.contains(id);
-        let Some(cached)=self.cache.get_mut(id) else { return; };
+        let Some(cached)=self.cache.get_mut(id) else {prepared.discard();return;};
         prepared.install(cached,managed);
         self.presentation_revision=self.presentation_revision.wrapping_add(1);
         self.refresh_find();
