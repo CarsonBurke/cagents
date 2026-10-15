@@ -52,6 +52,7 @@ pub(super) struct State {
     receipt_paths: HashMap<ProjectId, Vec<PathBuf>>,
     receipt_tokens: HashMap<ProjectId, CancellationToken>,
     daemon_receipts: HashMap<PathBuf, (ProjectId, OperationId)>,
+    uncertain_receipts: HashSet<PathBuf>,
 }
 
 impl Drop for State {
@@ -206,7 +207,7 @@ impl Cagents {
             let CardKind::Terminal(session) = &card.kind else { continue; };
             if session.launch.environment.get("CAGENTS_WORKTREE_SETUP").map(String::as_str) != Some("1") { continue; }
             let path = &session.launch.working_directory;
-            if self.setup_ui.pending.contains_key(path) { continue; }
+            if self.setup_ui.pending.contains_key(path) || self.setup_ui.uncertain_receipts.contains(path) { continue; }
             // A stale retained terminal from a previous run cannot stand in
             // for the run referenced by the durable creation intent.
             if let Some(run) = self.setup_ui.expected_runs.get(path)
@@ -246,7 +247,7 @@ impl Cagents {
             && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
     }
     pub(super) fn forget_worktree_setup(&mut self, path: &Path) {
-        self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path); self.setup_ui.review_requests.remove(path); self.setup_ui.daemon_receipts.remove(path);
+        self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path); self.setup_ui.review_requests.remove(path); self.setup_ui.daemon_receipts.remove(path); self.setup_ui.uncertain_receipts.remove(path);
     }
     pub(super) fn recover_worktree_setup(&mut self, creation: OperationId, path: PathBuf, intent: SetupIntent) {
         let status = restored_setup_status(&intent);
@@ -306,6 +307,7 @@ impl Cagents {
         review.loading = false;
         match result {
             Ok(snapshot) => {
+                self.setup_ui.uncertain_receipts.remove(&review.path);
                 review.creation = snapshot.creation; review.expected = snapshot.expected;
                 review.current = snapshot.current; review.trusted = snapshot.trusted;
                 review.active = snapshot.active; review.error = snapshot.error;
@@ -398,6 +400,7 @@ impl Cagents {
         match completion {
             ReviewCompletion::Local { creation, path, intent } => self.recover_worktree_setup(creation, path, intent),
             ReviewCompletion::Remote { path, run_id, setup, warnings, skipped } => {
+                self.setup_ui.uncertain_receipts.remove(&path);
                 self.setup_ui.expected_runs.insert(path.clone(), run_id);
                 self.setup_ui.terminals.remove(&path);
                 let status = if skipped { WorktreeSetupStatus::Skipped }
@@ -560,15 +563,18 @@ impl Cagents {
             self.status = Some(TransientNotice::warning("The daemon returned ambiguous worktree setup receipts."));
             return Task::none();
         }
-        // A complete, warning-free inventory can retire removed receipts.
-        // A partial inventory preserves evidence rather than implying success.
-        if warnings.is_empty() {
-            let removed = self.setup_ui.daemon_receipts.iter().filter(|(path, (owner, _))| *owner == project && !seen.contains(*path)).map(|(path, _)| path.clone()).collect::<Vec<_>>();
-            for path in removed {
-                self.setup_ui.daemon_receipts.remove(&path);
-                if !self.setup_ui.recovered.contains_key(&path) && !self.setup_ui.pending.contains_key(&path) {
-                    self.setup_ui.statuses.remove(&path); self.setup_ui.expected_runs.remove(&path); self.setup_ui.terminals.remove(&path);
-                }
+        // Old terminal cards are not evidence that a replacement checkout
+        // inherited its creation. Preserve the receipt for an explicit review,
+        // but suppress terminal arbitration until the daemon verifies a row.
+        let omitted = self.setup_ui.daemon_receipts.iter().filter(|(path, (owner, _))| *owner == project && !seen.contains(*path)).map(|(path, _)| path.clone()).collect::<Vec<_>>();
+        for path in omitted {
+            if self.setup_ui.recovered.contains_key(&path) || self.setup_ui.pending.contains_key(&path) { continue; }
+            if known.contains(&path) {
+                self.setup_ui.uncertain_receipts.insert(path.clone());
+                self.setup_ui.statuses.insert(path, WorktreeSetupStatus::Interrupted("Setup creation identity could not be verified for this checkout. Review its files and configuration before running setup.".into()));
+            } else if warnings.is_empty() {
+                self.setup_ui.daemon_receipts.remove(&path); self.setup_ui.uncertain_receipts.remove(&path);
+                self.setup_ui.statuses.remove(&path); self.setup_ui.expected_runs.remove(&path); self.setup_ui.terminals.remove(&path);
             }
         }
         for receipt in receipts {
@@ -583,6 +589,7 @@ impl Cagents {
                 self.setup_ui.expected_runs.insert(receipt.path.clone(), run);
                 if previous != Some(run) { self.setup_ui.terminals.remove(&receipt.path); }
             }
+            self.setup_ui.uncertain_receipts.remove(&receipt.path);
             self.setup_ui.daemon_receipts.insert(receipt.path.clone(), (project, receipt.creation_id));
             self.setup_ui.statuses.insert(receipt.path, setup_summary_status(receipt.skip, receipt.copy_done, receipt.has_commands));
         }
@@ -782,6 +789,33 @@ mod tests {
         assert_eq!(app.setup_ui.expected_runs[&path], run);
         assert!(!app.setup_ui.recovered.contains_key(&path), "daemon receipts must use daemon-owned review");
         assert!(app.durable.cards.is_empty());
+    }
+
+    #[test]
+    fn omitted_daemon_creation_receipt_suppresses_old_successful_terminal_evidence() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let path = PathBuf::from("/repo/setup"); let project = ProjectId::new(); let run = OperationId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "repo".into(), "/repo".into(),
+            vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))], vec![]));
+        let mut session = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string());
+        session.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 0 } };
+        Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(session);
+        app.setup_ui.daemon_receipts.insert(path.clone(), (project, OperationId::new()));
+        app.setup_ui.expected_runs.insert(path.clone(), run);
+        app.refresh_worktree_setup_rows();
+        assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Succeeded);
+        for warnings in [vec!["Creation generation no longer matches".into()], vec![]] {
+            let request = OperationId::new(); app.setup_ui.receipt_requests.insert(project, (request, "/repo".into(), Instant::now()));
+            drop(app.finish_worktree_setup_receipts(project, "/repo".into(), request, Ok((vec![], warnings))));
+            assert!(matches!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Interrupted(_)));
+        }
+        let receipt = crate::worktree_control::SetupReceipt { path: path.clone(), creation_id: OperationId::new(), run_id: Some(OperationId::new()), skip: true, copy_done: false, has_commands: false };
+        let request = OperationId::new(); app.setup_ui.receipt_requests.insert(project, (request, "/repo".into(), Instant::now()));
+        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), request, Ok((vec![receipt], vec![]))));
+        assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Skipped);
+        assert!(!app.setup_ui.uncertain_receipts.contains(&path));
     }
 
     #[test]
