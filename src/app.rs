@@ -17478,6 +17478,26 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // This precedes every specialized repository arm as well as the
+        // generic reducer. Captured commands re-enter update after resolving.
+        if let Message::Repository(action) = &message
+            && matches!(action, RepositoryAction::DiskMetadata { .. } | RepositoryAction::Save { .. }
+                | RepositoryAction::AutoSaveDue { .. } | RepositoryAction::StageSelected { .. }
+                | RepositoryAction::ApplyDiffSelection { .. } | RepositoryAction::ApplyDiffHunk { .. }
+                | RepositoryAction::RevertFile { .. } | RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }) {
+            if self.exit.is_some() { return Task::none(); }
+            if !matches!(action, RepositoryAction::DiskMetadata { .. }) {
+                let worktree = match self.cards.get(&action.card()) {
+                    Some(CardRuntime::Repository(runtime)) => Some(runtime.descriptor.worktree.as_path()),
+                    Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.descriptor.worktree.as_path()),
+                    _ => None,
+                };
+                if worktree.is_some_and(|worktree| self.publication_recovery_blocks(worktree)) {
+                    self.status = Some(TransientNotice::warning("Resolve file recovery in this worktree before another disk operation."));
+                    return Task::none();
+                }
+            }
+        }
         let Some(message) = self.admit_modal_surface_message(message) else {
             return Task::none();
         };
@@ -18481,16 +18501,6 @@ impl Application for Cagents {
                 })
             }
             Message::Repository(action) => {
-                // Exit has already made its ownership decision. Pure metadata
-                // cannot admit its first effectful restoration capture now;
-                // completion receipts from already admitted effects still pass.
-                if self.exit.is_some() && matches!(&action,
-                    RepositoryAction::DiskMetadata { .. } | RepositoryAction::Save { .. }
-                    | RepositoryAction::AutoSaveDue { .. } | RepositoryAction::StageSelected { .. }
-                    | RepositoryAction::ApplyDiffHunk { .. } | RepositoryAction::ApplyDiffSelection { .. }
-                    | RepositoryAction::RevertFile { .. } | RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }) {
-                    return Task::none();
-                }
                 if let RepositoryAction::DiffAnnotations {
                     identity,
                     review_revision,
@@ -18504,21 +18514,6 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
-                if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::StageSelected { .. } | RepositoryAction::AutoSaveDue { .. }) {
-                    let worktree = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => Some(runtime.descriptor.worktree.as_path()),
-                        Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.descriptor.worktree.as_path()),
-                        _ => None,
-                    };
-                    if worktree.is_some_and(|worktree| self.publication_recovery_blocks(worktree)) {
-                        if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = &action
-                            && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                            runtime.take_auto_save_due(identity, *revision, *ticket);
-                        }
-                        self.status = Some(TransientNotice::warning("File recovery is pending in this worktree. Resolve it before saving or staging another file."));
-                        return Task::none();
-                    }
-                }
                 if matches!(&action, RepositoryAction::Save { overwrite: false, .. }) {
                     if let Some(task) = self.maybe_format_before_save(card) { return task; }
                 }
@@ -24589,6 +24584,20 @@ mod tests {
         drop(app.exit_after_language_servers()); assert!(app.exit.is_some());
         drop(app.update(Message::Repository(metadata)));
         assert!(!app.card_has_editor_recovery(card), "no effectful capture nonce can be admitted after the window closes");
+    }
+
+    #[test]
+    fn exit_blocks_specialized_stage_revert_and_hunk_admission_before_dispatch() {
+        let mut app = context_inspector_test_app(true); let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "clean");
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.core.set_main_window_id(Some(window::Id::unique())); drop(app.exit_after_language_servers());
+        assert!(app.exit.is_some());
+        for action in [RepositoryAction::StageSelected { card, stage: true }, RepositoryAction::RevertFile { card },
+            RepositoryAction::ApplyDiffSelection { card, kind: crate::git_patch::Kind::Stage }] {
+            assert!(app.update(Message::Repository(action)).is_none());
+            assert!(app.source_control_mutations.is_empty());
+        }
     }
 
     #[test]

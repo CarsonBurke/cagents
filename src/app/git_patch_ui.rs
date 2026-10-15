@@ -10,7 +10,7 @@ impl Cagents {
         kind: git_patch::Kind,
         request: Option<Arc<DiffMutationRequest>>,
     ) -> Task<Message> {
-        if self.modal_is_open() {
+        if self.exit.is_some() || self.modal_is_open() {
             return Task::none();
         }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
@@ -51,10 +51,11 @@ impl Cagents {
         buffer_revision: Option<u64>,
         result: Result<Option<git_patch::Patch>, String>,
     ) -> Task<Message> {
+        if self.exit.is_some() || self.publication_recovery_blocks(&key.canonical_path) { return Task::none(); }
         if !self.sidebar_model.contains_worktree(&key) {
             return Task::none();
         }
-        if self.modal_is_open() {
+        if self.exit.is_some() || self.modal_is_open() {
             self.status = Some(TransientNotice::warning(
                 "Close the dialog and retry the selected change.",
             ));
