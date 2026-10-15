@@ -232,6 +232,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn initial_publication_retries_metadata_contention_with_one_bounded_budget() {
+        let fixture=super::super::tests::resident_fixture();let actor=fixture.server.actor.clone();
+        let held=actor.0.state.lock().unwrap();let (_client,control)=UnixStream::pair().unwrap();
+        let (reply,result)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move|| {
+            let publication=fixture.server.startup_attached_until(&control,Instant::now()+Duration::from_secs(1));
+            let _=reply.send(publication);
+        });
+        assert!(matches!(result.recv_timeout(Duration::from_millis(30)),Err(crossbeam_channel::RecvTimeoutError::Timeout)),"temporary actor metadata contention must not terminate startup");
+        drop(held);
+        let publication=result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(publication.identity.record.holder,Process::read(std::process::id() as i32).unwrap());
+        worker.join().unwrap();
+
+        let fixture=super::super::tests::resident_fixture();let actor=fixture.server.actor.clone();
+        let held=actor.0.state.lock().unwrap();let (_client,control)=UnixStream::pair().unwrap();
+        let started=Instant::now();
+        let error=fixture.server.startup_attached_until(&control,started+Duration::from_millis(30)).err().unwrap();
+        assert!(error.contains("deadline"));assert!(started.elapsed()<Duration::from_millis(250));
+        drop(held);
+        assert!(fixture.server.attached().is_ok(),"a metadata timeout does not claim provider death or retire the exact actor");
+    }
+
+    #[test]
+    fn live_attach_refuses_busy_metadata_before_rotating_epoch_and_retry_keeps_identity() {
+        let mut fixture=super::super::tests::resident_fixture();let server=&mut fixture.server;
+        let actor=server.actor.clone();let identity=server.identity.clone();let epoch=server.epoch;
+        server.attachment_preserved=true;
+        let source=server.source.clone();let held=actor.0.state.lock().unwrap();
+        let error=server.invoke(Invocation {proof:server.proof.clone(),epoch:None,method:"attach".into(),args:json!([source.clone()])}).unwrap_err();
+        assert!(error.contains("CAGENTS_ACTOR_METADATA_BUSY"));assert_eq!(server.epoch,epoch);assert!(server.attachment_preserved);
+        drop(held);
+        let publication=server.invoke(Invocation {proof:server.proof.clone(),epoch:None,method:"attach".into(),args:json!([source])}).unwrap();
+        let publication:Attached=serde_json::from_value(publication).unwrap();
+        assert_eq!(publication.identity,identity);assert_ne!(publication.epoch,epoch);assert!(!server.attachment_preserved);
+    }
+
     fn query()->SourceQuery {
         SourceQuery {source:SourceKey {agent_id:Some("child".into()),source_id:"opaque:native-part:real-id".into()},
             offset:4,limit:16,expected_epoch:Some(SourceEpoch {incarnation:uuid::Uuid::new_v4(),revision:7}),until:Some(8)}

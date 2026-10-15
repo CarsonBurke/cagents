@@ -1769,11 +1769,14 @@ impl Server {
         sources
     }
     fn attached(&self) -> Result<Attached, String> {
-        Ok(Attached {
+        Ok(self.attached_with_state(self.resident()?))
+    }
+    fn attached_with_state(&self, resident:Resident) -> Attached {
+        Attached {
             protocol: PROTOCOL,
             identity: self.identity.clone(),
             epoch: self.epoch,
-            resident: self.resident()?,
+            resident,
             source: self.source.clone(),
             launch_account_scope: self
                 .actor
@@ -1782,7 +1785,21 @@ impl Server {
                 .map_err(str::to_owned),
             execution_environment: self.environment.clone(),
             recovery_environment: self.recovery_environment.clone(),
-        })
+        }
+    }
+    fn startup_attached_until(&self, startup:&UnixStream, deadline:Instant)->Result<Attached,String> {
+        loop {
+            if Instant::now()>=deadline {return Err("Retained actor startup metadata remains unconfirmed after its deadline".into());}
+            if disconnected(startup)? {return Err("Retained actor startup was cancelled before publication".into());}
+            match self.attached() {
+                Ok(attached)=>return Ok(attached),
+                Err(error) if error.starts_with("CAGENTS_ACTOR_METADATA_BUSY:")=>{
+                    if Instant::now()>=deadline {return Err("Retained actor startup metadata remains unconfirmed after its deadline".into());}
+                    thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())));
+                },
+                Err(error)=>return Err(error),
+            }
+        }
     }
     fn finish_inputs(&mut self) {
         let journal = self.journal.clone();
@@ -1829,14 +1846,18 @@ impl Server {
                     "Retained actor source/account identity does not match this chat".into(),
                 );
             }
+            // Refuse ordinary contention before changing the attachment epoch.
+            // Reusing this exact authenticated request can then safely retry.
+            let resident=self.resident()?;
             self.epoch = uuid::Uuid::new_v4();
             if let Some(reads)=&self.source_reads {reads.invalidate();}
             self.attachment_preserved = false;
             self.proof = request.proof;
             if self.closed_snapshot.is_some() {
                 self.publish_close()?;
+                return serde_json::to_value(self.attached()?).map_err(|error|error.to_string());
             }
-            return serde_json::to_value(self.attached()?).map_err(|error| error.to_string());
+            return serde_json::to_value(self.attached_with_state(resident)).map_err(|error| error.to_string());
         }
         if request.epoch != Some(self.epoch) || request.proof != self.proof {
             return Err(
@@ -2240,11 +2261,9 @@ impl Server {
         })
     }
     fn serve(mut self, startup: UnixStream) -> Result<(), String> {
-        send(
-            &startup,
-            &Ok::<_, String>(self.attached()?),
-            Duration::from_secs(30),
-        )?;
+        let initial_deadline=Instant::now()+Duration::from_secs(30);
+        let attached=self.startup_attached_until(&startup,initial_deadline)?;
+        deadline_io::send_until(&startup,&Ok::<_,String>(attached),initial_deadline)?;
         loop {
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
