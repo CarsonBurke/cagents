@@ -51,6 +51,14 @@ pub fn command_id(action: &SidebarAction) -> Option<Command> {
     })
 }
 
+pub const fn change_command_id(command: ChangeGroupCommand) -> Command {
+    match command {
+        ChangeGroupCommand::Stage => Command::StageSelectedChanges,
+        ChangeGroupCommand::Unstage => Command::UnstageSelectedChanges,
+        ChangeGroupCommand::Discard => Command::DiscardSelectedChanges,
+    }
+}
+
 pub fn label(command: Command) -> &'static str {
     crate::workspace_widget::shortcut_descriptor(command).label
 }
