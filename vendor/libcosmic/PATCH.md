@@ -40,3 +40,7 @@ dependencies.
 Application layout regressions exercise toolkit text, text buttons and an actual
 right-click context-menu overlay at small and large interface sizes. The menu
 fixture initializes the retained widget tree before dispatching native events.
+
+## Runtime typography for stock inputs
+
+`src/widget/text_input/input.rs` captures the current toolkit interface font and UI-thread default text size when constructing a stock text input. Explicit `.font()` and `.size()` overrides remain authoritative. This lets standalone editor fields follow accepted interface preferences without relying on the renderer defaults fixed at startup. The application owns native layout regression coverage.
