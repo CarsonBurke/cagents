@@ -1942,10 +1942,8 @@ fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
 
 #[test]
 fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it() {
-    if isolated(
-        "an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it",
-    )
-    .is_some()
+    if isolated("an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it")
+        .is_some()
     {
         return;
     }
@@ -1991,7 +1989,10 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
     assert!(control(answer(&asked.id, "deny")).unwrap().is_empty());
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::fs::read_to_string(root.join("decisions")).unwrap_or_default() != "deny\n" {
-        assert!(Instant::now() < deadline, "the denial never reached the provider");
+        assert!(
+            Instant::now() < deadline,
+            "the denial never reached the provider"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
@@ -2090,49 +2091,111 @@ done
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let (record, _) = status(&host, &owner, agent).unwrap();
     let original_session = record.session.clone();
-    let handle = host.lock().unwrap().chats
-        .get(&record.session.as_ref().unwrap().id()).unwrap().handle.clone();
+    let handle = host
+        .lock()
+        .unwrap()
+        .chats
+        .get(&record.session.as_ref().unwrap().id())
+        .unwrap()
+        .handle
+        .clone();
     // The native provider controls can interrupt background work between
     // managed turns. The owner API correctly refuses general idle interrupts.
     handle.command(Command::Interrupt).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !root.join("idle-interrupt").exists() {
-        assert!(Instant::now() < deadline, "the provider never received the idle interrupt");
+        assert!(
+            Instant::now() < deadline,
+            "the provider never received the idle interrupt"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     let answer = |request_id: &str| Control::Answer {
-        request_id: request_id.into(), action: "deny".into(), answers: vec![],
+        request_id: request_id.into(),
+        action: "deny".into(),
+        answers: vec![],
     };
-    process(&host, owner.clone(), Operation::Control {
-        agent, command: answer("background-first"),
-    }).unwrap();
-    assert!(handle.requests().is_empty(), "the settled decision must retire before the next prompt");
-    let followup = submit(&host, &owner, Submit {
-        name: None, destination: Destination::Existing(agent),
-        prompt: "next owned prompt".into(), idempotency_key: "next-after-idle-interrupt".into(),
-    }).unwrap();
+    process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: answer("background-first"),
+        },
+    )
+    .unwrap();
+    assert!(
+        handle.requests().is_empty(),
+        "the settled decision must retire before the next prompt"
+    );
+    let followup = submit(
+        &host,
+        &owner,
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: "next owned prompt".into(),
+            idempotency_key: "next-after-idle-interrupt".into(),
+        },
+    )
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !root.join("next-prompt").exists() {
-        assert!(Instant::now() < deadline, "the provider never received the next prompt");
+        assert!(
+            Instant::now() < deadline,
+            "the provider never received the next prompt"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
-    process(&host, owner.clone(), Operation::Control {
-        agent, command: Control::Interrupt { including_subagents: false },
-    }).unwrap();
+    process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    )
+    .unwrap();
     let barrier = pending_requests(&host, agent);
     assert_eq!(barrier[0].id, "ack-barrier");
     let (_, waiting) = status(&host, &owner, agent).unwrap();
     assert_eq!(waiting.id, followup.run.id);
-    assert!(!waiting.state.is_terminal(), "the stale ACK settled the next run: {waiting:?}");
-    process(&host, owner.clone(), Operation::Control {
-        agent, command: answer("ack-barrier"),
-    }).unwrap();
+    assert!(
+        !waiting.state.is_terminal(),
+        "the stale ACK settled the next run: {waiting:?}"
+    );
+    process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: answer("ack-barrier"),
+        },
+    )
+    .unwrap();
     assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
-    let record = registry(&host).unwrap().lock().unwrap().agent(agent).unwrap();
+    let record = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap();
     assert_eq!(record.session, original_session);
-    assert!(!registry(&host).unwrap().lock().unwrap().agent_is_interactive(agent).unwrap());
-    assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(), "spawn\n");
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns")).unwrap(),
+        "spawn\n"
+    );
     assert!(close(&host, &owner, agent).unwrap().closed);
 }
 
