@@ -125,7 +125,16 @@ pub(crate) fn actor_provider_closed(
 /// Called only after the actual paired owner has proved cleanup. Re-read the
 /// exact phase evidence before updating it; a replacement or changed receipt
 /// cannot acquire the earlier close's pair acknowledgement.
-pub(crate) fn confirm_actor_pair_closed(closed: ActorProviderClosed) -> Result<(), String> {
+pub(crate) fn confirm_actor_pair_closed(
+    closed: ActorProviderClosed,
+    cleaned_holder: Option<&Record>,
+) -> Result<(), String> {
+    // The receipt can include a pair published after the close's inspection.
+    // Only the exact captured owner actually cleaned by that close can satisfy
+    // this acknowledgement, including an explicitly unpaired close.
+    if closed.receipt.paired_holder.as_ref() != cleaned_holder {
+        return Err("Actor provider-close pair differs from the exact cleaned terminal owner".into());
+    }
     let paired_was_closed = closed.paired_closed();
     let previous = closed.receipt;
     let mut current = read_actor_provider_close(&previous.record, &previous.proof)?
@@ -140,6 +149,51 @@ pub(crate) fn confirm_actor_pair_closed(closed: ActorProviderClosed) -> Result<(
     if current.paired_closed { return Ok(()); }
     current.paired_closed = true;
     save(&path(current.record.terminal, &current.record.holder)?, &current)
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn actor_pair_confirmation_refuses_uncleaned_and_replaced_owners_before_io() {
+        let recovery = super::super::tests::recovery();
+        let proof = recovery.source.proof.as_ref().unwrap().clone();
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Terminal,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: proof.boot_id.clone(),
+            terminal: recovery.source.id,
+            holder: Process { pid: 80, start: 20 },
+            root: Process { pid: 81, start: 21 },
+        };
+        let mut replacement = record.clone();
+        replacement.holder.start += 1;
+        for (published, cleaned) in [
+            (Some(record.clone()), None),
+            (None, Some(record.clone())),
+            (Some(record.clone()), Some(replacement)),
+        ] {
+            // These synthetic negative inputs cannot authorize any I/O or
+            // positive cleanup. Require the pair mismatch itself to refuse.
+            let closed = ActorProviderClosed {
+                receipt: Receipt {
+                    record: record.clone(),
+                    proof: proof.clone(),
+                    sources: vec![[1; 32]],
+                    paired_closed: true,
+                    paired_holder: published,
+                },
+                source: [1; 32],
+            };
+            assert_eq!(
+                confirm_actor_pair_closed(closed, cleaned.as_ref()).unwrap_err(),
+                "Actor provider-close pair differs from the exact cleaned terminal owner",
+            );
+        }
+    }
 }
 
 fn read_actor_provider_close(record: &Record, proof: &HostSessionProof) -> Result<Option<Receipt>, String> {
