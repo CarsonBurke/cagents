@@ -6366,6 +6366,7 @@ mod tests {
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             let mut step = Echo.receive(frame.clone())?;
             if frame["background"]==true {step.events.push(Event::Item(independent_websocket_command()));}
+            if frame["cancelled"]==true {step.events.push(Event::TurnFinished {key:Some("fixture-turn".into()),outcome:crate::notifications::Kind::Cancelled});}
             step.events.push(Event::Status {
                 busy: frame["busy"].as_bool().unwrap_or(false),
                 detail: String::new(),
@@ -6441,7 +6442,7 @@ mod tests {
             );
             socket
                 .send(Message::Text(
-                    json!({"text": " stopped", "busy": false})
+                    json!({"text": " stopped", "busy": false,"cancelled":true})
                         .to_string()
                         .into(),
                 ))
@@ -6500,6 +6501,7 @@ mod tests {
         let snapshot = handle.snapshot(None).unwrap();
         assert!(snapshot.exited);
         assert!(!snapshot.busy);
+        assert_eq!(snapshot.outcome,Some(crate::agent::ActivityOutcome::Cancelled));
         assert_eq!(
             unstamped(&snapshot.items),
             vec![text("echo", "hello stopped"),independent_websocket_command()],
