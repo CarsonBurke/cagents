@@ -582,10 +582,10 @@ fn result_row<'a>(
                 &preview,
                 font,
             ))
-                .font(font)
-                .size(design::TEXT_BODY)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .width(Length::Fill),
+            .font(font)
+            .size(design::TEXT_BODY)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .width(Length::Fill),
         )
         .width(Length::Fill)
         .clip(true)
@@ -773,14 +773,12 @@ mod tests {
                 let limits = layout::Limits::new(size, size);
                 let node = row.as_widget_mut().layout(&mut tree, &renderer, &limits);
                 let mut bounds = Bounds(None);
-                row.as_widget_mut().operate(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &mut bounds,
-                );
+                row.as_widget_mut()
+                    .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
                 let fitted = state.snippet_fits.borrow();
-                let cached = fitted.get(&0).expect("mounted responsive row fitted its actual slot");
+                let cached = fitted
+                    .get(&0)
+                    .expect("mounted responsive row fitted its actual slot");
                 let preview = cached.preview.clone();
                 let slot = f32::from_bits(cached.width);
                 let mounted = bounds.0.expect("actual clipped snippet container");
@@ -802,7 +800,10 @@ mod tests {
                 let mut again = result_row(&state, &matched, 0, false);
                 let mut tree = Tree::new(again.as_widget());
                 again.as_widget_mut().layout(&mut tree, &renderer, &limits);
-                assert!(Arc::ptr_eq(&preview, &state.snippet_fits.borrow()[&0].preview));
+                assert!(Arc::ptr_eq(
+                    &preview,
+                    &state.snippet_fits.borrow()[&0].preview
+                ));
                 assert_eq!(matched.length, hit.len());
             }
         }
