@@ -3156,6 +3156,27 @@ impl RepositoryRuntime {
         });
         true
     }
+    /// Places a server location against the actual loaded target, including
+    /// files that did not have a snapshot when the response was converted.
+    /// A UTF-16 position inside a surrogate pair is refused rather than rounded.
+    pub fn move_cursor_to_coordinates(&mut self, mut at: LspPosition, coordinates: crate::lsp::LspCoordinates) -> bool {
+        if coordinates == crate::lsp::LspCoordinates::Utf16 {
+            let Some(text) = self.editor_text() else { return false; };
+            let Some(line) = text.split('\n').nth(at.line as usize) else { return false; };
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let mut units = 0u32;
+            let mut scalars = 0u32;
+            for character in line.chars() {
+                if units == at.character { break; }
+                units += character.len_utf16() as u32;
+                if units > at.character { return false; }
+                scalars += 1;
+            }
+            at.character = scalars;
+        }
+        self.move_cursor_to(at)
+    }
+
     /// Marks the editor as search-owned: document edits are ignored while the
     /// native viewport continues to accept scrolling actions.
     pub fn set_search_mode(&mut self, enabled: bool) {
@@ -10851,6 +10872,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn server_target_coordinates_convert_utf16_after_loading_and_refuse_split_surrogates() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "prior\rbare\r\na😀éX\n");
+        assert!(runtime.move_cursor_to_coordinates(LspPosition::new(1, 4), crate::lsp::LspCoordinates::Utf16));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 3)));
+        let before = runtime.cursor_position();
+        assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(1, 2), crate::lsp::LspCoordinates::Utf16));
+        assert_eq!(runtime.cursor_position(), before);
+        assert!(runtime.move_cursor_to_coordinates(LspPosition::new(1, 3), crate::lsp::LspCoordinates::Scalar));
+        assert_eq!(runtime.cursor_position(), before);
     }
 
     #[test]

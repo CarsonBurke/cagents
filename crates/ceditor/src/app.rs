@@ -46,6 +46,7 @@ const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
 mod notification_ui;
+mod lsp_navigation;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -201,6 +202,7 @@ pub enum Message {
     Lsp(u64, Option<LspEvent>),
     Complete,
     Hover,
+    Navigation(lsp_navigation::Action),
     Completion(CardId, usize),
     Jump(CardId, LspPosition),
     Key(keyboard::Event),
@@ -499,6 +501,7 @@ pub struct Editor {
     lsp: LspManager,
     language_server_assistance: bool,
     next_document: u64,
+    lsp_navigation: lsp_navigation::State,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
@@ -1314,6 +1317,7 @@ impl Editor {
             paths: self
                 .tabs
                 .iter()
+                .filter(|tab| !tab.runtime.is_read_only_source())
                 .map(|tab| {
                     tab.pending_file
                         .as_ref()
@@ -1322,7 +1326,7 @@ impl Editor {
                         .unwrap_or_else(|| tab.runtime.descriptor.worktree.clone())
                 })
                 .collect(),
-            active: self.tabs.iter().position(|tab| Some(tab.id) == self.active),
+            active: self.tabs.iter().filter(|tab| !tab.runtime.is_read_only_source()).position(|tab| Some(tab.id) == self.active),
             sidebar_open: self.sidebar_open,
             expanded_directories,
         }
@@ -1392,6 +1396,10 @@ impl Editor {
     }
 
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
+        self.add_with_source(opened, focus, None)
+    }
+
+    fn add_with_source(&mut self, opened: Opened, focus: bool, external: Option<PathBuf>) -> Task<Message> {
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
                 if focus && !self.modal_open() {
@@ -1439,6 +1447,7 @@ impl Editor {
         } else {
             RepositoryRuntime::new_directory(descriptor)
         };
+        if let Some(path) = &external { runtime.set_external_source(path.clone()); }
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
@@ -1459,8 +1468,8 @@ impl Editor {
                 Vec::new(),
             )],
         );
-        sidebar.file_management = true;
-        sidebar.source_control = Some(match &opened.snapshot {
+        sidebar.file_management = external.is_none();
+        sidebar.source_control = external.is_none().then(|| match &opened.snapshot {
             Some(snapshot) => SourceControlModel::ready(key, snapshot),
             None => SourceControlModel::loading(key),
         });
@@ -1513,9 +1522,9 @@ impl Editor {
             navigation,
             pending_file,
             pending_fragment: None,
-            owned_file: None,
+            owned_file: external.clone(),
             next_open: 1,
-            files_loaded: false,
+            files_loaded: external.is_some(),
             git,
             diagnostics: Vec::new(),
             diagnostics_version: None,
@@ -1719,6 +1728,7 @@ impl Editor {
     }
 
     fn remove_tab(&mut self, id: CardId) {
+        self.lsp_navigation.remove_tab(id);
         let scratch = (!self.exiting)
             .then(|| self.untitled_scratch_path(id))
             .flatten();
@@ -1960,6 +1970,8 @@ impl Editor {
                     }
                 }
                 LspIntent::Change { version, text } => {
+                    self.lsp_navigation.requests.remove(&id);
+                    self.lsp_navigation.results.remove(&id);
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
                         self.lsp.change(doc, version, &[], &text);
                     }
@@ -1978,10 +1990,13 @@ impl Editor {
                 LspIntent::Close => self.close_document(id),
             }
         }
-        Task::batch([autosave, working_diff])
+        let navigation = self.finish_navigation_jump(id);
+        Task::batch([autosave, working_diff, navigation])
     }
 
     fn close_document(&mut self, id: CardId) {
+        self.lsp_navigation.requests.remove(&id);
+        self.lsp_navigation.results.remove(&id);
         if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
             self.lsp.close(doc);
         }
@@ -2971,6 +2986,7 @@ impl Application for Editor {
             lsp,
             language_server_assistance,
             next_document: 1,
+            lsp_navigation: Default::default(),
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
@@ -3398,6 +3414,8 @@ impl Application for Editor {
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
+                Message::Navigation(action) => self.update_navigation(action),
+                Message::Repository(RepositoryAction::Language { card, action }) => self.request_navigation(card, action),
                 Message::Repository(action) => {
                     if let RepositoryAction::DiffAnnotations {
                         identity,
@@ -4320,6 +4338,7 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let Some(event) = event {
+                        if let Some(task) = self.navigation_event(&event) { return Task::batch([task, self.lsp_next()]); }
                         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
                             if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
                                 && let Some(error) = language_server_failure(status)
@@ -4669,6 +4688,7 @@ impl Application for Editor {
                 )
                 .map(Message::Repository),
             );
+            if let Some(results) = self.navigation_results_view(tab.id) { editor.push(results); }
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
                 for (index, item) in tab.completions.iter().enumerate() {
@@ -5455,7 +5475,7 @@ mod tests {
 
     /// Execute actual application tasks, including mutation completion and
     /// subsequent snapshot/file refreshes, without a window or network remote.
-    fn run_tasks(app: &mut Editor, task: Task<Message>) {
+    pub(super) fn run_tasks(app: &mut Editor, task: Task<Message>) {
         use cosmic::iced::futures::StreamExt;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5875,7 +5895,7 @@ mod tests {
         );
     }
 
-    fn editor() -> Editor {
+    pub(super) fn editor() -> Editor {
         Editor {
             core: Core::default(),
             tabs: Vec::new(),
@@ -5920,6 +5940,7 @@ mod tests {
             lsp: LspManager::new(Vec::new()),
             language_server_assistance: false,
             next_document: 1,
+            lsp_navigation: Default::default(),
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
