@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod complete_inventory;
 mod pr_checkout;
 pub use pr_checkout::{
     ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
