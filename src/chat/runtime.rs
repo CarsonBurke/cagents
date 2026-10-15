@@ -126,6 +126,7 @@ pub(crate) struct CloseObservation {
     pub closing: bool,
     pub owns_work: bool,
     pub working_directory: std::path::PathBuf,
+    pub directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
 }
 
 struct CloseState {
@@ -133,6 +134,8 @@ struct CloseState {
     revision: u64,
     admitted_work: bool,
     unobserved_native: bool,
+    directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
+    directory: Option<Arc<std::fs::File>>,
     working_directory: std::path::PathBuf,
 }
 
@@ -253,6 +256,28 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        // A live actor's close authority follows the physical directory it
+        // entered, never a launch alias that can be retargeted afterwards.
+        // Adopted legacy providers have no actor-owned admission observation.
+        let scope_observed = !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+            && !matches!(spec.transport, TransportSpec::History | TransportSpec::UnixWebSocket { .. });
+        let directory_identity = if scope_observed {
+            spec.working_directory = std::fs::canonicalize(&spec.working_directory)
+                .map_err(|error| format!("Cannot resolve provider execution directory: {error}"))?;
+            if spec.execution.is_none() {
+                let directory = std::fs::File::open(&spec.working_directory)
+                    .map_err(|error| format!("Cannot pin provider execution directory: {error}"))?;
+                spec.execution = Some(Arc::new(super::protocol::ExecutionContext::new(Some(Arc::new(directory)))));
+            }
+            let context = spec.execution.as_ref().unwrap();
+            context.verify_directory(&spec.working_directory)?;
+            context.directory.as_ref().map(|directory|directory.metadata()
+                .map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata)))
+                .transpose().map_err(|error|error.to_string())?
+        } else { None };
+        // Keep the admitted inode alive even after the actor completes. Numeric
+        // identities alone can be recycled after a directory is removed.
+        let close_directory=if scope_observed {spec.execution.as_ref().and_then(|context|context.directory.clone())} else {None};
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -315,7 +340,7 @@ impl Handle {
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
-        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,unobserved_native:false,working_directory:spec.working_directory.clone()}));
+        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,unobserved_native:false,directory_identity,directory:close_directory,working_directory:if scope_observed {spec.working_directory.clone()} else {Default::default()}}));
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -666,12 +691,15 @@ impl Handle {
         let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
         let close=self.0.close_state.lock().unwrap_or_else(|p|p.into_inner());
         let activity=if close.unobserved_native {ActivityState::Unknown} else if (close.admitted_work || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
-        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready&&!close.unobserved_native,exited:state.exited&&!close.unobserved_native,completed:self.is_completed(),closing:!close.unobserved_native&&(self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire)),owns_work:owns_work||close.unobserved_native,working_directory:close.working_directory.clone()}
+        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready&&!close.unobserved_native,exited:state.exited&&!close.unobserved_native,completed:self.is_completed(),closing:!close.unobserved_native&&(self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire)),owns_work:owns_work||close.unobserved_native,working_directory:close.working_directory.clone(),directory_identity:close.directory_identity}
     }
 
     /// The actor compares consent with all earlier admitted commands before
     /// fencing further work. Call outside HostLock; joining may take time.
     pub(crate) fn close_if_revision(&self, revision:u64) -> Result<(),String> {
+        if self.close_observation().directory_identity.is_none() {
+            return Err("The provider execution scope is not authoritatively observed; reattach before confirming close".into());
+        }
         if self.is_completed() {
             if self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {
                 return Err("Retained provider work is not observed by this actor; reattach the session before confirming close".into());
@@ -1688,8 +1716,12 @@ impl Actor {
     fn record_execution_directory(&mut self,directory:&std::path::Path) {
         let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        if close.working_directory!=directory {
+        let pinned=self.launch_context.as_ref().and_then(|context|context.directory.clone());
+        let identity=pinned.as_ref().and_then(|pinned|pinned.metadata().ok()).map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata));
+        if close.working_directory!=directory || close.directory_identity!=identity {
             close.working_directory=directory.into();
+            close.directory_identity=identity;
+            close.directory=pinned;
             close.revision=close.revision.saturating_add(1);
         }
     }
@@ -2071,7 +2103,7 @@ impl Actor {
                 ActorCommand::CloseIfRevision {revision} => {
                     let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                     let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-                    let unchanged=close.revision==revision;
+                    let unchanged=close.revision==revision && close.directory_identity.is_some();
                     if unchanged {self.stop.store(true,Ordering::Release);}
                     let _=reply.send(if unchanged {Ok(())} else {Err("Provider work changed before conditional close".into())});
                     continue;
@@ -3133,6 +3165,34 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn close_scope_keeps_the_physical_admitted_directory_after_alias_retarget() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let original=root.path().join("original");
+        let replacement=root.path().join("replacement");
+        let alias=root.path().join("alias");
+        std::fs::create_dir(&original).unwrap(); std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original,&alias).unwrap();
+        let expected=crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&original).unwrap());
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:alias.clone(),environment:BTreeMap::new()};
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Idle),initial,store,None,|_|{}).unwrap();
+        until(&handle,|state|state.ready);
+        std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&replacement,&alias).unwrap();
+        let observed=handle.close_observation();
+        assert_eq!(observed.working_directory,original);
+        assert_eq!(observed.directory_identity,Some(expected));
+        assert_ne!(observed.working_directory,std::fs::canonicalize(&alias).unwrap());
+        handle.close_if_revision(observed.close_revision).unwrap();
+    }
+
     #[test]
     fn conditional_close_refuses_new_admitted_or_autonomous_work_but_allows_streaming() {
         struct Consent;
