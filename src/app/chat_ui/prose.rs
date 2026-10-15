@@ -436,57 +436,42 @@ impl Renderer {
                 .log10()
                 .ceil()
         });
-        let rows: Vec<Element<'static, Message>> = bullets
-            .iter()
-            .enumerate()
-            .map(|(index, bullet)| {
-                let (marker, items): (Element<'static, Message>, _) = match (bullet, start) {
+        let rows = bullets.iter().enumerate().map(|(index, bullet)| {
+            let renderer = self.clone();
+            let bullet = bullet.clone();
+            let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
+            virtualized::Row::new(key, self.revision, 64.0 + settings.spacing.0 * 0.75, None, move || {
+                let (marker, items): (Element<'static, Message>, _) = match (&bullet, start) {
                     (markdown::Bullet::Point { items }, Some(start))
                     | (markdown::Bullet::Task { items, .. }, Some(start)) => (
                         iced::widget::text(format!("{}.", index as u64 + start))
                             .size(settings.text_size)
                             .align_x(iced::alignment::Horizontal::Right)
-                            .width(
-                                settings.text_size * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
-                            )
-                            .into(),
-                        items,
+                            .width(settings.text_size * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0))
+                            .into(), items,
                     ),
                     (markdown::Bullet::Point { items }, None) => (
-                        iced::widget::text("•").size(settings.text_size).into(),
-                        items,
+                        iced::widget::text("•").size(settings.text_size).into(), items,
                     ),
                     (markdown::Bullet::Task { items, done }, None) => (
                         widget::container(iced::widget::checkbox(*done).size(settings.text_size))
-                            .center_y(
-                                iced::widget::text::LineHeight::default()
-                                    .to_absolute(settings.text_size),
-                            )
-                            .into(),
-                        items,
+                            .center_y(iced::widget::text::LineHeight::default().to_absolute(settings.text_size))
+                            .into(), items,
                     ),
                 };
-                let mut prefix = start.map_or_else(
-                    || "-".to_owned(),
-                    |start| format!("{}.", index as u64 + start),
-                );
-                if let markdown::Bullet::Task { done, .. } = bullet {
+                let mut prefix = start.map_or_else(|| "-".to_owned(), |start| format!("{}.", index as u64 + start));
+                if let markdown::Bullet::Task { done, .. } = &bullet {
                     prefix.push_str(if *done { " [x]" } else { " [ ]" });
                 }
-                iced::widget::row![
-                    marker,
-                    selection::wrap(self.child(index as u32).items(items, nested), selection::Kind::ListItem(prefix))
-                ]
-                .spacing(settings.spacing.0)
-                .into()
+                widget::container(iced::widget::row![marker,
+                    selection::wrap(renderer.child(index as u32).items(items, nested), selection::Kind::ListItem(prefix))
+                ].spacing(settings.spacing.0))
+                    .padding(iced::Padding::ZERO.bottom(settings.spacing.0 * 0.75)).into()
             })
-            .collect();
-        let list = widget::column::with_children(rows).spacing(settings.spacing.0 * 0.75);
-        if start.is_some() {
-            list.into()
-        } else {
-            list.padding([0.0, settings.spacing.0]).into()
-        }
+        }).collect();
+        widget::container(virtualized::column(rows, Default::default()))
+            .padding(if start.is_none() { iced::Padding::ZERO.left(settings.spacing.0).right(settings.spacing.0) } else { iced::Padding::ZERO })
+            .into()
     }
 
     fn table(
@@ -495,50 +480,34 @@ impl Renderer {
         columns: &[markdown::Column],
         rows: &[markdown::Row],
     ) -> Element<'static, Message> {
-        use iced::widget::table;
-        let table = table::table(
-            columns.iter().enumerate().map(|(index, column)| {
-                table::column(
-                    selection::wrap(
-                        self.child(0).child(index as u32).items(&column.header, settings),
-                        selection::Kind::Cell {
-                            row: 0,
-                            column: index,
-                        },
-                    ),
-                    move |row: usize| {
-                        let content: Element<'static, Message> = match rows[row].cells.get(index) {
-                            Some(cells) => self.child(row as u32 + 1).child(index as u32).items(cells, settings),
-                            None => iced::widget::text("").into(),
-                        };
-                        selection::wrap(
-                            content,
-                            selection::Kind::Cell {
-                                row: row + 1,
-                                column: index,
-                            },
-                        )
-                    },
-                )
-                .align_x(alignment(column))
-            }),
-            0..rows.len(),
-        )
-        .padding_x(settings.spacing.0)
-        .padding_y(settings.spacing.0 / 2.0)
-        .separator_x(0);
-        iced::widget::scrollable(selection::wrap(
-            table,
-            selection::Kind::Table {
-                columns: columns.len(),
-                rows: rows.len() + 1,
-            },
-        ))
-        .direction(iced::widget::scrollable::Direction::Horizontal(
-            design::scrollbar(),
-        ))
-        .spacing(settings.spacing.0 / 2.0)
-        .into()
+        // Stable column widths let independently mounted rows agree without
+        // shaping every hidden cell to discover its natural width.
+        let width = 240.0;
+        let alignments: Arc<[_]> = columns.iter().map(alignment).collect::<Vec<_>>().into();
+        let header = columns.iter().map(|column| column.header.clone()).collect::<Vec<_>>();
+        let descriptors = std::iter::once(header).chain(rows.iter().map(|row| row.cells.clone()))
+            .enumerate().map(|(row, cells)| {
+                let renderer = self.child(row as u32);
+                let key = selection::logical_identity(&self.item, &renderer.path);
+                let alignments = alignments.clone();
+                virtualized::Row::new(key, self.revision, 48.0 + settings.spacing.0, None, move || {
+                    widget::row::with_children(alignments.iter().enumerate().map(|(column, alignment)| {
+                        let content = renderer.child(column as u32).items(
+                            cells.get(column).map_or(&[][..], Vec::as_slice), settings,
+                        );
+                        widget::container(selection::wrap(content, selection::Kind::Cell { row, column }))
+                            .width(width).align_x(*alignment)
+                            .padding([settings.spacing.0 / 2.0, settings.spacing.0]).into()
+                    }).collect::<Vec<Element<'static, Message>>>()).into()
+                })
+            }).collect();
+        let table = widget::container(virtualized::column(descriptors, Default::default()))
+            .width(width * columns.len().max(1) as f32);
+        iced::widget::scrollable(selection::wrap(table, selection::Kind::Table {
+            columns: columns.len(), rows: rows.len() + 1,
+        }))
+            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .spacing(settings.spacing.0 / 2.0).into()
     }
 
     /// A fenced block on the sunken surface commands and outputs use, drawn
@@ -795,6 +764,39 @@ mod tests {
         assert_eq!(painted.0,vec![(0,vec![2046..2048],Some(2046..2048)),(2048,vec![0..4],Some(0..4))],
             "one indexed occurrence keeps ordinary and current paint on both actual mounted fragments");
     }
+
+    #[test]
+    fn giant_single_list_table_and_heading_keep_only_viewport_widget_trees() {
+        use iced::advanced::{layout, widget::Tree};
+        fn residents(tree: &Tree) -> (usize, usize) {
+            let prose = usize::from(tree.tag == iced::advanced::widget::tree::Tag::of::<selectable_prose::State>());
+            tree.children.iter().fold((1, prose), |(widgets, prose), child| {
+                let (children, leaves) = residents(child);
+                (widgets + children, prose + leaves)
+            })
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let sources = [
+            "- list row with meaningful text\n".repeat(20_000),
+            format!("| First | Second |\n| --- | --- |\n{}", "| table cell | other cell |\n".repeat(20_000)),
+            format!("# {}", "heading-word ".repeat(40_000)),
+        ];
+        for source in sources {
+            let cached = CachedItem::new(&ItemContent::Text { text: source,
+                thinking: false, phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
+            assert_eq!(cached.markdown.items().len(), 1, "adversarial single top-level item");
+            let mut element = view(&cached,
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                Target { card: CardId::new(), generation: 0 }, None);
+            let mut tree = Tree::new(&element);
+            element.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)));
+            let (widgets, prose) = residents(&tree);
+            assert!(prose < 100, "hidden leaf shaping escaped viewport bound: {prose}");
+            assert!(widgets < 2000, "hidden widget construction escaped viewport bound: {widgets}");
+        }
+    }
+
 
     #[test]
     fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {
