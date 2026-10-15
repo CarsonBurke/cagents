@@ -2210,8 +2210,13 @@ impl Runtime {
         runtime.snapshot = Arc::new(snapshot);
         runtime
     }
+    #[cfg(test)]
+    pub(super) fn removal_fixture(target: Target, session: chat::Session, handle: Arc<ClientHandle>, syntax_theme: crate::settings::EditorSyntaxTheme) -> Self {
+        Self::new(target, session, Connection::Live(handle), false, syntax_theme)
+    }
+
     /// The live connection, once the conversation has started.
-    fn handle(&self) -> Option<&Arc<ClientHandle>> {
+    pub(super) fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
             Connection::Draft => None,
             Connection::Live(handle) => Some(handle),
