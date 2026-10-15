@@ -799,7 +799,12 @@ impl Registry {
         request: &Submit,
         now_ms: u64,
     ) -> Result<Accepted, String> {
-        Self::submit_agent_selected_in(tx, origin, request, None, None, now_ms)
+        Self::submit_agent_observed_in(tx,origin,request,None,now_ms)
+    }
+    /// The firing worker may supply its pre-TX original FD observation. This
+    /// helper still performs no external I/O and cannot approve None.
+    pub(super) fn submit_agent_observed_in(tx:&Transaction<'_>,origin:&Origin,request:&Submit,directory:Option<&agent_locations::AcceptedDirectory>,now_ms:u64)->Result<Accepted,String> {
+        Self::submit_agent_selected_in(tx,origin,request,None,directory,now_ms)
     }
 
     fn submit_agent_selected_in(

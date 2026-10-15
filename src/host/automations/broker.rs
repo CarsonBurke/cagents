@@ -188,14 +188,15 @@ impl Handle {
         if automation.execution_revision != revision {
             return Err("The automation changed before this run was confirmed".into());
         }
-        service::validate_target(&host, &automation.definition, &automation.target_identity)?;
+        let directory=service::validate_target(&host, &automation.definition, &automation.target_identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
+        let observation=super::super::model::AcceptedDirectory::observe(&automation.definition.agent.target.directory,directory)?;
         let claim = self
             .0
             .registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .claim_automation(
+            .claim_automation_with_directory(
                 id,
                 revision,
                 None,
@@ -203,6 +204,7 @@ impl Handle {
                 automation.next,
                 confirmed,
                 service::now()?,
+                Some(observation),
             )?;
         let firing = claim.firing.clone();
         let result = self.launch(&host, claim);
@@ -520,12 +522,18 @@ impl Handle {
                 } else {
                     previous
                 };
+                // A failed observation grants nothing; the existing launch
+                // validation still records its actual failure after claim.
+                let needs_directory=automation.active_firing.is_none()&&automation.definition.precheck.is_none()
+                    &&(automation.definition.session_mode==crate::automations::SessionMode::Fresh||automation.reuse_agent.is_none());
+                let observation=if needs_directory {service::validate_target(host,&automation.definition,&automation.target_identity)
+                    .and_then(|directory|super::super::model::AcceptedDirectory::observe(&automation.definition.agent.target.directory,directory)).ok()}else{None};
                 let claim = self
                     .0
                     .registry
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .claim_automation(
+                    .claim_automation_with_directory(
                         automation.id,
                         automation.execution_revision,
                         Some(expected),
@@ -535,6 +543,7 @@ impl Handle {
                         Some(plan.next),
                         false,
                         now,
+                        observation,
                     )?;
                 checking |= claim.created
                     && claim.firing.state == FiringState::Prechecking
@@ -665,7 +674,14 @@ impl Handle {
                 return Ok(true);
             }
             Ok(Status::Complete(outcome)) => {
-                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, now)?;
+                let automation=self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).automation(firing.automation)?;
+                let needs_directory=matches!(&outcome,super::precheck::Outcome::Passed)&&firing.state==FiringState::Prechecking&&!firing.cancel_requested
+                    &&automation.execution_revision==firing.revision
+                    &&(matches!(&firing.trigger,Trigger::Manual{..})||automation.enabled)
+                    &&(automation.definition.session_mode==crate::automations::SessionMode::Fresh||automation.reuse_agent.is_none());
+                let observation=if needs_directory {service::validate_target(host,&automation.definition,&automation.target_identity)
+                    .and_then(|directory|super::super::model::AcceptedDirectory::observe(&automation.definition.agent.target.directory,directory)).ok()}else{None};
+                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck_with_directory(firing.id, outcome, now, observation)?;
                 if let Some(accepted) = accepted {
                     let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
                     match service::validate_target(host, &automation.definition, &automation.target_identity) {

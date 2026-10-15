@@ -107,7 +107,7 @@ impl AcceptedDirectory {
         }
         Ok(Self{path:path.to_owned(),identity,_directory:directory})
     }
-    fn require_target(&self,path:&Path)->Result<DirectoryIdentity,String> {
+    pub(super) fn require_target(&self,path:&Path)->Result<DirectoryIdentity,String> {
         if self.path!=path {return Err("The captured agent directory belongs to another selected target".into());}
         Ok(self.identity)
     }
