@@ -24405,20 +24405,67 @@ mod tests {
         app.active_workspace = Some(key.canonical_path.clone());
         let head = crate::repository::Oid::parse_object("11".repeat(20)).unwrap();
         app.sidebar_model.source_control.as_mut().unwrap().head_oid = Some(head.as_str().into());
-        app.sidebar_state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
         let revision = app.sidebar_state.amend_request_revision().unwrap();
-        app.sidebar_state.apply(&SidebarAction::CommitMessageChanged { key: key.clone(), message: "Later typed message".into() });
-        for failed_head in [head.clone(), crate::repository::Oid::parse_object("22".repeat(20)).unwrap()] {
-            app.sidebar_model.source_control.as_mut().unwrap().set_error(Some("Newer operation feedback".into()));
-            drop(app.update(Message::SourceControlAmendMessage { key: key.clone(), revision, head: failed_head, result: Err("Old reader failed".into()) }));
+        app.sidebar_state
+            .apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Later typed message".into(),
+            });
+        for failed_head in [
+            head.clone(),
+            crate::repository::Oid::parse_object("22".repeat(20)).unwrap(),
+        ] {
+            app.sidebar_model
+                .source_control
+                .as_mut()
+                .unwrap()
+                .set_error(Some("Newer operation feedback".into()));
+            drop(app.update(Message::SourceControlAmendMessage {
+                key: key.clone(),
+                revision,
+                head: failed_head,
+                result: Err("Old reader failed".into()),
+            }));
             assert_eq!(app.sidebar_state.commit_message(), "Later typed message");
-            assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().error.as_deref(), Some("Newer operation feedback"));
+            assert_eq!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref(),
+                Some("Newer operation feedback")
+            );
         }
-        app.sidebar_state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: false });
-        app.sidebar_state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
         let revision = app.sidebar_state.amend_request_revision().unwrap();
-        drop(app.update(Message::SourceControlAmendMessage { key, revision, head, result: Err("Current reader failed".into()) }));
-        assert!(app.sidebar_model.source_control.as_ref().unwrap().error.as_deref().unwrap().contains("Current reader failed"));
+        drop(app.update(Message::SourceControlAmendMessage {
+            key,
+            revision,
+            head,
+            result: Err("Current reader failed".into()),
+        }));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Current reader failed")
+        );
     }
 
     #[test]

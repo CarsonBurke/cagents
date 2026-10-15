@@ -3153,9 +3153,9 @@ impl SidebarState {
         } else {
             self.parked_commit_drafts.get_mut(&key.canonical_path)
         };
-        if let Some(draft) = draft.filter(|draft| {
-            draft.amend && draft.amend_loading && draft.revision == revision
-        }) {
+        if let Some(draft) =
+            draft.filter(|draft| draft.amend && draft.amend_loading && draft.revision == revision)
+        {
             draft.amend_loading = false;
             return true;
         }
