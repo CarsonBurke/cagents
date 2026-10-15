@@ -88,6 +88,7 @@ pull_request_open_target = "review"
 managed_worktree_directory = "worktrees/"
 worktree_sort = "newest"
 editor_auto_save = true
+editor_auto_close = true
 editor_tab_width = 4
 editor_wrap_lines = false
 editor_syntax_theme = "auto"
@@ -167,6 +168,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `managed_worktree_directory` | string | `"worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
+| `editor_auto_close` | boolean | `true` | Pairs brackets and quotes, wraps selected text, and types over an existing closer. Turn it off to insert characters literally |
 | `editor_tab_width` | integer | `4` | `1` through `16` columns. Changes native tab stops without rewriting tabs. Also supplies the space indentation fallback when neither file content nor `.editorconfig` sets it |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
 | `editor_syntax_theme` | string | `"auto"` | Syntax colors for editors and diffs: `"auto"` (follows the app theme), `"solarized_dark"`, `"mocha"`, `"ocean"`, `"eighties"`, or `"inspired_github"` (`"inspired_git_hub"`, written by earlier versions, is also read) |
@@ -262,6 +264,24 @@ ansi = [
   "#8fbcdb", "#c5a0c0", "#93ccdc", "#eceff4",
 ]
 ```
+
+## Editor navigation
+
+Ctrl+G accepts a one-based line or `line:column`. The Ln/Col indicator opens the
+same field and shows the selected character count. File filtering also accepts
+compiler locations such as `src/main.rs:120:8`.
+
+Alt+Left and Alt+Right, or the mouse back and forward buttons over the focused
+editor, revisit explicit jumps such as definitions, search results and go-to-line.
+Switching between saved files retains undo history for up to eight files and
+32 MiB of edit data per card. Reopening a file whose disk content changed drops
+its retained history. Unsaved edits still require saving or discarding before
+switching files.
+
+Tab and Shift+Tab indent or outdent multiline selections as one undo step. Enter keeps
+leading whitespace and adds a level after an opening bracket. The editor detects
+the file's indentation and applies matching `.editorconfig` settings from within
+the repository; the tab-width preference supplies the fallback.
 
 ## Language servers
 
