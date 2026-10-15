@@ -96,7 +96,7 @@ enum Request {
         #[serde(default)]
         recovery: Option<Recovery>,
         #[serde(default)]
-        setup_lease_identity: Option<(u64,u64)>,
+        setup_lease_identity: Option<(u64, u64)>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -188,26 +188,42 @@ pub(super) fn spawn_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Held, String> {
-    spawn_recoverable_with_setup_lease(command,size,exits,recovery,None)
+    spawn_recoverable_with_setup_lease(command, size, exits, recovery, None)
 }
 
-fn setup_lease_identity(file:&File)->Result<(u64,u64),String> {
-    let metadata=file.metadata().map_err(|error|error.to_string())?;
-    if !metadata.is_file()||metadata.uid()!=unsafe {libc::geteuid()}||metadata.nlink()!=1||metadata.mode()&0o077!=0 {
+fn setup_lease_identity(file: &File) -> Result<(u64, u64), String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
         return Err("Invalid setup execution lease descriptor".into());
     }
-    if unsafe {libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {
-        return Err(format!("Setup execution lease is unavailable: {}",io::Error::last_os_error()));
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "Setup execution lease is unavailable: {}",
+            io::Error::last_os_error()
+        ));
     }
-    Ok((metadata.dev(),metadata.ino()))
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 pub(super) fn spawn_recoverable_with_setup_lease(
-    command:CommandBuilder,size:PtySize,exits:Sender<ChildExit>,recovery:Option<Recovery>,
-    setup_lease:Option<std::sync::Arc<File>>,
-)->Result<Held,String> {
-    let setup_lease_identity=setup_lease.as_ref().map(|file|setup_lease_identity(file)).transpose()?;
-    let descriptors=setup_lease.iter().map(|file|file.as_raw_fd()).collect::<Vec<_>>();
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    setup_lease: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
+    let setup_lease_identity = setup_lease
+        .as_ref()
+        .map(|file| setup_lease_identity(file))
+        .transpose()?;
+    let descriptors = setup_lease
+        .iter()
+        .map(|file| file.as_raw_fd())
+        .collect::<Vec<_>>();
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -1056,30 +1072,31 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery,setup_identity,mut descriptors) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
-                command,
-                size,
-                recovery,
-                setup_lease_identity,
-            },
-            descriptors,
-        ))) => (command, size, recovery,setup_lease_identity,descriptors),
-        _ => return 1,
-    };
+    let (command, size, mut recovery, setup_identity, mut descriptors) =
+        match receive::<Request>(&control) {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    setup_lease_identity,
+                },
+                descriptors,
+            ))) => (command, size, recovery, setup_lease_identity, descriptors),
+            _ => return 1,
+        };
     // SCM_RIGHTS preserves the original flock's open file description. Keep
     // it in the holder through adoption, daemon loss and proved PTY cleanup.
-    let _setup_execution_lease=match (setup_identity,descriptors.len()) {
-        (Some(expected),1)=> {
-            let file=File::from(descriptors.pop().expect("checked setup lease descriptor"));
+    let _setup_execution_lease = match (setup_identity, descriptors.len()) {
+        (Some(expected), 1) => {
+            let file = File::from(descriptors.pop().expect("checked setup lease descriptor"));
             match setup_lease_identity(&file) {
-                Ok(actual) if actual==expected=>Some(file),
-                _=>return fail("Setup execution lease descriptor identity changed".into()),
+                Ok(actual) if actual == expected => Some(file),
+                _ => return fail("Setup execution lease descriptor identity changed".into()),
             }
         }
-        (None,0)=>None,
-        _=>return fail("Terminal spawn sent the wrong setup lease descriptors".into()),
+        (None, 0) => None,
+        _ => return fail("Terminal spawn sent the wrong setup lease descriptors".into()),
     };
     if let Some(recovery) = &recovery {
         let authority = (|| {
@@ -2222,8 +2239,22 @@ mod tests {
             let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
             let (exits, _exited) = crossbeam_channel::bounded(1);
             use std::os::unix::fs::OpenOptionsExt;
-            let setup_lease=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(PathBuf::from(&ready).parent().unwrap().join("setup-execution.lease")).unwrap();
-            assert_eq!(unsafe {libc::flock(setup_lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+            let setup_lease = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    PathBuf::from(&ready)
+                        .parent()
+                        .unwrap()
+                        .join("setup-execution.lease"),
+                )
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(setup_lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
             let held = spawn_recoverable_with_setup_lease(
                 command("echo ready; while read line; do if [ \"$line\" = finish ]; then echo completed-result; exit 7; fi; echo still-running:$line; done"),
                 size(),
@@ -2303,9 +2334,13 @@ mod tests {
         cleanup.daemon.wait().unwrap();
         assert!(record.holder.is_current());
         assert!(record.root.is_current());
-        let setup_lease=File::open(directory.join("setup-execution.lease")).unwrap();
-        assert_eq!(unsafe {libc::flock(setup_lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},-1,"the actual holder must retain setup authority after its daemon dies");
-        assert_eq!(io::Error::last_os_error().kind(),io::ErrorKind::WouldBlock);
+        let setup_lease = File::open(directory.join("setup-execution.lease")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(setup_lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+            "the actual holder must retain setup authority after its daemon dies"
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
         let runtime = directory
             .as_path()
             .join(crate::instance::RUNTIME_SUBDIRECTORY);
@@ -2462,7 +2497,11 @@ mod tests {
         drop(restored);
         wait_gone(record.root.pid);
         wait_gone(record.holder.pid);
-        assert_eq!(unsafe {libc::flock(setup_lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"proved holder cleanup releases the shared setup execution lease");
+        assert_eq!(
+            unsafe { libc::flock(setup_lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "proved holder cleanup releases the shared setup execution lease"
+        );
         assert!(
             registry::discover(&holders, &crate::daemon::read_boot_id().unwrap())
                 .unwrap()

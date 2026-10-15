@@ -630,8 +630,7 @@ impl Session {
     /// Connects on first use, starting the daemon if it is not running.
     fn client(&mut self) -> Result<&mut ControlClient, AppError> {
         if self.connection.is_none() {
-            let socket =
-                control_daemon_socket()?;
+            let socket = control_daemon_socket()?;
             let client = ControlClient::connect(&socket)
                 .map_err(|e| AppError::new("daemon_connection", e))?;
             self.connection = Some((client, socket));

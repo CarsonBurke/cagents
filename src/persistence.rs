@@ -537,7 +537,9 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    pub(crate) fn database_path(&self)->&Path {&self.path}
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.path
+    }
     /// Copies a live store through SQLite's transactionally consistent VACUUM
     /// snapshot. The source is never startup-reconciled or checkpointed here.
     pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
@@ -2230,45 +2232,99 @@ pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
 }
 
 /// Read a setup receipt without migration, reconciliation or write access.
-pub(crate) fn read_worktree_operation_at(path:&Path,id:OperationId)->Result<Option<PendingOperation>> {
-    let connection=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+pub(crate) fn read_worktree_operation_at(
+    path: &Path,
+    id: OperationId,
+) -> Result<Option<PendingOperation>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
-    worktree_operation_at(&connection,id)
+    worktree_operation_at(&connection, id)
 }
 
-fn worktree_operation_at(connection:&Connection,id:OperationId)->Result<Option<PendingOperation>> {
+fn worktree_operation_at(
+    connection: &Connection,
+    id: OperationId,
+) -> Result<Option<PendingOperation>> {
     let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_operations')",[],|row|row.get(0))?;
-    if !exists {return Ok(None);}
+    if !exists {
+        return Ok(None);
+    }
     let row=connection.query_row("SELECT entity_kind,entity_id,action,base_generation,payload_json,status,created_at_unix_ms,updated_at_unix_ms FROM pending_operations WHERE operation_id=?1",[id.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?,row.get::<_,i64>(7)?))).optional()?;
-    row.map(|(entity_kind,entity_id,action,generation,payload,status,created,updated)|Ok(PendingOperation {
-        id,entity_kind,entity_id,action,base_generation:i64_to_u64(generation,"operation base generation")?,
-        payload:serde_json::from_str(&payload).unwrap_or(Value::String(payload)),status:PendingOperationStatus::parse(&status)?,created_at_unix_ms:created,updated_at_unix_ms:updated,
-    })).transpose()
+    row.map(
+        |(entity_kind, entity_id, action, generation, payload, status, created, updated)| {
+            Ok(PendingOperation {
+                id,
+                entity_kind,
+                entity_id,
+                action,
+                base_generation: i64_to_u64(generation, "operation base generation")?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::String(payload)),
+                status: PendingOperationStatus::parse(&status)?,
+                created_at_unix_ms: created,
+                updated_at_unix_ms: updated,
+            })
+        },
+    )
+    .transpose()
 }
 
 /// A bounded execution fence against concurrent whole-payload intent CAS.
 /// Opens only an existing store; no schema migration or recovery is performed.
-pub(crate) struct WorktreeOperationGuard {connection:Connection,pub(crate) operation:PendingOperation}
-impl Drop for WorktreeOperationGuard {
-    fn drop(&mut self) {let _=self.connection.execute_batch("ROLLBACK");}
+pub(crate) struct WorktreeOperationGuard {
+    connection: Connection,
+    pub(crate) operation: PendingOperation,
 }
-pub(crate) fn lock_worktree_operation_at(path:&Path,id:OperationId)->Result<WorktreeOperationGuard> {
-    let connection=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+impl Drop for WorktreeOperationGuard {
+    fn drop(&mut self) {
+        let _ = self.connection.execute_batch("ROLLBACK");
+    }
+}
+pub(crate) fn lock_worktree_operation_at(
+    path: &Path,
+    id: OperationId,
+) -> Result<WorktreeOperationGuard> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
     connection.execute_batch("BEGIN IMMEDIATE")?;
-    let operation=worktree_operation_at(&connection,id)?.ok_or_else(||StoreError::InvalidState("Setup creation receipt disappeared before execution".into()))?;
-    Ok(WorktreeOperationGuard {connection,operation})
+    let operation = worktree_operation_at(&connection, id)?.ok_or_else(|| {
+        StoreError::InvalidState("Setup creation receipt disappeared before execution".into())
+    })?;
+    Ok(WorktreeOperationGuard {
+        connection,
+        operation,
+    })
 }
 
 /// Resolve a persisted UI project ID without migrating another window's store.
-pub fn read_project_repository(path:&Path,id:ProjectId)->Result<Option<PathBuf>> {
-    let connection=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+pub fn read_project_repository(path: &Path, id: ProjectId) -> Result<Option<PathBuf>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
-    let row:Option<(String,String)>=connection.query_row("SELECT repository_json,existence_json FROM projects WHERE project_id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-    row.map(|(repository,existence)| {
-        let existence:Existence=from_json("project existence",&existence)?;
-        if existence.is_open() {Ok(Some(from_json("project repository",&repository)?))} else {Ok(None)}
-    }).transpose().map(Option::flatten)
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT repository_json,existence_json FROM projects WHERE project_id=?1",
+            [id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(repository, existence)| {
+        let existence: Existence = from_json("project existence", &existence)?;
+        if existence.is_open() {
+            Ok(Some(from_json("project repository", &repository)?))
+        } else {
+            Ok(None)
+        }
+    })
+    .transpose()
+    .map(Option::flatten)
 }
 
 /// Read navigation identities without migrating or acquiring another window's
@@ -9259,23 +9315,70 @@ mod tests {
     }
 }
 
-
-#[cfg(all(test,feature="host"))]
+#[cfg(all(test, feature = "host"))]
 mod worktree_execution_guard_tests {
     use super::*;
     #[test]
     fn current_setup_receipt_guard_serializes_metadata_writers_without_recovery() {
-        let root=tempfile::tempdir().unwrap();let path=root.path().join("journal.sqlite3");
-        let store=StateStore::open(&path,BootId::new("guard-test")).unwrap();let id=OperationId::new();
-        store.begin_operation(&PendingOperation {id,entity_kind:"worktree_creation".into(),entity_id:"fixture".into(),action:"create".into(),base_generation:0,payload:serde_json::json!({"run":"old"}),status:PendingOperationStatus::Pending,created_at_unix_ms:1,updated_at_unix_ms:1}).unwrap();
-        assert_eq!(read_worktree_operation_at(&path,id).unwrap().unwrap().payload["run"],"old");
-        let guard=lock_worktree_operation_at(&path,id).unwrap();
-        let writer=Connection::open(&path).unwrap();writer.busy_timeout(Duration::ZERO).unwrap();
-        let blocked=writer.execute("UPDATE pending_operations SET payload_json='{}' WHERE operation_id=?1",[id.to_string()]).unwrap_err();
-        assert!(matches!(blocked,rusqlite::Error::SqliteFailure(ref failure,_) if failure.code==rusqlite::ErrorCode::DatabaseBusy||failure.code==rusqlite::ErrorCode::DatabaseLocked));
-        assert_eq!(guard.operation.payload["run"],"old");drop(guard);
-        assert_eq!(writer.execute("UPDATE pending_operations SET payload_json='{}' WHERE operation_id=?1",[id.to_string()]).unwrap(),1);
-        assert_eq!(read_worktree_operation_at(&path,id).unwrap().unwrap().status,PendingOperationStatus::Pending,"inspection must not reconcile the row");
-        assert!(read_worktree_operation_at(&path,OperationId::new()).unwrap().is_none());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("journal.sqlite3");
+        let store = StateStore::open(&path, BootId::new("guard-test")).unwrap();
+        let id = OperationId::new();
+        store
+            .begin_operation(&PendingOperation {
+                id,
+                entity_kind: "worktree_creation".into(),
+                entity_id: "fixture".into(),
+                action: "create".into(),
+                base_generation: 0,
+                payload: serde_json::json!({"run":"old"}),
+                status: PendingOperationStatus::Pending,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            read_worktree_operation_at(&path, id)
+                .unwrap()
+                .unwrap()
+                .payload["run"],
+            "old"
+        );
+        let guard = lock_worktree_operation_at(&path, id).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let blocked = writer
+            .execute(
+                "UPDATE pending_operations SET payload_json='{}' WHERE operation_id=?1",
+                [id.to_string()],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked,rusqlite::Error::SqliteFailure(ref failure,_) if failure.code==rusqlite::ErrorCode::DatabaseBusy||failure.code==rusqlite::ErrorCode::DatabaseLocked)
+        );
+        assert_eq!(guard.operation.payload["run"], "old");
+        drop(guard);
+        assert_eq!(
+            writer
+                .execute(
+                    "UPDATE pending_operations SET payload_json='{}' WHERE operation_id=?1",
+                    [id.to_string()]
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_worktree_operation_at(&path, id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PendingOperationStatus::Pending,
+            "inspection must not reconcile the row"
+        );
+        assert!(
+            read_worktree_operation_at(&path, OperationId::new())
+                .unwrap()
+                .is_none()
+        );
     }
 }

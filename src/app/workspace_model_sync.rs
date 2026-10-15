@@ -24,7 +24,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
-    WorktreesChanged { repository: PathBuf },
+    WorktreesChanged {
+        repository: PathBuf,
+    },
     /// The registry as it stood when the watcher connected.
     ///
     /// This is the only update that means "a connection just began", which is
@@ -99,10 +101,15 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
     loop {
-        let (sequence, edit) = match client.next_workspace_model_update().map_err(|error| error.to_string())? {
+        let (sequence, edit) = match client
+            .next_workspace_model_update()
+            .map_err(|error| error.to_string())?
+        {
             crate::control::WorkspaceModelEvent::Edited { sequence, edit } => (sequence, edit),
             crate::control::WorkspaceModelEvent::WorktreesChanged { repository } => {
-                sender.send_blocking(ModelUpdate::WorktreesChanged { repository }).map_err(|error| error.to_string())?;
+                sender
+                    .send_blocking(ModelUpdate::WorktreesChanged { repository })
+                    .map_err(|error| error.to_string())?;
                 continue;
             }
         };
@@ -401,8 +408,15 @@ impl Cagents {
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::WorktreesChanged { repository } => {
-                let project = self.sidebar_model.projects.iter().find(|project| project.repository == repository).map(|project| project.id);
-                project.map(|id| self.repository_load_task(repository, Some(id), false)).unwrap_or_else(Task::none)
+                let project = self
+                    .sidebar_model
+                    .projects
+                    .iter()
+                    .find(|project| project.repository == repository)
+                    .map(|project| project.id);
+                project
+                    .map(|id| self.repository_load_task(repository, Some(id), false))
+                    .unwrap_or_else(Task::none)
             }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(

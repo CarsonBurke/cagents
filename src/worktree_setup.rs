@@ -16,7 +16,10 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStringExt, fs::{MetadataExt, PermissionsExt}},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -86,8 +89,12 @@ impl CopyPermissions {
     }
 
     fn check(&self, source: &fs::File) -> Result<(), SetupError> {
-        if source_fingerprint(&source.metadata().map_err(error)?) != source_fingerprint(&self.metadata) {
-            return Err(error("source changed during setup copy; the worktree was kept"));
+        if source_fingerprint(&source.metadata().map_err(error)?)
+            != source_fingerprint(&self.metadata)
+        {
+            return Err(error(
+                "source changed during setup copy; the worktree was kept",
+            ));
         }
         Ok(())
     }
@@ -98,7 +105,9 @@ impl CopyPermissions {
         self.check(source)?;
         fs_safety::preserve_group(self.metadata.gid(), destination).map_err(error)?;
         self.acl.apply(destination).map_err(error)?;
-        destination.set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777)).map_err(error)
+        destination
+            .set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777))
+            .map_err(error)
     }
 }
 
@@ -427,14 +436,21 @@ fn prepare_inner(
     let source = fs_safety::Root::open(primary).map_err(error)?;
     let target = fs_safety::Root::open(destination).map_err(error)?;
     let verify_generation = || -> Result<(), SetupError> {
-        let Some(creation) = creation else { return Ok(()); };
+        let Some(creation) = creation else {
+            return Ok(());
+        };
         use std::os::unix::fs::MetadataExt;
         let held = target.metadata().map_err(error)?;
         let named = fs::symlink_metadata(destination).map_err(error)?;
         let admin = service.git_dir(destination, cancel).map_err(error)?;
-        if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino()
-            || !crate::repository::worktree_setup_marker_matches(&admin, creation).map_err(error)? {
-            return Err(error("The setup checkout creation generation changed; review the current checkout explicitly"));
+        if !named.is_dir()
+            || held.dev() != named.dev()
+            || held.ino() != named.ino()
+            || !crate::repository::worktree_setup_marker_matches(&admin, creation).map_err(error)?
+        {
+            return Err(error(
+                "The setup checkout creation generation changed; review the current checkout explicitly",
+            ));
         }
         Ok(())
     };
@@ -754,7 +770,10 @@ mod tests {
         let result = fixture.prepare(&plan);
         fs::set_permissions(&fixture.primary, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().copied, [PathBuf::from(".env")]);
-        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"secret");
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
@@ -784,12 +803,26 @@ mod tests {
         let snapshot = CopyPermissions::capture(&input).unwrap();
         let mut private = vec![b'p'; 65536];
         private.extend_from_slice(b"new private bytes");
-        let mut reader = RewritingReader { input: input.try_clone().unwrap(), path: path.clone(), rewrite: Some(private) };
+        let mut reader = RewritingReader {
+            input: input.try_clone().unwrap(),
+            path: path.clone(),
+            rewrite: Some(private),
+        };
         let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
         let mut output = temporary.reopen().unwrap();
         std::io::copy(&mut reader, &mut output).unwrap();
-        assert!(fs::read(temporary.path()).unwrap().ends_with(b"new private bytes"));
-        assert!(snapshot.apply(&input, &output).unwrap_err().to_string().contains("source changed"));
+        assert!(
+            fs::read(temporary.path())
+                .unwrap()
+                .ends_with(b"new private bytes")
+        );
+        assert!(
+            snapshot
+                .apply(&input, &output)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
         assert_eq!(output.metadata().unwrap().mode() & 0o777, 0o600);
         assert!(!fixture.destination.join(".env").exists());
         assert!(fixture.destination.join("tracked").exists());
@@ -806,7 +839,13 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
         snapshot.apply(&input, temporary.as_file()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(snapshot.check(&input).unwrap_err().to_string().contains("source changed"));
+        assert!(
+            snapshot
+                .check(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
         assert!(!fixture.destination.join(".env").exists());
     }
 
@@ -1170,7 +1209,11 @@ mod tests {
         let other_plan = other.config(config);
         trust(&other.primary, &other_plan, &CancellationToken::new()).unwrap();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
-        fs::write(fixture.primary.join("tracked"), "must not restore deleted tracked file").unwrap();
+        fs::write(
+            fixture.primary.join("tracked"),
+            "must not restore deleted tracked file",
+        )
+        .unwrap();
         fs::remove_file(fixture.destination.join("tracked")).unwrap();
         // Isolate environment mutation in a subprocess so other parallel tests
         // never inherit these intentionally hostile redirections.
@@ -1185,7 +1228,10 @@ mod tests {
             .env("GIT_DIR", other.primary.join(".git"))
             .env("GIT_WORK_TREE", &other.primary)
             .env("GIT_COMMON_DIR", other.primary.join(".git"))
-            .env("GIT_INDEX_FILE", fixture._directory.path().join("missing-index"))
+            .env(
+                "GIT_INDEX_FILE",
+                fixture._directory.path().join("missing-index"),
+            )
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");

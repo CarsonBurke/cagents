@@ -4,7 +4,13 @@ use super::*;
 
 /// An exact receipt's execution lease. Retain across file preparation and its
 /// progress CAS, then drop before requesting host terminal startup.
-pub struct WorktreeSetupGuard<'a> {store:&'a StateStore,creation_id:OperationId,entity_id:String,generation:u64,lease:fs::File}
+pub struct WorktreeSetupGuard<'a> {
+    store: &'a StateStore,
+    creation_id: OperationId,
+    entity_id: String,
+    generation: u64,
+    lease: fs::File,
+}
 
 /// Exact configuration reviewed for one creation. Execution still reloads and
 /// verifies this snapshot through `worktree_setup` before preparing commands.
@@ -50,12 +56,22 @@ fn read_creation_marker(admin: &crate::fs_safety::Root) -> io::Result<Option<Ope
         Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => return Err(io::Error::other(error)),
     };
-    if !file.metadata()?.is_file() { return Err(io::Error::other("Invalid worktree creation identity marker")); }
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "Invalid worktree creation identity marker",
+        ));
+    }
     let bytes = crate::fs_safety::read_bounded(&mut file, 64)?;
-    if bytes.len() != 37 || bytes.last() != Some(&b'\n') { return Err(io::Error::other("Invalid bounded canonical worktree creation marker")); }
+    if bytes.len() != 37 || bytes.last() != Some(&b'\n') {
+        return Err(io::Error::other(
+            "Invalid bounded canonical worktree creation marker",
+        ));
+    }
     let value = std::str::from_utf8(&bytes[..36]).map_err(io::Error::other)?;
     let creation: OperationId = value.parse().map_err(io::Error::other)?;
-    if creation.to_string().as_bytes() != &bytes[..36] { return Err(io::Error::other("Noncanonical worktree creation marker")); }
+    if creation.to_string().as_bytes() != &bytes[..36] {
+        return Err(io::Error::other("Noncanonical worktree creation marker"));
+    }
     Ok(Some(creation))
 }
 
@@ -72,34 +88,53 @@ impl WorktreeSetupCreationIdentity {
     /// disappears when Git removes its admin directory, even if its path or
     /// filesystem inode number is later reused. Never infer it for legacy rows.
     pub fn matches_checkout(&self, common: &Path, admin: &Path) -> io::Result<bool> {
-        if self.common_dir != common || self.admin_dir.as_deref() != Some(admin) { return Ok(false); }
+        if self.common_dir != common || self.admin_dir.as_deref() != Some(admin) {
+            return Ok(false);
+        }
         worktree_setup_marker_matches(admin, self.creation_id)
     }
 }
 
 pub(super) fn named_directory_matches(root: &crate::fs_safety::Root) -> bool {
     use std::os::unix::fs::MetadataExt;
-    root.metadata().ok().zip(fs::symlink_metadata(root.path()).ok()).is_some_and(|(held, named)|
-        named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino())
+    root.metadata()
+        .ok()
+        .zip(fs::symlink_metadata(root.path()).ok())
+        .is_some_and(|(held, named)| {
+            named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino()
+        })
 }
 
 /// Publish through the already-held original admin descriptor, only while
 /// the operation's Git lock and exclusive lease prove creation ownership.
 /// Never initialize or repair a marker from a setup resume callback.
-pub(super) fn record_creation_identity(admin: &crate::fs_safety::Root, creation: OperationId) -> io::Result<()> {
+pub(super) fn record_creation_identity(
+    admin: &crate::fs_safety::Root,
+    creation: OperationId,
+) -> io::Result<()> {
     use std::io::Write;
     match read_creation_marker(admin)? {
         Some(existing) if existing == creation => return Ok(()),
-        Some(_) => return Err(io::Error::other("Worktree creation identity belongs to another generation")),
+        Some(_) => {
+            return Err(io::Error::other(
+                "Worktree creation identity belongs to another generation",
+            ));
+        }
         None => {}
     }
-    let (mut file, temporary) = crate::fs_safety::create_temporary_in(admin, 0o600).map_err(io::Error::other)?;
+    let (mut file, temporary) =
+        crate::fs_safety::create_temporary_in(admin, 0o600).map_err(io::Error::other)?;
     let result = (|| {
         writeln!(file, "{creation}")?;
         file.sync_all()?;
-        match crate::fs_safety::rename_new_within(admin, &temporary, std::ffi::OsStr::new(CREATION_MARKER)) {
-            Ok(()) => {},
-            Err(error) if error.is_already_exists() && read_creation_marker(admin)? == Some(creation) => {},
+        match crate::fs_safety::rename_new_within(
+            admin,
+            &temporary,
+            std::ffi::OsStr::new(CREATION_MARKER),
+        ) {
+            Ok(()) => {}
+            Err(error)
+                if error.is_already_exists() && read_creation_marker(admin)? == Some(creation) => {}
             Err(error) => return Err(io::Error::other(error)),
         }
         crate::fs_safety::sync_directory(admin)
@@ -168,7 +203,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         operation: &PendingOperation,
     ) -> Result<WorktreeOperationReport, StoreError> {
-        let journal=settled_setup_journal(operation)?;
+        let journal = settled_setup_journal(operation)?;
         Ok(journal.report(operation.created_at_unix_ms))
     }
 
@@ -193,9 +228,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         store: &StateStore,
         creation_id: OperationId,
     ) -> Result<Option<WorktreeSetupCreationIdentity>, StoreError> {
-        let Some(operation) = store.journaled_worktree_operation(creation_id)? else { return Ok(None); };
+        let Some(operation) = store.journaled_worktree_operation(creation_id)? else {
+            return Ok(None);
+        };
         let journal = settled_setup_journal(&operation)?;
-        Ok(Some(WorktreeSetupCreationIdentity { creation_id, common_dir: journal.common_dir, admin_dir: journal.admin_dir }))
+        Ok(Some(WorktreeSetupCreationIdentity {
+            creation_id,
+            common_dir: journal.common_dir,
+            admin_dir: journal.admin_dir,
+        }))
     }
 
     /// Update metadata on a settled creation without reconciling or executing
@@ -227,54 +268,128 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Serialize production setup transitions across copied window journals
     /// and the host's actual setup execution, before taking a SQLite writer.
     pub fn update_worktree_setup_intent_guarded(
-        &self,store:&StateStore,creation_id:OperationId,
-        expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,
-    )->Result<WorktreeOperationReport,StoreError> {
-        let guard=self.worktree_setup_guard(store,creation_id,expected)?;
-        self.update_worktree_setup_intent_with_guard(store,creation_id,expected,updated,&guard)
+        &self,
+        store: &StateStore,
+        creation_id: OperationId,
+        expected: Option<&WorktreeSetupIntent>,
+        updated: WorktreeSetupIntent,
+    ) -> Result<WorktreeOperationReport, StoreError> {
+        let guard = self.worktree_setup_guard(store, creation_id, expected)?;
+        self.update_worktree_setup_intent_with_guard(store, creation_id, expected, updated, &guard)
     }
 
-    pub fn worktree_setup_guard<'a>(&self,store:&'a StateStore,creation_id:OperationId,expected:Option<&WorktreeSetupIntent>)->Result<WorktreeSetupGuard<'a>,StoreError> {
-        let initial=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation receipt is missing".into()))?;
-        let lease=self.worktree_setup_execution_lease(&initial)?;
+    pub fn worktree_setup_guard<'a>(
+        &self,
+        store: &'a StateStore,
+        creation_id: OperationId,
+        expected: Option<&WorktreeSetupIntent>,
+    ) -> Result<WorktreeSetupGuard<'a>, StoreError> {
+        let initial = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| StoreError::InvalidState("Setup creation receipt is missing".into()))?;
+        let lease = self.worktree_setup_execution_lease(&initial)?;
         // Copies of a known creator journal are not independent authority.
         // Refuse ambiguous owners rather than preparing from divergent intent.
-        let mut paths=crate::instance::window_database_paths()?;
-        if let Some(directories)=crate::instance::project_dirs() {paths.push(directories.data_dir().join("worktree-operations.sqlite3"));}
-        paths.sort();paths.dedup();let mut owners=Vec::new();
-        for path in paths {
-            if path.try_exists()?&&crate::persistence::read_worktree_operation_at(&path,creation_id)?.is_some() {owners.push(path);}
+        let mut paths = crate::instance::window_database_paths()?;
+        if let Some(directories) = crate::instance::project_dirs() {
+            paths.push(directories.data_dir().join("worktree-operations.sqlite3"));
         }
-        if owners.len()>1||(owners.len()==1&&owners[0].canonicalize()?!=store.database_path().canonicalize()?) {
+        paths.sort();
+        paths.dedup();
+        let mut owners = Vec::new();
+        for path in paths {
+            if path.try_exists()?
+                && crate::persistence::read_worktree_operation_at(&path, creation_id)?.is_some()
+            {
+                owners.push(path);
+            }
+        }
+        if owners.len() > 1
+            || (owners.len() == 1
+                && owners[0].canonicalize()? != store.database_path().canonicalize()?)
+        {
             return Err(StoreError::InvalidState("Multiple window journals retain this setup creation; its unique original authority is unavailable".into()));
         }
-        let current=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation disappeared".into()))?;
-        let journal=settled_setup_journal(&current)?;
-        if current.entity_id!=initial.entity_id||current.base_generation!=initial.base_generation {return Err(StoreError::InvalidState("Setup receipt identity changed".into()));}
-        if journal.request.setup_intent.as_ref()!=expected {return Err(StoreError::InvalidState("Setup intent was superseded before preparation".into()));}
-        if journal.lease_identity!=Some(lease_file_identity(&lease)?) {return Err(StoreError::InvalidState("Setup creation lease identity changed".into()));}
-        Ok(WorktreeSetupGuard {store,creation_id,entity_id:current.entity_id,generation:current.base_generation,lease})
+        let current = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| StoreError::InvalidState("Setup creation disappeared".into()))?;
+        let journal = settled_setup_journal(&current)?;
+        if current.entity_id != initial.entity_id
+            || current.base_generation != initial.base_generation
+        {
+            return Err(StoreError::InvalidState(
+                "Setup receipt identity changed".into(),
+            ));
+        }
+        if journal.request.setup_intent.as_ref() != expected {
+            return Err(StoreError::InvalidState(
+                "Setup intent was superseded before preparation".into(),
+            ));
+        }
+        if journal.lease_identity != Some(lease_file_identity(&lease)?) {
+            return Err(StoreError::InvalidState(
+                "Setup creation lease identity changed".into(),
+            ));
+        }
+        Ok(WorktreeSetupGuard {
+            store,
+            creation_id,
+            entity_id: current.entity_id,
+            generation: current.base_generation,
+            lease,
+        })
     }
 
-    pub fn update_worktree_setup_intent_with_guard(&self,store:&StateStore,creation_id:OperationId,expected:Option<&WorktreeSetupIntent>,updated:WorktreeSetupIntent,guard:&WorktreeSetupGuard<'_>)->Result<WorktreeOperationReport,StoreError> {
-        if guard.creation_id!=creation_id||!std::ptr::eq(guard.store,store) {return Err(StoreError::InvalidState("Setup preparation guard belongs to another receipt or store".into()));}
-        let row=store.journaled_worktree_operation(creation_id)?.ok_or_else(||StoreError::InvalidState("Setup creation disappeared".into()))?;
-        if row.entity_id!=guard.entity_id||row.base_generation!=guard.generation {return Err(StoreError::InvalidState("Setup preparation receipt identity changed".into()));}
-        let journal=settled_setup_journal(&row)?;
-        if journal.lease_identity!=Some(lease_file_identity(&guard.lease)?) {return Err(StoreError::InvalidState("Setup preparation lease identity changed".into()));}
-        self.update_worktree_setup_intent(store,creation_id,expected,updated)
+    pub fn update_worktree_setup_intent_with_guard(
+        &self,
+        store: &StateStore,
+        creation_id: OperationId,
+        expected: Option<&WorktreeSetupIntent>,
+        updated: WorktreeSetupIntent,
+        guard: &WorktreeSetupGuard<'_>,
+    ) -> Result<WorktreeOperationReport, StoreError> {
+        if guard.creation_id != creation_id || !std::ptr::eq(guard.store, store) {
+            return Err(StoreError::InvalidState(
+                "Setup preparation guard belongs to another receipt or store".into(),
+            ));
+        }
+        let row = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| StoreError::InvalidState("Setup creation disappeared".into()))?;
+        if row.entity_id != guard.entity_id || row.base_generation != guard.generation {
+            return Err(StoreError::InvalidState(
+                "Setup preparation receipt identity changed".into(),
+            ));
+        }
+        let journal = settled_setup_journal(&row)?;
+        if journal.lease_identity != Some(lease_file_identity(&guard.lease)?) {
+            return Err(StoreError::InvalidState(
+                "Setup preparation lease identity changed".into(),
+            ));
+        }
+        self.update_worktree_setup_intent(store, creation_id, expected, updated)
     }
 
-    pub(crate) fn worktree_setup_execution_lease(&self,operation:&PendingOperation)->Result<fs::File,StoreError> {
+    pub(crate) fn worktree_setup_execution_lease(
+        &self,
+        operation: &PendingOperation,
+    ) -> Result<fs::File, StoreError> {
         use std::os::unix::fs::MetadataExt;
-        let journal=settled_setup_journal(operation)?;
-        let expected=journal.lease_identity.ok_or_else(||StoreError::InvalidState("Setup creation has no original lease identity".into()))?;
+        let journal = settled_setup_journal(operation)?;
+        let expected = journal.lease_identity.ok_or_else(|| {
+            StoreError::InvalidState("Setup creation has no original lease identity".into())
+        })?;
         // Do not wait on a starting/live setup after a caller's activity census.
         // A retry must obtain fresh activity and intent evidence.
         let lease=worktree_lease(&journal.lease_path,false).map_err(|error|StoreError::InvalidState(format!("Close the previous Worktree setup terminal, including its completed card, before resuming; setup ownership is still held or unavailable: {error}")))?;
-        let named=fs::symlink_metadata(&journal.lease_path)?;
-        if lease_file_identity(&lease)?!=expected||!named.file_type().is_file()||(named.dev(),named.ino())!=expected {
-            return Err(StoreError::InvalidState("Setup creation lease was replaced".into()));
+        let named = fs::symlink_metadata(&journal.lease_path)?;
+        if lease_file_identity(&lease)? != expected
+            || !named.file_type().is_file()
+            || (named.dev(), named.ino()) != expected
+        {
+            return Err(StoreError::InvalidState(
+                "Setup creation lease was replaced".into(),
+            ));
         }
         Ok(lease)
     }
@@ -377,13 +492,27 @@ mod tests {
         record_creation_identity(&root, creation).unwrap();
         record_creation_identity(&root, creation).unwrap();
         assert!(worktree_setup_marker_matches(directory.path(), creation).unwrap());
-        assert_eq!(fs::metadata(directory.path().join(CREATION_MARKER)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(directory.path().join(CREATION_MARKER))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(record_creation_identity(&root, OperationId::new()).is_err());
         assert!(worktree_setup_marker_matches(directory.path(), creation).unwrap());
         fs::write(directory.path().join(CREATION_MARKER), vec![b'a'; 65]).unwrap();
         assert!(worktree_setup_marker_matches(directory.path(), creation).is_err());
-        fs::write(directory.path().join(CREATION_MARKER), format!("{creation}{}invalid", "\n".repeat(100))).unwrap();
-        assert!(worktree_setup_marker_matches(directory.path(), creation).is_err(), "a truncated valid prefix is not a marker");
+        fs::write(
+            directory.path().join(CREATION_MARKER),
+            format!("{creation}{}invalid", "\n".repeat(100)),
+        )
+        .unwrap();
+        assert!(
+            worktree_setup_marker_matches(directory.path(), creation).is_err(),
+            "a truncated valid prefix is not a marker"
+        );
         fs::remove_file(directory.path().join(CREATION_MARKER)).unwrap();
         symlink("/dev/null", directory.path().join(CREATION_MARKER)).unwrap();
         assert!(worktree_setup_marker_matches(directory.path(), creation).is_err());
@@ -401,40 +530,117 @@ mod tests {
         let creation = OperationId::new();
         record_creation_identity(&original, creation).unwrap();
         assert!(worktree_setup_marker_matches(&moved, creation).unwrap());
-        assert!(!worktree_setup_marker_matches(&admin, creation).unwrap(), "an asynchronous callback cannot initialize the replacement generation");
+        assert!(
+            !worktree_setup_marker_matches(&admin, creation).unwrap(),
+            "an asynchronous callback cannot initialize the replacement generation"
+        );
     }
 
     #[test]
     fn guarded_setup_transitions_share_the_original_lease_across_copied_stores() {
         if std::env::var_os("CAGENTS_SETUP_GUARD_TEST").is_none() {
-            let fixture=tempfile::tempdir().unwrap();
+            let fixture = tempfile::tempdir().unwrap();
             let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","repository::worktree_setup_intent::tests::guarded_setup_transitions_share_the_original_lease_across_copied_stores","--nocapture"])
                 .env_clear().env("PATH","/usr/bin:/bin").env("HOME",fixture.path()).env("XDG_RUNTIME_DIR",fixture.path()).env("XDG_DATA_HOME",fixture.path().join("data")).env("XDG_CONFIG_HOME",fixture.path().join("config"))
                 .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null").env("CAGENTS_SETUP_GUARD_TEST","1").output().unwrap();
-            assert!(output.status.success(),"isolated setup authority contract failed: {output:?}");return;
+            assert!(
+                output.status.success(),
+                "isolated setup authority contract failed: {output:?}"
+            );
+            return;
         }
 
-        let root=tempfile::tempdir().unwrap();let mut request=request(root.path());
-        let original=intent(&request);request.setup_intent=Some(original.clone());let mut journal=journal(request);
+        let root = tempfile::tempdir().unwrap();
+        let mut request = request(root.path());
+        let original = intent(&request);
+        request.setup_intent = Some(original.clone());
+        let mut journal = journal(request);
         fs::create_dir_all(&journal.common_dir).unwrap();
-        let lease=worktree_lease(&journal.lease_path,true).unwrap();journal.lease_identity=Some(lease_file_identity(&lease).unwrap());drop(lease);
-        let first=StateStore::open(root.path().join("first.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
-        let copied=StateStore::open(root.path().join("copied.sqlite3"),crate::model::BootId::new("lease-test")).unwrap();
-        seed(&first,&journal,PendingOperationStatus::Applied);seed(&copied,&journal,PendingOperationStatus::Applied);
-        let service=RepositoryService::system("git");let id=journal.request.operation_id;
-        let row=first.journaled_worktree_operation(id).unwrap().unwrap();let running=service.worktree_setup_guard(&first,id,Some(&original)).unwrap();
-        let mut updated=original.clone();updated.skip=true;updated.run_id=Some(OperationId::new());
-        assert!(service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated.clone()).is_err(),"a copied store must not bypass a starting or live execution");
-        assert_eq!(service.worktree_setup_creation(&copied,id).unwrap().unwrap().request.unwrap().setup_intent,Some(original.clone()));
-        assert!(service.update_worktree_setup_intent_with_guard(&copied,id,Some(&original),updated.clone(),&running).is_err(),"a preparation guard is bound to its exact store");
-        let mut prepared=original.clone();prepared.copy_done=true;
-        service.update_worktree_setup_intent_with_guard(&first,id,Some(&original),prepared,&running).unwrap();
+        let lease = worktree_lease(&journal.lease_path, true).unwrap();
+        journal.lease_identity = Some(lease_file_identity(&lease).unwrap());
+        drop(lease);
+        let first = StateStore::open(
+            root.path().join("first.sqlite3"),
+            crate::model::BootId::new("lease-test"),
+        )
+        .unwrap();
+        let copied = StateStore::open(
+            root.path().join("copied.sqlite3"),
+            crate::model::BootId::new("lease-test"),
+        )
+        .unwrap();
+        seed(&first, &journal, PendingOperationStatus::Applied);
+        seed(&copied, &journal, PendingOperationStatus::Applied);
+        let service = RepositoryService::system("git");
+        let id = journal.request.operation_id;
+        let row = first.journaled_worktree_operation(id).unwrap().unwrap();
+        let running = service
+            .worktree_setup_guard(&first, id, Some(&original))
+            .unwrap();
+        let mut updated = original.clone();
+        updated.skip = true;
+        updated.run_id = Some(OperationId::new());
+        assert!(
+            service
+                .update_worktree_setup_intent_guarded(&copied, id, Some(&original), updated.clone())
+                .is_err(),
+            "a copied store must not bypass a starting or live execution"
+        );
+        assert_eq!(
+            service
+                .worktree_setup_creation(&copied, id)
+                .unwrap()
+                .unwrap()
+                .request
+                .unwrap()
+                .setup_intent,
+            Some(original.clone())
+        );
+        assert!(
+            service
+                .update_worktree_setup_intent_with_guard(
+                    &copied,
+                    id,
+                    Some(&original),
+                    updated.clone(),
+                    &running
+                )
+                .is_err(),
+            "a preparation guard is bound to its exact store"
+        );
+        let mut prepared = original.clone();
+        prepared.copy_done = true;
+        service
+            .update_worktree_setup_intent_with_guard(
+                &first,
+                id,
+                Some(&original),
+                prepared,
+                &running,
+            )
+            .unwrap();
         drop(running);
-        assert!(service.worktree_setup_guard(&first,id,Some(&original)).is_err(),"stale preparation must fail before filesystem effects");
-        service.update_worktree_setup_intent_guarded(&copied,id,Some(&original),updated).unwrap();
-        let old=fs::File::open(&journal.lease_path).unwrap();fs::rename(&journal.lease_path,journal.lease_path.with_extension("retained")).unwrap();
-        drop(worktree_lease(&journal.lease_path,true).unwrap());
-        assert!(service.worktree_setup_execution_lease(&row).is_err(),"replacement lease inode must not inherit execution authority");drop(old);
+        assert!(
+            service
+                .worktree_setup_guard(&first, id, Some(&original))
+                .is_err(),
+            "stale preparation must fail before filesystem effects"
+        );
+        service
+            .update_worktree_setup_intent_guarded(&copied, id, Some(&original), updated)
+            .unwrap();
+        let old = fs::File::open(&journal.lease_path).unwrap();
+        fs::rename(
+            &journal.lease_path,
+            journal.lease_path.with_extension("retained"),
+        )
+        .unwrap();
+        drop(worktree_lease(&journal.lease_path, true).unwrap());
+        assert!(
+            service.worktree_setup_execution_lease(&row).is_err(),
+            "replacement lease inode must not inherit execution authority"
+        );
+        drop(old);
     }
 
     #[test]
@@ -517,18 +723,62 @@ mod tests {
     #[test]
     fn settled_identity_read_preserves_admin_and_legacy_missing_evidence_without_effects() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let store = StateStore::open(root.path().join("state.sqlite"), crate::model::BootId::new("setup-identity")).unwrap();
+        let store = StateStore::open(
+            root.path().join("state.sqlite"),
+            crate::model::BootId::new("setup-identity"),
+        )
+        .unwrap();
         let service = RepositoryService::system("must-not-execute-git");
         let request = request(root.path());
         let journal = journal(request.clone());
         seed(&store, &journal, PendingOperationStatus::Applied);
-        let before = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload;
-        assert_eq!(service.worktree_setup_creation_identity(&store, request.operation_id).unwrap(), Some(WorktreeSetupCreationIdentity { creation_id: request.operation_id, common_dir: journal.common_dir.clone(), admin_dir: journal.admin_dir.clone() }));
-        assert_eq!(store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, before);
-        let mut legacy = journal.clone(); legacy.admin_dir = None;
-        store.update_operation(request.operation_id, &before, &serde_json::to_value(&legacy).unwrap(), PendingOperationStatus::Applied).unwrap();
-        assert!(service.worktree_setup_creation_identity(&store, request.operation_id).unwrap().unwrap().admin_dir.is_none());
-        assert!(service.worktree_setup_creation_identity(&store, OperationId::new()).unwrap().is_none());
+        let before = store
+            .journaled_worktree_operation(request.operation_id)
+            .unwrap()
+            .unwrap()
+            .payload;
+        assert_eq!(
+            service
+                .worktree_setup_creation_identity(&store, request.operation_id)
+                .unwrap(),
+            Some(WorktreeSetupCreationIdentity {
+                creation_id: request.operation_id,
+                common_dir: journal.common_dir.clone(),
+                admin_dir: journal.admin_dir.clone()
+            })
+        );
+        assert_eq!(
+            store
+                .journaled_worktree_operation(request.operation_id)
+                .unwrap()
+                .unwrap()
+                .payload,
+            before
+        );
+        let mut legacy = journal.clone();
+        legacy.admin_dir = None;
+        store
+            .update_operation(
+                request.operation_id,
+                &before,
+                &serde_json::to_value(&legacy).unwrap(),
+                PendingOperationStatus::Applied,
+            )
+            .unwrap();
+        assert!(
+            service
+                .worktree_setup_creation_identity(&store, request.operation_id)
+                .unwrap()
+                .unwrap()
+                .admin_dir
+                .is_none()
+        );
+        assert!(
+            service
+                .worktree_setup_creation_identity(&store, OperationId::new())
+                .unwrap()
+                .is_none()
+        );
         assert!(!request.destination.exists());
     }
 

@@ -688,7 +688,9 @@ pub enum ServerMessage {
         target: crate::notifications::Target,
     },
     /// Sent only to shared-model subscribers after journaled worktree mutations.
-    WorktreesChanged { repository: PathBuf },
+    WorktreesChanged {
+        repository: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -800,31 +800,31 @@ pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
 pub struct AccessAcl(Option<Vec<u8>>);
 
 impl AccessAcl {
-pub fn capture(source: &File) -> io::Result<Self> {
-    let name = c"system.posix_acl_access";
-    let value = match read_attribute(source, name) {
-        Ok(value) => value,
-        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
-        Err(error) => return Err(error),
-    };
-    Ok(Self(value))
-}
+    pub fn capture(source: &File) -> io::Result<Self> {
+        let name = c"system.posix_acl_access";
+        let value = match read_attribute(source, name) {
+            Ok(value) => value,
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self(value))
+    }
 
-pub fn apply(&self, destination: &File) -> io::Result<()> {
-    let name = c"system.posix_acl_access";
-    if let Some(value) = &self.0 {
-        return write_attribute(destination, name, value);
-    }
-    // SAFETY: the descriptor is live and the attribute name is static.
-    let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
-    if status < 0 {
-        let error = io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
-            return Err(error);
+    pub fn apply(&self, destination: &File) -> io::Result<()> {
+        let name = c"system.posix_acl_access";
+        if let Some(value) = &self.0 {
+            return write_attribute(destination, name, value);
         }
+        // SAFETY: the descriptor is live and the attribute name is static.
+        let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
-    Ok(())
-}
 }
 
 /// Whether an attribute describes the file's content rather than the kernel's

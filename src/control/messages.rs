@@ -1,10 +1,10 @@
 use super::*;
-#[cfg(feature = "ui")]
-use crate::chat::coordination::{Received, Receipt};
 use crate::agent_execution::{
     Authority, Operation, Reply,
     mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short},
 };
+#[cfg(feature = "ui")]
+use crate::chat::coordination::{Receipt, Received};
 
 /// How often a waiting caller asks the daemon for a reply.
 const REPLY_POLL: Duration = Duration::from_millis(500);
@@ -307,8 +307,12 @@ pub(super) fn read_messages(output: &str) -> Vec<Received> {
         if id.is_empty() || id.contains(char::is_whitespace) {
             continue;
         }
-        let from = from.strip_suffix(" (waiting for your reply)").unwrap_or(from);
-        let from = from.rsplit_once(", replying to ").map_or(from, |(from, _)| from);
+        let from = from
+            .strip_suffix(" (waiting for your reply)")
+            .unwrap_or(from);
+        let from = from
+            .rsplit_once(", replying to ")
+            .map_or(from, |(from, _)| from);
         messages.push(Received {
             id: id.into(),
             from: from.into(),
@@ -366,8 +370,7 @@ struct Mailbox {
 
 impl Mailbox {
     fn connect() -> Result<Self, AppError> {
-        let socket =
-            control_daemon_socket()?;
+        let socket = control_daemon_socket()?;
         let client =
             ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
         Ok(Self {
@@ -613,7 +616,9 @@ mod tests {
         let mut answer = message.clone();
         answer.reply_to = Some(crate::model::MessageId::new());
         let printed = [message_lines(&message), message_lines(&answer)].join("\n\n");
-        let read = read_messages(&format!("{printed}\n\nAnswer one with: cagents reply <id> \"…\""));
+        let read = read_messages(&format!(
+            "{printed}\n\nAnswer one with: cagents reply <id> \"…\""
+        ));
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].id, short(message.id));
         assert_eq!(read[1].from, message.from.label());

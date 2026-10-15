@@ -112,23 +112,34 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
     if status.untracked_omitted || status.dirty.is_dirty() || !status.entries.is_empty() {
         return Err("Worktree has changes or untracked files".into());
     }
-    let ignored = service.notable_ignored_files(&request.path, &cancellation)
+    let ignored = service
+        .notable_ignored_files(&request.path, &cancellation)
         .map_err(|error| error.to_string())?;
     if !ignored.is_empty() {
-        return Err(format!("Kept: ignored files {}", ignored.iter().take(5).map(ToString::to_string).collect::<Vec<_>>().join(", ")));
+        return Err(format!(
+            "Kept: ignored files {}",
+            ignored
+                .iter()
+                .take(5)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     Ok(record.clone())
 }
 
 #[cfg(feature = "host")]
 fn cleanup_ref_storage_command(repository: &Path) -> crate::process::CommandSpec {
-    crate::repository::RepositoryService::system("git").git_base(repository, false)
+    crate::repository::RepositoryService::system("git")
+        .git_base(repository, false)
         .args(["config", "--get", "extensions.refStorage"])
 }
 
 #[cfg(feature = "host")]
 fn cleanup_removal_command(request: &RemovalRequest) -> crate::process::CommandSpec {
-    crate::repository::RepositoryService::system("git").git_base(&request.repository, false)
+    crate::repository::RepositoryService::system("git")
+        .git_base(&request.repository, false)
         .args(["worktree", "remove", "--"])
         .arg(request.path.as_os_str())
         .timeout(std::time::Duration::from_secs(30))
@@ -590,40 +601,102 @@ mod tests {
         if let Some(root) = std::env::var_os(FIXTURE) {
             let root = PathBuf::from(root);
             let cancellation = crate::process::CancellationToken::new();
-            let output = crate::process::SystemProcessExecutor.execute(
-                &cleanup_ref_storage_command(&root.join("primary")), &cancellation).unwrap();
+            let output = crate::process::SystemProcessExecutor
+                .execute(
+                    &cleanup_ref_storage_command(&root.join("primary")),
+                    &cancellation,
+                )
+                .unwrap();
             assert_eq!(output.exit_code, Some(1));
-            assert!(output.stdout.is_empty(), "foreign ref storage must not be read");
-            let mut removal = request(); removal.repository = root.join("primary"); removal.path = root.join("worktree");
+            assert!(
+                output.stdout.is_empty(),
+                "foreign ref storage must not be read"
+            );
+            let mut removal = request();
+            removal.repository = root.join("primary");
+            removal.path = root.join("worktree");
             let command = cleanup_removal_command(&removal);
-            let removed = crate::process::SystemProcessExecutor.execute(&command, &cancellation).unwrap();
-            assert!(removed.success, "{}", String::from_utf8_lossy(&removed.stderr));
+            let removed = crate::process::SystemProcessExecutor
+                .execute(&command, &cancellation)
+                .unwrap();
+            assert!(
+                removed.success,
+                "{}",
+                String::from_utf8_lossy(&removed.stderr)
+            );
             std::fs::write(root.join("child-completed"), "ok").unwrap();
             return;
         }
-        let fixture = tempfile::tempdir_in("/var/tmp").unwrap(); let root = fixture.path();
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = fixture.path();
         for name in ["primary", "foreign"] {
-            let repository = root.join(name); std::fs::create_dir(&repository).unwrap();
-            for arguments in [vec!["init", "-b", "main"], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "initial"]] {
+            let repository = root.join(name);
+            std::fs::create_dir(&repository).unwrap();
+            for arguments in [
+                vec!["init", "-b", "main"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            ] {
                 let output = fixture_git(&repository).args(arguments).output().unwrap();
-                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
-        let output = fixture_git(&root.join("primary")).args(["worktree", "add", "-b", "feature"]).arg(root.join("worktree")).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = fixture_git(&root.join("primary"))
+            .args(["worktree", "add", "-b", "feature"])
+            .arg(root.join("worktree"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let foreign = root.join("foreign");
-        let output = fixture_git(&foreign).args(["config", "extensions.refStorage", "reftable"]).output().unwrap();
+        let output = fixture_git(&foreign)
+            .args(["config", "extensions.refStorage", "reftable"])
+            .output()
+            .unwrap();
         assert!(output.status.success());
         let foreign_config = std::fs::read(foreign.join(".git/config")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "worktree_cleanup::tests::cleanup_commands_ignore_inherited_git_redirection", "--nocapture"])
-            .env(FIXTURE, root).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_DIR", foreign.join(".git"))
-            .env("GIT_WORK_TREE", &foreign).env("GIT_INDEX_FILE", foreign.join(".git/index"))
-            .env("GIT_COMMON_DIR", foreign.join(".git")).output().unwrap();
-        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            .args([
+                "--exact",
+                "worktree_cleanup::tests::cleanup_commands_ignore_inherited_git_redirection",
+                "--nocapture",
+            ])
+            .env(FIXTURE, root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_DIR", foreign.join(".git"))
+            .env("GIT_WORK_TREE", &foreign)
+            .env("GIT_INDEX_FILE", foreign.join(".git/index"))
+            .env("GIT_COMMON_DIR", foreign.join(".git"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(root.join("child-completed").exists());
         assert!(!root.join("worktree").exists());
-        assert_eq!(std::fs::read(foreign.join(".git/config")).unwrap(), foreign_config);
+        assert_eq!(
+            std::fs::read(foreign.join(".git/config")).unwrap(),
+            foreign_config
+        );
     }
 
     #[cfg(feature = "host")]
@@ -682,15 +755,30 @@ mod tests {
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
         checked_record(&request).unwrap();
-        std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\nnode_modules/\n").unwrap();
+        std::fs::write(
+            repository.join(".git/info/exclude"),
+            ".env\ntarget/\nnode_modules/\n",
+        )
+        .unwrap();
         std::fs::write(worktree.join(".env"), "preserve secret").unwrap();
-        assert!(checked_record(&request).unwrap_err().contains("ignored files .env"));
-        assert_eq!(std::fs::read_to_string(worktree.join(".env")).unwrap(), "preserve secret");
+        assert!(
+            checked_record(&request)
+                .unwrap_err()
+                .contains("ignored files .env")
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".env")).unwrap(),
+            "preserve secret"
+        );
         std::fs::remove_file(worktree.join(".env")).unwrap();
         std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
         std::fs::write(worktree.join("target/nested/generated"), "disposable").unwrap();
         std::fs::create_dir_all(worktree.join("node_modules/package/nested")).unwrap();
-        std::fs::write(worktree.join("node_modules/package/nested/output.js"), "disposable").unwrap();
+        std::fs::write(
+            worktree.join("node_modules/package/nested/output.js"),
+            "disposable",
+        )
+        .unwrap();
         checked_record(&request).unwrap();
         std::fs::write(worktree.join("tracked"), "changed").unwrap();
         assert!(checked_record(&request).is_err());

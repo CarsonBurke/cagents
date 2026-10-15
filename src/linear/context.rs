@@ -110,11 +110,19 @@ fn validate(issue: &LinkedIssue) -> Result<(), Error> {
 }
 
 pub fn link(issue_id: &str, workspace: Option<&str>) -> Result<LinkedIssue, Error> {
-    link_at(&std::env::current_dir().map_err(storage)?, issue_id, workspace)
+    link_at(
+        &std::env::current_dir().map_err(storage)?,
+        issue_id,
+        workspace,
+    )
 }
 
 /// Link an explicit checkout without changing the process-wide current directory.
-pub fn link_at(worktree: &Path, issue_id: &str, workspace: Option<&str>) -> Result<LinkedIssue, Error> {
+pub fn link_at(
+    worktree: &Path,
+    issue_id: &str,
+    workspace: Option<&str>,
+) -> Result<LinkedIssue, Error> {
     let issue = LinkedIssue {
         issue_id: super::issue_reference(issue_id)?,
         workspace: workspace.map(str::to_ascii_uppercase),
