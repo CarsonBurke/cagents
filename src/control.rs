@@ -19,9 +19,9 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
-mod format;
 mod agents;
 mod channels;
+mod format;
 pub use agents::AgentCommand;
 mod automations;
 mod completions;
