@@ -4909,6 +4909,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         amend: bool,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, amend, None, cancellation)
+    }
+
+    /// Amend only the commit whose message the composer loaded. An earlier
+    /// queued commit or another writer must not redirect this amendment.
+    pub fn commit_amend_at(
+        &self,
+        request: &CommitRequest,
+        expected_head: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, true, Some(expected_head), cancellation)
+    }
+
+    fn commit_with_amend_expected(
+        &self,
+        request: &CommitRequest,
+        amend: bool,
+        expected_head: Option<&Oid>,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -4929,6 +4950,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         let before = self.resolve_head(&request.worktree, cancellation)?;
+        if let Some(expected) = expected_head
+            && before.as_ref() != Some(expected)
+        {
+            return Ok(CommitOutcome::NotCreated {
+                failure: MutationFailure::Rejected {
+                    reason: "HEAD changed since Amend was enabled. Toggle Amend again to load the current commit.".into(),
+                },
+            });
+        }
         let failure = match self.run(&command, cancellation) {
             Ok(output) if output.success => None,
             Ok(output) => Some(MutationFailure::from(git_failure(&command, output))),
@@ -6975,18 +7005,33 @@ mod tests {
             fs::write(root.join("file.txt"), "second\n").unwrap();
             git(root, &["add", "file.txt"]);
             let outcome = service
-                .commit_with_amend(
+                .commit_amend_at(
                     &CommitRequest {
                         worktree: root.to_path_buf(),
                         message: message.clone(),
                     },
-                    true,
+                    &original,
                     &cancel,
                 )
                 .unwrap();
             assert!(matches!(outcome, CommitOutcome::Created { .. }));
             let amended = service.resolve_head(root, &cancel).unwrap().unwrap();
             assert_ne!(amended, original);
+            let stale = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: "Wrong target".into(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(stale, CommitOutcome::NotCreated { .. }));
+            assert_eq!(
+                service.resolve_head(root, &cancel).unwrap(),
+                Some(amended.clone())
+            );
             assert_eq!(
                 service.commit_message(root, &amended, &cancel).unwrap(),
                 message

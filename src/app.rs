@@ -14441,6 +14441,7 @@ impl Application for Cagents {
                             self.sidebar_state.finish_amend_read(&key, revision);
                             return Task::none();
                         };
+                        self.sidebar_state.pin_amend_head(&key, revision, head.clone());
                         cosmic::task::future(async move {
                             let worktree = key.canonical_path.clone();
                             let pinned = head.clone();
@@ -14533,6 +14534,8 @@ impl Application for Cagents {
                         let Some(commit_revision) = self.sidebar_state.submitted_commit_revision(&key, &message, amend) else {
                             return Task::none();
                         };
+                        let expected_head = self.sidebar_state.amend_target();
+                        if amend && expected_head.is_none() { return Task::none(); }
                         let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, Some(commit_revision)) else {
                             return Task::none();
                         };
@@ -14541,7 +14544,10 @@ impl Application for Cagents {
                             message,
                         };
                         Self::mutation_task(key, operation, move |service, cancel| {
-                            commit_report(service.commit_with_amend(&request, amend, cancel))
+                            commit_report(match expected_head {
+                                Some(head) if amend => service.commit_amend_at(&request, &head, cancel),
+                                _ => service.commit_with_amend(&request, amend, cancel),
+                            })
                         })
                     }
                     SidebarAction::Push {

@@ -2725,6 +2725,7 @@ struct CommitDraft {
     amend_loaded_message: Option<String>,
     amend_loading: bool,
     amend_edited: bool,
+    amend_head: Option<Oid>,
     revision: u64,
 }
 
@@ -3103,6 +3104,22 @@ impl SidebarState {
         }
     }
 
+    pub fn amend_target(&self) -> Option<Oid> {
+        self.commit_draft
+            .amend
+            .then(|| self.commit_draft.amend_head.clone())
+            .flatten()
+    }
+
+    pub fn pin_amend_head(&mut self, key: &ActiveWorktreeKey, revision: u64, head: Oid) {
+        if self.active_worktree.as_ref() == Some(key)
+            && self.commit_draft.amend
+            && self.commit_draft.revision == revision
+        {
+            self.commit_draft.amend_head = Some(head);
+        }
+    }
+
     pub fn amend_request_revision(&self) -> Option<u64> {
         self.commit_draft
             .amend_loading
@@ -3385,6 +3402,7 @@ impl SidebarState {
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = false;
                         self.commit_draft.amend_edited = false;
+                        self.commit_draft.amend_head = None;
                     }
                     self.revise_commit_draft();
                     self.commit_draft.amend = *amend;
@@ -16292,6 +16310,31 @@ pub(crate) mod tests {
         });
         assert!(!state.load_amend_message(&key, revision, "Too late"));
         assert_eq!(state.commit_message(), "Typing");
+    }
+
+    #[test]
+    fn amend_target_remains_pinned_through_edits_and_navigation() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        let head = oid_of(0x11);
+        state.pin_amend_head(&key, revision, head.clone());
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Explicit replacement".into(),
+        });
+        assert_eq!(state.amend_target(), Some(head.clone()));
+        state.sync_active_worktree(&model, &focus_on(&fix_key()));
+        assert_eq!(state.amend_target(), None);
+        state.sync_active_worktree(&model, &focus_on(&key));
+        assert_eq!(state.amend_target(), Some(head));
+        state.apply(&SidebarAction::AmendChanged { key, amend: false });
+        assert_eq!(state.amend_target(), None);
     }
 
     #[test]
