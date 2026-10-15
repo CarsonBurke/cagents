@@ -11,8 +11,8 @@ use std::{
 use super::Error;
 
 const APPLICATION: &str = "com.carson.cagents.linear";
-// Including the newline, the stdin write fits Linux PIPE_BUF (4096). A
-// helper waiting for a locked vault cannot block us before the timeout starts.
+// The complete stdin write fits Linux PIPE_BUF (4096). A helper waiting
+// for a locked vault cannot block us before the timeout starts.
 const MAX_KEY_BYTES: usize = 4095;
 
 /// A UI input/message whose debug representation cannot disclose its value.
@@ -54,7 +54,7 @@ fn helper(operation: &[&str], workspace: Option<&str>, secret: Option<&str>) -> 
     });
     let mut input = child.stdin.take().expect("piped input");
     let written = match secret {
-        Some(secret) => input.write_all(secret.as_bytes()).and_then(|_| input.write_all(b"\n")),
+        Some(secret) => input.write_all(secret.as_bytes()),
         None => Ok(()),
     };
     drop(input);
@@ -78,12 +78,13 @@ fn helper(operation: &[&str], workspace: Option<&str>, secret: Option<&str>) -> 
     if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() {
         return Ok(None);
     }
-    if !status.success() || written.is_err() || output.len() > MAX_KEY_BYTES + 1 {
+    if !status.success() || written.is_err() || output.len() > MAX_KEY_BYTES {
         return Err(keyring_error());
     }
     if operation == ["lookup"] {
-        let output = output.strip_suffix(b"\n").unwrap_or(&output);
-        return String::from_utf8(output.to_vec()).map(Some).map_err(|_| keyring_error());
+        // Piped secret-tool store/lookup use exact bytes through EOF and do
+        // not add a newline. Never alter the credential during a round trip.
+        return String::from_utf8(output).map(Some).map_err(|_| keyring_error());
     }
     Ok(None)
 }

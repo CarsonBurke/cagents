@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn healthy_global_window_does_not_hide_an_exhausted_endpoint_window() {
         let details = rate_limit_details(&[
-            ("x-ratelimit-requests-reset".into(), "3_600_000".replace('_', "")),
+            ("x-ratelimit-requests-reset".into(), "3600000".into()),
             ("x-ratelimit-requests-remaining".into(), "100".into()),
             ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
             ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),

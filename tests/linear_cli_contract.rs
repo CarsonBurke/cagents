@@ -349,7 +349,7 @@ fn uncertain_relation_deletion_identifies_relation_without_mistaking_it_for_issu
 fn stored_key_authenticates_without_shell_environment_and_environment_overrides_it() {
     let f = Fixture::new();
     let helper = f.path().join("bin/secret-tool");
-    fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LINEAR_FIXTURE/keyring-argv\"\nprintf '%s\\n' 'fixture-keyring-secret'\n").unwrap();
+    fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LINEAR_FIXTURE/keyring-argv\"\nprintf '%s' 'fixture-keyring-secret'\n").unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
     let output = f
         .command(&["linear", "issue", "ENG-12"])

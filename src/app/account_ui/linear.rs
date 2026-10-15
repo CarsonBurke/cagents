@@ -151,7 +151,7 @@ mod tests {
             let _ = update(&mut state, action);
             assert!(state.busy.is_none());
             assert!(state.status.as_deref().unwrap().contains("saved"));
-            assert!(std::fs::read_to_string(root.join("vault")).unwrap().trim_end() == key);
+            assert!(std::fs::read(root.join("vault")).unwrap() == key.as_bytes());
             assert_eq!(std::fs::metadata(root.join("vault")).unwrap().permissions().mode() & 0o077, 0);
             assert!(!toml::to_string(&AppSettings::default()).unwrap().contains(key));
             assert!(!std::fs::read_to_string(root.join("argv")).unwrap().contains(key));
