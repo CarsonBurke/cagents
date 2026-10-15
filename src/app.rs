@@ -17806,6 +17806,13 @@ mod tests {
             .flush(Duration::from_secs(10))
             .unwrap();
         drop(app.close_card_unasked(id));
+        // The native focus handoff emits this message before removal. Drive
+        // its actual callback here; dropping the Task only reserves the close.
+        drop(app.update(Message::CommitClose(id)));
+        assert!(matches!(
+            app.card_state(id).map(|card| &card.existence),
+            Some(Existence::Closed { .. })
+        ));
         assert!(
             app.durable.cards.iter().any(|card| card.id == id),
             "descriptor stays until its tombstone commits"
