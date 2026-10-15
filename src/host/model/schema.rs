@@ -148,6 +148,19 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     tx.commit().map_err(|e| e.to_string())?;
     checkpoint("committed")?;
     if convert {
+        // Keep the actual rollback-mode EXCLUSIVE lock acquired above, but
+        // select NORMAL before the first WAL access. Entering WAL while the
+        // policy is EXCLUSIVE creates a heap wal-index that cannot later be
+        // changed to shared-memory NORMAL mode without leaving WAL again.
+        db.pragma_update(None, "locking_mode", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        let locking: String = db
+            .pragma_query_value(Some("main"), "locking_mode", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if !locking.eq_ignore_ascii_case("normal") {
+            return Err("SQLite could not select normal registry locking".into());
+        }
+        checkpoint("normal_before_wal")?;
         let mode: String = db
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
@@ -155,14 +168,6 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
             return Err(format!(
                 "SQLite journal mode is `{mode}`, but WAL is required"
             ));
-        }
-        db.pragma_update(None, "locking_mode", "NORMAL")
-            .map_err(|e| e.to_string())?;
-        let locking: String = db
-            .pragma_query_value(Some("main"), "locking_mode", |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        if !locking.eq_ignore_ascii_case("normal") {
-            return Err("SQLite could not release exclusive registry admission".into());
         }
         // End the exclusive-lock lifetime only after persistent configuration.
         let release = db.transaction().map_err(|e| e.to_string())?;
@@ -699,11 +704,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("current-delete.sqlite3");
         legacy(&path, 12);
-        let observed = Rc::new(Cell::new(false));
+        let observed = Rc::new(Cell::new(0));
         let flag = Rc::clone(&observed);
         let target = path.clone();
         hook(move |stage| {
-            if stage == "committed" {
+            if matches!(stage, "committed" | "normal_before_wal") {
                 let writer = connect(&target, false)?;
                 writer
                     .busy_timeout(Duration::ZERO)
@@ -715,13 +720,17 @@ mod tests {
                     matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),
                     "{error}"
                 );
-                flag.set(true);
+                flag.set(flag.get() + 1);
             }
             Ok(())
         });
         let mut registry = Registry::at(&path).unwrap();
         HOOK.with(|h| *h.borrow_mut() = None);
-        assert!(observed.get());
+        assert_eq!(
+            observed.get(),
+            2,
+            "both conversion boundaries must exclude writers"
+        );
         require_current(&registry.db).unwrap();
         assert_eq!(
             registry
