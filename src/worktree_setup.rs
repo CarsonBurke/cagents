@@ -602,7 +602,15 @@ fn prepare_with_checkpoint(
     cancel: &CancellationToken,
     after_checkout_capture: impl FnOnce(),
 ) -> Result<SetupPreparation, SetupError> {
-    prepare_with_checkpoints(primary, destination, plan, skip, cancel, after_checkout_capture, |_, _, _| {})
+    prepare_with_checkpoints(
+        primary,
+        destination,
+        plan,
+        skip,
+        cancel,
+        after_checkout_capture,
+        |_, _, _| {},
+    )
 }
 
 fn prepare_with_checkpoints(
@@ -735,7 +743,9 @@ fn prepare_with_checkpoints(
         )
         .map_err(error)?;
         if output.metadata().map_err(error)?.dev() != parent.metadata().map_err(error)?.dev() {
-            return Err(error("Setup copies cannot cross filesystems from their retained checkout"));
+            return Err(error(
+                "Setup copies cannot cross filesystems from their retained checkout",
+            ));
         }
         let copied = (|| {
             let mut total = 0u64;
@@ -778,8 +788,7 @@ fn prepare_with_checkpoints(
             }
             Err(err) => {
                 // Existing destination is always kept, including dangling symlinks.
-                if matches!(&err, SetupError::Filesystem(cause) if cause.is_already_exists())
-                {
+                if matches!(&err, SetupError::Filesystem(cause) if cause.is_already_exists()) {
                     result.skipped_paths.push(SkippedCopy {
                         path,
                         reason: "destination already exists".into(),
@@ -857,10 +866,13 @@ mod tests {
         }
         fn git(&self, args: &[&str]) {
             let mut command = Command::new("git");
-            for (key, _) in std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_")) {
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_"))
+            {
                 command.env_remove(key);
             }
-            let output = command.current_dir(&self.primary)
+            let output = command
+                .current_dir(&self.primary)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1099,18 +1111,33 @@ mod tests {
             let foreign = fixture.destination.join(".cagents-tmp-foreign");
             let mut retained = None;
             let result = prepare_with_checkpoints(
-                &fixture.primary, &fixture.destination, &plan, false, &CancellationToken::new(), || {},
+                &fixture.primary,
+                &fixture.destination,
+                &plan,
+                false,
+                &CancellationToken::new(),
+                || {},
                 |parent, output, path| {
                     assert_eq!(path, Path::new(".env"));
                     assert_eq!(output.metadata().unwrap().nlink(), 0);
-                    assert!(!fs::read_dir(parent.path()).unwrap().any(|entry| {
-                        entry.unwrap().file_name().as_encoded_bytes().starts_with(b".cagents-tmp-")
-                    }), "the copied output must have no replaceable source entry");
+                    assert!(
+                        !fs::read_dir(parent.path()).unwrap().any(|entry| {
+                            entry
+                                .unwrap()
+                                .file_name()
+                                .as_encoded_bytes()
+                                .starts_with(b".cagents-tmp-")
+                        }),
+                        "the copied output must have no replaceable source entry"
+                    );
                     retained = Some(output.try_clone().unwrap());
                     fs::write(&foreign, "foreign temporary lookalike").unwrap();
-                    if collision { symlink(&outside, fixture.destination.join(".env")).unwrap(); }
+                    if collision {
+                        symlink(&outside, fixture.destination.join(".env")).unwrap();
+                    }
                 },
-            ).unwrap();
+            )
+            .unwrap();
             let output = retained.unwrap();
             let mut bytes = vec![0; "original private copy".len()];
             assert_eq!(output.read_at(&mut bytes, 0).unwrap(), bytes.len());
@@ -1118,7 +1145,10 @@ mod tests {
             if collision {
                 assert!(result.copied.is_empty());
                 assert_eq!(result.skipped_paths[0].path, Path::new(".env"));
-                assert_eq!(fs::read_link(fixture.destination.join(".env")).unwrap(), outside);
+                assert_eq!(
+                    fs::read_link(fixture.destination.join(".env")).unwrap(),
+                    outside
+                );
                 assert_eq!(output.metadata().unwrap().nlink(), 0);
             } else {
                 assert_eq!(result.copied, [PathBuf::from(".env")]);
@@ -1131,9 +1161,15 @@ mod tests {
                 symlink(&outside, fixture.destination.join(".env")).unwrap();
             }
             drop(output);
-            assert_eq!(fs::read_to_string(&foreign).unwrap(), "foreign temporary lookalike");
+            assert_eq!(
+                fs::read_to_string(&foreign).unwrap(),
+                "foreign temporary lookalike"
+            );
             assert_eq!(fs::read_to_string(&outside).unwrap(), "foreign destination");
-            assert_eq!(fs::read_link(fixture.destination.join(".env")).unwrap(), outside);
+            assert_eq!(
+                fs::read_link(fixture.destination.join(".env")).unwrap(),
+                outside
+            );
         }
         eprintln!("SETUP_ANONYMOUS_COPY_VERIFIED");
     }
@@ -1143,24 +1179,52 @@ mod tests {
         const CHILD: &str = "CAGENTS_SETUP_ANONYMOUS_UMASK_CHILD";
         if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "worktree_setup::tests::anonymous_copy_preserves_mode_under_restrictive_umask", "--nocapture"])
-                .env(CHILD, "1").env("RUST_TEST_THREADS", "1").output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stderr).contains("SETUP_ANONYMOUS_UMASK_VERIFIED"));
+                .args([
+                    "--exact",
+                    "worktree_setup::tests::anonymous_copy_preserves_mode_under_restrictive_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RUST_TEST_THREADS", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("SETUP_ANONYMOUS_UMASK_VERIFIED")
+            );
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return;
         }
         // This is the sole selected test in a disposable subprocess; changing
         // its umask cannot affect the parent harness or another test thread.
-        unsafe { libc::umask(0o077); }
+        unsafe {
+            libc::umask(0o077);
+        }
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "private bytes").unwrap();
-        fs::set_permissions(fixture.primary.join(".env"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(
+            fixture.primary.join(".env"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         let plan = fixture.config("copy = ['.env']");
         let result = fixture.prepare(&plan).unwrap();
         assert_eq!(result.copied, [PathBuf::from(".env")]);
-        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"private bytes");
-        assert_eq!(fs::metadata(fixture.destination.join(".env")).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"private bytes"
+        );
+        assert_eq!(
+            fs::metadata(fixture.destination.join(".env"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o640
+        );
         eprintln!("SETUP_ANONYMOUS_UMASK_VERIFIED");
     }
 
