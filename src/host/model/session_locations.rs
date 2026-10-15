@@ -539,6 +539,28 @@ impl Registry {
         }
         Ok(Some(location))
     }
+
+    /// Read-only attribution for an authenticated orphan census. A blocked
+    /// directory still belongs to its logical project; this cannot approve a
+    /// directory, adopt a session, or authorize process teardown.
+    pub(crate) fn retained_session_repository(
+        &self,
+        retained: &[HostedSession],
+    ) -> Result<Option<PathBuf>, String> {
+        let Some(first) = retained.first() else { return Ok(None) };
+        let Some(location) = read(&self.db, first.id())? else { return Ok(None) };
+        if retained.iter().any(|source| source.id() != first.id()) {
+            return Err("Orphan sources contain different session identities".into());
+        }
+        for source in retained {
+            if same_source(&location.source, source)
+                || source_key(source)?.is_some_and(|key| location.previous_sources.contains(&key))
+            {
+                return Ok(location.repository);
+            }
+        }
+        Err("Orphan sources do not authenticate the saved logical project".into())
+    }
 }
 
 #[cfg(test)]

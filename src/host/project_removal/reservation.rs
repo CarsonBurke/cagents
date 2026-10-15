@@ -21,6 +21,7 @@ pub(crate) struct ReservedProject {
     panes: HashSet<CardId>,
     sessions: HashSet<TerminalId>,
     protected_sessions: HashSet<TerminalId>,
+    protected_sources: Vec<HostedSession>,
     infer_directory: bool,
 }
 pub(crate) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, Arc<ReservedProject>>>>;
@@ -29,6 +30,21 @@ pub(crate) struct Reservation {
     token: uuid::Uuid,
 }
 impl Reservation {
+    pub(super) fn proves_foreign_orphan(&self, sources: &[HostedSession], repository: Option<&Path>) -> bool {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(&self.token).is_some_and(|scope| {
+            if sources.is_empty() { return false; }
+            if let Some(repository) = repository {
+                if repository == scope.project.repository { return false; }
+                return !sources.iter().any(|source| scope.sessions.contains(&source.id()) && !scope.protected_sessions.contains(&source.id()));
+            }
+            if sources.iter().any(|source| scope.qualifies(source)) { return false; }
+            // Old recipe paths may have been moved and reused by another
+            // project. Only exact authenticated saved membership (or the
+            // private logical binding above) can positively exclude an orphan.
+            sources.iter().any(|source| scope.protected_sources.iter().any(|saved| saved.same_process(source)))
+        })
+    }
+
     pub(super) fn qualifies(&self, source: &HostedSession) -> bool {
         self.entries
             .lock()
@@ -191,6 +207,7 @@ pub(crate) fn reserve(
         panes: HashSet::new(),
         sessions: HashSet::new(),
         protected_sessions: HashSet::new(),
+        protected_sources: Vec::new(),
         infer_directory: !model.projects.iter().any(|other| {
             other.repository != project.repository && other.kind == crate::model::ProjectKind::Git
         }),
@@ -244,9 +261,11 @@ pub(crate) fn reserve(
             match &pane.kind {
                 crate::model::CardKind::Terminal(session) => {
                     ids.insert(session.id);
+                    if !own { reserved.protected_sources.push(HostedSession::Terminal(session.clone())); }
                 }
                 crate::model::CardKind::Chat(session) => {
                     ids.insert(session.id);
+                    if !own { reserved.protected_sources.push(HostedSession::Chat(session.clone())); }
                     if let Some(terminal) = &session.terminal {
                         ids.insert(terminal.id);
                     }
@@ -279,9 +298,11 @@ pub(crate) fn reserve(
             );
             if let Some(source) = &agent.session {
                 reserved.protected_sessions.insert(source.id());
+                reserved.protected_sources.push(source.clone());
             }
             if let Some(console) = &agent.console {
                 reserved.protected_sessions.insert(console.id);
+                reserved.protected_sources.push(HostedSession::Terminal(console.clone()));
             }
         }
     }

@@ -16,6 +16,7 @@ use std::{
 };
 
 mod reservation;
+mod census;
 use reservation::Reservation;
 pub(super) use reservation::{
     Reservations, admit, ensure_agent_available, ensure_available, reserve,
@@ -108,6 +109,9 @@ pub(super) fn remove(
         .unwrap_or_else(|p| p.into_inner())
         .require_project_instance(&project)
         .map_err(error)?;
+    // Filesystem/holder IPC is deliberately outside HostState and exclusive
+    // control admission. Unknown retained ownership fails the whole roster.
+    census::require_no_unhosted_owners(host, reservation)?;
     // A start admitted before this request must not escape its confirmation.
     let selected_ids = sessions
         .iter()
@@ -313,6 +317,13 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_proof(HostSessionProof {
+                host_session_id: HostSessionId::new("guarded-project-close"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            })
+        }
+        fn with_proof(proof: HostSessionProof) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("project");
             std::fs::create_dir(&root).unwrap();
@@ -331,11 +342,6 @@ mod tests {
                 registry: model.identity,
                 repository: root.clone(),
                 ordinal: model.projects[0].ordinal,
-            };
-            let proof = HostSessionProof {
-                host_session_id: HostSessionId::new("guarded-project-close"),
-                boot_id: BootId::new("boot"),
-                host_incarnation: HostIncarnation::new("incarnation"),
             };
             let mut state = HostState::new(proof);
             state.install_model(registry);
@@ -729,6 +735,75 @@ mod tests {
         assert!(model.project(&nested).is_some());
         assert!(fixture.handles[0].is_completed());
         assert!(!fixture.handles[1].is_completed());
+    }
+
+    #[test]
+    fn authenticated_orphan_holder_refuses_missing_project_before_healthy_close_but_foreign_does_not() {
+        const STAGE: &str = "CAGENTS_PROJECT_ORPHAN_CENSUS_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::project_removal::tests::authenticated_orphan_holder_refuses_missing_project_before_healthy_close_but_foreign_does_not", "--nocapture"])
+                .env(STAGE,"1").env("XDG_RUNTIME_DIR",runtime.path()).env("XDG_DATA_HOME",runtime.path().join("data")).output().unwrap();
+            assert!(output.status.success(), "{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        struct Retained(crate::chat::native_holder::Detached);
+        impl Drop for Retained { fn drop(&mut self) { let _ = self.0.close(); } }
+        for foreign in [false,true] {
+            let mut source = crate::chat::native_holder::fixture_source();
+            let boot = crate::daemon::read_boot_id().unwrap();
+            source.proof.as_mut().unwrap().boot_id = boot.clone();
+            source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot;
+            let proof = source.proof.clone().unwrap();
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let _lease = crate::daemon::HostLease::acquire(&paths,&proof).unwrap();
+            let mut fixture = Fixture::with_proof(proof);
+            let healthy = fixture.spawn(crate::model::TerminalId::new());
+            let directory = if foreign { let path=fixture._directory.path().join("foreign"); std::fs::create_dir(&path).unwrap(); path } else { fixture.root.clone() };
+            source.launch.recipe.working_directory = directory.clone();
+            if foreign {
+                let mut state=fixture.host.lock().unwrap();
+                state.edit_model(1,ModelEdit::OpenProject { repository:directory.clone(),checkout:None,primary_checkout:None,name:"Foreign".into(),kind:ProjectKind::Folder }).unwrap();
+                state.edit_model(1,ModelEdit::SeedView { scope:Scope::Worktree { repository:directory.clone(),path:directory.clone() },panes:vec![crate::workspace_model::views::Pane { id:crate::model::CardId::new(),title:"Retained foreign native".into(),user_title:None,pending_terminal_start:false,width_fraction:0.5,kind:crate::model::CardKind::Chat(source.clone()),scope:Some(directory.clone()) }],closed:vec![] }).unwrap();
+            }
+            let context = Arc::new(crate::chat::protocol::ExecutionContext::capture(&directory).unwrap());
+            let spec = crate::chat::protocol::ProcessSpec {
+                execution:Some(context.clone()),messages:None,
+                transport:crate::chat::protocol::TransportSpec::OwnedUnixWebSocket { socket:source.owned_codex_listener.as_ref().unwrap().socket.clone() },
+                program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory,
+                environment:Default::default(),unset_environment:Default::default(),
+            };
+            let mut holder = crate::chat::native_holder::spawn(spec,source).unwrap();
+            context.installed();
+            let record=holder.record().clone();
+            holder.confirm(uuid::Uuid::new_v4().to_string(), crate::chat::protocol::ServerIdentity {
+                user_agent:"cagents/0.157.1 (Linux)".into(),
+                canonical_home:fixture._directory.path().join("codex-home"),
+                reported_home:fixture._directory.path().join("codex-home").to_string_lossy().into_owned(),
+            },record.root.clone()).unwrap();
+            let retained=Retained(holder.preserve());
+            assert!(record.root.is_current());
+            if !foreign { std::fs::rename(&fixture.root,fixture._directory.path().join("moved")).unwrap(); }
+            // No saved/native adoption failure map or installed chat exists:
+            // the authenticated orphan census is the only ownership evidence.
+            assert!(fixture.host.lock().unwrap().chats.is_empty());
+            let result=fixture.request(fixture.expected.clone(),vec![healthy]);
+            if foreign {
+                assert!(result.is_ok(),"{result:?}");
+                assert!(fixture.handles[0].is_completed());
+            } else {
+                let failure=result.unwrap_err();
+                assert!(failure.message.contains("Retained session"),"{failure:?}");
+                assert!(!fixture.handles[0].is_completed());
+                let model=super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().model().unwrap();
+                assert!(model.project(&fixture.root).is_some());
+            }
+            assert!(record.root.is_current(),"census must not adopt or terminate an orphan provider");
+            assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+            drop(retained);
+            assert!(!record.root.is_current());
+        }
     }
 
     #[test]
