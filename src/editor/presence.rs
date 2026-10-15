@@ -1,6 +1,6 @@
 //! Presence-aware publication for an editor buffer whose Undo can remove a file.
 use super::*;
-use std::{ffi::OsString, os::unix::fs::MetadataExt, sync::Arc};
+use std::{ffi::OsString, os::unix::fs::{MetadataExt, PermissionsExt}, sync::Arc};
 
 /// A private unlinked metadata template retains the removed file's access
 /// rules and attributes without sharing later changes through a hard link or

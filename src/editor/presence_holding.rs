@@ -49,7 +49,15 @@ impl AuthenticatedLeaf {
     }
 }
 
-struct OwnedTemporary { file: File, name: OsString }
+struct OwnedTemporary {
+    file: File,
+    // Open this exact inode while it is still private0600, before restoration
+    // can install a policy without read permission. Publication keeps this
+    // reader and closes its writer before exposing an executable name.
+    read_pin: Option<File>,
+    writable: bool,
+    name: OsString,
+}
 
 pub(super) struct PresenceHolding {
     publication: fs_safety::DirectoryPublication,
@@ -175,11 +183,27 @@ impl PresenceHolding {
         self.validate_live()?;
         if self.temporary.is_some() { return Err(FileIoError::Io("An editor temporary file is already retained.".into())); }
         let (file, name) = fs_safety::create_temporary_in(self.directory(), 0o600).map_err(resolve_error)?;
-        self.temporary = Some(OwnedTemporary { file, name });
+        self.temporary = Some(OwnedTemporary { file, read_pin: None, writable: true, name });
+        // Preserve the creator first so any failed mode/open/authentication
+        // step still has its exact cleanup owner. This private INTERNAL file
+        // has not acquired public source permissions or ownership yet.
+        self.temporary()?.set_permissions(Permissions::from_mode(0o600)).map_err(io_error)?;
+        let read_pin = fs_safety::open_beneath(self.directory(), Path::new(self.temporary_name())).map_err(resolve_error)?;
+        self.temporary.as_mut().unwrap().read_pin = Some(read_pin);
+        let temporary = self.temporary.as_ref().unwrap();
+        if !same_inode(&temporary.file.metadata().map_err(io_error)?, &temporary.read_pin.as_ref().unwrap().metadata().map_err(io_error)?) {
+            return Err(FileIoError::Io("The editor temporary reader did not retain the original created inode.".into()));
+        }
+        self.verify_temporary()?;
         Ok(())
     }
     pub(super) fn temporary(&self) -> Result<&File, FileIoError> { self.validate_live()?; Ok(&self.temporary.as_ref().expect("temporary created").file) }
-    pub(super) fn temporary_mut(&mut self) -> Result<&mut File, FileIoError> { self.validate_live()?; Ok(&mut self.temporary.as_mut().expect("temporary created").file) }
+    pub(super) fn temporary_mut(&mut self) -> Result<&mut File, FileIoError> {
+        self.validate_live()?;
+        let temporary = self.temporary.as_mut().expect("temporary created");
+        if !temporary.writable { return Err(FileIoError::Io("The editor temporary writer was already retired for publication.".into())); }
+        Ok(&mut temporary.file)
+    }
     pub(super) fn temporary_name(&self) -> &std::ffi::OsStr { &self.temporary.as_ref().expect("temporary created").name }
     fn verify_temporary(&self) -> Result<(), FileIoError> {
         self.validate_live()?;
@@ -197,6 +221,25 @@ impl PresenceHolding {
         Ok(self.temporary.take().unwrap().file)
     }
     pub(super) fn publish_temporary(&mut self) -> Result<(), FileIoError> {
+        self.publish_temporary_with_hook(|_| Ok(()))
+    }
+    fn publish_temporary_with_hook(&mut self, before_rename: impl FnOnce(&Self) -> Result<(), FileIoError>) -> Result<(), FileIoError> {
+        self.verify_temporary()?;
+        let temporary = self.temporary.as_mut().expect("temporary created");
+        if temporary.writable {
+            let read_pin = temporary.read_pin.as_ref().ok_or_else(|| FileIoError::Io("The original editor temporary reader is unavailable.".into()))?;
+            if !same_inode(&temporary.file.metadata().map_err(io_error)?, &read_pin.metadata().map_err(io_error)?) {
+                return Err(FileIoError::Io("The retained editor temporary reader is not the original created inode.".into()));
+            }
+            let read_pin = temporary.read_pin.take().ok_or_else(|| FileIoError::Io("The original editor temporary reader is unavailable.".into()))?;
+            let writer = std::mem::replace(&mut temporary.file, read_pin);
+            temporary.writable = false;
+            drop(writer);
+        }
+        // No owned write descriptor may survive the public rename: even a
+        // short overlap can make a newly published executable fail ETXTBSY.
+        // Failures retain the authenticated reader in this same whole owner.
+        before_rename(self)?;
         self.verify_temporary()?;
         let temporary = self.temporary.as_ref().expect("temporary created");
         fs_safety::rename_new_between(self.directory(), &temporary.name, &self.parent, &self.name).map_err(resolve_error)?;
@@ -274,7 +317,7 @@ impl PresenceHolding {
         let slot = self.slot.take().expect("presence reserves recovery before effects");
         let description = format!("Editor presence staging requires recovery. {error} Diagnostic opened spelling: {}", self.directory().path().display());
         // DirectoryPublication <=5 root descriptors, parent1, original1,
-        // pre-acquisition source1, temporary1. The
+        // pre-acquisition source1, temporary writer+reader2. The
         // closure captures the WHOLE owner (not disjoint fields), below16 FDs.
         let authority = slot.retain(description.clone(), move || self.retry_cleanup());
         FileIoError::Recovery { message: description, authority }
@@ -285,6 +328,54 @@ impl PresenceHolding {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_publication_retires_the_writer_before_public_rename() {
+        use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        let directory = tempfile::tempdir().unwrap();
+        let parent = Root::open(directory.path()).unwrap();
+        let mut holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("executable")).unwrap();
+        holding.create_temporary().unwrap();
+        holding.temporary_mut().unwrap().write_all(b"#!/bin/sh\nprintf 'presence executable\\n'\n").unwrap();
+        holding.temporary().unwrap().set_permissions(Permissions::from_mode(0o755)).unwrap();
+        holding.temporary().unwrap().sync_all().unwrap();
+        let private = holding.directory().path().join(holding.temporary_name());
+        let execute = |path: &Path| {
+            SystemProcessExecutor.execute(&CommandSpec::new(path).timeout(std::time::Duration::from_secs(5)), &CancellationToken::new())
+        };
+        assert!(execute(&private).is_err(), "the control still owns an executable writer");
+        holding.publish_temporary_with_hook(|current| {
+            let temporary = current.temporary()?;
+            let flags = unsafe { libc::fcntl(temporary.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+            let output = execute(&private).unwrap().require_success(&private).unwrap();
+            assert_eq!(output.stdout, b"presence executable\n");
+            assert!(!directory.path().join("executable").exists(), "the real kernel success precedes public exposure");
+            Ok(())
+        }).unwrap();
+        let public = directory.path().join("executable");
+        execute(&public).unwrap().require_success(&public).unwrap();
+        holding.finish().unwrap();
+
+        // The reader must have been captured before restoring a no-read
+        // policy. A failed no-replace rename retains it without reopening or
+        // recovering a writable descriptor, and preserves the foreign file.
+        let mut holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("executable")).unwrap();
+        holding.create_temporary().unwrap();
+        holding.temporary_mut().unwrap().write_all(b"replacement").unwrap();
+        holding.temporary().unwrap().set_permissions(Permissions::from_mode(0o111)).unwrap();
+        assert!(holding.publish_temporary().is_err());
+        assert!(holding.temporary_mut().is_err());
+        let temporary = holding.temporary().unwrap();
+        assert_eq!(temporary.metadata().unwrap().mode() & 0o7777, 0o111);
+        let flags = unsafe { libc::fcntl(temporary.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        holding.finish().unwrap();
+        execute(&public).unwrap().require_success(&public).unwrap();
+    }
+
     #[test]
     fn uncertain_payload_enrollment_retains_live_original_until_same_lease_accepts_retry() {
         use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
