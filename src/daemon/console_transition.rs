@@ -13,17 +13,24 @@ static FENCES:OnceLock<Mutex<Fences>>=OnceLock::new();
 #[derive(Debug)]
 pub(crate) struct Lease {held:Arc<AtomicBool>,requested:bool,confirmed:bool}
 pub(crate) fn acquire(id:TerminalId)->Result<Lease,String> {
+    acquire_inner(id,||{})
+}
+fn acquire_inner(id:TerminalId,before_claim:impl FnOnce())->Result<Lease,String> {
     let held={
         let mut fences=FENCES.get_or_init(||Mutex::new(BTreeMap::new())).lock().unwrap_or_else(|p|p.into_inner());
         fences.retain(|_,held|held.load(Ordering::Acquire));
-        if let Some(held)=fences.get(&id).cloned() {held}
+        let held=if let Some(held)=fences.get(&id).cloned() {held}
         else {
             if fences.len()>=CAPACITY {return Err("Console authority transition capacity is full; retry the existing session".into());}
             let held=Arc::new(AtomicBool::new(false));fences.insert(id,held.clone());held
-        }
+        };
+        // Pruning/lookup/insertion and claiming are one map transaction. An
+        // unclaimed entry must never be exposed to another caller's pruning.
+        before_claim();
+        held.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire)
+            .map_err(|_|"The exact session has a console spawn or authority transition in progress; retry after its outcome is confirmed".to_owned())?;
+        held
     };
-    held.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire)
-        .map_err(|_|"The exact session has a console spawn or authority transition in progress; retry after its outcome is confirmed".to_owned())?;
     Ok(Lease {held,requested:false,confirmed:false})
 }
 impl Lease {
@@ -44,6 +51,24 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lookup_and_claim_cannot_be_pruned_into_two_leases_for_the_same_session() {
+        let id=TerminalId::new();
+        let (selected,selection)=std::sync::mpsc::channel();
+        let (claim,claimed)=std::sync::mpsc::channel();
+        let (release,released)=std::sync::mpsc::channel();
+        let first=std::thread::spawn(move||{
+            let lease=acquire_inner(id,||{selected.send(()).unwrap();claimed.recv().unwrap();}).unwrap();
+            released.recv().unwrap();drop(lease);
+        });
+        selection.recv().unwrap();
+        let (attempt,attempted)=std::sync::mpsc::channel();
+        let second=std::thread::spawn(move||{attempt.send(()).unwrap();acquire(id)});
+        attempted.recv().unwrap();claim.send(()).unwrap();
+        assert!(second.join().unwrap().is_err(),"the second lookup must share the already-claimed entry");
+        release.send(()).unwrap();first.join().unwrap();
+        drop(acquire(id).unwrap());
+    }
     #[test]
     fn helper_owner_drop_after_a_requested_spawn_does_not_prove_family_cleanup() {
         let id=TerminalId::new();let mut lease=acquire(id).unwrap();lease.mark_requested();drop(lease);
