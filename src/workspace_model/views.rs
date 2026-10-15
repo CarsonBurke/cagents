@@ -250,7 +250,8 @@ pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::Term
         && receipt.source_binding.execution_instance==receipt.source_execution_instance
         && handoff_chat_source_matches(&receipt.source_binding.source,&receipt.source)
         && !receipt.terminal.execution_instance.is_nil()
-        && receipt.terminal.session.continuity.live_proof().is_some_and(|proof|proof.is_complete())
+        && receipt.source.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
+        && receipt.terminal.session.continuity.live_proof().is_none_or(|proof|receipt.source.proof.as_ref()==Some(&proof))
         && handoff_chat_source_matches(issued,&receipt.source)
 }
 /// Receipt-owned thread learning is narrower than ordinary logical-source
@@ -646,6 +647,10 @@ pub(crate) mod handoff_tests {
         assert!(view.panes.is_empty());assert_eq!(before,original);
         let mut learned=before.clone();learned.kind=CardKind::Chat(receipt.source.clone());
         assert!(same_removal_pane_source(&before,&learned,Some(&receipt)));
+        let mut ended_receipt=receipt.clone();ended_receipt.terminal.session.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:0}};
+        let mut ended=current.clone();ended.kind=CardKind::Terminal(ended_receipt.terminal.session.clone());
+        assert!(same_removal_pane_source(&before,&ended,Some(&ended_receipt)),"completed receipt retains source proof without synthesizing Live");
+        assert!(matches!(ended_receipt.terminal.session.continuity,TerminalContinuity::Exited {..}));
         let mut promoted=receipt.clone();promoted.source.native_continuity=crate::chat::NativeContinuity::Durable {provider_version:"same-backend".into()};
         assert!(same_removal_pane_source(&before,&current,Some(&promoted)),"metadata promotion does not replace the concrete source backend");
         promoted.source_binding.source.launch.session_id=Some("other-known-thread".into());

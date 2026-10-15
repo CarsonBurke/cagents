@@ -635,7 +635,8 @@ impl Cagents {
         shared:Option<super::shared_views::RemovalSource>,
     )->Option<QueuedCardClose> {
         let source=&receipt.terminal.session;
-        let proof=source.continuity.live_proof().filter(HostSessionProof::is_complete)?;
+        let proof=receipt.source.proof.clone().filter(HostSessionProof::is_complete)?;
+        if source.continuity.live_proof().is_some_and(|issued|issued!=proof) {return None;}
         if receipt.operation.is_nil() || receipt.terminal.execution_instance.is_nil()
             || !self.pane_close_decision_current(card,batch)
             || !self.card_state(card).is_some_and(|state|state.existence.is_open()
@@ -1790,6 +1791,22 @@ mod tests {
         descriptor.session = captured.source.clone();
         descriptor.execution_instance = captured.execution_instance;
         descriptor
+    }
+
+    #[test]
+    fn completed_handoff_receipt_uses_original_source_proof_without_marking_worker_live() {
+        let (mut app,card,_)=bound_fixture();
+        let (_,mut receipt)=crate::workspace_model::views::handoff_tests::fixture();
+        receipt.terminal.session.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:0}};
+        app.card_state_mut(card).unwrap().kind=CardKind::Terminal(receipt.terminal.session.clone());
+        app.cards.remove(&card);app.workspace_model.views.clear();app.shared_views.attached.remove(&card);app.shared_views.baseline.clear();
+        let queued=app.capture_handoff_card_close_for(card,None,&receipt,None).expect("completed descriptor keeps the exact returned worker and complete original proof");
+        let captured=queued.captured.as_ref().unwrap();
+        assert_eq!(Some(&captured.proof),receipt.source.proof.as_ref());
+        assert_eq!(captured.execution_instance,receipt.terminal.execution_instance);
+        assert!(matches!(captured.source.continuity,TerminalContinuity::Exited {..}));
+        receipt.source.proof=None;
+        assert!(app.capture_handoff_card_close_for(card,None,&receipt,None).is_none(),"no nil/unknown proof fallback");
     }
 
     #[test]
