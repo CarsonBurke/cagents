@@ -91,8 +91,12 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                 records.first().map(|record|record.path.join(&target)).ok_or("Repository has no primary checkout")?
             };
             let canonical=std::fs::canonicalize(&candidate).ok();
-            let (index,record)=records.iter().enumerate().find(|(_,record)|record.branch.as_deref()==Some(&full_branch)||canonical.as_ref()==Some(&record.path))
-                .ok_or("No matching worktree; use an exact branch or worktree path")?;
+            let matches=records.iter().enumerate().filter(|(_,record)|record.branch.as_deref()==Some(&full_branch)||canonical.as_ref()==Some(&record.path)).collect::<Vec<_>>();
+            let (index,record)=match matches.as_slice() {
+                [record]=>*record,
+                []=>return Err("No matching worktree; use an exact branch or worktree path".into()),
+                _=>return Err("The target matches different branch and path worktrees; use the exact absolute path".into()),
+            };
             if index==0||record.bare { return Err("The primary worktree cannot be removed".into()); }
             if record.lock.locked { return Err("The worktree is locked; unlock it before removing it".into()); }
             let sessions=live_sessions(&record.path)?;
