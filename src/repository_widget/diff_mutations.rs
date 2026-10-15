@@ -137,7 +137,7 @@ impl RepositoryRuntime {
         let file = self.subject_file()?;
         let old_path = file
             .previous_path(&self.diff_basis)
-            .unwrap_or_else(|| path.clone());
+            .unwrap_or_else(|| file.path.clone());
         let (buffer_revision, buffer_snapshot) = if kind == git_patch::Kind::Revert {
             match &self.document {
                 DocumentState::Editable(document) => (
@@ -156,7 +156,7 @@ impl RepositoryRuntime {
             mode: self.diff_mode,
             rows,
             old_path: RepoPath::parse(old_path).ok()?,
-            new_path: RepoPath::parse(path).ok()?,
+            new_path: RepoPath::parse(file.path).ok()?,
             buffer_revision,
             buffer_snapshot,
         })
@@ -516,6 +516,27 @@ mod tests {
         finish_presence_save(&mut runtime, recreation).await;
         assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "newer typing\n");
         assert!(!runtime.is_dirty());
+    }
+
+    #[test]
+    fn partial_change_patch_targets_the_followed_file_while_identity_stays_on_the_selected_link() {
+        let card = CardId::new();
+        let (mut runtime, identity) = added_file_runtime(card, Path::new("/repo"), "new\n");
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+        document.source = "target.sh".into();
+        let FileListState::Ready(files) = &mut runtime.files else { unreachable!(); };
+        files.push(RepositoryFile { path: "target.sh".into(), unstaged: true, ..RepositoryFile::default() });
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        let request = runtime.diff_mutation_request(card, 0..1).unwrap();
+        let capture = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap();
+        assert_eq!(capture.identity, identity);
+        assert_eq!(capture.new_path.as_path(), Path::new("target.sh"));
+        assert_eq!(capture.old_path.as_path(), Path::new("target.sh"));
+        let (_, _, patch) = capture.build().unwrap();
+        let text = std::str::from_utf8(&patch.patch).unwrap();
+        assert!(text.contains("b/target.sh"));
+        assert!(!text.contains("new.sh"));
     }
 
     #[test]
