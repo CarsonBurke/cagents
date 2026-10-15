@@ -46,7 +46,13 @@ pub(crate) fn selected_patch(
         (baseline, desired_present.then_some(desired.as_str()),
             [model.modes[0], desired_present.then_some(model.modes[1].or(model.modes[0])).flatten()])
     };
-    let patch = mode_aware_patch(old_path, new_path, before, after, modes)?;
+    // Undo selected content at the currently displayed path. Renaming it
+    // back is a whole-file operation, not part of a hunk/line replacement.
+    let patch = if undo {
+        mode_aware_patch(new_path, new_path, before, after, modes)?
+    } else {
+        mode_aware_patch(old_path, new_path, before, after, modes)?
+    };
     (!patch.is_empty()).then_some(Patch { patch: patch.into(), cached: kind != Kind::Revert, reverse: undo,
         expected_head, working_text: (kind == Kind::Revert).then(|| Arc::new(desired)), buffer_change: None })
 }
@@ -180,6 +186,40 @@ mod tests {
             assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), after.as_bytes());
             model.source_head = None;
             assert!(selected_patch(&model, &path, &path, mode, selected..end, Kind::Unstage).is_none());
+        }
+    }
+
+    #[test]
+    fn partial_unstage_of_a_rename_preserves_the_current_index_path() {
+        use crate::{diff_view::{build_diff, DiffRowKind}, repository::Oid};
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let root = tempfile::tempdir().unwrap();
+            git(root.path(), &["init", "-b", "main"], None);
+            let before = (0..40).map(|line| format!("line {line}\n")).collect::<String>();
+            let after = before.replace("line 3\n", "FIRST\n").replace("line 30\n", "SECOND\n");
+            fs::write(root.path().join("old.txt"), &before).unwrap();
+            git(root.path(), &["add", "."], None);
+            git(root.path(), &["commit", "-m", "baseline"], None);
+            let head = String::from_utf8(git(root.path(), &["rev-parse", "HEAD"], None)).unwrap();
+            git(root.path(), &["mv", "old.txt", "new.txt"], None);
+            fs::write(root.path().join("new.txt"), &after).unwrap();
+            git(root.path(), &["add", "new.txt"], None);
+            let mut model = build_diff(&before, &after);
+            model.source_head = Some(GitHeadGuard::Commit(Oid::parse(head.trim()).unwrap()));
+            model.modes = [Some(0o100644); 2];
+            model.present = [true; 2];
+            let first = match mode {
+                DiffMode::Inline => model.inline_rows.iter().position(|row| row.kind != DiffRowKind::Context).unwrap(),
+                DiffMode::Split => model.split_rows.iter().position(|row| row.kind != DiffRowKind::Context).unwrap(),
+            };
+            let end = first + if mode == DiffMode::Inline { 2 } else { 1 };
+            let plan = selected_patch(&model, &RepoPath::parse("old.txt").unwrap(), &RepoPath::parse("new.txt").unwrap(), mode, first..end, Kind::Unstage).unwrap();
+            git(root.path(), &["apply", "--cached", "--reverse", "--check"], Some(&plan.patch));
+            git(root.path(), &["apply", "--cached", "--reverse"], Some(&plan.patch));
+            assert_eq!(git(root.path(), &["ls-files", "-z"], None), b"new.txt\0");
+            assert_eq!(git(root.path(), &["show", ":new.txt"], None), before.replace("line 30\n", "SECOND\n").as_bytes());
+            assert_eq!(fs::read(root.path().join("new.txt")).unwrap(), after.as_bytes());
+            assert!(!root.path().join("old.txt").exists());
         }
     }
 
