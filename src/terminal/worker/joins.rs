@@ -44,6 +44,7 @@ pub(super) fn reserve() -> Result<Reservation, String> {
 struct Service {
     joins: crossbeam_channel::Sender<Job>,
     deadlines: crossbeam_channel::Sender<Arc<PublishedState>>,
+    changed: crossbeam_channel::Sender<()>,
 }
 static SERVICE: OnceLock<Result<Service, String>> = OnceLock::new();
 
@@ -51,35 +52,42 @@ fn service() -> Result<&'static Service, String> {
     SERVICE.get_or_init(|| {
         let (sender, receiver) = crossbeam_channel::bounded::<Job>(capacity());
         let (deadlines, pending) = crossbeam_channel::bounded::<Arc<PublishedState>>(capacity());
+        let (changed, changes) = crossbeam_channel::bounded(1);
         // Actual pthread joins can remain blocked in TLS destruction. One
-        // independent supervisor owns escalation for active AND queued jobs,
-        // so neither a deadline caller nor final Drop must wait for a join.
+        // independent supervisor owns active AND queued deadlines. Admission,
+        // completion and later escalation requests wake it without idle polls.
         thread::Builder::new().name("terminal-join-deadlines".into()).spawn(move || {
             let mut active: Vec<Arc<PublishedState>> = Vec::with_capacity(capacity());
             loop {
-                match pending.recv_timeout(Duration::from_millis(5)) {
-                    Ok(owner) => active.push(owner),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {},
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) if active.is_empty() => return,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => thread::sleep(Duration::from_millis(5)),
-                }
                 active.extend(pending.try_iter());
+                let mut retry_at = None;
                 active.retain(|owner| {
                     if matches!(owner.worker_join.load(Ordering::Acquire), 2 | 3) { return false; }
                     if owner.join_escalation_at.get().is_some_and(|deadline| Instant::now() >= *deadline) {
-                        // Handoff and deadline signaling share input ownership
-                        // admission: a successor's root must never be killed.
-                        if !escalate_owned_root(owner) { return true; }
-                        // The actual-join job continues retaining the exact
-                        // slot, original pidfd and reservation after signaling.
+                        // Handoff and signaling share ownership admission.
+                        // Retry only an expired, currently contended fence.
+                        if !escalate_owned_root(owner) {
+                            retry_at = Some(Instant::now()+Duration::from_millis(5));
+                            return true;
+                        }
                         return false;
                     }
                     true
                 });
+                let next = active.iter().filter_map(|owner|owner.join_escalation_at.get().copied())
+                    .filter(|deadline|*deadline>Instant::now()).chain(retry_at).min();
+                let timer = next.map(|deadline|crossbeam_channel::after(deadline.saturating_duration_since(Instant::now())))
+                    .unwrap_or_else(crossbeam_channel::never);
+                crossbeam_channel::select! {
+                    recv(pending) -> owner => match owner { Ok(owner)=>active.push(owner), Err(_)=>return },
+                    recv(changes) -> _ => {},
+                    recv(timer) -> _ => {},
+                }
             }
         }).map_err(|error| format!("Terminal deadline service unavailable: {error}"))?;
         for index in 0..WORKERS {
             let receiver = receiver.clone();
+            let changed = changed.clone();
             thread::Builder::new().name(format!("terminal-join-{index}")).spawn(move || {
                 while let Ok(job) = receiver.recv() {
                     // Only the shared service may wait for metadata or TLS.
@@ -88,10 +96,11 @@ fn service() -> Result<&'static Service, String> {
                     let success = worker.is_none_or(|worker| worker.join().is_ok());
                     if !success { job.published.completed.store(false, Ordering::Release); }
                     job.published.worker_join.store(if success { 2 } else { 3 }, Ordering::Release);
+                    let _ = changed.try_send(());
                 }
             }).map_err(|error| format!("Terminal join service unavailable: {error}"))?;
         }
-        Ok(Service { joins: sender, deadlines })
+        Ok(Service { joins: sender, deadlines, changed })
     }).as_ref().map_err(Clone::clone)
 }
 
@@ -101,7 +110,11 @@ pub(super) fn initialize() -> Result<(), String> { service().map(|_| ()) }
 /// task retains that slot and pidfd beyond the caller's deadline. Concurrent
 /// callers report pending rather than waiting behind the first caller's join.
 pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, deadline: Instant, escalate: bool, wait: bool) -> bool {
-    if escalate { let _ = published.join_escalation_at.set(deadline); }
+    if escalate && published.join_escalation_at.set(deadline).is_ok()
+        && let Some(Ok(service)) = SERVICE.get()
+    {
+        let _ = service.changed.try_send(());
+    }
     match published.worker_join.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {},
         Err(2) => return true,
