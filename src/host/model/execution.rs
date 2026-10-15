@@ -1556,7 +1556,7 @@ mod tests {
         scope: &crate::workspace_model::views::Scope,
         before: &crate::workspace_model::views::Pane,
         pane: &crate::workspace_model::views::Pane,
-    ) -> Result<bool, String> {
+    ) -> Result<Applied, String> {
         registry.apply(&ModelEdit::ChangeView {
             scope: scope.clone(),
             expected_revision: registry.view_revision(scope)?,
