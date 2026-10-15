@@ -453,7 +453,11 @@ mod tests {
             observed_at: 1,detail: "Verify".into(),pending: true });
         state.write(&cache).unwrap();
         assert!(cache.fixture_verify_identity(KEY,reading(20,UsageSource::Probe,"new@fixture.invalid")).is_err());
-        assert_pending(&cache,20);
+        assert!(cache.load(20).is_empty(),"exhaustion persists global refusal instead of wrapping");
+        assert!(cache.begin_verification(KEY).is_err());
+        assert!(cache.store(KEY,reading(30,UsageSource::Live,"old@fixture.invalid")).is_err());
+        assert_eq!(read_document(&cache.path()).unwrap().entries[KEY].identity.as_ref().unwrap().email.as_deref(),
+            Some("old@fixture.invalid"),"the failed verification never replaced underlying quota");
     }
 
     #[test]
