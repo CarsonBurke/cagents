@@ -112,6 +112,10 @@ impl Ledger {
         self.ensure_usable()?;
         identifier_str(credit_id)?;
         if let Some(index) = self.state.attempts.iter().position(|attempt| attempt.credit_id == credit_id) {
+            if matches!(self.state.attempts[index].outcome, Some(Outcome::NothingToReset | Outcome::NoCredit))
+                && self.state.attempts.iter().any(|attempt| attempt.credit_id != credit_id && attempt.outcome.is_none()) {
+                return Err("A previous reset has an uncertain outcome; reconcile that credit before reviving another".into());
+            }
             let attempt = &mut self.state.attempts[index];
             let key = attempt.idempotency_key.clone();
             match attempt.outcome {
@@ -218,6 +222,20 @@ mod tests {
         let mut ledger = Ledger::open(root.path(), &account()).unwrap();
         fresh.observed_at_ms = 2000;
         assert_eq!(ledger.begin_available("credit-one", 2000, &fresh).unwrap(), Admission::Pending {idempotency_key:key, reconcile_first:false});
+    }
+    #[test]
+    fn retryable_credit_cannot_bypass_another_credit_uncertainty_or_mutate_the_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path(), &account()).unwrap();
+        ledger.begin("credit-a", 1000).unwrap();
+        let fresh = Allowance {observed_at_ms:1100, account:Some(account()), account_binding_detail:None, windows:vec![], reset_credits:Some(super::super::ResetCredits {available_count:2, details:Some(vec![super::super::ResetCredit {id:"credit-a".into(), supported_type:true, available:true, expires_at_ms:None}])})};
+        ledger.finish("credit-a", Outcome::NothingToReset, &fresh).unwrap();
+        ledger.begin("credit-b", 1100).unwrap();
+        let before = fs::read(&ledger.path).unwrap();
+        assert!(ledger.begin_available("credit-a", 1200, &fresh).unwrap_err().contains("uncertain"));
+        assert_eq!(fs::read(&ledger.path).unwrap(), before);
+        assert_eq!(ledger.state.attempts[0].outcome, Some(Outcome::NothingToReset));
+        assert!(ledger.state.attempts[1].outcome.is_none());
     }
     #[test]
     fn corrupt_or_future_attempt_state_never_becomes_an_empty_new_history() {

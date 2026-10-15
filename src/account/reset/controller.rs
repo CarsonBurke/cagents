@@ -23,11 +23,11 @@ pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: I
         allowance = handle.read_allowance(expires)?;
         if allowance.account.as_ref() != Some(&expected) { return Err("Provider account changed before reset intent; no credit was consumed".into()); }
         let now = crate::chat::now_ms().ok_or("System clock cannot timestamp reset intent")?;
-        if let Some(condition) = condition {
-            if !matches!(super::decision(&allowance, now, condition.max_age_ms, condition.used_percent, true)?, super::Decision::Eligible {..}) {
-                return Ok(Report {session:request.session, provider:Provider::Codex, source:Source::CodexAppServer, allowance, outcome:None, reconciled:false});
-            }
-        }
+        let meets_condition = match condition {
+            Some(condition) => matches!(super::decision(&allowance, now, condition.max_age_ms, condition.used_percent, true)?, super::Decision::Eligible {..}),
+            None => true,
+        };
+        if meets_condition {
         match ledger.begin_available(&credit_id, now, &allowance)? {
             Admission::Complete(prior) => { outcome = Some(prior); reconciled = true; }
             Admission::Pending {idempotency_key, reconcile_first} => {
@@ -45,6 +45,7 @@ pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: I
                 outcome = Some(consumed.outcome);
                 reconciled = reconcile_first;
             }
+        }
         }
     }
     current()?;
