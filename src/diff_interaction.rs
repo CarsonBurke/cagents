@@ -202,11 +202,11 @@ pub enum Command {
 /// Whole-file contextual patch for just the selected changed rows. Git's
 /// contextual patch generator restores untouched lines around the selection,
 /// so a whole-hunk selection can be applied with ordinary `git apply`.
-pub fn selected_patch(model: &DiffModel, mode: DiffMode, selected: Range<usize>, path: &crate::repository::RepoPath) -> Option<String> {
+pub fn selected_patch(model: &DiffModel, mode: DiffMode, selected: Range<usize>, path: &crate::repository::RepoPath, old_path: Option<&crate::repository::RepoPath>) -> Option<String> {
     let after = crate::diff_patch::selected_content(model, &model.after, mode, selected, false)?;
     let before = model.present[0].then_some(model.before.as_ref());
     let target = if !model.present[1] && after.is_empty() { None } else { Some(after.as_str()) };
-    String::from_utf8(crate::diff_patch::unified_patch(path, before, target)).ok()
+    String::from_utf8(crate::diff_patch::unified_patch_paths(old_path.unwrap_or(path), path, before, target)).ok()
 }
 
 /// Mouse selection remains separate from syntax rendering and discussion

@@ -99,7 +99,8 @@ impl RepositoryRuntime {
             DiffCommand::CopyPatch => {
                 let Some(selection) = self.diff_interaction.selection else { return Task::none(); };
                 let Some(path) = self.selected_path().and_then(|path| RepoPath::parse(path).ok()) else { return Task::none(); };
-                interaction::selected_patch(model,self.diff_mode,selection.rows(),&path).map_or_else(Task::none,iced::clipboard::write)
+                let old_path = self.comparison_old_path().and_then(|old| RepoPath::parse(old).ok());
+                interaction::selected_patch(model,self.diff_mode,selection.rows(),&path,old_path.as_ref()).map_or_else(Task::none,iced::clipboard::write)
             }
             DiffCommand::CopyLineReference { row,side } => {
                 let selection = Selection::new(self.diff_mode,side,row);

@@ -49,7 +49,14 @@ pub fn selected_content(model: &DiffModel, after: &str, mode: DiffMode, selected
 /// A minimal contextual unified patch. `None` side denotes file absence;
 /// an empty present file remains distinct from a deleted file.
 pub fn unified_patch(path: &RepoPath, before: Option<&str>, after: Option<&str>) -> Vec<u8> {
-    if before == after { return Vec::new(); }
+    unified_patch_paths(path,path,before,after)
+}
+
+/// A renamed comparison keeps each tree's path, so applying a selected hunk
+/// against its baseline performs the rename as well as the selected edits.
+pub fn unified_patch_paths(old_path:&RepoPath,new_path:&RepoPath,before:Option<&str>,after:Option<&str>)->Vec<u8> {
+    let renamed = old_path != new_path && before.is_some() && after.is_some();
+    if before == after && !renamed { return Vec::new(); }
     let input = InternedInput::new(before.unwrap_or_default(), after.unwrap_or_default());
     let mut compared = Diff::compute(Algorithm::Histogram, &input);
     compared.postprocess_lines(&input);
@@ -58,10 +65,17 @@ pub fn unified_patch(path: &RepoPath, before: Option<&str>, after: Option<&str>)
     let changes: Vec<_> = compared.hunks().map(|change| (change.before.start as usize..change.before.end as usize, change.after.start as usize..change.after.end as usize)).collect();
     let mut patch = Vec::new();
     patch.extend_from_slice(b"diff --git ");
-    patch.extend(quoted_path(b'a', path));
+    patch.extend(quoted_path(b'a', old_path));
     patch.push(b' ');
-    patch.extend(quoted_path(b'b', path));
+    patch.extend(quoted_path(b'b', new_path));
     patch.push(b'\n');
+    if renamed {
+        patch.extend_from_slice(b"rename from ");
+        patch.extend(quoted_bytes(old_path.as_bytes()));
+        patch.extend_from_slice(b"\nrename to ");
+        patch.extend(quoted_bytes(new_path.as_bytes()));
+        patch.push(b'\n');
+    }
     // /dev/null headers represent text-file presence without guessing the
     // existing file's mode. Empty files have no textual hunk, so their
     // presence-only patch needs the ordinary regular-file mode marker.
@@ -69,9 +83,9 @@ pub fn unified_patch(path: &RepoPath, before: Option<&str>, after: Option<&str>)
     if before.is_none() && after == Some("") { patch.extend_from_slice(b"new file mode 100644\n"); }
     if after.is_none() && before == Some("") { patch.extend_from_slice(b"deleted file mode 100644\n"); }
     patch.extend_from_slice(b"--- ");
-    patch.extend(before.map_or_else(|| b"/dev/null".to_vec(), |_| quoted_path(b'a', path)));
+    patch.extend(before.map_or_else(|| b"/dev/null".to_vec(), |_| quoted_path(b'a', old_path)));
     patch.extend_from_slice(b"\n+++ ");
-    patch.extend(after.map_or_else(|| b"/dev/null".to_vec(), |_| quoted_path(b'b', path)));
+    patch.extend(after.map_or_else(|| b"/dev/null".to_vec(), |_| quoted_path(b'b', new_path)));
     patch.push(b'\n');
     let mut index = 0;
     while index < changes.len() {
@@ -105,8 +119,14 @@ fn patch_line(patch: &mut Vec<u8>, prefix: u8, line: &str) {
 }
 
 fn quoted_path(side: u8, path: &RepoPath) -> Vec<u8> {
-    let mut result = vec![b'"', side, b'/'];
-    for byte in path.as_bytes() {
+    let mut bytes = vec![side,b'/'];
+    bytes.extend_from_slice(path.as_bytes());
+    quoted_bytes(&bytes)
+}
+
+fn quoted_bytes(bytes:&[u8])->Vec<u8> {
+    let mut result = vec![b'"'];
+    for byte in bytes {
         match byte {
             b'"' | b'\\' => { result.push(b'\\'); result.push(*byte); }
             32..=126 => result.push(*byte),
@@ -189,6 +209,25 @@ mod tests {
             git(root, &["apply", "--cached", "--check", "-R", "-"], Some(&patch));
             git(root, &["apply", "--cached", "-R", "-"], Some(&patch));
             assert_eq!(git(root, &["show", ":selected.rs"], None), before.as_bytes());
+        }
+    }
+
+    #[test]
+    fn renamed_hunk_patch_keeps_both_tree_paths_and_reverses() {
+        for after in ["changed\n", "old\n"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            git(root,&["init","-q"],None);
+            fs::write(root.join("old name.txt"),"old\n").unwrap();
+            git(root,&["add","old name.txt"],None);
+            let patch = unified_patch_paths(&RepoPath::parse("old name.txt").unwrap(),&RepoPath::parse("new name.txt").unwrap(),Some("old\n"),Some(after));
+            git(root,&["apply","--cached","--check","-"],Some(&patch));
+            git(root,&["apply","--cached","-"],Some(&patch));
+            assert_eq!(git(root,&["show",":new name.txt"],None),after.as_bytes());
+            assert!(git(root,&["ls-files","--","old name.txt"],None).is_empty());
+            git(root,&["apply","--cached","--check","-R","-"],Some(&patch));
+            git(root,&["apply","--cached","-R","-"],Some(&patch));
+            assert_eq!(git(root,&["show",":old name.txt"],None),b"old\n");
         }
     }
 
