@@ -537,6 +537,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    pub(crate) fn database_path(&self) -> &Path { &self.path }
     /// Copies a live store through SQLite's transactionally consistent VACUUM
     /// snapshot. The source is never startup-reconciled or checkpointed here.
     pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
@@ -2410,6 +2411,24 @@ pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, Saved
     }
     Ok(owners)
 }
+
+/// Read a setup receipt without migration, reconciliation or write access.
+pub(crate) fn read_worktree_operation_at(path:&Path,id:OperationId)->Result<Option<PendingOperation>> {
+    let connection=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    worktree_operation_at(&connection,id)
+}
+
+fn worktree_operation_at(connection:&Connection,id:OperationId)->Result<Option<PendingOperation>> {
+    let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_operations')",[],|row|row.get(0))?;
+    if !exists {return Ok(None);}
+    let row=connection.query_row("SELECT entity_kind,entity_id,action,base_generation,payload_json,status,created_at_unix_ms,updated_at_unix_ms FROM pending_operations WHERE operation_id=?1",[id.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?,row.get::<_,i64>(7)?))).optional()?;
+    row.map(|(entity_kind,entity_id,action,generation,payload,status,created,updated)|Ok(PendingOperation {
+        id,entity_kind,entity_id,action,base_generation:i64_to_u64(generation,"operation base generation")?,
+        payload:serde_json::from_str(&payload).unwrap_or(Value::String(payload)),status:PendingOperationStatus::parse(&status)?,created_at_unix_ms:created,updated_at_unix_ms:updated,
+    })).transpose()
+}
+
 
 fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>) -> Result<()> {
     for sql in [
