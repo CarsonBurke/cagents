@@ -83,7 +83,7 @@ impl FilesystemRecoveryContext {
         Ok(FilesystemRecoveryReservation { context: self.clone(), slot })
     }
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
-        self.placement.validate().map_err(|error| error.to_string())?;
+        self.placement.require_payload_registration().map_err(|error| error.to_string())?;
         self.context.reserve()
     }
 }
@@ -97,9 +97,12 @@ mod tests {
         let source = directory.path().join("source"); let outside = directory.path().join("recovery");
         std::fs::create_dir(&source).unwrap(); std::fs::create_dir(&outside).unwrap();
         let source = Arc::new(Root::open(&source).unwrap()); let outside = Arc::new(Root::open(&outside).unwrap());
-        // The complete isolated fixture topology is static. This callback is
-        // test-only, never an intake policy for real registered projects.
-        let placement = RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source.clone()]), RecoveryRegistryCheck::new(Arc::new(|| Ok(())), 0)).unwrap();
+        // Static fixture enrollment is an owned bounded lease, never a
+        // callback-only production compatibility policy.
+        drop(outside);
+        let fixture = super::fixtures::fixture_context(&source).unwrap();
+        let placement = fixture.placement().clone();
+        drop(fixture);
         let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
         (directory, runtime, source, placement, protection)
     }

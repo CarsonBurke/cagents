@@ -691,10 +691,11 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
         fs::write(directory.path().join("file"), "contents").unwrap();
+        let context = crate::filesystem_recovery_context::fixture_context(&root).unwrap();
         let previous = unsafe { libc::umask(0o777) };
-        let result = capture_restoration_with_hook(&root, Path::new("file"), blake3::hash(b"contents"), |holding, _| {
+        let result = capture_restoration_in_context_with_hook(&root, Path::new("file"), blake3::hash(b"contents"), |holding, _| {
             assert_eq!(holding.metadata()?.mode() & 0o777, 0o700); Ok(())
-        });
+        }, &context);
         unsafe { libc::umask(previous) };
         assert!(result.is_ok(), "private capture must set permissions on its retained inode: {result:?}");
         assert_eq!(fs::read_to_string(directory.path().join("file")).unwrap(), "contents");

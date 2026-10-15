@@ -54,6 +54,7 @@ struct OwnedTemporary { file: File, name: OsString }
 pub(super) struct PresenceHolding {
     publication: fs_safety::DirectoryPublication,
     context: FilesystemRecoveryContext,
+    registered: bool,
     // None means consumer-private setup has not completed. The producer's
     // immutable initial access witness then remains the only permitted base.
     private_access: Option<(u32, u32, u32)>,
@@ -121,13 +122,20 @@ impl PresenceHolding {
                 return Err(FileIoError::Recovery { message, authority });
             },
         };
-        let mut holding = Self { publication, context: context.clone(), private_access: None, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
+        let mut holding = Self { publication, context: context.clone(), registered: false, private_access: None, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
         let prepared = (|| {
-            holding.context.register_payload_root(holding.directory()).map_err(io_error)?;
             if let Some(error) = holding.publication.publication_error() { return Err(FileIoError::Io(error.into())); }
-            holding.establish_private_access().map_err(FileIoError::Io)
+            // A restrictive umask may leave our authenticated Published inode
+            // mode000. Establish its exact witnessed private access before an
+            // ancestry walk requires search permission, but write no payload.
+            holding.establish_private_access().map_err(FileIoError::Io)?;
+            holding.context.register_payload_root(holding.directory()).map_err(io_error)?;
+            holding.registered = true;
+            Ok(())
         })();
-        match prepared { Ok(()) => Ok(holding), Err(error) => Err(holding.finish_error(error)) }
+        // An enrollment error can mean unknown daemon handoff. Keep the LIVE
+        // original H and lease; local empty cleanup cannot settle that handoff.
+        match prepared { Ok(()) => Ok(holding), Err(error) => Err(holding.retain(error.to_string())) }
     }
     pub(super) fn directory(&self) -> &Root { self.publication.directory() }
     pub(super) fn validate_live(&self) -> Result<(), FileIoError> {
@@ -225,12 +233,16 @@ impl PresenceHolding {
             fs_safety::sync_directory(self.context.placement().directory()).map_err(|error| error.to_string())?;
             return fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string());
         }
-        self.context.validate_payload_root(self.directory()).map_err(|error| error.to_string())?;
         // Restore the producer's exact pending mode witness before applying
         // this consumer's explicit private0700 policy to its original inode.
         // This step never acquires/removes a public recovery entry.
         self.publication.retry_publication_steps().map_err(|error| error.to_string())?;
         self.establish_private_access()?;
+        if !self.registered {
+            self.context.register_payload_root(self.directory()).map_err(|error| error.to_string())?;
+            self.registered = true;
+        }
+        self.context.validate_payload_root(self.directory()).map_err(|error| error.to_string())?;
         if self.temporary.is_some() { self.unlink_temporary().map_err(|error| error.to_string())?; }
         if self.restore_original {
             if let Some(original) = &self.original {
@@ -273,6 +285,38 @@ impl PresenceHolding {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[test]
+    fn uncertain_payload_enrollment_retains_live_original_until_same_lease_accepts_retry() {
+        use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+        struct Lease { payload: Mutex<Option<Root>>, uncertain: Arc<AtomicBool> }
+        impl fs_safety::RecoveryRegistrationLease for Lease {
+            fn validate(&self) -> io::Result<()> { Ok(()) }
+            fn descriptor_budget(&self) -> usize { 1 }
+            fn register_payload(&self, root: &Root) -> io::Result<()> {
+                let mut payload = self.payload.lock().unwrap();
+                if let Some(original) = payload.as_ref() {
+                    if fs_safety::recovery_directory_stamp(original)? != fs_safety::recovery_directory_stamp(root)? { return Err(io::Error::other("different original payload")); }
+                } else { *payload = Some(root.try_clone()?); }
+                if self.uncertain.load(Ordering::Acquire) { Err(io::Error::other("uncertain actual lease handoff")) } else { Ok(()) }
+            }
+        }
+        let tree = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
+        fs::create_dir(tree.path().join("source")).unwrap(); fs::create_dir(tree.path().join("outside")).unwrap();
+        let source = Arc::new(Root::open(&tree.path().join("source")).unwrap()); let outside = Arc::new(Root::open(&tree.path().join("outside")).unwrap());
+        let uncertain = Arc::new(AtomicBool::new(true)); let lease = Arc::new(Lease { payload: Mutex::new(None), uncertain: uncertain.clone() }); let weak = Arc::downgrade(&lease);
+        let placement = fs_safety::RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source.clone()]), fs_safety::RecoveryRegistryCheck::from_lease(lease.clone())).unwrap();
+        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
+        let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
+        let error = match PresenceHolding::create_in_context(&source, std::ffi::OsStr::new("file"), &context) { Err(error) => error, Ok(_) => panic!("unknown handoff must refuse payload effects") };
+        let authority = error.recovery_authority().expect("unknown registration keeps its original live holding").clone();
+        let original = lease.payload.lock().unwrap().as_ref().unwrap().try_clone().unwrap();
+        drop(lease); drop(context); drop(error);
+        assert!(weak.upgrade().is_some()); assert!(original.metadata().unwrap().nlink() > 0); assert!(original.read_dir().unwrap().next().is_none());
+        assert!(authority.retry().is_err()); assert!(original.metadata().unwrap().nlink() > 0, "local cleanup cannot erase an unknown handoff");
+        uncertain.store(false, Ordering::Release); authority.retry().unwrap(); assert!(authority.is_resolved());
+        assert_eq!(original.metadata().unwrap().nlink(), 0); assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     fn registered_presence_payload_stays_outside_actual_git_discovery_and_refuses_public_move() {
         let tree = tempfile::tempdir().unwrap(); let source = tree.path().join("source");
