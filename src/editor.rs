@@ -9,6 +9,7 @@ use std::{
 use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
+use crate::filesystem_recovery_context::FilesystemRecoveryContext;
 
 mod presence;
 mod save_publication;
@@ -1068,11 +1069,8 @@ pub(crate) fn save_file_at(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
-    let protection = std::sync::Arc::new(
-        crate::worktree_cleanup::protect(root.path()).map_err(io_error)?
-    );
-    let context = recovery_context_at(root, protection)?;
-    save_file_at_in_context(root, relative_path, text, expected_disk_hash, overwrite, &context)
+    let _ = (root, relative_path, text, expected_disk_hash, overwrite);
+    Err(FileIoError::Io("Saving requires the original registered filesystem recovery context; no file was changed.".into()))
 }
 
 /// Retains the caller's original cleanup lease with any unresolved publication.
@@ -1082,7 +1080,7 @@ pub(crate) fn save_file_at_in_context(
     text: &str,
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
-    context: &RecoveryContext,
+    context: &FilesystemRecoveryContext,
 ) -> Result<SaveOutcome, FileIoError> {
     save_file_at_with_hooks_in_context(
         root, relative_path, text, expected_disk_hash, overwrite,
@@ -1099,22 +1097,8 @@ fn save_file_with_hooks(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
-    validate_repo_path(relative_path)?;
-    let protection = std::sync::Arc::new(
-        crate::worktree_cleanup::protect(worktree).map_err(io_error)?
-    );
-    let root = worktree_root(worktree)?;
-    let context = recovery_context_at(&root, protection)?;
-    save_file_at_with_hooks_in_context(
-        &root,
-        relative_path,
-        text,
-        expected_disk_hash,
-        overwrite,
-        before_publish,
-        sync_parent,
-        &context,
-    )
+    let _ = (worktree, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent);
+    Err(FileIoError::Io("Saving requires the original registered filesystem recovery context; no file was changed.".into()))
 }
 
 pub(crate) fn save_file_at_with_hooks(
@@ -1126,12 +1110,8 @@ pub(crate) fn save_file_at_with_hooks(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
-    let protection = std::sync::Arc::new(
-        crate::worktree_cleanup::protect(root.path()).map_err(io_error)?
-    );
-    let context = recovery_context_at(root, protection)?;
-    save_file_at_with_hooks_in_context(root, relative_path, text, expected_disk_hash,
-        overwrite, before_publish, sync_parent, &context)
+    let _ = (root, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent);
+    Err(FileIoError::Io("Saving requires the original registered filesystem recovery context; no file was changed.".into()))
 }
 
 pub(crate) fn save_file_at_with_hooks_in_context(
@@ -1142,8 +1122,9 @@ pub(crate) fn save_file_at_with_hooks_in_context(
     overwrite: bool,
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
-    context: &RecoveryContext,
+    context: &FilesystemRecoveryContext,
 ) -> Result<SaveOutcome, FileIoError> {
+    context.validate_for_source(root).map_err(io_error)?;
     validate_repo_path(relative_path)?;
     let (parent, name) =
         fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
@@ -1397,6 +1378,17 @@ fn io_error(error: io::Error) -> FileIoError {
 
 #[cfg(test)]
 mod tests {
+    fn save_with_test_context(worktree: &Path, path: &Path, text: &str, hash: blake3::Hash, overwrite: bool) -> Result<SaveOutcome, FileIoError> {
+        let root = worktree_root(worktree)?;
+        let context = save_publication::fixture_context(&root);
+        save_file_at_in_context(&root, path, text, hash, overwrite, &context)
+    }
+    fn save_hooks_with_test_context(worktree: &Path, path: &Path, text: &str, hash: blake3::Hash, overwrite: bool,
+        hook: impl FnOnce() -> io::Result<()>, sync: impl FnOnce(&Root) -> io::Result<()>) -> Result<SaveOutcome, FileIoError> {
+        let root = worktree_root(worktree)?;
+        let context = save_publication::fixture_context(&root);
+        save_file_at_with_hooks_in_context(&root, path, text, hash, overwrite, hook, sync, &context)
+    }
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::tempdir;
@@ -1805,7 +1797,7 @@ mod tests {
             unreachable!("asserted editable above");
         };
         assert!(matches!(
-            save_file(
+            save_with_test_context(
                 root.path(),
                 &loaded.source,
                 "# Edited\n",
@@ -1823,7 +1815,7 @@ mod tests {
             fs::read_link(root.path().join("AGENTS.md")).unwrap(),
             Path::new("CLAUDE.md")
         );
-        assert!(save_file(root.path(), Path::new("AGENTS.md"), "x", content_hash, true).is_err());
+        assert!(save_with_test_context(root.path(), Path::new("AGENTS.md"), "x", content_hash, true).is_err());
         assert_eq!(
             fs::read_link(root.path().join("AGENTS.md")).unwrap(),
             Path::new("CLAUDE.md")
@@ -1920,7 +1912,7 @@ mod tests {
             b"after",
             source.permissions(),
             &SaveBaseline::capture(&foreign, None).unwrap(),
-            &RecoveryContext::with_guard((), 0).unwrap(),
+            &save_publication::fixture_context(&parent),
             || Ok(()),
             fs_safety::sync_directory,
         );
@@ -1964,7 +1956,7 @@ mod tests {
         };
         fs::set_permissions(&path, Permissions::from_mode(0o660)).unwrap();
         let before = file.metadata().unwrap();
-        let outcome = save_file(
+        let outcome = save_with_test_context(
             root.path(),
             Path::new("shared.txt"),
             "after\n",
@@ -2007,7 +1999,7 @@ mod tests {
 
         fs::write(&path, "external\n").unwrap();
         assert!(matches!(
-            save_file(
+            save_with_test_context(
                 root.path(),
                 Path::new("notes.md"),
                 "mine\n",
@@ -2020,7 +2012,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
 
         let outcome =
-            save_file(root.path(), Path::new("notes.md"), "mine\n", expected, true).unwrap();
+            save_with_test_context(root.path(), Path::new("notes.md"), "mine\n", expected, true).unwrap();
         assert!(matches!(
             outcome,
             SaveOutcome::Saved {
@@ -2042,7 +2034,7 @@ mod tests {
         fs::write(&path, "before\n").unwrap();
         let expected = blake3::hash(b"before\n");
 
-        let result = save_file_with_hooks(
+        let result = save_hooks_with_test_context(
             root.path(),
             Path::new("notes.txt"),
             "after\n",
@@ -2071,7 +2063,7 @@ mod tests {
         fs::write(&path, "before\n").unwrap();
         let expected = blake3::hash(b"before\n");
 
-        let result = save_file_with_hooks(
+        let result = save_hooks_with_test_context(
             root.path(),
             Path::new("notes.txt"),
             "after\n",
@@ -2119,7 +2111,7 @@ mod tests {
         } == 0;
         drop(file);
 
-        let outcome = save_file(
+        let outcome = save_with_test_context(
             root.path(),
             Path::new("notes.txt"),
             "after\n",
@@ -2157,7 +2149,7 @@ mod tests {
         huge.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
         drop(huge);
         assert!(matches!(
-            save_file(
+            save_with_test_context(
                 root.path(),
                 Path::new("notes.txt"),
                 "mine\n",

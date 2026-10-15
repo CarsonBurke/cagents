@@ -130,10 +130,12 @@ enum FailedHoldingDirectory {
 struct FailedHolding {
     directory: FailedHoldingDirectory,
     parent: Root,
+    context: FilesystemRecoveryContext,
     _source: File,
 }
 impl FailedHolding {
     fn retry(&mut self) -> Result<(), String> {
+        self.context.placement().validate().map_err(|error|error.to_string())?;
         match &mut self.directory {
             FailedHoldingDirectory::Preparation(preparation) => preparation
                 .retry_cleanup()
@@ -157,6 +159,7 @@ impl FailedHolding {
                 }
             }
         }
+        fs_safety::sync_directory(self.context.placement().directory()).map_err(|error|error.to_string())?;
         fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
     }
 }
@@ -167,6 +170,7 @@ struct Holding {
     root: Root,
     parent: Root,
     publication: fs_safety::DirectoryPublication,
+    context: FilesystemRecoveryContext,
     slot: Option<RecoverySlot>,
     // Keep authenticated file identities alive with an unresolved holding.
     // This producer retains at most four file FDs plus the receipt's bounded
@@ -174,12 +178,12 @@ struct Holding {
     files: Vec<File>,
 }
 impl Holding {
-    fn create(parent: &Root, source: &File, context: &RecoveryContext) -> Result<Self, FileIoError> {
-        Self::create_using(parent, source, context, |parent, name| fs_safety::create_directory_beneath(parent, name, 0o700))
+    fn create(parent: &Root, source: &File, context: &FilesystemRecoveryContext) -> Result<Self, FileIoError> {
+        Self::create_using(parent, source, context, |outside, name| fs_safety::create_directory_in_namespace(context.placement().namespace(), outside, name, 0o700))
     }
 
     fn create_using(
-        parent: &Root, source: &File, context: &RecoveryContext,
+        parent: &Root, source: &File, context: &FilesystemRecoveryContext,
         create: impl FnOnce(&Root, &Path) -> Result<fs_safety::DirectoryCreation, fs_safety::DirectoryCreateError>,
     ) -> Result<Self, FileIoError> {
         let slot = context.reserve().map_err(FileIoError::Io)?;
@@ -188,7 +192,7 @@ impl Holding {
         // later verification error keeps this inode pinned in the result.
         let retained_source = source.try_clone().map_err(io_error)?;
         let name = OsString::from(format!(".cagents-save-{}", uuid::Uuid::new_v4()));
-        let creation = match create(parent, Path::new(&name)) {
+        let creation = match create(context.placement().directory(), Path::new(&name)) {
             Ok(creation) => creation,
             Err(mut error) => {
                 let message = error.to_string();
@@ -200,6 +204,7 @@ impl Holding {
                     let mut state = FailedHolding {
                         directory: FailedHoldingDirectory::Preparation(preparation),
                         parent: retained_parent,
+                        context: context.clone(),
                         _source: retained_source,
                     };
                     let authority = slot.retain(description, move || state.retry());
@@ -226,6 +231,7 @@ impl Holding {
                 let mut state = FailedHolding {
                     directory: FailedHoldingDirectory::Unverified(directory),
                     parent: retained_parent,
+                    context: context.clone(),
                     _source: retained_source,
                 };
                 let authority = slot.retain(description, move || state.retry());
@@ -247,6 +253,7 @@ impl Holding {
                     "The save holding directory is not private; it was preserved.".into(),
                 ));
             }
+            fs_safety::sync_directory(context.placement().directory()).map_err(io_error)?;
             publication.directory().try_clone().map_err(io_error)
         })();
         let root = match checked {
@@ -259,6 +266,7 @@ impl Holding {
                 let mut state = FailedHolding {
                     directory: FailedHoldingDirectory::Publication(publication),
                     parent: retained_parent,
+                    context: context.clone(),
                     _source: retained_source,
                 };
                 let authority = slot.retain(description, move || state.retry());
@@ -272,6 +280,7 @@ impl Holding {
             root,
             parent: retained_parent,
             publication,
+            context: context.clone(),
             slot: Some(slot),
             files: vec![retained_source],
         })
@@ -291,7 +300,9 @@ impl Holding {
         }
     }
     fn remove_empty(&mut self, _parent: &Root) -> Result<(), FileIoError> {
-        self.publication.cleanup_empty().map_err(resolve_error)
+        self.context.placement().validate().map_err(io_error)?;
+        self.publication.cleanup_empty().map_err(resolve_error)?;
+        fs_safety::sync_directory(self.context.placement().directory()).map_err(io_error)
     }
     fn retain(mut self) -> RecoveryAuthority {
         let description = self.location();
@@ -304,6 +315,7 @@ impl Holding {
         slot.retain(description, move || self.retry_cleanup())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
+        self.context.placement().validate().map_err(|error|error.to_string())?;
         self.publication
             .resolve_recovery()
             .map_err(|e| e.to_string())?;
@@ -313,6 +325,7 @@ impl Holding {
         self.publication
             .cleanup_empty()
             .map_err(|e| e.to_string())?;
+        fs_safety::sync_directory(self.context.placement().directory()).map_err(|e|e.to_string())?;
         fs_safety::sync_directory(&self.parent).map_err(|e| e.to_string())
     }
     fn location(&self) -> String {
@@ -333,7 +346,7 @@ pub(super) fn publish_replacement(
     bytes: &[u8],
     permissions: Permissions,
     baseline: &SaveBaseline,
-    context: &RecoveryContext,
+    context: &FilesystemRecoveryContext,
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
@@ -359,7 +372,7 @@ fn publish_with_hooks(
     bytes: &[u8],
     permissions: Permissions,
     baseline: &SaveBaseline,
-    context: &RecoveryContext,
+    context: &FilesystemRecoveryContext,
     before_publish: impl FnOnce() -> io::Result<()>,
     after_acquire: impl FnOnce(&Root, &Root) -> io::Result<()>,
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
@@ -427,6 +440,7 @@ fn publish_in_holding(
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
+    holding.context.placement().validate().map_err(io_error)?;
     let (temporary, temporary_name) = match fs_safety::create_temporary_in(&holding.root, 0o600) {
         Ok(value) => value,
         Err(error) => {
@@ -482,8 +496,11 @@ fn publish_in_holding(
         }
     };
     let previous = OsStr::new("previous");
-    if let Err(error) =
-        fs_safety::rename_new_between(parent, name.as_os_str(), &holding.root, previous)
+    if let Err(error) = holding.context.placement().validate() {
+        return Err(clean_before_acquire(parent, holding, &temporary_name,
+            readable_temporary.as_ref().unwrap_or(&temporary), temporary_baseline.as_ref(), io_error(error)));
+    }
+    if let Err(error) = fs_safety::rename_new_between(parent, name.as_os_str(), &holding.root, previous)
     {
         return Err(clean_before_acquire(
             parent,
@@ -513,6 +530,7 @@ fn publish_in_holding(
             readable_temporary.as_ref().unwrap_or(&temporary),
             temporary_baseline.as_ref(),
         )?;
+        holding.context.placement().validate().map_err(io_error)?;
         fs_safety::rename_new_between(&holding.root, &temporary_name, parent, name.as_os_str())
             .map_err(resolve_error)?;
         Ok((acquired, acquired_version))
@@ -534,6 +552,7 @@ fn publish_in_holding(
                         "The acquired entry was replaced; unknown recovery entry retained.".into(),
                     ));
                 }
+                holding.context.placement().validate().map_err(io_error)?;
                 fs_safety::rename_new_between(&holding.root, previous, parent, name.as_os_str())
                     .map_err(resolve_error)
             })();
@@ -577,6 +596,7 @@ fn publish_in_holding(
             ));
         }
         baseline.verify(&acquired, true)?;
+        holding.context.placement().validate().map_err(io_error)?;
         fs_safety::unlink_within(&holding.root, previous).map_err(resolve_error)?;
         holding.remove_empty(parent)
     })();
@@ -632,6 +652,7 @@ fn remove_temporary(
     file: &File,
     baseline: Option<&SaveBaseline>,
 ) -> Result<(), FileIoError> {
+    holding.context.placement().validate().map_err(io_error)?;
     verify_temporary(holding, name, file, baseline)?;
     fs_safety::unlink_within(&holding.root, name).map_err(resolve_error)
 }
@@ -649,6 +670,31 @@ fn clean_before_acquire(
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static FIXTURE_PLACEMENTS: std::cell::RefCell<BTreeMap<PathBuf, PathBuf>> = std::cell::RefCell::new(BTreeMap::new());
+}
+#[cfg(test)]
+pub(super) fn fixture_context(root: &Root) -> FilesystemRecoveryContext {
+    fixture_context_with_guard(root, ())
+}
+#[cfg(test)]
+fn fixture_context_with_guard(root: &Root, guard: impl Send + Sync + 'static) -> FilesystemRecoveryContext {
+    use std::sync::Arc;
+    let outside = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let source = Arc::new(root.try_clone().unwrap());
+    let outside_root = Arc::new(Root::open(outside.path()).unwrap());
+    FIXTURE_PLACEMENTS.with(|placements| placements.borrow_mut().insert(root.path().to_owned(), outside.path().to_owned()));
+    let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), root.path(), false).unwrap()));
+    // Test-only: the entire isolated topology is known; these TempDirs and
+    // a non-FD test guard stay alive with its registry callback. Production
+    // intake must supply actual adoption/registration authority instead.
+    let registry = fs_safety::RecoveryRegistryCheck::new(Arc::new(move || { let _ = (&outside, &runtime, &guard); Ok(()) }), 0);
+    let placement = fs_safety::RecoveryPlacement::acquire(outside_root, source.clone(), Arc::from([source]), registry).unwrap();
+    FilesystemRecoveryContext::new(root, protection, placement).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -658,7 +704,7 @@ mod tests {
         hook: impl FnOnce() -> io::Result<()>,
         overwrite: bool,
     ) -> Result<SaveOutcome, FileIoError> {
-        save_file_at_with_hooks(
+        save_file_at_with_hooks_in_context(
             root,
             Path::new("file"),
             "mine",
@@ -666,6 +712,7 @@ mod tests {
             overwrite,
             hook,
             fs_safety::sync_directory,
+            &fixture_context(root),
         )
     }
     fn prepared_save(
@@ -682,7 +729,7 @@ mod tests {
             b"mine",
             source.metadata().unwrap().permissions(),
             &baseline,
-            &RecoveryContext::with_guard((), 0).unwrap(),
+            &fixture_context(&root),
             || Ok(()),
             after_acquire,
             after_publish,
@@ -696,7 +743,8 @@ mod tests {
         (dir, root)
     }
     fn holding(dir: &Path) -> PathBuf {
-        fs::read_dir(dir)
+        let outside = FIXTURE_PLACEMENTS.with(|placements| placements.borrow().get(dir).cloned()).expect("fixture captured an outside placement");
+        fs::read_dir(outside)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|path| path.is_dir())
@@ -740,7 +788,7 @@ mod tests {
             b"mine",
             source.metadata().unwrap().permissions(),
             &baseline,
-            &RecoveryContext::with_guard((), 0).unwrap(),
+            &fixture_context(&root),
             || Ok(()),
             |_, private| {
                 let path = private.path().join("previous");
@@ -964,8 +1012,8 @@ mod tests {
             fn drop(&mut self) { self.0.store(true, Ordering::Release); }
         }
         let dropped = Arc::new(AtomicBool::new(false));
-        let context = RecoveryContext::with_guard(Guard(dropped.clone()), 0).unwrap();
         let (_directory, root) = fixture();
+        let context = fixture_context_with_guard(&root, Guard(dropped.clone()));
         let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
         let holding = Holding::create(&root, &source, &context).unwrap();
         let private_path = holding.root.path().to_owned();
@@ -993,7 +1041,9 @@ mod tests {
         let root = Root::open(&named).unwrap();
         let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
         assert!(protection.retained_descriptor_count() >= 3);
-        let context = recovery_context_at(&root, Arc::new(Some(protection))).unwrap();
+        let fixture = fixture_context(&root);
+        let context = FilesystemRecoveryContext::new(&root, Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+        drop(fixture);
         let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
         let holding = Holding::create(&root, &source, &context).unwrap();
         let private = holding.root.try_clone().unwrap();
@@ -1021,7 +1071,9 @@ mod tests {
         let (directory, root) = fixture();
         let runtime = tempfile::tempdir().unwrap();
         let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false).unwrap();
-        let context = recovery_context_at(&root, Arc::new(Some(protection))).unwrap();
+        let fixture = fixture_context(&root);
+        let context = FilesystemRecoveryContext::new(&root, Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+        drop(fixture);
         let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
         let mut staging = None;
         let result = Holding::create_using(&root, &source, &context, |parent, _| {
@@ -1055,7 +1107,7 @@ mod tests {
         use std::os::fd::AsRawFd;
         let (dir, root) = fixture();
         let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
-        let holding = Holding::create(&root, &source, &RecoveryContext::with_guard((), 0).unwrap()).unwrap();
+        let holding = Holding::create(&root, &source, &fixture_context(&root)).unwrap();
         let descriptor = holding.files[0].as_raw_fd();
         let expected = source.metadata().unwrap();
         let expected = (expected.dev(), expected.ino());
@@ -1170,6 +1222,51 @@ mod tests {
             b"late"
         );
         assert!(!authority.is_resolved());
+    }
+
+    #[test]
+    fn save_acquisition_private_payload_cannot_be_included_by_git_add_all() {
+        use crate::process::{CommandSpec, ProcessExecutor, SystemProcessExecutor, CancellationToken};
+        let (directory, root) = fixture();
+        let git = |arguments: &[&str]| {
+            let mut command = CommandSpec::new("git");
+            for (name, _) in std::env::vars_os() {
+                if name.as_encoded_bytes().starts_with(b"GIT_") { command = command.env_remove(name); }
+            }
+            command = command.arg("-C").arg(directory.path())
+                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
+                .args(arguments.iter().copied())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0");
+            let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+            assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
+            output.stdout
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "--", "file"]);
+        let error = prepared_save(&root, |parent, _| fs::write(parent.path().join("file"), b"competitor"), |_, _| Ok(())).unwrap_err();
+        assert!(error.recovery_authority().is_some());
+        let private = holding(directory.path());
+        assert!(!private.starts_with(directory.path()));
+        assert_eq!(fs::read(private.join("previous")).unwrap(), b"base");
+        git(&["add", "-A"]);
+        assert_eq!(git(&["ls-files", "-z"]), b"file\0");
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"competitor");
+        assert_eq!(fs::read(private.join("previous")).unwrap(), b"base");
+    }
+
+    #[test]
+    fn save_acquisition_requires_real_context_and_refuses_a_foreign_source_before_effects() {
+        let (directory, root) = fixture();
+        let error = save_file_at_with_hooks(&root, Path::new("file"), "mine", blake3::hash(b"base"), false,
+            || panic!("a path-only caller has no registration proof"), |_| panic!("no publication occurred")).unwrap_err();
+        assert!(error.to_string().contains("registered filesystem recovery context"));
+        let (other_directory, other_root) = fixture();
+        let context = fixture_context(&root);
+        assert!(save_file_at_in_context(&other_root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context).is_err());
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
+        assert_eq!(fs::read(other_directory.path().join("file")).unwrap(), b"base");
+        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
     }
 
     #[test]
