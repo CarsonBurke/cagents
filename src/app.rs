@@ -13707,6 +13707,9 @@ impl Application for Cagents {
                             .iter_mut()
                             .find(|project| project.id == loaded.project.id)
                         {
+                            // A fresh filesystem listing cannot discard the
+                            // user's retained operation or its explicit retry.
+                            sidebar_project.pending_operation=existing.pending_operation.clone();
                             *existing = sidebar_project;
                         } else {
                             self.sidebar_model.projects.push(sidebar_project);

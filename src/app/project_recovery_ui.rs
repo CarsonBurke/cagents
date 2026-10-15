@@ -1114,6 +1114,14 @@ mod tests {
         assert!(!app.project_recovery_ui.operations[&id].in_flight);
         let notice=app.sidebar_model.project(id).unwrap().pending_operation.as_ref().unwrap();
         assert_eq!(notice.operation,request.operation);assert!(!notice.running);assert!(notice.reason.contains("final commit"));
+        let expected_notice=notice.clone();
+        // Deliver an actual folder worker result through the real App reducer.
+        // Ordinary project refresh must not make the sole retry control vanish.
+        let loaded=super::super::load_project(fixture.path(),Some(id),CancellationToken::default(),Some(ProjectKind::Folder)).unwrap();
+        app.repository_generations.insert(id,1);
+        drop(app.update(Message::RepositoryLoaded{open_cards:false,project_id:id,generation:1,result:Ok(Box::new(loaded))}));
+        assert_eq!(app.sidebar_model.project(id).unwrap().pending_operation.as_ref(),Some(&expected_notice));
+        assert_eq!(app.project_recovery_ui.operations[&id].request,request);
         // Even a newly observed ordinal must not become retry consent.
         app.workspace_model.projects[0].ordinal=99;
         drop(app.update_project_recovery(Action::Command(id,ProjectRecoveryAction::RetryOperation(request.operation))));
