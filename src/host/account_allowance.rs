@@ -49,7 +49,7 @@ mod tests {
     use std::sync::{Arc,Mutex};
     #[test]
     fn missing_target_unauthorized_reset_and_shutdown_never_create_a_replacement_source() {
-        let host=Arc::new(Mutex::new(super::super::state::HostState::new(HostSessionProof {
+        let host=Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(HostSessionProof {
             host_session_id:HostSessionId::new("private-allowance-test"),
             boot_id:BootId::new("private-boot"),host_incarnation:HostIncarnation::new("private-incarnation")})));
         let session=TerminalId::new();
@@ -161,7 +161,7 @@ mod tests {
             // from a process timeout; outer strict family settlement remains required.
             let root = tempfile::tempdir().unwrap().keep();
             crate::secure_file::prepare_private_directory(&root).unwrap();
-            Self { root, host: Arc::new(Mutex::new(super::super::state::HostState::new(HostSessionProof {
+            Self { root, host: Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(HostSessionProof {
                 host_session_id: HostSessionId::new("private-allowance-owner"),
                 boot_id: BootId::new("private-boot"), host_incarnation: HostIncarnation::new("private-incarnation"),
             }))), handles: vec![] }
