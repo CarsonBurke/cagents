@@ -4,7 +4,7 @@ use cagents::{
     persistence::StateStore,
     pull_request_review::CheckoutTarget,
     repository::{
-        CreateWorktreeRequest, WorktreeInput, WorktreeOperationReport, WorktreeOperationState,
+        CreateWorktreeRequest, WorktreeInput, WorktreeOperationReport, WorktreeOperationState, RetainedWorktreeCreation, SettledCreatedWorktree,
     },
 };
 
@@ -26,7 +26,8 @@ pub(crate) enum Action {
     Resolve,
     Resolved(OperationId, Result<CreateWorktreeRequest, String>),
     Create,
-    Finished(OperationId, Result<WorktreeOperationReport, String>),
+    Finished(OperationId, Result<RetainedWorktreeCreation, String>),
+    CreatedOpened(u64, Result<(Opened, SettledCreatedWorktree), String>),
     Cancel,
     Edit,
     Open(PathBuf),
@@ -34,7 +35,7 @@ pub(crate) enum Action {
 
 #[derive(Clone)]
 enum Base {
-    PullRequest(CheckoutTarget),
+    PullRequest { target: CheckoutTarget, authority: Option<WorktreeAuthority> },
     Commit {
         authority: WorktreeAuthority,
         head: cagents::repository::Oid,
@@ -46,30 +47,32 @@ impl Base {
             Self::Commit { authority, .. } => {
                 authority.validate().map_err(|error| error.to_string())
             }
-            Self::PullRequest(_) => Ok(()),
+            Self::PullRequest { authority, .. } => authority.as_ref()
+                .ok_or_else(|| "The original displayed worktree is unavailable. Reopen it before creating a worktree.".to_owned())?
+                .validate().map_err(|error| error.to_string()),
         }
     }
     fn authority(&self) -> Option<WorktreeAuthority> {
         match self {
             Self::Commit { authority, .. } => Some(authority.clone()),
-            Self::PullRequest(_) => None,
+            Self::PullRequest { authority, .. } => authority.clone(),
         }
     }
     fn repository(&self) -> &Path {
         match self {
-            Self::PullRequest(target) => &target.repository,
+            Self::PullRequest { target, .. } => &target.repository,
             Self::Commit { authority, .. } => authority.path(),
         }
     }
     fn head(&self) -> &cagents::repository::Oid {
         match self {
-            Self::PullRequest(target) => &target.head,
+            Self::PullRequest { target, .. } => &target.head,
             Self::Commit { head, .. } => head,
         }
     }
     fn branch(&self) -> String {
         match self {
-            Self::PullRequest(target) => target.suggested_branch(),
+            Self::PullRequest { target, .. } => target.suggested_branch(),
             Self::Commit { head, .. } => format!("review/{}", &head.as_str()[..8]),
         }
     }
@@ -114,7 +117,9 @@ impl Editor {
     }
 
     pub(super) fn begin_checkout(&mut self, target: CheckoutTarget) {
-        self.begin_checkout_base(Base::PullRequest(target));
+        let authority = self.tabs.iter().find(|tab| tab.runtime.descriptor.worktree == target.repository)
+            .and_then(|tab| tab.worktree_authority.clone());
+        self.begin_checkout_base(Base::PullRequest { target, authority });
     }
 
     pub(super) fn begin_commit_checkout(
@@ -175,34 +180,22 @@ impl Editor {
             }
             Action::OpenRecorded(id) => {
                 if self.checkout_history_open {
-                    if let Some(path) = self
-                        .checkout_history
-                        .iter()
-                        .find(|r| {
-                            r.operation_id == id && r.state == WorktreeOperationState::Created
-                        })
-                        .and_then(|r| r.request.as_ref())
-                        .map(|r| r.destination.clone())
-                    {
+                    let created = self.checkout_owners.get(&id).and_then(Option::as_ref).and_then(|retained| retained.created.clone());
+                    if let Some(created) = created {
                         self.checkout_history_open = false;
-                        self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                        return Self::open(
-                            path,
-                            self.selection_epoch,
-                            self.settings.git_status_limit,
-                        );
+                        return self.open_created_checkout(created);
                     }
+                    self.notice = Some("This history entry is a recorded description. Open the folder explicitly to inspect it; it cannot restore the original creation authority.".into());
                 }
             }
             Action::Open(path) => {
-                if self
-                    .checkout_dialog
-                    .as_ref()
-                    .is_some_and(|d| d.completed.as_ref() == Some(&path))
-                {
+                let created = self.checkout_dialog.as_ref()
+                    .filter(|d| d.completed.as_ref() == Some(&path))
+                    .and_then(|d| self.checkout_owners.get(&d.id))
+                    .and_then(Option::as_ref).and_then(|retained| retained.created.clone());
+                if let Some(created) = created {
                     self.checkout_dialog = None;
-                    self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                    return Self::open(path, self.selection_epoch, self.settings.git_status_limit);
+                    return self.open_created_checkout(created);
                 }
             }
             Action::Branch(value) => {
@@ -291,6 +284,10 @@ impl Editor {
                 }
             }
             Action::Create => {
+                if self.checkout_owners.len() >= 32 {
+                    self.notice = Some("Worktree creation ownership capacity is full. Resolve retained creations before starting another.".into());
+                    return Task::none();
+                }
                 let Some(journal) = self.checkout_journal.clone() else {
                     return Task::none();
                 };
@@ -310,26 +307,17 @@ impl Editor {
                 dialog.error = None;
                 let id = dialog.id;
                 let authority = dialog.target.clone();
+                self.checkout_owners.insert(id, None);
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        authority.validate()?;
-                        if let Some(authority) = authority.authority() {
-                            let service = RepositoryService::system("git")
-                                .with_worktree_authority(authority)
-                                .map_err(|error| error.to_string())?;
-                            Ok(cagents::pull_request_review::checkout::create_with_service(
-                                &service,
-                                &journal.0,
-                                &request,
-                                &cancellation,
-                            ))
-                        } else {
-                            Ok(cagents::pull_request_review::checkout::create(
-                                &journal.0,
-                                &request,
-                                &cancellation,
-                            ))
-                        }
+                        let prepared = authority.validate().and_then(|()| {
+                            let original = authority.authority().ok_or_else(|| "The original displayed creation source was not retained; no worktree was created.".to_owned())?;
+                            RepositoryService::system("git").with_worktree_authority(original).map_err(|error| error.to_string())
+                        });
+                        Ok::<_, String>(match prepared {
+                            Ok(service) => cagents::pull_request_review::checkout::create_retained_with_service(&service, &journal.0, &request, &cancellation),
+                            Err(error) => RetainedWorktreeCreation::not_started(&request, 1, error),
+                        })
                     })
                     .await
                     .map_err(|e| e.to_string())
@@ -338,29 +326,51 @@ impl Editor {
                 });
             }
             Action::Finished(id, result) => {
-                if let Ok(report) = &result {
-                    self.checkout_history
-                        .retain(|r| r.operation_id != report.operation_id);
+                // Retain BEFORE stale dialog checks and before projecting the
+                // report into the capped, serializable history list.
+                if let Ok(retained) = &result {
+                    if retained.retention().is_some() {
+                        self.checkout_owners.insert(id, Some(retained.clone()));
+                    } else {
+                        self.checkout_owners.remove(&id);
+                    }
+                    let report = &retained.report;
+                    self.checkout_history.retain(|r| r.operation_id != report.operation_id);
                     self.checkout_history.push(report.clone());
                     self.trim_checkout_history();
                 }
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
                     dialog.cancellation = None;
                     match result {
-                        Ok(report) if report.state == WorktreeOperationState::Created => {
-                            dialog.completed = report.request.map(|r| r.destination);
+                        Ok(retained) if retained.report.state == WorktreeOperationState::Created => {
+                            if let Some(created) = &retained.created {
+                                dialog.completed = Some(created.record().path.clone());
+                            } else {
+                                dialog.error = Some(retained.authority_error.unwrap_or_else(|| "Creation completed, but its original opening authority is unavailable. Its live ownership has been retained.".into()));
+                            }
                         }
-                        Ok(report) => dialog.error = Some(report.detail),
+                        Ok(retained) => dialog.error = Some(retained.report.detail),
                         Err(error) => {
-                            dialog.error = Some(format!(
-                                "Checkout outcome needs reconciliation: {error}. Reopen Ceditor to inspect the durable journal."
-                            ))
+                            // Keep the admitted negative obligation. A join or
+                            // transport error cannot prove no effects occurred.
+                            dialog.error = Some(format!("Checkout outcome needs reconciliation: {error}. Original ownership was not discarded."));
                         }
                     }
-                    // A new click must never silently replay an accepted job.
                     dialog.request = None;
                 }
             }
+            Action::CreatedOpened(epoch, result) => match result {
+                Ok((opened, created)) if !self.exiting => {
+                    // Directory opens always create a new tab. The worker
+                    // proved the ORIGINAL destination; no path recapture here.
+                    let index = self.tabs.len();
+                    let task = self.add(opened, epoch == self.selection_epoch);
+                    if let Some(tab) = self.tabs.get_mut(index) { tab.created_worktree = Some(created); }
+                    return task;
+                }
+                Ok(_) => {},
+                Err(error) => self.notice = Some(error),
+            },
             Action::Edit => {
                 if let Some(dialog) = self
                     .checkout_dialog
@@ -385,6 +395,22 @@ impl Editor {
             }
         }
         Task::none()
+    }
+
+    fn open_created_checkout(&mut self, created: SettledCreatedWorktree) -> Task<Message> {
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        let epoch = self.selection_epoch;
+        let limit = self.settings.git_status_limit;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                created.validate().map_err(|error| error.to_string())?;
+                let authority = created.destination().clone();
+                let snapshot = read_display_snapshot(authority.path(), limit, Some(authority.clone()))?;
+                created.validate().map_err(|error| error.to_string())?;
+                Ok((Opened { root: authority.path().to_owned(), file: None, snapshot: Some(snapshot), authority: Some(authority) }, created))
+            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            Message::Checkout(Action::CreatedOpened(epoch, result))
+        })
     }
 
     fn trim_checkout_history(&mut self) {
@@ -418,7 +444,7 @@ impl Editor {
                     );
                 }
                 rows.push(design::caption(&report.detail).into());
-                if report.state == WorktreeOperationState::Created && report.request.is_some() {
+                if self.checkout_owners.get(&report.operation_id).and_then(Option::as_ref).is_some_and(|retained| retained.created.is_some()) {
                     rows.push(
                         widget::button::standard("Open worktree")
                             .on_press(Message::Checkout(Action::OpenRecorded(report.operation_id)))
@@ -446,12 +472,12 @@ impl Editor {
         let action = |a| Message::Checkout(a);
         let mut body = vec![
             widget::text::title3(match &dialog.target {
-                Base::PullRequest(_) => "Create PR worktree",
+                Base::PullRequest { .. } => "Create PR worktree",
                 Base::Commit { .. } => "Create worktree from commit",
             })
             .into(),
             design::caption(match &dialog.target {
-                Base::PullRequest(target) => {
+                Base::PullRequest { target, .. } => {
                     format!("PR #{} · {}", target.number, target.head.as_str())
                 }
                 Base::Commit { head, .. } => format!("Base commit {}", head.as_str()),
@@ -541,6 +567,63 @@ impl Editor {
 mod tests {
     use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
     use super::*;
+
+    #[test]
+    fn actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open() {
+        use cosmic::iced::futures::StreamExt;
+        use cagents::process::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        const MARKER: &str = "CAGENTS_CEDITOR_RETAINED_CREATION_FIXTURE";
+        const FULL: &str = concat!(module_path!(), "::actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open");
+        let name = FULL.strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::")).unwrap_or(FULL);
+        if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new(name)) {
+            let mut command = CommandSpec::new(std::env::current_exe().unwrap()).args(["--exact", name, "--nocapture"]);
+            for (key, _) in std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_")) { command = command.env_remove(key); }
+            command = command.env(MARKER, name).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null");
+            command.timeout = Some(Duration::from_secs(60));
+            let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+            assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed; 0 failed"), "exact child must actually run once: {}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let repository = git_fixture(); let data = tempfile::tempdir().unwrap();
+        let destination = data.path().join("created");
+        let mut app = editor(); app.settings_path = data.path().join("settings.toml");
+        let task = app.load_checkout_journal(); run_tasks(&mut app, task);
+        let card = open_real_git(&mut app, repository.path(), None);
+        let authority = app.tab(card).unwrap().worktree_authority.clone().unwrap();
+        let head = cagents::repository::Oid::parse(&git(repository.path(), &["rev-parse", "HEAD"])).unwrap();
+        app.begin_commit_checkout(authority, head);
+        drop(app.update(Message::Checkout(Action::Branch("retained-child".into()))));
+        drop(app.update(Message::Checkout(Action::Destination(destination.to_string_lossy().into_owned()))));
+        let task = app.update(Message::Checkout(Action::Resolve)); run_tasks(&mut app, task);
+        let id = app.checkout_dialog.as_ref().unwrap().id;
+        let task = app.update(Message::Checkout(Action::Create));
+        assert!(app.checkout_owners.contains_key(&id), "reserve ownership before polling any effectful worker");
+        let receipt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+            let mut stream = iced::runtime::task::into_stream(task).expect("real creation worker");
+            loop {
+                let action = stream.next().await.expect("creation must deliver its ownership");
+                if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::Checkout(Action::Finished(..)))) = action { break message; }
+            }
+        });
+        app.checkout_dialog = None; app.tabs.clear(); app.active = None;
+        drop(app.update(receipt));
+        let retained = app.checkout_owners.get(&id).and_then(Option::as_ref).expect("late outcome retains original session before checking dialog");
+        assert!(retained.retention().is_some()); assert!(retained.created.is_some(), "{:?}", retained.authority_error);
+        app.checkout_history.clear();
+        drop(app.update(Message::CloseWindow));
+        assert!(!app.exiting, "unresolved transfer/lifecycle proof cannot disappear on exit");
+        let created = app.checkout_owners[&id].as_ref().unwrap().created.clone().unwrap();
+        let task = app.open_created_checkout(created.clone()); run_tasks(&mut app, task);
+        assert!(app.tabs.iter().any(|tab| tab.created_worktree.as_ref().is_some_and(|cap| cap.operation() == id)));
+        app.tabs.clear(); app.active = None;
+        std::fs::rename(&destination, data.path().join("parked")).unwrap();
+        std::fs::create_dir(&destination).unwrap(); std::fs::write(destination.join("foreign"), "untouched").unwrap();
+        let task = app.open_created_checkout(created); run_tasks(&mut app, task);
+        assert!(app.tabs.is_empty(), "the original created scope cannot recapture its replacement path");
+        assert_eq!(std::fs::read_to_string(destination.join("foreign")).unwrap(), "untouched");
+        assert!(app.checkout_owners[&id].as_ref().unwrap().retention().is_some());
+    }
 
     #[test]
     fn standalone_history_creates_real_worktree_from_captured_commit_dialog() {

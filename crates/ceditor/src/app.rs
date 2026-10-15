@@ -232,6 +232,7 @@ struct Tab {
     snapshot_refresh_pending: bool,
     change_source_revision: u64,
     worktree_authority: Option<WorktreeAuthority>,
+    created_worktree: Option<cagents::repository::SettledCreatedWorktree>,
     discard_authority: Option<WorktreeAuthority>,
     discard_queue_turn: Option<u64>,
     marker_authority: Option<WorktreeAuthority>,
@@ -688,6 +689,10 @@ pub struct Editor {
     checkout_dialog: Option<checkout::Dialog>,
     checkout_journal: Option<checkout::Journal>,
     checkout_history: Vec<cagents::repository::WorktreeOperationReport>,
+    // None reserves an admitted/uncertain worker; Some keeps its ORIGINAL live
+    // creation session across dialog close, stale receipt and history eviction.
+    // Final release needs the producer's pending-artifact/clean-transfer proof.
+    checkout_owners: BTreeMap<cagents::model::OperationId, Option<cagents::repository::RetainedWorktreeCreation>>,
     checkout_history_open: bool,
     checkout_error: Option<String>,
     closing: Option<CardId>,
@@ -1796,6 +1801,7 @@ impl Editor {
             snapshot_refresh_pending: false,
             change_source_revision: 1,
             worktree_authority: opened.authority,
+            created_worktree: None,
             discard_authority: None,
             discard_queue_turn: None,
             marker_authority: None,
@@ -3522,6 +3528,7 @@ impl Application for Editor {
             checkout_dialog: None,
             checkout_journal: None,
             checkout_history: Vec::new(),
+            checkout_owners: BTreeMap::new(),
             checkout_history_open: false,
             checkout_error: None,
             closing: None,
@@ -3876,6 +3883,10 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    if !self.checkout_owners.is_empty() {
+                        self.notice = Some("The original worktree creation is still retained. Resolve its creation ownership before closing.".into());
+                        return Task::none();
+                    }
                     if self
                         .checkout_dialog
                         .as_ref()
@@ -6548,6 +6559,7 @@ mod tests {
         let task = app.load_checkout_journal();
         run_tasks(&mut app, task);
         assert!(app.checkout_journal.is_some(), "{:?}", app.notice);
+        let _source = open_real_git(&mut app, root, None);
         app.begin_checkout(CheckoutTarget {
             repository: root.to_path_buf(),
             number: 17,
@@ -6594,13 +6606,9 @@ mod tests {
         assert!(reopened.checkout_history_open);
         let task = reopened.update(Message::Checkout(checkout::Action::OpenRecorded(id)));
         run_tasks(&mut reopened, task);
-        assert!(!reopened.checkout_history_open);
-        assert!(
-            reopened
-                .tabs
-                .iter()
-                .any(|tab| tab.runtime.descriptor.worktree == destination)
-        );
+        assert!(reopened.checkout_history_open);
+        assert!(reopened.tabs.is_empty(), "a serialized report cannot mint original created-worktree authority");
+        assert!(reopened.notice.as_deref().is_some_and(|notice| notice.contains("recorded description")));
         assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
     }
 
@@ -7309,6 +7317,7 @@ mod tests {
             checkout_dialog: None,
             checkout_journal: None,
             checkout_history: Vec::new(),
+            checkout_owners: BTreeMap::new(),
             checkout_history_open: false,
             checkout_error: None,
             closing: None,

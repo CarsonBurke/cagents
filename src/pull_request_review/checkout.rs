@@ -35,3 +35,15 @@ pub fn create_with_service<E: crate::process::ProcessExecutor>(
         &progress,
     )
 }
+
+/// A scoped creator must return its ORIGINAL live session on every outcome.
+/// Callers retain this carrier before inspecting its descriptive path report.
+pub fn create_retained_with_service<E: crate::process::ProcessExecutor>(
+    service: &RepositoryService<E>,
+    store: &StateStore,
+    request: &CreateWorktreeRequest,
+    cancellation: &CancellationToken,
+) -> crate::repository::RetainedWorktreeCreation {
+    let (progress, _receiver) = async_channel::bounded(8);
+    service.create_worktree_journaled_retained(store, request, 1, cancellation, &progress)
+}
