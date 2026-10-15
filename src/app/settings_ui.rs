@@ -75,7 +75,7 @@ fn font_family_setting<'a>(
                 .into(),
         );
     }
-    setting_field(field.label(), if monospace { "Choose an installed monospace family or type a family name. Leave blank to follow the default." } else { "Choose an installed family or type a family name. Leave blank to follow the default." }, widget::column::with_children(children).spacing(space::XS).into()).error(invalid.get(&field).map(String::as_str)).keywords(family)
+    setting_field(field.label(), if monospace { "Choose an installed monospace family or type a family name. Leave blank to follow the default." } else { "Choose an installed family or type a family name. Leave blank to follow the default." }, widget::column::with_children(children).spacing(space::XS).into()).error(invalid.get(&field).map(String::as_str)).keywords(field.config_key()).keywords(family)
 }
 
 fn setting_input<'a>(
@@ -197,7 +197,7 @@ fn setting_stepper<'a>(
         crate::ui_controls::icon_button(Icon::Minus, format!("Decrease {label}"))
             .on_press_maybe((current > min).then(|| change(current - step)))
             .into(),
-        crate::ui_controls::field::text(label, shown)
+        crate::ui_controls::field::text(label, shown.clone())
             .on_input(move |value| Message::SettingsNumberDraftChanged { field, value })
             .width(76)
             .into(),
@@ -213,7 +213,11 @@ fn setting_stepper<'a>(
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
-    setting_field(label, detail, control).error(invalid.get(&field).map(String::as_str))
+    setting_field(label, detail, control)
+        .keywords(field.config_key())
+        .keywords(value)
+        .keywords(shown)
+        .error(invalid.get(&field).map(String::as_str))
 }
 
 fn settings_choice<'a>(
@@ -1781,6 +1785,7 @@ mod search_tests {
             can_undo: false,
             invalid: &invalid,
             fonts: &app.settings_font_choices,
+            terminal_font_size: app.settings.terminal_font_size,
             accounts: vec![],
             updates: app.update_summary(),
             testing_notification: false,
@@ -1789,6 +1794,15 @@ mod search_tests {
             (SettingsCategory::General, "focus_follows_mouse"),
             (SettingsCategory::General, "hover"),
             (SettingsCategory::Terminal, "dracula"),
+            (SettingsCategory::Terminal, "terminal_font_family"),
+            (SettingsCategory::Terminal, "terminal_font_size"),
+            (SettingsCategory::Terminal, "terminal_line_height"),
+            (SettingsCategory::Editor, "editor_font_family"),
+            (SettingsCategory::Editor, "editor_font_size"),
+            (SettingsCategory::Appearance, "interface_font_family"),
+            (SettingsCategory::Appearance, "interface_font_size"),
+            (SettingsCategory::NativeChat, "chat_font_family"),
+            (SettingsCategory::NativeChat, "chat_font_size"),
             (SettingsCategory::Keyboard, "ctrl+t"),
             (
                 SettingsCategory::Keyboard,
@@ -1799,6 +1813,42 @@ mod search_tests {
                 .into_iter()
                 .any(|group| group.view(category.label(), query).is_some());
             assert!(result, "{query} should match {}", category.label());
+        }
+    }
+
+    #[test]
+    fn settings_search_finds_current_font_and_number_values_in_real_controls() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings_draft.terminal_font_family = "Fixture Search Monospace".into();
+        app.settings_draft.terminal_line_height = "1.375".into();
+        app.settings_draft
+            .numeric_display
+            .insert(SettingsField::TerminalLineHeight, "1.3750".into());
+        let invalid = HashMap::new();
+        let context = SettingsContext {
+            feedback: None,
+            reload_error: None,
+            can_undo: false,
+            invalid: &invalid,
+            fonts: &app.settings_font_choices,
+            terminal_font_size: app.settings.terminal_font_size,
+            accounts: vec![],
+            updates: app.update_summary(),
+            testing_notification: false,
+        };
+        for query in ["Fixture Search Monospace", "1.375", "1.3750"] {
+            assert!(
+                settings_category_controls(
+                    SettingsCategory::Terminal,
+                    &app.settings_draft,
+                    &context
+                )
+                .into_iter()
+                .any(|group| group
+                    .view(SettingsCategory::Terminal.label(), query)
+                    .is_some()),
+                "current value {query} should match the real Terminal controls"
+            );
         }
     }
 
