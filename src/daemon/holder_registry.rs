@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BootId, TerminalId};
 
+// The deadline socket implementation uses Linux atomic socket flags.
+// Shared CLI builds on other Unix platforms retain the ordinary connector.
+#[cfg(target_os = "linux")]
 mod connection;
+#[cfg(target_os = "linux")]
 pub(crate) use connection::connect_until;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,10 +168,19 @@ pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> 
 }
 
 pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
-    connect_until(
-        path,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
+    #[cfg(target_os = "linux")]
+    {
+        connect_until(
+            path,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        with_socket_address(path, |address| {
+            std::os::unix::net::UnixStream::connect(address)
+        })
+    }
 }
 
 impl Record {
