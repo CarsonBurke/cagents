@@ -1262,7 +1262,11 @@ impl Handle {
                 Some(Some(Err(_)))=> {
                     let error="Native chat worker did not shut down cleanly; provider state is unconfirmed".to_owned();
                     self.0.completed.store(false,Ordering::Release);
-                    *self.0.failure.lock().unwrap_or_else(|p|p.into_inner())=Some(error.clone());
+                    match self.0.failure.try_lock() {
+                        Ok(mut failure)=>*failure=Some(error.clone()),
+                        Err(std::sync::TryLockError::Poisoned(poisoned))=>*poisoned.into_inner()=Some(error.clone()),
+                        Err(std::sync::TryLockError::WouldBlock)=> {},
+                    }
                     return Err(error);
                 }
                 Some(_)=>return Ok(()),
@@ -1277,7 +1281,14 @@ impl Handle {
 
     fn close_inner(&self, preserving: bool, deadline:Option<Instant>) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
-        self.wake();
+        // Close intent is atomic even when another caller owns wake metadata.
+        // A full/nonavailable wake stream already has a pending notification;
+        // periodic actor polls also observe stop without extending this budget.
+        match self.0.wake.try_lock() {
+            Ok(mut wake)=> {let _=wake.write(&[1]);},
+            Err(std::sync::TryLockError::Poisoned(poisoned))=> {let _=poisoned.into_inner().write(&[1]);},
+            Err(std::sync::TryLockError::WouldBlock)=> {},
+        }
         // Never hold a worker mutex while waiting for provider code. Only
         // join after is_finished proves that its user cleanup has returned.
         self.join_worker_until(deadline.unwrap_or_else(||Instant::now()+IO_TIMEOUT+super::TERMINATE_GRACE))?;
@@ -1338,18 +1349,12 @@ impl Handle {
         if self.is_completed() {
             return Ok(());
         }
-        match self
-            .0
-            .failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        {
-            Some(error) => Err(error),
-            None => {
-                Err("Native chat teardown did not complete; provider state is unconfirmed".into())
-            }
-        }
+        let failure=match self.0.failure.try_lock() {
+            Ok(failure)=>failure.clone(),
+            Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner().clone(),
+            Err(std::sync::TryLockError::WouldBlock)=>return Err("Native teardown diagnostic is updating; cleanup remains unconfirmed".into()),
+        };
+        Err(failure.unwrap_or_else(||"Native chat teardown did not complete; provider state is unconfirmed".into()))
     }
 }
 
@@ -6400,7 +6405,10 @@ mod tests {
         assert!(!handle.is_completed()); assert!(handle.owns_work());
         assert!(handle.0.worker.try_lock().unwrap().as_ref().is_some_and(|worker|!worker.is_finished()),"the exact join handle is retained without a held mutex");
         let held=handle.0.worker.lock().unwrap();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(20)).is_err(),"even another caller holding worker metadata cannot block this deadline");
+        let wake_held=handle.0.wake.lock().unwrap();
+        let failure_held=handle.0.failure.lock().unwrap();
+        assert!(handle.close_until(Instant::now()+Duration::from_millis(20)).is_err(),"even another caller holding worker/wake/diagnostic metadata cannot block this deadline");
+        drop(failure_held);drop(wake_held);
         assert!(held.is_some());drop(held);
         release.send(()).unwrap();
         let _=command.join().unwrap();
