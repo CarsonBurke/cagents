@@ -316,6 +316,8 @@ impl State {
     pub(super) fn metadata(&self,item:&str)->Option<&chat::cache::changes::Metadata> {
         let key=self.aliases.get(item)?;Some(&self.entries.get(key)?.part.metadata)
     }
+    /// (records, logical metadata bytes); excludes allocator/container RSS.
+    pub(super) fn paged_intent_metadata(&self)->(usize,usize) {self.intents.usage()}
     pub(super) fn retained_bytes(&self)->usize {
         self.entries.values().map(|entry|entry.patches.values().map(|patch|patch.text.len()).sum::<usize>()
             +entry.restored.values().map(|(text,_)|text.len()).sum::<usize>()).sum()

@@ -22,7 +22,6 @@ impl<K:Eq+Hash,V> Cache<K,V> {
             let Some((_,key))=self.order.first_key_value() else {break;};let key=key.clone();self.take(key.as_ref());
         }
     }
-    #[cfg(test)]
     pub(super) fn usage(&self)->(usize,usize) {(self.values.len(),self.bytes)}
 }
 #[cfg(test)]
