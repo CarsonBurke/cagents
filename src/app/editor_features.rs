@@ -267,6 +267,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_response_after_caret_movement_does_not_open_an_old_symbol_field() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, card, doc) = signature_fixture(root.path());
+        let request = LspRequestId(71);
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.move_cursor_to(LspPosition::new(0, 5)); }
+        let operation = operation(&app, card);
+        app.track_editor_choice_request(request, operation);
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.move_cursor_to(LspPosition::new(0, 0)); }
+        drop(app.editor_feature_event(&LspEvent::PrepareRename { request, doc, range: Some(LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 4))), placeholder: Some("call".into()) }));
+        assert!(!app.editor_features.renames.contains_key(&card));
+        assert!(!app.editor_features.choice_requests.contains_key(&card));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_feature_ui_open()));
+    }
+
+    #[tokio::test]
+    async fn newer_choice_and_dismissal_refuse_already_emitted_older_responses() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, card, doc) = signature_fixture(root.path());
+        let old = LspRequestId(72);
+        let new = LspRequestId(73);
+        let initial = operation(&app, card);
+        app.track_editor_choice_request(old, initial.clone());
+        let mut newer = initial;
+        newer.kind = LspEditKind::CodeAction;
+        app.track_editor_choice_request(new, newer);
+        // Simulate a response already queued before cancellation reached the
+        // backend. It must not consume or replace the newer request's context.
+        drop(app.editor_feature_event(&LspEvent::PrepareRename { request: old, doc, range: Some(LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 4))), placeholder: Some("call".into()) }));
+        assert_eq!(app.editor_features.choice_requests[&card].0, new);
+        assert!(!app.editor_features.renames.contains_key(&card));
+        let event = LspEvent::CodeActions { request: new, doc, items: vec![LspCodeAction::local("Fix call", None, None)] };
+        drop(app.editor_feature_event(&event));
+        assert_eq!(app.editor_features.code_actions[&card].1[0].title, "Fix call");
+        let pending = LspRequestId(75);
+        let mut operation = operation(&app, card);
+        operation.kind = LspEditKind::CodeAction;
+        app.track_editor_choice_request(pending, operation);
+        drop(app.update_editor_features(Action::Dismiss(card)));
+        drop(app.editor_feature_event(&LspEvent::CodeActions { request: pending, doc, items: vec![LspCodeAction::local("Dismissed fix", None, None)] }));
+        assert!(!app.editor_features.code_actions.contains_key(&card));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_feature_ui_open()));
+    }
+
+    #[tokio::test]
+    async fn code_action_response_refuses_a_changed_selection_with_the_same_caret() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, card, doc) = signature_fixture(root.path());
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.move_cursor_to(LspPosition::new(0, 5)); }
+        let request = LspRequestId(74);
+        let operation = operation(&app, card);
+        app.track_editor_choice_request(request, operation);
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+            assert_eq!(runtime.select_text_match("call(", 0), Some(1));
+            assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 5)));
+        }
+        drop(app.editor_feature_event(&LspEvent::CodeActions { request, doc, items: vec![LspCodeAction::local("Fix old range", None, None)] }));
+        assert!(!app.editor_features.code_actions.contains_key(&card));
+        assert!(!app.editor_features.choice_requests.contains_key(&card));
+    }
+
+    #[tokio::test]
     async fn signature_response_after_caret_movement_cannot_reopen_the_old_call() {
         let root = tempfile::tempdir().unwrap();
         let (mut app, card, doc) = signature_fixture(root.path());
@@ -471,6 +532,7 @@ pub(super) struct State {
     preparing: HashMap<u64, Operation>,
     renames: HashMap<CardId, Rename>,
     code_actions: HashMap<CardId, (i32, Vec<LspCodeAction>)>,
+    choice_requests: HashMap<CardId, (LspRequestId, LspPosition, Option<LspRange>)>,
     signatures: HashSet<CardId>,
     signature_requests: HashMap<CardId, (LspRequestId, LspPosition)>,
     preview: Option<Preview>,
@@ -548,6 +610,7 @@ impl Cagents {
         if !is_escape_press(event) { return None; }
         if self.editor_features.modal_open() { return Some(self.update_editor_features(Action::CancelPreview)); }
         let card = self.workspace.focused()?;
+        if self.editor_features.choice_requests.contains_key(&card) { return Some(self.update_editor_features(Action::Dismiss(card))); }
         self.editor_features.renames.contains_key(&card).then(|| self.update_editor_features(Action::CancelRename(card)))
     }
 
@@ -555,6 +618,7 @@ impl Cagents {
         self.editor_features.renames.remove(&card);
         self.editor_features.code_actions.remove(&card);
         self.editor_features.signatures.remove(&card);
+        self.editor_features.choice_requests.remove(&card);
         if let Some((request, _)) = self.editor_features.signature_requests.remove(&card) { self.lsp.cancel(request); }
         let retired = self.editor_features.requests.iter().filter_map(|(request, operation)| (operation.card == card).then_some(*request)).collect::<Vec<_>>();
         for request in retired { self.editor_features.requests.remove(&request); self.lsp.cancel(request); }
@@ -563,6 +627,32 @@ impl Cagents {
     fn take_editor_feature_request(&mut self, request: &LspRequestId, doc: &LspDocumentId) -> Option<Operation> {
         if self.editor_features.requests.get(request)?.doc != *doc { return None; }
         self.editor_features.requests.remove(request)
+    }
+
+    fn track_editor_choice_request(&mut self, request: LspRequestId, operation: Operation) {
+        self.editor_features.renames.remove(&operation.card);
+        self.editor_features.code_actions.remove(&operation.card);
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) {
+            runtime.set_editor_rename(None);
+            runtime.dismiss_editor_choices();
+        }
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&operation.card)
+            && let Some(at) = runtime.cursor_position() {
+            let context = (request, at, runtime.editor_selection_range());
+            if let Some((previous, _, _)) = self.editor_features.choice_requests.insert(operation.card, context) {
+                self.editor_features.requests.remove(&previous);
+                self.lsp.cancel(previous);
+            }
+        }
+        self.editor_features.requests.insert(request, operation);
+    }
+
+    fn editor_choice_response_current(&mut self, request: LspRequestId, card: CardId) -> bool {
+        let Some(&(expected, at, selection)) = self.editor_features.choice_requests.get(&card) else { return false; };
+        if expected != request { return false; }
+        self.editor_features.choice_requests.remove(&card);
+        matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.cursor_position() == Some(at) && runtime.editor_selection_range() == selection)
     }
 
     fn execute_editor_feature_command(&mut self, operation: &Operation, command: LspCommand) {
@@ -581,7 +671,7 @@ impl Cagents {
         match event {
             LspEvent::PrepareRename { request, doc, range, placeholder } => {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
-                if !self.editor_operation_current(&operation) { return Some(Task::none()); }
+                if !self.editor_choice_response_current(*request, operation.card) || !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 let Some(range) = range else { self.feature_failure(operation.card, "This symbol cannot be renamed"); return Some(Task::none()); };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) else { return Some(Task::none()); };
                 let draft = placeholder.clone().or_else(|| runtime.editor_text_in_range(*range)).unwrap_or_default();
@@ -596,7 +686,7 @@ impl Cagents {
             }
             LspEvent::CodeActions { request, doc, items, .. } => {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
-                if !self.editor_operation_current(&operation) || self.editor_features.renames.contains_key(&operation.card) { return Some(Task::none()); }
+                if !self.editor_choice_response_current(*request, operation.card) || !self.editor_operation_current(&operation) || self.editor_features.renames.contains_key(&operation.card) { return Some(Task::none()); }
                 self.editor_features.code_actions.insert(operation.card, (operation.version, items.clone()));
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) { runtime.set_editor_code_actions(items); }
                 if items.is_empty() { self.status = Some(TransientNotice::success("No code actions are available here")); }
@@ -658,6 +748,7 @@ impl Cagents {
             },
             LspEvent::RequestFailed { request, doc, error, .. } => {
                 let operation = self.take_editor_feature_request(request, doc)?;
+                if self.editor_features.choice_requests.get(&operation.card).is_some_and(|(expected, _, _)| expected == request) { self.editor_features.choice_requests.remove(&operation.card); }
                 if self.editor_features.signature_requests.get(&operation.card).is_some_and(|(expected, _)| expected == request) { self.editor_features.signature_requests.remove(&operation.card); }
                 if !matches!(error, LspError::Cancelled) { self.feature_failure(operation.card, error.to_string()); }
                 Some(self.save_after_feature(&operation))
@@ -729,7 +820,7 @@ impl Cagents {
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
                 if runtime.is_saving() { return Task::none(); }
                 let request = self.lsp.request_prepare_rename(operation.doc, at);
-                self.editor_features.requests.insert(request, operation);
+                self.track_editor_choice_request(request, operation);
                 Task::none()
             }
             Action::RenameDraft(card, draft) => {
@@ -795,7 +886,7 @@ impl Cagents {
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
                 let range = runtime.editor_selection_range().unwrap_or(LspRange::new(at, at));
                 let request = self.lsp.request_code_actions(operation.doc, range, runtime.editor_diagnostics());
-                self.editor_features.requests.insert(request, operation);
+                self.track_editor_choice_request(request, operation);
                 Task::none()
             }
             Action::ChooseCodeAction(card, index) => {
@@ -833,6 +924,7 @@ impl Cagents {
             Action::Dismiss(card) => {
                 self.editor_features.signatures.remove(&card);
                 self.editor_features.code_actions.remove(&card);
+                if let Some((previous, _, _)) = self.editor_features.choice_requests.remove(&card) { self.editor_features.requests.remove(&previous); self.lsp.cancel(previous); }
                 if let Some((previous, _)) = self.editor_features.signature_requests.remove(&card) { self.editor_features.requests.remove(&previous); self.lsp.cancel(previous); }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.dismiss_editor_results(); }
                 Task::none()
