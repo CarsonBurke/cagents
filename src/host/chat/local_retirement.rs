@@ -130,3 +130,6 @@ pub(super) fn commit(host:&SharedHost,pending:&Arc<Pending>)->Result<(),Protocol
     drop((record,pair,removed_pending));
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
