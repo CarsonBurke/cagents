@@ -554,6 +554,7 @@ pub enum RepositoryAction {
     },
     BinaryPageLoaded {
         identity: AsyncIdentity,
+        request: u64,
         result: Result<crate::editor::BinaryPreview, FileIoError>,
     },
     StageSelected {
@@ -1963,6 +1964,7 @@ pub struct RepositoryRuntime {
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     pending_fragment: Option<String>,
+    binary_page_request: u64,
     diff_mode: DiffMode,
     committed_selection: Option<(DiffBasis, Option<PathBuf>)>,
     diff_basis: DiffBasis,
@@ -2147,6 +2149,7 @@ impl RepositoryRuntime {
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
             pending_fragment: None,
+            binary_page_request: 0,
             committed_selection: None,
             diff_mode: DiffMode::Inline,
             diff_basis: DiffBasis::IndexToWorktree,
@@ -4902,6 +4905,8 @@ impl RepositoryRuntime {
                     self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
                 let worktree = self.descriptor.worktree.clone();
                 let path = path.clone();
+                self.binary_page_request = self.binary_page_request.wrapping_add(1);
+                let request = self.binary_page_request;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         crate::editor::load_binary_page(&worktree, &path, offset)
@@ -4909,11 +4914,20 @@ impl RepositoryRuntime {
                     .await
                     .map_err(|error| FileIoError::Io(error.to_string()))
                     .and_then(|result| result);
-                    RepositoryAction::BinaryPageLoaded { identity, result }
+                    RepositoryAction::BinaryPageLoaded {
+                        identity,
+                        request,
+                        result,
+                    }
                 })
             }
-            RepositoryAction::BinaryPageLoaded { identity, result } => {
-                if self.accepts_selected(&identity)
+            RepositoryAction::BinaryPageLoaded {
+                identity,
+                request,
+                result,
+            } => {
+                if request == self.binary_page_request
+                    && self.accepts_selected(&identity)
                     && let DocumentState::ReadOnly { reason, .. } = &mut self.document
                 {
                     match result {
@@ -10731,33 +10745,11 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     }
 }
 
-fn binary_file_view(
+fn binary_file_view<'a>(
     card: CardId,
     path: &Path,
-    preview: &crate::editor::BinaryPreview,
-) -> Element<'static, RepositoryAction> {
-    use std::fmt::Write as _;
-    let mut hex = String::with_capacity(preview.data.len() * 5);
-    for (row, bytes) in preview.data.chunks(16).enumerate() {
-        let _ = write!(hex, "{:08x}  ", preview.offset + (row * 16) as u64);
-        for index in 0..16 {
-            match bytes.get(index) {
-                Some(byte) => {
-                    let _ = write!(hex, "{byte:02x} ");
-                }
-                None => hex.push_str("   "),
-            }
-        }
-        hex.push_str(" | ");
-        for byte in bytes {
-            hex.push(if byte.is_ascii_graphic() || *byte == b' ' {
-                *byte as char
-            } else {
-                '.'
-            });
-        }
-        hex.push('\n');
-    }
+    preview: &'a crate::editor::BinaryPreview,
+) -> Element<'a, RepositoryAction> {
     let modified = preview
         .modified
         .and_then(|time| jiff::Timestamp::try_from(time).ok())
@@ -10814,7 +10806,7 @@ fn binary_file_view(
             crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
             actions.into(),
             widget::scrollable(
-                widget::text(hex)
+                widget::text(preview.hex.as_ref())
                     .font(cosmic::iced::Font::MONOSPACE)
                     .wrapping(iced::widget::text::Wrapping::None),
             )
@@ -14086,6 +14078,56 @@ mod tests {
             runtime.diff_state(&DiffBasis::IndexToWorktree),
             Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) if model.additions == 2
         ));
+    }
+
+    #[test]
+    fn binary_page_completions_keep_the_latest_requested_page() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "blob.bin", "");
+        let page = |offset| crate::editor::BinaryPreview {
+            bytes: 200_000,
+            modified: None,
+            mime: "application/octet-stream",
+            error: None,
+            offset,
+            data: vec![0; 16].into(),
+            hex: "preview".into(),
+        };
+        runtime.document = DocumentState::ReadOnly {
+            path: "blob.bin".into(),
+            reason: ReadOnlyReason::BinaryPreview(page(0)),
+        };
+        drop(runtime.update(RepositoryAction::BinaryPage {
+            card,
+            offset: 65536,
+        }));
+        let older = runtime.binary_page_request;
+        drop(runtime.update(RepositoryAction::BinaryPage { card, offset: 0 }));
+        let latest = runtime.binary_page_request;
+        drop(runtime.update(RepositoryAction::BinaryPageLoaded {
+            identity: identity.clone(),
+            request: latest,
+            result: Ok(page(0)),
+        }));
+        drop(runtime.update(RepositoryAction::BinaryPageLoaded {
+            identity: identity.clone(),
+            request: older,
+            result: Ok(page(65536)),
+        }));
+        drop(runtime.update(RepositoryAction::BinaryPageLoaded {
+            identity,
+            request: older,
+            result: Err(FileIoError::Io("stale".into())),
+        }));
+        let DocumentState::ReadOnly {
+            reason: ReadOnlyReason::BinaryPreview(preview),
+            ..
+        } = runtime.document
+        else {
+            panic!("binary preview");
+        };
+        assert_eq!(preview.offset, 0);
+        assert_eq!(preview.error, None);
     }
 
     #[test]
