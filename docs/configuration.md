@@ -308,6 +308,11 @@ A server entry has these fields:
   a marker is the project root. If no folder has a marker, the worktree root is
   used.
 
+- `initialization_options` (optional): server-specific JSON-compatible TOML data,
+  sent in the first `initialize` request before workspace loading. It is limited
+  to 1 MiB of encoded JSON. For example, `initialization_options = { checkOnSave = false }`
+  configures rust-analyzer startup; supported keys depend on the server.
+
 An extension can belong to only one server.
 
 ```toml
