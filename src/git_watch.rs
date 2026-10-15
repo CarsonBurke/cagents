@@ -544,7 +544,10 @@ impl Project {
                     change.untracked |= name.is_some_and(|name| {
                         name == "index" || name == "config.worktree" || name == "exclude"
                     });
-                    change.membership |= name.is_some_and(|name| name == "HEAD");
+                    // Worktree-specific excludes can reveal existing directories
+                    // that the previous nonrecursive content plan never watched.
+                    change.membership |=
+                        name.is_some_and(|name| name == "HEAD" || name == "config.worktree");
                     change.topology |= path
                         .file_name()
                         .is_some_and(|name| name == "locked" || name == "gitdir");
@@ -1261,6 +1264,12 @@ pub(crate) mod tests {
         assert_eq!(index.worktrees, BTreeSet::from([first.id]));
         assert!(index.untracked);
         assert!(!index.membership && !index.topology);
+        let linked = &project.worktrees[1];
+        let config = project
+            .change(&modified(linked.git_dir.join("config.worktree")))
+            .unwrap();
+        assert_eq!(config.worktrees, BTreeSet::from([linked.id]));
+        assert!(config.untracked && config.membership && !config.topology);
         let refs = project
             .change(&modified(project.common_dir.join("refs/heads/main")))
             .unwrap();
@@ -1863,6 +1872,80 @@ pub(crate) mod tests {
             watch_budget(),
         );
         assert!(registrations.failures.contains_key(&plan.id));
+    }
+
+    #[test]
+    fn worktree_exclude_config_replans_newly_visible_directory_watches() {
+        const TEST: &str =
+            "git_watch::tests::worktree_exclude_config_replans_newly_visible_directory_watches";
+        if !fixture_isolated(TEST) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        init_fixture(&root);
+        let git = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let config = |arguments: &[&str], path: Option<&Path>| {
+            let mut command = git.git_base(&root, false).args(arguments.iter().copied());
+            if let Some(path) = path {
+                command = command.arg(path.as_os_str());
+            }
+            run_fixture_command(isolated_fixture_command(command));
+        };
+        config(&["config", "extensions.worktreeConfig", "true"], None);
+        let excludes = directory.path().join("exclude-patterns");
+        std::fs::write(&excludes, "hidden/\n").unwrap();
+        config(
+            &["config", "--worktree", "core.excludesFile"],
+            Some(&excludes),
+        );
+        std::fs::create_dir(root.join("hidden")).unwrap();
+        let file = root.join("hidden/payload");
+        std::fs::write(&file, "ignored\n").unwrap();
+        let records = git.list_worktrees(&root, &cancellation).unwrap();
+        let changed = records.iter().map(|record| record.id).collect();
+        let project = ProjectId::new();
+        let common = git.common_dir(&root, &cancellation).unwrap();
+        let plan = Project::read_changed(
+            project,
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &changed,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(!plan.worktrees[0].directories.contains(&root.join("hidden")));
+        let monitor = Monitor::start().unwrap();
+        monitor.configure(vec![Arc::new(plan.clone())]);
+        wait_for(&monitor, project, |change| change.coverage == Some(true));
+        config(
+            &["config", "--worktree", "core.excludesFile", "/dev/null"],
+            None,
+        );
+        wait_for(&monitor, project, |change| {
+            change.membership && change.worktrees.contains(&records[0].id)
+        });
+        let next = Project::read_changed(
+            project,
+            common,
+            &records,
+            &cancellation,
+            Some(&plan),
+            &changed,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(next.worktrees[0].directories.contains(&root.join("hidden")));
+        monitor.configure(vec![Arc::new(next)]);
+        wait_for(&monitor, project, |change| change.coverage == Some(true));
+        std::fs::write(&file, "visible changed bytes\n").unwrap();
+        wait_for(&monitor, project, |change| {
+            change.worktrees.contains(&records[0].id)
+        });
     }
 
     #[test]
