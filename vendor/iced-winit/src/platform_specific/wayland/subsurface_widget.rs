@@ -57,9 +57,7 @@ use wayland_protocols::wp::{
 };
 use winit::window::WindowId;
 
-use crate::platform_specific::{
-    event_loop::state::SctkState,
-};
+use crate::platform_specific::event_loop::state::SctkState;
 
 #[derive(Debug)]
 pub struct Plane {
@@ -410,7 +408,9 @@ impl SubsurfaceState {
         canvas[0..width as usize * height as usize * 4].copy_from_slice(data);
         surface.damage_buffer(0, 0, width as i32, height as i32);
         if let Err(error) = buffer.attach_to(&surface) {
-            log::warn!("Could not attach the Wayland shared-memory buffer: {error}");
+            log::warn!(
+                "Could not attach the Wayland shared-memory buffer: {error}"
+            );
             wp_viewport.destroy();
             return;
         }

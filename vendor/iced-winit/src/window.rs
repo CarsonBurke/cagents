@@ -324,7 +324,10 @@ where
     // Wrapped Wayland surfaces implement the legacy IME dispatch methods;
     // their modern request_ime_update/ime_capabilities adapter is not available.
     // Preserve working input until that adapter supports the new protocol.
-    #[expect(deprecated, reason = "The wrapped Wayland backend requires the legacy IME shim")]
+    #[expect(
+        deprecated,
+        reason = "The wrapped Wayland backend requires the legacy IME shim"
+    )]
     fn enable_ime(
         &mut self,
         cursor: Rectangle,
@@ -345,7 +348,10 @@ where
         }
     }
 
-    #[expect(deprecated, reason = "The wrapped Wayland backend requires the legacy IME shim")]
+    #[expect(
+        deprecated,
+        reason = "The wrapped Wayland backend requires the legacy IME shim"
+    )]
     fn disable_ime(&mut self) {
         if self.ime_state.is_some() {
             self.raw.set_ime_allowed(false);

@@ -108,9 +108,7 @@ use iced_runtime::{
     },
 };
 use wayland_protocols::{
-    ext::background_effect::v1::client::{
-        ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
-    },
+    ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
     wp::{
         fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
         keyboard_shortcuts_inhibit::zv1::client::{

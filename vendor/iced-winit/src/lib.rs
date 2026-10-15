@@ -254,7 +254,10 @@ where
             if self.boot.is_some() {
                 return;
             }
-            self.process_event(event_loop, Some(RuntimeEvent::NewEvents(cause)));
+            self.process_event(
+                event_loop,
+                Some(RuntimeEvent::NewEvents(cause)),
+            );
         }
 
         fn window_event(
@@ -567,13 +570,17 @@ where
                                 }
                             }
                             Control::Dnd(e) => {
-                                self.sender.start_send(RuntimeEvent::Dnd(e)).unwrap();
+                                self.sender
+                                    .start_send(RuntimeEvent::Dnd(e))
+                                    .unwrap();
                             }
                             #[cfg(feature = "a11y")]
                             Control::Accessibility(id, event) => {
                                 self.process_event(
                                     event_loop,
-                                    Some(RuntimeEvent::Accessibility(id, event)),
+                                    Some(RuntimeEvent::Accessibility(
+                                        id, event,
+                                    )),
                                 );
                             }
                             #[cfg(feature = "a11y")]
@@ -587,7 +594,9 @@ where
                             }
                             Control::PlatformSpecific(e) => {
                                 self.sender
-                                    .start_send(RuntimeEvent::PlatformSpecific(e))
+                                    .start_send(RuntimeEvent::PlatformSpecific(
+                                        e,
+                                    ))
                                     .unwrap();
                             }
                             Control::AboutToWait => {
@@ -651,9 +660,9 @@ where
                             #[cfg(feature = "a11y")]
                             Control::Cleanup(id) => {
                                 _ = self.adapters.remove(&id);
-                                let _ = self
-                                    .sender
-                                    .unbounded_send(RuntimeEvent::A11yClosed(id));
+                                let _ = self.sender.unbounded_send(
+                                    RuntimeEvent::A11yClosed(id),
+                                );
                             }
                         },
                         _ => {
@@ -1073,7 +1082,10 @@ async fn run_instance<P>(
                 }
                 actions += 1;
             }
-            RuntimeEvent::Winit(window_id, event::WindowEvent::RedrawRequested) => {
+            RuntimeEvent::Winit(
+                window_id,
+                event::WindowEvent::RedrawRequested,
+            ) => {
                 let Some(mut current_compositor) = compositor.as_mut() else {
                     continue;
                 };

@@ -1263,7 +1263,10 @@ pub fn key_code(
         KeyCode::WakeUp => keyboard::key::Code::WakeUp,
         // Preserve legacy physical key codes; there is no unhanded Meta
         // replacement in the pinned winit keyboard-types version.
-        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
+        #[expect(
+            deprecated,
+            reason = "Preserve the legacy physical-key conversion"
+        )]
         KeyCode::Super => keyboard::key::Code::Meta,
         KeyCode::Abort => keyboard::key::Code::Abort,
         KeyCode::Resume => keyboard::key::Code::Resume,
@@ -1470,15 +1473,24 @@ pub fn winit_key_code(
         keyboard::key::Code::WakeUp => KeyCode::WakeUp,
         // Preserve legacy physical key codes; there is no unhanded Meta
         // replacement in the pinned winit keyboard-types version.
-        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
+        #[expect(
+            deprecated,
+            reason = "Preserve the legacy physical-key conversion"
+        )]
         keyboard::key::Code::Meta => KeyCode::Super,
         // Preserve legacy physical key codes; there is no unhanded Meta
         // replacement in the pinned winit keyboard-types version.
-        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
+        #[expect(
+            deprecated,
+            reason = "Preserve the legacy physical-key conversion"
+        )]
         keyboard::key::Code::Hyper => KeyCode::Hyper,
         // Preserve legacy physical key codes; there is no unhanded Meta
         // replacement in the pinned winit keyboard-types version.
-        #[expect(deprecated, reason = "Preserve the legacy physical-key conversion")]
+        #[expect(
+            deprecated,
+            reason = "Preserve the legacy physical-key conversion"
+        )]
         keyboard::key::Code::Turbo => KeyCode::Turbo,
         keyboard::key::Code::Abort => KeyCode::Abort,
         keyboard::key::Code::Resume => KeyCode::Resume,

@@ -18,8 +18,8 @@ use cursor_icon::CursorIcon;
 use iced_futures::futures::channel::mpsc;
 use iced_graphics::compositor;
 use iced_runtime::core::{Vector, window};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use raw_window_handle::RawWindowHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use sctk_event::SctkEvent;
 use std::{collections::HashMap, sync::Arc};
 use subsurface_widget::{SubsurfaceInstance, SubsurfaceState};
@@ -106,26 +106,27 @@ impl PlatformSpecific {
         display: OwnedDisplayHandle,
     ) -> Self {
         self.wayland.winit_event_sender = Some(tx);
-        self.wayland.conn = match display.display_handle().map(|handle| handle.as_raw()) {
-            Ok(raw_window_handle::RawDisplayHandle::Wayland(
-                wayland_display_handle,
-            )) => {
-                let backend = unsafe {
-                    wayland_backend::client::Backend::from_foreign_display(
-                        wayland_display_handle.display.as_ptr().cast(),
-                    )
-                };
-                Some(Connection::from_backend(backend))
-            }
-            Ok(_) => {
-                log::warn!("Non-Wayland display handle");
-                None
-            }
-            Err(_) => {
-                log::error!("No display handle");
-                None
-            }
-        };
+        self.wayland.conn =
+            match display.display_handle().map(|handle| handle.as_raw()) {
+                Ok(raw_window_handle::RawDisplayHandle::Wayland(
+                    wayland_display_handle,
+                )) => {
+                    let backend = unsafe {
+                        wayland_backend::client::Backend::from_foreign_display(
+                            wayland_display_handle.display.as_ptr().cast(),
+                        )
+                    };
+                    Some(Connection::from_backend(backend))
+                }
+                Ok(_) => {
+                    log::warn!("Non-Wayland display handle");
+                    None
+                }
+                Err(_) => {
+                    log::error!("No display handle");
+                    None
+                }
+            };
         self.wayland.display_handle = Some(display);
         self.wayland.proxy = Some(raw);
         self.wayland.sender =

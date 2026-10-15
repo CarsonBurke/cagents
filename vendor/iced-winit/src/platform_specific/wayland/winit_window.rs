@@ -1,10 +1,7 @@
 use crate::platform_specific::wayland::Action;
 use cctk::sctk::reexports::{
     calloop::channel,
-    client::{
-        Proxy, QueueHandle,
-        protocol::wl_display::WlDisplay,
-    },
+    client::{Proxy, QueueHandle, protocol::wl_display::WlDisplay},
 };
 use raw_window_handle::HandleError;
 use std::sync::{Arc, Mutex};

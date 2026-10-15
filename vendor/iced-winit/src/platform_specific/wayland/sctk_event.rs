@@ -3,10 +3,7 @@ use crate::{
     platform_specific::{
         SurfaceIdWrapper, UserInterfaces,
         wayland::{
-            conversion::{
-                modifiers_to_native,
-                pointer_button_to_native,
-            },
+            conversion::{modifiers_to_native, pointer_button_to_native},
             keymap::{self, keysym_to_key},
             subsurface_widget::SubsurfaceState,
         },
@@ -39,32 +36,30 @@ use iced_runtime::{
     user_interface,
 };
 
-use cctk::{
-    sctk::{
-        output::OutputInfo,
-        reexports::{
-            calloop::channel,
-            client::{
-                Proxy, QueueHandle,
-                backend::ObjectId,
-                protocol::{
-                    wl_display::WlDisplay, wl_keyboard::WlKeyboard,
-                    wl_output::WlOutput, wl_pointer::WlPointer,
-                    wl_seat::WlSeat, wl_surface::WlSurface, wl_touch::WlTouch,
-                },
+use cctk::sctk::{
+    output::OutputInfo,
+    reexports::{
+        calloop::channel,
+        client::{
+            Proxy, QueueHandle,
+            backend::ObjectId,
+            protocol::{
+                wl_display::WlDisplay, wl_keyboard::WlKeyboard,
+                wl_output::WlOutput, wl_pointer::WlPointer, wl_seat::WlSeat,
+                wl_surface::WlSurface, wl_touch::WlTouch,
             },
-            csd_frame::WindowManagerCapabilities,
         },
-        seat::{
-            Capability,
-            keyboard::{KeyEvent, Modifiers},
-            pointer::{PointerEvent, PointerEventKind},
-        },
-        session_lock::SessionLockSurfaceConfigure,
-        shell::{
-            wlr_layer::{Layer, LayerSurfaceConfigure},
-            xdg::{popup::PopupConfigure, window::WindowConfigure},
-        },
+        csd_frame::WindowManagerCapabilities,
+    },
+    seat::{
+        Capability,
+        keyboard::{KeyEvent, Modifiers},
+        pointer::{PointerEvent, PointerEventKind},
+    },
+    session_lock::SessionLockSurfaceConfigure,
+    shell::{
+        wlr_layer::{Layer, LayerSurfaceConfigure},
+        xdg::{popup::PopupConfigure, window::WindowConfigure},
     },
 };
 use std::{
