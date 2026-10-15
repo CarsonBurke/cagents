@@ -2314,20 +2314,18 @@ fn bare_refs(fixture: &Fixture) -> Vec<String> {
         .collect()
 }
 
-/// Keeps the unused-import warning honest: `OsString` is only needed when this
-/// test inspects raw arguments, which the pathspec test does.
 #[test]
-fn command_arguments_keep_pathspecs_as_single_arguments() {
+fn command_pathspecs_use_literal_nul_delimited_stdin() {
     let service: RepositoryService<IsolatedExecutor> =
         RepositoryService::new("git", Arc::new(IsolatedExecutor(SystemProcessExecutor)));
     let command = service
         .stage_command(Path::new("/repo"), &[path(":(top)magic.txt")])
         .expect("stage command");
     assert_eq!(command.arguments[0], OsString::from("--literal-pathspecs"));
-    assert_eq!(
-        command.arguments.last(),
-        Some(&OsString::from(":(top)magic.txt"))
-    );
+    assert!(command.arguments.contains(&OsString::from("--pathspec-from-file=-")));
+    assert!(command.arguments.contains(&OsString::from("--pathspec-file-nul")));
+    assert!(!command.arguments.contains(&OsString::from(":(top)magic.txt")));
+    assert_eq!(command.stdin.as_deref(), Some(b":(top)magic.txt\0".as_slice()));
 }
 
 /// A project remembers its Git common directory, so reopening one hands
@@ -3397,7 +3395,10 @@ fn discard_blocks_external_staging_under_the_correct_worktree_index_lock() {
                 && !self.attempted.swap(true, Ordering::Relaxed)
             {
                 assert!(output.success);
-                assert!(output.stdout.is_empty());
+                // Membership now reads the complete NUL-delimited index and
+                // filters selected paths in memory. The selected file is not
+                // tracked, while this unrelated tracked entry remains present.
+                assert_eq!(output.stdout, b"tracked.txt\0");
                 assert!(
                     self.index_lock.is_file(),
                     "discard must hold this index lock"
