@@ -668,7 +668,7 @@ mod tests {
         app.close_lsp_document(a);
         app.cards.remove(&a);
         let (id, response) = app.lsp.fixture_workspace_edit_preview(LspDocumentId(2), Duration::from_secs(120)).unwrap();
-        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id, label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
+        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id, label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), observed_incarnation: app.lsp.document_incarnation(LspDocumentId(3)), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
         let mut tasks = vec![task];
         while let Some(task) = tasks.pop() {
             if let Some(mut stream) = iced::runtime::task::into_stream(task) {

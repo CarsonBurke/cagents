@@ -30,6 +30,8 @@ pub struct LspDocumentEdits {
     pub version: Option<i32>,
     /// Open-buffer version used for conversion, including unversioned edits.
     pub observed_version: Option<i32>,
+    /// Registration identity paired atomically with the converted snapshot.
+    pub observed_incarnation: Option<LspDocumentIncarnation>,
     pub coordinates: LspCoordinates,
     pub edits: Vec<LspTextEdit>,
 }
@@ -253,17 +255,35 @@ pub(super) fn convert_feature(store:&SnapshotStore,req:&PendingRequest,snapshot:
     }
 }
 
-pub(super) fn convert_workspace_edit(store:&SnapshotStore,edit:lsp_types::WorkspaceEdit,observed:Option<&HashMap<Url,i32>>)->Result<LspWorkspaceEdit,LspError>{
+pub(super) fn convert_workspace_edit(store:&SnapshotStore,edit:lsp_types::WorkspaceEdit,observed:Option<&HashMap<Url,ObservedDocument>>)->Result<LspWorkspaceEdit,LspError>{
     let annotations=edit.change_annotations.unwrap_or_default();let mut out=LspWorkspaceEdit::default();
     let mut seen=std::collections::HashSet::new();
     let mut used_annotations=std::collections::HashSet::new();
     let mut add=|uri:Url,version:Option<i32>,edits:Vec<lsp_types::OneOf<lsp_types::TextEdit,lsp_types::AnnotatedTextEdit>>|->Result<(),LspError>{
         if !seen.insert(uri.clone()){return Err(LspError::Unsupported("sequential document edits for the same URI".into()));}
         let path=uri.to_file_path().map_err(|_|LspError::Unsupported("workspace edits require file URIs".into()))?;
-        let snapshot=store.latest(&uri);
-        if let Some(snapshot)=&snapshot {
-            if let Some(version)=version {if version!=snapshot.version{return Err(LspError::StaleVersion{result:version,current:snapshot.version});}}
-            if let Some(observed)=observed {if observed.get(&uri)!=Some(&snapshot.version){return Err(LspError::StaleVersion{result:observed.get(&uri).copied().unwrap_or(-1),current:snapshot.version});}}
+        let current=store.observation(&uri);
+        if let Some(observed)=observed {
+            match (observed.get(&uri), current.as_ref()) {
+                (Some(previous), Some((snapshot, incarnation))) => {
+                    if previous.incarnation != *incarnation {
+                        return Err(LspError::Unsupported("A workspace-edit target was closed and reopened after the request".into()));
+                    }
+                    if previous.version != snapshot.version {
+                        return Err(LspError::StaleVersion { result:previous.version, current:snapshot.version });
+                    }
+                }
+                (Some(_), None) => return Err(LspError::Unsupported("An open workspace-edit target was closed after the request".into())),
+                (None, Some((snapshot, _))) => return Err(LspError::StaleVersion { result:-1, current:snapshot.version }),
+                (None, None) => {}
+            }
+        }
+        let (snapshot, observed_incarnation)=match current {
+            Some((snapshot, incarnation)) => (Some(snapshot), Some(incarnation)),
+            None => (None, None),
+        };
+        if let (Some(snapshot), Some(version))=(&snapshot, version) {
+            if version!=snapshot.version{return Err(LspError::StaleVersion{result:version,current:snapshot.version});}
         }
         let converted=edits.into_iter().map(|edit|{
             let edit=match edit {
@@ -285,7 +305,7 @@ pub(super) fn convert_workspace_edit(store:&SnapshotStore,edit:lsp_types::Worksp
             let range=if let Some(snapshot)=&snapshot {snapshot.range_from_utf16(edit.range)?}else {if edit.range.start>edit.range.end{return Err(LspError::InvertedRange);}LspRange::new(LspPosition::new(edit.range.start.line,edit.range.start.character),LspPosition::new(edit.range.end.line,edit.range.end.character))};
             Ok(LspTextEdit{range,new_text:edit.new_text})
         }).collect::<Result<Vec<_>,LspError>>()?;
-        out.documents.push(LspDocumentEdits{path,version,observed_version:snapshot.as_ref().map(|s|s.version),coordinates:if snapshot.is_some(){LspCoordinates::Scalar}else{LspCoordinates::Utf16},edits:converted});Ok(())
+        out.documents.push(LspDocumentEdits{path,version,observed_version:snapshot.as_ref().map(|s|s.version),observed_incarnation,coordinates:if snapshot.is_some(){LspCoordinates::Scalar}else{LspCoordinates::Utf16},edits:converted});Ok(())
     };
     match edit.document_changes {
         Some(lsp_types::DocumentChanges::Edits(items))=>for item in items {add(item.text_document.uri,item.text_document.version,item.edits)?;},
@@ -520,7 +540,7 @@ fn apply_workspace_edit_with_timeout(state:&mut RouterState, params:lsp_types::A
     let result=(||{
         if state.retired.load(Ordering::Acquire){return Err("language server retired".to_owned());}
         let doc=state.snapshots.docs_for_session(&state.key).into_iter().next().ok_or("no open document owns this language server")?;
-        let versions=state.snapshots.lock().uris.iter().filter(|(_,uri)|uri.session==state.key).map(|(uri,entry)|((**uri).clone(),entry.latest().version)).collect();
+        let versions=state.snapshots.observations_for_session(&state.key);
         let edit=convert_workspace_edit(&state.snapshots,params.edit,Some(&versions)).map_err(|e|e.to_string())?;
         let (id,rx)=state.server_edits.preview(doc,deadline,Arc::clone(&state.retired))?;
         state.events.emit_now(LspEvent::ApplyWorkspaceEdit{doc,id,label:params.label,edit});Ok((id,rx))
@@ -608,7 +628,7 @@ mod tests {
     fn code_actions_can_resolve_an_edit_even_when_a_command_is_already_present() {
         let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
         store.register(LspDocumentId(1),&uri,&key,1,Arc::from("foo")).unwrap();
-        let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::CodeActions,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:HashMap::from([(Url::parse("file:///repo/a.rs").unwrap(),1)])};
+        let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::CodeActions,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:store.observations_for_session(&key)};
         let raw:lsp_types::CodeActionOrCommand=serde_json::from_value(json!({"title":"Fix and run","command":{"title":"Run","command":"server.run"},"data":{"resolve_edit":true}})).unwrap();
         let item=convert_action(&store,&request,raw).unwrap();assert!(item.needs_resolve);assert!(item.command.is_some());assert!(item.edit.is_none());
     }
