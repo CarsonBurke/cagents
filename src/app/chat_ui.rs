@@ -20,6 +20,8 @@ mod completion;
 mod coordination;
 mod find;
 mod fold;
+#[cfg(test)]
+mod flow_layout;
 mod hover;
 mod images;
 mod layout;
