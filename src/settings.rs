@@ -2838,9 +2838,16 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 mod tests {
     #[test]
     fn editor_find_options_round_trip_with_disabled_language_servers() {
-        let settings = AppSettings { language_servers: Vec::new(),
-            editor_find_options: EditorFindOptions { case_sensitive: true, regex: true, whole_word: true },
-            editor_replace_preserve_case: true, ..AppSettings::default() };
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
         let serialized = toml::to_string(&settings).unwrap();
         let restored: AppSettings = toml::from_str(&serialized).unwrap();
         assert!(restored.language_servers.is_empty());
@@ -4087,13 +4094,22 @@ new_thread = "Alt+Shift+G"
         previous.keyboard_shortcuts.review_next_change = vec!["Alt+J".into()];
         previous.keyboard_shortcuts.review_previous_change = vec!["Alt+K".into()];
         let migrated = migrate(&previous);
-        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["Alt+J", "F7"]);
-        assert_eq!(migrated.keyboard_shortcuts.review_previous_change, ["Alt+K", "Shift+F7"]);
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_next_change,
+            ["Alt+J", "F7"]
+        );
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
         previous.keyboard_shortcuts.review_next_change = vec!["Alt+L".into()];
         previous.keyboard_shortcuts.new_terminal = vec!["Shift+F7".into()];
         let migrated = migrate(&previous);
         assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["Alt+L"]);
-        assert_eq!(migrated.keyboard_shortcuts.review_previous_change, ["Alt+K"]);
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K"]
+        );
         migrated.validate().unwrap();
     }
 

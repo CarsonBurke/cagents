@@ -544,9 +544,16 @@ struct BaselineFlight {
 struct BaselineBuilder(Arc<BaselineFlight>);
 impl Drop for BaselineBuilder {
     fn drop(&mut self) {
-        BASELINES.lock().unwrap_or_else(|error| error.into_inner()).pending
+        BASELINES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
             .retain(|entry| !Arc::ptr_eq(entry, &self.0));
-        *self.0.finished.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        *self
+            .0
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.0.ready.notify_all();
     }
 }
@@ -563,31 +570,59 @@ const BASELINE_CACHE_ENTRIES: usize = 8;
 static BASELINES: LazyLock<Mutex<BaselineCache>> =
     LazyLock::new(|| Mutex::new(BaselineCache::default()));
 
-fn baseline_syntax(before: &Arc<str>, token: &str,
-    theme: crate::settings::EditorSyntaxTheme, cancellation: &CancellationToken,
+fn baseline_syntax(
+    before: &Arc<str>,
+    token: &str,
+    theme: crate::settings::EditorSyntaxTheme,
+    cancellation: &CancellationToken,
 ) -> Result<Arc<BaselineSyntax>, Cancelled> {
     let hash = blake3::hash(before.as_bytes());
     let builder = loop {
         check_cancelled(cancellation)?;
         let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = cache.entries.iter().position(|entry| entry.hash == hash
-            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()) {
+        if let Some(index) = cache.entries.iter().position(|entry| {
+            entry.hash == hash
+                && entry.token == token
+                && entry.theme == theme
+                && entry.text.as_ref() == before.as_ref()
+        }) {
             let entry = cache.entries.remove(index).expect("matched baseline");
             cache.entries.push_back(Arc::clone(&entry));
             return Ok(entry);
         }
-        if let Some(flight) = cache.pending.iter().find(|entry| entry.hash == hash
-            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()).cloned() {
+        if let Some(flight) = cache
+            .pending
+            .iter()
+            .find(|entry| {
+                entry.hash == hash
+                    && entry.token == token
+                    && entry.theme == theme
+                    && entry.text.as_ref() == before.as_ref()
+            })
+            .cloned()
+        {
             drop(cache);
-            let mut finished = flight.finished.lock().unwrap_or_else(|error| error.into_inner());
+            let mut finished = flight
+                .finished
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             while !*finished {
                 check_cancelled(cancellation)?;
-                finished = flight.ready.wait_timeout(finished, std::time::Duration::from_millis(25))
-                    .unwrap_or_else(|error| error.into_inner()).0;
+                finished = flight
+                    .ready
+                    .wait_timeout(finished, std::time::Duration::from_millis(25))
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0;
             }
         } else {
-            let flight = Arc::new(BaselineFlight { text: Arc::clone(before), hash, token: token.to_owned(), theme,
-                finished: Mutex::new(false), ready: Condvar::new() });
+            let flight = Arc::new(BaselineFlight {
+                text: Arc::clone(before),
+                hash,
+                token: token.to_owned(),
+                theme,
+                finished: Mutex::new(false),
+                ready: Condvar::new(),
+            });
             cache.pending.push(Arc::clone(&flight));
             break BaselineBuilder(flight);
         }
@@ -595,22 +630,46 @@ fn baseline_syntax(before: &Arc<str>, token: &str,
     let mut parser = HighlightParser::new(token, theme);
     let mut syntax: SyntaxLines = Default::default();
     for text in before.split_inclusive('\n') {
-        for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) { lines.push(spans.into()); }
+        for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) {
+            lines.push(spans.into());
+        }
     }
     // This is a payload bound, including Arc headers/vector capacities. The
     // allocator's metadata/fragmentation and in-flight requests are measured
     // separately; no opaque parser heap is retained inside this cache.
-    let retained_bytes = std::mem::size_of::<BaselineSyntax>() + before.len()
-        + 6 * std::mem::size_of::<usize>() + token.len()
-        + syntax.iter().map(|lines| lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
-            + lines.iter().map(|spans| std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()).sum::<usize>()).sum::<usize>();
-    let baseline = Arc::new(BaselineSyntax { text: Arc::clone(before), hash,
-        token: token.to_owned(), theme, syntax: Arc::new(syntax), retained_bytes });
+    let retained_bytes = std::mem::size_of::<BaselineSyntax>()
+        + before.len()
+        + 6 * std::mem::size_of::<usize>()
+        + token.len()
+        + syntax
+            .iter()
+            .map(|lines| {
+                lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
+                    + lines
+                        .iter()
+                        .map(|spans| {
+                            std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+    let baseline = Arc::new(BaselineSyntax {
+        text: Arc::clone(before),
+        hash,
+        token: token.to_owned(),
+        theme,
+        syntax: Arc::new(syntax),
+        retained_bytes,
+    });
     {
         let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
         if retained_bytes <= BASELINE_CACHE_BYTES {
-            while cache.entries.len() >= BASELINE_CACHE_ENTRIES || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES {
-                let Some(oldest) = cache.entries.pop_front() else { break; };
+            while cache.entries.len() >= BASELINE_CACHE_ENTRIES
+                || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES
+            {
+                let Some(oldest) = cache.entries.pop_front() else {
+                    break;
+                };
                 cache.bytes -= oldest.retained_bytes;
             }
             cache.bytes += retained_bytes;
@@ -623,13 +682,25 @@ fn baseline_syntax(before: &Arc<str>, token: &str,
 
 /// State-only forward parsing is linear in the baseline, with at most one
 /// live old-side stack. Sharing a colored run never stores deep checkpoints.
-fn advance_lexical(parser: &mut HighlightParser, lines: &[&str], cursor: &mut usize,
-    end: usize, cancellation: &CancellationToken) -> Result<(), Cancelled> {
+fn advance_lexical(
+    parser: &mut HighlightParser,
+    lines: &[&str],
+    cursor: &mut usize,
+    end: usize,
+    cancellation: &CancellationToken,
+) -> Result<(), Cancelled> {
     debug_assert!(*cursor <= end);
     for text in &lines[*cursor..end] {
         check_cancelled(cancellation)?;
-        let text = text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text);
-        for (_, op) in parser.parser.parse_line(text, parser.syntaxes).unwrap_or_default() {
+        let text = text
+            .strip_suffix("\r\n")
+            .or_else(|| text.strip_suffix('\n'))
+            .unwrap_or(text);
+        for (_, op) in parser
+            .parser
+            .parse_line(text, parser.syntaxes)
+            .unwrap_or_default()
+        {
             let _ = parser.stack.apply(&op);
         }
     }
@@ -694,7 +765,13 @@ fn highlight_comparison_model(
             let starts_run =
                 index == 0 || corresponding[index - 1].is_none_or(|previous| previous + 1 != old);
             if starts_run || index >= probe {
-                advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old, cancellation)?;
+                advance_lexical(
+                    &mut old_parser,
+                    &old_lines,
+                    &mut old_cursor,
+                    old,
+                    cancellation,
+                )?;
                 if parser.parser == old_parser.parser && parser.stack == old_parser.stack {
                     let mut end = index + 1;
                     while end < corresponding.len() && corresponding[end] == Some(old + end - index)
@@ -707,7 +784,13 @@ fn highlight_comparison_model(
                             lines.push(Arc::clone(spans));
                         }
                     }
-                    advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old + end - index, cancellation)?;
+                    advance_lexical(
+                        &mut old_parser,
+                        &old_lines,
+                        &mut old_cursor,
+                        old + end - index,
+                        cancellation,
+                    )?;
                     parser.parser = old_parser.parser.clone();
                     parser.stack = old_parser.stack.clone();
                     index = end;
@@ -794,20 +877,34 @@ pub fn build_document_diff_sources(
     ignore_whitespace: bool,
     cancellation: &CancellationToken,
 ) -> Option<DiffModel> {
-    build_document_diff_sources_with_font(before,after,path,theme,ignore_whitespace,cosmic::iced::Font::MONOSPACE,cancellation)
+    build_document_diff_sources_with_font(
+        before,
+        after,
+        path,
+        theme,
+        ignore_whitespace,
+        cosmic::iced::Font::MONOSPACE,
+        cancellation,
+    )
 }
 
 /// Retain exact sources and measure with the same family rendered by the editor.
 /// Syntax colors are family-independent and keep sharing the baseline cache.
-pub fn build_document_diff_sources_with_font(before:Arc<str>,after:Arc<str>,path:&Path,
-    theme:crate::settings::EditorSyntaxTheme,ignore_whitespace:bool,font:cosmic::iced::Font,
-    cancellation:&CancellationToken)->Option<DiffModel> {
+pub fn build_document_diff_sources_with_font(
+    before: Arc<str>,
+    after: Arc<str>,
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    ignore_whitespace: bool,
+    font: cosmic::iced::Font,
+    cancellation: &CancellationToken,
+) -> Option<DiffModel> {
     check_cancelled(cancellation).ok()?;
     let mut model =
         build_diff_rows_from_sources(&before, &after, ignore_whitespace, cancellation).ok()?;
     model.syntax =
         highlight_comparison_model(&before, &after, path, theme, cancellation, &model).ok()?;
-    measure_diff_with_font(&mut model,font,cancellation).ok()?;
+    measure_diff_with_font(&mut model, font, cancellation).ok()?;
     check_cancelled(cancellation).ok()?;
     Some(model)
 }
@@ -822,10 +919,10 @@ struct ShapeKey<'a> {
 
 impl<'a> ShapeKey<'a> {
     fn new(text: &'a str, syntax: &[SyntaxSpan]) -> Self {
-        Self::with_font(text,syntax,cosmic::iced::Font::MONOSPACE)
+        Self::with_font(text, syntax, cosmic::iced::Font::MONOSPACE)
     }
 
-    fn with_font(text:&'a str,syntax:&[SyntaxSpan],font:cosmic::iced::Font)->Self {
+    fn with_font(text: &'a str, syntax: &[SyntaxSpan], font: cosmic::iced::Font) -> Self {
         let mut fonts: Vec<(Range<usize>, cosmic::iced::Font)> = Vec::new();
         let mut append = |range: Range<usize>, font| {
             if range.is_empty() {
@@ -845,14 +942,20 @@ impl<'a> ShapeKey<'a> {
             let start = (span.start as usize).min(text.len());
             let end = (span.end as usize).min(text.len());
             if cursor < start {
-                append(cursor..start,font);
+                append(cursor..start, font);
             }
-            let styled = span.font().map(|mut styled| { styled.family = font.family; styled }).unwrap_or(font);
-            append(start..end,styled);
+            let styled = span
+                .font()
+                .map(|mut styled| {
+                    styled.family = font.family;
+                    styled
+                })
+                .unwrap_or(font);
+            append(start..end, styled);
             cursor = end;
         }
         if cursor < text.len() {
-            append(cursor..text.len(),font);
+            append(cursor..text.len(), font);
         }
         Self { text, fonts }
     }
@@ -1010,15 +1113,23 @@ fn arithmetic_width(
 }
 
 fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Result<(), Cancelled> {
-    measure_diff_with_font(model,cosmic::iced::Font::MONOSPACE,cancellation)
+    measure_diff_with_font(model, cosmic::iced::Font::MONOSPACE, cancellation)
 }
 
 /// Re-measure retained rows on a CPU worker without repeating source/highlight work.
-pub fn measure_diff_for_font(model:&mut DiffModel,font:cosmic::iced::Font,cancellation:&CancellationToken)->Option<()> {
-    measure_diff_with_font(model,font,cancellation).ok()
+pub fn measure_diff_for_font(
+    model: &mut DiffModel,
+    font: cosmic::iced::Font,
+    cancellation: &CancellationToken,
+) -> Option<()> {
+    measure_diff_with_font(model, font, cancellation).ok()
 }
 
-fn measure_diff_with_font(model:&mut DiffModel,font:cosmic::iced::Font,cancellation:&CancellationToken)->Result<(),Cancelled> {
+fn measure_diff_with_font(
+    model: &mut DiffModel,
+    font: cosmic::iced::Font,
+    cancellation: &CancellationToken,
+) -> Result<(), Cancelled> {
     use cosmic::iced::advanced::graphics::text;
     let palettes = if model
         .syntax
@@ -1044,7 +1155,11 @@ fn measure_diff_with_font(model:&mut DiffModel,font:cosmic::iced::Font,cancellat
             ] {
                 if let Some(source) = source {
                     for (palette, width) in widths.iter_mut().enumerate().take(palettes) {
-                        let key = ShapeKey::with_font(source, model.syntax.line(old, line, palette == 1),font);
+                        let key = ShapeKey::with_font(
+                            source,
+                            model.syntax.line(old, line, palette == 1),
+                            font,
+                        );
                         if let Some(cached) = measured.get(&key) {
                             *width = width.max(*cached);
                         } else if let Some(arithmetic) = arithmetic_width(&key, &cells) {
@@ -1207,11 +1322,24 @@ impl RenderedDiff {
         ignore_whitespace: bool,
         cancellation: &CancellationToken,
     ) -> Self {
-        Self::from_content_with_options_and_font(content,path,theme,ignore_whitespace,cosmic::iced::Font::MONOSPACE,cancellation)
+        Self::from_content_with_options_and_font(
+            content,
+            path,
+            theme,
+            ignore_whitespace,
+            cosmic::iced::Font::MONOSPACE,
+            cancellation,
+        )
     }
 
-    pub fn from_content_with_options_and_font(content:DiffContent,path:&Path,theme:crate::settings::EditorSyntaxTheme,
-        ignore_whitespace:bool,font:cosmic::iced::Font,cancellation:&CancellationToken)->Self {
+    pub fn from_content_with_options_and_font(
+        content: DiffContent,
+        path: &Path,
+        theme: crate::settings::EditorSyntaxTheme,
+        ignore_whitespace: bool,
+        font: cosmic::iced::Font,
+        cancellation: &CancellationToken,
+    ) -> Self {
         if cancellation.is_cancelled() {
             return Self::Error("repository operation cancelled".into());
         }
@@ -1297,12 +1425,28 @@ pub fn load_repository_diff_with_options(
     ignore_whitespace: bool,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
-    load_repository_diff_with_options_and_font(worktree,relative_path,basis,previous_path,theme,ignore_whitespace,cosmic::iced::Font::MONOSPACE,cancellation)
+    load_repository_diff_with_options_and_font(
+        worktree,
+        relative_path,
+        basis,
+        previous_path,
+        theme,
+        ignore_whitespace,
+        cosmic::iced::Font::MONOSPACE,
+        cancellation,
+    )
 }
 
-pub fn load_repository_diff_with_options_and_font(worktree:&Path,relative_path:&Path,basis:&DiffBasis,
-    previous_path:Option<&Path>,theme:crate::settings::EditorSyntaxTheme,ignore_whitespace:bool,
-    font:cosmic::iced::Font,cancellation:&CancellationToken)->RenderedDiff {
+pub fn load_repository_diff_with_options_and_font(
+    worktree: &Path,
+    relative_path: &Path,
+    basis: &DiffBasis,
+    previous_path: Option<&Path>,
+    theme: crate::settings::EditorSyntaxTheme,
+    ignore_whitespace: bool,
+    font: cosmic::iced::Font,
+    cancellation: &CancellationToken,
+) -> RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
     // `..`, an empty component and an interior NUL, which is what makes the
     // pathspec safe to hand to Git.
@@ -3753,43 +3897,83 @@ mod memory_contracts {
     fn nested_grammar_cache_retains_only_exact_source_and_colored_spans() {
         let text: Arc<str> = ("/*\n".repeat(512) + &"*/\n".repeat(512)).into();
         let baseline = baseline_syntax(&text, "rs", AUTO, &CancellationToken::new()).unwrap();
-        let spans: usize = baseline.syntax.iter().flat_map(|lines| lines.iter()).map(|line| line.len()).sum();
-        let payload = std::mem::size_of::<BaselineSyntax>() + text.len() + 6 * std::mem::size_of::<usize>() + baseline.token.len()
-            + baseline.syntax.iter().map(|lines| lines.capacity()*std::mem::size_of::<Arc<[SyntaxSpan]>>()
-                + lines.len()*2*std::mem::size_of::<usize>()).sum::<usize>() + spans*std::mem::size_of::<SyntaxSpan>();
+        let spans: usize = baseline
+            .syntax
+            .iter()
+            .flat_map(|lines| lines.iter())
+            .map(|line| line.len())
+            .sum();
+        let payload = std::mem::size_of::<BaselineSyntax>()
+            + text.len()
+            + 6 * std::mem::size_of::<usize>()
+            + baseline.token.len()
+            + baseline
+                .syntax
+                .iter()
+                .map(|lines| {
+                    lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
+                        + lines.len() * 2 * std::mem::size_of::<usize>()
+                })
+                .sum::<usize>()
+            + spans * std::mem::size_of::<SyntaxSpan>();
         assert_eq!(baseline.retained_bytes, payload);
-        assert!(baseline.retained_bytes < text.len()*100, "no retained quadratic parser checkpoint heap");
+        assert!(
+            baseline.retained_bytes < text.len() * 100,
+            "no retained quadratic parser checkpoint heap"
+        );
     }
 
     #[test]
     fn same_blob_baseline_builds_once_under_concurrent_requests() {
-        let text: Arc<str> = (0..64).map(|line| format!("fn concurrent_cache_{line}() {{}}\n")).collect::<String>().into();
+        let text: Arc<str> = (0..64)
+            .map(|line| format!("fn concurrent_cache_{line}() {{}}\n"))
+            .collect::<String>()
+            .into();
         let barrier = Arc::new(std::sync::Barrier::new(8));
-        let workers: Vec<_> = (0..8).map(|_| {
-            let text = Arc::clone(&text); let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                WORK_COUNTS.with(|counts| counts.set((0,0))); barrier.wait();
-                let baseline = baseline_syntax(&text,"rs",AUTO,&CancellationToken::new()).unwrap();
-                (baseline,WORK_COUNTS.with(std::cell::Cell::get).0)
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let text = Arc::clone(&text);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    WORK_COUNTS.with(|counts| counts.set((0, 0)));
+                    barrier.wait();
+                    let baseline =
+                        baseline_syntax(&text, "rs", AUTO, &CancellationToken::new()).unwrap();
+                    (baseline, WORK_COUNTS.with(std::cell::Cell::get).0)
+                })
             })
-        }).collect();
-        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
-        assert_eq!(results.iter().map(|(_,count)| count).sum::<usize>(),64);
-        assert!(results.iter().all(|(baseline,_)| Arc::ptr_eq(baseline,&results[0].0)));
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().map(|(_, count)| count).sum::<usize>(), 64);
+        assert!(
+            results
+                .iter()
+                .all(|(baseline, _)| Arc::ptr_eq(baseline, &results[0].0))
+        );
     }
 
     #[test]
     fn waiting_baseline_can_cancel_while_unrelated_blob_completes() {
         let text: Arc<str> = Arc::from("fn held_cache_miss() {}\n");
-        let flight = Arc::new(BaselineFlight { text: Arc::clone(&text), hash: blake3::hash(text.as_bytes()), token:"rs".into(),
-            theme:AUTO,finished:Mutex::new(false),ready:Condvar::new() });
+        let flight = Arc::new(BaselineFlight {
+            text: Arc::clone(&text),
+            hash: blake3::hash(text.as_bytes()),
+            token: "rs".into(),
+            theme: AUTO,
+            finished: Mutex::new(false),
+            ready: Condvar::new(),
+        });
         BASELINES.lock().unwrap().pending.push(Arc::clone(&flight));
         let builder = BaselineBuilder(flight);
         let cancellation = CancellationToken::new();
         let worker_cancel = cancellation.clone();
-        let worker = std::thread::spawn(move || baseline_syntax(&text,"rs",AUTO,&worker_cancel).is_err());
+        let worker =
+            std::thread::spawn(move || baseline_syntax(&text, "rs", AUTO, &worker_cancel).is_err());
         let other: Arc<str> = Arc::from("fn unrelated_cache_miss() {}\n");
-        assert!(baseline_syntax(&other,"rs",AUTO,&CancellationToken::new()).is_ok());
+        assert!(baseline_syntax(&other, "rs", AUTO, &CancellationToken::new()).is_ok());
         cancellation.cancel();
         assert!(worker.join().unwrap());
         drop(builder);
@@ -3816,8 +4000,8 @@ mod memory_contracts {
             spans[2].color,
             Some(Color::from_rgba8(200, 100, 50, 128.0 / 255.0))
         );
-        assert!(spans[0].background.is_none());
-        assert!(spans[2].background.is_some());
+        assert!(spans[0].highlight.is_none());
+        assert!(spans[2].highlight.is_some());
     }
 }
 
@@ -3907,43 +4091,95 @@ mod separated_change_contract {
 #[cfg(test)]
 mod selected_font_contracts {
     use super::*;
-    use cosmic::iced::{Font,font};
+    use cosmic::iced::{Font, font};
 
     #[test]
     fn selected_family_preserves_syntax_weight_and_style() {
-        let selected = Font { family:font::Family::SansSerif,..Font::MONOSPACE };
-        let bold_italic = Font { weight:font::Weight::Bold,style:font::Style::Italic,..Font::MONOSPACE };
-        let key = ShapeKey::with_font("bold tail",&[SyntaxSpan::new(0..4,None,Some(bold_italic))],selected);
-        assert!(key.fonts.iter().all(|(_,font)| font.family == selected.family));
-        assert_eq!(key.fonts[0].1.weight,font::Weight::Bold);
-        assert_eq!(key.fonts[0].1.style,font::Style::Italic);
-        assert_eq!(key.fonts[1].1,selected);
+        let selected = Font {
+            family: font::Family::SansSerif,
+            ..Font::MONOSPACE
+        };
+        let bold_italic = Font {
+            weight: font::Weight::Bold,
+            style: font::Style::Italic,
+            ..Font::MONOSPACE
+        };
+        let key = ShapeKey::with_font(
+            "bold tail",
+            &[SyntaxSpan::new(0..4, None, Some(bold_italic))],
+            selected,
+        );
+        assert!(
+            key.fonts
+                .iter()
+                .all(|(_, font)| font.family == selected.family)
+        );
+        assert_eq!(key.fonts[0].1.weight, font::Weight::Bold);
+        assert_eq!(key.fonts[0].1.style, font::Style::Italic);
+        assert_eq!(key.fonts[1].1, selected);
     }
 
     #[test]
     fn selected_family_extents_match_the_actual_rich_text_and_share_baseline_syntax() {
-        let before:Arc<str> = Arc::from("fn font_family_contract() { let iii = \"WWWW café\"; }\n");
-        let after:Arc<str> = Arc::from("fn font_family_contract() { let iii = \"WWWW changed café\"; }\n");
+        let before: Arc<str> =
+            Arc::from("fn font_family_contract() { let iii = \"WWWW café\"; }\n");
+        let after: Arc<str> =
+            Arc::from("fn font_family_contract() { let iii = \"WWWW changed café\"; }\n");
         let cancel = CancellationToken::new();
-        let mono = build_document_diff_sources_with_font(before.clone(),after.clone(),Path::new("font-family.rs"),crate::settings::EditorSyntaxTheme::Auto,false,Font::MONOSPACE,&cancel).unwrap();
-        let selected = Font { family:font::Family::SansSerif,..Font::MONOSPACE };
-        let model = build_document_diff_sources_with_font(before,after,Path::new("font-family.rs"),crate::settings::EditorSyntaxTheme::Auto,false,selected,&cancel).unwrap();
-        assert!(Arc::ptr_eq(&mono.syntax.old,&model.syntax.old));
-        for (palette,extent) in model.max_line_width.into_iter().enumerate() {
+        let mono = build_document_diff_sources_with_font(
+            before.clone(),
+            after.clone(),
+            Path::new("font-family.rs"),
+            crate::settings::EditorSyntaxTheme::Auto,
+            false,
+            Font::MONOSPACE,
+            &cancel,
+        )
+        .unwrap();
+        let selected = Font {
+            family: font::Family::SansSerif,
+            ..Font::MONOSPACE
+        };
+        let model = build_document_diff_sources_with_font(
+            before,
+            after,
+            Path::new("font-family.rs"),
+            crate::settings::EditorSyntaxTheme::Auto,
+            false,
+            selected,
+            &cancel,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&mono.syntax.old, &model.syntax.old));
+        for (palette, extent) in model.max_line_width.into_iter().enumerate() {
             let mut expected = 0.0_f32;
             for row in &model.split_rows {
-                for (old,line,text) in [(true,row.old_line,row.old_text.as_deref()),(false,row.new_line,row.new_text.as_deref())] {
+                for (old, line, text) in [
+                    (true, row.old_line, row.old_text.as_deref()),
+                    (false, row.new_line, row.new_text.as_deref()),
+                ] {
                     if let Some(text) = text {
-                        let mut spans = line_spans(text,&[],model.syntax.line(old,line,palette == 1),cosmic::iced::Color::TRANSPARENT);
+                        let mut spans = line_spans(
+                            text,
+                            &[],
+                            model.syntax.line(old, line, palette == 1),
+                            cosmic::iced::Color::TRANSPARENT,
+                        );
                         for span in &mut spans {
-                            if let Some(font) = &mut span.font { font.family = selected.family; }
-                            else { span.font = Some(selected); }
+                            if let Some(font) = &mut span.font {
+                                font.family = selected.family;
+                            } else {
+                                span.font = Some(selected);
+                            }
                         }
                         expected = expected.max(shaped_spans_width(&spans));
                     }
                 }
             }
-            assert!((extent as f32-expected.ceil()).abs() <= 1.0,"selected-family extent {extent}, native {expected}");
+            assert!(
+                (extent as f32 - expected.ceil()).abs() <= 1.0,
+                "selected-family extent {extent}, native {expected}"
+            );
         }
     }
 }

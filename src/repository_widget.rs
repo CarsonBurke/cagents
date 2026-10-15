@@ -13,8 +13,8 @@ use std::{
 #[path = "editor_widget.rs"]
 pub(crate) mod text_editor;
 
-mod diff_layout;
 mod diff_actions;
+mod diff_layout;
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
@@ -38,7 +38,8 @@ use crate::{
     diff_view::{
         DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
         InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan,
-        highlighter_settings, build_document_diff_sources_with_font, build_line_changes, load_repository_diff_with_options_and_font,
+        build_document_diff_sources_with_font, build_line_changes, highlighter_settings,
+        load_repository_diff_with_options_and_font,
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
@@ -553,7 +554,9 @@ pub enum RepositoryAction {
         card: CardId,
         preview: bool,
     },
-    RevertFile { card: CardId },
+    RevertFile {
+        card: CardId,
+    },
     ToggleDiffWhitespace {
         card: CardId,
     },
@@ -630,9 +633,19 @@ pub enum RepositoryAction {
         card: CardId,
         query: String,
     },
-    FindOptionsChanged { card: CardId, option: crate::ui_controls::FindOption, enabled: bool },
-    FindSelectionChanged { card: CardId, enabled: bool },
-    PreserveCaseChanged { card: CardId, enabled: bool },
+    FindOptionsChanged {
+        card: CardId,
+        option: crate::ui_controls::FindOption,
+        enabled: bool,
+    },
+    FindSelectionChanged {
+        card: CardId,
+        enabled: bool,
+    },
+    PreserveCaseChanged {
+        card: CardId,
+        enabled: bool,
+    },
     FindNext {
         card: CardId,
     },
@@ -666,14 +679,40 @@ pub enum RepositoryAction {
         card: CardId,
     },
     SelectDiffRow {
-        identity: AsyncIdentity, basis: DiffBasis, mode: DiffMode, revision: u64,
-        row: usize, side: crate::diff_interaction::Side, extend: bool, context: bool, drag: bool,
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        mode: DiffMode,
+        revision: u64,
+        row: usize,
+        side: crate::diff_interaction::Side,
+        extend: bool,
+        context: bool,
+        drag: bool,
     },
-    EndDiffSelection { card: CardId },
-    MoveDiffSelection { card: CardId, delta: i32, extend: bool },
-    ClearDiffSelection { card: CardId },
-    DiffCommand { card: CardId, generation:u64,revision:u64,mode:DiffMode,sources:[(usize,usize);2], command: crate::diff_interaction::Command },
-    DiffFindLoaded { card: CardId, ticket: uuid::Uuid, result: Result<Option<Vec<crate::diff_interaction::Match>>,String> },
+    EndDiffSelection {
+        card: CardId,
+    },
+    MoveDiffSelection {
+        card: CardId,
+        delta: i32,
+        extend: bool,
+    },
+    ClearDiffSelection {
+        card: CardId,
+    },
+    DiffCommand {
+        card: CardId,
+        generation: u64,
+        revision: u64,
+        mode: DiffMode,
+        sources: [(usize, usize); 2],
+        command: crate::diff_interaction::Command,
+    },
+    DiffFindLoaded {
+        card: CardId,
+        ticket: uuid::Uuid,
+        result: Result<Option<Vec<crate::diff_interaction::Match>>, String>,
+    },
     ZoomFont {
         card: CardId,
         delta: i8,
@@ -691,8 +730,12 @@ pub enum ClipboardOp {
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
-            Self::SelectDiffRow { identity,.. } => identity.card,
-            Self::EndDiffSelection { card } | Self::MoveDiffSelection { card,.. } | Self::ClearDiffSelection { card } | Self::DiffCommand { card,.. } | Self::DiffFindLoaded { card,.. } => *card,
+            Self::SelectDiffRow { identity, .. } => identity.card,
+            Self::EndDiffSelection { card }
+            | Self::MoveDiffSelection { card, .. }
+            | Self::ClearDiffSelection { card }
+            | Self::DiffCommand { card, .. }
+            | Self::DiffFindLoaded { card, .. } => *card,
             Self::Review { card, .. }
             | Self::RefreshFiles { card }
             | Self::ListDirectory { card, .. }
@@ -1763,13 +1806,23 @@ fn added_source_lines(model: &DiffModel) -> Vec<usize> {
 }
 
 fn native_added_lines(snapshot: &text_editor::TextSnapshot, additions: Vec<usize>) -> Vec<usize> {
-    if snapshot.protocol_compatible_lines() { return additions; }
+    if snapshot.protocol_compatible_lines() {
+        return additions;
+    }
     let count = snapshot.line_count();
     let mut source = 0;
     let mut output = Vec::new();
     for native in 0..count {
-        if additions.binary_search(&source).is_ok() { output.push(native); }
-        if native + 1 == count || snapshot.line(native).is_some_and(|line| line.ending.as_str().contains('\n')) { source += 1; }
+        if additions.binary_search(&source).is_ok() {
+            output.push(native);
+        }
+        if native + 1 == count
+            || snapshot
+                .line(native)
+                .is_some_and(|line| line.ending.as_str().contains('\n'))
+        {
+            source += 1;
+        }
     }
     output
 }
@@ -1869,9 +1922,14 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
 
 type FindScope = ((usize, usize), (usize, usize));
 
-fn scoped_matches(matches: &mut Vec<(text_editor::Position, text_editor::Position)>, scope: Option<FindScope>) {
+fn scoped_matches(
+    matches: &mut Vec<(text_editor::Position, text_editor::Position)>,
+    scope: Option<FindScope>,
+) {
     if let Some((first, last)) = scope {
-        matches.retain(|(start, end)| (start.line, start.column) >= first && (end.line, end.column) <= last);
+        matches.retain(|(start, end)| {
+            (start.line, start.column) >= first && (end.line, end.column) <= last
+        });
     }
 }
 
@@ -2467,8 +2525,11 @@ impl RepositoryRuntime {
     fn clipboard(&mut self, card: CardId, op: ClipboardOp) -> Task<RepositoryAction> {
         if self.source_surface == SourceSurface::Diff {
             return match op {
-                ClipboardOp::Copy => self.copy_diff(card,crate::diff_interaction::Command::Copy),
-                ClipboardOp::SelectAll => { self.select_all_diff(); Task::none() },
+                ClipboardOp::Copy => self.copy_diff(card, crate::diff_interaction::Command::Copy),
+                ClipboardOp::SelectAll => {
+                    self.select_all_diff();
+                    Task::none()
+                }
                 _ => Task::none(),
             };
         }
@@ -2923,11 +2984,13 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let diff = self.refresh_diff_visibility(card,true);
-        if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() { return diff; }
+        let diff = self.refresh_diff_visibility(card, true);
+        if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() {
+            return diff;
+        }
         self.background_file_refresh = true;
         let files = self.load_files(card);
-        Task::batch([diff,files])
+        Task::batch([diff, files])
     }
 
     /// Whether a file-list read is genuinely still in flight.
@@ -3143,7 +3206,11 @@ impl RepositoryRuntime {
         self.search_mode = enabled;
     }
 
-    pub fn set_find_preferences(&mut self, options: crate::editor_search::FindOptions, preserve_case: bool) {
+    pub fn set_find_preferences(
+        &mut self,
+        options: crate::editor_search::FindOptions,
+        preserve_case: bool,
+    ) {
         self.replace_preserve_case = preserve_case;
         if self.find_options != options {
             self.find_options = options;
@@ -3156,7 +3223,9 @@ impl RepositoryRuntime {
     }
 
     fn current_selection_scope(&self) -> Option<FindScope> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let cursor = document.content.selected_cursor();
         let anchor = cursor.selection?;
         let first = (anchor.line, anchor.column);
@@ -3285,11 +3354,15 @@ impl RepositoryRuntime {
     /// spanning lines seeds nothing: this search is a substring search, and
     /// a paragraph is not a term anyone meant to look for.
     fn open_find(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.source_surface == SourceSurface::Diff { return self.open_diff_find(card); }
+        if self.source_surface == SourceSurface::Diff {
+            return self.open_diff_find(card);
+        }
         if !self.editable_surface_visible() {
             return Task::none();
         }
-        if self.find_open { return iced::widget::operation::focus(find_focus_id(card)); }
+        if self.find_open {
+            return iced::widget::operation::focus(find_focus_id(card));
+        }
         if let Some(selection) = self.selected_text()
             && !selection.trim().is_empty()
             && !selection.contains('\n')
@@ -3350,7 +3423,10 @@ impl RepositoryRuntime {
     /// Selects one occurrence and records the count that search reported,
     /// which is the only place the count is ever computed.
     fn select_find_match(&mut self, occurrence: usize) {
-        if self.source_surface == SourceSurface::Diff { self.select_diff_match(occurrence); return; }
+        if self.source_surface == SourceSurface::Diff {
+            self.select_diff_match(occurrence);
+            return;
+        }
         self.prepare_find_matches();
         if self.find_cache.as_ref() != self.wanted_find().as_ref() {
             // Keep the requested occurrence while a revision is re-searched;
@@ -3390,7 +3466,10 @@ impl RepositoryRuntime {
     /// Small files search immediately. Larger files clear stale highlights and
     /// let `find_task` scan a reusable immutable snapshot off the update thread.
     fn prepare_find_matches(&mut self) {
-        if self.source_surface == SourceSurface::Diff { self.prepare_diff_find(); return; }
+        if self.source_surface == SourceSurface::Diff {
+            self.prepare_diff_find();
+            return;
+        }
         let Some(wanted) = self.wanted_find() else {
             return;
         };
@@ -3411,7 +3490,10 @@ impl RepositoryRuntime {
         if wanted.query.is_empty()
             || (document.content.line_count() <= 2048 && document.content.text_len() <= 64 * 1024)
         {
-            match document.content.find_matches_with(&wanted.query, wanted.options) {
+            match document
+                .content
+                .find_matches_with(&wanted.query, wanted.options)
+            {
                 Ok(mut matches) => {
                     scoped_matches(&mut matches, wanted.selection);
                     self.find_matches = matches;
@@ -3425,7 +3507,9 @@ impl RepositoryRuntime {
     /// Only one CPU worker is outstanding, including after cancellation. A
     /// completed superseded query releases that slot before the latest starts.
     fn find_task(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.source_surface == SourceSurface::Diff { return self.diff_find_task(card); }
+        if self.source_surface == SourceSurface::Diff {
+            return self.diff_find_task(card);
+        }
         self.prepare_find_matches();
         let Some(key) = self.wanted_find() else {
             return Task::none();
@@ -3461,8 +3545,14 @@ impl RepositoryRuntime {
         });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                snapshot.find_matches_with(&key.query, key.options, || cancellation.is_cancelled())
-                    .map(|result| result.map(|mut matches| { scoped_matches(&mut matches, key.selection); matches }))
+                snapshot
+                    .find_matches_with(&key.query, key.options, || cancellation.is_cancelled())
+                    .map(|result| {
+                        result.map(|mut matches| {
+                            scoped_matches(&mut matches, key.selection);
+                            matches
+                        })
+                    })
             })
             .await
             .map_err(|error| format!("Find worker failed: {error}"))
@@ -3517,7 +3607,10 @@ impl RepositoryRuntime {
     /// Without this the strip keeps claiming "3 of 7" over text that no
     /// longer contains seven of anything.
     fn refresh_find_matches(&mut self) {
-        if self.source_surface == SourceSurface::Diff { self.select_diff_match(self.find_index); return; }
+        if self.source_surface == SourceSurface::Diff {
+            self.select_diff_match(self.find_index);
+            return;
+        }
         if !self.find_open {
             return;
         }
@@ -3936,8 +4029,16 @@ impl RepositoryRuntime {
         let untracked = self.subject_file()?.status.as_deref() == Some("??");
         Some(crate::repository::DiscardRequest {
             worktree: self.descriptor.worktree.clone(),
-            tracked: if untracked { Vec::new() } else { vec![selection.clone()] },
-            untracked: if untracked { vec![selection.path] } else { Vec::new() },
+            tracked: if untracked {
+                Vec::new()
+            } else {
+                vec![selection.clone()]
+            },
+            untracked: if untracked {
+                vec![selection.path]
+            } else {
+                Vec::new()
+            },
             confirmed: false,
         })
     }
@@ -4216,22 +4317,33 @@ impl RepositoryRuntime {
     pub fn set_diff_surface_visible(&mut self, visible: bool) {
         self.diff_surface_visible = visible;
         if !visible {
-            if let Some(active) = &self.working_diff.active && active.rich { active.cancellation.cancel(); }
+            if let Some(active) = &self.working_diff.active
+                && active.rich
+            {
+                active.cancellation.cancel();
+            }
             // Dropping the loading state cancels an initial repository diff as
             // well as live-buffer work. Completed models remain reusable.
-            self.diffs.retain(|(_,state)| !matches!(state,DiffState::Loading { .. }));
+            self.diffs
+                .retain(|(_, state)| !matches!(state, DiffState::Loading { .. }));
         }
     }
 
     /// Visibility transitions schedule work themselves: revealing a pane must
     /// not wait for another edit, and overscan must not retain rich CPU work.
-    pub fn refresh_diff_visibility(&mut self, card:CardId, visible:bool)->Task<RepositoryAction> {
+    pub fn refresh_diff_visibility(
+        &mut self,
+        card: CardId,
+        visible: bool,
+    ) -> Task<RepositoryAction> {
         self.set_diff_surface_visible(visible);
-        Task::batch([self.ensure_current_diff(card),self.working_diff_task(card)])
+        Task::batch([self.ensure_current_diff(card), self.working_diff_task(card)])
     }
 
     #[cfg(test)]
-    pub(crate) fn diff_surface_is_visible(&self)->bool { self.diff_surface_visible }
+    pub(crate) fn diff_surface_is_visible(&self) -> bool {
+        self.diff_surface_visible
+    }
 
     fn wants_rich_working_diff(&self) -> bool {
         self.diff_surface_visible && self.source_surface == SourceSurface::Diff
@@ -4252,7 +4364,14 @@ impl RepositoryRuntime {
         if revision_changed || rich != self.working_diff.desired_rich {
             self.working_diff.desired = wanted;
             self.working_diff.desired_rich = rich;
-            self.working_diff.deadline = Some(Instant::now() + if revision_changed { Duration::from_millis(180) } else { Duration::ZERO });
+            self.working_diff.deadline = Some(
+                Instant::now()
+                    + if revision_changed {
+                        Duration::from_millis(180)
+                    } else {
+                        Duration::ZERO
+                    },
+            );
             if self.working_diff.error.take().is_some() {
                 self.working_diff.applied = None;
             }
@@ -4297,9 +4416,7 @@ impl RepositoryRuntime {
         let Some((_, revision, before)) = self.wanted_working_diff() else {
             return Task::none();
         };
-        if self.working_diff.active.is_some()
-            || self.working_diff_current()
-        {
+        if self.working_diff.active.is_some() || self.working_diff_current() {
             return Task::none();
         }
         let DocumentState::Editable(document) = &self.document else {
@@ -4411,7 +4528,8 @@ impl RepositoryRuntime {
                                 new_label: "Working buffer".into(),
                             }),
                         );
-                        self.diff_change = self.diff_change.min(self.change_count().saturating_sub(1));
+                        self.diff_change =
+                            self.diff_change.min(self.change_count().saturating_sub(1));
                         installed = true;
                     }
                 }
@@ -4766,24 +4884,36 @@ impl RepositoryRuntime {
     }
 
     fn diff_typography(&self) -> DiffTypography {
-        DiffTypography { font: self.editor_font, size: self.editor_font_size, line_height: self.editor_font_size * self.line_height }
+        DiffTypography {
+            font: self.editor_font,
+            size: self.editor_font_size,
+            line_height: self.editor_font_size * self.line_height,
+        }
     }
 
     fn update_diff_typography(&mut self) {
         let anchor = self.current_diff_viewport();
         let height = self.diff_typography().line_height;
         for (_, state) in &mut self.diffs {
-            if let DiffState::Ready(_, layout) = state { layout.set_row_height(height); }
+            if let DiffState::Ready(_, layout) = state {
+                layout.set_row_height(height);
+            }
         }
-        if let Some((_, _, DiffState::Ready(_, layout))) = &mut self.stale_diff { layout.set_row_height(height); }
+        if let Some((_, _, DiffState::Ready(_, layout))) = &mut self.stale_diff {
+            layout.set_row_height(height);
+        }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         self.apply_diff_viewport(anchor);
     }
 
-    pub fn restore_font_viewport(&self) -> Task<RepositoryAction> { self.restore_visible_scroll() }
+    pub fn restore_font_viewport(&self) -> Task<RepositoryAction> {
+        self.restore_visible_scroll()
+    }
 
     pub fn set_editor_font(&mut self, font: Font, size: f32) {
-        if self.editor_font == font && self.editor_font_size == size { return; }
+        if self.editor_font == font && self.editor_font_size == size {
+            return;
+        }
         let family_changed = self.editor_font != font;
         let anchor = self.current_diff_viewport();
         self.editor_font = font;
@@ -4798,7 +4928,9 @@ impl RepositoryRuntime {
             self.pending_diff_anchor = Some(anchor);
             self.working_diff.applied = None;
             self.working_diff.desired = None;
-            if let Some(active) = &self.working_diff.active { active.cancellation.cancel(); }
+            if let Some(active) = &self.working_diff.active {
+                active.cancellation.cancel();
+            }
             self.clear_diff_selection();
             self.clear_diff_find();
         }
@@ -5411,7 +5543,10 @@ impl RepositoryRuntime {
                 if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
                 }
-                let moved = !matches!(action, text_editor::Action::Edit(_) | text_editor::Action::Scroll { .. });
+                let moved = !matches!(
+                    action,
+                    text_editor::Action::Edit(_) | text_editor::Action::Scroll { .. }
+                );
                 let applied = match &mut self.document {
                     DocumentState::Editable(document) => document.apply(action),
                     _ => Applied::Unchanged,
@@ -5426,9 +5561,11 @@ impl RepositoryRuntime {
                         self.markdown_task(card)
                     }
                     Applied::Unchanged => {
-                        if self.find_open && moved { self.find_selection_candidate = self.current_selection_scope(); }
+                        if self.find_open && moved {
+                            self.find_selection_candidate = self.current_selection_scope();
+                        }
                         Task::none()
-                    },
+                    }
                 }
             }
             RepositoryAction::Language { action, .. } => {
@@ -5609,7 +5746,11 @@ impl RepositoryRuntime {
                 }
                 // The toolbar button took the keyboard; give it back so the
                 // Ctrl+Z its tooltip promises reaches the buffer.
-                Task::batch([self.markdown_task(card), self.restore_visible_scroll(), self.focus_editor(card)])
+                Task::batch([
+                    self.markdown_task(card),
+                    self.restore_visible_scroll(),
+                    self.focus_editor(card),
+                ])
             }
             RepositoryAction::Undo { card } => self.step_history(card, false),
             RepositoryAction::Redo { card } => self.step_history(card, true),
@@ -5648,7 +5789,9 @@ impl RepositoryRuntime {
                 self.source_surface = surface;
                 self.find_cache = None;
                 self.clear_diff_find();
-                if self.find_open { self.refresh_find_matches(); }
+                if self.find_open {
+                    self.refresh_find_matches();
+                }
                 self.restore_native_viewport();
                 Task::batch([
                     self.ensure_current_diff(card),
@@ -6051,17 +6194,28 @@ impl RepositoryRuntime {
                 self.select_find_match(0);
                 Task::none()
             }
-            RepositoryAction::FindOptionsChanged { option, enabled, .. } => {
+            RepositoryAction::FindOptionsChanged {
+                option, enabled, ..
+            } => {
                 match option {
-                    crate::ui_controls::FindOption::CaseSensitive => self.find_options.case_sensitive = enabled,
+                    crate::ui_controls::FindOption::CaseSensitive => {
+                        self.find_options.case_sensitive = enabled
+                    }
                     crate::ui_controls::FindOption::Regex => self.find_options.regex = enabled,
-                    crate::ui_controls::FindOption::WholeWord => self.find_options.whole_word = enabled,
+                    crate::ui_controls::FindOption::WholeWord => {
+                        self.find_options.whole_word = enabled
+                    }
                 }
                 self.select_find_match(0);
                 Task::none()
             }
             RepositoryAction::FindSelectionChanged { enabled, .. } => {
-                self.find_selection = enabled.then(|| self.find_selection_candidate.or_else(|| self.current_selection_scope())).flatten();
+                self.find_selection = enabled
+                    .then(|| {
+                        self.find_selection_candidate
+                            .or_else(|| self.current_selection_scope())
+                    })
+                    .flatten();
                 self.select_find_match(0);
                 Task::none()
             }
@@ -6071,11 +6225,19 @@ impl RepositoryRuntime {
             }
             RepositoryAction::FindNext { .. } => {
                 self.step_find(true);
-                if self.shows_diff() { self.restore_visible_scroll() } else { Task::none() }
+                if self.shows_diff() {
+                    self.restore_visible_scroll()
+                } else {
+                    Task::none()
+                }
             }
             RepositoryAction::FindPrevious { .. } => {
                 self.step_find(false);
-                if self.shows_diff() { self.restore_visible_scroll() } else { Task::none() }
+                if self.shows_diff() {
+                    self.restore_visible_scroll()
+                } else {
+                    Task::none()
+                }
             }
             RepositoryAction::FindInputFocus { focused, .. } => {
                 self.find_input_focused = focused;
@@ -6090,7 +6252,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ToggleReplace { .. } => {
-                if self.shows_diff() { return Task::none(); }
+                if self.shows_diff() {
+                    return Task::none();
+                }
                 self.replace_open = !self.replace_open;
                 Task::none()
             }
@@ -6106,10 +6270,18 @@ impl RepositoryRuntime {
                 }
                 if all {
                     let snapshot = document.content.search_snapshot();
-                    let text = match snapshot.replace_matches_with(&self.find_matches, &self.find_query,
-                        &self.replace_query, self.find_options, self.replace_preserve_case) {
+                    let text = match snapshot.replace_matches_with(
+                        &self.find_matches,
+                        &self.find_query,
+                        &self.replace_query,
+                        self.find_options,
+                        self.replace_preserve_case,
+                    ) {
                         Ok(text) => text,
-                        Err(error) => { self.find_error = Some(error); return Task::none(); }
+                        Err(error) => {
+                            self.find_error = Some(error);
+                            return Task::none();
+                        }
                     };
                     document.content.perform(text_editor::Action::SelectAll);
                     document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
@@ -6118,18 +6290,31 @@ impl RepositoryRuntime {
                 } else {
                     let (start, end) = self.find_matches[self.find_index];
                     let replacement = document.content.with_line(start.line, |line, _| {
-                        crate::editor_search::replacement(line, start.column, end.column, &self.find_query,
-                            &self.replace_query, self.find_options, self.replace_preserve_case)
+                        crate::editor_search::replacement(
+                            line,
+                            start.column,
+                            end.column,
+                            &self.find_query,
+                            &self.replace_query,
+                            self.find_options,
+                            self.replace_preserve_case,
+                        )
                     });
                     let replacement = match replacement {
                         Some(Ok(replacement)) => replacement,
-                        _ => { self.find_error = Some("The selected match changed; search again.".into()); return Task::none(); }
+                        _ => {
+                            self.find_error =
+                                Some("The selected match changed; search again.".into());
+                            return Task::none();
+                        }
                     };
                     document.content.move_to(text_editor::Cursor {
                         position: end,
                         selection: Some(start),
                     });
-                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(replacement))));
+                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(replacement),
+                    )));
                 }
                 self.push_lsp_change(None);
                 self.markdown_task(card)
@@ -6146,15 +6331,44 @@ impl RepositoryRuntime {
                 self.set_diff_ignore_whitespace(!self.diff_ignore_whitespace);
                 self.ensure_current_diff(card)
             }
-            RepositoryAction::SelectDiffRow { identity,basis,mode,revision,row,side,extend,context,drag } => {
-                self.select_diff_row(identity,basis,mode,revision,row,side,extend,context,drag);
+            RepositoryAction::SelectDiffRow {
+                identity,
+                basis,
+                mode,
+                revision,
+                row,
+                side,
+                extend,
+                context,
+                drag,
+            } => {
+                self.select_diff_row(
+                    identity, basis, mode, revision, row, side, extend, context, drag,
+                );
                 Task::none()
             }
-            RepositoryAction::EndDiffSelection { .. } => { self.diff_interaction.dragging = false; Task::none() }
-            RepositoryAction::MoveDiffSelection { delta,extend,.. } => self.move_diff_selection(delta,extend),
-            RepositoryAction::ClearDiffSelection { .. } => { self.clear_diff_selection(); Task::none() }
-            RepositoryAction::DiffCommand { card,generation,revision,mode,sources,command } => self.run_diff_command(card,generation,revision,mode,sources,command),
-            RepositoryAction::DiffFindLoaded { ticket,result,.. } => self.finish_diff_find(ticket,result),
+            RepositoryAction::EndDiffSelection { .. } => {
+                self.diff_interaction.dragging = false;
+                Task::none()
+            }
+            RepositoryAction::MoveDiffSelection { delta, extend, .. } => {
+                self.move_diff_selection(delta, extend)
+            }
+            RepositoryAction::ClearDiffSelection { .. } => {
+                self.clear_diff_selection();
+                Task::none()
+            }
+            RepositoryAction::DiffCommand {
+                card,
+                generation,
+                revision,
+                mode,
+                sources,
+                command,
+            } => self.run_diff_command(card, generation, revision, mode, sources, command),
+            RepositoryAction::DiffFindLoaded { ticket, result, .. } => {
+                self.finish_diff_find(ticket, result)
+            }
             RepositoryAction::ZoomFont { .. } | RepositoryAction::RevertFile { .. } => Task::none(),
         }
     }
@@ -6168,8 +6382,13 @@ impl RepositoryRuntime {
     }
 
     fn set_diff_state(&mut self, basis: DiffBasis, mut state: DiffState) {
-        if basis == self.diff_basis { self.clear_diff_selection(); self.clear_diff_find(); }
-        if let DiffState::Ready(_, layout) = &mut state { layout.set_row_height(self.diff_typography().line_height); }
+        if basis == self.diff_basis {
+            self.clear_diff_selection();
+            self.clear_diff_find();
+        }
+        if let DiffState::Ready(_, layout) = &mut state {
+            layout.set_row_height(self.diff_typography().line_height);
+        }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         // The rows on screen before a rebuild, which a rebuild must not move:
@@ -6260,7 +6479,8 @@ impl RepositoryRuntime {
     /// discarding its expensive result later.
     fn ensure_current_diff(&mut self, card: CardId) -> Task<RepositoryAction> {
         let showing_diff = self.diff_surface_visible
-            && self.source_surface == SourceSurface::Diff && self.basis_resolution.is_none();
+            && self.source_surface == SourceSurface::Diff
+            && self.basis_resolution.is_none();
         self.diffs.retain(|(basis, state)| {
             !matches!(state, DiffState::Loading { .. })
                 || (showing_diff && *basis == self.diff_basis)
@@ -6578,18 +6798,35 @@ impl RepositoryRuntime {
     }
 
     fn align_diff_to_editor(&mut self) {
-        if !self.editable_surface_visible() { return; }
-        let Some(model) = self.diff_model() else { return; };
+        if !self.editable_surface_visible() {
+            return;
+        }
+        let Some(model) = self.diff_model() else {
+            return;
+        };
         let position = self.viewports.editor;
-        let Some(row) = model.row_at_new_line(self.diff_mode, position.line.saturating_add(1) as u32) else { return; };
+        let Some(row) =
+            model.row_at_new_line(self.diff_mode, position.line.saturating_add(1) as u32)
+        else {
+            return;
+        };
         let hidden = self.diff_layout().and_then(|layout| {
             let folded = layout.folded(self.diff_mode);
-            match folded.row(folded.display(row)) { DisplayRow::Fold { fold, .. } => Some(fold), _ => None }
+            match folded.row(folded.display(row)) {
+                DisplayRow::Fold { fold, .. } => Some(fold),
+                _ => None,
+            }
         });
-        if let Some(fold) = hidden { drop(self.expand_diff_fold(fold, FoldExpansion::All)); }
-        let fraction = (position.vertical / (self.editor_font_size * self.line_height)).clamp(0.0, 1.0);
+        if let Some(fold) = hidden {
+            drop(self.expand_diff_fold(fold, FoldExpansion::All));
+        }
+        let fraction =
+            (position.vertical / (self.editor_font_size * self.line_height)).clamp(0.0, 1.0);
         self.apply_diff_viewport(DiffViewportAnchor {
-            row: Some(diff_layout::Anchor::Row { row, fraction: fraction as f64 }),
+            row: Some(diff_layout::Anchor::Row {
+                row,
+                fraction: fraction as f64,
+            }),
             horizontal: position.horizontal,
             first_change: false,
             ..self.current_diff_viewport()
@@ -8026,7 +8263,10 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     }
     // Diff navigation follows the file it compares: view modes, file
     // actions, then diff scope.
-    if runtime.source_surface != SourceSurface::Diff && !runtime.directory_only && !runtime.reviews_pull_request() {
+    if runtime.source_surface != SourceSurface::Diff
+        && !runtime.directory_only
+        && !runtime.reviews_pull_request()
+    {
         controls.push(diff_basis_controls(card, runtime));
     }
     if editing && runtime.lsp_document.is_some() {
@@ -8098,27 +8338,27 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     if runtime.source_surface == SourceSurface::Diff {
         controls.extend(secondary);
     } else {
-    // The common commands stay visible. File, comparison, review and external
-    // editor commands use a popover rather than clipping an icon rail.
-    let primary_count = if editable { 2 } else { 1 };
-    let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
-    overflow.extend(secondary);
-    let more = icon_button(Icon::More, "More file actions")
-        .selected(runtime.toolbar_overflow_open)
-        .on_press(RepositoryAction::ToggleToolbarOverflow { card });
-    controls.push(crate::ui_controls::popover(
-        more,
-        runtime.toolbar_overflow_open.then(|| {
-            widget::container(
-                widget::column::with_children(overflow)
-                    .spacing(crate::design::TOOLBAR_GROUP_SPACING),
-            )
-            .padding(crate::design::TOOLBAR_INSET)
-            .into()
-        }),
-        widget::popover::Position::Bottom,
-        RepositoryAction::CloseToolbarOverflow { card },
-    ));
+        // The common commands stay visible. File, comparison, review and external
+        // editor commands use a popover rather than clipping an icon rail.
+        let primary_count = if editable { 2 } else { 1 };
+        let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
+        overflow.extend(secondary);
+        let more = icon_button(Icon::More, "More file actions")
+            .selected(runtime.toolbar_overflow_open)
+            .on_press(RepositoryAction::ToggleToolbarOverflow { card });
+        controls.push(crate::ui_controls::popover(
+            more,
+            runtime.toolbar_overflow_open.then(|| {
+                widget::container(
+                    widget::column::with_children(overflow)
+                        .spacing(crate::design::TOOLBAR_GROUP_SPACING),
+                )
+                .padding(crate::design::TOOLBAR_INSET)
+                .into()
+            }),
+            widget::popover::Position::Bottom,
+            RepositoryAction::CloseToolbarOverflow { card },
+        ));
     }
     let actions = widget::row::with_children(controls)
         .spacing(crate::design::TOOLBAR_GROUP_SPACING)
@@ -8147,12 +8387,22 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     let mut rows = vec![toolbar.into()];
     if runtime.source_surface == SourceSurface::Diff {
         let mapper = map.clone();
-        rows.push(crate::ui_controls::responsive(move |size| {
-            diff_action_toolbar(card, runtime, size.width).map(mapper.clone())
-        }).height(Length::Shrink).into());
+        rows.push(
+            crate::ui_controls::responsive(move |size| {
+                diff_action_toolbar(card, runtime, size.width).map(mapper.clone())
+            })
+            .height(Length::Shrink)
+            .into(),
+        );
     }
-    if let Some(find) = find_strip(card, runtime) { rows.push(find.map(map)); }
-    Some(widget::column::with_children(rows).width(Length::Fill).into())
+    if let Some(find) = find_strip(card, runtime) {
+        rows.push(find.map(map));
+    }
+    Some(
+        widget::column::with_children(rows)
+            .width(Length::Fill)
+            .into(),
+    )
 }
 
 /// The find strip, while find is open over a buffer that is on screen.
@@ -8165,10 +8415,17 @@ fn find_strip<'a>(
     }
     let matched = runtime.find_total != 0;
     let mut row: Vec<Element<'a, RepositoryAction>> = vec![
-        icon_button(Icon::Search, if runtime.shows_diff() { "Find in diff" } else { "Find and replace" })
-            .selected(runtime.replace_open && !runtime.shows_diff())
-            .on_press_maybe((!runtime.shows_diff()).then_some(RepositoryAction::ToggleReplace { card }))
-            .into(),
+        icon_button(
+            Icon::Search,
+            if runtime.shows_diff() {
+                "Find in diff"
+            } else {
+                "Find and replace"
+            },
+        )
+        .selected(runtime.replace_open && !runtime.shows_diff())
+        .on_press_maybe((!runtime.shows_diff()).then_some(RepositoryAction::ToggleReplace { card }))
+        .into(),
         crate::ui_controls::field::search("Find in file", &runtime.find_query)
             .id(find_focus_id(card))
             .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
@@ -8183,14 +8440,30 @@ fn find_strip<'a>(
             .width(Length::Fill)
             .into(),
     ];
-    row.push(crate::ui_controls::find_options(runtime.find_options.case_sensitive, runtime.find_options.regex,
-        runtime.find_options.whole_word, true,
-        move |option, enabled| RepositoryAction::FindOptionsChanged { card, option, enabled }));
+    row.push(crate::ui_controls::find_options(
+        runtime.find_options.case_sensitive,
+        runtime.find_options.regex,
+        runtime.find_options.whole_word,
+        true,
+        move |option, enabled| RepositoryAction::FindOptionsChanged {
+            card,
+            option,
+            enabled,
+        },
+    ));
     if !runtime.shows_diff() {
-    let selection_enabled = runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
-    let mut selection = crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
-    if selection_enabled { selection = selection.on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled }); }
-    row.push(crate::interaction::tooltip(selection, "Search the selection captured when enabled").into());
+        let selection_enabled =
+            runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
+        let mut selection = crate::ui_controls::field::checkbox(runtime.find_selection.is_some())
+            .label("Selection");
+        if selection_enabled {
+            selection = selection
+                .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
+        }
+        row.push(
+            crate::interaction::tooltip(selection, "Search the selection captured when enabled")
+                .into(),
+        );
     }
     // A count is read off the cache the search filled in; an empty query has
     // not searched for anything and says nothing rather than "No results".
@@ -8198,7 +8471,11 @@ fn find_strip<'a>(
         row.push(
             crate::design::caption(if let Some(error) = &runtime.find_error {
                 error.clone()
-            } else if if runtime.shows_diff() { runtime.diff_find_pending() } else { runtime.find_cache.as_ref() != runtime.wanted_find().as_ref() } {
+            } else if if runtime.shows_diff() {
+                runtime.diff_find_pending()
+            } else {
+                runtime.find_cache.as_ref() != runtime.wanted_find().as_ref()
+            } {
                 "Searching…".to_owned()
             } else if matched {
                 format!("{} of {}", runtime.find_index + 1, runtime.find_total)
@@ -8244,9 +8521,19 @@ fn find_strip<'a>(
                     .width(Length::Fill)
                     .into(),
                 {
-                    let mut preserve = crate::ui_controls::field::checkbox(runtime.replace_preserve_case).label("Preserve case");
-                    if !runtime.find_options.regex { preserve = preserve.on_toggle(move |enabled| RepositoryAction::PreserveCaseChanged { card, enabled }); }
-                    crate::interaction::tooltip(preserve, "Keep each matched word's upper, lower or title case (plain text)").into()
+                    let mut preserve =
+                        crate::ui_controls::field::checkbox(runtime.replace_preserve_case)
+                            .label("Preserve case");
+                    if !runtime.find_options.regex {
+                        preserve = preserve.on_toggle(move |enabled| {
+                            RepositoryAction::PreserveCaseChanged { card, enabled }
+                        });
+                    }
+                    crate::interaction::tooltip(
+                        preserve,
+                        "Keep each matched word's upper, lower or title case (plain text)",
+                    )
+                    .into()
                 },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
@@ -8936,57 +9223,171 @@ fn labelled_diff_control<'a>(
 fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
     let selected = match &runtime.basis_resolution {
         Some(BasisResolution::Resolving(choice)) => Some(BasisChoice::Committed(*choice)),
-        Some(BasisResolution::NeedsBase(_)) => Some(BasisChoice::Committed(CommittedChoice::Branch)),
+        Some(BasisResolution::NeedsBase(_)) => {
+            Some(BasisChoice::Committed(CommittedChoice::Branch))
+        }
         Some(BasisResolution::NoCommits | BasisResolution::Unavailable(_)) => None,
         None => basis_choice(&runtime.diff_basis),
     };
     let mut controls = Vec::new();
     for (label, tip, choice, enabled, action) in [
-        ("Working", "Compare index with working tree", BasisChoice::Unstaged, runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree), RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::IndexToWorktree }),
-        ("Staged", "Compare HEAD with index", BasisChoice::Staged, runtime.can_select_diff_basis(&DiffBasis::HeadToIndex), RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex }),
-        ("Branch", "Compare branch with base", BasisChoice::Committed(CommittedChoice::Branch), runtime.can_select_committed_basis(CommittedChoice::Branch), RepositoryAction::SelectCommittedBasis { card, choice: CommittedChoice::Branch }),
-        ("History", "Compare last commit with its parent", BasisChoice::Committed(CommittedChoice::LastCommit), runtime.can_select_committed_basis(CommittedChoice::LastCommit), RepositoryAction::SelectCommittedBasis { card, choice: CommittedChoice::LastCommit }),
+        (
+            "Working",
+            "Compare index with working tree",
+            BasisChoice::Unstaged,
+            runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree),
+            RepositoryAction::ApplyDiffBasis {
+                card,
+                basis: DiffBasis::IndexToWorktree,
+            },
+        ),
+        (
+            "Staged",
+            "Compare HEAD with index",
+            BasisChoice::Staged,
+            runtime.can_select_diff_basis(&DiffBasis::HeadToIndex),
+            RepositoryAction::ApplyDiffBasis {
+                card,
+                basis: DiffBasis::HeadToIndex,
+            },
+        ),
+        (
+            "Branch",
+            "Compare branch with base",
+            BasisChoice::Committed(CommittedChoice::Branch),
+            runtime.can_select_committed_basis(CommittedChoice::Branch),
+            RepositoryAction::SelectCommittedBasis {
+                card,
+                choice: CommittedChoice::Branch,
+            },
+        ),
+        (
+            "History",
+            "Compare last commit with its parent",
+            BasisChoice::Committed(CommittedChoice::LastCommit),
+            runtime.can_select_committed_basis(CommittedChoice::LastCommit),
+            RepositoryAction::SelectCommittedBasis {
+                card,
+                choice: CommittedChoice::LastCommit,
+            },
+        ),
     ] {
-        controls.push(labelled_diff_control(label, tip, enabled && selected == Some(choice), enabled.then_some(action)));
+        controls.push(labelled_diff_control(
+            label,
+            tip,
+            enabled && selected == Some(choice),
+            enabled.then_some(action),
+        ));
     }
     crate::ui_controls::segmented_controls(controls)
 }
 
-fn diff_action_toolbar(card: CardId, runtime: &RepositoryRuntime, width: f32) -> Element<'_, RepositoryAction> {
+fn diff_action_toolbar(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    width: f32,
+) -> Element<'_, RepositoryAction> {
     let mut rows = Vec::new();
     let mut actions = Vec::new();
     if !runtime.reviews_pull_request() {
         let subject = runtime.subject_file();
         for (stage, label, enabled) in [
-            (true, "Stage", subject.as_ref().is_some_and(|file| file.unstaged)),
-            (false, "Unstage", subject.as_ref().is_some_and(|file| file.staged)),
+            (
+                true,
+                "Stage",
+                subject.as_ref().is_some_and(|file| file.unstaged),
+            ),
+            (
+                false,
+                "Unstage",
+                subject.as_ref().is_some_and(|file| file.staged),
+            ),
         ] {
-            actions.push(labelled_diff_control(label, if stage { "Stage file changes · Ctrl+Shift+S" } else { "Unstage file changes · Ctrl+Shift+S when no unstaged changes" }, false,
-                (enabled && !runtime.mutation_refresh_pending && !runtime.blocks_navigation()).then_some(RepositoryAction::StageSelected { card, stage })));
+            actions.push(labelled_diff_control(
+                label,
+                if stage {
+                    "Stage file changes · Ctrl+Shift+S"
+                } else {
+                    "Unstage file changes · Ctrl+Shift+S when no unstaged changes"
+                },
+                false,
+                (enabled && !runtime.mutation_refresh_pending && !runtime.blocks_navigation())
+                    .then_some(RepositoryAction::StageSelected { card, stage }),
+            ));
         }
-        let revert = if runtime.can_discard_edits() { Some(RepositoryAction::DiscardEdits { card }) } else { runtime.selected_discard_request().map(|_| RepositoryAction::RevertFile { card }) };
-        actions.push(labelled_diff_control("Revert",if runtime.can_discard_edits() { "Discard unsaved edits · Ctrl+Z restores them" } else { "Revert working tree file changes…" },false,revert));
+        let revert = if runtime.can_discard_edits() {
+            Some(RepositoryAction::DiscardEdits { card })
+        } else {
+            runtime
+                .selected_discard_request()
+                .map(|_| RepositoryAction::RevertFile { card })
+        };
+        actions.push(labelled_diff_control(
+            "Revert",
+            if runtime.can_discard_edits() {
+                "Discard unsaved edits · Ctrl+Z restores them"
+            } else {
+                "Revert working tree file changes…"
+            },
+            false,
+            revert,
+        ));
     }
-    actions.push(labelled_diff_control("Ignore whitespace", "Ignore horizontal whitespace in every diff", runtime.diff_ignore_whitespace, Some(RepositoryAction::ToggleDiffWhitespace { card })));
+    actions.push(labelled_diff_control(
+        "Ignore whitespace",
+        "Ignore horizontal whitespace in every diff",
+        runtime.diff_ignore_whitespace,
+        Some(RepositoryAction::ToggleDiffWhitespace { card }),
+    ));
     let mut basis = Vec::new();
-    if !runtime.directory_only && !runtime.reviews_pull_request() { basis.push(diff_basis_controls(card,runtime)); }
+    if !runtime.directory_only && !runtime.reviews_pull_request() {
+        basis.push(diff_basis_controls(card, runtime));
+    }
     if let Some(model) = runtime.diff_model() {
-        let counts = crate::repository::line_change_counts(Some(u64::from(model.additions)),Some(u64::from(model.deletions)));
+        let counts = crate::repository::line_change_counts(
+            Some(u64::from(model.additions)),
+            Some(u64::from(model.deletions)),
+        );
         if !counts.is_empty() {
-            if runtime.reviews_pull_request() { actions.push(crate::ui_controls::change_counts(&counts)); }
-            else { basis.push(crate::ui_controls::change_counts(&counts)); }
+            if runtime.reviews_pull_request() {
+                actions.push(crate::ui_controls::change_counts(&counts));
+            } else {
+                basis.push(crate::ui_controls::change_counts(&counts));
+            }
         }
     }
-    rows.push(widget::row::with_children(actions).spacing(space::XS).align_y(Alignment::Center).into());
-    if !basis.is_empty() { rows.push(widget::row::with_children(basis).spacing(space::S).align_y(Alignment::Center).into()); }
-    rows.push(diff_review_controls(card,runtime));
+    rows.push(
+        widget::row::with_children(actions)
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .into(),
+    );
+    if !basis.is_empty() {
+        rows.push(
+            widget::row::with_children(basis)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+        );
+    }
+    rows.push(diff_review_controls(card, runtime));
     let contents = widget::column::with_children(rows).spacing(space::XS);
     if width >= 340.0 {
-        widget::container(contents).padding([space::XS,crate::design::TOOLBAR_INSET]).width(Length::Fill).into()
+        widget::container(contents)
+            .padding([space::XS, crate::design::TOOLBAR_INSET])
+            .width(Length::Fill)
+            .into()
     } else {
         crate::ui_controls::popover(
-            labelled_diff_control("Diff actions ⋮", "Diff actions", runtime.toolbar_overflow_open, Some(RepositoryAction::ToggleToolbarOverflow { card })),
-            runtime.toolbar_overflow_open.then(|| widget::container(contents).padding(space::S).into()),
+            labelled_diff_control(
+                "Diff actions ⋮",
+                "Diff actions",
+                runtime.toolbar_overflow_open,
+                Some(RepositoryAction::ToggleToolbarOverflow { card }),
+            ),
+            runtime
+                .toolbar_overflow_open
+                .then(|| widget::container(contents).padding(space::S).into()),
             widget::popover::Position::Bottom,
             RepositoryAction::CloseToolbarOverflow { card },
         )
@@ -9025,15 +9426,32 @@ fn diff_review_controls(
             "Refreshing diff",
         ),
         crate::ui_controls::segmented_controls(vec![
-            labelled_diff_control("Unified", "Unified diff", runtime.diff_mode == DiffMode::Inline,
-                runtime.can_change_diff_layout().then_some(RepositoryAction::ApplyDiffMode { card, split: false })),
-            labelled_diff_control("Split", "Side-by-side diff", runtime.diff_mode == DiffMode::Split,
-                runtime.can_change_diff_layout().then_some(RepositoryAction::ApplyDiffMode { card, split: true })),
+            labelled_diff_control(
+                "Unified",
+                "Unified diff",
+                runtime.diff_mode == DiffMode::Inline,
+                runtime
+                    .can_change_diff_layout()
+                    .then_some(RepositoryAction::ApplyDiffMode { card, split: false }),
+            ),
+            labelled_diff_control(
+                "Split",
+                "Side-by-side diff",
+                runtime.diff_mode == DiffMode::Split,
+                runtime
+                    .can_change_diff_layout()
+                    .then_some(RepositoryAction::ApplyDiffMode { card, split: true }),
+            ),
         ]),
         // Navigation commands are a plain cluster, distinct from mode choices.
         toolbar_group(vec![
-            labelled_diff_control("Previous", "Previous hunk · Alt+K / Shift+F7", false,
-                (runtime.can_navigate_diff() && runtime.change_target(false).is_some()).then_some(RepositoryAction::PreviousChange { card })),
+            labelled_diff_control(
+                "Previous",
+                "Previous hunk · Alt+K / Shift+F7",
+                false,
+                (runtime.can_navigate_diff() && runtime.change_target(false).is_some())
+                    .then_some(RepositoryAction::PreviousChange { card }),
+            ),
             crate::interaction::tooltip(
                 // A fixed width, because this label sits between the two
                 // controls a reader presses repeatedly and "1/4" and "12/128"
@@ -9051,8 +9469,13 @@ fn diff_review_controls(
                 .width(Length::Fixed(crate::design::STEPPER_LABEL_WIDTH)),
                 basis_label(&runtime.diff_basis),
             ),
-            labelled_diff_control("Next", "Next hunk · Alt+J / F7", false,
-                (runtime.can_navigate_diff() && runtime.change_target(true).is_some()).then_some(RepositoryAction::NextChange { card })),
+            labelled_diff_control(
+                "Next",
+                "Next hunk · Alt+J / F7",
+                false,
+                (runtime.can_navigate_diff() && runtime.change_target(true).is_some())
+                    .then_some(RepositoryAction::NextChange { card }),
+            ),
         ]),
     ];
     if runtime.can_retry_diff() {
@@ -9260,7 +9683,10 @@ fn diff_model_view<'a>(
     new_label: &'a str,
     review: Option<&'a crate::pull_request_review::State>,
 ) -> Element<'a, RepositoryAction> {
-    let rows: Element<'a, RepositoryAction> = if model.is_empty() && review.is_none() && !runtime.find_open {
+    let rows: Element<'a, RepositoryAction> = if model.is_empty()
+        && review.is_none()
+        && !runtime.find_open
+    {
         information_state(
             "No content changes",
             format!("{old_label} and {new_label} hold identical text."),
@@ -9271,8 +9697,10 @@ fn diff_model_view<'a>(
             // counter-translates the fixed gutters/center; only code moves in X.
             let gutter =
                 (model.row_count(DiffMode::Inline).max(1).ilog10() + 1).max(4) as f32 * 8.0 + 12.0;
-            let code_width =
-                (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32 * runtime.editor_font_size / DIFF_FONT_SIZE).max(1.0);
+            let code_width = (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32
+                * runtime.editor_font_size
+                / DIFF_FONT_SIZE)
+                .max(1.0);
             let geometry = DiffScrollGeometry::new(size.width, gutter, runtime.diff_mode);
             let viewport_width = geometry.viewport_width;
             let overflow = geometry.overflow(code_width);
@@ -9360,7 +9788,7 @@ fn diff_model_view<'a>(
                         horizontal,
                         context.and_then(|ctx| ctx.line_action(old, new)),
                         runtime.diff_typography(),
-                        Some(diff_actions::RowContext { card,runtime,row }),
+                        Some(diff_actions::RowContext { card, runtime, row }),
                     ),
                     DiffMode::Split => split_diff_row_with_review(
                         &model.split_rows[row],
@@ -9370,7 +9798,7 @@ fn diff_model_view<'a>(
                         horizontal,
                         context.map(|ctx| (ctx.line_action(old, None), ctx.line_action(None, new))),
                         runtime.diff_typography(),
-                        Some(diff_actions::RowContext { card,runtime,row }),
+                        Some(diff_actions::RowContext { card, runtime, row }),
                     ),
                 };
                 if let Some(ctx) =
@@ -9729,7 +10157,13 @@ struct DiffTypography {
     line_height: f32,
 }
 impl Default for DiffTypography {
-    fn default() -> Self { Self { font: Font::MONOSPACE, size: DIFF_FONT_SIZE, line_height: DIFF_LINE_HEIGHT } }
+    fn default() -> Self {
+        Self {
+            font: Font::MONOSPACE,
+            size: DIFF_FONT_SIZE,
+            line_height: DIFF_LINE_HEIGHT,
+        }
+    }
 }
 
 const DIFF_ROW_PADDING: f32 = 4.0;
@@ -9771,7 +10205,16 @@ fn inline_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
-    inline_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None, DiffTypography::default(), None)
+    inline_diff_row_with_review(
+        row,
+        syntax,
+        gutter,
+        code_width,
+        horizontal,
+        None,
+        DiffTypography::default(),
+        None,
+    )
 }
 
 fn inline_diff_row_with_review<'a>(
@@ -9784,9 +10227,14 @@ fn inline_diff_row_with_review<'a>(
     typography: DiffTypography,
     interaction: Option<diff_actions::RowContext<'a>>,
 ) -> Element<'a, RepositoryAction> {
-    let side = if row.new_line.is_none() { crate::diff_interaction::Side::Old } else { crate::diff_interaction::Side::New };
-    let found = interaction.map_or_else(Vec::new,|ctx| ctx.runtime.diff_match_ranges(ctx.row,side));
-    let active = interaction.and_then(|ctx| ctx.runtime.diff_active_match(ctx.row,side));
+    let side = if row.new_line.is_none() {
+        crate::diff_interaction::Side::Old
+    } else {
+        crate::diff_interaction::Side::New
+    };
+    let found =
+        interaction.map_or_else(Vec::new, |ctx| ctx.runtime.diff_match_ranges(ctx.row, side));
+    let active = interaction.and_then(|ctx| ctx.runtime.diff_active_match(ctx.row, side));
     let marker = match row.kind {
         DiffRowKind::Addition => "+",
         DiffRowKind::Deletion => "−",
@@ -9828,7 +10276,8 @@ fn inline_diff_row_with_review<'a>(
                 horizontal,
                 (row.old_line, row.new_line),
                 typography,
-                &found, active.as_ref(),
+                &found,
+                active.as_ref(),
             ),
         ])
         .align_y(Alignment::Center),
@@ -9836,7 +10285,10 @@ fn inline_diff_row_with_review<'a>(
         Length::FillPortion(1),
         typography,
     );
-    match interaction { Some(ctx) => ctx.wrap(side,code), None => code }
+    match interaction {
+        Some(ctx) => ctx.wrap(side, code),
+        None => code,
+    }
 }
 
 #[cfg(test)]
@@ -9847,7 +10299,16 @@ fn split_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
-    split_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None, DiffTypography::default(), None)
+    split_diff_row_with_review(
+        row,
+        syntax,
+        gutter,
+        code_width,
+        horizontal,
+        None,
+        DiffTypography::default(),
+        None,
+    )
 }
 
 fn split_diff_row_with_review<'a>(
@@ -9931,19 +10392,34 @@ fn diff_half<'a>(
     interaction: Option<diff_actions::RowContext<'a>>,
     side: crate::diff_interaction::Side,
 ) -> Element<'a, RepositoryAction> {
-    let found = interaction.map_or_else(Vec::new,|ctx| ctx.runtime.diff_match_ranges(ctx.row,side));
-    let active = interaction.and_then(|ctx| ctx.runtime.diff_active_match(ctx.row,side));
+    let found =
+        interaction.map_or_else(Vec::new, |ctx| ctx.runtime.diff_match_ranges(ctx.row, side));
+    let active = interaction.and_then(|ctx| ctx.runtime.diff_active_match(ctx.row, side));
     let code = diff_container(
         widget::row::with_children(vec![
             diff_review_gutter(lines.0.or(lines.1), gutter, action, typography),
-            diff_text(text, changed, syntax, kind, code_width, horizontal, lines, typography, &found, active.as_ref()),
+            diff_text(
+                text,
+                changed,
+                syntax,
+                kind,
+                code_width,
+                horizontal,
+                lines,
+                typography,
+                &found,
+                active.as_ref(),
+            ),
         ])
         .align_y(Alignment::Center),
         kind,
         Length::FillPortion(1),
         typography,
     );
-    match interaction.filter(|_| lines.0.or(lines.1).is_some()) { Some(ctx) => ctx.wrap(side,code), None => code }
+    match interaction.filter(|_| lines.0.or(lines.1).is_some()) {
+        Some(ctx) => ctx.wrap(side, code),
+        None => code,
+    }
 }
 
 fn diff_review_gutter(
@@ -9968,7 +10444,10 @@ fn diff_review_gutter(
     }
 }
 
-fn diff_gutter(line: Option<u32>, width: f32, typography: DiffTypography,
+fn diff_gutter(
+    line: Option<u32>,
+    width: f32,
+    typography: DiffTypography,
 ) -> Element<'static, RepositoryAction> {
     widget::container(
         crate::design::caption(line.map_or_else(String::new, |line| line.to_string()))
@@ -10101,9 +10580,11 @@ fn diff_text<'a>(
             if cosmic::theme::is_dark() { 0.24 } else { 0.18 },
         ),
     );
-    spans = crate::diff_interaction::highlight_matches(text,spans,found,active,&theme);
+    spans = crate::diff_interaction::highlight_matches(text, spans, found, active, &theme);
     for span in &mut spans {
-        if let Some(font) = &mut span.font { font.family = typography.font.family; }
+        if let Some(font) = &mut span.font {
+            font.family = typography.font.family;
+        }
         let background = match span
             .highlight
             .as_mut()
@@ -10272,11 +10753,26 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffScrollObs
             if let RepositoryAction::ReviewLine { extend: tagged, .. } = &mut message {
                 *tagged = extend;
             }
-            if let RepositoryAction::SelectDiffRow { extend: tagged,context:false,drag:false,.. } = &mut message { *tagged = extend; }
+            if let RepositoryAction::SelectDiffRow {
+                extend: tagged,
+                context: false,
+                drag: false,
+                ..
+            } = &mut message
+            {
+                *tagged = extend;
+            }
             message
         });
-        if matches!(event,iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) | iced::Event::Window(iced::window::Event::Unfocused)) {
-            if let Some(card) = self.card { shell.publish(RepositoryAction::EndDiffSelection { card }); }
+        if matches!(
+            event,
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left
+            )) | iced::Event::Window(iced::window::Event::Unfocused)
+        ) {
+            if let Some(card) = self.card {
+                shell.publish(RepositoryAction::EndDiffSelection { card });
+            }
         }
     }
     fn draw(
@@ -11081,27 +11577,61 @@ mod tests {
 
     #[test]
     fn diff_toolbar_labels_are_visible_at_default_width_and_collapse_when_narrow() {
-        use cosmic::iced::advanced::{Layout,layout,mouse,widget::Tree};
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
         let card = CardId::new();
-        let (mut runtime,_) = diff_runtime(card);
-        load_fresh_diff(&mut runtime,card,two_change_model());
+        let (mut runtime, _) = diff_runtime(card);
+        load_fresh_diff(&mut runtime, card, two_change_model());
         let renderer = headless_renderer();
         let height = |width| {
-            let mut toolbar = selected_file_toolbar(card,&runtime).unwrap();
+            let mut toolbar = selected_file_toolbar(card, &runtime).unwrap();
             let mut tree = Tree::new(toolbar.as_widget());
-            let node = toolbar.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,iced::Size::new(width,720.0)));
-            assert!(node.size().height < 160.0,"toolbar must leave space for code");
-            let accessible = toolbar.as_widget().a11y_nodes(Layout::new(&node),&tree,mouse::Cursor::Unavailable);
-            let labels = accessible.root().iter().chain(accessible.children()).filter(|node| !node.node().is_hidden()).filter_map(|node| node.node().label()).collect::<Vec<_>>();
+            let node = toolbar.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 720.0)),
+            );
+            assert!(
+                node.size().height < 160.0,
+                "toolbar must leave space for code"
+            );
+            let accessible = toolbar.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let labels = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| !node.node().is_hidden())
+                .filter_map(|node| node.node().label())
+                .collect::<Vec<_>>();
             if width >= 340.0 {
-                for label in ["Stage","Unstage","Revert","Ignore whitespace","Working","Staged","Branch","History","Unified","Split","Previous","Next"] { assert!(labels.contains(&label),"missing {label}: {labels:?}"); }
+                for label in [
+                    "Stage",
+                    "Unstage",
+                    "Revert",
+                    "Ignore whitespace",
+                    "Working",
+                    "Staged",
+                    "Branch",
+                    "History",
+                    "Unified",
+                    "Split",
+                    "Previous",
+                    "Next",
+                ] {
+                    assert!(labels.contains(&label), "missing {label}: {labels:?}");
+                }
                 assert!(!labels.contains(&"Diff actions ⋮"));
-            } else { assert!(labels.contains(&"Diff actions ⋮")); }
+            } else {
+                assert!(labels.contains(&"Diff actions ⋮"));
+            }
             node.size().height
         };
         let normal = height(crate::design::INSPECTOR_DEFAULT_WIDTH);
         let narrow = height(300.0);
-        assert!(normal > narrow+20.0);
+        assert!(normal > narrow + 20.0);
     }
 
     #[test]
@@ -11195,7 +11725,10 @@ mod tests {
     use crate::model::ProjectId;
 
     fn test_working_output(model: DiffModel) -> WorkingDiffOutput {
-        WorkingDiffOutput { additions: added_source_lines(&model), model: Some(model) }
+        WorkingDiffOutput {
+            additions: added_source_lines(&model),
+            model: Some(model),
+        }
     }
 
     /// A runtime whose working-tree comparison describes the live buffer.
@@ -11268,20 +11801,26 @@ mod tests {
     #[test]
     fn discarding_from_diff_reveals_backing_editor_and_remains_undoable() {
         let card = CardId::new();
-        let (mut runtime,_) = working_diff_runtime(card,"index\n", "saved\n");
+        let (mut runtime, _) = working_diff_runtime(card, "index\n", "saved\n");
         runtime.source_surface = SourceSurface::Editor;
-        drop(runtime.update(RepositoryAction::EditorAction { card,action:text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
         let changed = runtime.editor_text().unwrap();
         assert!(runtime.is_dirty());
         runtime.source_surface = SourceSurface::Diff;
         drop(runtime.update(RepositoryAction::DiscardEdits { card }));
-        assert!(runtime.editor_focus_target(card).is_some(),"Ctrl+Z must have a mounted native source editor");
-        assert_eq!(runtime.editor_text().as_deref(),Some("saved\n"));
+        assert!(
+            runtime.editor_focus_target(card).is_some(),
+            "Ctrl+Z must have a mounted native source editor"
+        );
+        assert_eq!(runtime.editor_text().as_deref(), Some("saved\n"));
         drop(runtime.update(RepositoryAction::Undo { card }));
-        assert_eq!(runtime.editor_text().as_deref(),Some(changed.as_str()));
+        assert_eq!(runtime.editor_text().as_deref(), Some(changed.as_str()));
         assert!(runtime.is_dirty());
         drop(runtime.update(RepositoryAction::Redo { card }));
-        assert_eq!(runtime.editor_text().as_deref(),Some("saved\n"));
+        assert_eq!(runtime.editor_text().as_deref(), Some("saved\n"));
         assert!(!runtime.is_dirty());
     }
 
@@ -11360,7 +11899,10 @@ mod tests {
             revision,
             timer,
             before.clone(),
-            Ok(Some(test_working_output(crate::diff_view::build_diff(&before, "obsolete\n")))),
+            Ok(Some(test_working_output(crate::diff_view::build_diff(
+                &before,
+                "obsolete\n",
+            )))),
         ));
         assert!(runtime.working_diff.applied.is_none());
         let next = runtime.working_diff.timer.unwrap();
@@ -11374,7 +11916,13 @@ mod tests {
         };
         let text = document.content.text();
         let model = crate::diff_view::build_diff(&before, &text);
-        drop(runtime.finish_working_diff(identity, revision, next, before, Ok(Some(test_working_output(model)))));
+        drop(runtime.finish_working_diff(
+            identity,
+            revision,
+            next,
+            before,
+            Ok(Some(test_working_output(model))),
+        ));
         assert!(runtime.working_annotations_current());
         assert!(runtime.working_diff.timer.is_none());
         assert!(runtime.working_diff.active.is_none());
@@ -11388,79 +11936,114 @@ mod tests {
     async fn gutter_only_diff_materializes_on_worker_and_upgrades_when_revealed() {
         use cosmic::iced::futures::StreamExt;
         let card = CardId::new();
-        let (mut runtime,_) = working_diff_runtime(card,"old\n", "new\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
         runtime.source_surface = SourceSurface::Editor;
         runtime.working_diff.applied = None;
-        let snapshot = match &runtime.document { DocumentState::Editable(document) => document.content.text_snapshot(),_ => unreachable!() };
+        let snapshot = match &runtime.document {
+            DocumentState::Editable(document) => document.content.text_snapshot(),
+            _ => unreachable!(),
+        };
         assert!(!snapshot.is_materialized());
         drop(runtime.working_diff_task(card));
         let ticket = runtime.working_diff.timer.unwrap();
         runtime.working_diff.deadline = Some(Instant::now());
-        let task = runtime.start_working_diff(card,ticket);
-        assert!(!snapshot.is_materialized(),"capturing a debounce must not serialize on the UI thread");
+        let task = runtime.start_working_diff(card, ticket);
+        assert!(
+            !snapshot.is_materialized(),
+            "capturing a debounce must not serialize on the UI thread"
+        );
         assert!(!runtime.working_diff.active.as_ref().unwrap().rich);
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let iced::runtime::Action::Output(action) = stream.next().await.unwrap() else { panic!("diff output") };
+        let iced::runtime::Action::Output(action) = stream.next().await.unwrap() else {
+            panic!("diff output")
+        };
         assert!(snapshot.is_materialized());
-        let RepositoryAction::WorkingDiffLoaded { result:Ok(Some(output)),.. } = &action else { panic!("successful gutter output") };
-        assert!(output.model.is_none(),"gutter lane must not build rich rows, syntax, or shape widths");
-        assert_eq!(output.additions,vec![0]);
+        let RepositoryAction::WorkingDiffLoaded {
+            result: Ok(Some(output)),
+            ..
+        } = &action
+        else {
+            panic!("successful gutter output")
+        };
+        assert!(
+            output.model.is_none(),
+            "gutter lane must not build rich rows, syntax, or shape widths"
+        );
+        assert_eq!(output.additions, vec![0]);
         drop(runtime.update(action));
         assert!(runtime.working_annotations_current());
         assert!(!runtime.working_diff.applied_rich);
         runtime.source_surface = SourceSurface::Diff;
         drop(runtime.working_diff_task(card));
-        let ticket = runtime.working_diff.timer.expect("revealing a stale rich comparison upgrades without another edit");
-        let task = runtime.start_working_diff(card,ticket);
+        let ticket = runtime
+            .working_diff
+            .timer
+            .expect("revealing a stale rich comparison upgrades without another edit");
+        let task = runtime.start_working_diff(card, ticket);
         assert!(runtime.working_diff.active.as_ref().unwrap().rich);
-        finish_navigation_task(&mut runtime,task).await;
+        finish_navigation_task(&mut runtime, task).await;
         assert!(runtime.working_diff.applied_rich);
         assert!(runtime.working_diff_current());
-        assert_eq!(runtime.diff_model().unwrap().after.as_ref(),"new\n");
+        assert_eq!(runtime.diff_model().unwrap().after.as_ref(), "new\n");
     }
 
     #[tokio::test]
     async fn hidden_diff_surface_uses_gutter_lane_until_visible() {
         let card = CardId::new();
-        let (mut runtime,_) = working_diff_runtime(card,"old\n", "new\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
         runtime.set_diff_surface_visible(false);
         runtime.working_diff.applied = None;
         drop(runtime.working_diff_task(card));
         let ticket = runtime.working_diff.timer.unwrap();
         runtime.working_diff.deadline = Some(Instant::now());
-        let task = runtime.start_working_diff(card,ticket);
+        let task = runtime.start_working_diff(card, ticket);
         assert!(!runtime.working_diff.active.as_ref().unwrap().rich);
-        finish_navigation_task(&mut runtime,task).await;
+        finish_navigation_task(&mut runtime, task).await;
         assert!(!runtime.working_diff.applied_rich);
         runtime.set_diff_surface_visible(true);
         drop(runtime.working_diff_task(card));
         let ticket = runtime.working_diff.timer.unwrap();
-        let task = runtime.start_working_diff(card,ticket);
+        let task = runtime.start_working_diff(card, ticket);
         assert!(runtime.working_diff.active.as_ref().unwrap().rich);
-        finish_navigation_task(&mut runtime,task).await;
+        finish_navigation_task(&mut runtime, task).await;
         assert!(runtime.working_diff.applied_rich);
     }
 
     #[test]
     fn hiding_diff_cancels_rich_worker_and_does_not_start_initial_rich_load() {
         let card = CardId::new();
-        let (mut runtime,_) = working_diff_runtime(card,"old\n", "new\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
         runtime.working_diff.applied = None;
         drop(runtime.working_diff_task(card));
         let ticket = runtime.working_diff.timer.unwrap();
         runtime.working_diff.deadline = Some(Instant::now());
-        drop(runtime.start_working_diff(card,ticket));
-        let cancellation = runtime.working_diff.active.as_ref().unwrap().cancellation.clone();
+        drop(runtime.start_working_diff(card, ticket));
+        let cancellation = runtime
+            .working_diff
+            .active
+            .as_ref()
+            .unwrap()
+            .cancellation
+            .clone();
         assert!(!cancellation.is_cancelled());
-        drop(runtime.refresh_diff_visibility(card,false));
+        drop(runtime.refresh_diff_visibility(card, false));
         assert!(cancellation.is_cancelled());
         runtime.diffs.clear();
         drop(runtime.ensure_current_diff(card));
-        assert!(runtime.diffs.is_empty(),"an offscreen comparison must not invoke Git/highlight/shape initially");
+        assert!(
+            runtime.diffs.is_empty(),
+            "an offscreen comparison must not invoke Git/highlight/shape initially"
+        );
         runtime.set_diff_surface_visible(true);
         drop(runtime.ensure_current_diff(card));
-        assert!(matches!(runtime.diff_state(&DiffBasis::IndexToWorktree),Some(DiffState::Loading { .. })));
-        let cancellation = match runtime.diff_state(&DiffBasis::IndexToWorktree).unwrap() { DiffState::Loading { cancellation,.. } => cancellation.clone(),_=>unreachable!() };
+        assert!(matches!(
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Loading { .. })
+        ));
+        let cancellation = match runtime.diff_state(&DiffBasis::IndexToWorktree).unwrap() {
+            DiffState::Loading { cancellation, .. } => cancellation.clone(),
+            _ => unreachable!(),
+        };
         runtime.set_diff_surface_visible(false);
         assert!(cancellation.is_cancelled());
         assert!(runtime.diffs.is_empty());
@@ -11468,9 +12051,16 @@ mod tests {
 
     #[test]
     fn diff_gutter_maps_source_lines_to_native_bare_cr_lines() {
-        let content = text_editor::Content::<cosmic::Renderer>::with_text("first\rsecond\nthird\r\nlast");
-        assert_eq!(native_added_lines(&content.text_snapshot(),vec![0]),vec![0,1]);
-        assert_eq!(native_added_lines(&content.text_snapshot(),vec![1,2]),vec![2,3]);
+        let content =
+            text_editor::Content::<cosmic::Renderer>::with_text("first\rsecond\nthird\r\nlast");
+        assert_eq!(
+            native_added_lines(&content.text_snapshot(), vec![0]),
+            vec![0, 1]
+        );
+        assert_eq!(
+            native_added_lines(&content.text_snapshot(), vec![1, 2]),
+            vec![2, 3]
+        );
     }
 
     #[test]
@@ -11494,7 +12084,10 @@ mod tests {
             0,
             ticket,
             before,
-            Ok(Some(test_working_output(crate::diff_view::build_diff("old\n", "obsolete\n")))),
+            Ok(Some(test_working_output(crate::diff_view::build_diff(
+                "old\n",
+                "obsolete\n",
+            )))),
         ));
         assert!(runtime.working_diff.applied.is_none());
         assert_eq!(
@@ -14997,18 +15590,44 @@ mod tests {
     #[test]
     fn editor_diff_roundtrip_tracks_the_source_line_and_unfolds_it() {
         let card = CardId::new();
-        let before = (0..200).map(|line| format!("line {line}\n")).collect::<String>();
-        let after = before.replace("line 20\n", "changed 20\n").replace("line 180\n", "changed 180\n");
+        let before = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 20\n", "changed 20\n")
+            .replace("line 180\n", "changed 180\n");
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "fixture.rs", &after);
-        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(staged_text_diff(crate::diff_view::build_diff(&before, &after))));
-        runtime.viewports.editor = text_editor::ScrollPosition { line: 100, vertical: 3.0, horizontal: 12.0 };
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        runtime.viewports.editor = text_editor::ScrollPosition {
+            line: 100,
+            vertical: 3.0,
+            horizontal: 12.0,
+        };
         runtime.align_diff_to_editor();
         runtime.source_surface = SourceSurface::Diff;
         let anchor = runtime.current_diff_viewport();
-        let Some(diff_layout::Anchor::Row { row, .. }) = anchor.row else { panic!("mapped row"); };
-        assert_eq!(runtime.diff_model().unwrap().new_line_at_row(DiffMode::Inline, row), Some(101));
+        let Some(diff_layout::Anchor::Row { row, .. }) = anchor.row else {
+            panic!("mapped row");
+        };
+        assert_eq!(
+            runtime
+                .diff_model()
+                .unwrap()
+                .new_line_at_row(DiffMode::Inline, row),
+            Some(101)
+        );
         let layout = runtime.diff_layout().unwrap();
-        assert!(matches!(layout.folded(DiffMode::Inline).row(layout.folded(DiffMode::Inline).display(row)), DisplayRow::Code(_)));
+        assert!(matches!(
+            layout
+                .folded(DiffMode::Inline)
+                .row(layout.folded(DiffMode::Inline).display(row)),
+            DisplayRow::Code(_)
+        ));
         runtime.align_editor_to_diff();
         assert_eq!(runtime.viewports.editor.line, 100);
         assert!((runtime.viewports.editor.vertical - 3.0).abs() < 0.01);
@@ -15031,17 +15650,32 @@ mod tests {
     #[test]
     fn diff_zoom_reuses_rows_but_family_changes_remeasure_with_the_reading_anchor() {
         let card = CardId::new();
-        let (mut runtime,_) = diff_runtime(card);
-        load_fresh_diff(&mut runtime,card,two_change_model());
+        let (mut runtime, _) = diff_runtime(card);
+        load_fresh_diff(&mut runtime, card, two_change_model());
         let baseline = Arc::clone(&runtime.diff_model().unwrap().before);
-        runtime.set_editor_font(Font::MONOSPACE,20.0);
-        assert!(Arc::ptr_eq(&runtime.diff_model().unwrap().before,&baseline),"zoom scales existing logical widths");
+        runtime.set_editor_font(Font::MONOSPACE, 20.0);
+        assert!(
+            Arc::ptr_eq(&runtime.diff_model().unwrap().before, &baseline),
+            "zoom scales existing logical widths"
+        );
         let anchor = runtime.current_diff_viewport();
-        runtime.set_editor_font(Font { family:iced::font::Family::SansSerif,..Font::MONOSPACE },20.0);
-        assert!(runtime.diff_model().is_none(),"another family needs native width measurement");
-        assert_eq!(runtime.current_diff_viewport().row,anchor.row);
+        runtime.set_editor_font(
+            Font {
+                family: iced::font::Family::SansSerif,
+                ..Font::MONOSPACE
+            },
+            20.0,
+        );
+        assert!(
+            runtime.diff_model().is_none(),
+            "another family needs native width measurement"
+        );
+        assert_eq!(runtime.current_diff_viewport().row, anchor.row);
         drop(runtime.refresh_diff_preferences(card));
-        assert!(matches!(runtime.diff_state(&runtime.diff_basis),Some(DiffState::Loading { .. })));
+        assert!(matches!(
+            runtime.diff_state(&runtime.diff_basis),
+            Some(DiffState::Loading { .. })
+        ));
     }
 
     #[test]
@@ -18389,17 +19023,33 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha alpha");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "alpha".into() }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
         assert_eq!(runtime.find_total, 2);
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 11 }, selection: None });
+            document.content.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 11,
+                },
+                selection: None,
+            });
         }
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
         assert_eq!(buffer_text(&runtime), "alpha alphax");
         // Literal search still matches a prefix until whole-word is enabled.
         assert_eq!(runtime.find_total, 2);
         assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 12)));
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::WholeWord, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::WholeWord,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 1);
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.find_total, 2);
@@ -18411,22 +19061,53 @@ mod tests {
     #[test]
     fn find_options_scope_and_invalid_patterns_are_applied_to_current_revision() {
         let card = CardId::new();
-        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha ALPHA alpha_beta alpha");
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "alpha ALPHA alpha_beta alpha");
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 11 }, selection: Some(text_editor::Position { line: 0, column: 0 }) });
+            document.content.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 11,
+                },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            });
         }
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "alpha".into() }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
         assert_eq!(runtime.find_total, 4);
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 2);
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::CaseSensitive, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::CaseSensitive,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 1);
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: false }));
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::WholeWord, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: false,
+        }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::WholeWord,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 2);
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "[".into() }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::Regex,
+            enabled: true,
+        }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "[".into(),
+        }));
         assert_eq!(runtime.find_total, 0);
         assert!(runtime.find_error.is_some());
     }
@@ -18436,20 +19117,40 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "call1 call2");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: r"call(\d)".into() }));
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "item$1".into() }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::Regex,
+            enabled: true,
+        }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: r"call(\d)".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "item$1".into(),
+        }));
         drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
         assert_eq!(buffer_text(&runtime), "item1 item2");
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(buffer_text(&runtime), "call1 call2");
         assert!(runtime.find_is_open());
 
-        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "word".into() }));
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "value".into() }));
-        drop(runtime.update(RepositoryAction::PreserveCaseChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "word".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "value".into(),
+        }));
+        drop(runtime.update(RepositoryAction::PreserveCaseChanged {
+            card,
+            enabled: true,
+        }));
         drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
         assert_eq!(buffer_text(&runtime), "value Value VALUE value");
         drop(runtime.update(RepositoryAction::Undo { card }));
