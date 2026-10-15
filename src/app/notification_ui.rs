@@ -1585,7 +1585,9 @@ mod tests {
             assert!(app.durable.channels[0].cards.is_empty());
             assert_eq!(app.workspace_model.agents[0], original,
                 "display-only activation preserves accepted cwd/spec/placement/provider/native actor");
+            app.project_ui.closed.remove(&original.spec.target.repository);
             drop(app.select_channel(original.channel().unwrap()));
+            assert_ne!(app.workspace.focused(), Some(card.id));
             let focused = app.workspace.focused();
             let saved_cards = app.durable.cards.clone();
             app.workspace_model.sequence += 1;
