@@ -294,15 +294,48 @@ mod tests {
     #[test]
     fn history_ranges_rebase_and_reject_removed_or_replaced_origins() {
         use crate::terminal::HistoryPosition;
-        let captured = HistoryPosition { epoch: 2, dropped: 100 };
-        let found = SearchMatch { history: captured, start_row: 8, end_row: 9, start_column: 1, end_column: 4 };
-        let current = HistoryPosition { epoch: 2, dropped: 103 };
+        let captured = HistoryPosition {
+            epoch: 2,
+            dropped: 100,
+        };
+        let found = SearchMatch {
+            history: captured,
+            start_row: 8,
+            end_row: 9,
+            start_column: 1,
+            end_column: 4,
+        };
+        let current = HistoryPosition {
+            epoch: 2,
+            dropped: 103,
+        };
         let rebased = found.rebase(current).unwrap();
         assert_eq!((rebased.start_row, rebased.end_row), (5, 6));
         assert_eq!(rebased.history, current);
-        assert!(found.rebase(HistoryPosition { epoch: 2, dropped: 109 }).is_none());
-        assert!(found.rebase(HistoryPosition { epoch: 3, dropped: 0 }).is_none());
-        assert!(found.rebase(HistoryPosition { epoch: 2, dropped: 99 }).is_none());
+        assert!(
+            found
+                .rebase(HistoryPosition {
+                    epoch: 2,
+                    dropped: 109
+                })
+                .is_none()
+        );
+        assert!(
+            found
+                .rebase(HistoryPosition {
+                    epoch: 3,
+                    dropped: 0
+                })
+                .is_none()
+        );
+        assert!(
+            found
+                .rebase(HistoryPosition {
+                    epoch: 2,
+                    dropped: 99
+                })
+                .is_none()
+        );
     }
 
     // Independent whole-logical-line oracle: deliberately scan each byte,

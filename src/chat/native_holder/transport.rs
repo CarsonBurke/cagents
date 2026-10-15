@@ -199,7 +199,12 @@ pub(crate) struct Holder {
 
 impl Holder {
     pub fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
-        if !self.identity.record.build.as_ref().is_some_and(|build| build.capabilities.iter().any(|capability| capability == "provider-exit-diagnostics")) {
+        if !self.identity.record.build.as_ref().is_some_and(|build| {
+            build
+                .capabilities
+                .iter()
+                .any(|capability| capability == "provider-exit-diagnostics")
+        }) {
             return Err("This older provider holder has no exit diagnostics; restart the session to update it".into());
         }
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
@@ -715,7 +720,14 @@ impl Residence {
 
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
-            if wait_for_control_with_stderr(control.as_raw_fd(), &self.child, &self.child_events, Some(&mut self.stderr)).is_err() {
+            if wait_for_control_with_stderr(
+                control.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+                Some(&mut self.stderr),
+            )
+            .is_err()
+            {
                 return self.recovery.is_durable();
             }
             let request = match receive(&control, TIMEOUT) {
@@ -725,21 +737,33 @@ impl Residence {
             let response = match request {
                 Request::Diagnostic => {
                     use std::os::unix::process::ExitStatusExt;
-                    let result = self.stderr.drain().and_then(|()| self.child.exit_status()).and_then(|status| {
-                        if status.is_some() {
-                            // Once the leader exited, drain its remaining pipe
-                            // bytes before publishing the last meaningful line.
-                            // Descendants may retain stderr; keep this bounded.
-                            for _ in 0..16 { self.stderr.drain()?; if self.stderr.reader.is_none() { break; } }
-                        }
-                        Ok(status)
-                    });
+                    let result = self
+                        .stderr
+                        .drain()
+                        .and_then(|()| self.child.exit_status())
+                        .and_then(|status| {
+                            if status.is_some() {
+                                // Once the leader exited, drain its remaining pipe
+                                // bytes before publishing the last meaningful line.
+                                // Descendants may retain stderr; keep this bounded.
+                                for _ in 0..16 {
+                                    self.stderr.drain()?;
+                                    if self.stderr.reader.is_none() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(status)
+                        });
                     match result {
                         Ok(status) => Report::Diagnostic(ExitDiagnostic {
                             code: status.and_then(|status| status.code()),
                             signal: status.and_then(|status| status.signal()),
-                            stderr: String::from_utf8_lossy(self.stderr.tail.make_contiguous()).into_owned(),
-                            log: status.and_then(|_|self.stderr.log.as_ref().and_then(|log|log.share().ok())),
+                            stderr: String::from_utf8_lossy(self.stderr.tail.make_contiguous())
+                                .into_owned(),
+                            log: status.and_then(|_| {
+                                self.stderr.log.as_ref().and_then(|log| log.share().ok())
+                            }),
                         }),
                         Err(error) => Report::Failed(error.to_string()),
                     }
@@ -825,7 +849,14 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
-            if wait_for_control_with_stderr(self.listener.socket.as_raw_fd(), &self.child, &self.child_events, Some(&mut self.stderr)).is_err() {
+            if wait_for_control_with_stderr(
+                self.listener.socket.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+                Some(&mut self.stderr),
+            )
+            .is_err()
+            {
                 return false;
             }
             let (control, _) = match self.listener.socket.accept() {
@@ -883,29 +914,52 @@ struct StderrCapture {
     log: Option<crate::chat::stderr_log::Capture>,
 }
 impl StderrCapture {
-    fn new(reader: Option<std::process::ChildStderr>, _terminal: crate::model::TerminalId) -> Result<Self, String> {
+    fn new(
+        reader: Option<std::process::ChildStderr>,
+        _terminal: crate::model::TerminalId,
+    ) -> Result<Self, String> {
         if let Some(reader) = &reader {
             let fd = reader.as_raw_fd();
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
                 return Err(io::Error::last_os_error().to_string());
             }
         }
-        let log = crate::chat::stderr_log::Capture::new().map_err(|error| {tracing::warn!(%error,"Provider diagnostic log is unavailable");error}).ok();
-        Ok(Self { reader, tail: Default::default(), log })
+        let log = crate::chat::stderr_log::Capture::new()
+            .map_err(|error| {
+                tracing::warn!(%error,"Provider diagnostic log is unavailable");
+                error
+            })
+            .ok();
+        Ok(Self {
+            reader,
+            tail: Default::default(),
+            log,
+        })
     }
     fn drain(&mut self) -> io::Result<()> {
         let mut bytes = [0_u8; 8192];
         // Bound work per poll so a noisy provider cannot starve Interrupt or
         // ownership updates. A still-readable pipe immediately polls again.
         for _ in 0..8 {
-            let Some(reader) = self.reader.as_mut() else { break; };
+            let Some(reader) = self.reader.as_mut() else {
+                break;
+            };
             match reader.read(&mut bytes) {
-                Ok(0) => { self.reader.take(); break; }
+                Ok(0) => {
+                    self.reader.take();
+                    break;
+                }
                 Ok(count) => {
-                    if let Some(log) = self.log.as_mut() {log.push(&bytes[..count]);}
+                    if let Some(log) = self.log.as_mut() {
+                        log.push(&bytes[..count]);
+                    }
                     for byte in &bytes[..count] {
-                        if self.tail.len() == 64 * 1024 { self.tail.pop_front(); }
+                        if self.tail.len() == 64 * 1024 {
+                            self.tail.pop_front();
+                        }
                         self.tail.push_back(*byte);
                     }
                 }
@@ -977,7 +1031,11 @@ impl Drop for ChildEvents {
 /// A child exit or control message is the only source of idle wakeups. Reap
 /// once before blocking as well, including orphans already pending at startup.
 #[cfg(test)]
-fn wait_for_control(fd: RawFd, children: &crate::daemon::owned_children::OwnedChildren, child_events: &ChildEvents) -> io::Result<()> {
+fn wait_for_control(
+    fd: RawFd,
+    children: &crate::daemon::owned_children::OwnedChildren,
+    child_events: &ChildEvents,
+) -> io::Result<()> {
     wait_for_control_with_stderr(fd, children, child_events, None)
 }
 
@@ -988,14 +1046,33 @@ fn wait_for_control_with_stderr(
     mut stderr: Option<&mut StderrCapture>,
 ) -> io::Result<()> {
     loop {
-        if let Some(stderr) = stderr.as_mut() { stderr.drain()?; }
+        if let Some(stderr) = stderr.as_mut() {
+            stderr.drain()?;
+        }
         if let Err(error) = children.reap_exited_descendants() {
             // A transient inspection failure must not tear down a durable server.
             eprintln!("Native holder could not reap exited tools: {error}");
         }
-        let mut poll = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: child_events.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: stderr.as_ref().and_then(|stderr| stderr.reader.as_ref()).map_or(-1, AsRawFd::as_raw_fd), events: libc::POLLIN, revents: 0 }];
+        let mut poll = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: child_events.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr
+                    .as_ref()
+                    .and_then(|stderr| stderr.reader.as_ref())
+                    .map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
         // SAFETY: the array and both owned descriptors remain live throughout
         // poll. No timer is armed: an idle holder sleeps indefinitely.
         match unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } {
@@ -1270,24 +1347,35 @@ mod tests {
 
     #[test]
     fn legacy_named_json_inspection_messages_remain_decodable() {
-        let recovery=super::super::tests::recovery();
-        let proof=recovery.source.proof.as_ref().unwrap();
+        let recovery = super::super::tests::recovery();
+        let proof = recovery.source.proof.as_ref().unwrap();
         // The actual holder codec is length-framed JSON. Its externally tagged
         // names, rather than Rust enum ordinals, are the compatibility boundary.
-        let inspect=serde_json::json!({"Inspect":{"proof":proof}});
-        let decoded:Request=serde_json::from_value(inspect.clone()).unwrap();
+        let inspect = serde_json::json!({"Inspect":{"proof":proof}});
+        let decoded: Request = serde_json::from_value(inspect.clone()).unwrap();
         assert!(matches!(&decoded,Request::Inspect{proof:decoded} if decoded==proof));
-        assert_eq!(serde_json::to_value(decoded).unwrap(),inspect);
-        let record=serde_json::json!({
+        assert_eq!(serde_json::to_value(decoded).unwrap(), inspect);
+        let record = serde_json::json!({
             "version":3,"kind":"Native","application":"legacy-holder",
             "boot":proof.boot_id,"terminal":recovery.source.id,
             "holder":{"pid":123,"start":1},"root":{"pid":124,"start":2}
         });
-        let inspected=serde_json::json!({"Inspected":{"protocol":2,"record":record,"recovery":recovery,"exited":false}});
-        let decoded:Report=serde_json::from_value(inspected).unwrap();
-        let Report::Inspected{protocol,record,recovery:decoded,exited}=decoded else {panic!("legacy inspection changed its JSON tag")};
-        assert_eq!(protocol,2);assert_eq!(record.version,3);assert!(record.build.is_none());assert!(!exited);
-        assert_eq!(decoded.source.proof.as_ref(),Some(proof));
+        let inspected = serde_json::json!({"Inspected":{"protocol":2,"record":record,"recovery":recovery,"exited":false}});
+        let decoded: Report = serde_json::from_value(inspected).unwrap();
+        let Report::Inspected {
+            protocol,
+            record,
+            recovery: decoded,
+            exited,
+        } = decoded
+        else {
+            panic!("legacy inspection changed its JSON tag")
+        };
+        assert_eq!(protocol, 2);
+        assert_eq!(record.version, 3);
+        assert!(record.build.is_none());
+        assert!(!exited);
+        assert_eq!(decoded.source.proof.as_ref(), Some(proof));
     }
 
     #[test]
@@ -1301,34 +1389,60 @@ mod tests {
                 .env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         let mut source = super::super::tests::recovery().source;
         let boot = crate::daemon::read_boot_id().unwrap();
         source.proof.as_mut().unwrap().boot_id = boot.clone();
-        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot;
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
         let spec = ProcessSpec {
-            execution:None,messages:None,unset_environment:Default::default(),
-            transport:TransportSpec::OwnedUnixWebSocket { socket:source.owned_codex_listener.as_ref().unwrap().socket.clone() },
-            program:"/bin/sh".into(),arguments:vec!["-c".into(),"printf 'first diagnostic\nlast failure\n' >&2; exit 3".into()],
-            working_directory:std::env::temp_dir(),environment:Default::default(),
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf 'first diagnostic\nlast failure\n' >&2; exit 3".into(),
+            ],
+            working_directory: std::env::temp_dir(),
+            environment: Default::default(),
         };
-        let mut holder = spawn(spec,source).unwrap();
-        let deadline = Instant::now()+Duration::from_secs(5);
+        let mut holder = spawn(spec, source).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         let diagnostic = loop {
             let diagnostic = holder.diagnostic().unwrap();
-            if diagnostic.code.is_some() || diagnostic.signal.is_some() { break diagnostic; }
-            assert!(Instant::now()<deadline,"fixture provider did not exit");
+            if diagnostic.code.is_some() || diagnostic.signal.is_some() {
+                break diagnostic;
+            }
+            assert!(Instant::now() < deadline, "fixture provider did not exit");
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(diagnostic.code,Some(3));
-        assert_eq!(diagnostic.signal,None);
-        assert_eq!(diagnostic.stderr,"first diagnostic\nlast failure\n");
-        assert_eq!(std::fs::read_to_string(&diagnostic.log.as_ref().unwrap().path).unwrap(),diagnostic.stderr);
+        assert_eq!(diagnostic.code, Some(3));
+        assert_eq!(diagnostic.signal, None);
+        assert_eq!(diagnostic.stderr, "first diagnostic\nlast failure\n");
+        assert_eq!(
+            std::fs::read_to_string(&diagnostic.log.as_ref().unwrap().path).unwrap(),
+            diagnostic.stderr
+        );
         let frame = serde_json::to_vec(&Report::Diagnostic(diagnostic)).unwrap();
-        let Report::Diagnostic(decoded) = serde_json::from_slice(&frame).unwrap() else { panic!("missing diagnostic control response") };
-        assert_eq!(decoded.code,Some(3));
+        let Report::Diagnostic(decoded) = serde_json::from_slice(&frame).unwrap() else {
+            panic!("missing diagnostic control response")
+        };
+        assert_eq!(decoded.code, Some(3));
         assert!(decoded.stderr.ends_with("last failure\n"));
         holder.close().unwrap();
     }

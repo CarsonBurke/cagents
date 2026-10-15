@@ -1,8 +1,15 @@
 //! Synchronous daemon discovery/startup shared by the lean CLI and UI.
 //! Attachment reactors are compiled only in the host and UI lanes.
-use std::{io, os::unix::{net::UnixStream, process::CommandExt}, path::{Path, PathBuf}, process::{Child, Command, ExitStatus, Stdio}, thread, time::{Duration, Instant}};
-use thiserror::Error;
 use super::ipc::{PROTOCOL_VERSION, daemon_socket_path};
+use std::{
+    io,
+    os::unix::{net::UnixStream, process::CommandExt},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+use thiserror::Error;
 const DAEMON_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Error)]
@@ -289,10 +296,12 @@ fn daemon_startup_ready(
 
 #[cfg(test)]
 mod tests {
+    use super::super::ipc::{
+        ClientEnvelope, ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+    };
     use super::*;
+    use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
     use std::os::unix::net::UnixListener;
-    use crate::model::{HostSessionProof, HostSessionId, BootId, HostIncarnation};
-    use super::super::ipc::{ClientEnvelope, ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame};
     const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
@@ -640,5 +649,4 @@ mod tests {
             }
         }
     }
-
 }

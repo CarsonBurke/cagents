@@ -1953,20 +1953,26 @@ fn confirm_account_conversation(
 }
 
 pub(super) fn enqueue_deferred(
-    host:&SharedHost,client:ClientId,request:ClientRequest,
-) -> Result<crossbeam_channel::Receiver<Result<(),String>>,ProtocolError> {
-    let mut pending=None;
-    super::agent_execution::interactive(host,client,request,|request| {
-        let ClientRequest::ChatCommand {chat_id,command}=request else {return Err(error("Expected a provider control command"));};
-        let handle={
-            let state=host.lock().unwrap_or_else(|p|p.into_inner());
-            if state.shutting_down {return Err(unavailable("Daemon is shutting down"));}
-            attached(&state,client,chat_id)?.handle.clone()
+    host: &SharedHost,
+    client: ClientId,
+    request: ClientRequest,
+) -> Result<crossbeam_channel::Receiver<Result<(), String>>, ProtocolError> {
+    let mut pending = None;
+    super::agent_execution::interactive(host, client, request, |request| {
+        let ClientRequest::ChatCommand { chat_id, command } = request else {
+            return Err(error("Expected a provider control command"));
         };
-        pending=Some(handle.enqueue_command(command).map_err(unavailable)?);
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.shutting_down {
+                return Err(unavailable("Daemon is shutting down"));
+            }
+            attached(&state, client, chat_id)?.handle.clone()
+        };
+        pending = Some(handle.enqueue_command(command).map_err(unavailable)?);
         Ok(ServerResponse::Accepted)
     })?;
-    pending.ok_or_else(||error("Provider control was not admitted"))
+    pending.ok_or_else(|| error("Provider control was not admitted"))
 }
 
 pub(super) fn process(
@@ -2196,14 +2202,27 @@ fn process_inner(
                 .set_visible(record.subscribers.values().any(|visible| *visible));
             Ok(ServerResponse::Detached)
         }
-        ClientRequest::ChatProviderExitOutput { chat_id, log_id, offset } => {
+        ClientRequest::ChatProviderExitOutput {
+            chat_id,
+            log_id,
+            offset,
+        } => {
             let handle = {
-                let state = host.lock().unwrap_or_else(|p|p.into_inner());
-                attached(&state,client,chat_id)?.handle.clone()
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                attached(&state, client, chat_id)?.handle.clone()
             };
             // Disk reads never hold HostLock and remain available after exit.
-            let (bytes,next_offset,omitted)=handle.provider_exit_output(&log_id,offset).map_err(unavailable)?;
-            Ok(ServerResponse::ChatProviderExitOutput {chat_id,log_id,offset,bytes,next_offset,omitted})
+            let (bytes, next_offset, omitted) = handle
+                .provider_exit_output(&log_id, offset)
+                .map_err(unavailable)?;
+            Ok(ServerResponse::ChatProviderExitOutput {
+                chat_id,
+                log_id,
+                offset,
+                bytes,
+                next_offset,
+                omitted,
+            })
         }
         ClientRequest::ChatCommand { chat_id, command } => {
             let handle = {

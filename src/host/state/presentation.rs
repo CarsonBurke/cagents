@@ -82,17 +82,31 @@ impl HostState {
             .or_default();
         let rows = view.size.map_or(snapshot.rows, |size| size.rows);
         let maximum = snapshot.scroll.total.saturating_sub(u64::from(rows));
-        let current = view.offset.map(|row| snapshot.scroll.history.rebase_row(row, view.history).unwrap_or(0))
-            .unwrap_or(maximum).min(maximum);
+        let current = view
+            .offset
+            .map(|row| {
+                snapshot
+                    .scroll
+                    .history
+                    .rebase_row(row, view.history)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(maximum)
+            .min(maximum);
         view.offset = match scroll {
             crate::terminal::ipc::TerminalScroll::Bottom => None,
             crate::terminal::ipc::TerminalScroll::Top => Some(0),
             crate::terminal::ipc::TerminalScroll::Row(row) => Some(row.min(maximum)),
             crate::terminal::ipc::TerminalScroll::Match(range) => {
-                let range = range.rebase(snapshot.scroll.history).ok_or_else(|| ProtocolError::new(
-                    ProtocolErrorCode::InvalidRequest, "Output moved; search again", false))?;
+                let range = range.rebase(snapshot.scroll.history).ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Output moved; search again",
+                        false,
+                    )
+                })?;
                 Some(range.start_row.min(maximum))
-            },
+            }
             crate::terminal::ipc::TerminalScroll::Lines(delta) if delta < 0 => {
                 Some(current.saturating_sub(delta.unsigned_abs()))
             }
@@ -260,9 +274,11 @@ pub(in crate::host) fn snapshot(
                 view.history,
             )
         };
-        let capture = handle.viewport_snapshot(offset, rows, history).map_err(|message| {
-            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
-        })?;
+        let capture = handle
+            .viewport_snapshot(offset, rows, history)
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+            })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state.subscriptions.attached(client, id) {
             return Err(ProtocolError::new(

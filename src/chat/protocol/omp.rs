@@ -350,9 +350,9 @@ impl Omp {
         self.read_child(id, step);
     }
     fn child_content(&mut self, frame: Value) -> Result<Step, String> {
-        self.child_content_at(frame,std::time::Instant::now())
+        self.child_content_at(frame, std::time::Instant::now())
     }
-    fn child_content_at(&mut self, frame: Value, now:std::time::Instant) -> Result<Step, String> {
+    fn child_content_at(&mut self, frame: Value, now: std::time::Instant) -> Result<Step, String> {
         // The subscription includes the authoritative partial message. Reapply
         // that full item after history hydration instead of appending a delta
         // that may already be included in the snapshot.
@@ -1845,19 +1845,21 @@ mod tests {
         let now = std::time::Instant::now();
         assert!(
             !adapter
-                .child_content_at(update("a"),now)
+                .child_content_at(update("a"), now)
                 .unwrap()
                 .events
                 .is_empty()
         );
         assert!(
             adapter
-                .child_content_at(update("ab"),now+std::time::Duration::from_millis(1))
+                .child_content_at(update("ab"), now + std::time::Duration::from_millis(1))
                 .unwrap()
                 .events
                 .is_empty()
         );
-        let later = adapter.child_content_at(update("abc"),now+std::time::Duration::from_millis(51)).unwrap();
+        let later = adapter
+            .child_content_at(update("abc"), now + std::time::Duration::from_millis(51))
+            .unwrap();
         assert!(later.events.iter().any(|event| matches!(event,Event::Item(Item{content:ItemContent::Text{text,..},..}) if text=="abc")));
         let end = adapter.child_content(json!({"type":"message_end","message":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":"abcd"}]}})).unwrap();
         assert!(end.events.iter().any(|event| matches!(event, Event::Item(Item { content:ItemContent::Text { text, .. }, .. }) if text == "abcd")));

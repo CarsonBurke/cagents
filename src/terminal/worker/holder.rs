@@ -67,7 +67,6 @@ const MAX_DESCRIPTORS: usize = 4;
 /// soon as it reads the release, so this only bounds a wedged one.
 const RELEASE_GRACE: Duration = Duration::from_millis(500);
 
-
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
 /// Grace period for anonymous legacy handoffs. Registered holders retain
@@ -416,12 +415,26 @@ fn watched(
     }
     let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
     holder.acknowledged = Some(acknowledged);
-    let reader = holder.control.try_clone().map_err(|error| format!("watch terminal holder: {error}"))?;
-    let watched_root = root.try_clone().map_err(|error| format!("watch terminal root: {error}"))?;
-    let (released, release) = std::io::pipe().map_err(|error| format!("watch terminal release: {error}"))?;
+    let reader = holder
+        .control
+        .try_clone()
+        .map_err(|error| format!("watch terminal holder: {error}"))?;
+    let watched_root = root
+        .try_clone()
+        .map_err(|error| format!("watch terminal root: {error}"))?;
+    let (released, release) =
+        std::io::pipe().map_err(|error| format!("watch terminal release: {error}"))?;
     holder.release = Some(release);
     holder.watch = Some(crate::terminal::reactor::runtime()?.spawn(async move {
-        watch_shared(reader, watched_root, released, exits, acknowledge, exited.is_some()).await;
+        watch_shared(
+            reader,
+            watched_root,
+            released,
+            exits,
+            acknowledge,
+            exited.is_some(),
+        )
+        .await;
     }));
     Ok(Held {
         master: PtyMaster(master),
@@ -451,8 +464,12 @@ async fn watch_shared(
     mut reported: bool,
 ) {
     use tokio::io::unix::AsyncFd;
-    let Ok(control) = AsyncFd::new(control) else { return; };
-    let Ok(released) = AsyncFd::new(released) else { return; };
+    let Ok(control) = AsyncFd::new(control) else {
+        return;
+    };
+    let Ok(released) = AsyncFd::new(released) else {
+        return;
+    };
     loop {
         let response = tokio::select! {
             response = receive_report_shared(&control) => response,
@@ -470,14 +487,20 @@ async fn watch_shared(
             Ok(Some(Report::ScreenCached | Report::AdoptionCommitted)) => {
                 let _ = acknowledge.try_send(Ok(()));
             }
-            Ok(Some(Report::Failed(message))) => { let _ = acknowledge.try_send(Err(message)); }
-            Ok(Some(_)) => {},
+            Ok(Some(Report::Failed(message))) => {
+                let _ = acknowledge.try_send(Err(message));
+            }
+            Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
         }
     }
-    if reported { return; }
+    if reported {
+        return;
+    }
     tracing::warn!("a terminal holder ended before its root process; the terminal stays attached");
-    let Ok(root) = AsyncFd::new(root) else { return; };
+    let Ok(root) = AsyncFd::new(root) else {
+        return;
+    };
     tokio::select! {
         _ = released.readable() => {},
         _ = root.readable() => {
@@ -493,12 +516,18 @@ async fn receive_report_shared(
     control: &tokio::io::unix::AsyncFd<UnixStream>,
 ) -> io::Result<Option<Report>> {
     let mut header = [0u8; 4];
-    if !receive_exact_shared(control, &mut header, true).await? { return Ok(None); }
+    if !receive_exact_shared(control, &mut header, true).await? {
+        return Ok(None);
+    }
     let length = u32::from_le_bytes(header);
-    if length > MAX_FRAME { return Err(io::ErrorKind::InvalidData.into()); }
+    if length > MAX_FRAME {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
     let mut body = vec![0u8; length as usize];
     receive_exact_shared(control, &mut body, false).await?;
-    serde_json::from_slice(&body).map(Some).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 async fn receive_exact_shared(
@@ -511,8 +540,19 @@ async fn receive_exact_shared(
         let mut ready = control.readable().await?;
         let result = ready.try_io(|fd| {
             // SAFETY: the socket and writable remaining slice span this call.
-            let count = unsafe { libc::recv(fd.get_ref().as_raw_fd(), bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, libc::MSG_DONTWAIT) };
-            if count < 0 { Err(io::Error::last_os_error()) } else { Ok(count as usize) }
+            let count = unsafe {
+                libc::recv(
+                    fd.get_ref().as_raw_fd(),
+                    bytes[filled..].as_mut_ptr().cast(),
+                    bytes.len() - filled,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
         });
         match result {
             Err(_) => continue,

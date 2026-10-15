@@ -624,7 +624,11 @@ struct Selection {
 }
 
 impl Selection {
-    fn rebase(mut self, captured: super::HistoryPosition, current: super::HistoryPosition) -> Option<Self> {
+    fn rebase(
+        mut self,
+        captured: super::HistoryPosition,
+        current: super::HistoryPosition,
+    ) -> Option<Self> {
         self.anchor.row = current.rebase_row(self.anchor.row, captured)?;
         self.head.row = current.rebase_row(self.head.row, captured)?;
         Some(self)
@@ -995,11 +999,16 @@ impl WidgetState {
     fn rebase_history(&mut self, current: super::HistoryPosition) -> bool {
         let had_selection = self.selection.is_some();
         if self.history_position != current {
-            self.selection = self.selection.and_then(|selection| selection.rebase(self.history_position, current));
+            self.selection = self
+                .selection
+                .and_then(|selection| selection.rebase(self.history_position, current));
         }
         self.history_position = current;
         let cleared = had_selection && self.selection.is_none();
-        if cleared { self.selecting = false; self.selection_click = None; }
+        if cleared {
+            self.selecting = false;
+            self.selection_click = None;
+        }
         cleared
     }
 }
@@ -3033,8 +3042,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if let Some((matches, selected)) = &self.find_matches {
                     let offset = self.snapshot.scroll.offset;
                     let origin = self.snapshot.scroll.history;
-                    let first = matches.partition_point(|hit|
-                        hit.rebase(origin).is_none_or(|hit| hit.end_row < offset));
+                    let first = matches.partition_point(|hit| {
+                        hit.rebase(origin).is_none_or(|hit| hit.end_row < offset)
+                    });
                     for (index, hit) in matches
                         .iter()
                         .enumerate()
@@ -5838,24 +5848,46 @@ mod tests {
 
     #[test]
     fn selection_stays_on_a_after_constant_total_pruning_and_notices_its_removal() {
-        let captured = super::super::HistoryPosition { epoch: 3, dropped: 100 };
+        let captured = super::super::HistoryPosition {
+            epoch: 3,
+            dropped: 100,
+        };
         let mut state = WidgetState {
             history_total: 1000,
             history_position: captured,
             selection: Some(Selection::new(at(9, 0), SelectionMode::Character)),
             ..WidgetState::default()
         };
-        let current = super::super::HistoryPosition { epoch: 3, dropped: 102 };
+        let current = super::super::HistoryPosition {
+            epoch: 3,
+            dropped: 102,
+        };
         assert!(!state.rebase_history(current));
-        assert_eq!(state.history_total, 1000, "total need not change when pruning");
+        assert_eq!(
+            state.history_total, 1000,
+            "total need not change when pruning"
+        );
         let rows = vec![row("A"), row("B")];
         let grid = selection_grid(&rows, 1);
-        assert_eq!(selection_text(grid, state.selection.unwrap().span(grid)), "A");
-        assert!(state.rebase_history(super::super::HistoryPosition { epoch: 3, dropped: 110 }),
-            "the update must publish the selection-moved notice");
+        assert_eq!(
+            selection_text(grid, state.selection.unwrap().span(grid)),
+            "A"
+        );
+        assert!(
+            state.rebase_history(super::super::HistoryPosition {
+                epoch: 3,
+                dropped: 110
+            }),
+            "the update must publish the selection-moved notice"
+        );
         assert!(state.selection.is_none());
-        assert!(!state.rebase_history(super::super::HistoryPosition { epoch: 3, dropped: 111 }),
-            "notice is emitted once");
+        assert!(
+            !state.rebase_history(super::super::HistoryPosition {
+                epoch: 3,
+                dropped: 111
+            }),
+            "notice is emitted once"
+        );
     }
 
     #[test]
@@ -6248,7 +6280,10 @@ mod tests {
     }
 
     const SCROLLBACK: ScrollSnapshot = ScrollSnapshot {
-        history: super::super::HistoryPosition { epoch: 0, dropped: 0 },
+        history: super::super::HistoryPosition {
+            epoch: 0,
+            dropped: 0,
+        },
         total: 1000,
         offset: 500,
         len: 24,

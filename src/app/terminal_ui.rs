@@ -89,9 +89,10 @@ mod tests {
         assert!(find.background_results);
         assert_eq!(find.schedule_refresh(latest), None);
         assert!(!find.begin_refresh(pending, latest));
-        assert!(find
-            .schedule_refresh(SearchContent::of(&output_snapshot(4)))
-            .is_some());
+        assert!(
+            find.schedule_refresh(SearchContent::of(&output_snapshot(4)))
+                .is_some()
+        );
     }
 
     #[test]
@@ -114,7 +115,10 @@ mod tests {
         let pending = find.schedule_refresh(SearchContent::of(&snapshot)).unwrap();
         assert!(find.begin_refresh(pending, SearchContent::of(&snapshot)));
         snapshot.scroll.total += 1;
-        assert!(find.schedule_refresh(SearchContent::of(&snapshot)).is_some());
+        assert!(
+            find.schedule_refresh(SearchContent::of(&snapshot))
+                .is_some()
+        );
     }
 
     #[test]
@@ -192,15 +196,18 @@ mod tests {
             end_row: row,
             end_column: 6,
         };
-        app.terminal_find.insert(card, Find {
-            open: true,
-            query: "needle".into(),
-            request: 7,
-            matches: vec![matched(100, 1), matched(100, 10), matched(100, 20)].into(),
-            selected: 1,
-            background_results: true,
-            ..Find::default()
-        });
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                query: "needle".into(),
+                request: 7,
+                matches: vec![matched(100, 1), matched(100, 10), matched(100, 20)].into(),
+                selected: 1,
+                background_results: true,
+                ..Find::default()
+            },
+        );
         app.terminal_search_results(
             card,
             7,
@@ -209,7 +216,10 @@ mod tests {
             false,
         );
         let find = &app.terminal_find[&card];
-        assert_eq!(find.selected, 0, "preserve the original text, not its old result index");
+        assert_eq!(
+            find.selected, 0,
+            "preserve the original text, not its old result index"
+        );
         assert_eq!(find.matches[find.selected], matched(103, 7));
         assert!(!find.focused);
     }
@@ -273,12 +283,24 @@ mod tests {
                 TerminalId::new(),
             )),
         );
-        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
-        drop(app.update(Message::KeyEvent { event: escape_event(), captured: true }));
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                ..Find::default()
+            },
+        );
+        drop(app.update(Message::KeyEvent {
+            event: escape_event(),
+            captured: true,
+        }));
         assert!(app.terminal_find[&card].open);
         // With no focused field answering the key, Escape on the terminal
         // surface still closes its open find bar.
-        drop(app.update(Message::KeyEvent { event: escape_event(), captured: false }));
+        drop(app.update(Message::KeyEvent {
+            event: escape_event(),
+            captured: false,
+        }));
         assert!(!app.terminal_find[&card].open);
     }
 
@@ -286,12 +308,21 @@ mod tests {
     fn focused_terminal_find_closes_on_its_first_escape_before_native_blur() {
         use cosmic::iced::{
             Event, Rectangle,
-            advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}},
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{Tree, operation},
+            },
             mouse,
         };
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
-        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                ..Find::default()
+            },
+        );
         let renderer = super::super::tests::headless_renderer();
         let mut element = app.terminal_find_view(card).unwrap();
         let mut tree = Tree::new(&element);
@@ -324,10 +355,11 @@ mod tests {
             message,
             Message::TerminalFind(Action::Close(target)) if *target == card
         )));
-        assert!(!published.iter().any(|message| matches!(
-            message,
-            Message::TerminalFind(Action::Focus(_, false))
-        )));
+        assert!(
+            !published
+                .iter()
+                .any(|message| matches!(message, Message::TerminalFind(Action::Focus(_, false))))
+        );
     }
 
     #[test]
@@ -592,10 +624,22 @@ impl Cagents {
                 find.focused = true;
                 let origin = handle.snapshot().scroll.history;
                 let mut selected_survived = true;
-                if find.matches.first().is_some_and(|found| found.history != origin) {
-                    let previous = find.matches.get(find.selected).and_then(|found| found.rebase(origin));
-                    let matches: Vec<_> = find.matches.iter().filter_map(|found| found.rebase(origin)).collect();
-                    let selected = previous.and_then(|previous| matches.iter().position(|found| *found == previous));
+                if find
+                    .matches
+                    .first()
+                    .is_some_and(|found| found.history != origin)
+                {
+                    let previous = find
+                        .matches
+                        .get(find.selected)
+                        .and_then(|found| found.rebase(origin));
+                    let matches: Vec<_> = find
+                        .matches
+                        .iter()
+                        .filter_map(|found| found.rebase(origin))
+                        .collect();
+                    let selected = previous
+                        .and_then(|previous| matches.iter().position(|found| *found == previous));
                     selected_survived = selected.is_some();
                     find.selected = selected.unwrap_or(0);
                     find.matches = matches.into();
@@ -674,12 +718,20 @@ impl Cagents {
         if !find.open || find.request != request || find.query != query {
             return;
         }
-        let previous = find.matches.get(find.selected).copied().and_then(|previous| {
-            matches.first().and_then(|found| previous.rebase(found.history))
-        });
+        let previous = find
+            .matches
+            .get(find.selected)
+            .copied()
+            .and_then(|previous| {
+                matches
+                    .first()
+                    .and_then(|found| previous.rebase(found.history))
+            });
         let background = std::mem::take(&mut find.background_results);
         let selected = background
-            .then(|| previous.and_then(|previous| matches.iter().position(|item| *item == previous)))
+            .then(|| {
+                previous.and_then(|previous| matches.iter().position(|item| *item == previous))
+            })
             .flatten()
             .unwrap_or_else(|| {
                 if background {

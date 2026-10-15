@@ -23,9 +23,9 @@ use super::{
 };
 
 #[cfg(test)]
-use std::{io::Read, thread};
-#[cfg(test)]
 use crate::terminal_ipc::read_frame_with_limit;
+#[cfg(test)]
+use std::{io::Read, thread};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -78,7 +78,11 @@ struct Registration {
 }
 
 impl Registration {
-    fn new(host: SharedHost, client_id: ClientId, retired: Option<Box<dyn FnOnce() + Send>>) -> Self {
+    fn new(
+        host: SharedHost,
+        client_id: ClientId,
+        retired: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
         let (delivery, proof) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             (state.register_client(client_id), state.proof().clone())
@@ -102,7 +106,9 @@ impl Drop for Registration {
         let retired = self.retired.take();
         crate::terminal::transport::retire(move || {
             disconnect_client(&host, client_id);
-            if let Some(retired) = retired { retired(); }
+            if let Some(retired) = retired {
+                retired();
+            }
         });
     }
 }
@@ -144,23 +150,44 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
 }
 
 pub(crate) fn spawn(
-    stream: UnixStream, client_id: ClientId, host: SharedHost,
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
     retired: impl FnOnce() + Send + 'static,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    Ok(crate::terminal::transport::runtime()?.spawn(serve_async(stream, client_id, host, process_request, Some(Box::new(retired)))))
+    Ok(crate::terminal::transport::runtime()?.spawn(serve_async(
+        stream,
+        client_id,
+        host,
+        process_request,
+        Some(Box::new(retired)),
+    )))
 }
 
 fn request_class(request: &ClientRequest) -> crate::terminal::transport::WorkClass {
     use crate::terminal::transport::WorkClass;
-    if super::deferred::is_deferred(request) { return WorkClass::Input; }
+    if super::deferred::is_deferred(request) {
+        return WorkClass::Input;
+    }
     match request {
-        ClientRequest::Input { .. } | ClientRequest::Paste { .. } | ClientRequest::Key { .. }
-        | ClientRequest::Mouse { .. } | ClientRequest::Focus { .. } | ClientRequest::Scroll { .. }
-        | ClientRequest::Resize { .. } | ClientRequest::SetTheme { .. } | ClientRequest::SetVisibility { .. }
-        | ClientRequest::Hibernate { .. } | ClientRequest::Resume { .. }
-        | ClientRequest::TerminalAcknowledge { .. } | ClientRequest::AcknowledgeRedraw { .. }
-        | ClientRequest::Authenticate { .. } | ClientRequest::BuildInfo => WorkClass::Input,
-        ClientRequest::Connect { .. } | ClientRequest::Attach { .. } | ClientRequest::Snapshot { .. } => WorkClass::Snapshot,
+        ClientRequest::Input { .. }
+        | ClientRequest::Paste { .. }
+        | ClientRequest::Key { .. }
+        | ClientRequest::Mouse { .. }
+        | ClientRequest::Focus { .. }
+        | ClientRequest::Scroll { .. }
+        | ClientRequest::Resize { .. }
+        | ClientRequest::SetTheme { .. }
+        | ClientRequest::SetVisibility { .. }
+        | ClientRequest::Hibernate { .. }
+        | ClientRequest::Resume { .. }
+        | ClientRequest::TerminalAcknowledge { .. }
+        | ClientRequest::AcknowledgeRedraw { .. }
+        | ClientRequest::Authenticate { .. }
+        | ClientRequest::BuildInfo => WorkClass::Input,
+        ClientRequest::Connect { .. }
+        | ClientRequest::Attach { .. }
+        | ClientRequest::Snapshot { .. } => WorkClass::Snapshot,
         _ => WorkClass::Domain,
     }
 }
@@ -268,10 +295,24 @@ impl Session {
         // A request that panics has released every guard it held by the time
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
-        let prepared=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||super::deferred::try_defer(&host,client_id,request_id,delivery.clone(),envelope.request)))
-            .unwrap_or_else(|_|Err(ProtocolError::new(ProtocolErrorCode::Internal,"the daemon failed while admitting this provider control",false)));
-        let request=match prepared {
-            Ok(Some(request))=>request,
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::deferred::try_defer(
+                &host,
+                client_id,
+                request_id,
+                delivery.clone(),
+                envelope.request,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "the daemon failed while admitting this provider control",
+                false,
+            ))
+        });
+        let request = match prepared {
+            Ok(Some(request)) => request,
             Ok(None) => return true,
             Err(error) => return push_error(&delivery, &host, request_id, error).is_ok(),
         };
@@ -324,7 +365,10 @@ impl Session {
 }
 
 async fn serve_async(
-    stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler,
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
+    handle: RequestHandler,
     retired: Option<Box<dyn FnOnce() + Send>>,
 ) {
     use crate::terminal::transport;
@@ -332,71 +376,131 @@ async fn serve_async(
     let pid = peer_pid(&stream);
     let registration = transport::dispatch(transport::WorkClass::Input, move || {
         let registration = Registration::new(Arc::clone(&host), client_id, retired);
-        if let Some(pid) = pid { host.lock().unwrap_or_else(|p| p.into_inner()).record_client_pid(client_id, pid); }
-        Session { registration, connected: false, handle }
+        if let Some(pid) = pid {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_client_pid(client_id, pid);
+        }
+        Session {
+            registration,
+            connected: false,
+            handle,
+        }
     });
     let mut session = match tokio::time::timeout_at(deadline, registration).await {
         Ok(Ok(session)) => session,
-        Ok(Err(error)) => { tracing::warn!(%error, "could not register daemon client"); return; },
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "could not register daemon client");
+            return;
+        }
         Err(_) => return,
     };
-    let socket = match tokio::io::unix::AsyncFd::new(stream) { Ok(socket) => Arc::new(socket), Err(_) => return };
+    let socket = match tokio::io::unix::AsyncFd::new(stream) {
+        Ok(socket) => Arc::new(socket),
+        Err(_) => return,
+    };
     let delivery = Arc::clone(&session.registration.delivery);
     let write_socket = Arc::clone(&socket);
     let writer_delivery = Arc::clone(&delivery);
-    let mut writer = transport::runtime().expect("initialized transport").spawn(async move {
-        writer_loop_async(write_socket, writer_delivery).await;
-    });
+    let mut writer = transport::runtime()
+        .expect("initialized transport")
+        .spawn(async move {
+            writer_loop_async(write_socket, writer_delivery).await;
+        });
     let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
     loop {
         let frame = if session.connected {
             transport::read::<ClientEnvelope>(&socket, &mut codec).await
         } else {
-            match tokio::time::timeout_at(deadline, transport::read::<ClientEnvelope>(&socket, &mut codec)).await {
+            match tokio::time::timeout_at(
+                deadline,
+                transport::read::<ClientEnvelope>(&socket, &mut codec),
+            )
+            .await
+            {
                 Ok(frame) => frame,
                 Err(_) => break,
             }
         };
-        let Ok(Some(envelope)) = frame else { break; };
+        let Ok(Some(envelope)) = frame else {
+            break;
+        };
         let class = request_class(&envelope.request);
         let result = transport::dispatch(class, move || {
             let connected = session.process(envelope);
             (session, connected)
-        }).await;
+        })
+        .await;
         match result {
-            Ok((next, connected)) => { session = next; if !connected { break; } },
-            Err(error) => { delivery.abort(error); return; },
+            Ok((next, connected)) => {
+                session = next;
+                if !connected {
+                    break;
+                }
+            }
+            Err(error) => {
+                delivery.abort(error);
+                return;
+            }
         }
     }
     drop(session);
-    if tokio::time::timeout(Duration::from_secs(6), &mut writer).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(6), &mut writer)
+        .await
+        .is_err()
+    {
         writer.abort();
         delivery.abort("client did not drain within its close deadline");
     }
     let _ = socket.get_ref().shutdown(Shutdown::Both);
 }
 
-async fn writer_loop_async(socket: Arc<tokio::io::unix::AsyncFd<UnixStream>>, delivery: Arc<DeliveryQueue>) {
+async fn writer_loop_async(
+    socket: Arc<tokio::io::unix::AsyncFd<UnixStream>>,
+    delivery: Arc<DeliveryQueue>,
+) {
     use crate::terminal::transport;
     // Even cancellation or a panic must release the peer's reader.
     struct Close(Arc<tokio::io::unix::AsyncFd<UnixStream>>);
-    impl Drop for Close { fn drop(&mut self) { let _ = self.0.get_ref().shutdown(Shutdown::Both); } }
+    impl Drop for Close {
+        fn drop(&mut self) {
+            let _ = self.0.get_ref().shutdown(Shutdown::Both);
+        }
+    }
     let _close = Close(Arc::clone(&socket));
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop_async().await {
         let encoded = transport::dispatch(transport::WorkClass::Encode, move || {
             let result = codec.encode(&message.wire());
             (codec, result)
-        }).await;
+        })
+        .await;
         match encoded {
             Ok((next, Ok(()))) => codec = next,
-            Ok((_, Err(error))) => { delivery.abort(write_failure(&error)); break; },
-            Err(error) => { delivery.abort(error); break; },
+            Ok((_, Err(error))) => {
+                delivery.abort(write_failure(&error));
+                break;
+            }
+            Err(error) => {
+                delivery.abort(error);
+                break;
+            }
         }
-        match tokio::time::timeout(Duration::from_secs(5), transport::write(&socket, codec.encoded())).await {
-            Ok(Ok(())) => {},
-            Ok(Err(error)) => { delivery.abort(write_failure(&FrameError::Io(error))); break; },
-            Err(_) => { delivery.abort("the client socket could not be written within its send timeout"); break; },
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            transport::write(&socket, codec.encoded()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                delivery.abort(write_failure(&FrameError::Io(error)));
+                break;
+            }
+            Err(_) => {
+                delivery.abort("the client socket could not be written within its send timeout");
+                break;
+            }
         }
     }
 }
@@ -1489,19 +1593,26 @@ mod tests {
 
     #[test]
     fn slow_domain_requests_cannot_occupy_input_or_response_encoding() {
-        static GATE: std::sync::OnceLock<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)> = std::sync::OnceLock::new();
-        fn handler(host: &SharedHost, client: ClientId, request: ClientRequest) -> Result<RequestOutcome, ProtocolError> {
+        static GATE: std::sync::OnceLock<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )> = std::sync::OnceLock::new();
+        fn handler(
+            host: &SharedHost,
+            client: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
             match request {
                 ClientRequest::SendTestNotification => {
                     let (entered, release) = GATE.get().unwrap();
                     entered.send(()).unwrap();
                     release.recv_timeout(Duration::from_secs(3)).unwrap();
                     Ok((ServerResponse::Accepted, Vec::new(), false))
-                },
+                }
                 ClientRequest::Input { bytes, .. } => {
                     assert_eq!(bytes, b"ping");
                     Ok((ServerResponse::Accepted, Vec::new(), false))
-                },
+                }
                 request => process_request(host, client, request),
             }
         }
@@ -1517,31 +1628,94 @@ mod tests {
         for client in 1..=5 {
             let (mut peer, server) = UnixStream::pair().unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-            tasks.push(runtime.spawn(serve_async(server, client, Arc::clone(&host), handler, None)));
-            codec.write(&mut peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 1, proof: None,
-                request: ClientRequest::Connect { expected_host: Some(proof.clone()), resume: Vec::new() } }).unwrap();
+            tasks.push(runtime.spawn(serve_async(
+                server,
+                client,
+                Arc::clone(&host),
+                handler,
+                None,
+            )));
+            codec
+                .write(
+                    &mut peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 1,
+                        proof: None,
+                        request: ClientRequest::Connect {
+                            expected_host: Some(proof.clone()),
+                            resume: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
             let response: ServerEnvelope = codec.read(&mut peer).unwrap().unwrap();
-            assert!(matches!(response.message, ServerMessage::Response { response: ServerResponse::Connected { .. } }));
+            assert!(matches!(
+                response.message,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
             peers.push(peer);
         }
         for peer in &mut peers[..4] {
-            codec.write(peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 2, proof: Some(proof.clone()), request: ClientRequest::SendTestNotification }).unwrap();
+            codec
+                .write(
+                    peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 2,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::SendTestNotification,
+                    },
+                )
+                .unwrap();
         }
-        for _ in 0..4 { observed.recv_timeout(Duration::from_secs(1)).unwrap(); }
+        for _ in 0..4 {
+            observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
         let started = Instant::now();
-        codec.write(&mut peers[4], &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 2, proof: Some(proof),
-            request: ClientRequest::Input { terminal_id: TerminalId::new(), bytes: b"ping".to_vec() } }).unwrap();
+        codec
+            .write(
+                &mut peers[4],
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 2,
+                    proof: Some(proof),
+                    request: ClientRequest::Input {
+                        terminal_id: TerminalId::new(),
+                        bytes: b"ping".to_vec(),
+                    },
+                },
+            )
+            .unwrap();
         let response: ServerEnvelope = codec.read(&mut peers[4]).unwrap().unwrap();
-        assert!(matches!(response.message, ServerMessage::Response { response: ServerResponse::Accepted }));
-        assert!(started.elapsed() < Duration::from_millis(500), "input/encoding waited for a slow domain request");
-        for _ in 0..4 { release.send(()).unwrap(); }
-        for peer in &mut peers[..4] { let _: ServerEnvelope = codec.read(peer).unwrap().unwrap(); }
+        assert!(matches!(
+            response.message,
+            ServerMessage::Response {
+                response: ServerResponse::Accepted
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "input/encoding waited for a slow domain request"
+        );
+        for _ in 0..4 {
+            release.send(()).unwrap();
+        }
+        for peer in &mut peers[..4] {
+            let _: ServerEnvelope = codec.read(peer).unwrap().unwrap();
+        }
         drop(peers);
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                for task in tasks { task.await.unwrap(); }
+                for task in tasks {
+                    task.await.unwrap();
+                }
                 crate::terminal::transport::flush_retired().await;
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         });
     }
 
@@ -1550,9 +1724,21 @@ mod tests {
         const FIXTURE: &str = "CAGENTS_TRANSPORT_THREAD_CENSUS";
         if std::env::var_os(FIXTURE).is_none() {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "host::client::tests::thirty_client_connections_add_no_os_threads", "--nocapture", "--test-threads=1"])
-                .env(FIXTURE, "1").output().unwrap();
-            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+                .args([
+                    "--exact",
+                    "host::client::tests::thirty_client_connections_add_no_os_threads",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(FIXTURE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
             return;
         }
         crate::terminal::transport::initialize_host().unwrap();
@@ -1567,21 +1753,45 @@ mod tests {
             peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             tasks.push(spawn(server, client_id, Arc::clone(&host), || {}).unwrap());
             let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
-            codec.write(&mut peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 1, proof: None,
-                request: ClientRequest::Connect { expected_host: Some(proof.clone()), resume: Vec::new() } }).unwrap();
+            codec
+                .write(
+                    &mut peer,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 1,
+                        proof: None,
+                        request: ClientRequest::Connect {
+                            expected_host: Some(proof.clone()),
+                            resume: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
             let response: ServerEnvelope = codec.read(&mut peer).unwrap().unwrap();
-            assert!(matches!(response.message, ServerMessage::Response { response: ServerResponse::Connected { .. } }));
+            assert!(matches!(
+                response.message,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
             peers.push(peer);
         }
         let attached = count();
-        assert!(attached <= idle, "idle={idle}, thirty_connections={attached}");
+        assert!(
+            attached <= idle,
+            "idle={idle}, thirty_connections={attached}"
+        );
         println!("transport_thread_census idle={idle} thirty_connections={attached}");
         drop(peers);
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(10), async {
-                for task in tasks { task.await.unwrap(); }
+                for task in tasks {
+                    task.await.unwrap();
+                }
                 crate::terminal::transport::flush_retired().await;
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         });
         assert!(host.lock().unwrap().clients.is_empty());
     }
@@ -2389,7 +2599,13 @@ mod tests {
 
     #[test]
     fn unanswered_controls_do_not_block_stop_on_the_same_framed_connection() {
-        use crate::{agent::Provider, chat::{self, Command, Event, protocol::{Adapter, ProcessSpec, Step}}};
+        use crate::{
+            agent::Provider,
+            chat::{
+                self, Command, Event,
+                protocol::{Adapter, ProcessSpec, Step},
+            },
+        };
         use std::collections::BTreeMap;
         struct Controls {
             admitted: crossbeam_channel::Sender<()>,
@@ -2397,83 +2613,220 @@ mod tests {
             next: u64,
         }
         impl Adapter for Controls {
-            fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
-            fn command(&mut self, command: Command) -> Result<Step,String> {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
                 match command {
                     Command::SetPermissionMode { .. } => {
                         self.next += 1;
-                        self.acknowledgement = Some(format!("ignored-{}",self.next));
+                        self.acknowledgement = Some(format!("ignored-{}", self.next));
                         self.admitted.send(()).unwrap();
-                        Ok(Step { writes:vec![serde_json::json!({"ignored":self.next})], ..Default::default() })
+                        Ok(Step {
+                            writes: vec![serde_json::json!({"ignored":self.next})],
+                            ..Default::default()
+                        })
                     }
-                    Command::Interrupt => Ok(Step { events:vec![Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled}], ..Default::default() }),
+                    Command::Interrupt => Ok(Step {
+                        events: vec![Event::TurnFinished {
+                            key: None,
+                            outcome: crate::notifications::Kind::Cancelled,
+                        }],
+                        ..Default::default()
+                    }),
                     _ => Err("Unexpected fixture command".into()),
                 }
             }
-            fn command_ack(&mut self) -> Option<String> { self.acknowledgement.take() }
-            fn receive(&mut self, _:serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
+            fn command_ack(&mut self) -> Option<String> {
+                self.acknowledgement.take()
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        fn send(stream:&mut UnixStream,proof:&HostSessionProof,request_id:u64,request:ClientRequest) {
-            FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(stream,&ClientEnvelope {version:PROTOCOL_VERSION,request_id,proof:Some(proof.clone()),request}).unwrap();
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
         }
         struct Cleanup {
-            stream:UnixStream,
-            server:Option<thread::JoinHandle<()>>,
-            handle:chat::runtime::Handle,
+            stream: UnixStream,
+            server: Option<thread::JoinHandle<()>>,
+            handle: chat::runtime::Handle,
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _=self.stream.shutdown(Shutdown::Both);
-                let _=self.handle.close();
-                if let Some(server)=self.server.take() {let _=server.join();}
+                let _ = self.stream.shutdown(Shutdown::Both);
+                let _ = self.handle.close();
+                if let Some(server) = self.server.take() {
+                    let _ = server.join();
+                }
             }
         }
-        let (proof,host)=panic_test_host("same-stream-provider-controls");
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new(),unset_environment:Default::default()};
-        let spec=ProcessSpec::from(&recipe);
-        let (admitted,observed)=crossbeam_channel::bounded(64);
-        let mut initial=Step {events:vec![Event::Ready(true),Event::TurnStarted],..Default::default()};
-        let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
-        let handle=chat::runtime::Handle::start(spec,Box::new(Controls {admitted,acknowledgement:None,next:0}),initial,store,None,|_|{}).unwrap();
-        let chat_id=TerminalId::new();
-        host.lock().unwrap().chats.insert(chat_id,super::super::chat::Record {
-            execution_instance:uuid::Uuid::nil(),console_recipe:None,paired_terminal:None,
-            session:chat::Session {native_continuity:Default::default(),owned_codex_listener:None,id:chat_id,launch:chat::Launch {provider:Provider::Claude,recipe,session_id:None},proof:Some(proof.clone()),terminal:None},
-            handle:handle.clone(),source_process:None,subscribers:BTreeMap::from([(1,false)]),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false,
-        });
-        let (mut stream,server_stream)=UnixStream::pair().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
-        let server_host=host.clone();
-        let _cleanup=Cleanup {stream:stream.try_clone().unwrap(),server:Some(thread::spawn(move||serve(server_stream,1,server_host))),handle:handle.clone()};
-        send(&mut stream,&proof,1,ClientRequest::Connect {expected_host:Some(proof.clone()),resume:Vec::new()});
-        let mut reader=FrameCodec::new(MAX_FRAME_BYTES);
-        let connected=reader.read::<ServerEnvelope>(&mut stream).unwrap().unwrap();
-        assert_eq!(connected.request_id,Some(1));
-        assert!(matches!(connected.message,ServerMessage::Response {response:ServerResponse::Connected{..}}));
+        let (proof, host) = panic_test_host("same-stream-provider-controls");
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let (admitted, observed) = crossbeam_channel::bounded(64);
+        let mut initial = Step {
+            events: vec![Event::Ready(true), Event::TurnStarted],
+            ..Default::default()
+        };
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::Handle::start(
+            spec,
+            Box::new(Controls {
+                admitted,
+                acknowledgement: None,
+                next: 0,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let chat_id = TerminalId::new();
+        host.lock().unwrap().chats.insert(
+            chat_id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: chat::Session {
+                    native_continuity: Default::default(),
+                    owned_codex_listener: None,
+                    id: chat_id,
+                    launch: chat::Launch {
+                        provider: Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: Some(proof.clone()),
+                    terminal: None,
+                },
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::from([(1, false)]),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_host = host.clone();
+        let _cleanup = Cleanup {
+            stream: stream.try_clone().unwrap(),
+            server: Some(thread::spawn(move || serve(server_stream, 1, server_host))),
+            handle: handle.clone(),
+        };
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+        let connected = reader.read::<ServerEnvelope>(&mut stream).unwrap().unwrap();
+        assert_eq!(connected.request_id, Some(1));
+        assert!(matches!(
+            connected.message,
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
         for request_id in 2..=66 {
-            send(&mut stream,&proof,request_id,ClientRequest::ChatCommand {chat_id,command:Command::SetPermissionMode {mode:"manual".into()}});
+            send(
+                &mut stream,
+                &proof,
+                request_id,
+                ClientRequest::ChatCommand {
+                    chat_id,
+                    command: Command::SetPermissionMode {
+                        mode: "manual".into(),
+                    },
+                },
+            );
         }
-        let deadline=Instant::now()+Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(2);
         for _ in 0..64 {
-            observed.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the connection blocked before admitting all bounded controls");
+            observed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the connection blocked before admitting all bounded controls");
         }
-        send(&mut stream,&proof,67,ClientRequest::ChatCommand {chat_id,command:Command::Interrupt});
-        let mut capacity_refusal=false;
+        send(
+            &mut stream,
+            &proof,
+            67,
+            ClientRequest::ChatCommand {
+                chat_id,
+                command: Command::Interrupt,
+            },
+        );
+        let mut capacity_refusal = false;
         loop {
-            let response=reader.read::<ServerEnvelope>(&mut stream).expect("Stop must not wait for ignored control replies").unwrap();
-            assert_eq!(response.proof,proof);
+            let response = reader
+                .read::<ServerEnvelope>(&mut stream)
+                .expect("Stop must not wait for ignored control replies")
+                .unwrap();
+            assert_eq!(response.proof, proof);
             match response.request_id {
-                Some(66)=> { assert!(matches!(response.message,ServerMessage::Error(_)));capacity_refusal=true; }
-                Some(67)=> { assert!(matches!(response.message,ServerMessage::Response {response:ServerResponse::Accepted}));break; }
-                Some(id)=>panic!("unanswered ordinary request {id} unexpectedly replied before Stop"),
-                None=>{}
+                Some(66) => {
+                    assert!(matches!(response.message, ServerMessage::Error(_)));
+                    capacity_refusal = true;
+                }
+                Some(67) => {
+                    assert!(matches!(
+                        response.message,
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted
+                        }
+                    ));
+                    break;
+                }
+                Some(id) => {
+                    panic!("unanswered ordinary request {id} unexpectedly replied before Stop")
+                }
+                None => {}
             }
         }
-        assert!(capacity_refusal,"the 65th normal control has an independent correlated refusal");
-        let snapshot=handle.snapshot(None).unwrap();
-        assert_eq!(snapshot.outcome,Some(crate::agent::ActivityOutcome::Cancelled));
+        assert!(
+            capacity_refusal,
+            "the 65th normal control has an independent correlated refusal"
+        );
+        let snapshot = handle.snapshot(None).unwrap();
+        assert_eq!(
+            snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        );
         assert!(snapshot.error.is_none());
     }
 
@@ -2585,7 +2938,9 @@ mod tests {
         });
         let delivery = delivery.recv().unwrap();
         assert!(client.join().is_err());
-        crate::terminal::transport::runtime().unwrap().block_on(crate::terminal::transport::flush_retired());
+        crate::terminal::transport::runtime()
+            .unwrap()
+            .block_on(crate::terminal::transport::flush_retired());
         assert!(!host.lock().unwrap().clients.contains_key(&7));
         // The writer blocks here until the queue is closed, holding the socket.
         assert!(delivery.pop().is_none());

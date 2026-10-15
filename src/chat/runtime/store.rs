@@ -708,9 +708,15 @@ impl Store {
         if let Some(warning) = self.flush_input()? {
             out.push(nonfatal(warning));
         }
-        if let Event::TurnFinished {outcome,..}=&event {
-            let status=match outcome {crate::notifications::Kind::Cancelled=>Some(crate::chat::ToolStatus::Stopped),crate::notifications::Kind::Failed=>Some(crate::chat::ToolStatus::Failed),_=>None};
-            if let Some(status)=status {self.finish_running(status)?;}
+        if let Event::TurnFinished { outcome, .. } = &event {
+            let status = match outcome {
+                crate::notifications::Kind::Cancelled => Some(crate::chat::ToolStatus::Stopped),
+                crate::notifications::Kind::Failed => Some(crate::chat::ToolStatus::Failed),
+                _ => None,
+            };
+            if let Some(status) = status {
+                self.finish_running(status)?;
+            }
         }
         let input_delta = matches!(&event, Event::InputDelta { .. });
         match event {
@@ -858,22 +864,54 @@ impl Store {
     }
     /// Finalize only the indexed live tools, leaving transcript bodies and
     /// completed history untouched. Batch metadata bounds transient memory.
-    pub(super) fn finish_running(&mut self,status:crate::chat::ToolStatus)->Result<(),String> {
-        let _=self.flush_text()?;let _=self.flush_input()?;
+    pub(super) fn finish_running(&mut self, status: crate::chat::ToolStatus) -> Result<(), String> {
+        let _ = self.flush_text()?;
+        let _ = self.flush_input()?;
         loop {
-            let rows={
-                let mut query=self.db.prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64").map_err(|error|error.to_string())?;
-                let rows=query.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?))).map_err(|error|error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
+            let rows = {
+                let mut query = self
+                    .db
+                    .prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64")
+                    .map_err(|error| error.to_string())?;
+                let rows = query
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
                 rows
             };
-            if rows.is_empty() {break;}
-            for (id,metadata) in rows {
-                let mut item:Item=postcard::from_bytes(&metadata).map_err(|error|error.to_string())?;
-                match &mut item.content {ItemContent::Tool {status:current,..}|ItemContent::Command {status:current,..}|ItemContent::Changes {status:current,..} if *current==crate::chat::ToolStatus::Running=>*current=status,_=>{}}
-                if matches!(item.content,ItemContent::Changes{..}) {self.finish_file_status("",&id,status)?;}
-                let metadata=postcard::to_stdvec(&item).map_err(|error|error.to_string())?;
-                self.db.execute("UPDATE items SET metadata=?2,running=0 WHERE id=?1",params![id,metadata]).map_err(|error|error.to_string())?;
-                self.changed(&id);self.dirty=true;
+            if rows.is_empty() {
+                break;
+            }
+            for (id, metadata) in rows {
+                let mut item: Item =
+                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+                match &mut item.content {
+                    ItemContent::Tool {
+                        status: current, ..
+                    }
+                    | ItemContent::Command {
+                        status: current, ..
+                    }
+                    | ItemContent::Changes {
+                        status: current, ..
+                    } if *current == crate::chat::ToolStatus::Running => *current = status,
+                    _ => {}
+                }
+                if matches!(item.content, ItemContent::Changes { .. }) {
+                    self.finish_file_status("", &id, status)?;
+                }
+                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
+                self.db
+                    .execute(
+                        "UPDATE items SET metadata=?2,running=0 WHERE id=?1",
+                        params![id, metadata],
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.changed(&id);
+                self.dirty = true;
             }
         }
         Ok(())
@@ -1646,8 +1684,14 @@ mod tests {
     #[ignore = "explicit disk-backed before/after performance measurement"]
     fn benchmark_one_megabyte_tool_input_stream() {
         fn written_bytes() -> u64 {
-            std::fs::read_to_string("/proc/self/io").unwrap().lines()
-                .find_map(|line| line.strip_prefix("wchar:").map(|value| value.trim().parse().unwrap())).unwrap()
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("wchar:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap()
         }
         for append in [false, true] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -1658,15 +1702,27 @@ mod tests {
                 serde_json::json!({"type":"message_start","message":{"id":"bench-message"}}),
                 serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bench","name":"Write","input":{}}}),
             ] {
-                for event in adapter.receive(stream(event)).unwrap().events { store.apply(event).unwrap(); }
+                for event in adapter.receive(stream(event)).unwrap().events {
+                    store.apply(event).unwrap();
+                }
             }
-            let mut item = Item { id:"bench".into(),role:Role::Assistant,started_at:None,at:None,
-                content:ItemContent::Tool {name:"Write".into(),input:String::new(),output:String::new(),status:crate::chat::ToolStatus::Running} };
+            let mut item = Item {
+                id: "bench".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "Write".into(),
+                    input: String::new(),
+                    output: String::new(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            };
             let mut payload = serde_json::json!({"file_path":"fixture.txt","content":""});
             let overhead = payload.to_string().len();
-            payload["content"] = serde_json::Value::String("x".repeat(1024*1024-overhead));
+            payload["content"] = serde_json::Value::String("x".repeat(1024 * 1024 - overhead));
             let source = payload.to_string();
-            assert_eq!(source.len(),1024*1024);
+            assert_eq!(source.len(), 1024 * 1024);
             let io_before = written_bytes();
             let started = std::time::Instant::now();
             let mut submitted_bytes = 0usize;
@@ -1675,10 +1731,14 @@ mod tests {
                 let step = adapter.receive(stream(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":delta}}))).unwrap();
                 for event in step.events {
                     if append {
-                        if let Event::InputDelta { delta,.. } = &event { submitted_bytes += delta.len(); }
+                        if let Event::InputDelta { delta, .. } = &event {
+                            submitted_bytes += delta.len();
+                        }
                         store.apply(event).unwrap();
-                    } else if let Event::InputDelta { delta,.. } = event {
-                        let ItemContent::Tool { input,.. } = &mut item.content else { unreachable!() };
+                    } else if let Event::InputDelta { delta, .. } = event {
+                        let ItemContent::Tool { input, .. } = &mut item.content else {
+                            unreachable!()
+                        };
                         input.push_str(&delta);
                         submitted_bytes += input.len();
                         // Reproduce the previous adapter's full-item publication.
@@ -1687,11 +1747,26 @@ mod tests {
                 }
             }
             store.flush_input().unwrap();
-            let io_written = written_bytes()-io_before;
-            let (bytes,chunks):(usize,usize) = store.db.query_row("SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='bench' AND field=0",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
-            assert_eq!(bytes,source.len());
-            println!("append={append} duration_ms={} body_bytes_submitted={submitted_bytes} syscall_write_bytes={io_written} final_body_bytes={bytes} final_chunks={chunks}",started.elapsed().as_millis());
-            if append { assert!(io_written <= 5 * 1024 * 1024,"append writes should stay within a small constant factor of input size"); }
+            let io_written = written_bytes() - io_before;
+            let (bytes, chunks): (usize, usize) = store
+                .db
+                .query_row(
+                    "SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='bench' AND field=0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(bytes, source.len());
+            println!(
+                "append={append} duration_ms={} body_bytes_submitted={submitted_bytes} syscall_write_bytes={io_written} final_body_bytes={bytes} final_chunks={chunks}",
+                started.elapsed().as_millis()
+            );
+            if append {
+                assert!(
+                    io_written <= 5 * 1024 * 1024,
+                    "append writes should stay within a small constant factor of input size"
+                );
+            }
         }
     }
 
@@ -1730,17 +1805,63 @@ mod tests {
 
     #[test]
     fn terminal_outcomes_update_only_running_metadata_and_never_rewrite_bodies() {
-        for (outcome,expected) in [(crate::notifications::Kind::Cancelled,crate::chat::ToolStatus::Stopped),(crate::notifications::Kind::Failed,crate::chat::ToolStatus::Failed),(crate::notifications::Kind::Succeeded,crate::chat::ToolStatus::Running)] {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();let mut store=Store::at(directory.path().into()).unwrap();
-            let input="retained input".repeat(1000);let output="retained output".repeat(1000);
-            store.apply(Event::Item(Item {id:"pending".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Write".into(),input:input.clone(),output:output.clone(),status:crate::chat::ToolStatus::Running}})).unwrap();
-            let before:i64=store.db.query_row("SELECT total_changes()",[],|row|row.get(0)).unwrap();
-            store.apply(Event::TurnFinished {key:None,outcome}).unwrap();
-            let after:i64=store.db.query_row("SELECT total_changes()",[],|row|row.get(0)).unwrap();
-            assert_eq!(after-before,if outcome==crate::notifications::Kind::Succeeded {0} else {1},"only the metadata row changes; chunks are never deleted or rewritten");
+        for (outcome, expected) in [
+            (
+                crate::notifications::Kind::Cancelled,
+                crate::chat::ToolStatus::Stopped,
+            ),
+            (
+                crate::notifications::Kind::Failed,
+                crate::chat::ToolStatus::Failed,
+            ),
+            (
+                crate::notifications::Kind::Succeeded,
+                crate::chat::ToolStatus::Running,
+            ),
+        ] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut store = Store::at(directory.path().into()).unwrap();
+            let input = "retained input".repeat(1000);
+            let output = "retained output".repeat(1000);
+            store
+                .apply(Event::Item(Item {
+                    id: "pending".into(),
+                    role: Role::Assistant,
+                    started_at: None,
+                    at: None,
+                    content: ItemContent::Tool {
+                        name: "Write".into(),
+                        input: input.clone(),
+                        output: output.clone(),
+                        status: crate::chat::ToolStatus::Running,
+                    },
+                }))
+                .unwrap();
+            let before: i64 = store
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            store
+                .apply(Event::TurnFinished { key: None, outcome })
+                .unwrap();
+            let after: i64 = store
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                after - before,
+                if outcome == crate::notifications::Kind::Succeeded {
+                    0
+                } else {
+                    1
+                },
+                "only the metadata row changes; chunks are never deleted or rewritten"
+            );
             store.apply(Event::TurnStarted).unwrap();
-            let page=store.window().unwrap();
-            assert!(matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected));
+            let page = store.window().unwrap();
+            assert!(
+                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected)
+            );
         }
     }
 

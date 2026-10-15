@@ -1874,7 +1874,9 @@ impl Adapter for Codex {
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| "The provider reported an error without a readable message".into())
+                        .unwrap_or_else(|| {
+                            "The provider reported an error without a readable message".into()
+                        })
                 );
                 step.events
                     .push(if matches!(pending, Pending::History { .. }) {
@@ -2882,9 +2884,10 @@ impl Adapter for Codex {
                     .as_str()
                     .or_else(|| params["summary"].as_str())
                     .filter(|text| !text.trim().is_empty());
-                let mut message = summary
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "Codex reported a configuration warning; check the provider log for details".into());
+                let mut message = summary.map(str::to_owned).unwrap_or_else(|| {
+                    "Codex reported a configuration warning; check the provider log for details"
+                        .into()
+                });
                 if summary.is_some() {
                     for key in ["details", "path"] {
                         if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {

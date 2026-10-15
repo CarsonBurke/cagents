@@ -222,7 +222,9 @@ pub struct HistoryPosition {
 
 impl HistoryPosition {
     pub fn rebase_row(self, row: u64, captured: Self) -> Option<u64> {
-        if self.epoch != captured.epoch { return None; }
+        if self.epoch != captured.epoch {
+            return None;
+        }
         row.checked_sub(self.dropped.checked_sub(captured.dropped)?)
     }
 

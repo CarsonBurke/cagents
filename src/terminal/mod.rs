@@ -1,15 +1,15 @@
+mod daemon_start;
 #[cfg(feature = "host")]
 pub(crate) mod holder;
-#[cfg(feature = "host")]
-pub(crate) mod reactor;
-mod daemon_start;
 #[cfg(any(feature = "ui", feature = "host"))]
 mod hosted;
-#[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) mod transport;
 pub mod ipc;
+#[cfg(feature = "host")]
+pub(crate) mod reactor;
 mod search;
 mod snapshot;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod transport;
 pub use search::SearchMatch;
 #[cfg(feature = "ui")]
 mod surface;
@@ -33,8 +33,8 @@ pub use daemon_start::{HostedTerminalStartError, ensure_daemon_ready, ensure_dae
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use hosted::HostedTerminalHandle;
 pub use snapshot::{
-    CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, HistoryPosition, RenderSnapshot, Rgb,
-    RowSnapshot, ScrollSnapshot, Underline,
+    CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, HistoryPosition,
+    RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, Underline,
 };
 #[cfg(feature = "ui")]
 pub use surface::TerminalSurface;

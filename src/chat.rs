@@ -20,10 +20,10 @@ pub(crate) mod native_holder;
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
-#[cfg(feature = "host")]
-pub(crate) mod stderr_log;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
 #[cfg(any(feature = "ui", feature = "host"))]
 #[path = "chat/protocol/terminal_output.rs"]
 pub(crate) mod terminal_output;
@@ -2113,8 +2113,12 @@ mod tests {
         for outcome in [
             ActivityOutcome::Succeeded,
             ActivityOutcome::Cancelled,
-            ActivityOutcome::Failed { reason: "Provider exited with status 3: authentication failed".into() },
-            ActivityOutcome::Interrupted { reason: "Provider exited with status 0 before its final result".into() },
+            ActivityOutcome::Failed {
+                reason: "Provider exited with status 3: authentication failed".into(),
+            },
+            ActivityOutcome::Interrupted {
+                reason: "Provider exited with status 0 before its final result".into(),
+            },
         ] {
             let snapshot = super::Snapshot {
                 outcome: Some(outcome),
@@ -2126,9 +2130,15 @@ mod tests {
                 ..Default::default()
             };
             let binary = postcard::to_stdvec(&snapshot).unwrap();
-            assert_eq!(postcard::from_bytes::<super::Snapshot>(&binary).unwrap(), snapshot);
+            assert_eq!(
+                postcard::from_bytes::<super::Snapshot>(&binary).unwrap(),
+                snapshot
+            );
             let json = serde_json::to_value(&snapshot).unwrap();
-            assert_eq!(serde_json::from_value::<super::Snapshot>(json).unwrap(), snapshot);
+            assert_eq!(
+                serde_json::from_value::<super::Snapshot>(json).unwrap(),
+                snapshot
+            );
         }
     }
 

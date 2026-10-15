@@ -3,8 +3,8 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
-mod delivery;
 mod deferred;
+mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
@@ -101,10 +101,16 @@ fn reap_finished(clients: &mut Vec<tokio::task::JoinHandle<()>>) {
     while index < clients.len() {
         if clients[index].is_finished() {
             let handle = clients.swap_remove(index);
-            if crate::terminal::transport::runtime().expect("initialized transport").block_on(handle).is_err() {
+            if crate::terminal::transport::runtime()
+                .expect("initialized transport")
+                .block_on(handle)
+                .is_err()
+            {
                 tracing::warn!("cagents daemon client task panicked");
             }
-        } else { index += 1; }
+        } else {
+            index += 1;
+        }
     }
 }
 
@@ -405,12 +411,17 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let runtime = crate::terminal::transport::runtime().expect("initialized transport");
     let clients_finished = runtime.block_on(async move {
         tokio::time::timeout(std::time::Duration::from_secs(15), async move {
-            for client in clients { let _ = client.await; }
+            for client in clients {
+                let _ = client.await;
+            }
             crate::terminal::transport::flush_retired().await;
-        }).await
+        })
+        .await
     });
     if clients_finished.is_err() {
-        runtime_error = Some(io::Error::other("daemon clients exceeded their shutdown deadline"));
+        runtime_error = Some(io::Error::other(
+            "daemon clients exceeded their shutdown deadline",
+        ));
     }
     match runtime_error {
         Some(error) => Err(error.into()),

@@ -368,7 +368,12 @@ impl History {
         self.rows = self.rows[first..].to_vec().into();
         self.meaningful_end = self.meaningful_end.saturating_sub(first);
         self.active_start = self.active_start.saturating_sub(first as u64);
-        self.base.scroll.history.dropped = self.base.scroll.history.dropped.saturating_add(first as u64);
+        self.base.scroll.history.dropped = self
+            .base
+            .scroll
+            .history
+            .dropped
+            .saturating_add(first as u64);
         self.base.scroll.total = self.rows.len() as u64;
         self.base.scroll.len = self.base.scroll.total;
         self.base.scroll.offset = 0;
@@ -430,12 +435,16 @@ impl Source {
             }
         }
         let (mut matches, truncated) = matcher.results();
-        for found in &mut matches { found.history = self.history; }
+        for found in &mut matches {
+            found.history = self.history;
+        }
         Some((matches, truncated))
     }
 
     pub(super) fn copy(&self, range: SearchMatch) -> Result<String, String> {
-        let range = range.rebase(self.history).ok_or_else(|| "Output moved; select again".to_owned())?;
+        let range = range
+            .rebase(self.history)
+            .ok_or_else(|| "Output moved; select again".to_owned())?;
         let unavailable = || "The selected terminal output is no longer available".to_owned();
         if range.start_row > range.end_row
             || range.end_row >= self.rows.len() as u64

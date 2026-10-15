@@ -324,20 +324,28 @@ type Notice = Box<dyn FnOnce() + Send>;
 /// hold a host or metadata lock, so invoking these callbacks inline can deadlock.
 fn event_dispatcher() -> Result<&'static Sender<Notice>, String> {
     static NOTIFIER: OnceLock<Result<Sender<Notice>, String>> = OnceLock::new();
-    NOTIFIER.get_or_init(|| {
-        let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
-        thread::Builder::new().name("terminal-events".into()).spawn(move || {
-            for notice in pending {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
-            }
-        }).map_err(|error| format!("start shared terminal event dispatcher: {error}"))?;
-        Ok(notices)
-    }).as_ref().map_err(Clone::clone)
+    NOTIFIER
+        .get_or_init(|| {
+            let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
+            thread::Builder::new()
+                .name("terminal-events".into())
+                .spawn(move || {
+                    for notice in pending {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
+                    }
+                })
+                .map_err(|error| format!("start shared terminal event dispatcher: {error}"))?;
+            Ok(notices)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 fn notify_archived(notice: impl FnOnce() + Send + 'static) {
     match event_dispatcher() {
-        Ok(notifier) => { let _ = notifier.send(Box::new(notice)); },
+        Ok(notifier) => {
+            let _ = notifier.send(Box::new(notice));
+        }
         Err(error) => tracing::error!(%error, "terminal semantic events cannot be delivered"),
     }
 }
@@ -563,7 +571,8 @@ impl PublishedState {
                         rows,
                         reply,
                     } => {
-                        let offset = offset.map(|row| history.position().rebase_row(row, captured).unwrap_or(0));
+                        let offset = offset
+                            .map(|row| history.position().rebase_row(row, captured).unwrap_or(0));
                         let _ = reply.send(Ok(history.snapshot_at(
                             offset,
                             rows,
@@ -616,7 +625,10 @@ impl PublishedState {
     }
 
     fn emit_event(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
-        let observer = self.event_observer.lock().unwrap_or_else(|p| p.into_inner());
+        let observer = self
+            .event_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(observer) = observer.as_ref().cloned() {
             // The caller can hold either an agent-state or host lock. Schedule
             // callbacks on the shared notifier, never invoke under those locks.
@@ -1137,14 +1149,25 @@ impl TerminalHandle {
     ) {
         let handle = Arc::downgrade(&self.inner);
         let observer: Arc<EventObserver> = Arc::new(move |event| {
-            if let Some(inner) = handle.upgrade() { observer(&TerminalHandle { inner }, event); }
+            if let Some(inner) = handle.upgrade() {
+                observer(&TerminalHandle { inner }, event);
+            }
         });
-        let mut current = self.inner.published.event_observer.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self
+            .inner
+            .published
+            .event_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for event in self.inner.events.try_iter() {
             let observer = Arc::clone(&observer);
             notify_archived(move || observer(event));
         }
-        let _ = self.inner.published.archive_observer.set(Arc::clone(&observer));
+        let _ = self
+            .inner
+            .published
+            .archive_observer
+            .set(Arc::clone(&observer));
         *current = Some(observer);
     }
 
@@ -1692,12 +1715,20 @@ impl Reader {
         };
         let reader = duplicate("reading")?;
         let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(format!("make PTY reader nonblocking: {}", std::io::Error::last_os_error()));
+        if flags < 0
+            || unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(format!(
+                "make PTY reader nonblocking: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let (wake_rx, wake) = wake_pipe()?;
         let (pty_tx, output) = crossbeam_channel::bounded(capacity.max(1));
-        if !pending.is_empty() { let _ = pty_tx.try_send(PtyMessage::Bytes(pending)); }
+        if !pending.is_empty() {
+            let _ = pty_tx.try_send(PtyMessage::Bytes(pending));
+        }
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
         let (start, started) = tokio::sync::oneshot::channel();
         let credit = Arc::new(tokio::sync::Notify::new());
@@ -1705,8 +1736,12 @@ impl Reader {
         let thread = super::reactor::runtime()?.spawn(async move {
             let _done = done_tx;
             if started.await.is_ok() {
-                if let Err(error) = read_pty_shared(reader, wake_rx, &pty_tx, &consumer_credit).await {
-                    let _ = pty_tx.try_send(PtyMessage::Error(format!("terminal {terminal_id}: {error}")));
+                if let Err(error) =
+                    read_pty_shared(reader, wake_rx, &pty_tx, &consumer_credit).await
+                {
+                    let _ = pty_tx.try_send(PtyMessage::Error(format!(
+                        "terminal {terminal_id}: {error}"
+                    )));
                 }
             }
         });
@@ -2176,7 +2211,7 @@ impl Worker {
                 Err(RecvTimeoutError::Timeout) => {
                     reader.abort();
                     tracing::warn!(terminal_id = %self.terminal_id, "canceling PTY reader task after its shutdown deadline");
-                },
+                }
                 _ => {
                     drop(reader);
                 }
@@ -2296,7 +2331,7 @@ impl Worker {
                         Ok(PtyMessage::Bytes(next)) => {
                             bytes.extend_from_slice(&next);
                             self.reader_credit.notify_one();
-                        },
+                        }
                         Ok(PtyMessage::Eof) => {
                             self.process_output(bytes);
                             return false;
@@ -2362,18 +2397,25 @@ impl Worker {
         // without removing any history, so they cannot measure global pruning.
         use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
         let marker_row = (self.terminal.scrollback_rows().unwrap_or(0) as u64).saturating_sub(1);
-        let marker = self.terminal.track_grid_ref(Point::Screen(PointCoordinate {
-            x: 0, y: u32::try_from(marker_row).unwrap_or(u32::MAX),
-        })).ok();
+        let marker = self
+            .terminal
+            .track_grid_ref(Point::Screen(PointCoordinate {
+                x: 0,
+                y: u32::try_from(marker_row).unwrap_or(u32::MAX),
+            }))
+            .ok();
         let screen = self.terminal.active_screen().ok();
         self.terminal.vt_write(&bytes);
         if screen != self.terminal.active_screen().ok() {
             self.history_position.invalidate();
-        } else if let Some(point) = marker.as_ref()
+        } else if let Some(point) = marker
+            .as_ref()
             .and_then(|pin| pin.point(PointSpace::Screen).ok().flatten())
         {
-            self.history_position.dropped = self.history_position.dropped.saturating_add(
-                marker_row.saturating_sub(u64::from(point.y)));
+            self.history_position.dropped = self
+                .history_position
+                .dropped
+                .saturating_add(marker_row.saturating_sub(u64::from(point.y)));
         } else {
             // No previous cell survives: an unknown number of newly-created
             // rows may also have been pruned within this batch. A fresh epoch
@@ -2647,11 +2689,17 @@ impl Worker {
                     latest.load(Ordering::Acquire) != request
                 }) {
                     Ok(Some((mut matches, truncated))) => {
-                        for found in &mut matches { found.history = self.history_position; }
+                        for found in &mut matches {
+                            found.history = self.history_position;
+                        }
                         self.emit(TerminalEvent::SearchResults {
-                            owner, request, query, matches, truncated,
+                            owner,
+                            request,
+                            query,
+                            matches,
+                            truncated,
                         });
-                    },
+                    }
                     Ok(None) => {}
                     Err(error) => self.error("search terminal", error.to_string()),
                 }
@@ -2664,7 +2712,10 @@ impl Worker {
             }
             Command::CopySelection { request, selection } => {
                 let Some(selection) = selection.rebase(self.history_position) else {
-                    self.error("copy terminal selection", "Output moved; select again".into());
+                    self.error(
+                        "copy terminal selection",
+                        "Output moved; select again".into(),
+                    );
                     return false;
                 };
                 match super::search::selected_text(&self.terminal, selection) {
@@ -2944,7 +2995,8 @@ impl Worker {
         }
         let base = self.published.snapshot.load_full();
         for (offset, captured, rows, reply) in std::mem::take(&mut self.viewport_reads) {
-            let offset = offset.map(|row| self.history_position.rebase_row(row, captured).unwrap_or(0));
+            let offset =
+                offset.map(|row| self.history_position.rebase_row(row, captured).unwrap_or(0));
             let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -3875,8 +3927,18 @@ async fn read_pty_shared(
         };
         let result = readiness.try_io(|fd| {
             // SAFETY: the owned descriptor and writable buffer span this call.
-            let count = unsafe { libc::read(fd.get_ref().as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-            if count < 0 { Err(std::io::Error::last_os_error()) } else { Ok(count as usize) }
+            let count = unsafe {
+                libc::read(
+                    fd.get_ref().as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
         });
         let message = match result {
             Err(_) => continue,
@@ -3900,7 +3962,9 @@ async fn read_pty_shared(
             // aborts a reader that exceeds its bounded cleanup deadline.
             credit.notified().await;
         }
-        if finished { return Ok(()); }
+        if finished {
+            return Ok(());
+        }
         // Every successful descriptor turn handles at most16KiB, bounding one
         // busy terminal's share of the reactor before another task can run.
         tokio::task::yield_now().await;
@@ -6091,9 +6155,14 @@ mod tests {
     fn history_origin_counts_rows_pruned_with_repeated_full_history() {
         let (mut worker, _) = capture_worker_with(
             shell_session("exit 0").launch,
-            TerminalConfig { max_scrollback_bytes: 100, ..TerminalConfig::default() },
+            TerminalConfig {
+                max_scrollback_bytes: 100,
+                ..TerminalConfig::default()
+            },
         );
-        for _ in 0..50 { worker.process_output(b"row\r\n".repeat(100)); }
+        for _ in 0..50 {
+            worker.process_output(b"row\r\n".repeat(100));
+        }
         let epoch = worker.history_position.epoch;
         let initial = worker.history_position.dropped;
         for _ in 0..50 {
@@ -6102,12 +6171,18 @@ mod tests {
             worker.process_output(b"row\r\n".repeat(100));
             let after_total = worker.terminal.scrollbar().unwrap().total;
             assert_eq!(worker.history_position.epoch, epoch);
-            assert_eq!(worker.history_position.dropped - before_dropped, before_total + 100 - after_total);
+            assert_eq!(
+                worker.history_position.dropped - before_dropped,
+                before_total + 100 - after_total
+            );
         }
         assert!(worker.history_position.dropped > initial);
         present(&worker);
         worker.publish_snapshot(true);
-        assert_eq!(worker.published.snapshot.load().scroll.history, worker.history_position);
+        assert_eq!(
+            worker.published.snapshot.load().scroll.history,
+            worker.history_position
+        );
         worker.run();
     }
 
@@ -6118,9 +6193,14 @@ mod tests {
         let origin = worker.history_position;
         let total = worker.terminal.total_rows().unwrap();
         worker.process_output(b"\x1b[12;24r\x1b[24;1H".to_vec());
-        for _ in 0..10 { worker.process_output(b"region\r\n".to_vec()); }
+        for _ in 0..10 {
+            worker.process_output(b"region\r\n".to_vec());
+        }
         assert_eq!(worker.terminal.total_rows().unwrap(), total);
-        assert_eq!(worker.history_position, origin, "moving active rows cannot remove older history");
+        assert_eq!(
+            worker.history_position, origin,
+            "moving active rows cannot remove older history"
+        );
         worker.run();
     }
 
@@ -6128,28 +6208,52 @@ mod tests {
     fn search_and_copy_rebase_surviving_text_and_refuse_pruned_text() {
         let (mut worker, events) = capture_worker_with(
             shell_session("exit 0").launch,
-            TerminalConfig { max_scrollback_bytes: 100, ..TerminalConfig::default() },
+            TerminalConfig {
+                max_scrollback_bytes: 100,
+                ..TerminalConfig::default()
+            },
         );
-        for _ in 0..50 { worker.process_output(b"row\r\n".repeat(100)); }
+        for _ in 0..50 {
+            worker.process_output(b"row\r\n".repeat(100));
+        }
         worker.process_output(b"ANCHOR\r\n".to_vec());
         worker.handle_command(Command::Search {
-            owner: None, request: 1, query: "ANCHOR".into(), case_sensitive: true,
+            owner: None,
+            request: 1,
+            query: "ANCHOR".into(),
+            case_sensitive: true,
             latest: Arc::new(AtomicU64::new(1)),
         });
-        let matched = events.try_iter().find_map(|event| match event {
-            TerminalEvent::SearchResults { matches, .. } => matches.first().copied(),
-            _ => None,
-        }).unwrap();
-        for _ in 0..3 { worker.process_output(b"row\r\n".repeat(100)); }
+        let matched = events
+            .try_iter()
+            .find_map(|event| match event {
+                TerminalEvent::SearchResults { matches, .. } => matches.first().copied(),
+                _ => None,
+            })
+            .unwrap();
+        for _ in 0..3 {
+            worker.process_output(b"row\r\n".repeat(100));
+        }
         let rebased = matched.rebase(worker.history_position).unwrap();
-        assert_eq!(super::super::search::selected_text(&worker.terminal, rebased).unwrap(), "ANCHOR");
+        assert_eq!(
+            super::super::search::selected_text(&worker.terminal, rebased).unwrap(),
+            "ANCHOR"
+        );
         let request = uuid::Uuid::new_v4();
-        worker.handle_command(Command::CopySelection { request, selection: matched });
+        worker.handle_command(Command::CopySelection {
+            request,
+            selection: matched,
+        });
         assert!(events.try_iter().any(|event| matches!(event,
             TerminalEvent::ClipboardText { text, .. } if text == "ANCHOR")));
-        for _ in 0..50 { worker.process_output(b"row\r\n".repeat(100)); }
+        for _ in 0..50 {
+            worker.process_output(b"row\r\n".repeat(100));
+        }
         assert!(matched.rebase(worker.history_position).is_none());
-        worker.handle_command(Command::CopySelection { request, selection: matched });
+        worker.handle_command(Command::CopySelection {
+            request,
+            selection: matched,
+        });
         assert!(events.try_iter().any(|event| matches!(event,
             TerminalEvent::Error { message, .. } if message == "Output moved; select again")));
         worker.run();
@@ -6702,7 +6806,12 @@ mod tests {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "terminal::worker::tests::terminal_io_reactor_costs_only_one_worker_per_terminal", "--nocapture", "--test-threads=1"])
                 .env(FIXTURE, "1").output().unwrap();
-            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
             return;
         }
         crate::terminal::reactor::initialize().unwrap();
@@ -6710,34 +6819,58 @@ mod tests {
         let idle = count();
         let mut handles = Vec::new();
         for _ in 0..30 {
-            handles.push(TerminalHandle::spawn(shell_session("exec sleep 600"),
-                TerminalConfig { initially_visible: false, ..TerminalConfig::default() }, |_| {}).unwrap());
+            handles.push(
+                TerminalHandle::spawn(
+                    shell_session("exec sleep 600"),
+                    TerminalConfig {
+                        initially_visible: false,
+                        ..TerminalConfig::default()
+                    },
+                    |_| {},
+                )
+                .unwrap(),
+            );
         }
         let after = count();
         assert!(after <= idle + 30, "idle={idle}, thirty_terminals={after}");
         println!("terminal_thread_census idle={idle} thirty_terminals={after}");
-        for handle in handles { handle.shutdown().unwrap(); }
+        for handle in handles {
+            handle.shutdown().unwrap();
+        }
     }
 
     #[test]
     fn shared_event_observer_replays_startup_and_never_runs_under_sender_locks() {
-        let handle = TerminalHandle::spawn(shell_session("printf '\\033]2;startup-title\\007ready'; read line"),
-            TerminalConfig::default(), |_| {}).unwrap();
+        let handle = TerminalHandle::spawn(
+            shell_session("printf '\\033]2;startup-title\\007ready'; read line"),
+            TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
         wait_for_text(&handle, "ready");
         let observed = Arc::new(Mutex::new(Vec::new()));
         let events = Arc::clone(&observed);
         handle.set_event_observer(move |_, event| events.lock().unwrap().push(event));
         {
             let _sender_lock = observed.lock().unwrap();
-            handle.inner.published.set_agent_activity(Some(crate::agent::Activity {
-                provider: crate::agent::Provider::Claude,
-                state: crate::agent::ActivityState::Working,
-            }));
+            handle
+                .inner
+                .published
+                .set_agent_activity(Some(crate::agent::Activity {
+                    provider: crate::agent::Provider::Claude,
+                    state: crate::agent::ActivityState::Working,
+                }));
         }
         flush_archived_notices();
         let events = observed.lock().unwrap();
-        assert!(events.iter().any(|event| matches!(event, TerminalEvent::TitleChanged(title) if title == "startup-title")));
-        assert!(events.iter().any(|event| matches!(event, TerminalEvent::AgentActivityChanged(Some(_)))));
+        assert!(events.iter().any(
+            |event| matches!(event, TerminalEvent::TitleChanged(title) if title == "startup-title")
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::AgentActivityChanged(Some(_))))
+        );
         drop(events);
         handle.shutdown().unwrap();
     }

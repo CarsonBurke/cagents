@@ -6,15 +6,18 @@ use std::{io, sync::OnceLock};
 
 pub(crate) fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
     static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("terminal-reactor")
-            .enable_io()
-            .enable_time()
-            .build()
-            .map_err(|error| format!("start shared terminal I/O reactor: {error}"))
-    }).as_ref().map_err(Clone::clone)
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("terminal-reactor")
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|error| format!("start shared terminal I/O reactor: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub(crate) fn initialize() -> io::Result<()> {
