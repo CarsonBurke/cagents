@@ -591,21 +591,16 @@ fn heading(
     logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
-    widget::container(leaf_text(
-        text.spans(heading_style(settings, level)),
-        match level {
+    widget::container(paragraph(markdown::Settings {
+        text_size: match level {
             HeadingLevel::H1 => settings.h1_size,
             HeadingLevel::H2 => settings.h2_size,
             HeadingLevel::H3 => settings.h3_size,
             HeadingLevel::H4 => settings.h4_size,
             HeadingLevel::H5 => settings.h5_size,
             HeadingLevel::H6 => settings.h6_size,
-        },
-        settings.style.font,
-        target,
-        find,
-        logical,
-    ))
+        }, style: heading_style(settings, level), ..settings
+    }, text, target, find, logical))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
     } else {

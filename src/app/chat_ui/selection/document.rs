@@ -77,9 +77,12 @@ pub(in crate::app::chat_ui) fn identity(item: &str, path: &[u32]) -> u64 {
 
 pub(in crate::app::chat_ui) struct Builder { read: Read }
 impl Builder {
-    pub fn plain(&mut self, item: &str, path: &[u32], text: Arc<str>) {
-        let mut logical = LogicalText { identity: identity(item, path), plain: text };
+    pub fn logical(&mut self, identity: u64, text: Arc<str>) {
+        let mut logical = LogicalText { identity, plain: text };
         self.read.custom(None, Rectangle::default(), &mut logical);
+    }
+    pub fn plain(&mut self, item: &str, path: &[u32], text: Arc<str>) {
+        self.logical(identity(item, path), text);
     }
     fn enter(&mut self, item: &str, path: &[u32], kind: Kind) {
         self.read.custom(None, Rectangle::default(), &mut boundary::Enter { identity: identity(item, path), kind });
