@@ -2986,7 +2986,7 @@ impl Actor {
                     // actual conditional-close barrier or the user explicitly
                     // stops the complete session.
                     let _ = reply.send(Err(if idle {
-                        "This provider cannot prove quiescent ownership for automatic replacement. Stop the session explicitly before restarting it.".into()
+                        "This live provider cannot prove safe automatic replacement. Its session remains open; end it explicitly when you are finished.".into()
                     } else {
                         "Provider state changed before conditional idle close".into()
                     }));
