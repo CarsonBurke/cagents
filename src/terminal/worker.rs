@@ -1939,12 +1939,13 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable_at_directory(
+                    holder::spawn_recoverable_with_authority(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
                         config.execution_directory.clone(),
+                        config.setup_execution_lease.clone(),
                     )?,
                     Vec::new(),
                 )
