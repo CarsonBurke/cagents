@@ -9031,4 +9031,16 @@ mod tests {
         for _ in 0..2 {let request=manager.request_code_actions(doc,LspRange::default(),&[]);next_matching(&events,|e|match e{LspEvent::RequestFailed{request:r,error:LspError::Unsupported(_),..}if *r==request=>Some(()),_=>None}).await;}
         manager.begin_shutdown().await;
     });}
+
+    #[test]
+    fn oversized_signature_labels_and_parameter_lists_are_refused_before_ui(){block_on(async{
+        let (_guard,worktree,file)=workspace();let mut manager=rust_manager();let count=Arc::new(AtomicUsize::new(0));let sequence=Arc::clone(&count);
+        let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"signatureHelpProvider":{}}),move|request|{
+            if request.method!="textDocument/signatureHelp"{return vec![];}
+            let signature=if sequence.fetch_add(1,Ordering::Relaxed)==0{json!({"label":"x".repeat(16*1024+1)})}else{json!({"label":"f()","parameters":vec![json!({"label":"p"});257]})};
+            vec![json!({"jsonrpc":"2.0","id":request.id,"result":{"signatures":[signature]}})]
+        });let events=manager.events();let doc=LspDocumentId(1);manager.open_for_test(doc,&file,&worktree,rust_language(),1,"foo\n");let _handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        for _ in 0..2 {let request=manager.request_signature_help(doc,LspPosition::default(),None);next_matching(&events,|e|match e{LspEvent::RequestFailed{request:r,error:LspError::Unsupported(_),..}if *r==request=>Some(()),_=>None}).await;}
+        manager.begin_shutdown().await;
+    });}
 }

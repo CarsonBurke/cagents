@@ -238,7 +238,7 @@ pub(super) fn convert_feature(store:&SnapshotStore,req:&PendingRequest,snapshot:
             match items.into_iter().map(|item|convert_action(store,req,item)).collect::<Result<Vec<_>,_>>(){Ok(items)=>LspEvent::CodeActions{request:req.id,doc:req.doc,items},Err(e)=>failed(e)}
         },
         RawFeatureResult::CodeActionResolved(item)=>match convert_action(store,req,lsp_types::CodeActionOrCommand::CodeAction(item)){Ok(item)=>LspEvent::CodeActionResolved{request:req.id,doc:req.doc,item},Err(e)=>failed(e)},
-        RawFeatureResult::SignatureHelp(help)=>LspEvent::SignatureHelp{request:req.id,doc:req.doc,help:help.map(convert_signature)},
+        RawFeatureResult::SignatureHelp(help)=>match help.map(convert_signature).transpose(){Ok(help)=>LspEvent::SignatureHelp{request:req.id,doc:req.doc,help},Err(error)=>failed(error)},
         RawFeatureResult::CommandExecuted(_)=>LspEvent::CommandExecuted{request:req.id,doc:req.doc},
     }
 }
@@ -301,7 +301,30 @@ fn convert_action(store:&SnapshotStore,req:&PendingRequest,raw:lsp_types::CodeAc
 }
 fn documentation(d:lsp_types::Documentation)->String{match d{lsp_types::Documentation::String(s)=>s,lsp_types::Documentation::MarkupContent(c)=>c.value}}
 fn utf16_byte(label:&str,offset:u32)->Option<usize>{let mut units=0;for (byte,ch) in label.char_indices(){if units==offset{return Some(byte);}units+=ch.len_utf16() as u32;if units>offset{return None;}}(units==offset).then_some(label.len())}
-fn convert_signature(help:lsp_types::SignatureHelp)->LspSignatureHelp {
+fn convert_signature(help:lsp_types::SignatureHelp)->Result<LspSignatureHelp,LspError> {
+    fn doc_len(doc:&lsp_types::Documentation)->usize{match doc{lsp_types::Documentation::String(text)=>text.len(),lsp_types::Documentation::MarkupContent(content)=>content.value.len()}}
+    let invalid=||LspError::Unsupported("signature help exceeds its label, documentation, parameter, or retained-text budget".into());
+    if help.signatures.len()>128{return Err(invalid());}
+    let mut retained=0usize;let mut parameters=0usize;
+    for signature in &help.signatures {
+        let docs=signature.documentation.as_ref().map_or(0,doc_len);
+        if signature.label.len()>16*1024||docs>64*1024{return Err(invalid());}
+        retained=retained.saturating_add(signature.label.len()+docs);
+        let params=signature.parameters.as_deref().unwrap_or_default();parameters+=params.len();
+        if params.len()>256||parameters>4096{return Err(invalid());}
+        for parameter in params {
+            let docs=parameter.documentation.as_ref().map_or(0,doc_len);
+            if docs>16*1024{return Err(invalid());}
+            let bytes=match &parameter.label {
+                lsp_types::ParameterLabel::Simple(label)=>{if label.len()>4096{return Err(invalid());}label.len()},
+                // Three UTF-8 bytes per UTF-16 unit is an upper bound, and
+                // overlapping parameter spans must not amplify one label.
+                lsp_types::ParameterLabel::LabelOffsets([start,end])=>((end.saturating_sub(*start) as usize).saturating_mul(3)).min(signature.label.len()),
+            };
+            retained=retained.saturating_add(bytes+docs);
+        }
+        if retained>4*1024*1024{return Err(invalid());}
+    }
     let signatures:Vec<_>=help.signatures.into_iter().map(|s|{
         let parameters:Vec<_>=s.parameters.unwrap_or_default().into_iter().map(|p|{
             let (label,range)=match p.label {
@@ -313,7 +336,7 @@ fn convert_signature(help:lsp_types::SignatureHelp)->LspSignatureHelp {
     }).collect();
     let active_signature=(help.active_signature.unwrap_or(0) as usize).min(signatures.len().saturating_sub(1));
     let active_parameter=help.active_parameter.and_then(|p|signatures.get(active_signature).filter(|s|(p as usize)<s.parameters.len()).map(|_|p as usize));
-    LspSignatureHelp{signatures,active_signature,active_parameter}
+    Ok(LspSignatureHelp{signatures,active_signature,active_parameter})
 }
 
 static NEXT_SERVER_EDIT_ID:AtomicU64=AtomicU64::new(1);
