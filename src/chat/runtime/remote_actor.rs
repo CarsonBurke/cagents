@@ -1090,9 +1090,7 @@ impl RemoteActor {
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
             state.installed = true;
-            state.native_continuity = chat::NativeContinuity::Durable {
-                provider_version: "claude-stream-json/actor-v1".into(),
-            };
+            state.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
         }
         self.0
             .startup
@@ -1554,9 +1552,7 @@ impl Server {
             usage,
             requests,
             native_continuity: if self.installed {
-                chat::NativeContinuity::Durable {
-                    provider_version: "claude-stream-json/actor-v1".into(),
-                }
+                chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
             } else {
                 chat::NativeContinuity::ReconnectOnly
             },
@@ -1582,9 +1578,7 @@ impl Server {
     fn published_sources(&self) -> Vec<chat::Session> {
         let confirmed = self.actor.confirmed_session_id();
         let continuity = if self.installed {
-            chat::NativeContinuity::Durable {
-                provider_version: "claude-stream-json/actor-v1".into(),
-            }
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
         } else {
             chat::NativeContinuity::ReconnectOnly
         };
@@ -2271,9 +2265,7 @@ extern "C" fn serve_if_requested() {
 }
 
 fn confirm_installed_snapshot(state: &mut Snapshot) {
-    let durable = chat::NativeContinuity::Durable {
-        provider_version: "claude-stream-json/actor-v1".into(),
-    };
+    let durable = chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
     if state.native_continuity != durable {
         state.native_continuity = durable;
         state.generation = state.generation.saturating_add(1);
@@ -2777,9 +2769,7 @@ done"#;
             owned_codex_listener: None,
             native_continuity: chat::NativeContinuity::ReconnectOnly,
         };
-        let continuity = chat::NativeContinuity::Durable {
-            provider_version: "claude-stream-json/actor-v1".into(),
-        };
+        let continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
         let published = published_source(&source, Some("confirmed"), &continuity);
         assert_eq!(published.launch.recipe, source.launch.recipe);
         assert_eq!(published.launch.session_id.as_deref(), Some("confirmed"));
@@ -2819,7 +2809,7 @@ done"#;
         confirm_installed_snapshot(&mut snapshot);
         assert!(matches!(
             snapshot.native_continuity,
-            chat::NativeContinuity::Durable { .. }
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
         ));
         let generation = snapshot.generation;
         confirm_installed_snapshot(&mut snapshot);
