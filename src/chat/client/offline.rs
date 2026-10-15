@@ -102,6 +102,13 @@ impl State {
     }
 
     pub(super) fn capture_changes(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool, changes: ResidentChanges) {
+        // Rejected raw/control publications need no body/provenance census.
+        // Recheck after capture: deletion or another rendered view can race
+        // this short preflight without granting an obsolete view authority.
+        {
+            let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+            if data.revoked || (!rendered && data.rendered) { return; }
+        }
         let sources = match sources::Manifest::capture_changes(&snapshot, &changes) {
             Ok(sources) => sources,
             Err(error) => {
