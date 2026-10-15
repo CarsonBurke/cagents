@@ -599,6 +599,14 @@ fn verify_local_head_with<E: crate::repository::ProcessExecutor>(
 }
 
 fn check_rank(check: &crate::github::PullRequestCheck) -> u8 {
+    // The shared sidebar treats skipped checks as successful for its aggregate
+    // indicator. The inspector keeps their outcome distinct in its summary.
+    if matches!(check.bucket.0.as_str(), "skipping" | "skipped" | "neutral")
+        || check.state.0.eq_ignore_ascii_case("skipped")
+        || check.state.0.eq_ignore_ascii_case("neutral")
+    {
+        return 3;
+    }
     match check.bucket.0.as_str() {
         bucket if sidebar::is_check_failure(bucket) => 0,
         bucket if sidebar::is_check_pending(bucket) => 1,
@@ -1745,6 +1753,16 @@ mod tests {
             checks_summary(&checks),
             "Checks · 1 failed, 1 running, 1 passed, 1 skipped"
         );
+        // Lightweight GitHub rollups normalize both conclusions into the
+        // shared successful bucket; preserve their original outcome here.
+        for conclusion in ["SKIPPED", "NEUTRAL"] {
+            let skipped = serde_json::from_value(serde_json::json!({
+                "name": "skipped-rollup", "bucket": "pass", "state": conclusion,
+                "link": "https://github.com/owner/repo/actions/runs/123"
+            })).unwrap();
+            assert_eq!(check_rank(&skipped), 3);
+            assert_eq!(checks_summary(&[skipped]), "Checks · 0 failed, 0 running, 0 passed, 1 skipped");
+        }
     }
 
     #[test]
