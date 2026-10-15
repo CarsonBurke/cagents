@@ -108,6 +108,8 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatProviderExitOutput { .. }
+                | ServerResponse::ChatRawSource { .. }
         }
     )
 }
@@ -507,6 +509,7 @@ mod tests {
                 chat_id,
                 state,
                 generation,
+                outcome: None,
             };
             queue.push(envelope.clone()).unwrap();
         }
@@ -522,6 +525,71 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn raw_source_pages_obey_the_two_page_budget_and_release_bodies_on_overflow() {
+        use crate::chat::cache::{
+            SourceEpoch, SourceKey,
+            raw::{RawRepresentation, RawSourceField, RawSourceMetadata, RawSourcePage},
+        };
+        let queue = DeliveryQueue::new(7, 512);
+        let chat_id = TerminalId::new();
+        let page = |request| {
+            let mut envelope = redraw(chat_id, 1);
+            envelope.request_id = Some(request);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::ChatRawSource {
+                    chat_id,
+                    result: Ok(RawSourcePage {
+                        source: SourceKey {
+                            agent_id: None,
+                            source_id: "exact-native-call".into(),
+                        },
+                        field: RawSourceField::ToolInput,
+                        epoch: SourceEpoch {
+                            incarnation: uuid::Uuid::new_v4(),
+                            revision: 1,
+                        },
+                        source_len: 256 * 1024,
+                        offset: 0,
+                        next_offset: 256 * 1024,
+                        text: "x".repeat(256 * 1024),
+                        complete: true,
+                        metadata: RawSourceMetadata {
+                            tool_name: "Write".into(),
+                            representation: RawRepresentation::CanonicalJson,
+                            complete_call: true,
+                        },
+                    }),
+                },
+            };
+            envelope
+        };
+        queue.push(page(1)).unwrap();
+        queue.push(page(2)).unwrap();
+        assert_eq!(queue.state.lock().unwrap().queued_chat_pages, 2);
+        // A page that was delivered releases one page credit while retaining
+        // the exact request ID; source replies may never coalesce.
+        assert_eq!(queue.pop().unwrap().request_id, Some(1));
+        queue.push(page(3)).unwrap();
+        assert_eq!(queue.push(page(4)), Err(DeliveryError::Full));
+        {
+            let state = queue.state.lock().unwrap();
+            assert_eq!(state.queued_chat_pages, 0);
+            assert_eq!(state.messages.len(), 1);
+            assert!(
+                state
+                    .messages
+                    .iter()
+                    .all(|item| matches!(&item.message, ServerMessage::Error(_)))
+            );
+        }
+        let notice = queue.pop().unwrap();
+        assert!(
+            matches!(notice.message,ServerMessage::Error(ref error) if error.code==ProtocolErrorCode::QueueFull)
+        );
+        assert!(queue.pop().is_none());
     }
 
     /// A client severed for backpressure must be able to report why, so the

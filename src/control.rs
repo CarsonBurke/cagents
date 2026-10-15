@@ -1824,6 +1824,9 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
+        ServerResponse::ChatProviderExitOutput { .. } => "chat_provider_exit_output",
+        ServerResponse::ChatSource { .. } => "chat_source",
+        ServerResponse::ChatRawSource { .. } => "chat_raw_source",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -4969,6 +4972,7 @@ mod tests {
                 chat_id,
                 state,
                 generation: 1,
+                outcome: None,
             };
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(

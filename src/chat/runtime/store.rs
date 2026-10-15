@@ -1,6 +1,12 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+mod adapter_items;
+mod child_tools;
 mod file_changes;
+pub(super) use adapter_items::reader as adapter_item_reader;
+mod raw;
+mod source;
+
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -45,11 +51,16 @@ enum LatestBoundary {
 pub(super) struct Window {
     pub items: Vec<std::sync::Arc<Item>>,
     pub changes: Vec<crate::chat::presentation::ItemChange>,
+    pub source_parts: Vec<crate::chat::cache::SourcePart>,
+    pub raw_source_parts: Vec<crate::chat::cache::raw::RawSourcePart>,
     pub has_earlier: bool,
     pub has_later: bool,
 }
 pub(crate) struct Store {
     db: Connection,
+    /// A reset revokes every previously issued canonical source reader.
+    canonical_generation: uuid::Uuid,
+    raw_sources: raw::State,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -75,6 +86,13 @@ pub(crate) struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
+    pending_input: Option<(String, usize, String)>,
+    pending_child_tool: Option<child_tools::Pending>,
+    child_tools_unavailable: Option<&'static str>,
+    child_tools_have_revocations: bool,
+    pending_child_source: Option<source::PendingChildSource>,
+    pub(super) source_revision: u64,
+    pub(super) source_incarnation: uuid::Uuid,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -138,13 +156,21 @@ impl Store {
                 .mode(0o600)
                 .open(&path)
                 .map_err(|e| e.to_string())?;
-            let db = Connection::open(&path).map_err(|e| e.to_string())?;
+            let mut db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,running INTEGER NOT NULL DEFAULT 0,source_shortened INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX running_tools ON items(id) WHERE running=1;
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
+            db.execute_batch(source::SCHEMA)
+                .map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            db.execute_batch(child_tools::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            let raw_sources = raw::initialize(&mut db)?;
             Ok(Self {
+                raw_sources,
+                canonical_generation: uuid::Uuid::new_v4(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -171,6 +197,13 @@ impl Store {
                 presentation: None,
                 presented_children: Default::default(),
                 pending_text: None,
+                pending_input: None,
+                pending_child_tool: None,
+                child_tools_unavailable: None,
+                child_tools_have_revocations: false,
+                pending_child_source: None,
+                source_revision: 0,
+                source_incarnation: uuid::Uuid::new_v4(),
             })
         })();
         if result.is_err() {
@@ -200,6 +233,7 @@ impl Store {
         older: bool,
         assigned: Option<i64>,
     ) -> Result<Option<String>, String> {
+        let is_text = matches!(&item.content, ItemContent::Text { .. });
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -354,9 +388,21 @@ impl Store {
             body0.len() as i64
         };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        raw::guard(&transaction, self.raw_sources.nonce)?;
+        if raw::revoked(
+            &transaction,
+            &crate::chat::cache::SourceKey {
+                agent_id: None,
+                source_id: item.id.clone(),
+            },
+        )? {
+            return Err("Removed original tool identity cannot be rewritten".into());
+        }
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,running,source_shortened) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,running=excluded.running,source_shortened=MAX(items.source_shortened,excluded.source_shortened)", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,item.content.status()==Some(crate::chat::ToolStatus::Running),shortened]).map_err(|e| e.to_string())?;
+        source::rewrite_epoch(&transaction, &item.id)?;
+
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -370,6 +416,14 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if is_text
+            || previous.as_ref().is_some_and(|(_, metadata, _)| {
+                postcard::from_bytes::<Item>(metadata)
+                    .is_ok_and(|old| matches!(old.content, ItemContent::Text { .. }))
+            })
+        {
+            self.source_changed()?;
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -640,6 +694,11 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        if matches!(&event, Event::Reset { .. }) {
+            // Revoke before the first destructive operation, including a
+            // failing child/index cleanup. Old readers must never revive.
+            self.canonical_generation = uuid::Uuid::new_v4();
+        }
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -649,62 +708,105 @@ impl Store {
                 _ => {}
             }
         }
+        let filtered_raw = self.raw_filter_history(&mut event)?;
+        if self.raw_event_revoked(&event)? {
+            return Ok(vec![nonfatal(
+                "Original tool source was removed; its late update was discarded".into(),
+            )]);
+        }
+        let raw_warning = self.cache_raw_call(&event)?;
+        let filtered_raw = filtered_raw | self.raw_filter_history(&mut event)?;
+        if matches!(&event, Event::Item(_)) && self.raw_event_revoked(&event)? {
+            return Ok(vec![nonfatal("An original tool identity changed kind; its private source was revoked and the ambiguous update discarded".into())]);
+        }
+        if matches!(&event, Event::RawToolCapture(_)) {
+            return Ok(raw_warning.into_iter().map(nonfatal).collect());
+        }
+        if self.revoked_child_tool_event(&event)? {
+            return Ok(vec![nonfatal("Delegated tool source was removed; a late update was discarded without recreating its private body".into())]);
+        }
+        let mut out = self
+            .cache_child_tool(&event)?
+            .into_iter()
+            .map(nonfatal)
+            .collect::<Vec<_>>();
+        out.extend(raw_warning.into_iter().map(nonfatal));
+        if filtered_raw {
+            out.push(nonfatal("Removed or ambiguous original tool identities were discarded from the history batch; unrelated history was retained".into()));
+        }
         self.index_child_event(&event)?;
-        let mut out = Vec::new();
+        self.cache_child_source(&event)?;
+
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
             && let Some(warning) = self.flush_text()?
         {
             out.push(nonfatal(warning));
         }
-        match event {
-            Event::OutputDelta { id, offset, delta } => {
-                let cached: Option<(Vec<u8>, usize, usize)> = self
-                    .db
-                    .query_row(
-                        "SELECT metadata,len0,len1 FROM items WHERE id=?1",
-                        [&id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()
-                    .map_err(|error| error.to_string())?;
-                let Some((metadata, len0, len1)) = cached else {
-                    // Oversized identities are deliberately refused by put_at
-                    // without terminating the provider. Their later appends
-                    // must preserve that same nonfatal cache boundary.
-                    out.push(nonfatal(format!(
-                        "Output for uncached provider item {} was not cached",
-                        brief(&id)
-                    )));
-                    return Ok(out);
-                };
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-                let (field, length) = match item.content {
-                    ItemContent::Command { .. } => (0, len0),
-                    ItemContent::Tool { .. } => (1, len1),
-                    _ => return Err("Output delta names a non-tool item".into()),
-                };
-                if length != offset {
-                    return Err("Output delta does not follow the cached output".into());
+        if let Event::InputDelta { id, offset, delta } = event {
+            if let Some((pending_id, pending_offset, pending)) = &self.pending_input {
+                if pending_id == &id && pending_offset.saturating_add(pending.len()) != offset {
+                    return Err("Input delta does not follow the cached input".into());
                 }
-                let at = observed_at();
-                item.started_at = item.started_at.or(item.at).or(at);
-                item.at = at;
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                let transaction = self.db.transaction().map_err(|error| error.to_string())?;
-                insert_body(&transaction, &id, field, offset as i64, &delta)?;
-                let update = if field == 0 {
-                    "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
-                } else {
-                    "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
-                };
-                transaction
-                    .execute(update, params![id, delta.len(), metadata])
-                    .map_err(|error| error.to_string())?;
-                transaction.commit().map_err(|error| error.to_string())?;
-                self.changed(&id);
-                self.dirty = true;
+            }
+            if self.pending_input.as_ref().is_some_and(|pending| {
+                pending.0 != id || pending.2.len().saturating_add(delta.len()) > 64 * 1024
+            }) {
+                if let Some(warning) = self.flush_input()? {
+                    out.push(nonfatal(warning));
+                }
+            }
+            if delta.len() > 64 * 1024 {
+                if let Some(warning) = self.append_body(&id, offset, &delta, true)? {
+                    out.push(nonfatal(warning));
+                }
+            } else if let Some(pending) = &mut self.pending_input {
+                pending.2.push_str(&delta);
+            } else {
+                let length: Option<usize> = self
+                    .db
+                    .query_row("SELECT len0 FROM items WHERE id=?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                match length {
+                    Some(length) if length != offset => {
+                        return Err("Input delta does not follow the cached input".into());
+                    }
+                    None => {
+                        out.push(nonfatal(format!(
+                            "Input for uncached provider item {} was not cached",
+                            brief(&id)
+                        )));
+                        return Ok(out);
+                    }
+                    _ => {}
+                }
+                self.pending_input = Some((id, offset, delta));
+            }
+            self.dirty = true;
+            return Ok(out);
+        }
+        if let Some(warning) = self.flush_input()? {
+            out.push(nonfatal(warning));
+        }
+        if let Event::TurnFinished { outcome, .. } = &event {
+            let status = match outcome {
+                crate::notifications::Kind::Cancelled => Some(crate::chat::ToolStatus::Stopped),
+                crate::notifications::Kind::Failed => Some(crate::chat::ToolStatus::Failed),
+                _ => None,
+            };
+            if let Some(status) = status {
+                self.finish_running(status)?;
+            }
+        }
+        let input_delta = matches!(&event, Event::InputDelta { .. });
+        match event {
+            Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
+                if let Some(warning) = self.append_body(&id, offset, &delta, input_delta)? {
+                    out.push(nonfatal(warning));
+                }
             }
             Event::Item(item) => {
                 if let Some(warning) = self.put(item, false)? {
@@ -761,6 +863,9 @@ impl Store {
                 thinking,
                 delta,
             } => {
+                if !delta.is_empty() {
+                    self.source_changed()?;
+                }
                 if self.pending_text.as_ref().is_some_and(|pending| {
                     pending.0 != id
                         || pending.1 != role
@@ -783,6 +888,9 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                if self.removes_text_sources(&ids)? {
+                    self.source_changed()?;
+                }
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
@@ -794,6 +902,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
+                self.source_changed()?;
                 self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
@@ -842,6 +951,136 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    /// Finalize only the indexed live tools, leaving transcript bodies and
+    /// completed history untouched. Batch metadata bounds transient memory.
+    pub(super) fn finish_running(&mut self, status: crate::chat::ToolStatus) -> Result<(), String> {
+        let _ = self.flush_text()?;
+        let _ = self.flush_input()?;
+        loop {
+            let rows = {
+                let mut query = self
+                    .db
+                    .prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64")
+                    .map_err(|error| error.to_string())?;
+                let rows = query
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                rows
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (id, metadata) in rows {
+                let mut item: Item =
+                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+                match &mut item.content {
+                    ItemContent::Tool {
+                        status: current, ..
+                    }
+                    | ItemContent::Command {
+                        status: current, ..
+                    }
+                    | ItemContent::Changes {
+                        status: current, ..
+                    } if *current == crate::chat::ToolStatus::Running => *current = status,
+                    _ => {}
+                }
+                if matches!(item.content, ItemContent::Changes { .. }) {
+                    self.finish_file_status("", &id, status)?;
+                }
+                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
+                self.db
+                    .execute(
+                        "UPDATE items SET metadata=?2,running=0 WHERE id=?1",
+                        params![id, metadata],
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.changed(&id);
+                self.dirty = true;
+            }
+        }
+        Ok(())
+    }
+    fn flush_input(&mut self) -> Result<Option<String>, String> {
+        match self.pending_input.take() {
+            Some((id, offset, delta)) => match self.append_body(&id, offset, &delta, true) {
+                Ok(warning) => Ok(warning),
+                Err(error) => {
+                    self.pending_input = Some((id, offset, delta));
+                    Err(error)
+                }
+            },
+            None => Ok(None),
+        }
+    }
+    fn append_body(
+        &mut self,
+        id: &str,
+        offset: usize,
+        delta: &str,
+        input_delta: bool,
+    ) -> Result<Option<String>, String> {
+        let cached: Option<(Vec<u8>, usize, usize)> = self
+            .db
+            .query_row(
+                "SELECT metadata,len0,len1 FROM items WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((metadata, len0, len1)) = cached else {
+            // Oversized identities are deliberately refused by put_at
+            // without terminating the provider. Their later appends
+            // must preserve that same nonfatal cache boundary.
+            return Ok(Some(format!(
+                "Output for uncached provider item {} was not cached",
+                brief(&id)
+            )));
+        };
+        let mut item: Item = postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+        let (field, length) = match item.content {
+            ItemContent::Tool { .. } if input_delta => (0, len0),
+            ItemContent::Command { .. } if !input_delta => (0, len0),
+            ItemContent::Tool { .. } if !input_delta => (1, len1),
+            _ => return Err("Output delta names a non-tool item".into()),
+        };
+        if length != offset {
+            return Err("Output delta does not follow the cached output".into());
+        }
+        let at = observed_at();
+        item.started_at = item.started_at.or(item.at).or(at);
+        item.at = at;
+        let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
+        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        raw::guard(&transaction, self.raw_sources.nonce)?;
+        if raw::revoked(
+            &transaction,
+            &crate::chat::cache::SourceKey {
+                agent_id: None,
+                source_id: id.into(),
+            },
+        )? {
+            return Err("Removed original tool input cannot be appended".into());
+        }
+        insert_body(&transaction, &id, field, offset as i64, &delta)?;
+        let update = if field == 0 {
+            "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
+        } else {
+            "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
+        };
+        transaction
+            .execute(update, params![id, delta.len(), metadata])
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.changed(&id);
+        self.dirty = true;
+        Ok(None)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
         match self.pending_text.take() {
@@ -1024,6 +1263,7 @@ impl Store {
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
+        let _ = self.flush_input()?;
         let old: std::collections::HashMap<_, _> = previous
             .iter()
             .map(|item| (item.id.as_str(), item))
@@ -1031,9 +1271,9 @@ impl Store {
         let mut reused = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,(SELECT epoch FROM source_epochs WHERE source_epochs.id=items.id) FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
             } else {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,(SELECT epoch FROM source_epochs WHERE source_epochs.id=items.id) FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
             };
             let mut statement = self.db.prepare(query).map_err(|e| e.to_string())?;
             let rows = statement
@@ -1051,6 +1291,7 @@ impl Store {
                             row.get::<_, i64>(4)? as usize,
                             row.get::<_, i64>(5)? as usize,
                             row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, u64>(7)?,
                         ))
                     },
                 )
@@ -1059,12 +1300,16 @@ impl Store {
                 .map_err(|e| e.to_string())?
         };
         let mut items = Vec::new();
+        let mut source_parts = Vec::new();
+        let mut raw_source_parts = Vec::new();
+        let mut raw_part_bytes = 0usize;
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2, spans, source_epoch) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
+            let original_parts = self.raw_parts(&id)?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
             let cut = |target: usize| {
                 if patch {
@@ -1103,11 +1348,30 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    std::borrow::Cow::Owned(format!(
-                        "{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}"
-                    ))
+                    let base_id =
+                        format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
+                    let mut candidate = base_id.clone();
+                    let mut attempt = 0_u64;
+                    // A provider's real ID may resemble any generated suffix.
+                    // Escape only synthetic aliases, preserving opaque root IDs.
+                    // The private cache nonce keeps aliases stable across pages.
+                    while self.exists(&candidate)? {
+                        candidate = format!(
+                            "{base_id}:native-alias:{}:{attempt}",
+                            self.directory.file_name().unwrap().to_string_lossy()
+                        );
+                        attempt = attempt
+                            .checked_add(1)
+                            .ok_or("Native alias capacity exhausted")?;
+                    }
+                    std::borrow::Cow::Owned(candidate)
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
+                };
+                let source_bytes = if kind == "text" {
+                    item_id.len() + id.len() + 64
+                } else {
+                    0
                 };
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
@@ -1115,10 +1379,44 @@ impl Store {
                     } else {
                         0
                     };
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + end - start + 128 + attached + source_bytes;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
+                }
+                if kind == "text" {
+                    source_parts.push(crate::chat::cache::SourcePart {
+                        item_id: item_id.to_string(),
+                        source: crate::chat::cache::SourceKey {
+                            agent_id: None,
+                            source_id: id.clone(),
+                        },
+                        start: start0,
+                        end: end0,
+                        source_len: len0,
+                        replacement: false,
+                        epoch: crate::chat::cache::SourceEpoch {
+                            incarnation: self.source_incarnation,
+                            revision: source_epoch,
+                        },
+                        metadata: crate::chat::cache::SourceMetadata::from_item(&base).unwrap(),
+                    });
+                }
+                for original in &original_parts {
+                    let cost = original.source.source_id.len()
+                        + item_id.len()
+                        + original.metadata.tool_name.len()
+                        + 128;
+                    if raw_source_parts.len() >= crate::chat::cache::raw::RAW_PARTS
+                        || raw_part_bytes.saturating_add(cost)
+                            > crate::chat::cache::raw::RAW_PART_BYTES
+                    {
+                        break;
+                    }
+                    let mut original = original.clone();
+                    original.item_id = item_id.to_string();
+                    raw_source_parts.push(original);
+                    raw_part_bytes += cost;
                 }
                 if self
                     .changed
@@ -1236,7 +1534,7 @@ impl Store {
                         }
                     }
                 }
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + end - start + 128 + attached + source_bytes;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
@@ -1330,6 +1628,8 @@ impl Store {
         Ok(Window {
             items,
             changes,
+            source_parts,
+            raw_source_parts,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
         })
@@ -1490,6 +1790,193 @@ mod tests {
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
     #[test]
+    fn one_megabyte_input_deltas_write_linear_bytes_and_hydrate_exactly() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut store = Store::at(directory.path().into()).unwrap();
+        let input = "x".repeat(1024 * 1024);
+        store
+            .apply(Event::Item(Item {
+                id: "large-input".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "Write".into(),
+                    input: String::new(),
+                    output: String::new(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            }))
+            .unwrap();
+        store.db.execute_batch("CREATE TEMP TRIGGER reject_stream_body_delete BEFORE DELETE ON chunks BEGIN SELECT RAISE(ABORT,'streaming input must append body chunks'); END;").unwrap();
+        for (index, chunk) in input.as_bytes().chunks(50).enumerate() {
+            store
+                .apply(Event::InputDelta {
+                    id: "large-input".into(),
+                    offset: index * 50,
+                    delta: String::from_utf8(chunk.to_vec()).unwrap(),
+                })
+                .unwrap();
+        }
+        store.flush_input().unwrap();
+        let (bytes, chunks): (usize, usize) = store
+            .db
+            .query_row(
+                "SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='large-input' AND field=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bytes, input.len());
+        assert!(
+            chunks < 100,
+            "deltas are batched, not separate SQLite transactions"
+        );
+        let read =
+            String::from_utf8(store.field("large-input", 0, 0, input.len()).unwrap()).unwrap();
+        assert_eq!(read, input);
+        let hydrated = store.window().unwrap();
+        assert!(hydrated.items.iter().all(
+            |item| matches!(&item.content, ItemContent::Tool { input, .. } if !input.is_empty())
+        ));
+        let reference_directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut reference = Store::at(reference_directory.path().into()).unwrap();
+        // Compare the same observed times: a separate live put would stamp a
+        // later wall clock, which is unrelated to append/reload equivalence.
+        reference
+            .put(
+                Item {
+                    id: "large-input".into(),
+                    role: Role::Assistant,
+                    started_at: hydrated.items[0].started_at,
+                    at: hydrated.items[0].at,
+                    content: ItemContent::Tool {
+                        name: "Write".into(),
+                        input,
+                        output: String::new(),
+                        status: crate::chat::ToolStatus::Running,
+                    },
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            hydrated.items,
+            reference.window().unwrap().items,
+            "append hydration must equal a single authoritative full item"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit disk-backed before/after performance measurement"]
+    fn benchmark_one_megabyte_tool_input_stream() {
+        fn written_bytes() -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("wchar:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap()
+        }
+        for append in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut store = Store::at(directory.path().into()).unwrap();
+            let mut adapter = crate::chat::protocol::claude::fixture_adapter();
+            let stream = |event| serde_json::json!({"type":"stream_event","event":event});
+            for event in [
+                serde_json::json!({"type":"message_start","message":{"id":"bench-message"}}),
+                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bench","name":"Write","input":{}}}),
+            ] {
+                for event in adapter.receive(stream(event)).unwrap().events {
+                    store.apply(event).unwrap();
+                }
+            }
+            let mut item = Item {
+                id: "bench".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "Write".into(),
+                    input: String::new(),
+                    output: String::new(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            };
+            let mut payload = serde_json::json!({"file_path":"fixture.txt","content":""});
+            let overhead = payload.to_string().len();
+            payload["content"] = serde_json::Value::String("x".repeat(1024 * 1024 - overhead));
+            let source = payload.to_string();
+            assert_eq!(source.len(), 1024 * 1024);
+            let io_before = written_bytes();
+            let started = std::time::Instant::now();
+            let mut submitted_bytes = 0usize;
+            for chunk in source.as_bytes().chunks(50) {
+                let delta = String::from_utf8(chunk.to_vec()).unwrap();
+                let step = adapter.receive(stream(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":delta}}))).unwrap();
+                for event in step.events {
+                    if append {
+                        if let Event::InputDelta { delta, .. } = &event {
+                            submitted_bytes += delta.len();
+                        }
+                        store.apply(event).unwrap();
+                    } else if let Event::InputDelta { delta, .. } = event {
+                        let ItemContent::Tool { input, .. } = &mut item.content else {
+                            unreachable!()
+                        };
+                        input.push_str(&delta);
+                        submitted_bytes += input.len();
+                        // Reproduce the previous adapter's full-item publication.
+                        store.apply(Event::Item(item.clone())).unwrap();
+                    }
+                }
+            }
+            store.flush_input().unwrap();
+            let stream_io_written = written_bytes() - io_before;
+            let stream_duration = started.elapsed();
+            let (bytes, chunks): (usize, usize) = store
+                .db
+                .query_row(
+                    "SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='bench' AND field=0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(bytes, source.len());
+            // Include the authoritative block-stop classification in the
+            // complete measurement; it is one full final item, not a delta.
+            for event in adapter
+                .receive(stream(
+                    serde_json::json!({"type":"content_block_stop","index":0}),
+                ))
+                .unwrap()
+                .events
+            {
+                store.apply(event).unwrap();
+            }
+            store.flush_input().unwrap();
+            let total_io_written = written_bytes() - io_before;
+            println!(
+                "append={append} stream_duration_ms={} total_duration_ms={} delta_body_bytes_submitted={submitted_bytes} stream_syscall_write_bytes={stream_io_written} total_syscall_write_bytes={total_io_written} streamed_body_bytes={bytes} streamed_chunks={chunks}",
+                stream_duration.as_millis(),
+                started.elapsed().as_millis()
+            );
+            if append {
+                assert!(
+                    stream_io_written <= 5 * 1024 * 1024,
+                    "append writes should stay within a small constant factor of input size"
+                );
+                assert!(
+                    total_io_written <= 16 * 1024 * 1024,
+                    "the final authoritative classification must remain linear too"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn output_for_an_uncacheable_identity_remains_nonfatal() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         let id = "x".repeat(METADATA_LIMIT + 1);
@@ -1520,6 +2007,127 @@ mod tests {
             .apply(Event::Item(history_item("later", "provider still alive")))
             .unwrap();
         assert_eq!(store.window().unwrap().items[0].id, "later");
+    }
+
+    #[test]
+    fn terminal_outcomes_update_only_running_metadata_and_never_rewrite_bodies() {
+        for (outcome, expected) in [
+            (
+                crate::notifications::Kind::Cancelled,
+                crate::chat::ToolStatus::Stopped,
+            ),
+            (
+                crate::notifications::Kind::Failed,
+                crate::chat::ToolStatus::Failed,
+            ),
+            (
+                crate::notifications::Kind::Succeeded,
+                crate::chat::ToolStatus::Running,
+            ),
+        ] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut store = Store::at(directory.path().into()).unwrap();
+            let input = "retained input".repeat(1000);
+            let output = "retained output".repeat(1000);
+            store
+                .apply(Event::Item(Item {
+                    id: "pending".into(),
+                    role: Role::Assistant,
+                    started_at: None,
+                    at: None,
+                    content: ItemContent::Tool {
+                        name: "Write".into(),
+                        input: input.clone(),
+                        output: output.clone(),
+                        status: crate::chat::ToolStatus::Running,
+                    },
+                }))
+                .unwrap();
+            let before: i64 = store
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            store
+                .apply(Event::TurnFinished { key: None, outcome })
+                .unwrap();
+            let after: i64 = store
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                after - before,
+                if outcome == crate::notifications::Kind::Succeeded {
+                    0
+                } else {
+                    1
+                },
+                "only the metadata row changes; chunks are never deleted or rewritten"
+            );
+            store.apply(Event::TurnStarted).unwrap();
+            let page = store.window().unwrap();
+            assert!(
+                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected)
+            );
+        }
+    }
+
+    #[test]
+    fn input_appends_preserve_existing_chunks_and_final_rewrites() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let item = Item {
+            id: "tool".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "shell".into(),
+                input: "α".into(),
+                output: "args".into(),
+                status: crate::chat::ToolStatus::Running,
+            },
+        };
+        store.apply(Event::Item(item.clone())).unwrap();
+        for offset in [2, 4, 6] {
+            store
+                .apply(Event::InputDelta {
+                    id: "tool".into(),
+                    offset,
+                    delta: "β".into(),
+                })
+                .unwrap();
+        }
+        assert!(
+            store
+                .apply(Event::InputDelta {
+                    id: "tool".into(),
+                    offset: 1,
+                    delta: "bad".into()
+                })
+                .is_err()
+        );
+        store.flush_input().unwrap();
+        let chunks: usize = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE id='tool' AND field=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunks, 2, "the original chunk survives each append");
+        let window = store.window().unwrap();
+        assert!(
+            matches!(&window.items[0].content, ItemContent::Tool { input, output, .. } if input == "αβββ" && output == "args")
+        );
+        let mut rewritten = item;
+        if let ItemContent::Tool { output, status, .. } = &mut rewritten.content {
+            *output = "final replacement".into();
+            *status = crate::chat::ToolStatus::Succeeded;
+        }
+        store.apply(Event::Item(rewritten)).unwrap();
+        assert!(
+            matches!(&store.window().unwrap().items[0].content, ItemContent::Tool { output, .. } if output == "final replacement")
+        );
     }
 
     #[test]
