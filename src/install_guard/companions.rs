@@ -151,13 +151,13 @@ fn preflight_in(
     Ok(())
 }
 
-/// Never execute an unknown older daemon to ask its version: historical
-/// entrypoints may ignore informational flags and start a service. Only exact
-/// bytes from the coordinator's already trusted matched daemon qualify.
 pub(crate) fn trusted_executable_owner(owner: u32) -> bool {
     owner == 0 || owner == unsafe { libc::geteuid() }
 }
 
+/// Never execute an unknown older daemon to ask its version: historical
+/// entrypoints may ignore informational flags and start a service. Only exact
+/// bytes from the coordinator's already trusted matched daemon qualify.
 fn same_daemon_binary(candidate: &Path, expected: &Path) -> io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     fn open(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
