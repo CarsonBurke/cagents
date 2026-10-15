@@ -274,7 +274,7 @@ impl Editor {
         if !self.git_review_bound(origin.card, &origin.key) { return Task::none(); }
         let root_unavailable = origin.authority.validate().is_err();
         if root_unavailable {
-            let error = "The original worktree directory is unavailable or was replaced; reopen it before retrying.".to_owned();
+            let error = "The original worktree binding changed or is unavailable; reopen it before retrying.".to_owned();
             match &mut action {
                 Action::AmendLoaded { result, .. } => *result = Err(error),
                 Action::HistoryLoaded { result, .. } => *result = Err(error),
@@ -333,8 +333,8 @@ impl Editor {
                     Err(error) => Some(error),
                 };
                 if root_unavailable {
-                    let warning = if created { "Commit created in the captured worktree; its original directory is now unavailable. Reopen the worktree to inspect it." }
-                        else { "The original worktree directory is now unavailable. Reopen it before retrying." };
+                    let warning = if created { "Commit created in the captured worktree; its original binding changed or is unavailable. Reopen the worktree to inspect it." }
+                        else { "The original worktree binding changed or is unavailable. Reopen it before retrying." };
                     notice = Some(notice.map_or_else(|| warning.to_owned(), |notice| format!("{notice}\n{warning}")));
                 }
                 for tab in &mut self.tabs { if tab.runtime.descriptor.worktree == origin.key.canonical_path { if let Some(source) = tab.sidebar.source_control.as_mut() { source.set_error(notice.clone()); } } }
@@ -601,6 +601,31 @@ mod tests {
         assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("replaced")));
         assert!(app.tab(card).unwrap().mutation.is_none());
         assert_eq!(git(&parked.path().join("original"), &["diff", "--cached", "--name-only"]), "tracked.txt");
+    }
+
+    #[test]
+    fn standalone_commit_refuses_replaced_git_metadata_with_unchanged_worktree_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = git_fixture(); let root = directory.path(); let foreign = git_fixture(); let parked = tempfile::tempdir().unwrap();
+        std::fs::write(root.join("tracked.txt"), "original staged content\n").unwrap(); git(root, &["add", "tracked.txt"]);
+        git(foreign.path(), &["commit", "--allow-empty", "-m", "Foreign repository baseline"]);
+        std::fs::write(foreign.path().join("tracked.txt"), "foreign staged content\n").unwrap(); git(foreign.path(), &["add", "tracked.txt"]);
+        let foreign_head = git(foreign.path(), &["rev-parse", "HEAD"]);
+        let original_head = git(root, &["rev-parse", "HEAD"]);
+        let metadata = std::fs::metadata(root).unwrap(); let identity = (metadata.dev(), metadata.ino());
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Must belong to original repository".into() });
+        let saved_git = parked.path().join("original-git");
+        std::fs::rename(root.join(".git"), &saved_git).unwrap();
+        std::fs::rename(foreign.path().join(".git"), root.join(".git")).unwrap();
+        let metadata = std::fs::metadata(root).unwrap(); assert_eq!((metadata.dev(), metadata.ino()), identity);
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), foreign_head);
+        sidebar_action(&mut app, SidebarAction::Commit { key: origin.key, message: "Must belong to original repository".into(), amend: false });
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), foreign_head, "stale displayed repository must not commit into replacement metadata");
+        assert_eq!(git(root, &["--git-dir", saved_git.to_str().unwrap(), "rev-parse", "HEAD"]), original_head);
+        assert_eq!(app.tab(card).unwrap().navigation.commit_message(), "Must belong to original repository");
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert!(app.notice.is_some());
     }
 
     #[test]
