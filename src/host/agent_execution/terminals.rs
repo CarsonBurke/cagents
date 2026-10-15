@@ -82,6 +82,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatAttach { .. }
         | R::ChatDetach { .. }
         | R::ChatCommand { .. }
+        | R::ChatProviderExitOutput { .. }
         | R::ChatVisibility { .. }
         | R::ChatRead { .. }
         | R::ChatClose { .. }

@@ -61,25 +61,78 @@ const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
-const OUTPUT_TRUNCATED: &str = "\n[Output truncated for display]";
+/// Output keeps its first quarter and a rolling tail, with accounting kept
+/// separately from provider text so marker-like output cannot forge omission.
+#[derive(Default)]
+struct OutputWindow {
+    omitted: usize,
+    head: usize,
+}
 
-fn append_display_output(output: &mut String, delta: &str, limit: usize) -> bool {
-    if (output.ends_with(OUTPUT_TRUNCATED) && output.len().saturating_add(3) >= limit)
-        || delta.is_empty()
-    {
+fn append_display_output(
+    output: &mut String,
+    delta: &str,
+    limit: usize,
+    window: &mut OutputWindow,
+) -> bool {
+    if delta.is_empty() {
         return false;
     }
-    if output.len().saturating_add(delta.len()) <= limit {
+    if limit < 64 {
+        // Large command identity fields can leave very little output budget.
+        // Preserve the newest UTF-8-safe suffix even when no marker fits.
+        if delta.len() >= limit {
+            *output = delta[delta.ceil_char_boundary(delta.len().saturating_sub(limit))..].into();
+        } else {
+            let keep = limit - delta.len();
+            let start = output.ceil_char_boundary(output.len().saturating_sub(keep));
+            output.drain(..start);
+            output.push_str(delta);
+        }
+        window.omitted = 0;
+        window.head = 0;
+        return true;
+    }
+    if window.omitted == 0 && output.len().saturating_add(delta.len()) <= limit {
         output.push_str(delta);
         return true;
     }
-    let budget = limit.saturating_sub(OUTPUT_TRUNCATED.len());
-    let end = output.floor_char_boundary(budget.min(output.len()));
-    output.truncate(end);
-    let end = delta.floor_char_boundary(budget.saturating_sub(output.len()).min(delta.len()));
-    output.push_str(&delta[..end]);
-    if limit >= OUTPUT_TRUNCATED.len() {
-        output.push_str(OUTPUT_TRUNCATED);
+    // Reserve enough space for the largest usize count and marker punctuation.
+    let budget = limit.saturating_sub(64);
+    let (head, tail) = if window.omitted == 0 {
+        let mut whole = std::mem::take(output);
+        whole.push_str(delta);
+        let mut head = whole.floor_char_boundary((budget / 4).min(whole.len()));
+        if let Some(line) = whole[..head].rfind('\n') {
+            head = line + 1;
+        }
+        (whole[..head].to_owned(), whole[head..].to_owned())
+    } else {
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        let mut tail = output[window.head + marker.len()..].to_owned();
+        tail.push_str(delta);
+        (output[..window.head].to_owned(), tail)
+    };
+    let tail_budget = budget.saturating_sub(head.len());
+    let mut start = tail.ceil_char_boundary(tail.len().saturating_sub(tail_budget));
+    // A rolling tail begins on a complete line where possible. For long
+    // single-line output preserve a UTF-8-safe suffix instead.
+    if start > 0
+        && let Some(line) = tail[start..].find('\n')
+    {
+        if start + line + 1 < tail.len() {
+            start += line + 1;
+        }
+    }
+    window.omitted = window.omitted.saturating_add(start);
+    window.head = head.len();
+    *output = head;
+    let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+    if marker.len() <= limit.saturating_sub(output.len()) {
+        output.push_str(&marker);
+        output.push_str(&tail[start..]);
+    } else {
+        output.truncate(output.floor_char_boundary(limit));
     }
     true
 }
@@ -359,6 +412,7 @@ fn create_inner(
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
+            output_windows: BTreeMap::new(),
             models: Vec::new(),
             listing: Vec::new(),
             modalities: BTreeMap::new(),
@@ -498,6 +552,7 @@ struct Codex {
     /// start of an escape sequence the next delta finishes. An entry exists
     /// only for an item in `active_items`, and goes when the item does.
     output_streams: BTreeMap<String, super::terminal_output::Stream>,
+    output_windows: BTreeMap<String, OutputWindow>,
     models: Vec<Model>,
     /// The pages of a model listing still under way. The listing is
     /// reported whole, since a model missing from part of it reads as one
@@ -1062,7 +1117,9 @@ impl Codex {
 
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
+        let mut outcomes = Step::default();
         for turn in array(page, "data")?.iter().rev() {
+            let first_item = items.len();
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
             if active && self.busy {
@@ -1125,11 +1182,14 @@ impl Codex {
                             // adapter missed while it was not reading.
                             self.active_items.remove(&item.id);
                             self.output_streams.remove(&item.id);
+                            self.output_windows.remove(&item.id);
                         }
                     }
                     items.push(item);
                 }
             }
+            self.bind_turn_items(turn_id, items[first_item..].iter().map(|item| item.id.as_str()), &mut outcomes);
+            self.record_turn_outcome(turn, &mut outcomes);
         }
         if !earlier {
             self.child_history_outcome(array(page, "data")?.first(), step);
@@ -1152,6 +1212,7 @@ impl Codex {
                 has_earlier: self.cursor.is_some(),
             }
         });
+        step.events.extend(outcomes.events);
         step.events
             .push(Event::BranchPoints(self.branch_points.clone()));
         Ok(())
@@ -1818,7 +1879,9 @@ impl Adapter for Codex {
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| error.to_string())
+                        .unwrap_or_else(|| {
+                            "The provider reported an error without a readable message".into()
+                        })
                 );
                 step.events
                     .push(if matches!(pending, Pending::History { .. }) {
@@ -2519,6 +2582,7 @@ impl Adapter for Codex {
                 self.materialized = true;
                 let turn = &params["turn"];
                 if method == "turn/completed" {
+                    self.record_turn_outcome(turn, &mut step);
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
                         Some("completed") => Some(Kind::Succeeded),
@@ -2592,6 +2656,7 @@ impl Adapter for Codex {
                     if !self.busy {
                         self.active_items.clear();
                         self.output_streams.clear();
+                        self.output_windows.clear();
                     }
                     step.events.push(Event::Status {
                         busy: self.busy,
@@ -2648,6 +2713,7 @@ impl Adapter for Codex {
                     if done {
                         self.active_items.remove(&item.id);
                         self.output_streams.remove(&item.id);
+                        self.output_windows.remove(&item.id);
                     } else if self.tracks(&params["item"], &item) {
                         self.active_items.insert(item.id.clone(), item.clone());
                     }
@@ -2722,9 +2788,10 @@ impl Adapter for Codex {
                         let limit =
                             MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                         let offset = output.len();
-                        let preserves_prefix = offset.saturating_add(delta.len()) <= limit
-                            || offset <= limit.saturating_sub(OUTPUT_TRUNCATED.len());
-                        if append_display_output(output, delta, limit) {
+                        let window = self.output_windows.entry(id.clone()).or_default();
+                        let preserves_prefix =
+                            window.omitted == 0 && offset.saturating_add(delta.len()) <= limit;
+                        if append_display_output(output, delta, limit, window) {
                             if preserves_prefix {
                                 step.events.push(Event::OutputDelta {
                                     id,
@@ -2806,7 +2873,7 @@ impl Adapter for Codex {
                 let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| params["error"].to_string());
+                    .unwrap_or_else(|| "Codex reported an error without a readable message".into());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
@@ -2823,9 +2890,10 @@ impl Adapter for Codex {
                     .as_str()
                     .or_else(|| params["summary"].as_str())
                     .filter(|text| !text.trim().is_empty());
-                let mut message = summary
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| params.to_string());
+                let mut message = summary.map(str::to_owned).unwrap_or_else(|| {
+                    "Codex reported a configuration warning; check the provider log for details"
+                        .into()
+                });
                 if summary.is_some() {
                     for key in ["details", "path"] {
                         if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
@@ -2873,6 +2941,18 @@ impl Adapter for Codex {
             // requests are visibly rejected above.
             _ => {}
         }
+        // This frame explicitly names a native turn. Bind only the actual
+        // visible aliases emitted for that frame, including split text parts.
+        if thread == self.thread.as_deref()
+            && let Some(turn_id) = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str()) {
+            let mut bindings = Step::default();
+            self.bind_turn_items(turn_id, step.events.iter().filter_map(|event| match event {
+                Event::Item(item) => Some(item.id.as_str()),
+                Event::TextDelta { id, .. } | Event::InputDelta { id, .. } | Event::OutputDelta { id, .. } => Some(id.as_str()),
+                _ => None,
+            }), &mut bindings);
+            step.events.extend(bindings.events);
+        }
         Ok(step)
     }
 }
@@ -2911,6 +2991,49 @@ impl Codex {
             }
             _ => {}
         }
+    }
+    fn confirmed_turn_identity(&self, turn_id: &str) -> Option<chat::turn_outcomes::TurnIdentity> {
+        if self.is_child { return None; }
+        let identity = chat::turn_outcomes::TurnIdentity {
+            session_id: self.thread.clone()?,
+            kind: chat::turn_outcomes::TurnIdentityKind::NativeTurn,
+            id: turn_id.into(),
+        };
+        identity.validate().ok()?;
+        Some(identity)
+    }
+    fn bind_turn_items<'a>(&self, turn_id: &str, ids: impl Iterator<Item=&'a str>, step: &mut Step) {
+        use chat::turn_outcomes::{TurnUpdate, MAX_TURN_ITEM_IDS, MAX_TURN_ID_BYTES};
+        let Some(identity) = self.confirmed_turn_identity(turn_id) else { return; };
+        let mut batch = Vec::new();
+        for id in ids {
+            if id.is_empty() || id.len() > MAX_TURN_ID_BYTES { continue; }
+            if batch.iter().any(|prior| prior == id) { continue; }
+            batch.push(id.to_owned());
+            if batch.len() == MAX_TURN_ITEM_IDS {
+                step.events.push(Event::TurnOutcome(TurnUpdate::Bind { identity: identity.clone(), item_ids: std::mem::take(&mut batch) }));
+            }
+        }
+        if !batch.is_empty() {
+            step.events.push(Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids: batch }));
+        }
+    }
+    fn record_turn_outcome(&self, turn: &Value, step: &mut Step) {
+        use crate::agent::ActivityOutcome;
+        use chat::turn_outcomes::{TurnUpdate, MAX_TURN_REASON_BYTES};
+        let Some(identity) = turn["id"].as_str().and_then(|id| self.confirmed_turn_identity(id)) else { return; };
+        let outcome = match turn["status"].as_str() {
+            Some("completed") => ActivityOutcome::Succeeded,
+            Some("interrupted") => ActivityOutcome::Cancelled,
+            Some("failed") => {
+                let mut reason = turn["error"]["message"].as_str().filter(|message| !message.trim().is_empty()).unwrap_or("The provider reported a failed turn").to_owned();
+                reason.truncate(reason.floor_char_boundary(MAX_TURN_REASON_BYTES));
+                ActivityOutcome::Failed { reason }
+            }
+            _ => return,
+        };
+        let finished_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+        step.events.push(Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, finished_at }));
     }
     fn thread_state(&mut self, thread: &Value, step: &mut Step) -> Result<(), String> {
         let id = string(thread, "id")?;
@@ -3466,7 +3589,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                 // Completed items replace streamed items, so apply the same bound.
                 let full = std::mem::take(output);
-                append_display_output(output, &full, limit);
+                append_display_output(output, &full, limit, &mut OutputWindow::default());
             }
         }
         if item.content.byte_len() > limit {
@@ -3698,6 +3821,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rolling_output_preserves_first_last_lines_and_exact_omission_bytes() {
+        let source = (1..=200000)
+            .map(|line| format!("{line}:🦀\n"))
+            .collect::<String>();
+        let mut output = String::new();
+        let mut window = OutputWindow::default();
+        let mut start = 0;
+        while start < source.len() {
+            let end = source.floor_char_boundary((start + 1024).min(source.len()));
+            append_display_output(
+                &mut output,
+                &source[start..end],
+                MAX_ITEM_BYTES,
+                &mut window,
+            );
+            assert!(output.len() <= MAX_ITEM_BYTES);
+            start = end;
+        }
+        assert!(output.starts_with("1:🦀\n"));
+        assert!(output.ends_with("200000:🦀\n"));
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert!(output.contains(&marker));
+        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+    }
+
+    #[test]
     fn absent_or_failed_predictions_and_observed_child_turns_never_produce_prompts() {
         for result in [
             json!({"type":"failed"}),
@@ -3882,6 +4031,53 @@ mod tests {
                 (!completed).then_some("newer-turn")
             );
         }
+    }
+
+    #[test]
+    fn historical_turn_outcomes_use_native_identity_and_exact_visible_aliases() {
+        use chat::turn_outcomes::{TurnIdentityKind, TurnUpdate};
+        let mut adapter = adapter();
+        let started = adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"A","status":"inProgress","items":[{"id":"user","type":"userMessage","content":[{"type":"text","text":"first"}]}]}}})).unwrap();
+        let alias = format!("{}/input/0", item_key("A", "user"));
+        assert!(started.events.iter().any(|event| matches!(event, Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids })
+            if identity.session_id == "thread-exact" && identity.kind == TurnIdentityKind::NativeTurn && identity.id == "A" && item_ids == &[alias.clone()])));
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"B","status":"inProgress","items":[]}}})).unwrap();
+        let late = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"A","status":"interrupted","items":[]}}})).unwrap();
+        let results: Vec<_> = late.events.iter().filter_map(|event| match event {
+            Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, .. }) => Some((identity.id.as_str(), outcome)),
+            _ => None,
+        }).collect();
+        assert_eq!(results, vec![("A", &crate::agent::ActivityOutcome::Cancelled)]);
+        let reasoning = adapter.receive(json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread-exact","turnId":"B","itemId":"thinking","summaryIndex":2,"delta":"proof"}})).unwrap();
+        let actual = reasoning.events.iter().find_map(|event| match event { Event::TextDelta { id, .. } => Some(id), _ => None }).unwrap();
+        assert!(reasoning.events.iter().any(|event| matches!(event, Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids }) if identity.id == "B" && item_ids == &[actual.clone()])));
+    }
+
+    #[test]
+    fn turn_outcome_bindings_are_bounded_and_history_requires_explicit_terminal_status() {
+        use chat::turn_outcomes::TurnUpdate;
+        let mut adapter = adapter();
+        let parts: Vec<_> = (0..130).map(|index| json!({"type":"text","text":index.to_string()})).collect();
+        let started = adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"many","item":{"id":"user","type":"userMessage","content":parts}}})).unwrap();
+        let batches: Vec<_> = started.events.iter().filter_map(|event| match event {
+            Event::TurnOutcome(TurnUpdate::Bind { item_ids, .. }) => Some(item_ids.len()), _ => None,
+        }).collect();
+        assert_eq!(batches, vec![128,2]);
+        let mut page = Step::default();
+        adapter.page(&json!({"data":[
+            {"id":"unknown","status":"future","items":[]},
+            {"id":"old","status":"failed","error":{"message":"exact failure"},"items":[{"id":"answer","type":"agentMessage","text":"partial"}]}
+        ],"nextCursor":null}), &mut page, true).unwrap();
+        let terminal: Vec<_> = page.events.iter().filter_map(|event| match event { Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, .. }) => Some((identity.id.as_str(), outcome)), _ => None }).collect();
+        assert_eq!(terminal, vec![("old", &crate::agent::ActivityOutcome::Failed { reason:"exact failure".into() })]);
+        let mut child = Codex { is_child: true, ..Default::default() };
+        child.thread = Some("thread-exact".into());
+        let finished = child.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"child","status":"completed","items":[]}}})).unwrap();
+        assert!(!finished.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
+        let unrelated = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"unrelated","turn":{"id":"unknown","status":"completed","items":[]}}})).unwrap();
+        assert!(!unrelated.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
+        let unscoped = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"turnId":"unknown","itemId":"unscoped","delta":"text"}})).unwrap();
+        assert!(!unscoped.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
     }
 
     #[test]
@@ -4256,6 +4452,7 @@ mod tests {
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
+            output_windows: BTreeMap::new(),
             models: vec![Model {
                 id: "model".into(),
                 label: "Model".into(),
@@ -5963,17 +6160,15 @@ mod tests {
         adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
         let delta = "🦀".repeat(MAX_ITEM_BYTES);
         let streamed = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"large","delta":delta}})).unwrap();
-        let Event::OutputDelta {
-            offset,
-            delta: suffix,
-            ..
-        } = &streamed.events[0]
-        else {
-            panic!("missing streamed append")
+        let Event::Item(streamed) = &streamed.events[0] else {
+            panic!("missing bounded output window")
         };
-        assert_eq!(*offset, 0);
+        let ItemContent::Command { output: suffix, .. } = &streamed.content else {
+            panic!("missing command")
+        };
         assert!(suffix.len() <= MAX_ITEM_BYTES);
-        assert!(suffix.ends_with(OUTPUT_TRUNCATED));
+        assert!(suffix.contains("bytes omitted"));
+        assert!(suffix.ends_with("🦀"));
         item["status"] = json!("completed");
         item["aggregatedOutput"] = json!(delta);
         let completed = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
