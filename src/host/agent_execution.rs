@@ -948,8 +948,7 @@ fn control(
     {
         return Err("A person took this agent over; its controls are theirs".into());
     }
-    let declines = matches!(&command, Control::Answer { action, .. } if chat::declines(action));
-    if run.state.is_terminal() && !declines {
+    if run.state.is_terminal() && !matches!(&command, Control::Answer { .. }) {
         return Err(format!(
             "The agent has no active run; its latest is {:?}",
             run.state
@@ -988,11 +987,16 @@ fn control(
                     answer.field
                 ));
             }
-            handle.command(Command::Answer {
+            let command = Command::Answer {
                 request_id: request_id.clone(),
                 action,
                 answers,
-            })?;
+            };
+            if run.state.is_terminal() {
+                handle.decline_answer(command)?;
+            } else {
+                handle.command(command)?;
+            }
             Some(request_id)
         }
     };
