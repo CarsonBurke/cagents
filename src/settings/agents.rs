@@ -29,14 +29,7 @@ pub fn provider_settings(provider: Provider) -> Result<AgentLaunchSettings, Stri
 /// Account discovery and authentication use the same pinned CLI as launches.
 #[cfg(any(feature = "ui", feature = "host"))]
 pub fn provider_executable(provider: Provider, search_path: Option<&std::ffi::OsStr>) -> Result<std::path::PathBuf, String> {
-    let configuration = provider_settings(provider)?;
-    if let Some(executable) = configuration.executable {
-        if !executable_available(&executable) {
-            return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
-        }
-        return Ok(executable.into());
-    }
-    crate::account::probe::find_executable(provider.executable(), search_path).ok_or_else(|| format!("{} is not installed", provider.label()))
+    provider_settings(provider)?.resolve_executable(provider, search_path)
 }
 
 pub fn permission_modes(provider: Provider) -> &'static [&'static str] {
@@ -70,6 +63,19 @@ pub fn environment_reserved(provider: Provider, name: &str) -> bool {
 }
 
 impl AgentLaunchSettings {
+    /// Resolve from this immutable policy capture so probes cannot pair an
+    /// executable from one settings revision with arguments from another.
+    #[cfg(any(feature = "ui", feature = "host"))]
+    pub fn resolve_executable(&self, provider: Provider, search_path: Option<&std::ffi::OsStr>) -> Result<std::path::PathBuf, String> {
+        if let Some(executable) = &self.executable {
+            if !executable_available(executable) {
+                return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
+            }
+            return Ok(executable.into());
+        }
+        crate::account::probe::find_executable(provider.executable(), search_path).ok_or_else(|| format!("{} is not installed", provider.label()))
+    }
+
     pub fn validate(&self, provider: Provider) -> Result<(), String> {
         if self.executable.as_deref().is_some_and(|path| !executable_available(path)) {
             return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
