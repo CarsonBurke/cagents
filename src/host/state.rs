@@ -69,6 +69,7 @@ pub(crate) struct TerminalRecord {
     events: VecDeque<(u64, WireTerminalEvent)>,
     /// Stable provider metadata must survive eviction from the transition log.
     conversation_title: Option<(u64, String)>,
+    terminal_title: Option<String>,
     working_directory: Option<(u64, PathBuf)>,
 }
 
@@ -948,6 +949,9 @@ impl HostState {
             }
         };
         Ok(TerminalDescriptor {
+            title: record.conversation_title().or(record.terminal_title.as_deref()).unwrap_or(&record.session.launch.program).to_owned(),
+            visibility: self.subscriptions.visibility(terminal_id),
+            completed: record.handle.is_completed(),
             screen_lost_after_crash: record.screen_lost_after_crash,
             session,
             activity: record.handle.activity(),
@@ -1167,6 +1171,7 @@ impl HostState {
                 event_sequence: 0,
                 events: VecDeque::new(),
                 conversation_title: None,
+                terminal_title: None,
                 working_directory: None,
             },
         );
@@ -3966,6 +3971,9 @@ fn record_event_from(
         }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
+        if let WireTerminalEvent::TitleChanged { title } = &wire_event {
+            record.terminal_title = Some(title.clone());
+        }
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
         }

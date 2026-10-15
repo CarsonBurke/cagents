@@ -1125,6 +1125,9 @@ mod ownership_tests {
             host_incarnation: "test-incarnation".into(),
         };
         let descriptor = TerminalDescriptor {
+            title: String::new(),
+            visibility: crate::terminal_ipc::TerminalVisibility::Hidden,
+            completed: false,
             screen_lost_after_crash: false,
             session: session.clone(),
             generation: 0,

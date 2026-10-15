@@ -143,7 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 78 adds terminal title, presentation visibility and completion to descriptors.
+pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -550,10 +551,11 @@ impl From<TerminalSize> for WireTerminalSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalVisibility {
     Visible,
+    #[default]
     Hidden,
     Hibernated,
 }
@@ -884,6 +886,15 @@ pub enum ProtocolErrorCode {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminalDescriptor {
+    /// Current provider title, falling back to the launched program.
+    #[serde(default)]
+    pub title: String,
+    /// Aggregate presentation visibility, independent of process completion.
+    #[serde(default)]
+    pub visibility: TerminalVisibility,
+    /// The root process and PTY have both finished.
+    #[serde(default)]
+    pub completed: bool,
     /// The process survived an unplanned daemon loss, but its old screen did not.
     #[serde(default)]
     pub screen_lost_after_crash: bool,
@@ -920,6 +931,9 @@ impl TerminalDescriptor {
         transcript_path: Option<PathBuf>,
     ) -> Self {
         Self {
+            title: recipe.program.clone(),
+            visibility: TerminalVisibility::Hibernated,
+            completed: true,
             session: TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
