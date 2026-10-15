@@ -16762,6 +16762,16 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::Repository(RepositoryAction::CapturedCommand { target, action }) => {
+                let card = action.card();
+                let runtime = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => Some(runtime.as_ref()),
+                    Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
+                    _ => None,
+                };
+                let action = runtime.and_then(|runtime| runtime.resolve_captured_command(&target, *action));
+                action.map_or_else(Task::none, |action| self.update(Message::Repository(action)))
+            }
             Message::Repository(RepositoryAction::NewTerminal { card }) => {
                 match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) => {

@@ -299,6 +299,7 @@ pub struct AsyncIdentity {
 pub struct RepositoryCommandTarget {
     identity: AsyncIdentity,
     editor_revision: Option<u64>,
+    external_editors_generation: u64,
     editor_selection: Option<((usize, usize), (usize, usize))>,
     cursor: Option<(usize, usize, Option<(usize, usize)>)>,
     surface: SourceSurface,
@@ -316,7 +317,7 @@ impl std::fmt::Debug for RepositoryCommandTarget {
 }
 impl PartialEq for RepositoryCommandTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
+        self.identity == other.identity && self.external_editors_generation == other.external_editors_generation && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
         }
     }
@@ -463,6 +464,10 @@ fn conflict_blocks(text: &str) -> Vec<ConflictBlock> {
 
 #[derive(Debug, Clone)]
 pub enum RepositoryAction {
+    CapturedCommand {
+        target: Arc<RepositoryCommandTarget>,
+        action: Box<RepositoryAction>,
+    },
     Review {
         card: CardId,
         action: crate::pull_request_review::Action,
@@ -859,6 +864,7 @@ pub enum ClipboardOp {
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
+            Self::CapturedCommand { action, .. } => action.card(),
             Self::SelectDiffRow { identity, .. }
             | Self::OpenWorkingFileLocation { identity, .. } => identity.card,
             Self::EndDiffSelection { card }
@@ -4334,6 +4340,24 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
+    /// Resolve a native menu payload before any host-specific effect routing.
+    /// Matching widget keys alone cannot fence a message already emitted.
+    pub fn resolve_captured_command(&self, target: &RepositoryCommandTarget, action: RepositoryAction) -> Option<RepositoryAction> {
+        let card = action.card();
+        if target.identity.card != card || self.command_target(card) != *target { return None; }
+        let available = match &action {
+            RepositoryAction::Undo { .. } => self.can_step_editor_history(false),
+            RepositoryAction::Redo { .. } => self.can_step_editor_history(true),
+            RepositoryAction::Clipboard { op, .. } => {
+                let bit = match op { ClipboardOp::Cut => 1 << 2, ClipboardOp::Copy => 1 << 3, ClipboardOp::Paste => 1 << 4, ClipboardOp::SelectAll => 1 << 5 };
+                self.editor_command_capabilities() & bit != 0
+            }
+            RepositoryAction::OpenExternal { editor_id, .. } => self.can_open_external() && self.external_editors.iter().any(|editor| editor.id == *editor_id),
+            _ => false,
+        };
+        available.then_some(action)
+    }
+
     pub fn command_target(&self, card: CardId) -> RepositoryCommandTarget {
         let (editor_revision, cursor) = match &self.document {
             DocumentState::Editable(document) => {
@@ -4344,6 +4368,7 @@ impl RepositoryRuntime {
         };
         RepositoryCommandTarget {
             identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
+            external_editors_generation: self.external_editors.generation(),
             editor_selection: match &self.document {
                 DocumentState::Editable(document) => document.content.selection_bounds().map(|(start, end)| ((start.line, start.column), (end.line, end.column))),
                 _ => None,
@@ -5698,6 +5723,9 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::CapturedCommand { target, action } => {
+                self.resolve_captured_command(&target, *action).map_or_else(Task::none, |action| self.update_inner(action))
+            }
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
             RepositoryAction::SearchDirectory { card, query } => self.search_directory(card, query),
@@ -8876,17 +8904,17 @@ pub fn focus_restore_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.view"))
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExternalEditorCommand<'a>(CardId, &'a str);
+struct ExternalEditorCommand<'a>(CardId, &'a str, &'a RepositoryCommandTarget);
 
 /// An entry in the editor's context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditorMenuCommand {
+enum EditorMenuOperation {
     Undo(CardId),
     Redo(CardId),
     Clipboard(CardId, ClipboardOp),
 }
 
-impl EditorMenuCommand {
+impl EditorMenuOperation {
     fn command(self) -> crate::workspace_widget::GlobalShortcut {
         use crate::workspace_widget::GlobalShortcut as Command;
         match self {
@@ -8970,13 +8998,19 @@ pub fn editor_command_action(
     })
 }
 
-impl widget::menu::Action for EditorMenuCommand {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EditorMenuCommand<'a>(EditorMenuOperation, &'a RepositoryCommandTarget);
+impl EditorMenuCommand<'_> {
+    fn command(self) -> crate::workspace_widget::GlobalShortcut { self.0.command() }
+}
+impl widget::menu::Action for EditorMenuCommand<'_> {
     type Message = RepositoryAction;
     fn message(&self) -> RepositoryAction {
-        let card = match *self {
-            Self::Undo(card) | Self::Redo(card) | Self::Clipboard(card, _) => card,
-        };
-        editor_command_action(card, self.command()).expect("registered editor menu command")
+        let card = match self.0 { EditorMenuOperation::Undo(card) | EditorMenuOperation::Redo(card) | EditorMenuOperation::Clipboard(card, _) => card };
+        RepositoryAction::CapturedCommand {
+            target: Arc::new(self.1.clone()),
+            action: Box::new(editor_command_action(card, self.command()).expect("registered editor menu command")),
+        }
     }
 }
 
@@ -8987,18 +9021,19 @@ fn editor_context_menu(
     runtime: &RepositoryRuntime,
 ) -> Vec<widget::menu::Tree<RepositoryAction>> {
     use widget::menu::Item;
+    let target = runtime.command_target(card);
     let commands = [
-        EditorMenuCommand::Undo(card),
-        EditorMenuCommand::Redo(card),
-        EditorMenuCommand::Clipboard(card, ClipboardOp::Cut),
-        EditorMenuCommand::Clipboard(card, ClipboardOp::Copy),
-        EditorMenuCommand::Clipboard(card, ClipboardOp::Paste),
-        EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll),
+        EditorMenuOperation::Undo(card),
+        EditorMenuOperation::Redo(card),
+        EditorMenuOperation::Clipboard(card, ClipboardOp::Cut),
+        EditorMenuOperation::Clipboard(card, ClipboardOp::Copy),
+        EditorMenuOperation::Clipboard(card, ClipboardOp::Paste),
+        EditorMenuOperation::Clipboard(card, ClipboardOp::SelectAll),
     ];
     let capabilities = runtime.editor_command_capabilities();
     let mut hints = HashMap::new();
     let mut items = Vec::with_capacity(7);
-    for (index, command) in commands.into_iter().enumerate() {
+    for (index, command) in commands.into_iter().map(|command| EditorMenuCommand(command, &target)).enumerate() {
         let action = command.command();
         if let Some(chord) =
             crate::workspace_widget::menu_shortcut(action, &runtime.keyboard_shortcuts)
@@ -9039,7 +9074,7 @@ fn external_editor_action(card: CardId, editor_id: &str) -> RepositoryAction {
 impl widget::menu::Action for ExternalEditorCommand<'_> {
     type Message = RepositoryAction;
     fn message(&self) -> RepositoryAction {
-        external_editor_action(self.0, self.1)
+        RepositoryAction::CapturedCommand { target: Arc::new(self.2.clone()), action: Box::new(external_editor_action(self.0, self.1)) }
     }
 }
 
@@ -9299,6 +9334,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         if runtime.is_saving() {
             secondary.push(button.into());
         } else {
+            let target = runtime.command_target(card);
             let entries = runtime
                 .external_editors
                 .iter()
@@ -9306,7 +9342,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                     widget::menu::Item::Button(
                         editor.name.clone(),
                         Some(icon(editor)),
-                        ExternalEditorCommand(card, editor.id.as_str()),
+                        ExternalEditorCommand(card, editor.id.as_str(), &target),
                     )
                 })
                 .collect();
@@ -9316,7 +9352,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 .external_editors
                 .first()
                 .and_then(|editor| {
-                    let command = ExternalEditorCommand(card, editor.id.as_str());
+                    let command = ExternalEditorCommand(card, editor.id.as_str(), &target);
                     crate::workspace_widget::menu_shortcut(
                         command.command(),
                         &runtime.keyboard_shortcuts,
@@ -9331,6 +9367,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                     card,
                     runtime.generation,
                     runtime.external_editors.generation(),
+                    target.clone(),
                 ),
                 widget::menu::items(&bindings, entries),
             ));
@@ -10218,7 +10255,7 @@ fn editable_document_view<'a>(
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
         crate::interaction::context_menu_keyed(
             editor,
-            (card, runtime.generation, document.revision),
+            runtime.command_target(card),
             editor_context_menu(card, runtime),
         )
     };
@@ -18786,11 +18823,15 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        let command = ExternalEditorCommand(card, "chosen");
+        let target = runtime.command_target(card);
+        let command = ExternalEditorCommand(card, "chosen", &target);
         assert_eq!(
             crate::workspace_widget::shortcut_descriptor(command.command()).id(),
             "open_in_external_editor"
         );
+        use widget::menu::Action as _;
+        let RepositoryAction::CapturedCommand { target: captured, action } = command.message() else { panic!("native editor choice retains its document") };
+        assert!(matches!(runtime.resolve_captured_command(&captured, *action), Some(RepositoryAction::OpenExternal { card: id, editor_id }) if id == card && editor_id == "chosen"));
         assert!(
             matches!(runtime.external_editor_command(card, Some("chosen")), Some(RepositoryAction::OpenExternal { card: id, editor_id }) if id == card && editor_id == "chosen")
         );
@@ -18879,18 +18920,43 @@ mod tests {
     }
 
     #[test]
+    fn emitted_native_editor_menu_cannot_cut_a_replacement_document_or_selection() {
+        use widget::menu::Action as _;
+        let card = CardId::new();
+        let mut current = RepositoryRuntime::word_selection_fixture(card);
+        let target = current.command_target(card);
+        let valid = EditorMenuCommand(EditorMenuOperation::Clipboard(card, ClipboardOp::Cut), &target).message();
+        drop(current.update(valid));
+        assert_eq!(current.editor_text().as_deref(), Some("play the \nnext\n"));
+        for replacement_document in [false, true] {
+            let mut runtime = RepositoryRuntime::word_selection_fixture(card);
+            let target = runtime.command_target(card);
+            let old = EditorMenuCommand(EditorMenuOperation::Clipboard(card, ClipboardOp::Cut), &target).message();
+            if replacement_document {
+                runtime = RepositoryRuntime::dirty_fixture_at(card, "replacement.md".into());
+                drop(runtime.update(editor_command_action(card, crate::workspace_widget::GlobalShortcut::EditorSelectAll).unwrap()));
+            } else {
+                drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::SelectLine }));
+            }
+            let before = runtime.editor_text().unwrap();
+            drop(runtime.update(old));
+            assert_eq!(runtime.editor_text().as_deref(), Some(before.as_str()));
+        }
+    }
+
+    #[test]
     fn registry_editor_menu_commands_share_native_actions_and_capabilities() {
         use crate::workspace_widget::GlobalShortcut as Command;
         use widget::menu::Action as _;
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "original");
         let commands = [
-            EditorMenuCommand::Undo(card),
-            EditorMenuCommand::Redo(card),
-            EditorMenuCommand::Clipboard(card, ClipboardOp::Cut),
-            EditorMenuCommand::Clipboard(card, ClipboardOp::Copy),
-            EditorMenuCommand::Clipboard(card, ClipboardOp::Paste),
-            EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll),
+            EditorMenuOperation::Undo(card),
+            EditorMenuOperation::Redo(card),
+            EditorMenuOperation::Clipboard(card, ClipboardOp::Cut),
+            EditorMenuOperation::Clipboard(card, ClipboardOp::Copy),
+            EditorMenuOperation::Clipboard(card, ClipboardOp::Paste),
+            EditorMenuOperation::Clipboard(card, ClipboardOp::SelectAll),
         ];
         for command in commands {
             assert_eq!(
@@ -18907,7 +18973,7 @@ mod tests {
         let changed = buffer_text(&runtime);
         assert_ne!(changed, "original");
         assert_ne!(runtime.editor_command_capabilities() & 1, 0);
-        drop(runtime.update(EditorMenuCommand::Undo(card).message()));
+        drop(runtime.update(editor_command_action(card, Command::EditorUndo).unwrap()));
         assert_eq!(buffer_text(&runtime), "original");
         assert_ne!(runtime.editor_command_capabilities() & 2, 0);
         drop(runtime.update(editor_command_action(card, Command::EditorRedo).unwrap()));
