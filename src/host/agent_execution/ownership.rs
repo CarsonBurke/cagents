@@ -138,6 +138,25 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
     expected: &Run,
     retire: bool,
 ) -> Result<Reconciliation, String> {
+    reconcile_agent_run_with_archive(host, expected, retire, None)
+}
+
+/// Capture the completed Fresh report under the same owner gate that fences
+/// conditional teardown and every executable attachment/recovery admission.
+pub(in crate::host) fn reconcile_archived_automation_run_under_control(
+    host: &SharedHost,
+    expected: &Run,
+    firing: uuid::Uuid,
+) -> Result<Reconciliation, String> {
+    reconcile_agent_run_with_archive(host, expected, true, Some(firing))
+}
+
+fn reconcile_agent_run_with_archive(
+    host: &SharedHost,
+    expected: &Run,
+    retire: bool,
+    archive: Option<uuid::Uuid>,
+) -> Result<Reconciliation, String> {
     if !expected.state.is_terminal() || expected.state == State::Interrupted {
         return Err("An unfinished or uncertain run cannot be automatically reconciled".into());
     }
@@ -181,12 +200,14 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
                 .ok_or("The exact provider ownership is unavailable for reconciliation")?;
             record.handle.clone()
         };
-        let idle_generation = if !handle.is_completed() {
-            let snapshot = handle
-                .snapshot(None)
-                .ok_or("Provider state is unavailable")?;
-            if !snapshot.ready || snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty()
-            {
+        let completed = handle.is_completed();
+        let snapshot = (!completed || archive.is_some())
+            .then(|| handle.snapshot(None).ok_or("Provider state is unavailable"))
+            .transpose()?;
+        let idle_generation = if !completed {
+            let snapshot = snapshot.as_ref().expect("live provider snapshot");
+            let working = if retire { snapshot.is_working() } else { snapshot.busy };
+            if !snapshot.ready || working || snapshot.waiting || !snapshot.requests.is_empty() {
                 return Err("The provider is not idle; automatic cleanup did not stop it".into());
             }
             Some(snapshot.generation)
@@ -197,6 +218,11 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         };
         if !retire {
             return Ok(Reconciliation::Idle);
+        }
+        if let Some(firing) = archive {
+            registry.lock().unwrap_or_else(|p| p.into_inner())
+                .archive_automation_conversation(firing, &agent, snapshot.expect("archive snapshot"))
+                .map_err(|error| format!("The completed conversation could not be saved: {error}. Open the blocking run, then close it explicitly to unblock."))?;
         }
         if let Some(generation) = idle_generation {
             handle.close_if_idle(generation)?;

@@ -582,52 +582,14 @@ impl Handle {
         let agent = detail
             .agent
             .ok_or("The automation lost its agent identity")?;
-        let archive_handle = if detail.definition.session_mode == SessionMode::Fresh
-            && !agent.closed
-        {
-            match &agent.session {
-                Some(crate::agent_execution::HostedSession::Chat(session)) => host
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .chats
-                    .get(&session.id)
-                    .filter(|record| {
-                        crate::agent_execution::HostedSession::Chat(session.clone()).same_process(
-                            &crate::agent_execution::HostedSession::Chat(record.session.clone()),
-                        )
-                    })
-                    .map(|record| record.handle.clone()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(handle) = &archive_handle
-            && let Some(snapshot) = handle.snapshot(None)
-            && !snapshot.busy
-            && !snapshot.waiting
-            && snapshot.requests.is_empty()
-        {
-            if !self
-                .0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .preserve_automation_conversation(firing.id, &agent, snapshot, now)?
-            {
-                return Ok(false);
-            }
-        }
         // Explicit user close is valid cleanup evidence even when the earlier
         // provider outcome was interrupted. It must never authorize a resend.
         let disposition = if agent.closed {
             Ok(agent_execution::Reconciliation::Closed)
+        } else if detail.definition.session_mode == SessionMode::Fresh {
+            agent_execution::reconcile_archived_automation_run_under_control(host, &run, firing.id)
         } else {
-            agent_execution::reconcile_agent_run_under_control(
-                host,
-                &run,
-                detail.definition.session_mode == SessionMode::Fresh,
-            )
+            agent_execution::reconcile_agent_run_under_control(host, &run, false)
         };
         let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
         let result = match disposition {

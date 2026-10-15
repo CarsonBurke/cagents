@@ -3073,3 +3073,42 @@ fn archived_automation_reservation_refuses_stale_executable_controls_before_and_
         "distinct new conversations remain executable"
     );
 }
+
+#[test]
+fn automation_does_not_reserve_or_close_a_successful_parent_with_running_native_subagents() {
+    const NAME: &str = "automation_does_not_reserve_or_close_a_successful_parent_with_running_native_subagents";
+    if isolated(NAME).is_some() { return; }
+    let (host, request, path) = fixture();
+    let script = path.parent().unwrap().join("bin/claude");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let marker = r#"      printf 'prompt\n' >> "$HOME/../prompts""#;
+    assert!(source.contains(marker));
+    let extra = r#"      printf '{"type":"system","subtype":"task_started","task_id":"still-running","task_type":"local_agent","description":"Useful background work"}\n'"#;
+    let source = source.replace(marker, &format!("{marker}\n{extra}"));
+    std::fs::write(&script,source).unwrap();
+    let mut definition = automation_fixture(&host,&request).definition;
+    definition.session_mode = crate::automations::SessionMode::Fresh;
+    let automation = crate::host::automations::service::create(&host,definition).unwrap();
+    let accepted = claim_fixture(&host,&automation);
+    dispatch_accepted(&host,accepted.clone()).unwrap();
+    let done = settled(&host,accepted.run.id);
+    assert_eq!(done.state,State::Succeeded);
+    let store = registry(&host).unwrap();
+    let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+    let Some(HostedSession::Chat(session)) = &agent.session else { panic!("hosted provider") };
+    let handle = host.lock().unwrap().chats.get(&session.id).unwrap().handle.clone();
+    let snapshot = handle.snapshot(None).unwrap();
+    assert!(!snapshot.busy && snapshot.is_working(), "{snapshot:?}");
+    let firing = store.lock().unwrap().reconcile_automation_run(done.id,now()).unwrap().unwrap();
+    let control = host.lock().unwrap().control_gate.clone();
+    let guard = control.read().unwrap();
+    let error = reconcile_archived_automation_run_under_control(&host,&done,firing.id).unwrap_err();
+    drop(guard);
+    assert!(error.contains("not idle"),"{error}");
+    assert!(!handle.is_completed());
+    assert!(!store.lock().unwrap().agent(agent.id).unwrap().closed);
+    assert!(!store.lock().unwrap().is_archived_automation_session(session.id).unwrap(), "useful work must not acquire a completed-archive execution fence");
+    assert_eq!(std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),"spawn\n");
+    // Explicit fixture cleanup is separate from automatic reconciliation.
+    crate::host::chat::process(&host,EXECUTION_CLIENT,ClientRequest::ChatClose { chat_id: session.id }).unwrap();
+}
