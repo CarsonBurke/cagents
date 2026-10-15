@@ -5359,15 +5359,31 @@ new_thread = "Alt+Shift+G"
                 .filter(|name| name.as_str() != "terminal_passthrough_actions")
                 .eq(SHORTCUT_ACTIONS.iter())
         );
-        let shortcuts = KeyboardShortcuts::default();
-        for (name, chords) in KeyboardShortcuts::action_names()
+        // Distinct sentinels expose swapped actions even when both defaults
+        // are empty or coincidentally contain the same chord.
+        let mut sentinels = table.clone();
+        for (index, name) in KeyboardShortcuts::action_names().iter().enumerate() {
+            sentinels.insert((*name).into(), vec![format!("action-{index}")].into());
+        }
+        let shortcuts: KeyboardShortcuts = sentinels.clone().try_into().unwrap();
+        for (index, (name, chords)) in KeyboardShortcuts::action_names()
             .iter()
             .zip(shortcuts.actions())
+            .enumerate()
         {
-            let serialized: Vec<String> = table[*name].clone().try_into().unwrap();
             assert_eq!(
-                &serialized, chords,
-                "serialized action order must match {name}"
+                chords,
+                &vec![format!("action-{index}")],
+                "read action {name}"
+            );
+            let mut changed = shortcuts.clone();
+            changed.set_action(index, vec!["replacement".into()]);
+            let mut expected = sentinels.clone();
+            expected.insert((*name).into(), vec!["replacement"].into());
+            assert_eq!(
+                toml::Table::try_from(changed).unwrap(),
+                expected,
+                "write action {name}"
             );
         }
     }
@@ -5505,8 +5521,9 @@ new_thread = "Alt+Shift+G"
         let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
             .as_table()
             .unwrap()
-            .values()
-            .flat_map(|chords| chords.as_array().unwrap())
+            .iter()
+            .filter(|(name, _)| name.as_str() != "terminal_passthrough_actions")
+            .flat_map(|(_, chords)| chords.as_array().unwrap())
             .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
             .collect();
         for (index, binding) in bindings.iter().enumerate() {
