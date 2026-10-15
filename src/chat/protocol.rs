@@ -210,6 +210,11 @@ pub struct ServerIdentity {
 pub trait Adapter: Send {
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    /// Whether this exact pending answer refuses work. Providers with opaque
+    /// action IDs must inspect their retained decision, never its UI label.
+    fn answer_declines(&self, _request_id: &str, action: &str) -> bool {
+        super::declines(action)
+    }
     fn command_for_run(
         &mut self,
         _run: crate::model::RunId,
