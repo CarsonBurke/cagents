@@ -76,6 +76,13 @@ pub(super) fn migrate_names(db: &Connection) -> Result<(), String> {
     tx.commit().map_err(|error| error.to_string())
 }
 
+fn cleanup_session_directory(session: &HostedSession) -> &std::path::Path {
+    match session {
+        HostedSession::Chat(session) => &session.launch.recipe.working_directory,
+        HostedSession::Terminal(session) => &session.launch.working_directory,
+    }
+}
+
 impl Registry {
     /// Automatic removal must also wait for durable work not yet represented
     /// by an actor, including unconfirmed launch ownership after a restart.
@@ -87,6 +94,46 @@ impl Registry {
             [], |row| row.get(0),
         ).map_err(|error| error.to_string())
     }
+    /// Read every retained execution directory, including accepted work that
+    /// has not yet acquired an actor. Unlike listing agents, this safety census
+    /// is not paginated and must not silently omit a launch.
+    pub(crate) fn cleanup_execution_directories(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut query = self.db.prepare(
+            "SELECT a.record FROM agents a WHERE
+                EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent=a.id)
+                OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent=a.id AND r.state IN ('accepted','running','waiting'))
+                OR (a.closed=0 AND a.session_id IS NOT NULL)"
+        ).map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut directories = Vec::new();
+        for record in records {
+            let agent: Agent = decode(&record)?;
+            directories.push(agent.spec.target.directory);
+            if let Some(session) = agent.session {
+                directories.push(cleanup_session_directory(&session).to_owned());
+            }
+            if let Some(console) = agent.console {
+                directories.push(console.launch.working_directory);
+            }
+        }
+        let mut query = self
+            .db
+            .prepare("SELECT source FROM agent_launches")
+            .map_err(|error| error.to_string())?;
+        let launches = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        for launch in launches {
+            let session: HostedSession = decode(&launch)?;
+            directories.push(cleanup_session_directory(&session).to_owned());
+        }
+        Ok(directories)
+    }
+
     /// Accepted work can be queued behind the daemon's update write gate before
     /// it owns a hosted actor. Do not lose it from impact merely because there
     /// is no terminal/chat to project yet. Call outside HostState; final update

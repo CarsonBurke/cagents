@@ -424,6 +424,12 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
 }
 
+/// Hold the original directory identity's exclusive protection for confirmed removal.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub fn removal_protection(directory: &Path) -> io::Result<Protection> {
+    acquire(&crate::instance::runtime_directory()?, directory, true)
+}
+
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]

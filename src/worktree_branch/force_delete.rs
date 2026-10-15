@@ -1,6 +1,6 @@
 //! Keep native checkout refusal and bind force consent inside Git's ref lock.
 use super::git_command;
-use crate::repository::{CancellationToken, ProcessExecutor, SystemProcessExecutor};
+use crate::repository::{CancellationToken, ProcessExecutor};
 use std::{io::Write, os::unix::fs::PermissionsExt, path::Path};
 
 const PROBE: &str = "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nif [ \"$1\" = prepared ]; then printf prepared > \"$CAGENTS_DELETE_PROOF\"; fi\n";
@@ -28,25 +28,29 @@ EOF_INPUT
 fi
 "##;
 
-fn run(
+fn run<E: ProcessExecutor>(
+    executor: &E,
     command: crate::repository::CommandSpec,
     cancel: &CancellationToken,
 ) -> Result<crate::process::ProcessOutput, String> {
-    SystemProcessExecutor
+    executor
         .execute(&command, cancel)
         .and_then(|output| output.require_success(&command.program))
         .map_err(|error| error.reported_detail())
 }
 
-pub(super) fn delete(
+pub(super) fn delete<E: ProcessExecutor>(
     repository: &Path,
     branch: &str,
     full_ref: &str,
     oid: &str,
     cancel: &CancellationToken,
+    executor: &E,
+    force: bool,
     guards: &super::registered_heads::RegisteredHeads,
 ) -> Result<(), String> {
     let previous = run(
+        executor,
         guards.scope(git_command(repository).args([
             "rev-parse",
             "--path-format=absolute",
@@ -74,6 +78,7 @@ pub(super) fn delete(
     // and this probe deliberately does not invoke repository policy hooks.
     let input = format!("start\nverify {full_ref} {oid}\nprepare\nabort\n");
     run(
+        executor,
         guards.scope(
             git_command(repository)
                 .args([
@@ -119,7 +124,7 @@ pub(super) fn delete(
                 std::ffi::OsString::from("-c"),
                 hooks,
                 "branch".into(),
-                "-D".into(),
+                if force { "-D".into() } else { "-d".into() },
                 "--".into(),
                 branch.into(),
             ])
@@ -131,7 +136,7 @@ pub(super) fn delete(
             .env("CAGENTS_DELETE_GIT", "git")
             .env("CAGENTS_DELETE_REGISTRATION_GUARD", registration_guard),
     )?;
-    let output = SystemProcessExecutor
+    let output = executor
         .execute(&command, cancel)
         .and_then(|output| output.require_success(&command.program));
     if let Err(error) = output {
@@ -141,7 +146,7 @@ pub(super) fn delete(
                 error.reported_detail()
             ));
         }
-        let current = SystemProcessExecutor.execute(
+        let current = executor.execute(
             &guards.scope(
                 git_command(repository).args(["show-ref", "--verify", "--quiet", full_ref]),
             )?,
@@ -190,14 +195,12 @@ pub(super) fn delete(
         "--get-regexp",
         &pattern,
     ]))?;
-    let output = SystemProcessExecutor
-        .execute(&check, cancel)
-        .map_err(|error| {
-            format!(
-                "Branch was deleted; its configuration cleanup could not be inspected: {}",
-                error.reported_detail()
-            )
-        })?;
+    let output = executor.execute(&check, cancel).map_err(|error| {
+        format!(
+            "Branch was deleted; its configuration cleanup could not be inspected: {}",
+            error.reported_detail()
+        )
+    })?;
     if output.exit_code != Some(1) {
         return Err("Branch was deleted, but its configuration cleanup could not be confirmed; remaining metadata was preserved".into());
     }

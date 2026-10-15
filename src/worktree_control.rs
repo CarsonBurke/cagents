@@ -1,0 +1,184 @@
+//! Typed worktree control shared by the control CLI and its owning daemon.
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Operation {
+    List {
+        repository: PathBuf,
+    },
+    Remove {
+        repository: PathBuf,
+        target: String,
+        force: bool,
+        delete_branch: bool,
+        expected_fingerprint: Option<String>,
+        resolved_path: Option<PathBuf>,
+        continuation: Option<uuid::Uuid>,
+    },
+    Inspect {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    /// Retain physical checkout authority for explicit session-stop consent.
+    InspectForSessionStop {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    StaleLock {
+        repository: PathBuf,
+        path: PathBuf,
+        unlock: bool,
+    },
+    SetDisposableIgnoredDirectories {
+        repository: PathBuf,
+        path: PathBuf,
+        directories: Vec<String>,
+    },
+    GetDisposableIgnoredDirectories {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    DeleteBranch {
+        repository: PathBuf,
+        branch: String,
+        force: bool,
+        expected_oid: Option<String>,
+        continuation: Option<uuid::Uuid>,
+    },
+    BusySessions {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    CloseSessions {
+        repository: PathBuf,
+        path: PathBuf,
+        agents: Vec<BusyAgent>,
+        census: Vec<BusyAgent>,
+    },
+    StopSessions {
+        repository: PathBuf,
+        path: PathBuf,
+        consent: SessionStopConsent,
+        expected_fingerprint: String,
+        stop_authority: uuid::Uuid,
+    },
+}
+
+impl Operation {
+    pub fn repository(&self) -> Option<&std::path::Path> {
+        let repository = match self {
+            Self::List { repository } | Self::Remove { repository, .. }
+            | Self::Inspect { repository, .. } | Self::InspectForSessionStop { repository, .. }
+            | Self::StaleLock { repository, .. }
+            | Self::SetDisposableIgnoredDirectories { repository, .. }
+            | Self::GetDisposableIgnoredDirectories { repository, .. }
+            | Self::DeleteBranch { repository, .. } | Self::BusySessions { repository, .. }
+            | Self::CloseSessions { repository, .. } | Self::StopSessions { repository, .. } => repository,
+        };
+        Some(repository)
+    }
+    pub fn mutates(&self) -> bool {
+        !matches!(self, Self::List { .. } | Self::Inspect { .. }
+            | Self::InspectForSessionStop { .. } | Self::BusySessions { .. }
+            | Self::StaleLock { unlock: false, .. } | Self::GetDisposableIgnoredDirectories { .. })
+    }
+}
+
+/// Daemon-observed actor identity and close revision; the full census includes
+/// idle actors while `agents` identifies the subset requiring interruption.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BusyAgent {
+    pub session: crate::model::TerminalId,
+    pub instance: uuid::Uuid,
+    pub close_revision: Option<u64>,
+    pub turn_generation: Option<u64>,
+    /// Stable actor lifetime, independent of newly admitted work.
+    pub session_instance: uuid::Uuid,
+    /// Positive resident provider-working evidence, never generic shell output.
+    pub working_agent: bool,
+}
+
+/// Exact actor lifetime approved for stopping all its ongoing work.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub session: crate::model::TerminalId,
+    pub instance: uuid::Uuid,
+}
+
+/// Explicit whole-session consent. This does not claim a backend turn fence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStopConsent {
+    pub sessions: Vec<SessionIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head_oid: Option<String>,
+    pub primary: bool,
+    pub detached: bool,
+    pub locked: bool,
+    pub dirty: bool,
+    /// None means that Git has no upstream comparison, never zero.
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
+    pub live_sessions: Vec<crate::model::TerminalId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reply {
+    Listed {
+        worktrees: Vec<Entry>,
+    },
+    Removed {
+        path: PathBuf,
+        branch_deleted: Option<String>,
+        warnings: Vec<String>,
+        branch_error: Option<String>,
+        continuation: Option<uuid::Uuid>,
+    },
+    StaleLock {
+        unlocked: bool,
+    },
+    /// Repository snapshots keep their byte-exact path schema without pulling
+    /// the daemon's Git/SQLite implementation into the control CLI.
+    Inspected {
+        snapshot: String,
+        disposable_ignored_directories: Vec<String>,
+        /// Connection-bound physical inspection; absent on diagnostic/local execution.
+        stop_authority: Option<uuid::Uuid>,
+    },
+    DisposableIgnoredDirectories {
+        directories: Vec<String>,
+    },
+    BranchDeleted {
+        branch: String,
+    },
+    BranchDeleteRefused {
+        failure: BranchDeleteFailure,
+        continuation: Option<uuid::Uuid>,
+    },
+    BusySessions {
+        agents: Vec<BusyAgent>,
+        census: Vec<BusyAgent>,
+    },
+    SessionsClosed {
+        path: PathBuf,
+    },
+    SessionsStopped {
+        path: PathBuf,
+        continuation: Option<uuid::Uuid>,
+    },
+}
+
+#[cfg(feature = "host")]
+pub(crate) use crate::worktree_branch::git_command;
+pub use crate::worktree_branch::{BranchDeleteFailure, BranchDeleteFailureKind};
+#[cfg(any(feature = "ui", feature = "host"))]
+pub use crate::worktree_branch::{delete_branch, delete_branch_checked, delete_branch_checked_at};
+
+#[cfg(feature = "host")]
+pub(crate) mod service;

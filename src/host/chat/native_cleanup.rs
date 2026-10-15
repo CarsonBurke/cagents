@@ -10,6 +10,16 @@ pub(in crate::host) struct NativeClose {
     paired: Option<RetainedPair>,
 }
 
+impl NativeClose {
+    pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
+        &self.source.launch.recipe.working_directory
+    }
+
+    pub(in crate::host) fn holder_identity(&self) -> &crate::daemon::holder_registry::Record {
+        &self.owner.record
+    }
+}
+
 #[derive(Clone)]
 struct RetainedPair {
     source: Option<crate::model::TerminalSession>,

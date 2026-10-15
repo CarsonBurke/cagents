@@ -115,6 +115,9 @@ struct Omp {
     expected_session: Option<String>,
     session_id: Option<String>,
     state_request: Option<String>,
+    compaction_request: Option<String>,
+    compaction_probe: Option<String>,
+    compaction_active: bool,
     history_request: Option<String>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
@@ -238,6 +241,11 @@ impl Omp {
         let id = format!("cagents-{}", self.sequence);
         if kind == "get_state" {
             self.state_request = Some(id.clone());
+            // Every replacement is issued after the compact ACK too. Keep
+            // the completion phase while the latest-state fence advances.
+            if let Some(probe) = self.compaction_probe.as_mut() {
+                *probe = id.clone();
+            }
             if let Some((probe, _)) = self
                 .execution
                 .as_mut()
@@ -796,7 +804,14 @@ impl Adapter for Omp {
             }
             Command::SetFastMode { .. } => return Err("Fast mode is not advertised by this OMP connection".into()),
             Command::SetPermissionMode{..} => return Err("OMP approval policy is configured at launch; use its settings command to change policy.".into()),
-            Command::Compact => step.writes.push(self.request("compact")),
+            Command::Compact => {
+                if self.busy || self.compaction_active {return Err("OMP compaction requires an idle conversation".into());}
+                let request=self.request("compact");
+                self.compaction_request=request["id"].as_str().map(str::to_owned);
+                self.compaction_active=true;
+                step.events.push(Event::Compaction {active:true});
+                step.writes.push(request);
+            },
             Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
@@ -942,6 +957,7 @@ impl Adapter for Omp {
                 // Only the current state request and current page may mutate the view.
                 let pending = match text(&frame, "command") {
                     "get_state" => Some(&mut self.state_request),
+                    "compact" => Some(&mut self.compaction_request),
                     "get_messages_page" => Some(&mut self.history_request),
                     "get_subagents" => Some(&mut self.children_request),
                     "set_subagent_subscription" => Some(&mut self.subscription_request),
@@ -955,6 +971,11 @@ impl Adapter for Omp {
                     *pending = None;
                 }
                 if frame["success"].as_bool() != Some(true) {
+                    if text(&frame, "command") == "compact" {
+                        self.compaction_active = false;
+                        self.compaction_probe = None;
+                        step.events.push(Event::Compaction { active: false });
+                    }
                     // The conversation takes commands only once these have
                     // answered, so one that fails leaves it never ready; it
                     // ends with the reason rather than waiting on nothing.
@@ -1036,6 +1057,14 @@ impl Adapter for Omp {
                             step.events.push(Event::Ready(false));
                         }
                         self.session_id = Some(id.into());
+                        if self.compaction_probe.as_deref() == frame["id"].as_str()
+                            && data["isCompacting"].as_bool() == Some(false)
+                            && data["isStreaming"].as_bool() == Some(false)
+                        {
+                            self.compaction_probe = None;
+                            self.compaction_active = false;
+                            step.events.push(Event::Compaction { active: false });
+                        }
                         if let Some(text) = self.branch_draft.take() {
                             step.events.push(Event::Composer { text });
                         }
@@ -1227,7 +1256,11 @@ impl Adapter for Omp {
                             .map(|n| (n * 1_000_000.0) as u64);
                         step.events.push(Event::Usage(self.usage.clone()));
                     }
-                    "set_model" | "set_thinking_level" | "compact" => step = self.refresh(),
+                    "compact" => {
+                        step = self.refresh();
+                        self.compaction_probe = self.state_request.clone();
+                    }
+                    "set_model" | "set_thinking_level" => step = self.refresh(),
                     "prompt" if data["agentInvoked"].as_bool() == Some(false) => {
                         step = self.refresh();
                         self.finish_execution(
@@ -1390,6 +1423,17 @@ impl Adapter for Omp {
                 });
             }
             "agent_start" | "auto_compaction_start" => {
+                if text(&frame, "type") == "auto_compaction_start" {
+                    self.compaction_active = true;
+                    // A new provider boundary supersedes every earlier ACK
+                    // and idle probe, even when maintenance was already active.
+                    self.compaction_request = None;
+                    self.compaction_probe = None;
+                    let probe = self.request("get_state");
+                    self.compaction_probe = probe["id"].as_str().map(str::to_owned);
+                    step.writes.push(probe);
+                    step.events.push(Event::Compaction { active: true });
+                }
                 if text(&frame, "type") == "agent_start" {
                     step.events.push(Event::TurnStarted);
                     self.turn_outcome = None;
@@ -1442,6 +1486,12 @@ impl Adapter for Omp {
                 };
                 self.busy = false;
                 step = self.refresh();
+                if text(&frame, "type") == "auto_compaction_end" {
+                    self.compaction_active = false;
+                    self.compaction_request = None;
+                    self.compaction_probe = None;
+                    step.events.push(Event::Compaction { active: false });
+                }
                 if finished
                     && let Some(execution) = self
                         .execution

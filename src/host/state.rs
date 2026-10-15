@@ -1,3 +1,4 @@
+mod cleanup;
 mod presentation;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
@@ -236,9 +237,11 @@ pub(crate) struct HostState {
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     spawning: BTreeSet<TerminalId>,
+    pub(super) spawning_scopes: BTreeMap<TerminalId, (uuid::Uuid, PathBuf)>,
     /// Covers the interval before a login's live TerminalRecord exists.
     browser_logins_spawning: BTreeSet<TerminalId>,
     pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
+    pub(super) stop_inspections: BTreeMap<uuid::Uuid, Arc<super::worktree_inspections::Inspection>>,
     /// Connections that asked for terminal-inventory edges. A client that never
     /// asked receives none, which is what keeps every strict request/response
     /// client free of unsolicited frames.
@@ -326,8 +329,10 @@ impl HostState {
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
+            spawning_scopes: BTreeMap::new(),
             browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
+            stop_inspections: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
             execution_registry: None,
@@ -649,6 +654,46 @@ impl HostState {
         }
     }
 
+    pub(super) fn announce_worktrees_changed(&self, repository: &std::path::Path) {
+        for client in &self.model_watchers {
+            if let Some(delivery) = self.clients.get(client) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::WorktreesChanged {
+                        repository: repository.to_path_buf(),
+                    },
+                ));
+            }
+        }
+    }
+
+    pub(super) fn worktree_live_sessions(&self, path: &std::path::Path) -> Vec<TerminalId> {
+        let mut sessions = BTreeSet::new();
+        for (id, record) in &self.terminals {
+            if !record.handle.is_completed() && record.current_directory().starts_with(path) {
+                sessions.insert(*id);
+            }
+        }
+        for (id, record) in &self.chats {
+            if record.handle.owns_work()
+                && record
+                    .session
+                    .launch
+                    .recipe
+                    .working_directory
+                    .starts_with(path)
+            {
+                sessions.insert(*id);
+            }
+        }
+        for (id, session) in &self.chat_spawning {
+            if session.launch.recipe.working_directory.starts_with(path) {
+                sessions.insert(*id);
+            }
+        }
+        sessions.into_iter().collect()
+    }
+
     /// Tells every observing client except `creator` that a terminal now
     /// exists.
     ///
@@ -677,6 +722,8 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.stop_inspections
+            .retain(|_, inspection| inspection.client != client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -971,7 +1018,7 @@ impl HostState {
 
     #[cfg(test)]
     pub(crate) fn reserve_spawn(&mut self, terminal_id: TerminalId) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view(terminal_id, None)
+        self.reserve_spawn_for_view(terminal_id, None, None)
     }
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
@@ -1018,6 +1065,7 @@ impl HostState {
         &mut self,
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
+        directory: Option<&std::path::Path>,
     ) -> Result<(), ProtocolError> {
         if self.shutting_down {
             return Err(ProtocolError::new(
@@ -1056,8 +1104,20 @@ impl HostState {
                 false,
             ));
         }
+        if let Some(directory) = directory {
+            self.spawning_scopes
+                .insert(terminal_id, (uuid::Uuid::new_v4(), directory.to_owned()));
+        }
         self.inventory_generation += 1;
         Ok(())
+    }
+
+    pub(super) fn has_unscoped_spawn(&self) -> bool {
+        !self.browser_logins_spawning.is_empty()
+            || self
+                .spawning
+                .iter()
+                .any(|id| !self.spawning_scopes.contains_key(id))
     }
 
     /// Whether any of `sessions` runs, or is starting or handing off, here.
@@ -1090,6 +1150,7 @@ impl HostState {
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
+        self.spawning_scopes.remove(&terminal_id);
         self.browser_logins_spawning.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
             self.inventory_generation += 1;
@@ -3458,7 +3519,11 @@ fn start_terminal_view_owned(
                 return Err(not_found(terminal_id));
             }
         }
-        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
+        state.reserve_spawn_for_view(
+            terminal_id,
+            paired.then_some(&session),
+            Some(&session.launch.working_directory),
+        )?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.

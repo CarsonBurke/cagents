@@ -289,6 +289,8 @@ impl Actor {
             }
         };
         self.step(initial)?;
+        self.close_input_fd = Some(socket.get_ref().socket.as_raw_fd());
+        self.close_input_drained = false;
         let mut flushing = false;
         let mut closing = None;
         let mut close_sent = false;
@@ -296,6 +298,11 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            self.drain_session_stop();
+            // Admission bypasses queued writes; normal cleanup still proves exit.
+            if self.whole_session_stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if self.stop.load(Ordering::Acquire)
                 && self
                     .native_holder
@@ -344,7 +351,6 @@ impl Actor {
                 ));
             }
             if !flushing && !close_sent && !peer_closed {
-                self.drain_commands(closing.is_some())?;
                 if let Some(bytes) = self.pending.pop_front() {
                     self.queued -= bytes.len();
                     let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
@@ -376,6 +382,7 @@ impl Actor {
             let stream = socket.get_mut();
             stream.budget = 64 * 1024;
             let mut read_again = false;
+            self.close_input_drained = false;
             // Keep adapter ordering: all requests from one Step are sent before
             // processing the next application message. Control replies are
             // driven by tungstenite and share the bounded flush deadline.
@@ -420,9 +427,17 @@ impl Actor {
                     }
                     Err(error) if would_block(&error) => {
                         read_again = socket.get_ref().budget == 0;
+                        self.close_input_drained =
+                            !read_again && socket.get_ref().progress.partial_started().is_none();
                     }
                     Err(error) => return Err(format!("Codex WebSocket read: {error}")),
                 }
+            }
+            if !flushing && !close_sent && !peer_closed {
+                self.drain_commands(closing.is_some())?;
+            }
+            if self.whole_session_stop.load(Ordering::Acquire) {
+                return Ok(());
             }
             let partial_started = socket.get_ref().progress.partial_started();
             if partial_started.is_some_and(|at| at.elapsed() > IO_TIMEOUT) {
