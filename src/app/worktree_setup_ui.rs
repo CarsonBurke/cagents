@@ -1609,14 +1609,28 @@ mod tests {
                     let path = PathBuf::from("/repo/setup");
                     let project = ProjectId::new();
                     app.sidebar_model.projects.push(SidebarProject::new(
-                        project, RepositoryId::new(), "repo".into(), "/repo".into(),
-                        vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))],
+                        project,
+                        RepositoryId::new(),
+                        "repo".into(),
+                        "/repo".into(),
+                        vec![SidebarWorktree::from_durable(
+                            crate::model::WorktreeId::new(),
+                            path.clone(),
+                            Some("setup".into()),
+                        )],
                         vec![],
                     ));
                     let old = OperationId::new();
-                    let mut terminal = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
-                    terminal.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
-                    terminal.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), old.to_string());
+                    let mut terminal =
+                        fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
+                    terminal
+                        .launch
+                        .environment
+                        .insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+                    terminal
+                        .launch
+                        .environment
+                        .insert("CAGENTS_WORKTREE_SETUP_ID".into(), old.to_string());
                     terminal.continuity = if live {
                         TerminalContinuity::Live {
                             host_session_id: crate::model::HostSessionId::new("old-host"),
@@ -1624,9 +1638,13 @@ mod tests {
                             host_incarnation: crate::model::HostIncarnation::new("old-incarnation"),
                         }
                     } else {
-                        TerminalContinuity::Exited { last_exit: crate::model::TerminalExit {
-                            code: Some(0), signal: None, occurred_at_unix_ms: 100,
-                        } }
+                        TerminalContinuity::Exited {
+                            last_exit: crate::model::TerminalExit {
+                                code: Some(0),
+                                signal: None,
+                                occurred_at_unix_ms: 100,
+                            },
+                        }
                     };
                     Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(terminal);
                     app.setup_ui.expected_runs.insert(path.clone(), old);
@@ -1638,24 +1656,49 @@ mod tests {
                     let copy_done = summary == "copy-only";
                     let has_commands = summary == "unfinished";
                     if remote {
-                        app.setup_ui.daemon_receipts.insert(path.clone(), (project, OperationId::new()));
+                        app.setup_ui
+                            .daemon_receipts
+                            .insert(path.clone(), (project, OperationId::new()));
                         let request = OperationId::new();
-                        app.setup_ui.receipt_requests.insert(project, (request, "/repo".into(), Instant::now()));
-                        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), request, Ok((
-                            vec![crate::worktree_control::SetupReceipt {
-                                path: path.clone(), creation_id: creation, run_id: None,
-                                skip, copy_done, has_commands,
-                            }], vec![],
-                        ))));
+                        app.setup_ui
+                            .receipt_requests
+                            .insert(project, (request, "/repo".into(), Instant::now()));
+                        drop(app.finish_worktree_setup_receipts(
+                            project,
+                            "/repo".into(),
+                            request,
+                            Ok((
+                                vec![crate::worktree_control::SetupReceipt {
+                                    path: path.clone(),
+                                    creation_id: creation,
+                                    run_id: None,
+                                    skip,
+                                    copy_done,
+                                    has_commands,
+                                }],
+                                vec![],
+                            )),
+                        ));
                     } else {
-                        app.recover_worktree_setup(creation, path.clone(), SetupIntent {
-                            run_id: None, skip, copy_done,
-                            plan: Some(SetupPlan {
-                                copy: vec![], commands: if has_commands { vec!["true".into()] } else { vec![] },
-                                fingerprint: "a".repeat(64),
-                            }),
-                            ..Default::default()
-                        });
+                        app.recover_worktree_setup(
+                            creation,
+                            path.clone(),
+                            SetupIntent {
+                                run_id: None,
+                                skip,
+                                copy_done,
+                                plan: Some(SetupPlan {
+                                    copy: vec![],
+                                    commands: if has_commands {
+                                        vec!["true".into()]
+                                    } else {
+                                        vec![]
+                                    },
+                                    fingerprint: "a".repeat(64),
+                                }),
+                                ..Default::default()
+                            },
+                        );
                     }
                     for _ in 0..2 {
                         app.refresh_worktree_setup_rows();

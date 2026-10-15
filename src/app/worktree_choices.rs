@@ -116,8 +116,7 @@ impl Choices {
                 if reference.starts_with("refs/remotes/")
                     && reference.ends_with("/HEAD")
                     && symbolic.starts_with("refs/remotes/")
-                    && (*reference == "refs/remotes/origin/HEAD"
-                        || choices.default_base.is_empty())
+                    && (*reference == "refs/remotes/origin/HEAD" || choices.default_base.is_empty())
                 {
                     choices.default_base = symbolic.to_string();
                 }
@@ -160,9 +159,11 @@ impl Choices {
                     .flatten(),
             });
         }
-        if !choices.refs.iter().any(|choice| {
-            choice.kind == Kind::Remote && choice.reference == choices.default_base
-        }) {
+        if !choices
+            .refs
+            .iter()
+            .any(|choice| choice.kind == Kind::Remote && choice.reference == choices.default_base)
+        {
             choices.default_base.clear();
         }
         if choices.default_base.is_empty() {

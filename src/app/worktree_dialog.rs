@@ -1375,15 +1375,24 @@ mod tests {
             } else {
                 let mut choices = super::super::worktree_choices::Choices::default();
                 choices.prefix = "previous/".into();
-                drop(app.update(Message::WorktreeChoicesResolved { id, result: Ok(choices) }));
+                drop(app.update(Message::WorktreeChoicesResolved {
+                    id,
+                    result: Ok(choices),
+                }));
                 assert!(dialog(&app).choices_request.is_none());
                 "team/feature/fresh"
             };
             assert_eq!(dialog(&app).effective_branch().unwrap(), expected);
-            assert!(dialog(&app).resolving.is_none(), "edited input requires a new submit");
+            assert!(
+                dialog(&app).resolving.is_none(),
+                "edited input requires a new submit"
+            );
             assert!(app.worktree_operations.is_empty());
             drop(app.update(Message::SubmitWorktree));
-            assert!(dialog(&app).resolving.is_some(), "the fresh lookup remains usable after explicit submit");
+            assert!(
+                dialog(&app).resolving.is_some(),
+                "the fresh lookup remains usable after explicit submit"
+            );
         }
     }
 
